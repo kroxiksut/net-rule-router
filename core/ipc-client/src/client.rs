@@ -24,7 +24,8 @@
 //! 1. **Disconnected**: invoke `transport::connect()`. On success →
 //!    Connecting. On failure → consult `scm_probe::probe()` to decide
 //!    if we drop into NotInstalled / ServiceStopped, then back off.
-//! 2. **Connecting**: send `ContractNegotiate`, expect ack. On success →
+//! 2. **Connecting**: refuse a pipe served by anything but the service
+//!    (`transport::impostor_reason`), then send `ContractNegotiate`, expect ack. On success →
 //!    Connected. On version mismatch → ProtocolMismatch (terminal).
 //! 3. **Connected**: drain pending requests until error / EOF / shutdown.
 //!    On read error → close handle, transition to Disconnected.
@@ -32,11 +33,12 @@
 //!    Transition to Disconnected when SCM reports Running / StartPending.
 //!
 //! Pending requests held in the queue at the moment of disconnect get
-//! `Err(IpcClientError::Disconnected)` so callers don't hang.
+//! `Err(IpcClientError::Disconnected)` at once, before the reconnect pause.
 
 #![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
 
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -47,7 +49,9 @@ use serde_json::Value;
 
 use nrr_shared::ipc::IpcOperationName;
 
-use crate::connection::{ConnectionStatus, IpcClientError, NegotiateInfo, ReconnectBackoff};
+use crate::connection::{
+    ConnectionStatus, DropBackoff, IpcClientError, NegotiateInfo, ReconnectBackoff,
+};
 use crate::protocol::{
     build_contract_negotiate, build_request_envelope, interpret_negotiate_response,
     new_request_serial, parse_response, NegotiateParse, RequestResponse, CLIENT_PROTOCOL_VERSION,
@@ -338,11 +342,6 @@ struct ClientInner {
     replay_seq: AtomicU64,
 }
 
-// `NegotiateInfo` is declared in `connection.rs` so the `IpcClient`
-// trait can include the getter in its default method (block
-// 16.QoL+7). Re-export it from this module for callers that grab
-// it via the concrete `NamedPipeIpcClient` rather than the trait.
-
 impl ClientInner {
     fn new() -> Self {
         let (tx, rx) = sync_channel::<PendingRequest>(REQUEST_CHANNEL_CAPACITY);
@@ -395,6 +394,7 @@ fn worker_loop(inner: Arc<ClientInner>) {
 
     let mut backoff = ReconnectBackoff::fast();
     let mut slow_backoff = ReconnectBackoff::slow();
+    let mut drop_backoff = DropBackoff::new();
 
     while !inner.shutdown.load(Ordering::SeqCst) {
         // Try to connect.
@@ -406,6 +406,14 @@ fn worker_loop(inner: Arc<ClientInner>) {
                 continue;
             }
         };
+
+        if let Some(reason) = transport::impostor_reason(pipe.0) {
+            transport::close_pipe(pipe.0);
+            inner.set_status(ConnectionStatus::Refused { reason });
+            let delay = slow_backoff.next_delay();
+            sleep_observing_shutdown(&inner, delay);
+            continue;
+        }
 
         // Handshake: ContractNegotiate.
         match handshake(&pipe) {
@@ -451,17 +459,15 @@ fn worker_loop(inner: Arc<ClientInner>) {
             }
         }
 
-        // Connected: serve requests until disconnect.
+        let connected_at = Instant::now();
         serve_requests(&inner, &request_rx, pipe);
 
-        // `serve_requests` returns when the connection died. Without a pause
-        // the loop reconnects immediately, so a service that is going down is
-        // met with connect+handshake at full speed — burning its connection
-        // slots and, for a rejecting service, its audit trail. A forced
-        // reconnect asked for by the user still skips the wait: the flag is
-        // consumed by `sleep_observing_shutdown`.
+        // Without a pause a service that is going down, or closes right after
+        // the handshake, is met with connect + handshake at full speed —
+        // burning its connection slots and its audit trail.
+        fail_queued_requests(&inner, &request_rx);
         if !inner.shutdown.load(Ordering::SeqCst) {
-            let delay = backoff.next_delay();
+            let delay = drop_backoff.after_drop(connected_at.elapsed());
             sleep_observing_shutdown(&inner, delay);
         }
     }
@@ -540,24 +546,13 @@ fn handshake(pipe: &SendableHandle) -> HandshakeResult {
         Err(e) => return HandshakeResult::TransportError(e.to_string()),
     };
 
-    // Interpretation of the negotiate frame is transport-neutral — shared with
-    // the Unix client via `crate::protocol`. Only the I/O above is per-transport.
-    // A refusal arrives id-less, so the negotiate parser can only call it
-    // "unexpected"; read it here before falling through to that.
-    if crate::protocol::is_server_refusal(&response) {
-        let message = response
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("service refused the connection")
-            .to_string();
-        return HandshakeResult::Refused { message };
-    }
+    // Interpretation is transport-neutral, shared with the Unix client.
     match interpret_negotiate_response(&response) {
         NegotiateParse::Ok(info) => HandshakeResult::Ok(info),
         NegotiateParse::ProtocolMismatch { server_version } => {
             HandshakeResult::ProtocolMismatch { server_version }
         }
+        NegotiateParse::Refused { message } => HandshakeResult::Refused { message },
         NegotiateParse::Unexpected(msg) => HandshakeResult::TransportError(msg),
     }
 }
@@ -813,16 +808,14 @@ fn remember_subscription_id(inner: &Arc<ClientInner>, frame: &Value) {
     }
 }
 
-/// Re-issue the remembered subscription on a freshly opened pipe. Runs before
-/// the dispatch loop so events emitted right after reconnect are not missed.
-/// Re-establish the caller's subscription on a fresh connection.
+/// Re-issue the remembered subscription on a freshly opened pipe, before the
+/// dispatch loop, so events emitted right after reconnect are not missed.
 ///
-/// Returns `false` when the connection must be dropped and retried. Swallowing
-/// the failure (which is what returning unit did) left the worker serving a
-/// pipe that was dead or out of step while the status still said `Connected`,
-/// and the subscriber silently received nothing — the Unix twin already got
-/// this right.
-fn replay_subscription(inner: &Arc<ClientInner>, io: &mut PipeIo) -> bool {
+/// Returns `false` only when the pipe is dead or out of step. A subscription
+/// the service DECLINES (subscriber cap, identity) keeps the connection:
+/// reconnecting would earn the same answer forever, while ordinary requests on
+/// this pipe still work.
+fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, io: &mut S) -> bool {
     let Ok(guard) = inner.last_subscribe.lock() else {
         return true;
     };
@@ -881,7 +874,7 @@ fn replay_subscription(inner: &Arc<ClientInner>, io: &mut PipeIo) -> bool {
                     .and_then(|g| g.clone())
                     .unwrap_or_else(|| "unknown".to_string())
             );
-            return ok;
+            return true;
         }
         // A frame belonging to some other request: on a single-in-flight pipe
         // this means the two ends are out of step, and continuing to read on it
@@ -934,6 +927,20 @@ fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: &str) {
     }
 }
 
+/// The connection is gone: nothing queued may wait out the backoff, nor be sent
+/// later on a connection its caller never saw. The status flips first so that
+/// no new request is admitted behind the drain.
+fn fail_queued_requests(inner: &Arc<ClientInner>, request_rx: &Receiver<PendingRequest>) {
+    if inner.status.read().is_ok_and(|s| s.is_connected()) {
+        inner.set_status(ConnectionStatus::Disconnected {
+            last_error: "connection closed".into(),
+        });
+    }
+    while let Ok(p) = request_rx.try_recv() {
+        let _ = p.response_tx.send(RequestResponse::Disconnected);
+    }
+}
+
 fn wait_for_shutdown_or_force_reconnect(
     inner: &Arc<ClientInner>,
     request_rx: &Receiver<PendingRequest>,
@@ -960,21 +967,10 @@ fn sleep_observing_shutdown(inner: &Arc<ClientInner>, total: Duration) {
         if inner.shutdown.load(Ordering::SeqCst) {
             return;
         }
-        // Consume the flag (swap, not load) when waking early for it. Every
-        // other reader (`serve_requests`, `wait_for_shutdown_or_force_reconnect`)
-        // already swaps-and-clears on observing it; this was the one reader
-        // that only peeked. A `force_reconnect()` nudge fired while the worker
-        // was backing off (the common case: a caller's failed `call()` nudges
-        // on every `Disconnected`, and backoff is where the worker spends most
-        // of its time before the service comes back) left the flag set. The
-        // NEXT successful connect then hit `serve_requests`' own top-of-loop
-        // check, which read it still `true` and broke immediately — tearing
-        // down the connection before serving a single request, without even
-        // resetting `status` off `Connected`. Any subsequent failed call
-        // nudges again, so the cycle never broke on its own: the worker kept
-        // reconnecting and immediately self-disconnecting, forever, while
-        // `connection_status()` reported `Connected` for a fraction of each
-        // cycle far too small for a caller's synchronous check to observe.
+        // Consume the flag, not just observe it: callers nudge on every failed
+        // call, and a nudge left set during backoff made the NEXT connection
+        // tear itself down in `serve_requests` before serving anything — a
+        // reconnect/disconnect livelock for as long as callers kept nudging.
         if inner.force_reconnect.swap(false, Ordering::SeqCst) {
             return;
         }

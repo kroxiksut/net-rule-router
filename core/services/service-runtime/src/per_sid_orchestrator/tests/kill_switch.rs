@@ -1028,3 +1028,175 @@ fn link_provider_app_earns_app_exempt_permit_under_fail_closed() {
         "ALE app exemption stays scoped to the caller SID"
     );
 }
+
+// ── The floor under a destination-less block ─────────────────────────────
+
+const PINNED_APP: &str = r"C:\Apps\tg.exe";
+const PRIMARY_LUID: u64 = 0x0006_0000_0000_0002;
+
+/// A secondary-routed app, with `snap` as the policy and `resolution` as the
+/// kill-switch's view of the links.
+fn pinned_app_filters(
+    snap: PerSidPolicySnapshot,
+    resolution: KillSwitchResolution,
+) -> Vec<WfpFilterSpec> {
+    let mut book = rules_with_one_app("tg.exe").rule_book;
+    std::mem::swap(&mut book.primary, &mut book.secondary);
+    filters_for(snap, resolution, book)
+}
+
+fn filters_for(
+    snap: PerSidPolicySnapshot,
+    resolution: KillSwitchResolution,
+    book: CanonicalRuleBook,
+) -> Vec<WfpFilterSpec> {
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let source = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+    let audit = Arc::new(CollectAudit::default());
+    let resolver = nrr_platform_api::MockAppPathResolver::new()
+        .with("tg.exe", vec![std::path::PathBuf::from(PINNED_APP)]);
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_app_resolver(Arc::new(resolver))
+    .with_kill_switch_resolver(Arc::new(move |_| Some(resolution.clone())));
+    rules.set(ActiveRulesSnapshot {
+        rule_book: book,
+        behavior_mode: RouteBehaviorMode::PreferPrimary,
+    });
+    source.set("S-1-5-21-A", snap);
+    match orch
+        .compute_filters_for_sid("S-1-5-21-A", false, None, ComputeIntent::Apply)
+        .unwrap()
+    {
+        ComputedFilterSet::Install(plan) => plan.filters,
+        _ => panic!("expected an installable filter set"),
+    }
+}
+
+fn in_subnet(ip: Ipv4Addr, (net, prefix): (Ipv4Addr, u8)) -> bool {
+    let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+    u32::from(ip) & mask == u32::from(net) & mask
+}
+
+/// The ALE connect verdict for a TCP connect by the pinned app to `ip` leaving
+/// through `egress`: the highest-weight matching filter wins, none means allow.
+fn app_may_connect(filters: &[WfpFilterSpec], ip: Ipv4Addr, egress: u64) -> bool {
+    filters
+        .iter()
+        .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV4)
+        .filter(|f| f.app_pattern.as_deref().is_none_or(|a| a == PINNED_APP))
+        .filter(|f| f.local_interface_luid.is_none_or(|l| l == egress))
+        .filter(|f| f.remote_port.is_none() && f.ip_protocol.is_none_or(|p| p == 6))
+        .filter(|f| {
+            let names_one = f.remote_ip.is_some() || !f.remote_ip_set.is_empty();
+            match f.remote_subnet {
+                Some(subnet) => in_subnet(ip, subnet),
+                None if names_one => f.covers_v4(ip),
+                None => true,
+            }
+        })
+        .max_by_key(|f| f.weight)
+        .is_none_or(|f| f.action == WfpAction::Permit)
+}
+
+#[test]
+fn a_pinned_app_keeps_loopback_and_the_lan_while_the_tunnel_is_up() {
+    let filters = pinned_app_filters(snap_block("Wi-Fi", "TAP"), full_ks_resolution());
+    assert!(
+        filters.iter().any(|f| f.action == WfpAction::Block
+            && f.app_pattern.as_deref() == Some(PINNED_APP)
+            && f.remote_ip.is_none()
+            && f.remote_subnet.is_none()),
+        "the app rule must arm its per-app block"
+    );
+
+    for local in [
+        Ipv4Addr::new(127, 0, 0, 1),
+        Ipv4Addr::new(169, 254, 10, 1),
+        Ipv4Addr::new(192, 168, 1, 20),
+        Ipv4Addr::new(203, 0, 113, 7),
+    ] {
+        assert!(
+            app_may_connect(&filters, local, PRIMARY_LUID),
+            "{local} is local or the tunnel's own server; the per-app block must not cut it"
+        );
+    }
+    // Positive control: everything else off the tunnel is still cut, and the
+    // tunnel itself still carries it.
+    let remote = Ipv4Addr::new(203, 0, 113, 50);
+    assert!(!app_may_connect(&filters, remote, PRIMARY_LUID));
+    assert!(app_may_connect(&filters, remote, KS_LUID));
+}
+
+#[test]
+fn a_pinned_app_keeps_loopback_and_the_lan_when_the_pair_cannot_arm() {
+    // A zero LUID leaves the egress pair unarmable, and the fail-closed
+    // branch cuts the app outright instead.
+    let resolution = KillSwitchResolution {
+        secondary_luid: 0,
+        ..full_ks_resolution()
+    };
+    let filters = pinned_app_filters(snap_block("Wi-Fi", "TAP"), resolution);
+
+    for local in [Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 20)] {
+        assert!(app_may_connect(&filters, local, PRIMARY_LUID), "{local}");
+    }
+    assert!(!app_may_connect(
+        &filters,
+        Ipv4Addr::new(203, 0, 113, 50),
+        PRIMARY_LUID
+    ));
+}
+
+/// Strict's default block is destination-less too. With the catch-all armed
+/// the floor must not land twice; with it unable to arm (no tunnel server to
+/// exempt) the default block must still not stand over an empty floor.
+#[test]
+fn strict_mode_carries_the_floor_once_in_every_guard_posture() {
+    let mut strict = snap_block("Wi-Fi", "TAP");
+    strict.mode = PerSidBehaviorMode::StrictSecondaryFailClosed;
+    let no_server = KillSwitchResolution {
+        bootstrap_server_ips: Vec::new(),
+        ..full_ks_resolution()
+    };
+    // Without an app rule, so the default block alone has to earn the floor.
+    let book = rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 4)).rule_book;
+    for resolution in [full_ks_resolution(), no_server] {
+        let filters = filters_for(strict.clone(), resolution.clone(), book.clone());
+        assert!(
+            filters
+                .iter()
+                .any(|f| f.action == WfpAction::Block && f.weight == 0x0000_FFFF),
+            "strict mode must emit its default block"
+        );
+        let mut ids = std::collections::HashSet::new();
+        assert!(
+            filters.iter().all(|f| ids.insert(f.id)),
+            "a filter id appears twice (servers: {:?})",
+            resolution.bootstrap_server_ips
+        );
+        assert!(
+            app_may_connect(&filters, Ipv4Addr::new(127, 0, 0, 1), PRIMARY_LUID),
+            "loopback cut (servers: {:?})",
+            resolution.bootstrap_server_ips
+        );
+        assert!(app_may_connect(
+            &filters,
+            Ipv4Addr::new(192, 168, 1, 20),
+            PRIMARY_LUID
+        ));
+        assert!(!app_may_connect(
+            &filters,
+            Ipv4Addr::new(203, 0, 113, 50),
+            PRIMARY_LUID
+        ));
+    }
+}

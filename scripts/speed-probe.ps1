@@ -1,4 +1,4 @@
-# Per-adapter reachability and download-speed probe.
+﻿# Per-adapter reachability and download-speed probe.
 #
 # NetRuleRouter routes traffic across existing interfaces by source IP
 # (e.g. a primary Ethernet NIC plus a secondary VPN tunnel adapter). This

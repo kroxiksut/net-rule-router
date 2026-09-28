@@ -419,6 +419,59 @@ fn restore_deletes_only_our_key_and_spawns_nothing() {
         .expect("restoring twice is a no-op");
 }
 
+/// A search list held in memory, as the DNS client would hold it.
+#[derive(Default)]
+struct MemorySearchList {
+    view: Mutex<SearchListView>,
+    noted: Mutex<Vec<String>>,
+}
+impl SearchListStore for MemorySearchList {
+    fn read(&self) -> Result<SearchListView, PlatformError> {
+        Ok(self.view.lock().unwrap_or_else(|p| p.into_inner()).clone())
+    }
+    fn write(&self, suffixes: &[String]) -> Result<(), PlatformError> {
+        self.view.lock().unwrap_or_else(|p| p.into_inner()).global = suffixes.to_vec();
+        Ok(())
+    }
+    fn noted(&self) -> Vec<String> {
+        self.noted.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+    fn note(&self, suffixes: &[String]) -> Result<(), PlatformError> {
+        *self.noted.lock().unwrap_or_else(|p| p.into_inner()) = suffixes.to_vec();
+        Ok(())
+    }
+}
+
+/// The list exists only for the catch-all; it leaves with it.
+#[test]
+fn restore_takes_back_the_search_list_the_redirect_wrote() {
+    let list = Arc::new(MemorySearchList::default());
+    list.view
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .connections = vec!["branch.corp.example".to_string()];
+    let redirect = NrptDnsRedirect::new(FakeRunner::new(ok("")), FakeStore::default())
+        .with_search_list(list.clone());
+
+    redirect.keep_short_names(&[]).expect("keep");
+    assert_eq!(
+        list.read().expect("read").global,
+        ["branch.corp.example".to_string()]
+    );
+    redirect.restore(&handle()).expect("restore");
+    assert!(list.read().expect("read").global.is_empty());
+    assert!(list.noted().is_empty());
+}
+
+#[test]
+fn without_a_search_list_short_names_are_left_as_they_were() {
+    let redirect = NrptDnsRedirect::new(FakeRunner::new(ok("")), FakeStore::default());
+    redirect
+        .keep_short_names(&["lab.example".to_string()])
+        .expect("keep");
+    assert!(redirect.runner.scripts().is_empty());
+}
+
 fn exemption(suffix: &str, servers: &[&str]) -> DnsNamespaceExemption {
     DnsNamespaceExemption {
         suffix: suffix.to_string(),

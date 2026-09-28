@@ -274,6 +274,7 @@ impl DnsEgressPolicy for SecondaryPreferredEgress {
         if open.is_none() {
             tracing::info!(
                 target: "nrr::dns-resolver",
+                msg_key = "dnsegress-tunnel-cooldown",
                 failures,
                 cooldown_secs = self.cooldown.as_secs(),
                 "DNS-over-secondary: the tunnel stopped answering — sending queries straight to the captured upstream for now. They already fell back there after a timeout; this only drops the wait",

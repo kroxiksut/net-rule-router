@@ -224,6 +224,7 @@ impl AutoRulesEngine {
                     // nothing"; a list of names can.
                     tracing::info!(
                         target: "nrr::auto-rules",
+                        msg_key = "autorules-tick-parked",
                         sid = %sid,
                         offered = %preview(&fresh),
                         "parked new suggestions",

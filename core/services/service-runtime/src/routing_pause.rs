@@ -204,12 +204,14 @@ impl RoutingPauseCoordinator {
         match result {
             Ok(delta) => tracing::info!(
                 target: "nrr::routing-pause",
+                msg_key = "routingpause-route-teardown",
                 persist,
                 removed = delta.removed,
                 "routing paused — tore down secondary route table",
             ),
             Err(e) => tracing::warn!(
                 target: "nrr::routing-pause",
+                msg_key = "routingpause-route-teardown-failed",
                 "routing-pause route teardown failed (best-effort): {e:?}",
             ),
         }

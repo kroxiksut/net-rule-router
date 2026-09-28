@@ -1,6 +1,11 @@
-# Remove every trace of the product from this machine: the service, its data
-# tree under %ProgramData%, the per-user directories the desktop surfaces write,
-# and the QSettings hive. Windows counterpart of purge-data.sh.
+﻿# Remove every trace of the product from this machine: the service, its data
+# tree under %ProgramData%, the dev staging directory, the per-user directories
+# the desktop surfaces write, the tray's launch-at-login entry and the QSettings
+# hive. Windows counterpart of purge-data.sh.
+#
+# Nothing is deleted while the service is still registered: an auto-start
+# service would recreate the data tree at the next boot. The script stops with
+# exit code 4 instead.
 #
 # Dry-run by default: it prints what it would remove and touches nothing. Only
 # -Yes deletes, and only the locations declared below — no pattern is ever
@@ -33,9 +38,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Keep in sync with product_identity.rs (PRODUCT_NAME) and the Qt host's
-# setOrganizationName / setApplicationName pair.
-$productName = 'NetRuleRouter'
+. (Join-Path $PSScriptRoot 'lib\service-paths.ps1')
+
+# Also the Qt host's setOrganizationName / setApplicationName pair.
+$productName = $NrrProductName
 
 $dataRoot = if ($env:ProgramData) { Join-Path $env:ProgramData $productName } else { $null }
 $auditDir = if ($dataRoot) { Join-Path $dataRoot 'audit' } else { $null }
@@ -131,16 +137,17 @@ function Remove-DataRoot {
     $removed.Add("$dataRoot\* (audit kept)")
 }
 
-# Take the service down before the data goes, so a running service cannot
-# rewrite what was just deleted.
+# Take the service down before the data goes: a running service rewrites what
+# was just deleted, and a registered auto-start one recreates it at boot.
 function Invoke-ServiceUninstall {
     $uninstall = Join-Path $PSScriptRoot 'uninstall-service.ps1'
-    if (-not (Test-Path -LiteralPath $uninstall)) {
-        Write-Host "  absent       $uninstall (skipping service uninstall)" -ForegroundColor DarkGray
+    if (-not (Test-ServiceRegistered)) {
+        Write-Host "  absent       service $NrrServiceName (not registered)" -ForegroundColor DarkGray
+        $absent.Add("service $NrrServiceName")
         return
     }
     if (-not $Yes) {
-        Write-Host "  would run    $uninstall -Profile $Profile" -ForegroundColor Yellow
+        Write-Host "  would run    $uninstall -Profile $Profile (service $NrrServiceName is registered)" -ForegroundColor Yellow
         return
     }
     Write-Host "==> $uninstall -Profile $Profile" -ForegroundColor Cyan
@@ -148,10 +155,57 @@ function Invoke-ServiceUninstall {
         & $uninstall -Profile $Profile
     }
     catch {
-        # No binary to run `uninstall` from is not fatal here: the data below is
-        # removed either way, and the caller is told the service stayed.
         Write-Host "uninstall-service.ps1 failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        $failed.Add('service uninstall')
+    }
+    # The registration, not the child's exit code, is what decides.
+    if (Test-ServiceRegistered) {
+        Write-Host ""
+        if (Test-ServiceDeletePending) {
+            Write-Host "Service $NrrServiceName is marked for deletion but still registered; it goes at the next reboot." -ForegroundColor Yellow
+            Write-Host "Reboot, then re-run this script." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "Service $NrrServiceName is still registered, so nothing was deleted:" -ForegroundColor Yellow
+            Write-Host "it would recreate $dataRoot at the next start." -ForegroundColor Yellow
+            Write-Host "Remove it first, from this elevated console:" -ForegroundColor Yellow
+            Write-Host "  sc.exe stop $NrrServiceName"
+            Write-Host "  sc.exe delete $NrrServiceName"
+            Write-Host "then re-run this script." -ForegroundColor Yellow
+        }
+        exit 4
+    }
+    $removed.Add("service $NrrServiceName")
+}
+
+# Only a value that launches our tray: the same name written by another tool
+# is that tool's entry.
+function Remove-TrayAutostart {
+    $label = "$NrrAutostartKey\$NrrAutostartValueName"
+    $command = $null
+    try {
+        $command = (Get-ItemProperty -Path $NrrAutostartKey -Name $NrrAutostartValueName -ErrorAction Stop).$NrrAutostartValueName
+    }
+    catch {
+        Write-Host "  absent       $label" -ForegroundColor DarkGray
+        $absent.Add($label)
+        return
+    }
+    if ("$command" -notlike "*$NrrTrayExeName*") {
+        Write-Host "  kept         $label (launches '$command', not $NrrTrayExeName)" -ForegroundColor DarkGray
+        return
+    }
+    if (-not $Yes) {
+        Write-Host "  would remove $label" -ForegroundColor Yellow
+        return
+    }
+    try {
+        Remove-ItemProperty -Path $NrrAutostartKey -Name $NrrAutostartValueName -ErrorAction Stop
+        Write-Host "  removed      $label" -ForegroundColor Green
+        $removed.Add($label)
+    }
+    catch {
+        Write-Host "  FAILED       $label : $($_.Exception.Message)" -ForegroundColor Yellow
+        $failed.Add($label)
     }
 }
 
@@ -167,10 +221,13 @@ Invoke-ServiceUninstall
 
 Write-Host "==> machine-wide footprint" -ForegroundColor Cyan
 Remove-DataRoot
+# The default location only: a -StageDir of the caller's choosing is not known here.
+if ($NrrDevStageDir) { Remove-ProductPath -Path $NrrDevStageDir }
 
 Write-Host "==> profile of $env:USERNAME" -ForegroundColor Cyan
 foreach ($path in $userRoots) { Remove-ProductPath -Path $path }
 Remove-ProductPath -Path $settingsHive
+Remove-TrayAutostart
 
 Write-Host ""
 if (-not $Yes) {

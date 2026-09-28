@@ -27,19 +27,18 @@ use nrr_ipc_client::{ipc_error_to_wire, NamedPipeIpcClient};
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::product_identity::BinaryRole;
 
+use nrr_platform_windows::trusted_location::{first_reparse_point, owner_is_trusted};
+
+use crate::log_location::{log_dir_refusal, PathFact};
 use crate::protocol::{
-    BrokerRequest, BrokerResponse, BrokerServerArgs, BROKER_PING, BROKER_SERVICE_CONTROL,
-    BROKER_SHUTDOWN,
+    relay_timeout, BrokerRequest, BrokerResponse, BrokerServerArgs, BROKER_PING,
+    BROKER_SERVICE_CONTROL, BROKER_SHUTDOWN, SERVICE_CONTROL_BUDGET,
 };
 use crate::spawn::read_and_delete_token_file;
 use crate::windows_sys::{
     accept_with_parent_watch, client_process_id, create_owner_restricted_pipe,
     disconnect_and_close, open_parent_process, pipe_client_user_sid, AcceptResult, PipeIo,
 };
-
-/// Upper bound on the per-call timeout the launcher can request, so a buggy
-/// or hostile caller cannot pin the broker on one service call forever.
-const MAX_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait at startup for the privileged service client to reach
 /// `Connected` before entering the accept loop. The dispatcher only routes
@@ -62,8 +61,7 @@ const ALLOWED_SERVICE_ACTIONS: &[&str] = &[
     "stop",
     "restart",
     // Re-point the registration at the service binary next to this broker and
-    // restart it. Single-token by necessity — the path is the binary's own, and
-    // `check_service_binary` has already confirmed it is our sibling.
+    // restart it. Single-token: the path is always the broker's own sibling.
     "reinstall",
     // Single-token start-mode verbs.
     "set-start-auto",
@@ -88,25 +86,87 @@ fn claim_post_elevation_settle(action: &str, spent: &AtomicBool) -> bool {
     ACTIONS_THAT_STOP_THE_SERVICE.contains(&action) && !spent.swap(true, Ordering::SeqCst)
 }
 
-/// Path of the broker's own lifecycle log.
+/// Directories the broker may log into, most preferred first, each paired with
+/// the first directory of our own on its path.
 ///
-/// NOT `%TEMP%`: the broker runs at high integrity, and a fixed, predictable
-/// name in a directory the unprivileged user can write is an invitation — a
-/// hard link planted there in advance (no admin right needed) turns every
-/// append into a write to whatever file the link names. The log lives under the
-/// machine's ProgramData root, falling back to the install directory beside the
-/// broker binary. Both need administrative rights to write to; if neither
-/// resolves, the broker logs to stderr only.
-fn broker_log_path() -> Option<std::path::PathBuf> {
+/// NOT `%TEMP%`: a fixed name in a directory the unprivileged user can write
+/// lets a planted link turn every elevated append into a write elsewhere.
+/// The machine's ProgramData root comes first, the install directory second.
+fn log_dir_candidates() -> Vec<(PathBuf, PathBuf)> {
+    let mut candidates = Vec::with_capacity(2);
     if let Some(root) = crate::trusted_env::machine_program_data() {
-        let dir = root
-            .join(nrr_shared::product_identity::PRODUCT_NAME)
-            .join("logs");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            return Some(dir.join(nrr_platform_api::paths::BROKER_LOG_FILE));
-        }
+        let product = root.join(nrr_shared::product_identity::PRODUCT_NAME);
+        candidates.push((product.join("logs"), product));
     }
-    current_exe_dir().map(|dir| dir.join(nrr_platform_api::paths::BROKER_LOG_FILE))
+    if let Some(dir) = current_exe_dir() {
+        candidates.push((dir.clone(), dir));
+    }
+    candidates
+}
+
+/// Path of the broker's own lifecycle log, or `None` for stderr only.
+///
+/// Resolved once: a directory that passed is owned by SYSTEM or Administrators,
+/// so the user cannot swap it afterwards.
+fn broker_log_path() -> Option<PathBuf> {
+    static RESOLVED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            for (dir, owned_from) in log_dir_candidates() {
+                match prepare_trusted_log_dir(&dir, &owned_from) {
+                    Ok(()) => return Some(dir.join(nrr_platform_api::paths::BROKER_LOG_FILE)),
+                    // Not `broker_log`: it would re-enter this initialiser.
+                    Err(reason) => eprintln!("[nrr-broker] not logging to a file there: {reason}"),
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+/// Creates `dir` if needed, checking before and after that no component is a
+/// link and that our own directories are owned by SYSTEM or Administrators.
+fn prepare_trusted_log_dir(dir: &Path, owned_from: &Path) -> Result<(), String> {
+    if let Some(reason) = log_dir_refusal(dir, owned_from, true, probe_log_path) {
+        return Err(reason);
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    // Again after creating: a missing directory could have been claimed by
+    // the user between the check and the create.
+    if let Some(reason) = log_dir_refusal(dir, owned_from, false, probe_log_path) {
+        return Err(reason);
+    }
+    match first_reparse_point(dir) {
+        Ok(None) => Ok(()),
+        Ok(Some(link)) => Err(format!("{} is a link to somewhere else", link.display())),
+        Err(e) => Err(e),
+    }
+}
+
+fn probe_log_path(path: &Path, owner_matters: bool) -> PathFact {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PathFact::Missing,
+        Err(e) => return PathFact::Unreadable(e.to_string()),
+    };
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return PathFact::Link;
+    }
+    if !meta.is_dir() {
+        return PathFact::NotADirectory;
+    }
+    if !owner_matters {
+        return PathFact::Directory {
+            trusted_owner: true,
+        };
+    }
+    match owner_is_trusted(path) {
+        Ok(trusted_owner) => PathFact::Directory { trusted_owner },
+        Err(e) => PathFact::Unreadable(e),
+    }
 }
 
 /// Append one lifecycle line to the broker log file and also echo to stderr.
@@ -160,18 +220,27 @@ fn current_exe_dir() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
-/// Whether `candidate` may be executed as the service binary.
+/// The service binary the broker runs: always the sibling of this executable.
 ///
-/// The broker runs what it is told WITH AN ELEVATED TOKEN, so the path is the
-/// most dangerous field on the wire: whoever can speak to the broker would
-/// otherwise get arbitrary elevated execution, and the caller is a
-/// non-elevated GUI — exactly the boundary elevation exists to defend.
-///
-/// Two conditions, both cheap: the file must be named like the service binary
-/// (a rename cannot smuggle another program in), and it must live in the
-/// broker's own directory (the product ships its binaries together, so a path
-/// pointing anywhere else did not come from this installation). Pure over its
-/// inputs so both rules are testable without an elevated process.
+/// A path from the wire is never executed. Checking it and then running it
+/// left a window in which a junction swapped under the checked directory made
+/// the elevated broker run any binary of the caller's choosing. The client's
+/// path survives only as a hint that must agree with ours.
+fn resolve_service_binary(
+    hint: Option<&Path>,
+    broker_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let Some(broker_dir) = broker_dir else {
+        return Err("the application's own directory is unknown".to_string());
+    };
+    if let Some(hint) = hint {
+        check_service_binary(hint, Some(broker_dir))?;
+    }
+    Ok(broker_dir.join(BinaryRole::Service.host_file_name()))
+}
+
+/// Whether the client's `candidate` names the service binary beside the broker:
+/// named like the service binary and living in the broker's own directory.
 fn check_service_binary(candidate: &Path, broker_dir: Option<&Path>) -> Result<(), String> {
     let expected = BinaryRole::Service.host_file_name();
     let name = candidate
@@ -234,12 +303,6 @@ fn normalised_dir(path: &Path) -> String {
     }
 }
 
-/// How long a relayed service-control verb may take before the broker gives up
-/// on it. Generous — `reinstall` restarts a service — but finite: this runs in
-/// the broker's ONLY accept loop, so a wedged child used to take the whole
-/// elevation channel with it, `broker.shutdown` included.
-const SERVICE_CONTROL_BUDGET: Duration = Duration::from_secs(90);
-
 /// Runs `cmd` to completion or kills it when the budget expires. Returns the
 /// exit status with whatever the child wrote to stderr: the broker has no
 /// console, so this is the only way the reason for a non-zero exit survives.
@@ -290,21 +353,30 @@ fn last_stderr_line(stderr: &str) -> Option<&str> {
 /// Run a privileged service-control action by executing the service binary
 /// subcommand. The broker is already elevated, so the child inherits the
 /// elevated token with no new UAC prompt.
-fn run_service_control(service_exe: &str, action: &str) -> BrokerResponse {
+fn run_service_control(hint: Option<&str>, action: &str) -> BrokerResponse {
     if !ALLOWED_SERVICE_ACTIONS.contains(&action) {
         return BrokerResponse::err("malformed-request", format!("unknown action: {action}"));
     }
-    if let Err(reason) = check_service_binary(Path::new(service_exe), current_exe_dir().as_deref())
-    {
-        broker_log(&format!("service-control: refused {service_exe}: {reason}"));
-        return BrokerResponse::err("malformed-request", reason);
-    }
-    broker_log(&format!("service-control: {action} via {service_exe}"));
+    let service_exe =
+        match resolve_service_binary(hint.map(Path::new), current_exe_dir().as_deref()) {
+            Ok(path) => path,
+            Err(reason) => {
+                broker_log(&format!(
+                    "service-control: refused {}: {reason}",
+                    hint.unwrap_or("<no path>")
+                ));
+                return BrokerResponse::err("malformed-request", reason);
+            }
+        };
+    broker_log(&format!(
+        "service-control: {action} via {}",
+        service_exe.display()
+    ));
     if claim_post_elevation_settle(action, &SETTLE_SPENT) {
         broker_log("service-control: settling after the prompt before the first stop");
         nrr_platform_api::elevation::settle_after_elevation();
     }
-    let mut cmd = Command::new(service_exe);
+    let mut cmd = Command::new(&service_exe);
     cmd.arg(action);
     // The elevated child derives its state root from `%PROGRAMDATA%`, and this
     // process inherited the environment of the user who triggered the UAC
@@ -552,12 +624,9 @@ fn dispatch(
                 .payload
                 .get("service-exe-path")
                 .and_then(|v| v.as_str());
-            let resp = match (action, exe) {
-                (Some(a), Some(e)) => run_service_control(e, a),
-                _ => BrokerResponse::err(
-                    "malformed-request",
-                    "service-control needs action + service-exe-path",
-                ),
+            let resp = match action {
+                Some(a) => run_service_control(exe, a),
+                None => BrokerResponse::err("malformed-request", "service-control needs action"),
             };
             (resp, Served::Continue)
         }
@@ -574,7 +643,7 @@ fn dispatch(
                     )
                 }
             };
-            let timeout = Duration::from_millis(request.timeout_ms.max(1)).min(MAX_FORWARD_TIMEOUT);
+            let timeout = relay_timeout(request.timeout_ms);
             let response = match service.call(op, request.payload.clone(), timeout) {
                 Ok(value) => BrokerResponse::ok(value),
                 Err(e) => {
@@ -610,8 +679,8 @@ install failed: no PROGRAMDATA
     }
 
     use super::{
-        broker_log_path, check_service_binary, claim_post_elevation_settle, rotate_broker_log,
-        AtomicBool,
+        check_service_binary, claim_post_elevation_settle, log_dir_candidates,
+        resolve_service_binary, rotate_broker_log, AtomicBool,
     };
     use nrr_shared::product_identity::BinaryRole;
     use std::fs;
@@ -675,6 +744,33 @@ install failed: no PROGRAMDATA
         let candidate = Path::new("C:/anywhere").join(service_name());
         assert!(check_service_binary(&candidate, None).is_err());
         assert!(check_service_binary(Path::new("C:/anywhere/other.exe"), None).is_err());
+    }
+
+    #[test]
+    fn the_binary_run_is_our_sibling_not_the_path_on_the_wire() {
+        let dir = PathBuf::from(r"C:\Program Files\NetRuleRouter");
+        let expected = dir.join(service_name());
+        // A different spelling of the same file resolves to OUR spelling.
+        let hint = PathBuf::from("c:/program files/netrulerouter").join(service_name());
+        assert_eq!(
+            resolve_service_binary(Some(&hint), Some(&dir)),
+            Ok(expected.clone())
+        );
+        assert_eq!(resolve_service_binary(None, Some(&dir)), Ok(expected));
+    }
+
+    #[test]
+    fn a_hint_that_disagrees_with_our_sibling_is_refused() {
+        let dir = PathBuf::from(r"C:\Program Files\NetRuleRouter");
+        let elsewhere = Path::new(r"C:\Users\Public").join(service_name());
+        assert!(resolve_service_binary(Some(&elsewhere), Some(&dir)).is_err());
+        let renamed = dir.join("payload.exe");
+        assert!(resolve_service_binary(Some(&renamed), Some(&dir)).is_err());
+    }
+
+    #[test]
+    fn without_our_own_directory_nothing_is_run() {
+        assert!(resolve_service_binary(None, None).is_err());
     }
 
     #[test]
@@ -751,15 +847,26 @@ install failed: no PROGRAMDATA
 
     #[test]
     fn the_broker_log_never_lands_in_a_user_writable_temp_dir() {
-        let Some(path) = broker_log_path() else {
-            return; // no machine root and no install dir — stderr only
-        };
         let temp = std::env::temp_dir();
+        for (dir, owned_from) in log_dir_candidates() {
+            assert!(
+                !dir.starts_with(&temp),
+                "an elevated process must not append to a fixed name under {}: {}",
+                temp.display(),
+                dir.display()
+            );
+            assert!(dir.starts_with(&owned_from));
+        }
+    }
+
+    #[test]
+    fn a_user_owned_log_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let logs = dir.path().join("logs");
+        let refused = super::prepare_trusted_log_dir(&logs, dir.path());
         assert!(
-            !path.starts_with(&temp),
-            "an elevated process must not append to a fixed name under {}: {}",
-            temp.display(),
-            path.display()
+            refused.is_err(),
+            "a directory an ordinary account owns must not take elevated writes"
         );
     }
 

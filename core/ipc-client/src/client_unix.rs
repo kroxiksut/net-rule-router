@@ -24,10 +24,7 @@
 //!
 //! The transport-generic `negotiate_over` / `exchange` helpers are unit-tested
 //! against an `AF_UNIX` `socketpair`, and the whole client is driven end-to-end
-//! against a local `UnixListener` stub server (handshake + round-trip +
-//! reconnect) on WSL2 — no real service needed. The production server side
-//! (`SO_PEERCRED` peer-credential identity in a future `linux-service`) is out
-//! of scope for this slice.
+//! against a local `UnixListener` stub server — no real service needed.
 
 #![cfg(unix)]
 
@@ -55,9 +52,9 @@ use crate::wire::{read_frame, write_frame, WireError};
 /// Capacity of the per-request channel between caller threads and the worker.
 const REQUEST_CHANNEL_CAPACITY: usize = 32;
 
-/// Hard ceiling on one response read — the Unix twin of the Windows client's
-/// deadline. Above the slowest operation the service admits (a mutation
-/// budgets 30 s): it ends waits that will never be answered, not slow ones.
+/// Hard ceiling on one read or write once connected — the Windows client's
+/// bound. Above the slowest operation the service admits (a mutation budgets
+/// 30 s): it ends waits that will never be answered, not slow ones.
 const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── Public client ────────────────────────────────────────────────────────────

@@ -42,6 +42,7 @@ impl ConnectionObservationConsumer {
             companion_reported: Mutex::new(HashSet::new()),
             primary_stall_evidence: Mutex::new(stall_evidence::ConnectionStallTracker::default()),
             app_main_link: None,
+            app_additional_link: None,
             connection_programs: Mutex::new(std::collections::HashMap::new()),
             torn_down_before: Mutex::new(HashSet::new()),
             last_secondary_at: Mutex::new(None),
@@ -113,6 +114,14 @@ impl ConnectionObservationConsumer {
     #[must_use]
     pub fn with_app_main_link(mut self, sink: super::AppMainLinkFn) -> Self {
         self.app_main_link = Some(sink);
+        self
+    }
+
+    /// Wire the other half of the application measure: programs already
+    /// carried by the additional link are never moved whole.
+    #[must_use]
+    pub fn with_app_additional_link(mut self, sink: super::AppAdditionalLinkFn) -> Self {
+        self.app_additional_link = Some(sink);
         self
     }
 
@@ -250,5 +259,10 @@ impl ConnectionObservationConsumer {
     pub fn with_trace_ring(mut self, ring: Arc<ConnectionTraceRing>) -> Self {
         self.trace_ring = Some(ring);
         self
+    }
+
+    /// The ring this consumer feeds, if any.
+    pub fn trace_ring(&self) -> Option<&Arc<ConnectionTraceRing>> {
+        self.trace_ring.as_ref()
     }
 }

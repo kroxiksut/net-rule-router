@@ -29,13 +29,13 @@ use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE,
-    HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_PIPE_BUSY, HANDLE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING,
 };
-use windows::Win32::System::Pipes::{PeekNamedPipe, WaitNamedPipeW};
+use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, PeekNamedPipe, WaitNamedPipeW};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -88,7 +88,7 @@ fn open_pipe(wide: &[u16]) -> Result<HANDLE, u32> {
     let result: windows::core::Result<HANDLE> = unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
-            GENERIC_READ.0 | GENERIC_WRITE.0,
+            nrr_shared::ipc_transport::SERVICE_PIPE_CLIENT_ACCESS,
             FILE_SHARE_NONE,
             None,
             OPEN_EXISTING,
@@ -114,6 +114,25 @@ fn win32_code(err: &windows::core::Error) -> u32 {
     } else {
         hr
     }
+}
+
+/// Why the process serving `handle` is not the service, or `None` when it is.
+/// Runs before the first byte is sent, so a squatter never sees a request.
+pub fn impostor_reason(handle: HANDLE) -> Option<String> {
+    let mut server_pid = 0u32;
+    // SAFETY: `handle` is a connected client end from `connect`; the call
+    // only writes the out-parameter.
+    if let Err(e) = unsafe { GetNamedPipeServerProcessId(handle, &mut server_pid) } {
+        return Some(format!(
+            "could not read the service pipe's server process (Win32 0x{:08X})",
+            win32_code(&e)
+        ));
+    }
+    crate::server_identity::impostor_reason(
+        server_pid,
+        crate::scm_probe::service_process_id(),
+        cfg!(debug_assertions),
+    )
 }
 
 /// Close a connected pipe handle. Idempotent for an already-closed handle.

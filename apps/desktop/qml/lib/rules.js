@@ -115,6 +115,13 @@ function ruleTypeToSection(ruleType) {
     return ""
 }
 
+// A line break or other control character inside one field would start a line
+// the parser reads as a rule or section of its own. The service refuses them;
+// this is the backstop, matching `neutralize_field` in the Rust writer.
+function oneLineField(value) {
+    return String(value || "").replace(/[\u0000-\u0008\u000a-\u001f\u007f-\u009f]/g, " ")
+}
+
 // THE canonical-txt writer: walks the rules model, filters by `route`, groups
 // rules into their docs/en/rules-file-format.md sections and emits the text shape
 // `nrr_shared::preset_parser` accepts. It is the ONLY generator behind every
@@ -152,19 +159,19 @@ function buildCanonicalRulesText(rulesModel, route, passthroughSections, include
             var originReason = String(row.originReason || "")
             var isAuto = originReason !== "" && section === "Domains"
             if (isAuto) section = "Auto"
-            var line = String(row.matchValue || "").trim()
+            var line = oneLineField(row.matchValue).trim()
             if (line === "") continue
             if (rowRoute === "block") line += " +block"
             if (!row.enabled) line = "# " + line
-            var c = emitComments ? String(row.comment || "").trim() : ""
+            var c = emitComments ? oneLineField(row.comment).trim() : ""
             if (isAuto) {
                 // Provenance travels even when user comments are stripped:
                 // without these tokens the rule is indistinguishable from one
                 // the user typed on the next import.
-                var tokens = "auto:" + originReason
-                var anchor = String(row.originAnchor || "").trim()
+                var tokens = "auto:" + oneLineField(originReason)
+                var anchor = oneLineField(row.originAnchor).trim()
                 if (anchor !== "") tokens += " anchor:" + anchor
-                var added = String(row.originAdded || "").trim()
+                var added = oneLineField(row.originAdded).trim()
                 if (added !== "") tokens += " added:" + added
                 line += "          # " + tokens + (c !== "" ? " " + c : "")
             } else if (c !== "") {
@@ -402,21 +409,25 @@ function buildDriftRulesJsonForRoute(rows, route, aceEncodeHost) {
     })
 }
 
-// Order-independent sort key for a drift DTO: id is zeroed by the time we get
-// here, so the key is built from routing semantics alone.
+// Order-independent sort key for a drift DTO: id and comment are gone by the
+// time we get here, so the key is built from routing semantics alone.
+// Mirrors `comparison_key` in `nrr_shared::rules_json` part for part, and must
+// name every field a drift DTO carries: a key that cannot tell two rules apart
+// leaves their order — and the dirty/drift comparison — to input order.
 // The separator is NUL rather than a space: an application rule's match value
-// is a file path and can contain spaces, which would let two different rules
-// produce the same key and make the order — and therefore the hash — depend on
-// the input order again.
+// is a file path and can contain spaces.
 function driftSortKey(d) {
     var sep = String.fromCharCode(0)
-    var am = d["address-match"] || {}
-    var ap = d["app-match"] || {}
-    var pat = (ap && ap.pattern) || {}
-    var kind = String(am.kind || ("app:" + (pat.kind || "")))
-    var val = String(am.value || am.suffix || am.name || am.address
-        || pat.value || "")
-    return kind + sep + val + sep + (d.enabled ? "1" : "0") + sep
+    var am = d["address-match"] || null
+    var ap = d["app-match"] || null
+    var pat = (ap && ap.pattern) || null
+    var kind = am ? String(am.kind || "") : ""
+    var val = am ? String(am.value || am.suffix || am.name || am.address || "") : ""
+    var appKind = pat ? "app:" + String(pat.kind || "") : ""
+    var appVal = pat ? String(pat.value || "") : ""
+    var children = (ap && ap["include-child-processes"]) ? "1" : "0"
+    return kind + sep + val + sep + appKind + sep + appVal + sep
+        + children + sep + (d.enabled ? "1" : "0") + sep
         + String(d.action || "route")
 }
 

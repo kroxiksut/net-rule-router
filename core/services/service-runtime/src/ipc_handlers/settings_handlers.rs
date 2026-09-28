@@ -644,10 +644,10 @@ impl AutostartToggleHandler {
 }
 
 impl IpcHandler for AutostartToggleHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let req: AutostartToggleRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| malformed("autostart.toggle", e))?;
-        match self.writer.toggle(req.enabled) {
+        match self.writer.toggle(ctx.caller_stored(), req.enabled) {
             Ok(dto) => serialise("autostart.toggle", dto),
             Err(e) => Err(map_settings_write_error(e)),
         }
@@ -1044,7 +1044,6 @@ mod tests {
             Ok(ApplyFailurePolicyDto {
                 policy: slug.to_string(),
                 updated_at: 300,
-                set_by_sid: sid.map(str::to_string),
             })
         }
     }
@@ -1060,7 +1059,6 @@ mod tests {
                 dto: ApplyFailurePolicyDto {
                     policy: "all-or-nothing".into(),
                     updated_at: 0,
-                    set_by_sid: None,
                 },
             }),
         );
@@ -1089,7 +1087,6 @@ mod tests {
                 dto: ApplyFailurePolicyDto {
                     policy: "all-or-nothing".into(),
                     updated_at: 0,
-                    set_by_sid: None,
                 },
             }),
         );
@@ -1215,11 +1212,11 @@ mod tests {
     }
 
     struct FakeAutostartWriter {
-        last: Mutex<Option<bool>>,
+        last: Mutex<Option<(String, bool)>>,
     }
     impl AutostartWriter for FakeAutostartWriter {
-        fn toggle(&self, enabled: bool) -> Result<AutostartDto, SettingsWriteError> {
-            *self.last.lock().unwrap() = Some(enabled);
+        fn toggle(&self, sid: &str, enabled: bool) -> Result<AutostartDto, SettingsWriteError> {
+            *self.last.lock().unwrap() = Some((sid.to_string(), enabled));
             Ok(AutostartDto {
                 enabled,
                 last_known_state: if enabled { "enabled" } else { "disabled" }.into(),
@@ -1245,6 +1242,10 @@ mod tests {
         let parsed: AutostartDto = serde_json::from_value(value).unwrap();
         assert!(parsed.enabled);
         assert_eq!(parsed.last_known_state, "enabled");
-        assert_eq!(*w.last.lock().unwrap(), Some(true));
+        assert_eq!(
+            *w.last.lock().unwrap(),
+            Some(("S-A".to_string(), true)),
+            "the toggle is attributed to the caller, whose news it is"
+        );
     }
 }

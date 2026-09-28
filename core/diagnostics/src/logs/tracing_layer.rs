@@ -458,6 +458,7 @@ impl TracingVerbosityHandle {
         if let Err(err) = self.handle.reload(filter) {
             tracing::warn!(
                 target: "nrr::stability",
+                msg_key = "diag-tracing-reload-failed",
                 error = %err,
                 "live tracing verbosity reload failed; filter unchanged",
             );

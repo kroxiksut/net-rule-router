@@ -154,6 +154,7 @@ impl DnsResolverPort for UpstreamResolverPort {
                     AnswerSanity::Unusable => {
                         tracing::info!(
                             target: "nrr::dns-resolver",
+                            msg_key = "dns-resolver-no-usable-address",
                             host = %hostname,
                             "no source could answer this host with a usable address — not caching a placeholder",
                         );
@@ -799,6 +800,7 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
         if let Suspicion::AlsoAnsweredFor(other) = &suspicion {
             tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-reuse-suspected",
                 host = %hostname,
                 also_answered_for = %other,
                 "upstream handed this host the exact address set of an unrelated one — asking a second source",
@@ -829,6 +831,7 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
                 Some(Confirmation::Agreed) => {
                     tracing::info!(
                         target: "nrr::dns-resolver",
+                        msg_key = "dns-resolver-confirmation-agreed",
                         host = %hostname,
                         addresses = candidate.addresses.len(),
                         "an independent resolver named the same addresses — the reuse alarm was a false alarm",
@@ -838,6 +841,7 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
                 Some(Confirmation::Replaced) => {
                     tracing::info!(
                         target: "nrr::dns-resolver",
+                        msg_key = "dns-resolver-fallback-answered-clean",
                         host = %hostname,
                         reason = %suspicion.as_str(),
                         addresses = candidate.addresses.len(),
@@ -863,12 +867,14 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
             ),
             Suspicion::NoUsableAddress => tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-unconfirmed-answer",
                 host = %hostname,
                 reason = %suspicion.as_str(),
                 "no second source could confirm this host's addresses — returning the upstream answer unconfirmed (it will not be pinned)",
             ),
             Suspicion::AlsoAnsweredFor(other) => tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-reuse-unconfirmed",
                 host = %hostname,
                 also_answered_for = %other,
                 "no second source could confirm this host's addresses — answering with the upstream set as-is",
@@ -1039,6 +1045,7 @@ impl FactSink for CacheFactSink {
         if let Err(e) = guard.upsert_resolution(entry) {
             tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-cache-upsert-failed",
                 error = %e,
                 "upsert_resolution failed while recording resolver fact",
             );
@@ -1187,6 +1194,10 @@ struct ReconcileWorkerState {
     /// Highest generation the worker has fully reconciled (the hook run that
     /// completed it started no earlier than the request).
     completed: u64,
+    /// Highest generation whose covering run panicked. Its waiters are
+    /// answered at once instead of waiting out their deadline, and the worker
+    /// does not re-run for it — a hook that always panics must not spin.
+    failed: u64,
     worker_spawned: bool,
     shutdown: bool,
 }
@@ -1225,7 +1236,7 @@ impl HookSyncReconciler {
                     if guard.shutdown {
                         return;
                     }
-                    if guard.requested > guard.completed {
+                    if guard.requested > guard.completed.max(guard.failed) {
                         break guard.requested;
                     }
                     guard = cv.wait(guard).unwrap_or_else(|p| p.into_inner());
@@ -1235,7 +1246,25 @@ impl HookSyncReconciler {
             // it works; they will be covered by the NEXT run (their facts may
             // have landed mid-run, so this run cannot vouch for them).
             let started = std::time::Instant::now();
-            hook();
+            // A panic must not take the worker with it: the flag would still
+            // say "spawned" and every later reconcile would wait out its
+            // deadline, withholding every rule host until a restart.
+            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook())) {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                tracing::error!(
+                    target: "nrr::dns",
+                    panic = %detail,
+                    "route/WFP reconcile panicked — its waiters are told it did not install",
+                );
+                let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+                guard.failed = guard.failed.max(target);
+                cv.notify_all();
+                continue;
+            }
             let took = started.elapsed();
             // Published so the answer gate can tell a wait that can succeed
             // from one that cannot — see `SyncReconciler::typical_run`.
@@ -1294,6 +1323,11 @@ impl SyncReconciler for HookSyncReconciler {
         loop {
             if guard.completed >= my_gen {
                 return ReconcileOutcome::Installed;
+            }
+            // The run that covered this request panicked: not installed, and
+            // the consumers already treat that like a missed deadline.
+            if guard.failed >= my_gen {
+                return ReconcileOutcome::DeadlineExceeded;
             }
             let Some(remaining) = deadline
                 .checked_sub(start.elapsed())
@@ -1506,6 +1540,7 @@ impl crate::dns_resolver::DirectAnswerGate for ReconcilingDirectAnswerGate {
         let outcome = self.reconciler.reconcile_now(self.deadline);
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-block-all-exemption-installed",
             host = %hostname,
             added,
             outcome = ?outcome,

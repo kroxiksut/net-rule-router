@@ -51,6 +51,7 @@ impl SecondaryRouteCoordinator {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-killswitch-luid-error",
                     sid = %sid,
                     ifindex = secondary.interface_index,
                     "kill-switch: could not resolve secondary LUID; staying off (fail-open): {e:?}",
@@ -67,6 +68,7 @@ impl SecondaryRouteCoordinator {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-killswitch-table-unreadable",
                     sid = %sid,
                     "kill-switch: route table could not be read, so the local-network exemptions are unknown; staying off (fail-open): {e:?}",
                 );
@@ -133,7 +135,7 @@ impl SecondaryRouteCoordinator {
             bootstrap_server_ips_v6,
             local_subnets,
             local_subnets_v6,
-            foreign_tunnel_luids: self.foreign_tunnel_luids(Some(secondary.interface_index)),
+            foreign_tunnel_luids: self.foreign_tunnel_luids(sid, &resolution, Some(&routes)),
         })
     }
 
@@ -144,28 +146,44 @@ impl SecondaryRouteCoordinator {
     /// it was never asked to manage, and from the outside it is
     /// indistinguishable from the corporate VPN failing on its own.
     ///
-    /// Only tunnels, and only usable ones. The name decision is
-    /// `text_indicates_vpn_tunnel`, the same one that keeps a tunnel from
-    /// being mistaken for a hypervisor network — one notion of "this is a
-    /// tunnel", not two.
-    fn foreign_tunnel_luids(&self, secondary_index: Option<u32>) -> Vec<u64> {
+    /// `routes` is `None` when the table could not be read. Nothing is then
+    /// exempted: which link carries the default route is unknown, and
+    /// [`foreign_tunnel_indexes`] resolves doubt to "not a foreign tunnel".
+    ///
+    /// The bound links count as ours even when they did not resolve to a
+    /// route target this pass (liveness-gated, no derivable next hop): an
+    /// unresolved binding is still the user's link, never somebody else's.
+    fn foreign_tunnel_luids(
+        &self,
+        sid: &str,
+        resolution: &RouteResolution,
+        routes: Option<&[RouteEntry]>,
+    ) -> Vec<u64> {
+        let Some(routes) = routes else {
+            return Vec::new();
+        };
         let Ok(adapters) = self.api.get_adapter_infos() else {
             return Vec::new();
         };
-        adapters
+        let policy = self.route_source.load_for_sid(sid);
+        let bindings = policy
             .iter()
-            .filter(|a| Some(a.index) != secondary_index)
-            .filter(|a| {
-                nrr_platform_api::classify_availability(a)
-                    == Some(nrr_platform_api::AdapterAvailability::Available)
-            })
-            .filter(|a| {
-                nrr_platform_api::adapters::text_indicates_vpn_tunnel(&format!(
-                    "{} {}",
-                    a.description, a.friendly_name
-                ))
-            })
-            .filter_map(|a| self.api.interface_luid_for_index(a.index).ok())
+            .flat_map(|p| p.primary.iter().chain(p.secondary.iter()));
+        let ours: Vec<u32> = resolution
+            .primary
+            .iter()
+            .chain(resolution.secondary.iter())
+            .map(|t| t.interface_index)
+            .chain(bindings.flat_map(|b| {
+                adapters
+                    .iter()
+                    .filter(|a| binding_matches_live(a, &b.stable_id, &b.known_stable_ids))
+                    .map(|a| a.index)
+            }))
+            .collect();
+        foreign_tunnel_indexes(&adapters, &ours, routes)
+            .into_iter()
+            .filter_map(|index| self.api.interface_luid_for_index(index).ok())
             .filter(|luid| *luid != 0)
             .collect()
     }
@@ -189,6 +207,7 @@ impl SecondaryRouteCoordinator {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-failclosed-table-unreadable",
                     sid = %sid,
                     "fail-closed: route table could not be read; falling back to the last known local subnets: {e:?}",
                 );
@@ -211,6 +230,7 @@ impl SecondaryRouteCoordinator {
                     local_subnets = cached.clone();
                     tracing::info!(
                         target: "nrr::route-coordinator",
+                        msg_key = "route-failclosed-cached-subnets",
                         sid = %sid,
                         subnets = local_subnets.len(),
                         "fail-closed: using the last known local subnets so the block-all keeps LAN reachable",
@@ -296,8 +316,11 @@ impl SecondaryRouteCoordinator {
             bootstrap_server_ips_v6,
             local_subnets,
             local_subnets_v6,
-            foreign_tunnel_luids: self
-                .foreign_tunnel_luids(resolution.secondary.map(|s| s.interface_index)),
+            foreign_tunnel_luids: self.foreign_tunnel_luids(
+                sid,
+                &resolution,
+                table_read.then_some(routes.as_slice()),
+            ),
             // the resolver has no rule/codegen context;
             // the orchestrator fills known-primary IPs at the block-all call site.
             primary_dest_ips: Vec::new(),
@@ -313,6 +336,63 @@ impl SecondaryRouteCoordinator {
             probe_target_ips,
         }
     }
+}
+
+/// Adapters that may keep their egress under a block-all as somebody else's
+/// tunnel: usable, named like a tunnel, and not a link the machine's own
+/// traffic leaves by.
+///
+/// A permit on the uplink is no kill-switch at all, and a name cannot tell
+/// one from a tunnel: many providers deliver the internet itself over PPPoE,
+/// and a user may bind a link called "OpenVPN" as the primary. So the links
+/// ours are bound to (`ours`) never qualify, and neither does the SOLE holder
+/// of a default route in its address family — that link is the uplink. With
+/// two holders (the physical link plus a corporate full tunnel) the table
+/// cannot say which is which, and the name decides as before.
+///
+/// The name decision is `text_indicates_vpn_tunnel`, the same one that keeps
+/// a tunnel from being mistaken for a hypervisor network.
+pub(crate) fn foreign_tunnel_indexes(
+    adapters: &[AdapterInfo],
+    ours: &[u32],
+    routes: &[RouteEntry],
+) -> Vec<u32> {
+    let available: Vec<&AdapterInfo> = adapters
+        .iter()
+        .filter(|a| {
+            nrr_platform_api::classify_availability(a)
+                == Some(nrr_platform_api::AdapterAvailability::Available)
+        })
+        .collect();
+    let sole_default_holder = |v6: bool| {
+        let mut holders = available.iter().map(|a| a.index).filter(|index| {
+            routes.iter().any(|r| {
+                r.interface_index == *index
+                    && r.prefix_length == 0
+                    && !r.is_ours
+                    && r.destination.is_ipv6() == v6
+            })
+        });
+        match (holders.next(), holders.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        }
+    };
+    let uplinks: Vec<u32> = [sole_default_holder(false), sole_default_holder(true)]
+        .into_iter()
+        .flatten()
+        .collect();
+    available
+        .into_iter()
+        .filter(|a| !ours.contains(&a.index) && !uplinks.contains(&a.index))
+        .filter(|a| {
+            nrr_platform_api::adapters::text_indicates_vpn_tunnel(&format!(
+                "{} {}",
+                a.description, a.friendly_name
+            ))
+        })
+        .map(|a| a.index)
+        .collect()
 }
 
 /// The IPv6 exemptions both postures share: the tunnel's `/128` endpoints and

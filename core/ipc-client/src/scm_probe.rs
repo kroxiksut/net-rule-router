@@ -52,28 +52,52 @@ const SERVICE_NAME: &str = nrr_shared::product_identity::WINDOWS_SERVICE_NAME;
 /// Run an SCM status query for the NetRuleRouter service. Always returns
 /// some `ServiceProbe`; never panics.
 pub fn probe() -> ServiceProbe {
-    // Step 1: connect to SCM (read-only).
-    let scm = match open_scm_for_query() {
-        Ok(h) => h,
-        Err(code) => return ServiceProbe::Unknown { code },
+    let status = match query_status() {
+        Ok(s) => s,
+        Err(QueryError::NotFound) => return ServiceProbe::NotFound,
+        Err(QueryError::Code(code)) => return ServiceProbe::Unknown { code },
     };
-    let _scm_guard = ScHandleGuard(scm);
+    match status.dwCurrentState {
+        SERVICE_RUNNING => ServiceProbe::Running,
+        SERVICE_STOPPED => ServiceProbe::Stopped,
+        SERVICE_START_PENDING => ServiceProbe::StartPending,
+        SERVICE_STOP_PENDING => ServiceProbe::StopPending,
+        other => ServiceProbe::Unknown { code: other.0 },
+    }
+}
 
-    // Step 2: open the service entry.
+/// The service's process id as SCM knows it: `Ok(None)` when it is not
+/// installed or has no process; `Err` with the Win32 code when SCM could not
+/// be asked.
+pub fn service_process_id() -> Result<Option<u32>, u32> {
+    match query_status() {
+        Ok(s) => Ok(Some(s.dwProcessId).filter(|&pid| pid != 0)),
+        Err(QueryError::NotFound) => Ok(None),
+        Err(QueryError::Code(code)) => Err(code),
+    }
+}
+
+enum QueryError {
+    NotFound,
+    Code(u32),
+}
+
+fn query_status() -> Result<SERVICE_STATUS_PROCESS, QueryError> {
+    let scm = open_scm_for_query().map_err(QueryError::Code)?;
+    let _scm_guard = ScHandleGuard(scm);
     let svc = match open_service_for_query(scm) {
         OpenSvcResult::Ok(h) => h,
-        OpenSvcResult::NotFound => return ServiceProbe::NotFound,
-        OpenSvcResult::OtherError(code) => return ServiceProbe::Unknown { code },
+        OpenSvcResult::NotFound => return Err(QueryError::NotFound),
+        OpenSvcResult::OtherError(code) => return Err(QueryError::Code(code)),
     };
     let _svc_guard = ScHandleGuard(svc);
 
-    // Step 3: query status.
     let mut status = SERVICE_STATUS_PROCESS::default();
     let mut bytes_needed = 0u32;
     // SAFETY: `status` is a POD struct on stack; size is the buffer
     // capacity; bytes_needed is a stack out-pointer. svc is a valid
     // handle owned by the guard.
-    let result = unsafe {
+    unsafe {
         QueryServiceStatusEx(
             svc,
             SC_STATUS_PROCESS_INFO,
@@ -83,19 +107,9 @@ pub fn probe() -> ServiceProbe {
             )),
             &mut bytes_needed as *mut u32,
         )
-    };
-    if result.is_err() {
-        let code = result.err().map(|e| e.code().0 as u32).unwrap_or(0);
-        return ServiceProbe::Unknown { code };
     }
-
-    match status.dwCurrentState {
-        SERVICE_RUNNING => ServiceProbe::Running,
-        SERVICE_STOPPED => ServiceProbe::Stopped,
-        SERVICE_START_PENDING => ServiceProbe::StartPending,
-        SERVICE_STOP_PENDING => ServiceProbe::StopPending,
-        other => ServiceProbe::Unknown { code: other.0 },
-    }
+    .map_err(|e| QueryError::Code(win32_code(&e)))?;
+    Ok(status)
 }
 
 /// The Win32 code behind a windows-rs error.

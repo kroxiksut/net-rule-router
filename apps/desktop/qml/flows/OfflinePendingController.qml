@@ -86,7 +86,7 @@ QtObject {
                     "When a routed domain shares an IP address with other sites")
             case "mode-a-coverage-strategy":
                 return root.tr("settings.routing.mode-a-coverage.label",
-                    "When the additional route is unavailable (Mode A)")
+                    "When the additional route is unavailable (watching system DNS)")
             case "resolve-hosts-bypass":
                 return root.tr("settings.routing.hosts-bypass.label",
                     "Resolve routed domains bypassing the hosts file")
@@ -157,7 +157,7 @@ QtObject {
             case "enforcement-mode":
                 return root.tr("settings.routing.enforcement-mode.option-" + String(value),
                     String(value) === "resolver"
-                        ? "Local DNS resolver (Mode B)" : "Reactive kill-switch (Mode A)")
+                        ? "Local DNS resolver (default)" : "Watching system DNS (legacy)")
             case "kill-switch-fail-closed":
                 return (value === true)
                     ? root.tr("settings.routing.kill-switch.failure-mode.option-fail-closed",

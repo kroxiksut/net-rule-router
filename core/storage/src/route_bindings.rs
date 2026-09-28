@@ -179,6 +179,11 @@ pub struct RoutePolicyRecord {
     /// engine has always taken this as a parameter; until now nothing supplied
     /// one, so the user-facing setting existed only in the documentation.
     pub zone_priority_over_ip: bool,
+    /// Complete short names with [`Self::short_name_suffix`] for a connection
+    /// that announces no domain of its own. Off by default.
+    pub short_name_completion: bool,
+    /// The network domain the user named; stored normalised, empty when unset.
+    pub short_name_suffix: String,
     /// "Treat a domain as `domain` + `*.domain`". When `true`, the
     /// enforcement layer expands every bare-domain (`ExactFqdn`) rule with a
     /// `SuffixDomain` sibling so it also covers subdomains (apex kept).
@@ -272,6 +277,8 @@ impl RoutePolicyRecord {
             primary_probe_repeat_secs: DEFAULT_PRIMARY_PROBE_REPEAT_SECS,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             // Default ON: adding `mysite.com` and silently losing
             // `cdn.mysite.com` to the other route was the surprising outcome.
             // Widening only adds coverage towards the route the rule names, so
@@ -390,6 +397,8 @@ struct BlockPolicyRow {
     primary_probe_repeat_secs: u32,
     local_networks_auto_accept: bool,
     zone_priority_over_ip: bool,
+    short_name_completion: bool,
+    short_name_suffix: String,
 }
 
 impl Default for BlockPolicyRow {
@@ -417,6 +426,8 @@ impl Default for BlockPolicyRow {
             primary_probe_repeat_secs: DEFAULT_PRIMARY_PROBE_REPEAT_SECS,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
         }
     }
 }
@@ -525,9 +536,10 @@ impl<'c> RouteBindingsRepository<'c> {
                  kill_switch_strict_shared_ips, auto_rules_mode, \
                  auto_rules_eager_delivery_names, primary_probe_auto, \
                  primary_probe_timeout_ms, primary_probe_max_targets, \
-                 primary_probe_repeat_secs, local_networks_auto_accept,                  zone_priority_over_ip, updated_at)
+                 primary_probe_repeat_secs, local_networks_auto_accept, \
+                 zone_priority_over_ip, short_name_completion, short_name_suffix, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
              ON CONFLICT(sid) DO UPDATE SET
                 block_secondary_when_unavailable = excluded.block_secondary_when_unavailable,
                 kill_switch_fail_closed = excluded.kill_switch_fail_closed,
@@ -551,6 +563,8 @@ impl<'c> RouteBindingsRepository<'c> {
                 primary_probe_repeat_secs = excluded.primary_probe_repeat_secs,
                 local_networks_auto_accept = excluded.local_networks_auto_accept,
                 zone_priority_over_ip = excluded.zone_priority_over_ip,
+                short_name_completion = excluded.short_name_completion,
+                short_name_suffix = excluded.short_name_suffix,
                 updated_at = excluded.updated_at",
             params![
                 sid,
@@ -576,6 +590,8 @@ impl<'c> RouteBindingsRepository<'c> {
                 record.primary_probe_repeat_secs as i64,
                 record.local_networks_auto_accept as i64,
                 record.zone_priority_over_ip as i64,
+                record.short_name_completion as i64,
+                record.short_name_suffix,
                 now_epoch_secs
             ],
         )
@@ -721,6 +737,8 @@ impl<'c> RouteBindingsRepository<'c> {
             primary_probe_repeat_secs: policy.primary_probe_repeat_secs,
             local_networks_auto_accept: policy.local_networks_auto_accept,
             zone_priority_over_ip: policy.zone_priority_over_ip,
+            short_name_completion: policy.short_name_completion,
+            short_name_suffix: policy.short_name_suffix,
             binding_source,
         })
     }
@@ -820,7 +838,7 @@ impl<'c> RouteBindingsRepository<'c> {
         let row: Option<BlockPolicyRow> = self
             .conn
             .query_row(
-                "SELECT block_secondary_when_unavailable, kill_switch_fail_closed,                  kill_switch_protocols, kill_switch_block_all, kill_switch_enabled,                  allow_dns_over_primary, include_subdomains, shared_ip_policy,                  mode_a_coverage_strategy, resolve_hosts_bypass,                  doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed,                  kill_switch_strict_shared_ips, auto_rules_mode,                  auto_rules_eager_delivery_names, primary_probe_auto,                  primary_probe_timeout_ms, primary_probe_max_targets,                  primary_probe_repeat_secs,                  local_networks_auto_accept, zone_priority_over_ip
+                "SELECT block_secondary_when_unavailable, kill_switch_fail_closed,                  kill_switch_protocols, kill_switch_block_all, kill_switch_enabled,                  allow_dns_over_primary, include_subdomains, shared_ip_policy,                  mode_a_coverage_strategy, resolve_hosts_bypass,                  doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed,                  kill_switch_strict_shared_ips, auto_rules_mode,                  auto_rules_eager_delivery_names, primary_probe_auto,                  primary_probe_timeout_ms, primary_probe_max_targets,                  primary_probe_repeat_secs,                  local_networks_auto_accept, zone_priority_over_ip,                  short_name_completion, short_name_suffix
                  FROM secondary_block_policy WHERE sid = ?1",
                 params![sid],
                 |row| {
@@ -865,6 +883,8 @@ impl<'c> RouteBindingsRepository<'c> {
                             .unwrap_or(DEFAULT_PRIMARY_PROBE_REPEAT_SECS),
                         local_networks_auto_accept: row.get::<_, i64>(20)? != 0,
                         zone_priority_over_ip: row.get::<_, i64>(21)? != 0,
+                        short_name_completion: row.get::<_, i64>(22)? != 0,
+                        short_name_suffix: row.get(23)?,
                     })
                 },
             )

@@ -78,7 +78,7 @@ GroupBox {
         Label {
             Layout.fillWidth: true
             text: root.tr("settings.note.experimental",
-                "This section is reserved for upcoming experimental options.")
+                "Early features that are still being tested. They are off by default and may change or be removed.")
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
         }
@@ -117,7 +117,7 @@ GroupBox {
                 Label {
                     Layout.fillWidth: true
                     text: root.tr("settings.experimental.detailed-mode.note",
-                        "Shows manual switches for individual DNS and address-routing mechanisms under Settings → Routing. Off by default: without it, NetRuleRouter uses sensible defaults for those mechanisms and keeps this screen simple.")
+                        "Shows extra fine-tuning switches under Settings → Routing. Off by default: without it, NetRuleRouter uses sensible defaults for them. The main routing switches stay visible either way.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }
@@ -341,7 +341,7 @@ GroupBox {
                     CheckBox {
                         id: allowModeACheck
                         text: root.tr("settings.experimental.allow-mode-a.label",
-                            "Allow kill-switch mode A (legacy)")
+                            "Allow the legacy routing method (watching system DNS)")
                         checked: root.uiRevision >= 0
                             ? (root.prefs.allowModeAKillswitch === true) : false
                         Accessible.role: Accessible.CheckBox
@@ -370,7 +370,7 @@ GroupBox {
                 Label {
                     Layout.fillWidth: true
                     text: root.tr("settings.experimental.allow-mode-a.note",
-                        "Mode A is a legacy enforcement mode kept only for historical reference. It is not maintained, may not work, and can be removed in a future release. Mode B (the local DNS resolver) is the supported mechanism. Turn this on only if you specifically need to pick mode A in the routing settings.")
+                        "Watching system DNS is the legacy routing method, kept for reference only. It is not maintained, may not work, and may be removed in a future release; the supported method is the local DNS resolver. Turn this on only if you specifically need to choose it in the routing settings.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }

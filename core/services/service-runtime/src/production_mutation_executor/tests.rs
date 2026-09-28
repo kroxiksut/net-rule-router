@@ -48,7 +48,7 @@ fn a_rule_written_into_both_route_sets_is_reported_with_the_preview() {
         }],
     })
     .to_string();
-    let found = cross_set_duplicates_of(&both);
+    let found = cross_set_duplicates_of(&both, HostPlatform::Windows);
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].primary_rule_id, "r-1");
     assert_eq!(found[0].secondary_rule_id, "r-2");
@@ -56,7 +56,7 @@ fn a_rule_written_into_both_route_sets_is_reported_with_the_preview() {
 
     // Undecodable input says nothing here — the malformed path speaks for
     // it, and inventing a duplicate report would be worse than silence.
-    assert!(cross_set_duplicates_of("{").is_empty());
+    assert!(cross_set_duplicates_of("{", HostPlatform::Windows).is_empty());
 }
 
 /// One rule book, two spellings of the same application name: after
@@ -84,7 +84,7 @@ fn two_spellings_of_one_app_rule_become_one_payload() {
             content_hash: "client-supplied".into(),
             correlation_id: None,
         };
-        ProductionMutationExecutor::canonicalize_rules_payload(&mut p);
+        ProductionMutationExecutor::canonicalize_rules_payload(&mut p, HostPlatform::Windows);
         p
     }
 
@@ -99,6 +99,89 @@ fn two_spellings_of_one_app_rule_become_one_payload() {
     assert!(typed.rules_json.contains("swiftvpn 3.0.exe"));
 }
 
+/// The GUI table re-sorted is the same rule book: rules sharing one address
+/// must not keep their arrival order, or the dedup that says "no change"
+/// never fires. What does distinguish them still moves the hash.
+#[test]
+fn one_rule_book_in_two_orders_hashes_once() {
+    fn rule(id: &str, app: Option<&str>, enabled: bool, action: &str) -> serde_json::Value {
+        let mut r = serde_json::json!({
+            "id": id,
+            "enabled": enabled,
+            "address-match": { "kind": "exact-fqdn", "value": "example.com" },
+            "action": action,
+        });
+        if let Some(app) = app {
+            r["app-match"] = serde_json::json!({
+                "pattern": { "kind": "exact", "value": app },
+                "include-child-processes": false,
+            });
+        }
+        r
+    }
+    fn hash(primary: Vec<serde_json::Value>) -> String {
+        let mut p = RulesUpdatePayload {
+            rules_json: serde_json::json!({
+                "schema-version": 1, "primary": primary, "secondary": [],
+            })
+            .to_string(),
+            content_hash: "client-supplied".into(),
+            correlation_id: None,
+        };
+        ProductionMutationExecutor::canonicalize_rules_payload(&mut p, HostPlatform::Windows);
+        p.content_hash
+    }
+    let book = vec![
+        rule("r-1", None, true, "route"),
+        rule("r-2", Some("chrome.exe"), true, "route"),
+        rule("r-3", None, true, "block"),
+        rule("r-4", None, false, "route"),
+    ];
+    let mut reversed = book.clone();
+    reversed.reverse();
+    assert_eq!(hash(book.clone()), hash(reversed));
+
+    let mut other_action = book.clone();
+    other_action[0]["action"] = "block".into();
+    let mut other_enabled = book.clone();
+    other_enabled[0]["enabled"] = false.into();
+    let mut other_app = book.clone();
+    other_app[1]["app-match"]["pattern"]["value"] = "firefox.exe".into();
+    for changed in [other_action, other_enabled, other_app] {
+        assert_ne!(hash(book.clone()), hash(changed));
+    }
+}
+
+/// A Linux service stores the name the process has; appending the Windows
+/// suffix there wrote a spelling no file on the machine carries.
+#[test]
+fn a_linux_service_re_spells_an_app_rule_without_the_windows_suffix() {
+    let mut p = RulesUpdatePayload {
+        rules_json: serde_json::json!({
+            "schema-version": 1,
+            "primary": [{
+                "id": "r-1",
+                "enabled": true,
+                "app-match": { "pattern": { "kind": "exact", "value": "Telegram-Desktop" },
+                               "include-child-processes": false },
+                "comment": "",
+                "action": "route",
+            }],
+            "secondary": [],
+        })
+        .to_string(),
+        content_hash: "client-supplied".into(),
+        correlation_id: None,
+    };
+    ProductionMutationExecutor::canonicalize_rules_payload(&mut p, HostPlatform::Linux);
+    assert!(
+        p.rules_json.contains("\"telegram-desktop\""),
+        "{}",
+        p.rules_json
+    );
+    assert!(!p.rules_json.contains(".exe"), "{}", p.rules_json);
+}
+
 #[test]
 fn an_undecodable_payload_is_left_alone_for_the_validator_to_reject() {
     let mut p = RulesUpdatePayload {
@@ -106,7 +189,7 @@ fn an_undecodable_payload_is_left_alone_for_the_validator_to_reject() {
         content_hash: "h".into(),
         correlation_id: None,
     };
-    ProductionMutationExecutor::canonicalize_rules_payload(&mut p);
+    ProductionMutationExecutor::canonicalize_rules_payload(&mut p, HostPlatform::Windows);
     assert_eq!(p.rules_json, "not json at all");
     assert_eq!(p.content_hash, "h");
 }
@@ -132,12 +215,41 @@ fn classify_risk_high_when_warnings_present() {
     let warnings = vec![PreFlightWarning {
         sid: "S".into(),
         category: crate::activation_coordinator::PreFlightCategory::FilterIdCollision,
+        subjects: Vec::new(),
         message: "test".into(),
     }];
     assert!(matches!(
         classify_risk_heuristic(0, 0, &warnings),
         ReviewRiskLevel::High
     ));
+}
+
+#[test]
+fn pre_flight_findings_reach_the_review_as_one_signal_per_kind() {
+    let warning = |category, subjects: &[&str]| PreFlightWarning {
+        sid: "S".into(),
+        category,
+        subjects: subjects.iter().map(|s| s.to_string()).collect(),
+        message: String::new(),
+    };
+    let signals = pre_flight_signals(&[
+        warning(PreFlightCategory::AppRuleUnenforceable, &["b.exe", "a.exe"]),
+        warning(PreFlightCategory::AppRuleUnenforceable, &["a.exe"]),
+        warning(PreFlightCategory::BindingUnresolved, &[]),
+        warning(PreFlightCategory::BatchOverflow, &[]),
+        warning(PreFlightCategory::FilterIdCollision, &[]),
+    ]);
+    assert_eq!(
+        signals,
+        vec![
+            RiskSignalDto::ApplyWillBeRefused,
+            RiskSignalDto::AdditionalAdapterUnresolved,
+            RiskSignalDto::AppRuleUnenforceable {
+                executables: vec!["a.exe".into(), "b.exe".into()],
+            },
+        ]
+    );
+    assert!(pre_flight_signals(&[]).is_empty());
 }
 
 // ── Real risk-scoring path ────────────────────────────────────────────
@@ -777,6 +889,43 @@ fn preset_import_rejects_inline_comment_over_limit() {
     assert_eq!(err.code, "inline-comment-too-long");
 }
 
+/// A preset and a rules payload are refused under one code, so the window
+/// shows one message for the same defect.
+#[test]
+fn preset_and_rules_payload_refuse_a_control_character_alike() {
+    let (exec, _conn) = build_test_executor();
+    let payload = serde_json::json!({
+        "primary-bytes-b64": b64("--- Domains\nexample.com  # note\r--- IP\n"),
+        "include-child-processes": false,
+    });
+    let MutationOutcome::Failed(err) =
+        exec.execute_preset_import(&payload, nrr_storage::BASELINE_PRINCIPAL)
+    else {
+        panic!("expected Failed");
+    };
+    assert_eq!(err.code, "control-character");
+
+    let rules_json = serde_json::json!({
+        "schema-version": 1,
+        "primary": [{
+            "id": "r-1",
+            "enabled": true,
+            "address-match": { "kind": "exact-fqdn", "value": "example.com" },
+            "comment": "note\n--- IP\n192.0.2.9",
+        }],
+        "secondary": [],
+    })
+    .to_string();
+    let payload = serde_json::json!({ "rules-json": rules_json, "content-hash": "h" });
+    let MutationOutcome::Failed(err) =
+        exec.execute_rules_update(&payload, nrr_storage::BASELINE_PRINCIPAL)
+    else {
+        panic!("expected Failed");
+    };
+    assert_eq!(err.code, "control-character");
+    assert!(err.message.contains("r-1"), "{}", err.message);
+}
+
 #[test]
 fn preview_preset_import_single_route_succeeds_with_empty_db() {
     let (exec, _conn) = build_test_executor();
@@ -968,6 +1117,70 @@ fn preset_import_single_route_preserves_active_other_route() {
     );
 }
 
+/// Both write paths of a Linux service — a preset import and a rules edit the
+/// GUI sends unvalidated — store application names as the process carries
+/// them: no `.exe`, and the inactive `--- Windows` section left out.
+#[test]
+fn a_linux_service_stores_app_names_without_the_windows_suffix() {
+    let (exec, conn) = build_test_executor();
+    let exec = exec.with_host_platform(HostPlatform::Linux);
+    let active_rules_json = || {
+        let guard = conn.lock().unwrap();
+        nrr_storage::revisions::RevisionsRepository::new(&guard)
+            .get_active()
+            .expect("query")
+            .expect("active revision present")
+            .rules_json
+    };
+
+    let preset = "--- Linux\ntelegram-desktop\nCodex*\n--- Windows\nbrowser\n";
+    let import = serde_json::json!({
+        "secondary-bytes-b64": b64(preset),
+        "include-child-processes": false,
+        "correlation-id": "linux-import",
+    });
+    assert!(matches!(
+        exec.execute_preset_import(&import, nrr_storage::BASELINE_PRINCIPAL),
+        MutationOutcome::Completed(_)
+    ));
+    let stored = active_rules_json();
+    assert!(stored.contains("\"telegram-desktop\""), "{stored}");
+    assert!(stored.contains("\"codex*\""), "{stored}");
+    assert!(
+        !stored.contains(".exe") && !stored.contains("browser"),
+        "{stored}"
+    );
+
+    let mut dto = nrr_shared::rules_json::from_canonical_string(&stored).expect("stored parses");
+    dto.secondary.push(nrr_shared::rules_json::RuleDto {
+        id: "R-0009".into(),
+        enabled: true,
+        address_match: None,
+        app_match: Some(nrr_shared::rules_json::AppMatchDto {
+            pattern: nrr_shared::rules_json::AppPatternDto::Exact {
+                value: "Signal-Desktop".into(),
+            },
+            include_child_processes: false,
+        }),
+        comment: String::new(),
+        action: nrr_shared::rules_json::RuleAction::Route,
+        origin: None,
+    });
+    let edit = serde_json::json!({
+        "rules-json": nrr_shared::rules_json::to_canonical_string(&dto).expect("serialize"),
+        "content-hash": "client-supplied",
+        "correlation-id": "linux-edit",
+    });
+    assert!(matches!(
+        exec.execute_rules_update(&edit, nrr_storage::BASELINE_PRINCIPAL),
+        MutationOutcome::Completed(_)
+    ));
+    let stored = active_rules_json();
+    assert!(stored.contains("\"signal-desktop\""), "{stored}");
+    assert!(stored.contains("\"telegram-desktop\""), "{stored}");
+    assert!(!stored.contains(".exe"), "{stored}");
+}
+
 // ── Administrative rules lock (defence in depth) ─────────────────────
 
 /// The IPC handler refuses a locked user's submission first, so this test
@@ -1051,4 +1264,99 @@ fn executor_without_a_stability_provider_leaves_the_gate_open() {
         ),
         MutationOutcome::Completed(_)
     ));
+}
+
+/// One rule with the given conditions, as a submitted `rules-update` payload.
+fn shaped_rules_update(
+    address: bool,
+    app: bool,
+    action: nrr_shared::rules_json::RuleAction,
+    correlation: &str,
+) -> serde_json::Value {
+    use nrr_shared::rules_json::{
+        to_canonical_string, AddressMatchDto, AppMatchDto, AppPatternDto, CanonicalRulesJsonV1,
+        RuleDto, RULES_JSON_SCHEMA_VERSION,
+    };
+    let rules_json = to_canonical_string(&CanonicalRulesJsonV1 {
+        schema_version: RULES_JSON_SCHEMA_VERSION,
+        primary: vec![],
+        secondary: vec![RuleDto {
+            id: "R-0001".into(),
+            enabled: true,
+            address_match: address.then(|| AddressMatchDto::ExactFqdn {
+                value: "host.example".into(),
+            }),
+            app_match: app.then(|| AppMatchDto {
+                pattern: AppPatternDto::Exact {
+                    value: "app.exe".into(),
+                },
+                include_child_processes: false,
+            }),
+            comment: String::new(),
+            action,
+            origin: None,
+        }],
+    })
+    .unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(rules_json.as_bytes());
+    serde_json::json!({
+        "rules-json": rules_json,
+        "content-hash": format!("{:x}", hasher.finalize()),
+        "correlation-id": correlation,
+    })
+}
+
+/// Enforcement cannot limit an address to one application, so a revision
+/// asking for it is refused at submission — for either action, before any row
+/// is written, and the preview says the same.
+#[test]
+fn a_rule_naming_both_an_app_and_an_address_is_refused_at_submission() {
+    use nrr_shared::rules_json::RuleAction as WireAction;
+    let (exec, conn) = build_test_executor();
+    for (action, slug) in [
+        (WireAction::Route, "app-scoped-destination-route"),
+        (WireAction::Block, "app-scoped-destination-block"),
+    ] {
+        let payload = shaped_rules_update(true, true, action, "corr-shape");
+        match exec.execute_rules_update(&payload, nrr_storage::BASELINE_PRINCIPAL) {
+            MutationOutcome::Failed(e) => {
+                assert_eq!(e.code, "unsupported-rule-shape");
+                assert!(e.message.contains("R-0001"), "{}", e.message);
+                assert!(e.message.contains(slug), "{}", e.message);
+            }
+            other => panic!("{action:?}: expected a refusal, got {other:?}"),
+        }
+        let review = exec.preview_rules_update(&payload, nrr_storage::BASELINE_PRINCIPAL);
+        assert!(
+            review.diff_summary.contains(slug),
+            "{}",
+            review.diff_summary
+        );
+    }
+    let rows: i64 = conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "a refused submission stores nothing");
+}
+
+/// Positive control: the shapes enforcement carries out still go through.
+#[test]
+fn address_only_and_app_only_rules_are_accepted() {
+    use nrr_shared::rules_json::RuleAction as WireAction;
+    for (address, app) in [(true, false), (false, true)] {
+        for action in [WireAction::Route, WireAction::Block] {
+            let (exec, _conn) = build_test_executor();
+            let payload = shaped_rules_update(address, app, action, "corr-ok");
+            assert!(
+                matches!(
+                    exec.execute_rules_update(&payload, nrr_storage::BASELINE_PRINCIPAL),
+                    MutationOutcome::Completed(_)
+                ),
+                "address {address}, app {app}, {action:?} must be accepted"
+            );
+        }
+    }
 }

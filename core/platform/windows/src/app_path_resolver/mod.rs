@@ -326,6 +326,7 @@ impl WalkShared {
         if let Some(report) = truncation_report(&truncated) {
             tracing::warn!(
                 target: "nrr::app_path_resolver",
+                msg_key = "win-apppath-install-root-search-budget-hit",
                 patterns = report.patterns,
                 sample = %report.sample,
                 "install-root search hit its file budget — those applications may be missed, or found only in part, until they run",

@@ -52,8 +52,12 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
     // Best effort: a bootstrap failure (or a non-Windows build with no
     // DPAPI) logs and degrades to unsigned operation — routing is
     // independent of this integrity scan.
+    let key_store = production_key_store();
+    let tamper_bootstrap = settings_conn
+        .as_ref()
+        .and_then(|conn| run_db_mac_tamper_bootstrap(conn, key_store.as_ref()));
     let tamper_signing_key: Option<Vec<u8>> =
-        settings_conn.as_ref().and_then(run_db_mac_tamper_bootstrap);
+        tamper_bootstrap.as_ref().map(|o| o.signing_key.clone());
     // Keyed follow-up to the keyless boot sweep: signed candidate rows
     // orphaned by a hard kill can only be rejected once the signing key
     // exists (re-signing keeps their row_hmac consistent). Runs after
@@ -123,7 +127,9 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
             // Without it the coordinator runs unsigned (back-compat /
             // non-Windows / bootstrap error).
             if let Some(key) = tamper_signing_key.clone() {
-                coordinator = coordinator.with_signing_key(key);
+                coordinator = coordinator
+                    .with_signing_key(key)
+                    .with_key_store(Arc::clone(&key_store));
             }
             // No-tray routing-user fallback: an
             // activation with a dead tray subscription must still dispatch to
@@ -142,9 +148,14 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
     // before any SID install can read it — none have started yet this
     // early in bootstrap (the IPC server isn't listening). A row that
     // reached `revisions` outside the app is rolled back to the last
-    // trusted revision here instead of being enforced as-is.
-    if let (Some(coord), Some(conn)) = (activation_coordinator.as_ref(), settings_conn.as_ref()) {
-        run_active_integrity_enforcement(coord, conn);
+    // trusted revision here instead of being enforced as-is. No bootstrap
+    // outcome means no key, and an unsigned coordinator has nothing to verify.
+    if let (Some(coord), Some(conn), Some(bootstrap)) = (
+        activation_coordinator.as_ref(),
+        settings_conn.as_ref(),
+        tamper_bootstrap.as_ref(),
+    ) {
+        run_active_integrity_enforcement(coord, conn, bootstrap);
     }
 
     // Build the rule author, now that the activation coordinator exists.

@@ -99,6 +99,7 @@ impl BlockNoticeMuteStore for SqliteBlockNoticeMuteStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::block-notice",
+                    msg_key = "blocknotice-mutes-read-failed",
                     error = %e,
                     "could not read block-notice mutes — this session shows none active",
                 );
@@ -114,6 +115,7 @@ impl BlockNoticeMuteStore for SqliteBlockNoticeMuteStore {
         {
             tracing::warn!(
                 target: "nrr::block-notice",
+                msg_key = "blocknotice-mute-persist-failed",
                 error = %e,
                 "could not persist a block-notice mute — it holds for this session only",
             );
@@ -129,6 +131,7 @@ impl BlockNoticeMuteStore for SqliteBlockNoticeMuteStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::block-notice",
+                    msg_key = "blocknotice-mute-remove-failed",
                     error = %e,
                     "could not remove a block-notice mute — it stays active for this session",
                 );
@@ -144,6 +147,7 @@ impl BlockNoticeMuteStore for SqliteBlockNoticeMuteStore {
         {
             tracing::warn!(
                 target: "nrr::block-notice",
+                msg_key = "blocknotice-mutes-clear-failed",
                 error = %e,
                 "could not clear block-notice mutes — some may stay active for this session",
             );

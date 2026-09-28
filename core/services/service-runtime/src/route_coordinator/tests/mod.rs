@@ -263,6 +263,7 @@ fn adapter(stable_seed: &str, idx: u32, up: bool, ipv4: bool, gw: Option<[u8; 4]
 
 mod binding_identity;
 mod first_contact_and_probe;
+mod foreign_tunnels;
 mod offers_and_paused;
 mod recompute;
 mod sid_and_notices;

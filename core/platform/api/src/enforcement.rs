@@ -489,6 +489,18 @@ impl EnforcementCapabilities {
             app_match: AppMatchMechanism::ObservedDestOnly,
         }
     }
+
+    /// The set for the OS this binary runs on, for callers that decide policy
+    /// without holding a backend. Mirrors `PlatformProfile::current`.
+    pub const fn current() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::linux_mvp()
+        } else if cfg!(target_os = "macos") {
+            Self::macos_mvp()
+        } else {
+            Self::windows()
+        }
+    }
 }
 
 /// The per-OS mechanism boundary. `reconcile` is AUTHORITATIVE — it always runs
@@ -1085,6 +1097,15 @@ mod tests {
         assert_eq!(
             mac_sup.per_user_all_protocol_scoping,
             mac_caps.per_user_all_protocol_scoping
+        );
+
+        // `current()` picks the same OS the profile does.
+        let cur_caps = EnforcementCapabilities::current();
+        let cur_sup = PlatformProfile::current().supports;
+        assert_eq!(cur_sup.per_user_routing, cur_caps.per_user_routing);
+        assert_eq!(
+            cur_sup.per_app_block_leakproof,
+            cur_caps.per_app_block_leakproof
         );
     }
 

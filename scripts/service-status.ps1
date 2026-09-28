@@ -1,4 +1,4 @@
-# Show NetRuleRouter service status. Read-only, no elevation required.
+﻿# Show NetRuleRouter service status. Read-only, no elevation required.
 #
 # Combines `sc.exe query` (SCM-canonical state) with a one-line
 # diagnostic banner from the service binary's `status` subcommand.

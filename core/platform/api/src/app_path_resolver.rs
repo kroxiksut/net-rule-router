@@ -59,65 +59,11 @@ impl AppPathResolver for NoopAppPathResolver {
 
 // ── Pure helpers (neutral; shared by the Mock and every OS backend) ────────────
 
-/// Case-insensitive filename glob supporting `*` (zero-or-more chars) and `?`
-/// (exactly one char). Both `pattern` and `name` are bare file names (no path).
-/// A pattern with no metacharacters degenerates to an exact case-insensitive
-/// match, which is exactly the non-glob name case.
+/// Case-insensitive filename glob, the same one the rule engine uses: `*` is
+/// any run of characters and the only wildcard. A pattern without `*` is an
+/// exact case-insensitive match, which is the non-glob name case.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
-    let pat: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
-    let txt: Vec<char> = name.to_ascii_lowercase().chars().collect();
-    glob_chars(&pat, &txt)
-}
-
-/// Iterative wildcard match with a single backtrack point.
-///
-/// Deliberately not the recursive `(0..=txt.len()).any(...)` form: that
-/// re-explores the same suffixes once per `*` and goes exponential on a pattern
-/// like `*a*a*a*a*b`. Patterns arrive from imported rule sets — someone else's
-/// file — and this runs on the connection-observation path, so a pathological
-/// pattern would wedge that thread rather than merely be slow.
-///
-/// The algorithm walks both strings once, remembering where the last `*` was
-/// and how much text it had consumed; on a mismatch it hands the `*` one more
-/// character and resumes. Consecutive stars collapse, since `**` matches
-/// exactly what `*` matches.
-pub fn glob_chars(pat: &[char], txt: &[char]) -> bool {
-    let (mut p, mut t) = (0usize, 0usize);
-    // Where to resume from if the current attempt fails: the pattern index just
-    // after the last `*`, and the text index that `*` had reached.
-    let mut star: Option<(usize, usize)> = None;
-
-    loop {
-        if p < pat.len() && pat[p] == '*' {
-            while p < pat.len() && pat[p] == '*' {
-                p += 1;
-            }
-            if p == pat.len() {
-                // A trailing `*` matches whatever is left.
-                return true;
-            }
-            star = Some((p, t));
-            continue;
-        }
-        let matched = t < txt.len() && p < pat.len() && (pat[p] == '?' || pat[p] == txt[t]);
-        if matched {
-            p += 1;
-            t += 1;
-            continue;
-        }
-        if p == pat.len() && t == txt.len() {
-            return true;
-        }
-        match star {
-            // Give the last `*` one more character and try again.
-            Some((resume_p, resume_t)) if resume_t < txt.len() => {
-                p = resume_p;
-                t = resume_t + 1;
-                star = Some((resume_p, t));
-            }
-            _ => return false,
-        }
-    }
+    nrr_shared::glob::glob_match(pattern, name)
 }
 
 /// Collect the files under `root` that `is_executable` accepts, bounded by
@@ -350,10 +296,82 @@ mod tests {
     }
 
     #[test]
-    fn glob_match_question_mark_is_single_char() {
-        assert!(glob_match("vk?.exe", "vk1.exe"));
-        assert!(!glob_match("vk?.exe", "ab.exe")); // '?' needs exactly one char
+    fn glob_match_question_mark_is_a_literal_character() {
+        assert!(!glob_match("vk?.exe", "vk1.exe"));
+        assert!(glob_match("vk?.exe", "vk?.exe"));
         assert!(!glob_match("vk?.exe", "vk12.exe"));
+        assert!(!glob_match("*?*.exe", "vk1.exe"));
+    }
+
+    /// The engine answers "which rule wins", the resolver decides what gets
+    /// enforced: one pattern must name the same processes in both.
+    #[test]
+    fn the_engine_and_the_resolver_agree_on_star_and_question_mark() {
+        use nrr_domain::canonical::{
+            CanonicalAppMatch, CanonicalAppPattern, CanonicalRule, CanonicalRuleBook,
+            CanonicalRuleSet, RuleAction,
+        };
+        use nrr_domain::decision_engine_input::match_sample;
+        use nrr_domain::decision_matching::{RequestedRouteDecision, ZonePriorityPolicy};
+
+        let pattern = "vk?*.exe";
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
+                id: nrr_domain::RuleId("R-0001".to_owned()),
+                enabled: true,
+                address_match: None,
+                app_match: Some(CanonicalAppMatch {
+                    pattern: CanonicalAppPattern::Glob(pattern.to_owned()),
+                    include_child_processes: false,
+                }),
+                comment: String::new(),
+                action: RuleAction::Route,
+                origin: None,
+            }]),
+            secondary: CanonicalRuleSet::from_rules(Vec::new()),
+        };
+        let resolver = MockAppPathResolver::from_seed(
+            [
+                "vk?.exe",
+                "vk?app.exe",
+                "VK?APP.EXE",
+                "vk1.exe",
+                "vkapp.exe",
+                "vk.exe",
+            ]
+            .map(|name| (name.to_owned(), vec![p(&format!(r"C:\Apps\{name}"))])),
+        );
+        let resolved = resolver.resolve(pattern);
+
+        for process in [
+            "vk?.exe",
+            "vk?app.exe",
+            "VK?APP.EXE",
+            "vk1.exe",
+            "vkapp.exe",
+            "vk.exe",
+        ] {
+            let engine = matches!(
+                match_sample(
+                    &book,
+                    Some("example.com"),
+                    None,
+                    Some(process),
+                    ZonePriorityPolicy::default(),
+                    nrr_domain::RouteBehaviorMode::PreferPrimary,
+                ),
+                RequestedRouteDecision::MatchedRoute { .. }
+            );
+            let enforced = resolved.iter().any(|path| {
+                path.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(&format!(r"\{}", process.to_ascii_lowercase()))
+            });
+            // `?` stands only for itself: `vk1.exe` is not named.
+            let expected = process.to_ascii_lowercase().starts_with("vk?");
+            assert_eq!(engine, expected, "engine on {process}");
+            assert_eq!(enforced, expected, "resolver on {process}");
+        }
     }
 
     #[test]
@@ -411,31 +429,5 @@ mod tests {
         let r = MockAppPathResolver::new().with("ab.exe", vec![p(r"C:\Apps\ab.exe")]);
         assert!(r.resolve("").is_empty());
         assert!(r.resolve("   ").is_empty());
-    }
-    /// The same answers as the recursive form, without its blow-up.
-    ///
-    /// The last case is the one that mattered: under the old
-    /// `(0..=txt.len()).any(...)` it re-explored every suffix once per star and
-    /// took exponential time on a pattern a shared rules file can carry.
-    #[test]
-    fn glob_matches_the_same_things_and_returns_promptly() {
-        assert!(glob_match("*.exe", "chrome.exe"));
-        assert!(glob_match("chrome.exe", "CHROME.EXE"));
-        assert!(glob_match("c*e.exe", "chrome.exe"));
-        assert!(glob_match("chrom?.exe", "chrome.exe"));
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("**", "anything"));
-        assert!(glob_match("*chrome*", "c:/x/chrome.exe"));
-        assert!(!glob_match("*.exe", "chrome.dll"));
-        assert!(!glob_match("chrom?.exe", "chrome2.exe"));
-        assert!(glob_match("", ""));
-        assert!(!glob_match("", "x"));
-
-        let started = std::time::Instant::now();
-        assert!(!glob_match("*a*a*a*a*a*a*a*a*a*a*b", &"a".repeat(64)));
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(200),
-            "wildcard match must not backtrack exponentially",
-        );
     }
 }

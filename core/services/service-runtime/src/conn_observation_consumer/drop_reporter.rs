@@ -10,6 +10,50 @@
 
 use super::*;
 
+/// The sockets a destination pin was seen dropping to one address this batch.
+#[derive(Debug, Default)]
+pub(super) struct PinDropVictims {
+    locals: Vec<std::net::SocketAddrV4>,
+    owners: Vec<String>,
+}
+
+impl PinDropVictims {
+    pub(super) fn note(&mut self, local: SocketAddr, owner: Option<&str>) {
+        if let SocketAddr::V4(local) = local {
+            if !self.locals.contains(&local) {
+                self.locals.push(local);
+            }
+        }
+        if let Some(owner) = owner {
+            if !self.owners.iter().any(|o| o.eq_ignore_ascii_case(owner)) {
+                self.owners.push(owner.to_owned());
+            }
+        }
+    }
+}
+
+/// Which listed connections a batch of pin drops may tear down: each dropped
+/// socket, and its owner's other sockets to that address — the pin is that
+/// user's, so they sit behind it too. Another user's connection is not, and
+/// no address census applies: the dropped socket is dead on this link anyway.
+pub(super) fn stale_flows_behind_drops(
+    candidates: Vec<EstablishedFlow>,
+    victims: &std::collections::BTreeMap<std::net::Ipv4Addr, PinDropVictims>,
+) -> Vec<EstablishedFlow> {
+    candidates
+        .into_iter()
+        .filter(|flow| {
+            victims.get(flow.remote.ip()).is_some_and(|v| {
+                v.locals.contains(&flow.local)
+                    || flow
+                        .owner
+                        .as_deref()
+                        .is_some_and(|owner| v.owners.iter().any(|o| o.eq_ignore_ascii_case(owner)))
+            })
+        })
+        .collect()
+}
+
 impl ConnectionObservationConsumer {
     /// Destinations whose flows this session already tore down once — the fact
     /// that separates "socket older than the pin" from "the application holds a
@@ -151,6 +195,7 @@ impl ConnectionObservationConsumer {
                 app,
                 reason,
             },
+            rec.observed_unix_ms,
         );
     }
 
@@ -188,6 +233,7 @@ impl ConnectionObservationConsumer {
         if first {
             tracing::info!(
                 target: "nrr::conn-trace",
+                msg_key = "connobs-blocked-connection-first-seen",
                 remote_ip = %rec.remote.ip(),
                 remote_port = rec.remote.port(),
                 protocol = proto_str(rec.protocol),

@@ -108,6 +108,7 @@ pub fn build_ipc_accept_task_bundle(
     // wiring end-to-end without provoking IPC failures.
     tracing::info!(
         target: "nrr::stability",
+        msg_key = "svctask-ipc-accept-scheduled",
         task = TASK_ID_IPC_ACCEPT_LOOP,
         class = ?class,
         max_restarts,

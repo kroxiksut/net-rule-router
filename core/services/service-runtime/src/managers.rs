@@ -237,6 +237,9 @@ pub enum AcceptErrorCategory {
     /// `CreateNamedPipeW` failed. Usually transient (e.g. handle table
     /// pressure) but may indicate persistent system state.
     PipeCreate,
+    /// Another process holds the endpoint name, so clients may be reaching it
+    /// instead of the service.
+    PipeNameTaken,
     /// Wait on shutdown/connect events failed. Should be impossible in
     /// healthy state; suggests OS-level corruption.
     WaitFailed,

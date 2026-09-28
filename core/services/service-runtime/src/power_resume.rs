@@ -109,6 +109,7 @@ impl PowerResumeRearm {
             Arc::new(move || {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "power-resume-from-sleep",
                     source = "power-event",
                     "machine resumed from sleep — re-resolving the adapter binding and re-driving routes",
                 );
@@ -160,6 +161,7 @@ pub fn build_resume_watchdog_task(
             if let Some(gap) = gap {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "power-resume-from-sleep",
                     source = "clock-gap",
                     slept_seconds = gap.as_secs(),
                     "machine resumed from sleep — re-resolving the adapter binding and re-driving routes",
@@ -173,6 +175,7 @@ pub fn build_resume_watchdog_task(
             if let Some(reason) = requests.take() {
                 tracing::info!(
                     target: "nrr::route-coordinator",
+                    msg_key = "power-resume-rebind-requested",
                     reason,
                     "re-resolving the adapter binding on request",
                 );

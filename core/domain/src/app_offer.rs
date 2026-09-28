@@ -8,22 +8,30 @@
 /// not to carry it — the bar the host measure sets per name.
 pub const APP_STALL_CONFIRMATIONS: usize = 3;
 
-/// One program's connections on the main link over the measuring window.
+/// One program's connections over the measuring window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AppMainLinkReach {
-    /// Distinct unnamed remote addresses its connections stalled on.
+    /// Distinct unnamed remote addresses it stalled on over the main link.
     pub stalled_addresses: usize,
-    /// Connections of any kind that closed in order.
-    pub completed: u32,
+    /// Distinct addresses, named or not, it stalled on over the main link.
+    pub failing_addresses: usize,
+    /// Distinct addresses a connection of it closed in order with.
+    pub working_addresses: usize,
+    /// Some of its connections already leave over the additional link.
+    pub rides_additional_link: bool,
 }
 
-/// The main link does not carry this program: nothing it opened there
-/// finished, and it stalled on several different addresses. One working
-/// connection — a browser with its own DNS, an updater that got through — keeps
-/// a program out of the offers.
+/// The main link does not carry this program: most of the different
+/// addresses it tried there failed, several of them unnamed.
+///
+/// A program already split across both links — a browser whose routed sites go
+/// through the tunnel by host rules — is never moved whole: its other sites
+/// work on the main link, and a few failures among many say nothing.
 #[must_use]
 pub fn main_link_does_not_carry(reach: AppMainLinkReach) -> bool {
-    reach.completed == 0 && reach.stalled_addresses >= APP_STALL_CONFIRMATIONS
+    !reach.rides_additional_link
+        && reach.stalled_addresses >= APP_STALL_CONFIRMATIONS
+        && reach.failing_addresses > reach.working_addresses
 }
 
 /// Where operating systems keep their own programs. Those serve every
@@ -61,26 +69,40 @@ pub fn program_name(image_path: &str) -> String {
 mod tests {
     use super::*;
 
-    fn reach(stalled_addresses: usize, completed: u32) -> AppMainLinkReach {
+    fn reach(stalled: usize, working: usize) -> AppMainLinkReach {
         AppMainLinkReach {
-            stalled_addresses,
-            completed,
+            stalled_addresses: stalled,
+            failing_addresses: stalled,
+            working_addresses: working,
+            rides_additional_link: false,
         }
     }
 
     #[test]
-    fn a_program_that_never_completes_and_stalls_on_three_addresses_is_not_carried() {
+    fn a_program_that_stalls_on_three_addresses_and_works_on_none_is_not_carried() {
         assert!(main_link_does_not_carry(reach(3, 0)));
     }
 
     #[test]
-    fn one_completed_connection_keeps_a_program_out() {
-        assert!(!main_link_does_not_carry(reach(10, 1)));
+    fn most_of_its_addresses_must_fail() {
+        assert!(main_link_does_not_carry(reach(4, 3)));
+        assert!(!main_link_does_not_carry(reach(4, 4)));
+        assert!(!main_link_does_not_carry(reach(3, 12)));
     }
 
     #[test]
     fn two_stalled_addresses_are_not_enough() {
         assert!(!main_link_does_not_carry(reach(2, 0)));
+    }
+
+    #[test]
+    fn a_program_already_on_the_additional_link_is_never_moved_whole() {
+        let split = AppMainLinkReach {
+            rides_additional_link: true,
+            ..reach(8, 0)
+        };
+        assert!(!main_link_does_not_carry(split));
+        assert!(main_link_does_not_carry(reach(8, 0)), "positive control");
     }
 
     #[test]

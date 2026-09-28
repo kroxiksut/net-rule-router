@@ -325,7 +325,7 @@ Pane {
                     }
                 }
 
-                // Diagnostics submenu: the live connection trace.
+                // Diagnostics submenu: the live connection trace and the cache.
                 ColumnLayout {
                     visible: navEntry.isDiagnosticsEntry && navigationSidebar.diagnosticsNavExpanded
                         && !root.sidebarCollapsed
@@ -367,6 +367,44 @@ Pane {
                                 Layout.fillWidth: true
                                 text: root.sectionTitle("conn-trace")
                                 color: connTraceNavButton.highlighted ? palette.highlightedText : root.textColor
+                                elide: Text.ElideRight
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                        }
+                    }
+
+                    Button {
+                        id: cacheNavButton
+                        Layout.fillWidth: true
+                        activeFocusOnTab: true
+                        highlighted: root.section === "cache"
+                        Accessible.name: root.sectionTitle("cache")
+                        onClicked: root.requestSectionChange("cache")
+                        background: PanelSurface {
+                            theme: root.uiTheme
+                            cornerRadius: root.uiTheme.radiusSm
+                            color: cacheNavButton.highlighted ? root.accentColor
+                                : (cacheNavButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
+                            border.color: cacheNavButton.highlighted ? root.uiTheme.stateSelectedBorder
+                                : (cacheNavButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
+                        }
+                        contentItem: RowLayout {
+                            spacing: root.uiTheme.spacingXs
+                            Image {
+                                source: cacheNavButton.highlighted
+                                    ? root.uiIconSourceOnAccent("cache")
+                                    : root.uiIconSource("cache")
+                                sourceSize.width: 16
+                                sourceSize.height: 16
+                                Layout.preferredWidth: 16
+                                Layout.preferredHeight: 16
+                                fillMode: Image.PreserveAspectFit
+                                asynchronous: true
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: root.sectionTitle("cache")
+                                color: cacheNavButton.highlighted ? palette.highlightedText : root.textColor
                                 elide: Text.ElideRight
                                 verticalAlignment: Text.AlignVCenter
                             }
@@ -509,13 +547,15 @@ Pane {
                             }
                         }
                     }
-                    // Rules of the two routes claiming the same hosts. Hidden
-                    // while there are none; the count is the unconfirmed ones.
+                    // Rules of the two routes claiming the same hosts, and the
+                    // address conflicts of the applied rules. Hidden while there
+                    // are neither; the count is the unconfirmed pairs.
                     Button {
                         id: rulesOverlapsButton
                         Layout.fillWidth: true
                         activeFocusOnTab: true
                         visible: root.ruleOverlapsController.overlaps.length > 0
+                            || root.ruleOverlapsController.conflicts.length > 0
                         highlighted: root.section === "rule-overlaps"
                         Accessible.name: root.tr("rules.overlaps.nav-label", "Overlaps")
                         Accessible.description: root.ruleOverlapsController.pendingCount > 0

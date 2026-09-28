@@ -24,7 +24,7 @@ impl ProductionMutationExecutor {
             Ok(p) => p,
             Err(e) => return MutationOutcome::Failed(e),
         };
-        Self::canonicalize_rules_payload(&mut parsed);
+        Self::canonicalize_rules_payload(&mut parsed, self.host_platform);
         if let Err(e) = Self::enforce_free_rule_cap(&parsed.rules_json) {
             return MutationOutcome::Failed(e);
         }
@@ -106,6 +106,7 @@ impl ProductionMutationExecutor {
             Ok(Some(active)) if active.revision_id == revision_id.as_str() => {
                 tracing::info!(
                     target: "nrr::mutation::execute",
+                    msg_key = "prod-activation-already-active",
                     revision_id = %revision_id,
                     "submitted content matches the active revision — no-op success (nothing to activate)"
                 );
@@ -158,6 +159,7 @@ impl ProductionMutationExecutor {
             RevisionStatus::Superseded | RevisionStatus::RolledBack | RevisionStatus::Rejected => {
                 tracing::info!(
                     target: "nrr::mutation::execute",
+                    msg_key = "prod-activation-reactivate-historical",
                     revision_id = %revision_id,
                     ?status,
                     "submitted content deduped to a historical revision — \

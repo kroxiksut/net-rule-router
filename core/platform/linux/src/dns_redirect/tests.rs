@@ -76,7 +76,7 @@ fn failed(stderr: &str) -> Result<CommandReply, PlatformError> {
     })
 }
 
-impl ResolvedCommands for FakeResolved {
+impl DnsCommands for FakeResolved {
     fn run(&self, program: &str, args: &[&str]) -> Result<CommandReply, PlatformError> {
         let mut links = self.links.lock().expect("lock");
         match (program, args) {
@@ -145,6 +145,15 @@ impl ResolvedCommands for FakeResolved {
             },
             other => panic!("unexpected command {other:?}"),
         }
+    }
+
+    fn run_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        _input: &str,
+    ) -> Result<CommandReply, PlatformError> {
+        panic!("unexpected command {program} {args:?} with input")
     }
 }
 

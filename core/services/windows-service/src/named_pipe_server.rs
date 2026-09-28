@@ -2,8 +2,8 @@
 //!
 //! Binds `\\.\pipe\NetRuleRouter\service-v1` with the canonical DACL from
 //! `named_pipe_acl` (LocalSystem + Administrators full, Authenticated Users
-//! RW, no-write-up). Each connection gets a dedicated worker thread (no
-//! pool), capped at 32 concurrent.
+//! read/write but never a new instance, no-write-up). Each connection gets a
+//! dedicated worker thread (no pool), capped at 32 concurrent.
 //!
 //! ## Tick-model accept loop
 //!
@@ -26,7 +26,10 @@
 //! Each `accept_one` tick creates one pipe instance via `CreateNamedPipeW`
 //! and blocks on `ConnectNamedPipe`; a connecting client hands the instance
 //! to a worker thread and the next tick creates a fresh one. Active
-//! instances = 1 accepting + up to 32 workers. At the cap, a new connection
+//! instances = 1 accepting + up to 32 workers. A tick that starts with no
+//! worker holds no instance at all, so it demands the FIRST instance: if
+//! anyone else took the name in the meantime the create fails with
+//! `ACCESS_DENIED` instead of quietly joining their pipe. At the cap, a new connection
 //! is busy-closed and the tick returns `Idle` without charging the
 //! supervisor's retry budget.
 //!
@@ -55,9 +58,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING};
-use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -65,6 +70,7 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
+use nrr_service_runtime::connection_slot::{PerPrincipalSlots, MAX_CONNECTIONS_PER_PRINCIPAL};
 use nrr_service_runtime::ipc_push::{
     adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
 };
@@ -130,6 +136,9 @@ pub struct WindowsNamedPipeServer {
     /// push events for the connection's subscription (if any) and write
     /// push frames on the same pipe. `None` disables push delivery.
     event_bus: Option<Arc<EventBus>>,
+    /// Connections per SID. Owned by the server, not the acceptor, so a rebind
+    /// does not hand a caller a fresh allowance while its old workers live.
+    per_sid: Arc<PerPrincipalSlots<String>>,
 }
 
 impl WindowsNamedPipeServer {
@@ -145,6 +154,7 @@ impl WindowsNamedPipeServer {
             audit,
             active_sids: None,
             event_bus: None,
+            per_sid: Arc::default(),
         }
     }
 
@@ -169,6 +179,7 @@ impl WindowsNamedPipeServer {
             audit,
             active_sids: Some(active_sids),
             event_bus: None,
+            per_sid: Arc::default(),
         }
     }
 }
@@ -187,6 +198,7 @@ impl IpcServer for WindowsNamedPipeServer {
             active_count: Arc::new(AtomicUsize::new(0)),
             worker_handles: Arc::new(Mutex::new(Vec::new())),
             event_bus: self.event_bus.clone(),
+            per_sid: Arc::clone(&self.per_sid),
         }))
     }
 }
@@ -220,6 +232,7 @@ pub struct WindowsNamedPipeAcceptor {
     /// Concurrent connection count. Accept ticks busy-close inbound
     /// connections when the count is at `MAX_CONCURRENT_CONNECTIONS`.
     active_count: Arc<AtomicUsize>,
+    per_sid: Arc<PerPrincipalSlots<String>>,
     /// Worker handles for `join_workers`. Periodically pruned of
     /// finished entries so the vec does not grow unboundedly.
     worker_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -255,10 +268,15 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         //
         // SAFETY: pipe_name_wide is null-terminated UTF-16; security pointer
         // is valid for the duration of CreateNamedPipeW (held by Arc<self>).
+        let holds_no_instance = self.active_count.load(Ordering::SeqCst) == 0;
+        let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+        if holds_no_instance {
+            open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+        }
         let pipe = unsafe {
             CreateNamedPipeW(
                 PCWSTR(pipe_name_wide.as_ptr()),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                open_mode,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 PIPE_UNLIMITED_INSTANCES,
                 PIPE_BUFFER_SIZE,
@@ -270,6 +288,17 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         if pipe.is_invalid() {
             // SAFETY: GetLastError is thread-local; safe to read.
             let code = unsafe { windows::Win32::Foundation::GetLastError().0 };
+            if holds_no_instance && code == ERROR_ACCESS_DENIED.0 {
+                tracing::error!(
+                    target: "nrr::ipc",
+                    msg_key = "svc-ipc-pipe-name-taken",
+                    "the service pipe name is held by another process; clients may be talking to it"
+                );
+                return AcceptOutcome::Err(AcceptError {
+                    category: AcceptErrorCategory::PipeNameTaken,
+                    message: "pipe name is held by another process".to_string(),
+                });
+            }
             return AcceptOutcome::Err(AcceptError {
                 category: AcceptErrorCategory::PipeCreate,
                 message: format!("CreateNamedPipeW failed: 0x{code:08X}"),
@@ -364,6 +393,7 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         let worker_shutdown_clone = Arc::clone(&self.worker_shutdown);
         let registry_clone = self.active_sids.clone();
         let event_bus_clone = self.event_bus.clone();
+        let per_sid_clone = Arc::clone(&self.per_sid);
         // The slot is a GUARD, not a pair of counter writes: a panic in
         // dispatch unwinds past a trailing `fetch_sub` and leaks the slot, and
         // thirty-two of those close the transport for good.
@@ -380,6 +410,7 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
                     worker_shutdown_clone,
                     registry_clone,
                     event_bus_clone,
+                    &per_sid_clone,
                 );
             });
 
@@ -410,26 +441,7 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.worker_shutdown.store(true, Ordering::SeqCst);
 
-        // Wake any pending ConnectNamedPipe by self-connecting to the pipe.
-        // Best-effort: if the pipe was never created (no accept_one ran yet)
-        // CreateFileW returns an error, which is fine — the flag check at
-        // the start of the next accept_one will short-circuit.
-        let pipe_name_wide: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: pipe_name_wide is null-terminated UTF-16; we open with
-        // standard read/write access and immediately close the handle.
-        unsafe {
-            if let Ok(client) = CreateFileW(
-                PCWSTR(pipe_name_wide.as_ptr()),
-                GENERIC_READ.0 | GENERIC_WRITE.0,
-                FILE_SHARE_NONE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
-                HANDLE::default(),
-            ) {
-                let _ = CloseHandle(client);
-            }
-        }
+        wake_pending_accept();
     }
 
     fn join_workers(&self) {
@@ -453,28 +465,34 @@ impl Drop for WindowsNamedPipeAcceptor {
         // must call join_workers() explicitly.
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.worker_shutdown.store(true, Ordering::SeqCst);
-        // Best-effort wake. Same logic as request_shutdown, but inlined to
-        // avoid taking &self through a trait method call inside drop.
-        let pipe_name_wide: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: see request_shutdown.
-        unsafe {
-            if let Ok(client) = CreateFileW(
-                PCWSTR(pipe_name_wide.as_ptr()),
-                GENERIC_READ.0 | GENERIC_WRITE.0,
-                FILE_SHARE_NONE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
-                HANDLE::default(),
-            ) {
-                let _ = CloseHandle(client);
-            }
+        wake_pending_accept();
+    }
+}
+
+/// Unblock a pending `ConnectNamedPipe` by connecting to it ourselves; the
+/// woken tick sees the shutdown flag. Best-effort: with no instance up the
+/// open fails and the next tick's flag check does the job.
+fn wake_pending_accept() {
+    let pipe_name_wide: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `pipe_name_wide` is null-terminated UTF-16; the handle is
+    // closed right away.
+    unsafe {
+        if let Ok(client) = CreateFileW(
+            PCWSTR(pipe_name_wide.as_ptr()),
+            nrr_shared::ipc_transport::SERVICE_PIPE_CLIENT_ACCESS,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
+            HANDLE::default(),
+        ) {
+            let _ = CloseHandle(client);
         }
     }
 }
 
-/// Send a busy-close on a pipe instance and shut it down. Used when
-/// concurrency cap is hit before identity check.
+/// Send a busy-close on a pipe instance and shut it down: the global cap, or
+/// the caller's own share of it.
 fn send_busy_close(pipe: HANDLE) {
     // Best-effort: no router involvement here, just a synthetic
     // response to communicate the rejection to a client that opened
@@ -518,6 +536,7 @@ fn handle_connection(
     shutdown: Arc<AtomicBool>,
     active_sids: Option<Arc<ActiveSidRegistry>>,
     event_bus: Option<Arc<EventBus>>,
+    per_sid: &Arc<PerPrincipalSlots<String>>,
 ) {
     let pipe = pipe.0;
     let _ = audit; // audit hooks fire inside IpcRouter::dispatch via the
@@ -538,11 +557,23 @@ fn handle_connection(
             id
         }
         Err(reason) => {
-            tracing::warn!(target: "nrr::ipc", ?reason, "client rejected");
+            tracing::warn!(target: "nrr::ipc", msg_key = "svc-ipc-client-rejected", ?reason, "client rejected");
             let _ = write_reject_response(pipe, &reason);
             close_pipe(pipe);
             return;
         }
+    };
+
+    let Some(_sid_slot) = per_sid.claim(&identity.caller_sid) else {
+        tracing::warn!(
+            target: "nrr::ipc",
+            msg_key = "svc-ipc-principal-connection-cap",
+            sid = %identity.caller_sid,
+            cap = MAX_CONNECTIONS_PER_PRINCIPAL,
+            "refused a connection: this account already holds its share of the service's connection slots"
+        );
+        send_busy_close(pipe);
+        return;
     };
 
     // Register this connection with the per-SID registry. RAII guard
@@ -580,7 +611,7 @@ fn handle_connection(
             w
         }
         Err(e) => {
-            tracing::warn!(target: "nrr::ipc", error = %e, "writer setup failed, dropping connection");
+            tracing::warn!(target: "nrr::ipc", msg_key = "svc-ipc-writer-setup-failed", error = %e, "writer setup failed, dropping connection");
             close_pipe(pipe);
             return;
         }
@@ -640,7 +671,7 @@ fn handle_connection(
                 }
 
                 if let Err(e) = write_frame(&mut writer, &response) {
-                    tracing::warn!(target: "nrr::ipc", error = %e, "response write failed, closing connection");
+                    tracing::warn!(target: "nrr::ipc", msg_key = "svc-ipc-response-write-failed", error = %e, "response write failed, closing connection");
                     break;
                 }
             }
@@ -741,7 +772,7 @@ fn run_reader_loop(pipe: SendableHandle, reader_tx: std::sync::mpsc::SyncSender<
     let mut io = match PipeIo::new(pipe.0) {
         Ok(io) => io,
         Err(e) => {
-            tracing::warn!(target: "nrr::ipc", error = %e, "reader setup failed, closing connection");
+            tracing::warn!(target: "nrr::ipc", msg_key = "svc-ipc-reader-setup-failed", error = %e, "reader setup failed, closing connection");
             let _ = reader_tx.send(ReaderMsg::Closed);
             return;
         }
@@ -1128,7 +1159,7 @@ mod tests {
         let opened = unsafe {
             CreateFileW(
                 PCWSTR(wide.as_ptr()),
-                GENERIC_READ.0 | GENERIC_WRITE.0,
+                nrr_shared::ipc_transport::SERVICE_PIPE_CLIENT_ACCESS,
                 FILE_SHARE_NONE,
                 None,
                 OPEN_EXISTING,
@@ -1189,7 +1220,7 @@ mod tests {
             let result = unsafe {
                 CreateFileW(
                     PCWSTR(wide.as_ptr()),
-                    GENERIC_READ.0 | GENERIC_WRITE.0,
+                    nrr_shared::ipc_transport::SERVICE_PIPE_CLIENT_ACCESS,
                     FILE_SHARE_NONE,
                     None,
                     OPEN_EXISTING,
@@ -1235,7 +1266,7 @@ mod tests {
         let client = unsafe {
             CreateFileW(
                 PCWSTR(wide.as_ptr()),
-                GENERIC_READ.0 | GENERIC_WRITE.0,
+                nrr_shared::ipc_transport::SERVICE_PIPE_CLIENT_ACCESS,
                 FILE_SHARE_NONE,
                 None,
                 OPEN_EXISTING,

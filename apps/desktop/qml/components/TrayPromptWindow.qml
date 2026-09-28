@@ -14,7 +14,11 @@ import QtQuick.Window 2.15
 // reuses it without a single edit here.
 //
 // Shape of the injected values:
-//   items            - array of { primaryText, secondaryText } (secondary optional)
+//   items            - array of { primaryText, secondaryText, detailText, key,
+//                      accessibleText, secondaryAccessibleText } (all but
+//                      primaryText optional; `key` carries a row's tick across
+//                      `replaceContent()`, the accessible texts replace what is drawn
+//                      where arrows or elision would read badly aloud)
 //   primaryAction    - { label, actionId, accent } (accent renders as the
 //   secondaryAction    highlighted/primary affordance; absent = plain button)
 //   tertiaryAction
@@ -44,6 +48,9 @@ Window {
     /// pass free-form strings (hostnames, adapter names) that must not be
     /// interpreted as markup.
     property bool bodyRichText: false
+    /// What a screen reader hears for the body when the drawn text reads
+    /// badly aloud (arrows, separators). Empty = the body text, tags stripped.
+    property string bodyAccessibleText: ""
     /// Expand every row's `detailText`. Toggled by the caller's "Details"
     /// action, which keeps the notice standing.
     property bool detailsExpanded: false
@@ -125,13 +132,16 @@ Window {
         return Math.min(promptWindow._listMaxHeight, n * rowH + (n - 1) * gap + margins)
     }
 
-    /// Populate and show. Passing the whole configuration through one call
-    /// keeps the caller from leaving a stale field behind between showings.
-    function present(config) {
-        var c = config || {}
+    /// Bumped by every `present()`, never by `replaceContent()`: a caller that
+    /// remembers it can tell whether the window still shows ITS screen or has
+    /// since been swapped for another one.
+    property int presentationSerial: 0
+
+    function _applyContent(c) {
         titleText = String(c.titleText || "")
         bodyText = String(c.bodyText || "")
         bodyRichText = c.bodyRichText === true
+        bodyAccessibleText = String(c.bodyAccessibleText || "")
         items = c.items || []
         emptyText = String(c.emptyText || "")
         primaryAction = c.primaryAction || null
@@ -145,8 +155,16 @@ Window {
         selectable = c.selectable === true
         copyPayload = String(c.copyPayload || "")
         autoRetireMs = Number(c.autoRetireMs || 0)
-        detailsExpanded = false
         _reservedListHeight = _reserveListHeight(items)
+    }
+
+    /// Populate and show. Passing the whole configuration through one call
+    /// keeps the caller from leaving a stale field behind between showings.
+    function present(config) {
+        var c = config || {}
+        _applyContent(c)
+        presentationSerial += 1
+        detailsExpanded = false
         _checked = items.map(function() { return true })
         _copyAcknowledged = false
         _settled = false
@@ -175,6 +193,37 @@ Window {
                 : "none",
             "visible", promptWindow.visible)
     }
+
+    /// Replace the content of the screen already up WITHOUT re-showing it:
+    /// the answer in progress (ticks, the details toggle) survives, and the
+    /// window is only re-anchored through the deferred path.
+    ///
+    /// A row keeps its tick by `key`. A row that is new starts ticked only if
+    /// its key is in `c.preCheckedKeys` — the user may already have chosen,
+    /// and a row slipped in just before the click must not ride along unseen.
+    function replaceContent(config) {
+        if (!visible || _settled) return
+        var c = config || {}
+        var previous = {}
+        for (var i = 0; i < items.length; i += 1) {
+            var oldKey = String((items[i] || {}).key || "")
+            if (oldKey !== "") previous[oldKey] = _checked[i] !== false
+        }
+        var preChecked = c.preCheckedKeys || []
+        _applyContent(c)
+        _checked = items.map(function(row) {
+            var key = String((row || {}).key || "")
+            if (key !== "" && previous[key] !== undefined) return previous[key]
+            return key !== "" && preChecked.indexOf(key) >= 0
+        })
+        // New content deserves the whole allowance again. Dropping the flag the
+        // countdown's `running` binding reads, then restoring it, restarts it
+        // without an imperative call that would detach that binding.
+        _retireRestart = true
+        _retireRestart = false
+        placeTimer.restart()
+    }
+    property bool _retireRestart: false
 
     // ── Internals ────────────────────────────────────────────────────────────
 
@@ -235,6 +284,22 @@ Window {
     /// Tallest the detail list may grow before it starts scrolling.
     readonly property int _listMaxHeight: 190
 
+    FontMetrics {
+        id: primaryTextMetrics
+        font.pixelSize: promptWindow._baseFontPx
+    }
+
+    /// One width for the first column across all rows, so the second column
+    /// lines up: the widest primary text, capped so the second keeps room.
+    function _primaryColumnWidth(listWidth) {
+        var widest = 0
+        for (var i = 0; i < items.length; i += 1) {
+            var t = String((items[i] || {}).primaryText || "")
+            widest = Math.max(widest, Math.ceil(primaryTextMetrics.advanceWidth(t)))
+        }
+        return Math.min(widest + 2, Math.max(0, listWidth * 0.6))
+    }
+
     /// Side of the square header close box. Tracks the base font so it stays
     /// proportionate when the user scales text.
     readonly property int _closeBoxPx: Math.max(24, _baseFontPx + 11)
@@ -283,7 +348,7 @@ Window {
         id: autoRetireTimer
         interval: promptWindow.autoRetireMs > 0 ? promptWindow.autoRetireMs : 1
         running: promptWindow.visible && promptWindow.autoRetireMs > 0
-            && !pointerOver.hovered
+            && !pointerOver.hovered && !promptWindow._retireRestart
         repeat: false
         onTriggered: {
             console.log("tray prompt: retired itself after",
@@ -492,7 +557,9 @@ Window {
             wrapMode: Text.WordWrap
             Accessible.role: Accessible.StaticText
             // Screen readers get plain text — strip the styling tags used for visual emphasis.
-            Accessible.name: promptWindow.bodyRichText ? text.replace(/<\/?[a-z]+>/gi, "") : text
+            Accessible.name: promptWindow.bodyAccessibleText !== ""
+                ? promptWindow.bodyAccessibleText
+                : (promptWindow.bodyRichText ? text.replace(/<\/?[a-z]+>/gi, "") : text)
         }
 
         // Compact detail list. Height follows the content up to the cap, past
@@ -568,10 +635,26 @@ Window {
                             }
                         }
                         Accessible.role: Accessible.CheckBox
-                        Accessible.name: String((modelData || {}).primaryText || "")
+                        // The whole row, so a screen reader hears which program
+                        // the address belongs to before ticking it.
+                        Accessible.name: String((modelData || {}).accessibleText || "") !== ""
+                            ? String(modelData.accessibleText)
+                            : [String((modelData || {}).primaryText || ""),
+                                String((modelData || {}).secondaryText || "")]
+                                .filter(function(s) { return s !== "" }).join(", ")
                     }
+                    // Sized by its own text, the second column started at a
+                    // different x on every row.
                     Label {
-                        Layout.fillWidth: true
+                        readonly property bool pairedWithSecondary:
+                            String((modelData || {}).secondaryText || "") !== ""
+                        readonly property real columnWidth: pairedWithSecondary
+                            ? promptWindow._primaryColumnWidth(detailList.width
+                                - detailList.scrollBarGutter) : 0
+                        Layout.fillWidth: !pairedWithSecondary
+                        Layout.preferredWidth: pairedWithSecondary ? columnWidth : -1
+                        Layout.minimumWidth: pairedWithSecondary ? columnWidth : 0
+                        Layout.maximumWidth: pairedWithSecondary ? columnWidth : Number.POSITIVE_INFINITY
                         text: String((modelData || {}).primaryText || "")
                         color: promptWindow._fgColor
                         font.pixelSize: promptWindow._baseFontPx
@@ -581,6 +664,7 @@ Window {
                     }
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         visible: String((modelData || {}).secondaryText || "") !== ""
                         text: String((modelData || {}).secondaryText || "")
                         color: promptWindow._mutedColor
@@ -589,7 +673,12 @@ Window {
                         maximumLineCount: 2
                         elide: Text.ElideRight
                         Accessible.role: Accessible.StaticText
-                        Accessible.name: text
+                        Accessible.name: String((modelData || {}).secondaryAccessibleText || "") !== ""
+                            ? String(modelData.secondaryAccessibleText) : text
+                        // The elided tail is still readable on hover.
+                        HoverHandler { id: secondaryHover }
+                        ToolTip.visible: secondaryHover.hovered && truncated
+                        ToolTip.text: text
                     }
                     }
                     // The "how do you know?" line. Hidden until the user asks

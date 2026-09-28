@@ -244,20 +244,20 @@ mod tests {
         let c = conn();
         let repo = LocalNetworkRulesRepository::new(&c);
         let switch = "Ethernet (Default Switch)";
-        repo.upsert("S", &discovered("172.23.208.0/20", switch, true), 1)
+        repo.upsert("S", &discovered("172.16.0.0/20", switch, true), 1)
             .expect("yesterday");
-        repo.upsert("S", &discovered("172.28.176.0/20", switch, true), 2)
+        repo.upsert("S", &discovered("172.16.16.0/20", switch, true), 2)
             .expect("today");
         // A refusal on another adapter must survive the prune.
         repo.upsert("S", &discovered("192.168.56.0/24", "VirtualBox", false), 2)
             .expect("refusal");
         let pruned = repo
-            .forget_superseded_confirmations("S", switch, "172.28.176.0/20")
+            .forget_superseded_confirmations("S", switch, "172.16.16.0/20")
             .expect("prune");
         assert_eq!(pruned, 1);
         let stored = repo.list_for_sid("S").expect("read");
         assert_eq!(stored.len(), 2);
-        assert!(stored.iter().any(|r| r.cidr == "172.28.176.0/20"));
+        assert!(stored.iter().any(|r| r.cidr == "172.16.16.0/20"));
         assert!(stored
             .iter()
             .any(|r| r.cidr == "192.168.56.0/24" && !r.allow));

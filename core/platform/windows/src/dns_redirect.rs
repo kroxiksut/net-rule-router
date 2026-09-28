@@ -53,6 +53,13 @@ pub use nrr_platform_api::dns_redirect::{
     DnsNamespaceExemption, RedirectHandle, RedirectState, SystemDnsRedirectPort,
 };
 
+mod search_list;
+#[cfg(target_os = "windows")]
+pub use search_list::WindowsSearchList;
+pub use search_list::{
+    release_search_list, sync_search_list, SearchListOutcome, SearchListStore, SearchListView,
+};
+
 /// Output of a shell command: whether it succeeded plus its captured streams.
 #[derive(Clone, Debug)]
 pub struct CommandOutput {
@@ -409,6 +416,9 @@ pub struct NrptDnsRedirect<R: CommandRunner, S: NrptRuleStore> {
     /// behind the port because the same flush is wanted from elsewhere in the
     /// service, and two ways to flush one cache is how they drift apart.
     cache: Arc<dyn DnsCacheControlPort>,
+    /// The global suffix list the catch-all needs beside it; `None` leaves
+    /// short names to whatever the machine had.
+    search_list: Option<Arc<dyn SearchListStore>>,
 }
 
 impl<R: CommandRunner, S: NrptRuleStore> NrptDnsRedirect<R, S> {
@@ -423,7 +433,14 @@ impl<R: CommandRunner, S: NrptRuleStore> NrptDnsRedirect<R, S> {
             runner,
             store,
             cache,
+            search_list: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_search_list(mut self, search_list: Arc<dyn SearchListStore>) -> Self {
+        self.search_list = Some(search_list);
+        self
     }
 }
 
@@ -436,6 +453,7 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         if swept > 0 {
             tracing::warn!(
                 target: "nrr::dns-redirect",
+                msg_key = "win-dns-redirect-orphans-swept",
                 swept,
                 "removed NRPT rules that would have had the DNS client reject the whole table",
             );
@@ -468,6 +486,7 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
             Err(error) => {
                 tracing::warn!(
                     target: "nrr::dns-redirect",
+                    msg_key = "win-dns-redirect-verify-unconfirmed",
                     "NRPT redirect installed but could not be confirmed against the \
                      effective policy table ({error}); proceeding as armed",
                 );
@@ -489,8 +508,18 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         if let Err(error) = swept {
             tracing::warn!(
                 target: "nrr::dns-redirect",
+                msg_key = "win-dns-redirect-exemption-sweep-failed",
                 "could not remove the namespace exemptions: {error:?}",
             );
+        }
+        if let Some(search_list) = self.search_list.as_deref() {
+            if let Err(error) = release_search_list(search_list) {
+                tracing::warn!(
+                    target: "nrr::dns-redirect",
+                    msg_key = "win-dns-search-list-release-failed",
+                    "could not take back the DNS suffix search list: {error:?}",
+                );
+            }
         }
         deleted.map(drop)
     }
@@ -558,6 +587,7 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
                 // of the way is still better than being fully in it.
                 Err(error) => tracing::warn!(
                     target: "nrr::dns-redirect",
+                    msg_key = "win-dns-redirect-exemption-write-failed",
                     suffix = %exemption.suffix,
                     "could not leave this namespace to its own resolver: {error:?}",
                 ),
@@ -566,12 +596,34 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         if removed > 0 || written > 0 {
             tracing::info!(
                 target: "nrr::dns-redirect",
+                msg_key = "win-dns-redirect-exemptions-applied",
                 removed,
                 written,
                 "namespaces left to the connections that claim them",
             );
         }
         Ok(written)
+    }
+
+    fn keep_short_names(&self, extra: &[String]) -> Result<(), PlatformError> {
+        let Some(search_list) = self.search_list.as_deref() else {
+            return Ok(());
+        };
+        match sync_search_list(search_list, extra)? {
+            SearchListOutcome::Written(suffixes) => tracing::info!(
+                target: "nrr::dns-redirect",
+                msg_key = "win-dns-search-list-written",
+                suffixes = %suffixes.join(", "),
+                "short names are completed with these suffixes while the redirect is in force",
+            ),
+            SearchListOutcome::Cleared => tracing::info!(
+                target: "nrr::dns-redirect",
+                msg_key = "win-dns-search-list-cleared",
+                "no connection suffix left to complete short names with; search list cleared",
+            ),
+            SearchListOutcome::Unchanged | SearchListOutcome::NotOurs => {}
+        }
+        Ok(())
     }
 
     fn flush_cache(&self) -> Result<(), PlatformError> {

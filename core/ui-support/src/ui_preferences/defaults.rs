@@ -43,6 +43,7 @@ impl Default for UiPreferences {
             allow_mode_a_killswitch: false,
             routing_detailed_mode: false,
             show_virtual_machines_section: false,
+            app_groups_offer_dismissed: false,
             show_remembered_adapters: true,
             auto_confirm_adapter_id_change: true,
             warn_kill_switch_block_all: true,

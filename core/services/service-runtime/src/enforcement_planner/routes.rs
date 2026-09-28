@@ -457,4 +457,7 @@ pub struct PlanReport {
     pub claimed_by_main: Vec<(String, Ipv4Addr)>,
     /// Suffix/zone fan-outs stopped at the backstop: `(rule_id, suffix, cap)`.
     pub truncated_suffixes: Vec<(String, String, usize)>,
+    /// Rules skipped because their shape cannot be enforced as written:
+    /// `(rule_id, reason)`. The twin of `CodegenDiagnostic::UnsupportedRuleShape`.
+    pub unsupported_shapes: Vec<(String, nrr_domain::rule_shape::UnsupportedShapeReason)>,
 }

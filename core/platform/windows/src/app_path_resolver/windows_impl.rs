@@ -144,7 +144,7 @@ impl WindowsAppPathResolver {
 
     /// Union of every source, with the walks served from their own cache.
     fn resolve_uncached(&self, key: &str) -> Vec<PathBuf> {
-        let is_glob = key.contains('*') || key.contains('?');
+        let is_glob = key.contains('*');
 
         let mut out = resolve_from_app_paths(key, is_glob);
         out.extend(matching_images(
@@ -624,6 +624,7 @@ fn resolve_from_packaged_apps(query: &str) -> super::WalkOutcome {
         // traffic goes the wrong way.
         tracing::warn!(
             target: "nrr::app_path_resolver",
+            msg_key = "win-apppath-store-search-budget-hit",
             query,
             files = PACKAGED_WALK_MAX_FILES,
             "Store-package search hit its file budget — an application installed from the Store may be missed until it runs",

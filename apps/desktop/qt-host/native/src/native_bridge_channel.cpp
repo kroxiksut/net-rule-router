@@ -116,8 +116,14 @@ void NrrNativeBridge::launchMainGui(const QString &section, bool about, bool lic
     launchMainGuiWithAction(section, about, license, {}, {});
 }
 
+void NrrNativeBridge::openMainGuiFocused(const QString &section, const QString &focusId,
+                                         const QString &focusContextJson) {
+    launchMainGuiWithAction(section, false, false, {}, {}, focusId, focusContextJson);
+}
+
 void NrrNativeBridge::launchMainGuiWithAction(const QString &section, bool about, bool license,
-                                 const QString &action, const QString &reason) {
+                                 const QString &action, const QString &reason,
+                                 const QString &focus, const QString &focusContext) {
     if (mainGuiExecutable_.isEmpty()) {
         qWarning() << "NRR_LAUNCH_GUI mainGuiExecutable is empty (resolveMainGuiExecutable returned no path)";
         return;
@@ -144,6 +150,13 @@ void NrrNativeBridge::launchMainGuiWithAction(const QString &section, bool about
     }
     if (!reason.isEmpty()) {
         arguments << QStringLiteral("--reason=%1").arg(reason);
+    }
+    // One argv entry each; QProcess quotes them for the command line.
+    if (!focus.isEmpty()) {
+        arguments << QStringLiteral("--focus=") + focus;
+    }
+    if (!focusContext.isEmpty()) {
+        arguments << QStringLiteral("--focus-context=") + focusContext;
     }
 
     const QString workingDir = QFileInfo(mainGuiExecutable_).absolutePath();

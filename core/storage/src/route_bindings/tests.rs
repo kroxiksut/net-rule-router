@@ -186,6 +186,8 @@ fn sample_record(source: BindingSource) -> RoutePolicyRecord {
         primary_probe_repeat_secs: 120,
         local_networks_auto_accept: false,
         zone_priority_over_ip: false,
+        short_name_completion: true,
+        short_name_suffix: "corp.example".to_string(),
         binding_source: source,
     }
 }
@@ -645,6 +647,8 @@ fn row_defaults_as_wire() -> Vec<(&'static str, serde_json::Value)> {
             json!(row.local_networks_auto_accept),
         ),
         ("zone-priority-over-ip", json!(row.zone_priority_over_ip)),
+        ("short-name-completion", json!(row.short_name_completion)),
+        ("short-name-suffix", json!(row.short_name_suffix)),
     ]
 }
 

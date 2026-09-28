@@ -81,6 +81,7 @@ pub fn report_if_slow(timings: &PhaseTimings, pass: &str, threshold: Duration) {
     }
     tracing::info!(
         target: "nrr::enforcement-cost",
+        msg_key = "phase-pass-slow",
         pass = %pass,
         total_ms = timings.total().as_millis(),
         phases = %timings.render(),

@@ -71,6 +71,7 @@ impl Ipv6RouteTableLog {
         // report about this machine is answered before it is investigated.
         tracing::info!(
             target: "nrr::routes-v6",
+            msg_key = "ipv6route-table-logged",
             reason,
             routes = rows.len(),
             has_global = has_global_route(rows),

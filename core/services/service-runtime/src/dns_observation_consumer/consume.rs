@@ -244,6 +244,7 @@ impl DnsObservationConsumer {
                         if !secondary_usable {
                             tracing::info!(
                                 target: "nrr::dns-observe",
+                                msg_key = "dnsobs-collateral-pin-skipped-secondary-unusable",
                                 direct_host = %obs.hostname,
                                 shared_ip = %ip,
                                 secondary_rule_host = %owner,

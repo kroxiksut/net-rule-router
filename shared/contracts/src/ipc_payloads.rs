@@ -485,8 +485,9 @@ pub struct StatusUpdatesSubscribeResponse {
     pub gap_detected: bool,
 }
 
-/// Status events the service broadcasts to every subscriber. New
-/// variants append; clients that don't recognise a kind drop it.
+/// Status events the service pushes to subscribers — to every one, or only to
+/// the principal [`StatusUpdateEvent::addressee`] names. New variants append;
+/// clients that don't recognise a kind drop it.
 ///
 /// Wire-tagged externally (`tag = "type"`) so a client can demux by
 /// reading just the discriminator before deserialising the body. We
@@ -545,7 +546,14 @@ pub enum StatusUpdateEvent {
     // ── Settings push events ──────────────────────────────────────
     /// A revision row's status changed (candidate → active → superseded
     /// / rolled-back / rejected). GUI may refresh its pending list.
-    RevisionStatusChanged { revision_id: String, status: String },
+    RevisionStatusChanged {
+        revision_id: String,
+        status: String,
+        /// Whose revision it is. `None` for the admin baseline: every user who
+        /// has not diverged runs it, so its change is news for all of them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sid: Option<String>,
+    },
     /// A SID's routing-pause state flipped. GUI flips the chip / tray
     /// menu without a re-snapshot.
     RoutingPauseStateChanged { sid: String, paused: bool },
@@ -553,8 +561,10 @@ pub enum StatusUpdateEvent {
     ApplyFailurePolicyChanged { policy: String },
     /// Autostart configuration changed (toggle, registry observation,
     /// or external-override detection). GUI re-renders the General
-    /// settings panel.
+    /// settings panel. Autostart lives in the user's own registry hive, so
+    /// it is only ever that user's news.
     AutostartStateChanged {
+        sid: String,
         enabled: bool,
         last_known_state: String,
     },
@@ -670,6 +680,10 @@ pub enum StatusUpdateEvent {
         reason: String,
         /// Attempts folded into this episode so far.
         attempts: u64,
+        /// Image names of the processes that started `app`, nearest parent
+        /// first. Absent when unknown; never paths or command lines.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        launched_by: Vec<String>,
     },
     /// Whether this SID's policy is actually being enforced, and what the user
     /// has to do when it is not.
@@ -723,16 +737,17 @@ impl StatusUpdateEvent {
             | Self::SecondaryExternalAddressObserved { sid, .. }
             | Self::UnassignedTunnelDetected { sid, .. }
             | Self::BlockNoticeRaised { sid, .. }
-            | Self::EnforcementStatusChanged { sid, .. } => Some(sid.as_str()),
+            | Self::EnforcementStatusChanged { sid, .. }
+            | Self::AutostartStateChanged { sid, .. } => Some(sid.as_str()),
+            // A baseline revision carries no SID and reaches everyone.
+            Self::RevisionStatusChanged { sid, .. } => sid.as_deref(),
             Self::HealthChanged { .. }
             | Self::ProtectionCoverageChanged { .. }
             | Self::AdaptersChanged { .. }
             | Self::AlertRaised { .. }
             | Self::OperationFinished { .. }
             | Self::Overflow { .. }
-            | Self::RevisionStatusChanged { .. }
             | Self::ApplyFailurePolicyChanged { .. }
-            | Self::AutostartStateChanged { .. }
             | Self::RetentionSettingsChanged
             | Self::MutationProgress { .. } => None,
         }
@@ -859,6 +874,56 @@ pub struct SnapshotInitialResponse {
     /// setup. Wire key: `kill-switch-block-all-armed`.
     #[serde(default)]
     pub kill_switch_block_all_armed: bool,
+    /// Where the caller's APPLIED rules are enforced differently from how they
+    /// read, as the last filter compute found it. Empty when nothing
+    /// conflicts. Wire key: `rule-conflicts`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_conflicts: Vec<RuleConflictDto>,
+}
+
+/// One rule enforced differently from how it reads: because of another rule
+/// that shares its addresses, or because its shape cannot be enforced. Rule values and addresses come from the caller's
+/// own rules and address cache, which the on-screen views already show.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RuleConflictDto {
+    pub kind: RuleConflictKind,
+    /// The rule enforced differently: the route (`literal-block-overrides-route`)
+    /// or the Block (`block-leaks-shared-address`).
+    pub rule_id: String,
+    /// That rule as the rules table shows it (`*.x` for a suffix).
+    pub rule_value: String,
+    /// One affected address.
+    pub ip: String,
+    /// How many addresses of the rule are affected, `ip` included.
+    pub count: u32,
+    /// The literal-IP Block that wins (`literal-block-overrides-route` only).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub other_rule_id: String,
+    /// The route's host at `ip`, or the host left unblocked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    /// The narrowly routed host (or literal address) that keeps `ip` open
+    /// (`block-leaks-shared-address` only).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via_host: String,
+    /// The application the rule names (`unsupported-rule-shape` only).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuleConflictKind {
+    /// A literal-IP Block drops an address a route rule's host resolves to.
+    LiteralBlockOverridesRoute,
+    /// A Block leaves an address open because a narrower route names another
+    /// host on it, so the Block's own host on that address stays reachable.
+    BlockLeaksSharedAddress,
+    /// A rule names both an application and an address, which enforcement
+    /// cannot scope to the application, so the rule is not enforced at all.
+    /// `ip` is empty and `count` zero: no address was acted on.
+    UnsupportedRuleShape,
 }
 
 /// Compact summary of a revision row surfaced in

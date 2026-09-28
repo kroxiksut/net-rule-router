@@ -2,6 +2,12 @@
 
 #include "host_includes.h"
 
+#ifndef Q_OS_WIN
+#include <cerrno>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 struct LaunchOptions {
     QString qmlPath;
     QString appIconPath;
@@ -247,10 +253,45 @@ inline QString resolveAppIconPath(const LaunchOptions &options, const QString &a
     return findBundledFile(applicationDir, appIconRelativePath());
 }
 
-// Set once from `--nrr-runtime-dir=` before anything touches a lock or a flag.
-// Empty only when the host was started without the argument (a hand-run of the
-// binary), which keeps the historical Windows path working.
+// Set once by `adoptRuntimeDirectory` before anything touches a lock or a flag.
 inline QString g_runtimeDirectoryOverride;
+
+#ifndef Q_OS_WIN
+// Owner-only, and never a symlink or another user's directory: the fallback
+// sits in the shared temp dir, where anyone can plant our name first.
+inline bool ensurePrivateDirectory(const QString &path) {
+    const QByteArray native = QFile::encodeName(path);
+    if (::mkdir(native.constData(), 0700) != 0 && errno != EEXIST) {
+        return false;
+    }
+    struct stat info {};
+    if (::lstat(native.constData(), &info) != 0) {
+        return false;
+    }
+    return S_ISDIR(info.st_mode) && info.st_uid == ::geteuid() && (info.st_mode & 077) == 0;
+}
+#endif
+
+// The launcher's directory, or for a hand-run of the binary a fallback in the
+// temp dir (per-user already on Windows, per-uid and checked elsewhere).
+// False when that fallback is not private to this user.
+inline bool adoptRuntimeDirectory(const QString &launcherDirectory) {
+    if (!launcherDirectory.isEmpty()) {
+        g_runtimeDirectoryOverride = QDir::cleanPath(normalizeLocalPath(launcherDirectory));
+        return true;
+    }
+#ifdef Q_OS_WIN
+    return true;
+#else
+    const QString fallback = QDir::cleanPath(
+        QDir::tempPath() + QStringLiteral("/NetRuleRouter-%1").arg(::geteuid()));
+    if (!ensurePrivateDirectory(fallback)) {
+        return false;
+    }
+    g_runtimeDirectoryOverride = fallback;
+    return true;
+#endif
+}
 
 inline QString appRuntimeDirectoryPath() {
     const QString path =

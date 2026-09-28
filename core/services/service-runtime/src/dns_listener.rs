@@ -110,6 +110,10 @@ pub type PrivateResolversFn = Arc<dyn Fn() -> Vec<std::net::Ipv4Addr> + Send + S
 /// disagree about which namespaces exist.
 pub type ClaimedNamespacesFn = crate::dns_resolver_service::DnsNamespaceExemptionsFn;
 
+/// The network domain the user named for short names, for a connection that
+/// announces none. `None` when the setting is off.
+pub type ShortNameSuffixFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// How many private resolvers are re-asked before a "no such name" stands.
 /// A machine has one or two; the bound only stops a strange configuration
 /// from turning one failed lookup into a burst.
@@ -192,6 +196,7 @@ pub struct DnsInterceptListener {
     /// Namespaces connections claim, used to complete a single-label name.
     /// `None` leaves such names exactly as they arrive.
     claimed_namespaces: Option<ClaimedNamespacesFn>,
+    short_name_suffix: Option<ShortNameSuffixFn>,
     /// Port the resolvers named by a connection listen on. Always 53 outside
     /// tests, which cannot bind it.
     resolver_port: u16,
@@ -260,6 +265,50 @@ const DNS_DATAGRAM_BUFFER_BYTES: usize = 4096;
 /// them still ends the loop; one odd packet does not.
 const DNS_RECV_ERROR_TOLERANCE: u32 = 16;
 
+/// Minimum spacing between per-datagram receive-noise log lines: any local
+/// process can produce that noise at will.
+const RECV_NOISE_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// What one failed `recv_from` means for the serve loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecvErrorClass {
+    /// The read timeout — a chance to look at `stop`.
+    Idle,
+    /// About one datagram, not the socket: skip it, never count it.
+    PerDatagram,
+    /// Unknown; a run of these means the socket is dead.
+    Unrecognised,
+}
+
+/// WSAEMSGSIZE: Windows reports a datagram larger than the buffer as an error
+/// (the truncated datagram is discarded). Linux and macOS truncate silently
+/// and return the length read, so there is no counterpart to recognise.
+#[cfg(windows)]
+const OS_ERROR_DATAGRAM_TOO_LARGE: Option<i32> = Some(10040);
+#[cfg(not(windows))]
+const OS_ERROR_DATAGRAM_TOO_LARGE: Option<i32> = None;
+
+/// Classify a receive error. A UDP server must never die on one datagram:
+/// counting per-datagram conditions toward the fatal streak let any local
+/// process switch interception off by sending sixteen of them.
+fn classify_recv_error(error: &std::io::Error) -> RecvErrorClass {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => RecvErrorClass::Idle,
+        // Windows surfaces the ICMP port-unreachable for a reply to a client
+        // whose port already closed (WSAECONNRESET) on the NEXT receive.
+        ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionAborted => RecvErrorClass::PerDatagram,
+        _ if OS_ERROR_DATAGRAM_TOO_LARGE.is_some()
+            && error.raw_os_error() == OS_ERROR_DATAGRAM_TOO_LARGE =>
+        {
+            RecvErrorClass::PerDatagram
+        }
+        _ => RecvErrorClass::Unrecognised,
+    }
+}
+
 impl DnsInterceptListener {
     pub fn new(
         oracle: Arc<dyn RuleHostOracle>,
@@ -281,6 +330,7 @@ impl DnsInterceptListener {
             secondary_owned: Arc::new(NoopSecondaryOwnedIps),
             private_resolvers: None,
             claimed_namespaces: None,
+            short_name_suffix: None,
             resolver_port: 53,
             fake_ip: Arc::new(NoopFakeIpAnswerer),
             direct_gate: Arc::new(NoopDirectAnswerGate),
@@ -413,6 +463,14 @@ impl DnsInterceptListener {
         self
     }
 
+    /// Complete short names with a domain the user named, asked of the
+    /// resolvers every other name goes to.
+    #[must_use]
+    pub fn with_short_name_suffix(mut self, suffix: ShortNameSuffixFn) -> Self {
+        self.short_name_suffix = Some(suffix);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_resolver_port(mut self, port: u16) -> Self {
         self.resolver_port = port;
@@ -424,44 +482,71 @@ impl DnsInterceptListener {
         self.claimed_namespaces.is_some()
     }
 
-    /// Answer a single-label name by completing it with a claimed namespace.
+    /// Answer a single-label name by completing it with a claimed namespace,
+    /// then with the domain the user named.
     ///
-    /// Windows completes a bare label using the connection's own DNS
-    /// suffix, then asks the server that connection named. Pointing
-    /// every name at a loopback listener takes that away: loopback carries no
-    /// suffix, so nothing is completed and the bare label reaches a resolver
-    /// that was never going to know it. An internal host stops resolving
-    /// while its full name still works.
-    ///
-    /// The reply is rebuilt against the ORIGINAL question. A client that asked
-    /// for a bare label discards an answer about a different name, so the
-    /// completed lookup stays an implementation detail — the same thing the
-    /// OS resolver does on its own.
+    /// The OS completes a bare label with the connection's own DNS suffix;
+    /// loopback carries none, so pointing every name at us took that away.
+    /// The reply is rebuilt against the ORIGINAL question — a client discards
+    /// an answer about a different name — and the completion is remembered so
+    /// an offer can name the full host.
     fn complete_single_label(
         &self,
         query: &[u8],
         label: &str,
         budget: Duration,
     ) -> Option<Vec<u8>> {
-        let namespaces = self.claimed_namespaces.as_ref()?();
+        let mut attempts: Vec<(String, Vec<SocketAddr>)> = self
+            .claimed_namespaces
+            .as_ref()
+            .map(|claims| {
+                claims()
+                    .into_iter()
+                    .map(|claim| {
+                        let servers = claim
+                            .servers
+                            .into_iter()
+                            .map(|s| SocketAddr::from((s, self.resolver_port)))
+                            .collect();
+                        (claim.suffix, servers)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A domain the user named has no servers of its own: it is asked of
+        // the ones every other name goes to.
+        if let Some(suffix) = self.short_name_suffix.as_ref().and_then(|named| named()) {
+            if !attempts.iter().any(|(claimed, _)| *claimed == suffix) {
+                let mut servers: Vec<SocketAddr> =
+                    self.upstream_dns.current().into_iter().collect();
+                if let Some(private) = self.private_resolvers.as_ref() {
+                    servers.extend(
+                        private()
+                            .into_iter()
+                            .take(MAX_PRIVATE_RETRIES)
+                            .map(|s| SocketAddr::from((s, self.resolver_port))),
+                    );
+                }
+                servers.dedup();
+                attempts.push((suffix, servers));
+            }
+        }
         let started = Instant::now();
-        for claim in namespaces {
+        for (suffix, servers) in attempts {
             let left = budget.saturating_sub(started.elapsed());
             if left.is_zero() {
                 break;
             }
-            let full = format!("{label}.{}", claim.suffix);
-            let servers = claim.servers;
+            let full = format!("{label}.{suffix}");
             let id = crate::dns_resolver_ports::next_query_id();
             let Some(probe) = crate::dns_wire::build_address_query(id, &full, QTYPE_A) else {
                 continue;
             };
-            for server in servers {
+            for target in servers {
                 let left = budget.saturating_sub(started.elapsed());
                 if left.is_zero() {
                     break;
                 }
-                let target = SocketAddr::from((server, self.resolver_port));
                 let Some(reply) = self.forward_to(&probe, target, self.forward_timeout.min(left))
                 else {
                     continue;
@@ -474,11 +559,14 @@ impl DnsInterceptListener {
                     }
                     tracing::info!(
                         target: "nrr::dns-resolver",
+                        msg_key = "dns-listener-short-name-completed",
                         label = %label,
                         completed = %full,
-                        server = %server,
-                        "completed a short name with the namespace its connection claims",
+                        server = %target,
+                        "completed a short name with its network domain",
                     );
+                    crate::short_name_completions::global_short_name_completions()
+                        .record(label, &full);
                     return build_a_response(query, &only_v4(&addresses), min_ttl.max(1));
                 }
             }
@@ -513,6 +601,7 @@ impl DnsInterceptListener {
         }
         tracing::warn!(
             target: "nrr::dns",
+            msg_key = "dns-listener-rule-host-ipv6-uncovered",
             host = %qname,
             "a rule host was asked for over IPv6 and IPv4 cannot carry it — its \
              v6 traffic leaves outside the rule",
@@ -575,6 +664,7 @@ impl DnsInterceptListener {
                 if self.rule_lane_saturated.swap(false, Ordering::Relaxed) {
                     tracing::info!(
                         target: "nrr::dns-resolver",
+                        msg_key = "dns-listener-modeb-resolves-caught-up",
                         "Mode B: rule-host resolves are keeping up again — answering from the upstream as usual",
                     );
                 }
@@ -584,6 +674,7 @@ impl DnsInterceptListener {
                 if !self.rule_lane_saturated.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
                         target: "nrr::dns-resolver",
+                        msg_key = "dns-listener-modeb-resolve-slots-saturated",
                         concurrent = MAX_CONCURRENT_RULE_HOST_RESOLVES,
                         "Mode B: every rule-host resolve slot is taken by an upstream that is not answering — serving rule hosts from the cache so the rest of the machine's DNS keeps working",
                     );
@@ -802,60 +893,43 @@ impl DnsInterceptListener {
             }
             let mut buf = [0u8; DNS_DATAGRAM_BUFFER_BYTES];
             let mut consecutive_errors = 0u32;
+            let mut last_noise_log: Option<Instant> = None;
             while !stop.load(Ordering::Relaxed) {
                 let (n, src) = match socket.recv_from(&mut buf) {
                     Ok(v) => v,
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        continue
-                    }
-                    // a UDP server must NEVER die on one datagram.
-                    // On Windows `recv_from` surfaces WSAECONNRESET (os error 10054) as
-                    // a PER-DATAGRAM condition: after we `send_to` a DNS client whose
-                    // ephemeral port already closed, the loopback ICMP port-unreachable
-                    // arrives on the NEXT `recv_from`. Treating that as fatal would
-                    // terminate the whole Mode-B resolver serve loop (with no watchdog
-                    // to re-arm it), silently stopping zone/suffix rules from resolving.
-                    // Skip these transient connection-level errors and keep serving;
-                    // only a genuinely dead socket ends the loop. Platform-neutral:
-                    // correct on every OS (see the cross-platform seam — no Win32 here;
-                    // SIO_UDP_CONNRESET suppression, if ever wanted, belongs behind the
-                    // platform socket port).
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::ConnectionRefused
-                                | std::io::ErrorKind::ConnectionAborted
-                        ) =>
-                    {
-                        tracing::debug!(
-                            target: "nrr::dns_resolver",
-                            error = %e,
-                            "Mode B: skipped a transient per-datagram recv error (client port closed) — continuing to serve",
-                        );
-                        continue;
-                    }
-                    // Anything else: log and keep serving. Returning here is
-                    // what made one oversized datagram take DNS interception
-                    // down for the whole machine.
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors >= DNS_RECV_ERROR_TOLERANCE {
-                            return Err(e);
+                    Err(e) => match classify_recv_error(&e) {
+                        RecvErrorClass::Idle => continue,
+                        // Neither counts toward the streak nor resets it.
+                        RecvErrorClass::PerDatagram => {
+                            if last_noise_log
+                                .is_none_or(|at| at.elapsed() >= RECV_NOISE_LOG_INTERVAL)
+                            {
+                                last_noise_log = Some(Instant::now());
+                                tracing::debug!(
+                                    target: "nrr::dns_resolver",
+                                    error = %e,
+                                    "Mode B: skipped a per-datagram receive error — continuing to serve",
+                                );
+                            }
+                            continue;
                         }
-                        tracing::warn!(
-                            target: "nrr::dns_resolver",
-                            error = %e,
-                            consecutive_errors,
-                            "Mode B: unrecognised receive error; continuing to serve",
-                        );
-                        continue;
-                    }
+                        // Keep serving through a few: a dead socket fails
+                        // every time, one odd packet does not.
+                        RecvErrorClass::Unrecognised => {
+                            consecutive_errors += 1;
+                            if consecutive_errors >= DNS_RECV_ERROR_TOLERANCE {
+                                return Err(e);
+                            }
+                            tracing::warn!(
+                                target: "nrr::dns_resolver",
+                                msg_key = "dns-listener-modeb-unrecognised-recv-error",
+                                error = %e,
+                                consecutive_errors,
+                                "Mode B: unrecognised receive error; continuing to serve",
+                            );
+                            continue;
+                        }
+                    },
                 };
                 consecutive_errors = 0;
                 match tx.try_send((buf[..n].to_vec(), src)) {
@@ -1126,6 +1200,7 @@ impl DnsInterceptListener {
         }
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-listener-direct-host-parked-suggestion",
             host = %q.qname,
             "direct host is a parked suggestion for the additional route — left on it instead of being steered onto the primary",
         );
@@ -1149,6 +1224,7 @@ impl DnsInterceptListener {
         let resp = build_a_response(query, &fake, self.response_ttl)?;
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-listener-modeb-direct-host-shared-address",
             host = %q.qname,
             fake = ?fake,
             real = ?addresses,
@@ -1257,6 +1333,7 @@ impl DnsInterceptListener {
             if !reply_is_nxdomain(&reply) {
                 tracing::info!(
                     target: "nrr::dns-resolver",
+                    msg_key = "dns-listener-local-resolver-knows-name",
                     server = %server,
                     "a resolver on this machine knows a name the upstream called non-existent",
                 );

@@ -11,9 +11,10 @@
 //! `ExactFqdn` first (sorted lexicographically), then `SuffixDomain` (sorted
 //! lexicographically), then `Zone` (sorted lexicographically), then `ExactIp`
 //! (sorted numerically by 32-bit value), then `Application` (sorted
-//! lexicographically by process name). This ensures that two logically
-//! equivalent configurations produce the same byte sequence when serialized,
-//! and therefore the same SHA-256 content hash.
+//! lexicographically by process name). Rules sharing a match value are then
+//! ordered by every remaining field, so the order is total: two equal books
+//! produce the same byte sequence when serialized, and therefore the same
+//! SHA-256 content hash, whatever order they arrived in.
 //!
 //! Note: this canonical storage order is fixed for hashing purposes and does
 //! **not** reflect the runtime evaluation priority, which is configurable for
@@ -62,9 +63,8 @@ impl CanonicalAppPattern {
 ///
 /// This is modeled as a per-rule attribute rather than a [`RouteRole`] variant
 /// because a block has no adapter binding and no reachability to probe. The
-/// action is intentionally NOT part of the canonical sort key: block and route
-/// rules interleave by address so a route rule's canonical bytes stay stable
-/// when a sibling rule toggles block.
+/// action only breaks ties between rules with the same match: block and route
+/// rules still interleave by address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum RuleAction {
     /// Route matching traffic via the rule's route role. Default action.
@@ -184,12 +184,11 @@ pub struct CanonicalRule {
     /// Trimmed user comment.
     pub comment: String,
     /// Per-rule enforcement action (route vs. hard block). Defaults to
-    /// [`RuleAction::Route`]; not part of the canonical sort key.
+    /// [`RuleAction::Route`].
     pub action: RuleAction,
     /// Who authored the rule; `None` means the user did. Carried through
-    /// validation unchanged and **not** part of the canonical sort key —
-    /// provenance must never move a rule within the deterministic order, or
-    /// annotating a rule would reshuffle the content hash of its neighbours.
+    /// validation unchanged, and the last tie-breaker of the canonical order:
+    /// it only decides between rules identical in everything else.
     pub origin: Option<crate::RuleOrigin>,
 }
 
@@ -200,7 +199,9 @@ impl CanonicalRule {
     /// does **not** reflect runtime evaluation priority, which is configurable for
     /// Zone vs ExactIp (see `ZonePriorityPolicy`):
     /// `ExactFqdn(0) < SuffixDomain(1) < Zone(2) < ExactIp(3) < Application(4)`.
-    /// Within each group, the match value string is used for lexicographic ordering.
+    /// Within each group, the match value string is used for lexicographic
+    /// ordering. Not total on its own — [`CanonicalRuleSet::from_rules`] adds
+    /// the tie-breaker.
     pub(crate) fn sort_key(&self) -> (u8, String) {
         match &self.address_match {
             Some(m) => {
@@ -222,13 +223,53 @@ impl CanonicalRule {
             }
         }
     }
+
+    /// Orders two rules [`sort_key`](Self::sort_key) cannot tell apart.
+    ///
+    /// Total over every field the canonical bytes carry: rules equal here
+    /// serialize identically, so no tie is left to input order — which is what
+    /// made the same book, re-sorted in the GUI table, hash as a new revision.
+    fn tie_break(&self, other: &Self) -> core::cmp::Ordering {
+        fn app(rule: &CanonicalRule) -> Option<(u8, &str, bool)> {
+            rule.app_match.as_ref().map(|m| {
+                let kind = match m.pattern {
+                    CanonicalAppPattern::Exact(_) => 0u8,
+                    CanonicalAppPattern::Glob(_) => 1u8,
+                };
+                (kind, m.pattern.as_str(), m.include_child_processes)
+            })
+        }
+        fn action(rule: &CanonicalRule) -> u8 {
+            match rule.action {
+                RuleAction::Route => 0,
+                RuleAction::Block => 1,
+            }
+        }
+        fn origin(rule: &CanonicalRule) -> Option<(&str, &str, &str)> {
+            rule.origin.as_ref().map(|o| match o {
+                crate::RuleOrigin::Auto {
+                    reason,
+                    anchor,
+                    added,
+                } => (reason.as_slug(), anchor.as_str(), added.as_str()),
+            })
+        }
+        app(self)
+            .cmp(&app(other))
+            .then_with(|| action(self).cmp(&action(other)))
+            .then_with(|| self.enabled.cmp(&other.enabled))
+            .then_with(|| self.id.0.cmp(&other.id.0))
+            .then_with(|| self.comment.cmp(&other.comment))
+            .then_with(|| origin(self).cmp(&origin(other)))
+    }
 }
 
 /// Canonically ordered collection of routing rules for one route role.
 ///
 /// Rules are stored in the fixed canonical order described in the module
 /// documentation: ExactFqdn → SuffixDomain → Zone → ExactIp → Application,
-/// then lexicographically by value within each group.
+/// then lexicographically by value within each group, then by the remaining
+/// fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CanonicalRuleSet {
     rules: Vec<CanonicalRule>,
@@ -244,9 +285,16 @@ impl CanonicalRuleSet {
     /// sanctioned path: rules MUST go through `from_rules` so the
     /// canonical-order invariant cannot be broken by hand-crafting a
     /// `CanonicalRuleSet { rules: ... }` from outside the crate.
-    pub fn from_rules(mut rules: Vec<CanonicalRule>) -> Self {
-        rules.sort_by_key(|r| r.sort_key());
-        Self { rules }
+    pub fn from_rules(rules: Vec<CanonicalRule>) -> Self {
+        // The primary key allocates, so it is built once per rule rather than
+        // once per comparison.
+        let mut keyed: Vec<((u8, String), CanonicalRule)> =
+            rules.into_iter().map(|r| (r.sort_key(), r)).collect();
+        // Total order, so stability buys nothing: equal rules are identical.
+        keyed.sort_unstable_by(|(ka, a), (kb, b)| ka.cmp(kb).then_with(|| a.tie_break(b)));
+        Self {
+            rules: keyed.into_iter().map(|(_, r)| r).collect(),
+        }
     }
 
     /// All rules in canonical order.
@@ -563,6 +611,71 @@ mod tests {
             CanonicalRuleSet::from_rules(rules_a),
             CanonicalRuleSet::from_rules(rules_b),
         );
+    }
+
+    /// Rules sharing one match value used to keep their arrival order, so the
+    /// same book re-sorted in the GUI serialized — and hashed — differently.
+    #[test]
+    fn rules_sharing_a_match_value_order_the_same_from_any_arrival_order() {
+        let with_app = |id: &str, app: &str, children: bool| CanonicalRule {
+            app_match: Some(CanonicalAppMatch {
+                pattern: CanonicalAppPattern::Exact(app.to_string()),
+                include_child_processes: children,
+            }),
+            ..exact_fqdn_rule(id, "example.com")
+        };
+        let mut glob = with_app("r-g", "chrome.exe", false);
+        glob.app_match = Some(CanonicalAppMatch {
+            pattern: CanonicalAppPattern::Glob("chrome.exe".to_string()),
+            include_child_processes: false,
+        });
+        let mut blocked = exact_fqdn_rule("r-b", "example.com");
+        blocked.action = RuleAction::Block;
+        let mut disabled = exact_fqdn_rule("r-d", "example.com");
+        disabled.enabled = false;
+        let mut commented = exact_fqdn_rule("r-1", "example.com");
+        commented.comment = "note".to_string();
+        let mut authored = exact_fqdn_rule("r-1", "example.com");
+        authored.origin = Some(crate::RuleOrigin::auto(
+            nrr_shared::AutoRuleReason::SiteCompanion,
+            "anchor.example",
+            "2026-09-01",
+        ));
+        let rules = vec![
+            exact_fqdn_rule("r-1", "example.com"),
+            exact_fqdn_rule("r-2", "example.com"),
+            with_app("r-a", "chrome.exe", false),
+            with_app("r-c", "chrome.exe", true),
+            glob,
+            blocked,
+            disabled,
+            commented,
+            authored,
+        ];
+        let expected = CanonicalRuleSet::from_rules(rules.clone());
+        // Every rotation and its reverse: enough to move each rule to every
+        // position without the factorial.
+        for shift in 0..rules.len() {
+            let mut rotated = rules.clone();
+            rotated.rotate_left(shift);
+            assert_eq!(CanonicalRuleSet::from_rules(rotated.clone()), expected);
+            rotated.reverse();
+            assert_eq!(CanonicalRuleSet::from_rules(rotated), expected);
+        }
+        // Address order still leads; the tie-breaker never reaches across it.
+        let set = CanonicalRuleSet::from_rules(vec![
+            exact_fqdn_rule("r-z", "b.example"),
+            blocked_fqdn("r-a", "a.example"),
+        ]);
+        let ids: Vec<&str> = set.rules().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["r-a", "r-z"]);
+    }
+
+    fn blocked_fqdn(id: &str, label: &str) -> CanonicalRule {
+        CanonicalRule {
+            action: RuleAction::Block,
+            ..exact_fqdn_rule(id, label)
+        }
     }
 
     #[test]

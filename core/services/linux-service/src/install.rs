@@ -48,6 +48,13 @@ pub fn install_service() -> ExitCode {
 pub fn uninstall_service() -> ExitCode {
     match LinuxServiceControl::new().uninstall(&ServiceUninstallSpec::keep_data()) {
         Ok(_) => {
+            // Stopping the unit ran its stop hook; a daemon already dead
+            // without one would leave the machine's DNS on a gone listener.
+            if let Some(data_dir) = nrr_platform_api::paths::production_data_root() {
+                if let Err(reason) = crate::dns_stack::clear_dns_redirect(&data_dir) {
+                    eprintln!("could not give the machine's DNS back: {reason}");
+                }
+            }
             println!("Uninstalled '{SYSTEMD_UNIT_NAME}'.");
             ExitCode::SUCCESS
         }

@@ -175,6 +175,7 @@ impl AutoRulesEngine {
                 applied: 0,
                 unknown,
                 pending: self.pending_count(sid),
+                anchor_skipped: false,
             });
         }
         let author = self.author.get().ok_or_else(|| {
@@ -191,17 +192,18 @@ impl AutoRulesEngine {
             .map(PendingCandidate::authored_rule)
             .collect();
         let correlation = format!("auto-rules-accept-{}", unix_ms(now));
-        match author.author(
+        match author.author_with_outcome(
             sid,
             &AutoRuleReason::UserConfirmed,
             &rules,
             now,
             &correlation,
         ) {
-            Ok(_) => {
+            Ok(outcome) => {
                 self.remember_authored(sid, &selected);
                 tracing::info!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-inbox-accepted",
                     sid = %sid,
                     accepted = selected.len(),
                     anchor = %top_anchor(&selected),
@@ -211,6 +213,7 @@ impl AutoRulesEngine {
                     applied: selected.len() as u32,
                     unknown,
                     pending: self.pending_count(sid),
+                    anchor_skipped: outcome.anchor_skipped,
                 })
             }
             Err(e) => {
@@ -220,6 +223,7 @@ impl AutoRulesEngine {
                 self.park(sid, selected, unix_ms(now));
                 tracing::warn!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-inbox-accept-failed",
                     sid = %sid,
                     code = %e.code,
                     "could not add the accepted addresses: {}",
@@ -239,6 +243,7 @@ impl AutoRulesEngine {
                 applied: 0,
                 unknown,
                 pending: self.pending_count(sid),
+                anchor_skipped: false,
             };
         }
         let records: Vec<AutoRuleDismissal> =
@@ -253,6 +258,7 @@ impl AutoRulesEngine {
         }
         tracing::info!(
             target: "nrr::auto-rules",
+            msg_key = "autorules-inbox-dismissed",
             sid = %sid,
             dismissed = selected.len(),
             anchor = %top_anchor(&selected),
@@ -262,6 +268,7 @@ impl AutoRulesEngine {
             applied: selected.len() as u32,
             unknown,
             pending: self.pending_count(sid),
+            anchor_skipped: false,
         }
     }
 
@@ -332,6 +339,7 @@ impl AutoRulesEngine {
         if restored > 0 {
             tracing::info!(
                 target: "nrr::auto-rules",
+                msg_key = "autorules-inbox-restored",
                 sid = %sid,
                 restored,
                 re_offered,
@@ -342,6 +350,7 @@ impl AutoRulesEngine {
             applied: restored,
             unknown,
             pending: self.pending_count(sid),
+            anchor_skipped: false,
         }
     }
 
@@ -386,6 +395,7 @@ impl AutoRulesEngine {
         if forgotten > 0 {
             tracing::info!(
                 target: "nrr::auto-rules",
+                msg_key = "autorules-inbox-erased",
                 sid = %sid,
                 forgotten,
                 "user erased suggestions — they may be offered again from scratch",
@@ -395,6 +405,7 @@ impl AutoRulesEngine {
             applied: forgotten,
             unknown: (ids.len() as u32).saturating_sub(forgotten),
             pending: self.pending_count(sid),
+            anchor_skipped: false,
         }
     }
 

@@ -542,21 +542,72 @@ fn without_a_scope_classifier_every_drop_reads_as_destination_scoped() {
     assert_eq!(summary.killswitch_drops_live_secondary_dest_scope(), 1);
 }
 
+fn established(
+    local: SocketAddrV4,
+    remote_port: u16,
+    owner: Option<&str>,
+) -> nrr_platform_api::fake_ip::stale_flows::EstablishedFlow {
+    nrr_platform_api::fake_ip::stale_flows::EstablishedFlow {
+        local,
+        remote: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 50), remote_port),
+        owner: owner.map(str::to_owned),
+    }
+}
+
 #[test]
 fn destination_scoped_drop_with_live_secondary_tears_the_stale_flow_down() {
-    // One /32 sweep per victim address, however often it is re-observed.
     let reset = Arc::new(nrr_platform_api::fake_ip::stale_flows::MockStaleFlowReset::new());
+    // The dropped socket itself, unattributed; and another user's connection
+    // to the same address, which the pin is not about.
+    let dropped = established(
+        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 51000),
+        1194,
+        None,
+    );
+    reset.set_flows(vec![
+        dropped.clone(),
+        established(
+            SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 51001),
+            443,
+            Some("S-1-5-21-1-2-3-1002"),
+        ),
+    ]);
     let consumer = test_consumer_with_live_secondary()
         .with_killswitch_app_scope_check(Arc::new(|_| false))
         .with_stale_flow_reset(Arc::clone(&reset) as Arc<dyn StaleFlowReset>);
 
-    // The same stalled flow observed twice in one batch sweeps once.
+    // The same stalled flow observed twice in one batch reads the table once.
     consumer.consume(
         &[vpn_drop_obs(Some(80122)), vpn_drop_obs(Some(80122))],
         SystemTime::now(),
     );
 
-    assert_eq!(reset.calls(), vec![(Ipv4Addr::new(203, 0, 113, 50), 32)]);
+    assert_eq!(reset.queried(), vec![Ipv4Addr::new(203, 0, 113, 50)]);
+    assert_eq!(reset.reset_flows(), vec![dropped]);
+}
+
+/// The pin is its owner's, so the owner's other sockets to the address go
+/// with the dropped one; another user's and an unattributed one stay.
+#[test]
+fn a_pin_drop_tears_down_its_owners_connections_only() {
+    const OWNER: &str = "S-1-5-21-1-2-3-1001";
+    let reset = Arc::new(nrr_platform_api::fake_ip::stale_flows::MockStaleFlowReset::new());
+    let local = |port| SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), port);
+    let sibling = established(local(52000), 443, Some("s-1-5-21-1-2-3-1001"));
+    reset.set_flows(vec![
+        sibling.clone(),
+        established(local(52001), 443, Some("S-1-5-21-1-2-3-1002")),
+        established(local(52002), 443, None),
+    ]);
+    let consumer = test_consumer_with_live_secondary()
+        .with_killswitch_app_scope_check(Arc::new(|_| false))
+        .with_stale_flow_reset(Arc::clone(&reset) as Arc<dyn StaleFlowReset>);
+    let mut obs = vpn_drop_obs(Some(80122));
+    obs.user_sid = Some(OWNER.to_owned());
+
+    consumer.consume(&[obs], SystemTime::now());
+
+    assert_eq!(reset.reset_flows(), vec![sibling]);
 }
 
 #[test]
@@ -570,7 +621,7 @@ fn app_scoped_drop_with_live_secondary_is_not_torn_down() {
 
     consumer.consume(&[vpn_drop_obs(Some(80122))], SystemTime::now());
 
-    assert!(reset.calls().is_empty());
+    assert!(reset.queried().is_empty());
 }
 
 #[test]
@@ -583,7 +634,7 @@ fn a_drop_with_an_unresolved_secondary_is_never_torn_down() {
 
     consumer.consume(&[vpn_drop_obs(Some(80122))], SystemTime::now());
 
-    assert!(reset.calls().is_empty());
+    assert!(reset.queried().is_empty());
 }
 
 #[test]
@@ -780,7 +831,7 @@ fn p2p_processes_suppress_fcrdns_learning_others_do_not() {
     // A torrent client's dropped peers must be skipped;
     // a browser's drop (the legit forward-confirmed service case) must not.
     assert!(process_is_p2p_fcrdns_suppressed(Some(
-        r"\device\harddiskvolume5\users\krox\appdata\roaming\bittorrent web\btweb.exe"
+        r"\device\harddiskvolume5\users\alice\appdata\roaming\bittorrent web\btweb.exe"
     )));
     assert!(process_is_p2p_fcrdns_suppressed(Some(
         r"C:\Program Files\qBittorrent\qbittorrent.exe"
@@ -996,15 +1047,17 @@ fn block_notice_consumer(
     let mut consumer = ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
         .with_block_notice(
             Arc::new(|_ip| None),
-            Arc::new(move |_sid: &str, attempt: BlockAttempt| {
-                let mut g = sink_ledger.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(notice) = g.record(0, &attempt) {
-                    sink_notices
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .push(notice);
-                }
-            }),
+            Arc::new(
+                move |_sid: &str, attempt: BlockAttempt, _seen_at: Option<u64>| {
+                    let mut g = sink_ledger.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(notice) = g.record(0, &attempt) {
+                        sink_notices
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(notice);
+                    }
+                },
+            ),
         );
     if let Some(check) = killswitch_check {
         consumer = consumer.with_killswitch_drop_check(check);
@@ -1098,12 +1151,14 @@ fn raw_attempt_consumer(
     let consumer = ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
         .with_block_notice(
             Arc::new(|_ip| None),
-            Arc::new(move |_sid: &str, attempt: BlockAttempt| {
-                sink_attempts
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(attempt);
-            }),
+            Arc::new(
+                move |_sid: &str, attempt: BlockAttempt, _seen_at: Option<u64>| {
+                    sink_attempts
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(attempt);
+                },
+            ),
         )
         .with_killswitch_drop_check(Arc::new(|id| id == 777))
         .with_fail_closed_armed(Arc::new(move || armed));
@@ -1359,6 +1414,25 @@ fn a_connection_the_stack_reported_up_and_closed_in_order_counts_as_working() {
     );
 }
 
+/// Unanswered peers are a torrent client's normal day; offering it for the
+/// tunnel on their account would be noise.
+#[test]
+fn a_peer_to_peer_program_is_not_measured_for_an_offer() {
+    let (consumer, seen) = test_consumer_on_both_links();
+    let torrent = |progress| ConnectionObservation {
+        process_path: Some(r"\device\harddiskvolume2\btweb.exe".to_string()),
+        ..over_the_main_link(ConnectionVerdict::Unknown, progress)
+    };
+    consumer.consume(
+        &[
+            torrent(ConnectionProgress::Attempt),
+            torrent(ConnectionProgress::ClosedInOrder),
+        ],
+        SystemTime::now(),
+    );
+    assert!(seen.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+}
+
 /// A filter classify fires before the handshake, so it must not make the
 /// close of a connection that never came up read as "this host answers".
 #[test]
@@ -1375,4 +1449,39 @@ fn a_filter_classify_is_not_an_establishment() {
         SystemTime::now(),
     );
     assert!(seen.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+}
+
+/// A browser whose routed sites already go through the tunnel is split across
+/// both links; the measure must hear about that half to leave it alone.
+#[test]
+fn a_program_leaving_over_the_additional_link_is_reported_as_split() {
+    let (consumer, _) = test_consumer_on_both_links();
+    let split: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&split);
+    let consumer = consumer.with_app_additional_link(Arc::new(move |program| {
+        sink.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(program.to_string());
+    }));
+    // Positive control: the same program on the main link says nothing here.
+    consumer.consume(
+        &[over_the_main_link(
+            ConnectionVerdict::Unknown,
+            ConnectionProgress::Attempt,
+        )],
+        SystemTime::now(),
+    );
+    assert!(split.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+
+    consumer.consume(
+        &[obs(
+            Ipv4Addr::new(10, 88, 1, 41),
+            Ipv4Addr::new(203, 0, 113, 9),
+        )],
+        SystemTime::now(),
+    );
+    assert_eq!(
+        *split.lock().unwrap_or_else(|p| p.into_inner()),
+        vec!["chrome.exe".to_string()]
+    );
 }

@@ -348,6 +348,7 @@ impl SqliteFqdnCacheLookup {
             Err(_) => {
                 tracing::warn!(
                     target: "nrr::wfp-codegen",
+                    msg_key = "fqdncache-mutex-poisoned-ips",
                     "fqdn cache mutex poisoned; treating as cold for ips_for_hostname"
                 );
                 return Vec::new();
@@ -383,6 +384,7 @@ impl SqliteFqdnCacheLookup {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::wfp-codegen",
+                    msg_key = "fqdncache-lookup-failed",
                     error = %e,
                     hostname = %hostname,
                     "fqdn cache lookup failed; treating as cold"
@@ -426,6 +428,7 @@ impl FqdnCacheLookup for SqliteFqdnCacheLookup {
             Err(_) => {
                 tracing::warn!(
                     target: "nrr::wfp-codegen",
+                    msg_key = "fqdncache-mutex-poisoned-suffix",
                     "fqdn cache mutex poisoned; treating suffix lookup as cold"
                 );
                 return Vec::new();
@@ -436,6 +439,7 @@ impl FqdnCacheLookup for SqliteFqdnCacheLookup {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::wfp-codegen",
+                    msg_key = "fqdncache-suffix-lookup-failed",
                     error = %e,
                     suffix = %suffix,
                     "list_hostnames_under_suffix failed; treating as cold"
@@ -528,6 +532,7 @@ impl FqdnCacheSnapshot {
             Err(_) => {
                 tracing::warn!(
                     target: "nrr::wfp-codegen",
+                    msg_key = "fqdncache-mutex-poisoned-snapshot",
                     "fqdn cache mutex poisoned; taking an empty snapshot"
                 );
                 return Self::empty();
@@ -546,6 +551,7 @@ impl FqdnCacheSnapshot {
             }
             Err(e) => tracing::warn!(
                 target: "nrr::wfp-codegen",
+                msg_key = "fqdncache-snapshot-failed",
                 error = %e,
                 "fqdn cache snapshot failed; treating as cold"
             ),

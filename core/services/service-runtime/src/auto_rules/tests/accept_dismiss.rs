@@ -13,6 +13,7 @@ fn accepting_authors_with_the_user_confirmed_reason_and_clears_the_offer() {
     assert_eq!(outcome.applied, 1);
     assert_eq!(outcome.unknown, 0);
     assert_eq!(outcome.pending, 0);
+    assert!(!outcome.anchor_skipped);
 
     let calls = f.author.calls();
     assert_eq!(calls.len(), 1);
@@ -23,6 +24,21 @@ fn accepting_authors_with_the_user_confirmed_reason_and_clears_the_offer() {
     let again = f.engine.tick(SID, later());
     assert_eq!(again.parked, 0);
     assert!(f.engine.candidates(SID).is_empty());
+}
+
+/// The caller learns when the page the offer came from still needs a reload.
+#[test]
+fn accepting_reports_an_anchor_the_author_could_not_refresh() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.tick(SID, later());
+    let ids: Vec<String> = f.engine.candidates(SID).into_iter().map(|c| c.id).collect();
+    f.author.leave_anchor();
+
+    let outcome = f.engine.accept(SID, &ids, later()).expect("accept");
+
+    assert_eq!(outcome.applied, 1);
+    assert!(outcome.anchor_skipped);
 }
 
 #[test]

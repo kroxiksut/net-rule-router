@@ -241,6 +241,9 @@ pub enum RoutePolicyWriteError {
     /// `mode = strict-secondary-fail-closed` but `secondary` is
     /// `None`. Handler maps to `IpcErrorCode::PreconditionFailed`.
     StrictModeRequiresSecondary,
+    /// The short-name domain is not a usable DNS domain. Handler maps to
+    /// `IpcErrorCode::PreconditionFailed`.
+    InvalidNetworkDomain,
     /// Storage layer reported an error. Handler maps to
     /// `IpcErrorCode::Internal`.
     Storage(String),
@@ -265,6 +268,9 @@ impl std::fmt::Display for RoutePolicyWriteError {
                 f,
                 "strict-secondary-fail-closed mode requires a bound secondary"
             ),
+            Self::InvalidNetworkDomain => {
+                write!(f, "the short-name domain is not a valid DNS domain")
+            }
             Self::Storage(m) => write!(f, "storage write failed: {m}"),
         }
     }
@@ -494,8 +500,9 @@ pub trait AutostartProvider: Send + Sync {
 /// Writer for the autostart configuration. Production impl wraps
 /// `nrr_platform_api::autostart::AutostartHelper::set_enabled` /
 /// `clear` and persists the result via `AutostartStateRepository::set`.
+/// `sid` is the caller: the change is announced to them and nobody else.
 pub trait AutostartWriter: Send + Sync {
-    fn toggle(&self, enabled: bool) -> Result<AutostartDto, SettingsWriteError>;
+    fn toggle(&self, sid: &str, enabled: bool) -> Result<AutostartDto, SettingsWriteError>;
 }
 
 // ── Service stability config ────────────────────────────────────────────────

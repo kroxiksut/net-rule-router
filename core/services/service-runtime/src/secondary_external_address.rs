@@ -315,6 +315,7 @@ impl ExternalAddressAnnouncer {
             }
             tracing::info!(
                 target: "nrr::interfaces",
+                msg_key = "secext-probe-no-address",
                 sid = %link.sid,
                 adapter = %link.adapter_name,
                 attempt = entry.attempts,
@@ -341,6 +342,7 @@ impl ExternalAddressAnnouncer {
 
         tracing::info!(
             target: "nrr::interfaces",
+            msg_key = "secext-observed",
             sid = %link.sid,
             adapter = %link.adapter_name,
             "external address of the additional route observed after it connected — telling the user",

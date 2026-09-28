@@ -189,6 +189,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 Err(e) => {
                     tracing::warn!(
                         target: "nrr::runtime",
+                        msg_key = "svc-ipc-diagnostics-cache-open-failed",
                         error = %e,
                         path = %path.display(),
                         "diagnostics facade: cache connection open failed; \
@@ -453,12 +454,14 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                                 {
                                     Ok(()) => tracing::info!(
                                         target: "nrr::fake-ip",
+                                        msg_key = "svc-ipc-fakeip-dns-flush-ok",
                                         enabled = req.desired,
                                         reason = %reason,
                                         "flushed OS DNS resolver cache after fake-IP transition",
                                     ),
                                     Err(e) => tracing::warn!(
                                         target: "nrr::fake-ip",
+                                        msg_key = "svc-ipc-fakeip-dns-flush-failed",
                                         error = ?e,
                                         enabled = req.desired,
                                         reason = %reason,
@@ -661,11 +664,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 ));
             let seeder = Arc::new(
                 nrr_service_runtime::browser_history_seeder::BrowserHistorySeeder::new(
-                    history,
-                    rules,
-                    Arc::clone(&active_sid),
-                    resolver,
-                    cache,
+                    history, rules, resolver, cache,
                 ),
             );
             deps = deps.with_browser_history_seeder(Arc::clone(&seeder));
@@ -699,9 +698,13 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                             if enabled {
                                 tracing::info!(
                                     target: "nrr::browser-history",
+                                    msg_key = "svc-ipc-browser-history-autoseed-run",
                                     "auto-seed opt-in enabled — running boot browser-history seed",
                                 );
-                                let _ = seeder.seed(std::time::SystemTime::now());
+                                // A manual import already running covers it.
+                                if let Some(run) = seeder.try_begin(&sid) {
+                                    let _ = run.run(std::time::SystemTime::now());
+                                }
                             }
                             // SID resolved and the opt-in was consulted — done
                             // either way (one boot pass, not a periodic loop).
@@ -711,6 +714,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 if let Err(e) = spawned {
                     tracing::warn!(
                         target: "nrr::browser-history",
+                        msg_key = "svc-ipc-browser-history-autoseed-spawn-failed",
                         error = %e,
                         "could not spawn boot browser-history auto-seed worker",
                     );

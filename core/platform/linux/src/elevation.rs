@@ -104,6 +104,14 @@ pub fn run_pkexec(helper: &Path, args: &[String]) -> ElevationOutcome {
     }
 }
 
+/// Whether this process already runs with root's rights.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub fn running_as_root() -> bool {
+    // SAFETY: `geteuid` takes no arguments, cannot fail, and touches no memory.
+    unsafe { libc::geteuid() == 0 }
+}
+
 /// The Linux answer to "run this one command again with administrator rights".
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PkexecRelaunch;

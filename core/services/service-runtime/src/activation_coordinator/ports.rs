@@ -125,13 +125,17 @@ pub enum ActivationAuditEvent {
         revision_id: String,
         sid_failures: Vec<(String, String)>,
     },
+    // `principal` on the terminal transitions is whose revision it is — the
+    // status push is addressed to them, or to everyone for the baseline.
     RevisionActivated {
+        principal: String,
         revision_id: String,
         previous_revision_id: Option<String>,
         succeeded_sids: Vec<String>,
         drift_sids: Vec<(String, String)>,
     },
     RevisionRejected {
+        principal: String,
         revision_id: String,
         reason: String,
         sid_failures: Vec<(String, String)>,
@@ -141,6 +145,7 @@ pub enum ActivationAuditEvent {
         correlation_id: String,
     },
     RolledBack {
+        principal: String,
         from_revision_id: String,
         to_revision_id: String,
     },

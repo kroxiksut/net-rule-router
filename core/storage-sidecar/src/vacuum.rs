@@ -1,31 +1,29 @@
 //! Startup VACUUM throttle for the sidecar database.
 //!
-//! Comments and passthrough are sparse, but `pending_apply` can hold a
-//! multi-megabyte `rules_json` blob and SQLite never gives space back
-//! after a DELETE without a VACUUM. Over many import/discard cycles
-//! the file can grow much larger than the live data.
+//! SQLite never gives space back after a DELETE without a VACUUM. The live
+//! data is small (sparse comments, passthrough sections, a one-row park
+//! marker), but every re-import rewrites passthrough bodies of up to 1 MiB, so
+//! freed pages accumulate over many import cycles.
 //!
 //! Strategy:
 //!
-//! * VACUUM is checked once during `SidecarDb::open` (i.e. once per
-//!   GUI launch). It is deliberately not periodic — the sidecar is
-//!   small enough that startup is the right time to absorb the cost.
-//! * We only vacuum when the file is **above the size threshold**
-//!   AND we haven't vacuumed within the last [`VACUUM_MIN_INTERVAL_MS`].
-//!   Both gates must hold; either alone would either be too aggressive
-//!   (every launch on a moderately-sized DB) or too lazy (DB grows
-//!   unbounded for users who launch rarely).
-//! * The throttle timestamp lives in the `db_state` single-row table.
+//! * Checked once per `SidecarDb::open` — deliberately not periodic.
+//! * Runs only when the file is **above the size threshold** AND the last
+//!   VACUUM is older than [`SIDECAR_VACUUM_MIN_INTERVAL_MS`]; either gate
+//!   alone is too aggressive or too lazy.
+//! * The throttle timestamp lives in the single-row `db_state` table.
 //!
-//! VACUUM in SQLite cannot run inside a transaction and rewrites the
-//! whole file. Since `SidecarDb` owns the sole connection (and the GUI
-//! is single-instance) we can do this safely on the open path.
+//! Two processes hold this file: the GUI launcher and the tray launcher, each
+//! with its own connection, and the caller holds its sidecar mutex for the
+//! duration. So nothing here may wait on the other process's readers: VACUUM
+//! in WAL mode needs only the write lock, and the checkpoint after it never
+//! blocks (see [`SidecarDb::vacuum_now_at`]).
 
 use std::time::SystemTime;
 
 use rusqlite::{params, OptionalExtension};
 
-use crate::db::SidecarDb;
+use crate::db::{SidecarDb, BUSY_TIMEOUT};
 use crate::error::SidecarResult;
 
 /// File-size threshold above which the startup VACUUM is considered.
@@ -96,24 +94,22 @@ impl SidecarDb {
     /// timestamp for deterministic last-vacuum assertions.
     pub fn vacuum_now_at(&self, now_ms: i64) -> SidecarResult<()> {
         let conn = self.conn_mut();
-        // VACUUM cannot run inside a transaction; `execute_batch`
-        // runs the statement directly. SQLite handles the file
-        // rewrite atomically using its journal.
+        // Outside any transaction; SQLite rewrites the file atomically.
         conn.execute_batch("VACUUM")?;
-        // Update the db_state housekeeping row.
         conn.execute(
             "INSERT INTO db_state (id, last_vacuum_at_ms) VALUES (1, ?1)
              ON CONFLICT(id) DO UPDATE SET last_vacuum_at_ms = excluded.last_vacuum_at_ms",
             params![now_ms],
         )?;
-        // In WAL mode the VACUUM rewrite is itself logged into the
-        // WAL, which can leave the on-disk footprint *larger* than
-        // before VACUUM ran. A TRUNCATE checkpoint flushes the WAL
-        // back into the main DB and resets `.db-wal` to zero bytes,
-        // so the on-disk size actually shrinks afterwards. Without
-        // this step, callers who measure the disk footprint right
-        // after VACUUM would see paradoxical growth.
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        // The rewrite went into the WAL, so the footprint only shrinks once it
+        // is checkpointed and truncated. A TRUNCATE checkpoint waits for every
+        // reader, including the other process's, for the whole busy timeout; with
+        // the handler off it degrades to PASSIVE instead — copies what it can,
+        // truncates when nobody reads, never blocks.
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        let checkpoint = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        checkpoint?;
         Ok(())
     }
 
@@ -261,6 +257,38 @@ mod tests {
         let ran = db.maybe_vacuum_with(256 * 1024, 1_000, T0 + 2_000)?;
         assert!(ran, "vacuum should run again after the interval elapses");
         assert_eq!(db.read_last_vacuum_at_ms()?, T0 + 2_000);
+        Ok(())
+    }
+
+    /// The tray holds its own connection to this file. A TRUNCATE checkpoint
+    /// waited out the whole busy timeout behind the tray's read snapshot, and
+    /// the launcher held its sidecar mutex all that time — every `sidecar.*`
+    /// request stalled.
+    #[test]
+    fn a_reader_in_the_other_process_does_not_stall_the_vacuum() -> SidecarResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = open_sidecar(&tmp)?;
+        inflate_then_free(&db, 300 * 1024)?;
+
+        let tray = rusqlite::Connection::open(db.path())?;
+        tray.execute_batch("BEGIN")?;
+        let _: i64 = tray.query_row("SELECT COUNT(*) FROM external_ip_cache", [], |r| r.get(0))?;
+
+        let started = std::time::Instant::now();
+        db.vacuum_now_at(T0)?;
+        let took = started.elapsed();
+        tray.execute_batch("COMMIT")?;
+
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "vacuum waited {took:?} behind a reader"
+        );
+        assert_eq!(db.read_last_vacuum_at_ms()?, T0);
+        // The busy timeout the rest of the session relies on is back.
+        let timeout_ms: i64 = db
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+        assert_eq!(timeout_ms, 5_000);
         Ok(())
     }
 

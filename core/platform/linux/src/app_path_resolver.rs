@@ -1,16 +1,12 @@
 //! Linux mechanism behind
 //! [`nrr_platform_api::app_path_resolver::AppPathResolver`].
 //!
-//! ## The `.exe` the neutral layer guarantees
+//! ## The `.exe` a name may still carry
 //!
-//! `nrr-domain` normalises every application name to a lowercase file name with
-//! a `.exe` suffix, on every OS. That is not an accident to route around: both
-//! sides of a match go through the same normaliser, so the key stays
-//! self-consistent and one canonical spelling survives a rules file moving
-//! between machines. The suffix only stops being true at the one place a name
-//! meets a real filesystem — here. So this backend strips it before looking,
-//! which is exactly what a mechanism layer is for: the neutral key in, this
-//! OS's reality out.
+//! A Linux rule is stored as the process is named, but one stored before
+//! `.exe` became Windows-only, or typed with it, still reads `telegram.exe`.
+//! This backend strips the suffix before looking, so both spellings find the
+//! same file — and a genuinely `.exe`-named Wine program is tried as written.
 //!
 //! ## Where it looks
 //!
@@ -200,7 +196,7 @@ mod tests {
 
     #[test]
     fn the_neutral_exe_suffix_is_stripped_for_the_lookup() {
-        // The neutral layer guarantees `.exe`; on disk the file is `messenger`.
+        // Stored with the Windows spelling; on disk the file is `messenger`.
         let patterns = candidate_patterns("messenger.exe");
         assert_eq!(patterns.first().map(String::as_str), Some("messenger"));
         // The original spelling stays as a fallback for a Wine-launched app.
@@ -242,9 +238,8 @@ mod tests {
         }
     }
 
-    /// The live half: every Linux host has a shell on `$PATH`, and the neutral
-    /// layer would name it `sh.exe`. Resolving that to a real executable is the
-    /// whole point of this backend.
+    /// The live half: every Linux host has a shell on `$PATH`, and a rule
+    /// stored with the Windows spelling names it `sh.exe`.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_real_executable_resolves_through_the_neutral_spelling() {

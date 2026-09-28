@@ -2,15 +2,13 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import "../components"
 import "../theme"
 import "../lib/pure.js" as Pure
 
-// FQDN/IP cache viewer, moved out of DiagnosticsSection into its own window.
-// It is a working surface — search, filter, group, copy — read beside the rules
-// table rather than inside a section that cannot be open at the same time.
-// Owns its state: the section lives in a lazy Loader and does not exist until
-// Diagnostics has been opened once.
-Window {
+// FQDN/IP cache: its actions and the entries viewer. The Loader keeps it
+// resident once opened, so search and filters survive a trip elsewhere.
+ScrollView {
 
     // Draggable column-resize grip for the cache table header. Sits
     // on the LEFT edge of a fixed-width column; dragging it emits an incremental
@@ -53,24 +51,19 @@ Window {
             }
         }
     }
-    id: cacheWindow
+    id: section
+    property var root
+    clip: true
+    Layout.fillWidth: true
+    Layout.fillHeight: true
+    contentWidth: availableWidth
 
-    property var root: null
-
-    width: 1180
-    height: 760
-    visible: false
-    modality: Qt.NonModal
-    color: root ? root.panelColor : "transparent"
-    title: root ? root.tr("diag.cache.window-title", "Cache") : ""
-    transientParent: root
-    flags: Qt.Dialog
-    onVisibleChanged: if (visible) { root.centerChildWindow(cacheWindow); root.applyTitleBarTo(cacheWindow) }
-
-    // The window owns its column widths, so it is also what restores them. The
-    // call used to sit in the section that hosted the table; left there after
-    // the split it named a function this file declares and the section does not.
-    Component.onCompleted: cacheWindow._loadCacheColWidths()
+    Component.onCompleted: {
+        section._loadCacheColWidths()
+        section._loadCacheEntries(true)
+    }
+    // Coming back shows what the cache holds now, not what it held then.
+    onVisibleChanged: if (visible) section._loadCacheEntries(true)
 
     property var _cacheEntries: []
     property string _cacheEntriesCursor: ""
@@ -90,7 +83,7 @@ Window {
         if (typeof root._readServiceMirror === "function") {
             var stability = root._readServiceMirror()["stability"] || {}
             if (stability["fake-ip-enabled"] !== undefined)
-                cacheWindow._fakeIpEnabled = stability["fake-ip-enabled"] === true
+                section._fakeIpEnabled = stability["fake-ip-enabled"] === true
         }
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
         if (!root.serviceStabilitySupported || !root.bridgeAvailable || bridge === null
@@ -99,10 +92,10 @@ Window {
         var corr = bridge.rpcServiceStabilityConfigGet()
         root.rpc.registerRpcCallback(corr, function(ok, payload) {
             if (!ok) return
-            cacheWindow._fakeIpEnabled = (payload && payload["fake-ip-enabled"]) === true
+            section._fakeIpEnabled = (payload && payload["fake-ip-enabled"]) === true
             if (typeof root._rememberServiceValues === "function")
                 root._rememberServiceValues("stability",
-                    { "fake-ip-enabled": cacheWindow._fakeIpEnabled })
+                    { "fake-ip-enabled": section._fakeIpEnabled })
         })
     }
     // TASK A (in-table classic copy) — direct row selection for the cache table.
@@ -123,54 +116,54 @@ Window {
     property int _cacheSelAnchor: -1
     property int _cacheSelRev: 0
     function _cacheRowSelected(g) {
-        return cacheWindow._cacheSelRev >= 0 && g !== undefined
-            && cacheWindow._cacheSel.indexOf(g) !== -1
+        return section._cacheSelRev >= 0 && g !== undefined
+            && section._cacheSel.indexOf(g) !== -1
     }
     function _cacheSelectedCount() {
-        var model = cacheWindow._cacheRendered
+        var model = section._cacheRendered
         var n = 0
-        for (var i = 0; cacheWindow._cacheSelRev >= 0 && i < model.length; i++)
-            if (cacheWindow._cacheSel.indexOf(model[i]) !== -1) n++
+        for (var i = 0; section._cacheSelRev >= 0 && i < model.length; i++)
+            if (section._cacheSel.indexOf(model[i]) !== -1) n++
         return n
     }
     function _selectCacheRow(index, g, ctrl, shift) {
-        var model = cacheWindow._cacheRendered
-        if (shift && cacheWindow._cacheSelAnchor >= 0
-                && cacheWindow._cacheSelAnchor < model.length) {
-            var lo = Math.min(cacheWindow._cacheSelAnchor, index)
-            var hi = Math.max(cacheWindow._cacheSelAnchor, index)
-            var next = ctrl ? cacheWindow._cacheSel.slice() : []
+        var model = section._cacheRendered
+        if (shift && section._cacheSelAnchor >= 0
+                && section._cacheSelAnchor < model.length) {
+            var lo = Math.min(section._cacheSelAnchor, index)
+            var hi = Math.max(section._cacheSelAnchor, index)
+            var next = ctrl ? section._cacheSel.slice() : []
             for (var i = lo; i <= hi; i++) {
                 var it = model[i]
                 if (it !== undefined && next.indexOf(it) === -1) next.push(it)
             }
-            cacheWindow._cacheSel = next
+            section._cacheSel = next
         } else if (ctrl) {
-            var arr = cacheWindow._cacheSel.slice()
+            var arr = section._cacheSel.slice()
             var at = arr.indexOf(g)
             if (at === -1) arr.push(g); else arr.splice(at, 1)
-            cacheWindow._cacheSel = arr
-            cacheWindow._cacheSelAnchor = index
+            section._cacheSel = arr
+            section._cacheSelAnchor = index
         } else {
-            cacheWindow._cacheSel = [g]
-            cacheWindow._cacheSelAnchor = index
+            section._cacheSel = [g]
+            section._cacheSelAnchor = index
         }
-        cacheWindow._cacheSelRev++
+        section._cacheSelRev++
     }
     function _clearCacheSelection() {
-        cacheWindow._cacheSel = []
-        cacheWindow._cacheSelAnchor = -1
-        cacheWindow._cacheSelRev++
+        section._cacheSel = []
+        section._cacheSelAnchor = -1
+        section._cacheSelRev++
     }
     // Copy every currently-selected row as TSV, in the DISPLAYED order, reusing
     // the per-row `_cacheGroupTsv` helper (one line per address — lossless, and
     // the same format as the right-click "Copy row").
     function _copyCacheSelected() {
-        var model = cacheWindow._cacheRendered
+        var model = section._cacheRendered
         var lines = []
         for (var i = 0; i < model.length; i++) {
-            if (cacheWindow._cacheSel.indexOf(model[i]) !== -1)
-                lines.push(cacheWindow._cacheGroupTsv(model[i]))
+            if (section._cacheSel.indexOf(model[i]) !== -1)
+                lines.push(section._cacheGroupTsv(model[i]))
         }
         if (lines.length > 0)
             root.copyToClipboard(lines.join("\n"))
@@ -268,13 +261,13 @@ Window {
             function clampW(v, fallback) {
                 if (typeof v !== "number" || !isFinite(v))
                     return fallback
-                return Math.max(cacheWindow._cacheColMinW,
-                    Math.min(cacheWindow._cacheColMaxW, v))
+                return Math.max(section._cacheColMinW,
+                    Math.min(section._cacheColMaxW, v))
             }
-            cacheWindow._cacheColIpW = clampW(obj.ip, cacheWindow._cacheColIpW)
-            cacheWindow._cacheColFreshW = clampW(obj.freshness, cacheWindow._cacheColFreshW)
-            cacheWindow._cacheColSourceW = clampW(obj.source, cacheWindow._cacheColSourceW)
-            cacheWindow._cacheColRouteW = clampW(obj.route, cacheWindow._cacheColRouteW)
+            section._cacheColIpW = clampW(obj.ip, section._cacheColIpW)
+            section._cacheColFreshW = clampW(obj.freshness, section._cacheColFreshW)
+            section._cacheColSourceW = clampW(obj.source, section._cacheColSourceW)
+            section._cacheColRouteW = clampW(obj.route, section._cacheColRouteW)
         } catch (e) {
             // Malformed blob — keep the current (default) widths.
         }
@@ -285,10 +278,10 @@ Window {
     function _persistCacheColWidths() {
         root.updatePrefs({ cacheTableColumnWidths: JSON.stringify({
             v: 2,
-            ip: Math.round(cacheWindow._cacheColIpW),
-            freshness: Math.round(cacheWindow._cacheColFreshW),
-            source: Math.round(cacheWindow._cacheColSourceW),
-            route: Math.round(cacheWindow._cacheColRouteW)
+            ip: Math.round(section._cacheColIpW),
+            freshness: Math.round(section._cacheColFreshW),
+            source: Math.round(section._cacheColSourceW),
+            route: Math.round(section._cacheColRouteW)
         }) })
         root.emitPrefs()
     }
@@ -296,7 +289,7 @@ Window {
         id: cacheColPersistDebounce
         interval: 400
         repeat: false
-        onTriggered: cacheWindow._persistCacheColWidths()
+        onTriggered: section._persistCacheColWidths()
     }
     // Shared guard for the cache-clear buttons: verifies the native bridge is
     // reachable, setting a localized status line and returning false otherwise.
@@ -365,7 +358,7 @@ Window {
         }
         var out = []
         for (var k = 0; k < order.length; k++)
-            out.push(cacheWindow._buildCacheGroup(order[k], byHost[order[k]]))
+            out.push(section._buildCacheGroup(order[k], byHost[order[k]]))
         return out
     }
     function _buildCacheGroup(host, entries) {
@@ -386,8 +379,8 @@ Window {
                 var f = String(e.fake_ip || "")
                 if (f !== "") fakeIp = f
             }
-            var rb = cacheWindow._cacheFreshnessRank(e.freshness)
-            var rBest = cacheWindow._cacheFreshnessRank(best.freshness)
+            var rb = section._cacheFreshnessRank(e.freshness)
+            var rBest = section._cacheFreshnessRank(best.freshness)
             if (rb < rBest
                     || (rb === rBest
                         && Number(e.expires_at_ms || 0) > Number(best.expires_at_ms || 0)))
@@ -398,7 +391,7 @@ Window {
         var kindRank = 3
         var kind = ""
         for (var m = 0; m < entries.length; m++) {
-            var kr = cacheWindow._cacheMatchKindRank(entries[m].rule_match_kind)
+            var kr = section._cacheMatchKindRank(entries[m].rule_match_kind)
             if (kr < kindRank) { kindRank = kr; kind = String(entries[m].rule_match_kind || "") }
         }
         return {
@@ -433,8 +426,8 @@ Window {
         for (var i = 0; i < list.length; i++)
             decorated.push({ "row": list[i], "idx": i })
         decorated.sort(function(a, b) {
-            var ra = cacheWindow._cacheMatchKindRank(a.row.rule_match_kind)
-            var rb = cacheWindow._cacheMatchKindRank(b.row.rule_match_kind)
+            var ra = section._cacheMatchKindRank(a.row.rule_match_kind)
+            var rb = section._cacheMatchKindRank(b.row.rule_match_kind)
             if (ra !== rb) return ra - rb
             return a.idx - b.idx
         })
@@ -448,7 +441,7 @@ Window {
         if (slugs.length === 0) return "—"
         var parts = []
         for (var i = 0; i < slugs.length; i++)
-            parts.push(cacheWindow._cacheSourceLabel(slugs[i]))
+            parts.push(section._cacheSourceLabel(slugs[i]))
         return parts.join(", ")
     }
     // Full resolved/expires timestamps for the merged Freshness cell's hover
@@ -469,9 +462,9 @@ Window {
             lines.push([
                 String((g && g.hostname) || ""),
                 String(e.ip || ""),
-                cacheWindow._cacheSourceLabel(e.source),
-                cacheWindow._cacheRouteLabel(e),
-                cacheWindow._cacheFreshnessLabel(e.freshness),
+                section._cacheSourceLabel(e.source),
+                section._cacheRouteLabel(e),
+                section._cacheFreshnessLabel(e.freshness),
                 Pure.formatTimestamp(e.expires_at_ms)
             ].join("\t"))
         }
@@ -511,9 +504,9 @@ Window {
             // same text each cell renders (joined sources, best-entry freshness).
             if (col === "host") return String((e && e.hostname) || "")
             if (col === "ip") return String((e && e.ip) || "")
-            if (col === "source") return cacheWindow._cacheGroupSourceLabel(e)
-            if (col === "route") return cacheWindow._cacheRouteLabel(e)
-            if (col === "freshness") return cacheWindow._cacheFreshnessLabel(e && e.best_freshness)
+            if (col === "source") return section._cacheGroupSourceLabel(e)
+            if (col === "route") return section._cacheRouteLabel(e)
+            if (col === "freshness") return section._cacheFreshnessLabel(e && e.best_freshness)
             return ""
         }
         if (col === "process") return String((e && e.process) || "")
@@ -524,11 +517,11 @@ Window {
     // may hand back the live `_cacheEntries` reference when no filter is active.
     function _sortRows(list, table, col, dir) {
         if (!col || !dir) return list
-        var numeric = cacheWindow._isNumericSortCol(table, col)
+        var numeric = section._isNumericSortCol(table, col)
         var arr = list.slice()
         arr.sort(function(a, b) {
-            var va = cacheWindow._sortKey(table, col, a)
-            var vb = cacheWindow._sortKey(table, col, b)
+            var va = section._sortKey(table, col, a)
+            var vb = section._sortKey(table, col, b)
             var r
             if (numeric) {
                 r = Number(va) - Number(vb)
@@ -542,22 +535,22 @@ Window {
         return arr
     }
     function _toggleCacheSort(col) {
-        if (cacheWindow._cacheSortCol === col)
-            cacheWindow._cacheSortDir = -cacheWindow._cacheSortDir
-        else { cacheWindow._cacheSortCol = col; cacheWindow._cacheSortDir = 1 }
+        if (section._cacheSortCol === col)
+            section._cacheSortDir = -section._cacheSortDir
+        else { section._cacheSortCol = col; section._cacheSortDir = 1 }
     }
     function _cacheSortArrow(col) {
-        if (cacheWindow._cacheSortCol !== col) return ""
-        return cacheWindow._cacheSortDir < 0 ? " ▼" : " ▲"
+        if (section._cacheSortCol !== col) return ""
+        return section._cacheSortDir < 0 ? " ▼" : " ▲"
     }
     function _cacheRowBlob(e) {
         if (e && e._blob !== undefined) return e._blob
         var b = [
             String((e && e.hostname) || ""),
             String((e && e.ip) || ""),
-            cacheWindow._cacheSourceLabel(e && e.source),
-            cacheWindow._cacheRouteLabel(e),
-            cacheWindow._cacheFreshnessLabel(e && e.freshness),
+            section._cacheSourceLabel(e && e.source),
+            section._cacheRouteLabel(e),
+            section._cacheFreshnessLabel(e && e.freshness),
             Pure.formatTimestamp(e && e.expires_at_ms)
         ].join(" ").toLowerCase()
         if (e) e._blob = b
@@ -600,7 +593,7 @@ Window {
                 if (route === "none") { if (r !== "" && r !== "ipv6") continue }
                 else if (r !== route) continue
             }
-            if (q !== "" && cacheWindow._cacheRowBlob(e).indexOf(q) === -1) continue
+            if (q !== "" && section._cacheRowBlob(e).indexOf(q) === -1) continue
             out.push(e)
         }
         return out
@@ -622,16 +615,16 @@ Window {
     function _cacheRowsTsv() {
         // Export the FLAT filtered rows (one line per address) so "copy all shown"
         // stays lossless even though the table collapses addresses per host.
-        var list = cacheWindow._cacheFlatFiltered
+        var list = section._cacheFlatFiltered
         var lines = []
         for (var i = 0; i < list.length; i++) {
             var e = list[i] || {}
             lines.push([
                 String(e.hostname || ""),
                 String(e.ip || ""),
-                cacheWindow._cacheSourceLabel(e.source),
-                cacheWindow._cacheRouteLabel(e),
-                cacheWindow._cacheFreshnessLabel(e.freshness),
+                section._cacheSourceLabel(e.source),
+                section._cacheRouteLabel(e),
+                section._cacheFreshnessLabel(e.freshness),
                 Pure.formatTimestamp(e.expires_at_ms)
             ].join("\t"))
         }
@@ -642,29 +635,29 @@ Window {
                 || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcCacheEntriesList !== "function") {
-            cacheWindow._cacheEntriesError = root.tr("diag.cache.entries-bridge-unavailable",
+            section._cacheEntriesError = root.tr("diag.cache.entries-bridge-unavailable",
                 "Service bridge not connected — cache entries unavailable")
-            cacheWindow._cacheEntriesShown = true
+            section._cacheEntriesShown = true
             return
         }
         if (reset) {
-            cacheWindow._cacheEntries = []
-            cacheWindow._cacheEntriesCursor = ""
+            section._cacheEntries = []
+            section._cacheEntriesCursor = ""
             // Re-read the virtual-address setting alongside the first page so
             // the fake-IP rows appear/disappear with the live service state.
-            cacheWindow._refreshFakeIpEnabled()
+            section._refreshFakeIpEnabled()
         }
-        cacheWindow._cacheEntriesShown = true
-        cacheWindow._cacheEntriesLoading = true
-        cacheWindow._cacheEntriesError = ""
-        var cursor = reset ? "" : cacheWindow._cacheEntriesCursor
+        section._cacheEntriesShown = true
+        section._cacheEntriesLoading = true
+        section._cacheEntriesError = ""
+        var cursor = reset ? "" : section._cacheEntriesCursor
         // Pass the server-side search term so a large cache is
         // filtered in SQLite (WHERE LIKE) rather than drained page-by-page.
-        var corr = nrrNativeBridge.rpcCacheEntriesList(cursor, 50, cacheWindow._cacheQuery)
+        var corr = nrrNativeBridge.rpcCacheEntriesList(cursor, 50, section._cacheQuery)
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-            cacheWindow._cacheEntriesLoading = false
+            section._cacheEntriesLoading = false
             if (!ok) {
-                cacheWindow._cacheEntriesError = root.tr("diag.cache.entries-failed",
+                section._cacheEntriesError = root.tr("diag.cache.entries-failed",
                     "Failed to load cache entries: ")
                     + ((typeof root.ipcErrorLabel === "function")
                         ? root.ipcErrorLabel(String(errorCode || "unknown"))
@@ -673,15 +666,15 @@ Window {
             }
             var page = (payload && payload.page) || {}
             var items = page.items || []
-            cacheWindow._cacheEntriesRedacted = (payload && payload.redacted) === true
+            section._cacheEntriesRedacted = (payload && payload.redacted) === true
             if (page.total_count !== undefined && page.total_count !== null)
                 root.diagCacheEntriesTotal = Number(page.total_count)
-            var merged = cacheWindow._cacheEntries.slice()
+            var merged = section._cacheEntries.slice()
             for (var i = 0; i < items.length; i++)
                 merged.push(items[i])
-            cacheWindow._cacheEntries = merged
+            section._cacheEntries = merged
             var nc = page.next_cursor
-            cacheWindow._cacheEntriesCursor =
+            section._cacheEntriesCursor =
                 (nc === undefined || nc === null) ? "" : String(nc)
             // The filter-driven page DRAIN was removed. It fetched
             // page after page on a search and each append rebuilt the render model,
@@ -690,48 +683,8 @@ Window {
         })
     }
 
-    // Tear the cache viewer down for the single show/hide toggle.
-    // Clears the search WITHOUT going through `cacheSearchField.text = ""`: that
-    // path fired `onTextChanged` → `cacheSearchDebounce` → `_loadCacheEntries`,
-    // which re-showed the viewer, so the old hide button needed two presses. We
-    // stop the pending debounce and reset the filter state directly, then drop
-    // `_cacheEntriesShown` last so the gated Repeater empties.
-    function _hideCacheEntries() {
-        if (typeof cacheSearchDebounce !== "undefined" && cacheSearchDebounce)
-            cacheSearchDebounce.stop()
-        cacheWindow._cacheEntriesFilter = ""
-        cacheWindow._cacheQuery = ""
-        cacheWindow._cacheSourceFilter = "all"
-        cacheWindow._cacheFreshnessFilter = "all"
-        cacheWindow._cacheRouteFilter = "all"
-        if (typeof cacheSearchField !== "undefined" && cacheSearchField)
-            cacheSearchField.text = ""
-        // Snap the filter combos back to their "all" entry so a reopen doesn't
-        // show a stale selection out of sync with the reset filter state.
-        if (typeof cacheSourceFilterCombo !== "undefined" && cacheSourceFilterCombo) {
-            cacheSourceFilterCombo.currentIndex = 0
-            cacheSourceFilterCombo.displayText =
-                root.tr("diag.cache.source-filter.all", "All sources")
-        }
-        if (typeof cacheFreshnessFilterCombo !== "undefined" && cacheFreshnessFilterCombo) {
-            cacheFreshnessFilterCombo.currentIndex = 0
-            cacheFreshnessFilterCombo.displayText =
-                root.tr("diag.cache.freshness-filter.all", "Any freshness")
-        }
-        if (typeof cacheRouteFilterCombo !== "undefined" && cacheRouteFilterCombo) {
-            cacheRouteFilterCombo.currentIndex = 0
-            cacheRouteFilterCombo.displayText =
-                root.tr("diag.cache.route-filter.all", "All routes")
-        }
-        cacheWindow._cacheEntriesShown = false
-    }
-
-    // Q3 — read-only connection-trace viewer. Pulls recently-observed outbound
-    // connections page-by-page via `conn-trace.entries.list`, then keeps the
-    // head fresh on a timer. Addresses arrive unmasked: this is the user's own
-    // machine, and a masked remote defeats the panel.
     readonly property int _renderCap: 400
-    // Viewport sizing for the two virtualized tables below. Their height is
+    // Viewport sizing for the virtualized table below. Its height is
     // derived from the MODEL, never from their own `contentHeight`: a ListView
     // only builds the delegates that fit its current height, so a height bound to
     // contentHeight is circular and can settle on a sliver of the real table.
@@ -748,27 +701,164 @@ Window {
     // is expanded (`_isCacheExpanded` reads `root.diagCacheExpandRev`, so a
     // toggle re-evaluates this).
     readonly property int _cacheRenderedHeight: {
-        var rows = cacheWindow._cacheRendered
+        var rows = section._cacheRendered
         var lines = 0
         for (var i = 0; i < rows.length; i++) {
             var g = rows[i] || {}
             lines += 1
-            if (cacheWindow._fakeIpEnabled && String(g.fake_ip || "") !== "") lines += 1
-            if (cacheWindow._isCacheExpanded(g.hostname)) lines += Number(g.ipCount || 0)
+            if (section._fakeIpEnabled && String(g.fake_ip || "") !== "") lines += 1
+            if (section._isCacheExpanded(g.hostname)) lines += Number(g.ipCount || 0)
         }
-        return lines * cacheWindow._listLineHeight
+        return lines * section._listLineHeight
     }
-    ScrollView {
-        anchors.fill: parent
-        anchors.margins: root.uiTheme.spacingLg
-        clip: true
-        ColumnLayout {
-            width: cacheWindow.width - 2 * root.uiTheme.spacingLg
-            spacing: root.uiTheme.spacingMd
+    ColumnLayout {
+        width: section.availableWidth
+        spacing: root.uiTheme.spacingMd
+        // Cache actions: clear, flush, seed from browser history.
+        Frame {
+            Layout.fillWidth: true
+            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
+            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: root.uiTheme.spacingSm - root.uiTheme.spacingXxs
+                Label {
+                    text: root.tr("diag.cache.title", "Cache")
+                    color: root.textColor
+                    font.bold: true
+                }
+                // RightToLeft: buttons are declared in reverse reading order.
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    layoutDirection: Qt.RightToLeft
+                    // Seed the FQDN/IP cache from the local browser history.
+                    // Runs on demand by explicit user consent — the service
+                    // resolves ONLY hosts that match the user's rules (privacy
+                    // boundary), filling the gap for sites visited before the
+                    // service ran.
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("diag.cache.seed-browser-history.button",
+                            "Seed cache from browser history")
+                        onClicked: {
+                            if (!root.bridgeReadyOrWarn())
+                                return
+                            var corr = nrrNativeBridge.rpcSeedFromBrowserHistory()
+                            root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+                                if (!ok) {
+                                    root.statusLine = root.tr("diag.cache.seed-browser-history.unavailable",
+                                        "This feature is unavailable.") + " "
+                                        + ((typeof root.ipcErrorLabel === "function")
+                                            ? root.ipcErrorLabel(String(errorCode || "unknown"))
+                                            : String(errorCode || "unknown"))
+                                    return
+                                }
+                                root.statusLine = (payload && payload["started"] === true)
+                                    ? root.tr("diag.cache.seed-browser-history.started",
+                                        "Import started — hosts matching your rules will appear in the cache.")
+                                    : (payload && payload["already-running"] === true)
+                                        ? root.tr("diag.cache.seed-browser-history.already-running",
+                                            "Your previous import is still running — hosts matching your rules will appear in the cache when it finishes.")
+                                        : root.tr("diag.cache.seed-browser-history.unavailable",
+                                            "This feature is unavailable.")
+                                // Newly-seeded entries show up as "Browser history".
+                                section._loadCacheEntries(true)
+                            })
+                        }
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("diag.cache.clear-os-dns-button", "Clear OS DNS cache")
+                        onClicked: {
+                            // Flushes the OS DNS resolver cache only; the app's
+                            // FQDN/IP cache is left untouched.
+                            if (!root.bridgeReadyOrWarn())
+                                return
+                            var corr = nrrNativeBridge.rpcCacheClear({ "clear-app-cache": false, "flush-os-cache": true })
+                            root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+                                if (!ok) {
+                                    root.statusLine = root.tr("status.cache-cleared-failed",
+                                        "Failed to clear cache: ") + ((typeof root.ipcErrorLabel === "function")
+                                            ? root.ipcErrorLabel(String(errorCode || "unknown"))
+                                            : String(errorCode || "unknown"))
+                                    return
+                                }
+                                // `os-cache-flushed` is true/false/null — true only
+                                // when the OS flush actually ran and succeeded.
+                                root.statusLine = (payload && payload["os-cache-flushed"] === true)
+                                    ? root.tr("diag.cache.os-flush-ok", "OS DNS cache flushed.")
+                                    : root.tr("diag.cache.os-flush-failed", "Could not flush the OS DNS cache.")
+                            })
+                        }
+                    }
+                    // Cache clearing split into two independent
+                    // actions: the app's rebuildable FQDN/IP cache, and the OS
+                    // DNS resolver cache. Each drives the same cache.clear RPC
+                    // with a different flag set.
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("diag.cache.clear-app-button", "Clear app cache")
+                        onClicked: {
+                            // Clears the rebuildable FQDN/IP cache; audit/state
+                            // DBs untouched. OS DNS cache left alone.
+                            if (!root.bridgeReadyOrWarn())
+                                return
+                            var corr = nrrNativeBridge.rpcCacheClear({ "clear-app-cache": true, "flush-os-cache": false })
+                            root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+                                if (!ok) {
+                                    root.statusLine = root.tr("status.cache-cleared-failed",
+                                        "Failed to clear cache: ") + ((typeof root.ipcErrorLabel === "function")
+                                            ? root.ipcErrorLabel(String(errorCode || "unknown"))
+                                            : String(errorCode || "unknown"))
+                                    return
+                                }
+                                var removed = Number((payload && payload["resolutions-removed"]) || 0)
+                                root.statusLine = root.tr("status.cache-cleared",
+                                    "Cache cleared: {count} resolution(s) removed.")
+                                    .replace("{count}", String(removed))
+                                section._loadCacheEntries(true)
+                            })
+                        }
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: root.tr("diag.cache.seed-browser-history.note",
+                        "Resolves hosts from your browser history that match your rules (closes the gap for sites visited before the service started). Privacy: only names matching your rules are processed.")
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                }
+                // Per-user, off by default; the manual button works regardless.
+                CheckBox {
+                    id: browserHistoryAutoSeedCheckbox
+                    text: root.tr("diag.cache.auto-seed-label",
+                        "Seed the cache from browser history automatically at service start")
+                    checked: root.uiRevision >= 0
+                        ? (root.routingState
+                           && root.routingState.browserHistoryAutoSeed === true)
+                        : false
+                    onToggled: root.routePolicyController.applyBrowserHistoryAutoSeed(checked)
+                    Accessible.role: Accessible.CheckBox
+                    Accessible.name: text
+                }
+                // What the automatic variant reads, and that it sends nothing.
+                Label {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: root.uiTheme.spacingMd
+                    text: root.tr("diag.cache.auto-seed-privacy-note",
+                        "Only visited hostnames are read from local browser profiles — nothing is sent anywhere.")
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                }
+            }
+        }
         // C4b: Cache entries viewer (read-only, populated on demand)
         Frame {
             Layout.fillWidth: true
-            visible: cacheWindow._cacheEntriesShown
+            visible: section._cacheEntriesShown
             padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
             background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
             ColumnLayout {
@@ -792,8 +882,8 @@ Window {
                         id: cacheSearchField
                         theme: root.uiTheme
                         Layout.fillWidth: true
-                        visible: cacheWindow._cacheEntries.length > 0
-                            || cacheWindow._cacheEntriesFilter !== ""
+                        visible: section._cacheEntries.length > 0
+                            || section._cacheEntriesFilter !== ""
                         placeholderText: root.tr("diag.cache.entries-search-placeholder",
                             "Exact name or IP; *.search.example — subdomains; *google* — any match")
                         // Debounce so a single keystroke no longer runs
@@ -813,11 +903,11 @@ Window {
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: root.uiTheme.spacingSm
-                    visible: cacheWindow._cacheEntries.length > 0
-                        || cacheWindow._cacheEntriesFilter !== ""
-                        || cacheWindow._cacheSourceFilter !== "all"
-                        || cacheWindow._cacheFreshnessFilter !== "all"
-                        || cacheWindow._cacheRouteFilter !== "all"
+                    visible: section._cacheEntries.length > 0
+                        || section._cacheEntriesFilter !== ""
+                        || section._cacheSourceFilter !== "all"
+                        || section._cacheFreshnessFilter !== "all"
+                        || section._cacheRouteFilter !== "all"
                     ThemedComboBox {
                         id: cacheFreshnessFilterCombo
                         theme: root.uiTheme
@@ -839,7 +929,7 @@ Window {
                         popup.width: root.comboPopupWidth(cacheFreshnessFilterCombo, model, "",
                             function(item) { return cacheFreshnessFilterCombo.freshnessFilterLabel(item) })
                         onActivated: {
-                            cacheWindow._cacheFreshnessFilter = model[currentIndex]
+                            section._cacheFreshnessFilter = model[currentIndex]
                             cacheFreshnessFilterCombo.displayText =
                                 cacheFreshnessFilterCombo.freshnessFilterLabel(model[currentIndex])
                         }
@@ -876,7 +966,7 @@ Window {
                         popup.width: root.comboPopupWidth(cacheRouteFilterCombo, model, "",
                             function(item) { return cacheRouteFilterCombo.routeFilterLabel(item) })
                         onActivated: {
-                            cacheWindow._cacheRouteFilter = model[currentIndex]
+                            section._cacheRouteFilter = model[currentIndex]
                             cacheRouteFilterCombo.displayText =
                                 cacheRouteFilterCombo.routeFilterLabel(model[currentIndex])
                         }
@@ -894,11 +984,11 @@ Window {
                         id: cacheSourceFilterCombo
                         theme: root.uiTheme
                         implicitWidth: 200
-                        model: cacheWindow._cacheSourceSlugs
+                        model: section._cacheSourceSlugs
                         function sourceFilterLabel(slug) {
                             if (slug === "all")
                                 return root.tr("diag.cache.source-filter.all", "All sources")
-                            return cacheWindow._cacheSourceLabel(slug)
+                            return section._cacheSourceLabel(slug)
                         }
                         labelResolver: function(item) {
                             return cacheSourceFilterCombo.sourceFilterLabel(item)
@@ -909,7 +999,7 @@ Window {
                         popup.width: root.comboPopupWidth(cacheSourceFilterCombo, model, "",
                             function(item) { return cacheSourceFilterCombo.sourceFilterLabel(item) })
                         onActivated: {
-                            cacheWindow._cacheSourceFilter = model[currentIndex]
+                            section._cacheSourceFilter = model[currentIndex]
                             cacheSourceFilterCombo.displayText =
                                 cacheSourceFilterCombo.sourceFilterLabel(model[currentIndex])
                         }
@@ -935,7 +1025,7 @@ Window {
                         // A pending tick can outlive a hide (clearing
                         // the field on hide restarts this timer); do nothing once
                         // the viewer is closed so it can't re-open itself.
-                        if (!cacheWindow._cacheEntriesShown)
+                        if (!section._cacheEntriesShown)
                             return
                         // Filter the already-loaded rows only. The
                         // per-keystroke full-cache DRAIN was removed: it re-fetched
@@ -950,17 +1040,17 @@ Window {
                         // the literal asterisks as text (no cell contains
                         // one), silently hiding every server-matched row.
                         // Strip them before the client pass.
-                        cacheWindow._cacheEntriesFilter =
+                        section._cacheEntriesFilter =
                             cacheSearchField.text.split("*").join("").trim()
-                        cacheWindow._cacheQuery = cacheSearchField.text.trim()
-                        cacheWindow._loadCacheEntries(true)
+                        section._cacheQuery = cacheSearchField.text.trim()
+                        section._loadCacheEntries(true)
                     }
                 }
 
                 // Privacy notice — compact tier reduces hostnames/IPs.
                 Label {
                     Layout.fillWidth: true
-                    visible: cacheWindow._cacheEntriesRedacted && cacheWindow._cacheEntries.length > 0
+                    visible: section._cacheEntriesRedacted && section._cacheEntries.length > 0
                     text: root.tr("diag.cache.entries-redacted-notice",
                         "Hostnames and IPs are reduced for privacy. Enable Extended diagnostics for full detail.")
                     color: root.mutedTextColor
@@ -970,8 +1060,8 @@ Window {
                 // Error state.
                 Label {
                     Layout.fillWidth: true
-                    visible: cacheWindow._cacheEntriesError !== ""
-                    text: cacheWindow._cacheEntriesError
+                    visible: section._cacheEntriesError !== ""
+                    text: section._cacheEntriesError
                     color: root.uiTheme.colorAccent
                     wrapMode: Text.WordWrap
                 }
@@ -979,7 +1069,7 @@ Window {
                 // First-load spinner surrogate.
                 Label {
                     Layout.fillWidth: true
-                    visible: cacheWindow._cacheEntriesLoading && cacheWindow._cacheEntries.length === 0
+                    visible: section._cacheEntriesLoading && section._cacheEntries.length === 0
                     text: root.tr("diag.cache.entries-loading", "Loading cache entries...")
                     color: root.mutedTextColor
                 }
@@ -987,9 +1077,9 @@ Window {
                 // Empty state.
                 Label {
                     Layout.fillWidth: true
-                    visible: !cacheWindow._cacheEntriesLoading
-                        && cacheWindow._cacheEntriesError === ""
-                        && cacheWindow._cacheEntries.length === 0
+                    visible: !section._cacheEntriesLoading
+                        && section._cacheEntriesError === ""
+                        && section._cacheEntries.length === 0
                     text: root.tr("diag.cache.entries-empty", "No cache entries")
                     color: root.mutedTextColor
                 }
@@ -997,10 +1087,10 @@ Window {
                 // No-match state — filter active, entries exist, none match.
                 Label {
                     Layout.fillWidth: true
-                    visible: !cacheWindow._cacheEntriesLoading
-                        && cacheWindow._cacheEntriesError === ""
-                        && cacheWindow._cacheEntries.length > 0
-                        && cacheWindow._cacheFiltered.length === 0
+                    visible: !section._cacheEntriesLoading
+                        && section._cacheEntriesError === ""
+                        && section._cacheEntries.length > 0
+                        && section._cacheFiltered.length === 0
                     text: root.tr("diag.cache.entries-no-match",
                         "No entries match your search")
                     color: root.mutedTextColor
@@ -1013,24 +1103,24 @@ Window {
                 // menu, or these buttons.
                 RowLayout {
                     Layout.fillWidth: true
-                    visible: cacheWindow._cacheEntries.length > 0
+                    visible: section._cacheEntries.length > 0
                     spacing: root.uiTheme.spacingSm
                     ThemedButton {
                         theme: root.uiTheme
                         text: root.tr("diag.copy-all-shown", "Copy all shown")
-                        onClicked: root.copyToClipboard(cacheWindow._cacheRowsTsv())
+                        onClicked: root.copyToClipboard(section._cacheRowsTsv())
                     }
                     ThemedButton {
                         theme: root.uiTheme
-                        visible: cacheWindow._cacheSelectedCount() > 0
+                        visible: section._cacheSelectedCount() > 0
                         text: root.tr("diag.copy-selected", "Copy selected")
-                            + " (" + cacheWindow._cacheSelectedCount() + ")"
-                        onClicked: cacheWindow._copyCacheSelected()
+                            + " (" + section._cacheSelectedCount() + ")"
+                        onClicked: section._copyCacheSelected()
                     }
                 }
                 Label {
                     Layout.fillWidth: true
-                    visible: cacheWindow._cacheEntries.length > 0
+                    visible: section._cacheEntries.length > 0
                     text: root.tr("diag.table.select-hint",
                         "Click a row to select it (Ctrl+click to toggle, Shift+click to extend), then press Ctrl+C to copy. Right-click for more options.")
                     color: root.mutedTextColor
@@ -1050,25 +1140,25 @@ Window {
                 // give up/take, with a preferred/min so they are never starved.
                 RowLayout {
                     Layout.fillWidth: true
-                    visible: cacheWindow._cacheEntries.length > 0
+                    visible: section._cacheEntries.length > 0
                     spacing: root.uiTheme.spacingSm
                     Label {
                         Layout.fillWidth: true
-                        Layout.preferredWidth: cacheWindow._cacheColHostW
-                        Layout.minimumWidth: cacheWindow._cacheColHostMinW
+                        Layout.preferredWidth: section._cacheColHostW
+                        Layout.minimumWidth: section._cacheColHostMinW
                         text: root.tr("diag.cache.col-hostname", "Host")
-                            + cacheWindow._cacheSortArrow("host")
+                            + section._cacheSortArrow("host")
                         color: root.mutedTextColor
                         font.bold: true
                         elide: Text.ElideRight
                         HoverHandler { cursorShape: Qt.PointingHandCursor }
                         TapHandler {
                             acceptedButtons: Qt.LeftButton
-                            onTapped: cacheWindow._toggleCacheSort("host")
+                            onTapped: section._toggleCacheSort("host")
                         }
                     }
                     Item {
-                        Layout.preferredWidth: cacheWindow._cacheColIpW
+                        Layout.preferredWidth: section._cacheColIpW
                         Layout.fillHeight: true
                         implicitHeight: cacheColIpHdr.implicitHeight
                         Label {
@@ -1077,7 +1167,7 @@ Window {
                             leftPadding: 9
                             verticalAlignment: Text.AlignVCenter
                             text: root.tr("diag.cache.col-ip", "IP")
-                                + cacheWindow._cacheSortArrow("ip")
+                                + section._cacheSortArrow("ip")
                             color: root.mutedTextColor
                             font.bold: true
                             elide: Text.ElideRight
@@ -1085,18 +1175,18 @@ Window {
                         HoverHandler { cursorShape: Qt.PointingHandCursor }
                         TapHandler {
                             acceptedButtons: Qt.LeftButton
-                            onTapped: cacheWindow._toggleCacheSort("ip")
+                            onTapped: section._toggleCacheSort("ip")
                         }
                         CacheColHandle {
                             onWidthDelta: function(dx) {
-                                cacheWindow._cacheColIpW = Math.max(cacheWindow._cacheColMinW,
-                                    Math.min(cacheWindow._cacheColMaxW, cacheWindow._cacheColIpW - dx))
+                                section._cacheColIpW = Math.max(section._cacheColMinW,
+                                    Math.min(section._cacheColMaxW, section._cacheColIpW - dx))
                                 cacheColPersistDebounce.restart()
                             }
                         }
                     }
                     Item {
-                        Layout.preferredWidth: cacheWindow._cacheColSourceW
+                        Layout.preferredWidth: section._cacheColSourceW
                         Layout.fillHeight: true
                         implicitHeight: cacheColSourceHdr.implicitHeight
                         Label {
@@ -1105,7 +1195,7 @@ Window {
                             leftPadding: 9
                             verticalAlignment: Text.AlignVCenter
                             text: root.tr("diag.cache.col-source", "Source")
-                                + cacheWindow._cacheSortArrow("source")
+                                + section._cacheSortArrow("source")
                             color: root.mutedTextColor
                             font.bold: true
                             elide: Text.ElideRight
@@ -1113,18 +1203,18 @@ Window {
                         HoverHandler { cursorShape: Qt.PointingHandCursor }
                         TapHandler {
                             acceptedButtons: Qt.LeftButton
-                            onTapped: cacheWindow._toggleCacheSort("source")
+                            onTapped: section._toggleCacheSort("source")
                         }
                         CacheColHandle {
                             onWidthDelta: function(dx) {
-                                cacheWindow._cacheColSourceW = Math.max(cacheWindow._cacheColMinW,
-                                    Math.min(cacheWindow._cacheColMaxW, cacheWindow._cacheColSourceW - dx))
+                                section._cacheColSourceW = Math.max(section._cacheColMinW,
+                                    Math.min(section._cacheColMaxW, section._cacheColSourceW - dx))
                                 cacheColPersistDebounce.restart()
                             }
                         }
                     }
                     Item {
-                        Layout.preferredWidth: cacheWindow._cacheColRouteW
+                        Layout.preferredWidth: section._cacheColRouteW
                         Layout.fillHeight: true
                         implicitHeight: cacheColRouteHdr.implicitHeight
                         Label {
@@ -1133,7 +1223,7 @@ Window {
                             leftPadding: 9
                             verticalAlignment: Text.AlignVCenter
                             text: root.tr("diag.cache.col-route", "Route")
-                                + cacheWindow._cacheSortArrow("route")
+                                + section._cacheSortArrow("route")
                             color: root.mutedTextColor
                             font.bold: true
                             elide: Text.ElideRight
@@ -1141,18 +1231,18 @@ Window {
                         HoverHandler { cursorShape: Qt.PointingHandCursor }
                         TapHandler {
                             acceptedButtons: Qt.LeftButton
-                            onTapped: cacheWindow._toggleCacheSort("route")
+                            onTapped: section._toggleCacheSort("route")
                         }
                         CacheColHandle {
                             onWidthDelta: function(dx) {
-                                cacheWindow._cacheColRouteW = Math.max(cacheWindow._cacheColMinW,
-                                    Math.min(cacheWindow._cacheColMaxW, cacheWindow._cacheColRouteW - dx))
+                                section._cacheColRouteW = Math.max(section._cacheColMinW,
+                                    Math.min(section._cacheColMaxW, section._cacheColRouteW - dx))
                                 cacheColPersistDebounce.restart()
                             }
                         }
                     }
                     Item {
-                        Layout.preferredWidth: cacheWindow._cacheColFreshW
+                        Layout.preferredWidth: section._cacheColFreshW
                         Layout.fillHeight: true
                         implicitHeight: cacheColFreshHdr.implicitHeight
                         Label {
@@ -1161,7 +1251,7 @@ Window {
                             leftPadding: 9
                             verticalAlignment: Text.AlignVCenter
                             text: root.tr("diag.cache.col-freshness", "Freshness")
-                                + cacheWindow._cacheSortArrow("freshness")
+                                + section._cacheSortArrow("freshness")
                             color: root.mutedTextColor
                             font.bold: true
                             elide: Text.ElideRight
@@ -1169,12 +1259,12 @@ Window {
                         HoverHandler { cursorShape: Qt.PointingHandCursor }
                         TapHandler {
                             acceptedButtons: Qt.LeftButton
-                            onTapped: cacheWindow._toggleCacheSort("freshness")
+                            onTapped: section._toggleCacheSort("freshness")
                         }
                         CacheColHandle {
                             onWidthDelta: function(dx) {
-                                cacheWindow._cacheColFreshW = Math.max(cacheWindow._cacheColMinW,
-                                    Math.min(cacheWindow._cacheColMaxW, cacheWindow._cacheColFreshW - dx))
+                                section._cacheColFreshW = Math.max(section._cacheColMinW,
+                                    Math.min(section._cacheColMaxW, section._cacheColFreshW - dx))
                                 cacheColPersistDebounce.restart()
                             }
                         }
@@ -1193,10 +1283,10 @@ Window {
                 ListView {
                     id: cacheEntriesList
                     Layout.fillWidth: true
-                    Layout.preferredHeight: Math.min(cacheWindow._listMaxHeight,
-                        Math.max(cacheWindow._listLineHeight, cacheWindow._cacheRenderedHeight))
-                    visible: cacheWindow._cacheEntriesShown
-                        && cacheWindow._cacheRendered.length > 0
+                    Layout.preferredHeight: Math.min(section._listMaxHeight,
+                        Math.max(section._listLineHeight, section._cacheRenderedHeight))
+                    visible: section._cacheEntriesShown
+                        && section._cacheRendered.length > 0
                     clip: true
                     interactive: contentHeight > height
                     ScrollBar.vertical: ScrollBar {
@@ -1208,17 +1298,17 @@ Window {
                     // clears the selection. Focus arrives via the row MouseArea.
                     Keys.onPressed: function(event) {
                         if (event.matches(StandardKey.Copy)) {
-                            cacheWindow._copyCacheSelected()
+                            section._copyCacheSelected()
                             event.accepted = true
                         } else if (event.key === Qt.Key_Escape) {
-                            cacheWindow._clearCacheSelection()
+                            section._clearCacheSelection()
                             event.accepted = true
                         }
                     }
                     // Reuse the cached `_cacheFiltered` view (render-capped
                     // to `_renderCap`) so each page-append evaluates the filter once.
-                    model: cacheWindow._cacheEntriesShown
-                        ? cacheWindow._cacheRendered
+                    model: section._cacheEntriesShown
+                        ? section._cacheRendered
                         : []
                     delegate: Item {
                         id: cacheRowItem
@@ -1230,14 +1320,14 @@ Window {
                         // Reads _cacheExpandRev inside _isCacheExpanded so a toggle
                         // (which bumps that revision) re-evaluates this binding.
                         readonly property bool _expanded:
-                            cacheWindow._isCacheExpanded(_g && _g.hostname)
+                            section._isCacheExpanded(_g && _g.hostname)
                         // TASK A — is this row part of the current selection? Reads
                         // `_cacheSelRev` (via the helper) so it re-evaluates on every
                         // selection change.
-                        readonly property bool _selected: cacheWindow._cacheRowSelected(_g)
+                        readonly property bool _selected: section._cacheRowSelected(_g)
                         // Whole-row right-click → copy. One TSV line per address so
                         // the copy stays lossless despite the collapsed display.
-                        readonly property string _rowTsv: cacheWindow._cacheGroupTsv(_g)
+                        readonly property string _rowTsv: section._cacheGroupTsv(_g)
                         // TASK A — accent-tinted selection highlight, behind the row
                         // content (mirrors the leak-mismatch tint in the trace twin).
                         Rectangle {
@@ -1257,7 +1347,7 @@ Window {
                             anchors.fill: parent
                             acceptedButtons: Qt.LeftButton
                             onPressed: function(mouse) {
-                                cacheWindow._selectCacheRow(
+                                section._selectCacheRow(
                                     index, cacheRowItem._g,
                                     (mouse.modifiers & Qt.ControlModifier) !== 0,
                                     (mouse.modifiers & Qt.ShiftModifier) !== 0)
@@ -1271,7 +1361,7 @@ Window {
                                 // Right-clicking an unselected row selects it first so
                                 // "Copy row" / "Copy selected" act on what was clicked.
                                 if (!cacheRowItem._selected)
-                                    cacheWindow._selectCacheRow(index, cacheRowItem._g, false, false)
+                                    section._selectCacheRow(index, cacheRowItem._g, false, false)
                                 cacheEntriesList.forceActiveFocus()
                                 cacheRowMenu.popup()
                             }
@@ -1282,13 +1372,13 @@ Window {
                         readonly property string _vHost:
                             String((cacheRowItem._g && cacheRowItem._g.hostname) || "")
                         readonly property string _vIps:
-                            cacheWindow._cacheGroupIps(cacheRowItem._g)
+                            section._cacheGroupIps(cacheRowItem._g)
                         readonly property string _vSource:
-                            cacheWindow._cacheGroupSourceLabel(cacheRowItem._g)
+                            section._cacheGroupSourceLabel(cacheRowItem._g)
                         readonly property string _vRoute:
-                            cacheWindow._cacheRouteLabel(cacheRowItem._g)
+                            section._cacheRouteLabel(cacheRowItem._g)
                         readonly property string _vFreshness:
-                            cacheWindow._cacheFreshnessLabel(
+                            section._cacheFreshnessLabel(
                                 cacheRowItem._g && cacheRowItem._g.best_freshness)
                         readonly property string _vExpires:
                             Pure.formatTimestamp(
@@ -1303,12 +1393,12 @@ Window {
                             }
                             MenuItem {
                                 text: root.tr("diag.copy-selected", "Copy selected")
-                                visible: cacheWindow._cacheSelectedCount() > 0
-                                onTriggered: cacheWindow._copyCacheSelected()
+                                visible: section._cacheSelectedCount() > 0
+                                onTriggered: section._copyCacheSelected()
                             }
                             MenuItem {
                                 text: root.tr("diag.copy-all-shown", "Copy all shown")
-                                onTriggered: root.copyToClipboard(cacheWindow._cacheRowsTsv())
+                                onTriggered: root.copyToClipboard(section._cacheRowsTsv())
                             }
                             MenuSeparator { }
                             // Single-column copies. The whole-row TSV above is
@@ -1351,7 +1441,7 @@ Window {
                             MenuItem {
                                 // Mirrors the row's own gate: no virtual
                                 // address is offered while the feature is off.
-                                visible: cacheWindow._fakeIpEnabled && cacheRowItem._vFakeIp !== ""
+                                visible: section._fakeIpEnabled && cacheRowItem._vFakeIp !== ""
                                 text: root.copyValueLabel(cacheRowItem._vFakeIp)
                                 onTriggered: root.copyToClipboard(cacheRowItem._vFakeIp)
                             }
@@ -1372,8 +1462,8 @@ Window {
                             // "+N" work reads as a dead row.
                             Label {
                                 Layout.fillWidth: true
-                                Layout.preferredWidth: cacheWindow._cacheColHostW
-                                Layout.minimumWidth: cacheWindow._cacheColHostMinW
+                                Layout.preferredWidth: section._cacheColHostW
+                                Layout.minimumWidth: section._cacheColHostMinW
                                 text: String((cacheRowItem._g && cacheRowItem._g.hostname) || "—")
                                 color: root.textColor
                                 elide: Text.ElideRight
@@ -1384,7 +1474,7 @@ Window {
                                 TapHandler {
                                     enabled: cacheRowItem._ipCount > 1
                                     acceptedButtons: Qt.LeftButton
-                                    onTapped: cacheWindow._toggleCacheExpand(
+                                    onTapped: section._toggleCacheExpand(
                                         cacheRowItem._g && cacheRowItem._g.hostname)
                                 }
                             }
@@ -1392,7 +1482,7 @@ Window {
                             // host has more than one; the whole cell toggles the inline
                             // per-address expansion below.
                             Item {
-                                Layout.preferredWidth: cacheWindow._cacheColIpW
+                                Layout.preferredWidth: section._cacheColIpW
                                 Layout.fillHeight: true
                                 implicitHeight: cacheIpRow.implicitHeight
                                 RowLayout {
@@ -1424,30 +1514,30 @@ Window {
                                 TapHandler {
                                     enabled: cacheRowItem._ipCount > 1
                                     acceptedButtons: Qt.LeftButton
-                                    onTapped: cacheWindow._toggleCacheExpand(
+                                    onTapped: section._toggleCacheExpand(
                                         cacheRowItem._g && cacheRowItem._g.hostname)
                                 }
                             }
                             Label {
-                                Layout.preferredWidth: cacheWindow._cacheColSourceW
+                                Layout.preferredWidth: section._cacheColSourceW
                                 leftPadding: 9
-                                text: cacheWindow._cacheGroupSourceLabel(cacheRowItem._g)
+                                text: section._cacheGroupSourceLabel(cacheRowItem._g)
                                 color: root.mutedTextColor
                                 elide: Text.ElideRight
                             }
                             Label {
                                 // Route mirrors the conn-trace expected-route field;
                                 // first non-empty route of the group, "—" when none.
-                                Layout.preferredWidth: cacheWindow._cacheColRouteW
+                                Layout.preferredWidth: section._cacheColRouteW
                                 leftPadding: 9
-                                text: cacheWindow._cacheRouteLabel(cacheRowItem._g)
+                                text: section._cacheRouteLabel(cacheRowItem._g)
                                 color: root.mutedTextColor
                                 elide: Text.ElideRight
                             }
                             // Merged Freshness + Expires cell: best-entry freshness
                             // label + compact remaining TTL, full timestamps on hover.
                             Item {
-                                Layout.preferredWidth: cacheWindow._cacheColFreshW
+                                Layout.preferredWidth: section._cacheColFreshW
                                 Layout.fillHeight: true
                                 implicitHeight: cacheFreshCell.implicitHeight
                                 Label {
@@ -1455,16 +1545,16 @@ Window {
                                     anchors.fill: parent
                                     leftPadding: 9
                                     verticalAlignment: Text.AlignVCenter
-                                    text: cacheWindow._cacheFreshnessLabel(
+                                    text: section._cacheFreshnessLabel(
                                             cacheRowItem._g && cacheRowItem._g.best_freshness)
-                                        + " · " + cacheWindow._cacheCompactExpiry(
+                                        + " · " + section._cacheCompactExpiry(
                                             cacheRowItem._g && cacheRowItem._g.best_expires_at_ms)
                                     color: root.mutedTextColor
                                     elide: Text.ElideRight
                                 }
                                 HoverHandler { id: cacheFreshHover }
                                 ToolTip.visible: cacheFreshHover.hovered
-                                ToolTip.text: cacheWindow._cacheExpiryTooltip(
+                                ToolTip.text: section._cacheExpiryTooltip(
                                     cacheRowItem._g && cacheRowItem._g.best_resolved_at_ms,
                                     cacheRowItem._g && cacheRowItem._g.best_expires_at_ms)
                             }
@@ -1478,11 +1568,11 @@ Window {
                             RowLayout {
                                 Layout.fillWidth: true
                                 spacing: root.uiTheme.spacingSm
-                                visible: cacheWindow._fakeIpEnabled
+                                visible: section._fakeIpEnabled
                                     && String((cacheRowItem._g && cacheRowItem._g.fake_ip) || "") !== ""
                                 Item {
-                                    Layout.preferredWidth: cacheWindow._cacheColHostW
-                                    Layout.minimumWidth: cacheWindow._cacheColHostMinW
+                                    Layout.preferredWidth: section._cacheColHostW
+                                    Layout.minimumWidth: section._cacheColHostMinW
                                 }
                                 Label {
                                     Layout.fillWidth: true
@@ -1506,11 +1596,11 @@ Window {
                                     spacing: root.uiTheme.spacingSm
                                     Item {
                                         Layout.fillWidth: true
-                                        Layout.preferredWidth: cacheWindow._cacheColHostW
-                                        Layout.minimumWidth: cacheWindow._cacheColHostMinW
+                                        Layout.preferredWidth: section._cacheColHostW
+                                        Layout.minimumWidth: section._cacheColHostMinW
                                     }
                                     Label {
-                                        Layout.preferredWidth: cacheWindow._cacheColIpW
+                                        Layout.preferredWidth: section._cacheColIpW
                                         leftPadding: 18
                                         text: String((modelData && modelData.ip) || "—")
                                         color: root.mutedTextColor
@@ -1520,15 +1610,15 @@ Window {
                                     Label {
                                         Layout.fillWidth: true
                                         leftPadding: 9
-                                        text: cacheWindow._cacheFreshnessLabel(modelData && modelData.freshness)
-                                            + " · " + cacheWindow._cacheCompactExpiry(
+                                        text: section._cacheFreshnessLabel(modelData && modelData.freshness)
+                                            + " · " + section._cacheCompactExpiry(
                                                 modelData && modelData.expires_at_ms)
                                         color: root.mutedTextColor
                                         elide: Text.ElideRight
                                         font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                                         HoverHandler { id: cacheSubFreshHover }
                                         ToolTip.visible: cacheSubFreshHover.hovered
-                                        ToolTip.text: cacheWindow._cacheExpiryTooltip(
+                                        ToolTip.text: section._cacheExpiryTooltip(
                                             modelData && modelData.resolved_at_ms,
                                             modelData && modelData.expires_at_ms)
                                     }
@@ -1542,11 +1632,11 @@ Window {
                 // render cap. Copy-all-shown still exports the FULL filtered list.
                 Label {
                     Layout.fillWidth: true
-                    visible: cacheWindow._cacheEntriesShown
-                        && cacheWindow._cacheFiltered.length > cacheWindow._cacheRendered.length
+                    visible: section._cacheEntriesShown
+                        && section._cacheFiltered.length > section._cacheRendered.length
                     text: root.tr("diag.cache.render-truncated",
                         "Showing the first %1 of %2 matches — refine your search to narrow it.")
-                        .arg(cacheWindow._cacheRendered.length).arg(cacheWindow._cacheFiltered.length)
+                        .arg(section._cacheRendered.length).arg(section._cacheFiltered.length)
                     color: root.uiTheme.colorWarning
                     font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                     wrapMode: Text.WordWrap
@@ -1555,15 +1645,14 @@ Window {
                 // Load-more affordance — present only while a further page exists.
                 ThemedButton {
                     theme: root.uiTheme
-                    visible: cacheWindow._cacheEntriesCursor !== ""
-                    enabled: !cacheWindow._cacheEntriesLoading
+                    visible: section._cacheEntriesCursor !== ""
+                    enabled: !section._cacheEntriesLoading
                     text: root.tr("diag.cache.entries-load-more", "Load more")
-                    onClicked: cacheWindow._loadCacheEntries(false)
+                    onClicked: section._loadCacheEntries(false)
                 }
             }
         }
 
-            Item { Layout.fillHeight: true }
-        }
+        Item { Layout.fillHeight: true }
     }
 }

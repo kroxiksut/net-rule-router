@@ -37,8 +37,9 @@ function idxForSection(value) {
     if (value === "rule-virtual-machines") return 4
     if (value === "diagnostics") return 5
     if (value === "conn-trace") return 6
-    if (value === "logs") return 7
-    return 8
+    if (value === "cache") return 7
+    if (value === "logs") return 8
+    return 9
 }
 
 // ---- ListModel / array access helpers ----
@@ -811,7 +812,9 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "primary-probe-max-targets": 8,
     "primary-probe-repeat-secs": 300,
     "local-networks-auto-accept": false,
-    "zone-priority-over-ip": false
+    "zone-priority-over-ip": false,
+    "short-name-completion": false,
+    "short-name-suffix": ""
 }
 
 // Keys the policy SNAPSHOT carries but the update REQUEST must not: they are
@@ -1326,4 +1329,49 @@ function sortAutoRuleGroups(groups, mode) {
         return d2 !== 0 ? d2 : a.domain.localeCompare(b.domain)
     })
     return out
+}
+
+// ---- plural forms and block-notice grouping ----
+
+// CLDR plural category of a whole number under a named rule FAMILY. The
+// locale file names its family (`label.plural-rule`), so a language added as
+// a file needs no code here; an unknown family counts like English.
+function pluralCategory(rule, n) {
+    var k = Math.abs(Math.floor(Number(n) || 0))
+    switch (String(rule || "")) {
+        case "east-slavic":
+            var d = k % 10
+            var h = k % 100
+            if (d === 1 && h !== 11) return "one"
+            if (d >= 2 && d <= 4 && (h < 12 || h > 14)) return "few"
+            return "many"
+        case "none":
+            return "other"
+        default:
+            return k === 1 ? "one" : "other"
+    }
+}
+
+// Rows of a block notice, in arrival order. Blocks of one program for one
+// reason fold into a single row when the reason is `groupable` (the answer
+// is about the program or a switch, not the address); every other block
+// keeps a row per address, because routing is decided address by address.
+function groupBlockNotices(entries, groupableReasons) {
+    var rows = []
+    var byKey = {}
+    for (var i = 0; i < (entries || []).length; i += 1) {
+        var e = entries[i] || {}
+        var app = String(e.app || "")
+        var reason = String(e.reason || "")
+        var groupable = app !== "" && (groupableReasons || []).indexOf(reason) >= 0
+        var key = groupable
+            ? "g|" + app.toLowerCase() + "|" + reason
+            : "a|" + String(e.destination || "") + "|" + app.toLowerCase() + "|" + reason
+        if (byKey[key] === undefined) {
+            byKey[key] = rows.length
+            rows.push({ key: key, grouped: groupable, entries: [] })
+        }
+        rows[byKey[key]].entries.push(e)
+    }
+    return rows
 }

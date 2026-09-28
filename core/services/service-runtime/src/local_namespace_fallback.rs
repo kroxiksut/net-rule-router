@@ -123,6 +123,7 @@ impl UpstreamResolver for LocalNamespaceFallbackResolver {
                 if !resolved.addresses.is_empty() {
                     tracing::info!(
                         target: "nrr::dns-resolver",
+                        msg_key = "localns-resolved-via-local",
                         host = %hostname,
                         server = %server,
                         "a resolver on this machine knows a name the upstream called non-existent",

@@ -473,6 +473,7 @@ fn check_binary_location(binary: &Path) -> Result<(), ServiceControlError> {
     if cfg!(debug_assertions) {
         tracing::warn!(
             target: "nrr::service-control",
+            msg_key = "win-svcctl-untrusted-binary-location",
             problem = %problem,
             "registering a service binary that non-administrators can change — development build only",
         );
@@ -648,6 +649,7 @@ fn sweep_enforcement_state() -> bool {
             if let Err(e) = crate::win32_ffi::wfp_sublayer::delete_sublayer(&token) {
                 tracing::warn!(
                     target: "nrr::wfp",
+                    msg_key = "win-svcctl-sublayer-delete-failed",
                     error = %e,
                     "could not remove the WFP sub-layer; a reboot clears it",
                 );
@@ -677,7 +679,9 @@ fn sweep_enforcement_state() -> bool {
     }
     let dns_swept =
         crate::dns_redirect::clear_orphan_redirect(&crate::dns_redirect::TransactedNrptStore)
-            .is_ok();
+            .is_ok()
+            && crate::dns_redirect::release_search_list(&crate::dns_redirect::WindowsSearchList)
+                .is_ok();
     filters_swept && dns_swept
 }
 

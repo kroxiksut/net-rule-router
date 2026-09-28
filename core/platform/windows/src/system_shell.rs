@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData, SHGetKnownFolderPath,
-    KNOWN_FOLDER_FLAG,
+    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_RoamingAppData,
+    SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
 };
 
 /// Where every supported Windows keeps it; used only if the API itself fails,
@@ -61,6 +61,12 @@ pub fn program_data_directory() -> Option<PathBuf> {
 #[must_use]
 pub fn local_app_data_directory() -> Option<PathBuf> {
     known_folder(&FOLDERID_LocalAppData)
+}
+
+/// `%APPDATA%` as the shell registers it, or `None` when it cannot say.
+#[must_use]
+pub fn roaming_app_data_directory() -> Option<PathBuf> {
+    known_folder(&FOLDERID_RoamingAppData)
 }
 
 /// The user's profile folder as the shell registers it, or `None` when it

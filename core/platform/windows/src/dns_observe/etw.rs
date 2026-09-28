@@ -20,7 +20,7 @@
 //!
 //! Every failure path returns an `Err`/logs and yields no observations —
 //! the service keeps running, only suffix/zone routing is degraded. The
-//! trace session is stopped + closed on drop.
+//! trace session ([`crate::etw_session`]) is stopped + closed on drop.
 //!
 //! ## Payload parsing
 //!
@@ -36,22 +36,16 @@
 #![allow(unsafe_code)]
 
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 
-use windows::core::{GUID, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{GetLastError, WIN32_ERROR};
-use windows::Win32::System::Diagnostics::Etw::{
-    CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
-    CONTROLTRACE_HANDLE, ENABLE_TRACE_PARAMETERS, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD,
-    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
-};
+use windows::core::GUID;
+use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, TRACE_LEVEL_INFORMATION};
 
 use super::{DnsObservation, DnsObservationSource};
 use crate::error::PlatformError;
+use crate::etw_session::{
+    callback_context, user_data, ProviderEnable, RealtimeSession, SessionClock, SessionConfig,
+};
 
 /// `Microsoft-Windows-DNS-Client` provider GUID.
 const DNS_CLIENT_PROVIDER: GUID = GUID::from_u128(0x1c95126e_7eea_49a9_a3fe_a378b03ddb4d);
@@ -61,24 +55,15 @@ const EVENT_ID_QUERY_COMPLETED: u16 = 3008;
 
 /// Shared buffer of observations, drained by the consumer. The ETW
 /// callback (a C ABI fn with no closure capture) reaches it through the
-/// `EVENT_RECORD.UserContext` pointer set on `OpenTraceW`.
+/// session context.
 type Buffer = Arc<Mutex<Vec<DnsObservation>>>;
 
-/// A running real-time ETW consumer for DNS-Client events.
+/// A running real-time ETW consumer for DNS-Client events. The session stops
+/// when this is dropped.
 pub struct EtwDnsObserver {
     buffer: Buffer,
-    session_name: Vec<u16>,
-    control_handle: CONTROLTRACE_HANDLE,
-    process_handle: PROCESSTRACE_HANDLE,
-    stop_flag: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    _session: RealtimeSession,
 }
-
-// The handles are owned solely by this struct, which serialises access; the
-// background thread only calls `ProcessTrace` (blocking) and the callback
-// only touches the `Buffer` behind its mutex.
-unsafe impl Send for EtwDnsObserver {}
-unsafe impl Sync for EtwDnsObserver {}
 
 impl DnsObservationSource for EtwDnsObserver {
     fn drain(&self) -> Vec<DnsObservation> {
@@ -89,197 +74,37 @@ impl DnsObservationSource for EtwDnsObserver {
     }
 }
 
-/// Allocate + initialize an `EVENT_TRACE_PROPERTIES` buffer for the real-time
-/// session `session_name`, reserving room for the struct, the logger name, AND
-/// a log-file-name region. The kernel writes name regions back into the buffer
-/// on Query/Stop, so a buffer sized only for struct+name is overrun when
-/// `ControlTraceW(STOP)` finds a stale session — which then makes the following
-/// `StartTraceW` fail with `ERROR_BAD_LENGTH` (0x18). Always give the STOP call
-/// and the StartTraceW call SEPARATE buffers; never reuse one across both.
-fn alloc_trace_props(session_name: &[u16]) -> Vec<u8> {
-    const LOGFILE_PAD_CHARS: usize = 1024;
-    let name_bytes = std::mem::size_of_val(session_name);
-    let pad_bytes = LOGFILE_PAD_CHARS * std::mem::size_of::<u16>();
-    let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes + pad_bytes;
-    let mut buf: Vec<u8> = vec![0u8; props_size];
-    // SAFETY: `buf` is `props_size` bytes, ≥ size_of::<EVENT_TRACE_PROPERTIES>().
-    let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-    unsafe {
-        (*props).Wnode.BufferSize = props_size as u32;
-        (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        (*props).Wnode.ClientContext = 1; // QPC clock
-        (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-        (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-    }
-    buf
-}
-
 impl EtwDnsObserver {
     /// Start a real-time ETW session, enable the DNS-Client provider, and
-    /// spawn the `ProcessTrace` worker. Returns an error (and starts
-    /// nothing) on any setup failure — the caller degrades to no
-    /// observation.
+    /// spawn the pump. Returns an error (and starts nothing) on any setup
+    /// failure — the caller degrades to no observation.
     pub fn start() -> Result<Self, PlatformError> {
         let buffer: Buffer = Arc::new(Mutex::new(Vec::new()));
-        let session_name = wide("NrrDnsObserve");
-
-        // ── Allocate TWO independent EVENT_TRACE_PROPERTIES buffers. The
-        // kernel writes the stale session's full properties back into the
-        // buffer handed to ControlTraceW(STOP); reusing that same buffer for
-        // StartTraceW then passes a mutated/over-stuffed struct and StartTraceW
-        // fails with ERROR_BAD_LENGTH (0x18) whenever a stale session was
-        // present. So STOP gets its own scratch buffer and StartTraceW a
-        // pristine one, both sized by `alloc_trace_props` to absorb the
-        // kernel's writeback. ──
-        let mut stop_buf = alloc_trace_props(&session_name);
-        let mut props_buf = alloc_trace_props(&session_name);
-        let props = props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-
-        let mut control_handle = CONTROLTRACE_HANDLE::default();
-        // SAFETY: `session_name` outlives both calls; `stop_buf` / `props_buf`
-        // are independently owned, adequately sized, and live to fn end.
-        unsafe {
-            let _ = ControlTraceW(
-                CONTROLTRACE_HANDLE::default(),
-                PCWSTR(session_name.as_ptr()),
-                stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
-                EVENT_TRACE_CONTROL_STOP,
-            );
-            let start = StartTraceW(&mut control_handle, PCWSTR(session_name.as_ptr()), props);
-            if start != WIN32_ERROR(0) {
-                return Err(PlatformError::Win32 {
-                    operation: "StartTraceW(NrrDnsObserve)",
-                    code: start.0,
-                    message: "failed to start DNS-observe ETW session".into(),
-                });
-            }
-        }
-
-        // ── Enable the DNS-Client provider on the session. ──
-        let enable_params = ENABLE_TRACE_PARAMETERS {
-            Version: 2, // ENABLE_TRACE_PARAMETERS_VERSION_2
-            ..Default::default()
-        };
-        let enable = unsafe {
-            EnableTraceEx2(
-                control_handle,
-                &DNS_CLIENT_PROVIDER,
-                EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
-                TRACE_LEVEL_INFORMATION as u8,
-                0,
-                0,
-                0,
-                Some(&enable_params),
-            )
-        };
-        if enable != WIN32_ERROR(0) {
-            unsafe {
-                let _ = ControlTraceW(
-                    control_handle,
-                    PCWSTR(session_name.as_ptr()),
-                    props,
-                    EVENT_TRACE_CONTROL_STOP,
-                );
-            }
-            return Err(PlatformError::Win32 {
-                operation: "EnableTraceEx2(DNS-Client)",
-                code: enable.0,
-                message: "failed to enable DNS-Client ETW provider".into(),
-            });
-        }
-
-        // ── Open the trace for real-time consumption. The buffer pointer
-        // is threaded to the C callback via the logfile Context. ──
-        let mut logfile = EVENT_TRACE_LOGFILEW {
-            LoggerName: PWSTR(session_name.as_ptr() as *mut u16),
-            ..Default::default()
-        };
-        logfile.Anonymous1.ProcessTraceMode =
-            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-        logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
-        // Hand the callback a stable raw pointer to the buffer. The Arc is
-        // kept alive by `self.buffer`; we leak one ref for the callback's
-        // lifetime and reclaim it on drop.
-        let ctx = Arc::into_raw(Arc::clone(&buffer)) as *mut std::ffi::c_void;
-        logfile.Context = ctx;
-
-        let process_handle = unsafe { OpenTraceW(&mut logfile) };
-        // OpenTraceW returns INVALID_PROCESSTRACE_HANDLE (u64::MAX on the
-        // wire) on failure.
-        if process_handle.Value == u64::MAX {
-            let err = unsafe { GetLastError() };
-            unsafe {
-                drop(Arc::from_raw(ctx as *const Mutex<Vec<DnsObservation>>));
-                let _ = ControlTraceW(
-                    control_handle,
-                    PCWSTR(session_name.as_ptr()),
-                    props,
-                    EVENT_TRACE_CONTROL_STOP,
-                );
-            }
-            return Err(PlatformError::Win32 {
-                operation: "OpenTraceW(NrrDnsObserve)",
-                code: err.0,
-                message: "failed to open DNS-observe ETW trace".into(),
-            });
-        }
-
-        // ── Spawn the blocking ProcessTrace pump on its own thread. ──
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let worker = {
-            let handle = process_handle;
-            std::thread::Builder::new()
-                .name("nrr-dns-etw".into())
-                .spawn(move || {
-                    // ProcessTrace blocks until the session stops / trace
-                    // closes. Return value ignored — shutdown is driven by
-                    // `CloseTrace` in `Drop`.
-                    let _ = unsafe { ProcessTrace(&[handle], None, None) };
-                })
-                .map_err(|e| PlatformError::Win32 {
-                    operation: "spawn(nrr-dns-etw)",
-                    code: 0,
-                    message: e.to_string(),
-                })?
-        };
-
+        let session = RealtimeSession::start(
+            &SessionConfig {
+                name: "NrrDnsObserve",
+                thread_name: "nrr-dns-etw",
+                clock: SessionClock::PerformanceCounter,
+                flush_timer_secs: 0,
+            },
+            &ProviderEnable {
+                guid: DNS_CLIENT_PROVIDER,
+                level: TRACE_LEVEL_INFORMATION as u8,
+                keywords: 0,
+                enable_property: 0,
+            },
+            event_record_callback,
+            Arc::clone(&buffer),
+        )?;
         tracing::info!(
             target: "nrr::dns-observe",
+            msg_key = "win-etw-dns-observer-started",
             "DNS-Client ETW observer started",
         );
         Ok(Self {
             buffer,
-            session_name,
-            control_handle,
-            process_handle,
-            stop_flag,
-            worker: Some(worker),
+            _session: session,
         })
-    }
-}
-
-impl Drop for EtwDnsObserver {
-    fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
-        // Stop the session and close the trace → ProcessTrace returns and
-        // the worker thread exits.
-        let mut props_buf = alloc_trace_props(&self.session_name);
-        let props = props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-        // SAFETY: stop the session + close the trace → ProcessTrace returns and
-        // the worker exits. `props_buf` is adequately sized for the kernel's
-        // Stop writeback (see `alloc_trace_props`).
-        unsafe {
-            let _ = ControlTraceW(
-                self.control_handle,
-                PCWSTR(self.session_name.as_ptr()),
-                props,
-                EVENT_TRACE_CONTROL_STOP,
-            );
-            let _ = CloseTrace(self.process_handle);
-        }
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
-        }
     }
 }
 
@@ -293,20 +118,13 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
     if rec.EventHeader.EventDescriptor.Id != EVENT_ID_QUERY_COMPLETED {
         return;
     }
-    // Reconstruct the buffer handle (borrow, do NOT drop — ownership stays
-    // with the observer's Arc).
-    let ctx = rec.UserContext as *const Mutex<Vec<DnsObservation>>;
-    if ctx.is_null() {
+    // Borrowed: the session owns the reference.
+    let Some(buffer) = callback_context::<Mutex<Vec<DnsObservation>>>(rec) else {
         return;
-    }
-    let buffer = &*ctx;
-
-    let data = rec.UserData as *const u8;
-    let len = rec.UserDataLength as usize;
-    if data.is_null() || len < 2 {
+    };
+    let Some(bytes) = user_data(rec).filter(|b| b.len() >= 2) else {
         return;
-    }
-    let bytes = std::slice::from_raw_parts(data, len);
+    };
 
     // Field layout for event 3008: QueryName (UTF-16, NUL-terminated),
     // then fixed fields, then QueryResults (UTF-16, NUL-terminated). We
@@ -394,11 +212,6 @@ fn parse_ipv4_tokens(results: &str) -> Vec<Ipv4Addr> {
         }
     }
     out
-}
-
-/// NUL-terminated UTF-16 from a `&str`.
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(test)]

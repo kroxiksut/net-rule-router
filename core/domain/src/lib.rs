@@ -54,6 +54,7 @@ pub mod ptr_names;
 pub mod review;
 pub mod revision;
 pub mod risk;
+pub mod rule_shape;
 pub mod rule_specificity;
 pub mod rule_value_validation;
 pub mod rules_file;

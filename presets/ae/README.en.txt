@@ -13,4 +13,4 @@ Expected structure:
 Author: repository contributors
 
 Note:
-- Initial pack content can be AI-generated drafts and may be unverified.
+- Initial pack content may be unverified.

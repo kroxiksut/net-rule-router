@@ -68,6 +68,7 @@ pub fn handle_a_query(
         AnswerSanity::Sanitized { keep } => {
             tracing::info!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-answer-sanitized",
                 host = %hostname,
                 dropped = ?rejected_addresses(&resolved.addresses),
                 kept = ?keep,
@@ -81,6 +82,7 @@ pub fn handle_a_query(
         AnswerSanity::Unusable => {
             tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-answer-unusable",
                 host = %hostname,
                 rejected = ?rejected_addresses(&resolved.addresses),
                 "rule-host answer holds no address that could be a destination — answering the client but NOT pinning it to enforcement",
@@ -113,6 +115,7 @@ pub fn handle_a_query(
     if let Some(other) = displaced.filter(|other| !hosts_share_origin(hostname, other)) {
         tracing::warn!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-stub-suspected",
             host = %hostname,
             also_answered_for = %other,
             addresses = ?usable,
@@ -139,6 +142,7 @@ pub fn handle_a_query(
     if !fake_ip.may_substitute(&answered) {
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-real-address-in-subnet",
             host = %hostname,
             addresses = ?answered,
             "answering with the real address: this host lives inside the additional route's own subnet, and a virtual address there would point the caller at our TUN instead of into the tunnel",
@@ -227,6 +231,7 @@ pub fn handle_a_query(
     if !all_enforced {
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-ahead-of-enforcement",
             host = %hostname,
             addresses = ?unenforced,
             waited = !futile_wait,
@@ -248,6 +253,7 @@ pub fn handle_a_query(
     if matches!(reconcile, ReconcileOutcome::DeadlineExceeded) && leak_guard.blocking() {
         tracing::warn!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-withheld-leak-guard",
             host = %hostname,
             addresses = ?answered,
             "leak guard is blocking with the additional link unresolved and enforcement for this answer did not install in time — withholding the addresses instead of leaking them to the main link",
@@ -332,6 +338,7 @@ pub fn handle_aaaa_query(
     if matches!(reconcile, ReconcileOutcome::DeadlineExceeded) && leak_guard.blocking() {
         tracing::warn!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-withheld-leak-guard-ipv6",
             host = %hostname,
             addresses = ?answered,
             "leak guard is blocking and enforcement for this IPv6 answer did not install in time — withholding it",

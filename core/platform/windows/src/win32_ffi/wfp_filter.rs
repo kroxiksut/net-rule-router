@@ -498,6 +498,7 @@ pub fn enumerate_our_filters(
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::wfp",
+                    msg_key = "win-ffi-layer-enumerate-failed",
                     error = %e,
                     "a WFP layer would not enumerate; continuing with the layers that did"
                 );

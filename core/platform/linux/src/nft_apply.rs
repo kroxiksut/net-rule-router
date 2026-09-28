@@ -210,7 +210,9 @@ impl std::fmt::Display for NftApplyError {
             ),
             Self::NotPermitted { detail } => write!(
                 f,
-                "the kernel refused the nftables change: {detail}.                  Check that the service runs privileged (CAP_NET_ADMIN) and                  that this kernel has nf_tables"
+                "the kernel refused the nftables change: {detail}. \
+                 Check that the service runs privileged (CAP_NET_ADMIN) and \
+                 that this kernel has nf_tables"
             ),
             Self::Rejected { detail } => write!(f, "nft refused the ruleset: {detail}"),
         }
@@ -531,6 +533,25 @@ mod tests {
 
     fn json_of(ruleset: &NftRuleset) -> String {
         serde_json::to_string(&render_batch(ruleset)).expect("the batch must serialise")
+    }
+
+    /// The text reaches the tray and the archive: a source line break must not
+    /// leave a run of indentation inside it.
+    #[test]
+    fn error_texts_carry_no_source_indentation() {
+        let detail = "x".to_string();
+        for error in [
+            NftApplyError::NftUnavailable {
+                detail: detail.clone(),
+            },
+            NftApplyError::NotPermitted {
+                detail: detail.clone(),
+            },
+            NftApplyError::Rejected { detail },
+        ] {
+            let text = error.to_string();
+            assert!(!text.contains("  "), "{text:?}");
+        }
     }
 
     /// The transaction has to create the table, flush it, then rebuild — in

@@ -656,18 +656,11 @@ fn rule_summary_enabled_is_default(enabled: &bool) -> bool {
     *enabled == rule_summary_enabled_default()
 }
 
-/// Wire-form mirror of `nrr_domain::risk::RiskSignal`.
+/// Wire-form mirror of `nrr_domain::risk::RiskSignal`, plus the service's
+/// pre-apply findings (the last three variants), so the review lists both.
 ///
-/// Tagged enum with kebab-case `kind` discriminator: `broad-suffix-scope`,
-/// `moderate-suffix-scope`, `default-behavior-changed`,
-/// `mass-change-count`, `secondary-reroute`,
-/// `unstable-interface-binding`, `unknown-source`,
-/// `linked-suspicious-delta`, `rule-set-emptied`, `high-removal-ratio`,
-/// `overlapping-rules`, `fail-closed-activation`.
-///
-/// Field names use kebab-case at the JSON layer. Payloads carry the
-/// minimum metadata the GUI needs to render a localized message
-/// (label / count / apex / prev_total / removed_pct).
+/// The GUI renders each `kind` through `risk.signal.<kind>` with the payload
+/// fields as placeholders.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 // `rename_all_fields = "kebab-case"` is essential: the QML reads
 // e.g. `signal["rule-count"]`, but without this attribute the
@@ -713,6 +706,14 @@ pub enum RiskSignalDto {
     /// `behavior_mode` is transitioning to
     /// `StrictSecondaryFailClosed`.
     FailClosedActivation,
+    /// Application rules that match no installed executable: stored, enforce nothing.
+    AppRuleUnenforceable {
+        executables: Vec<String>,
+    },
+    /// The additional route's adapter is not present; its leak guard blocks until it returns.
+    AdditionalAdapterUnresolved,
+    /// The service's own consistency check would refuse this apply.
+    ApplyWillBeRefused,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

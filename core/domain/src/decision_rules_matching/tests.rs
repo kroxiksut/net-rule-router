@@ -196,44 +196,56 @@ fn matched_conflict(decision: &RequestedRouteDecision) -> Option<ConflictMarker>
     }
 }
 
-// ── glob_matches ──────────────────────────────────────────────────────────
+// ── app_pattern_matches (glob) ───────────────────────────────────────────
+
+fn glob_names(pattern: &str, process: &str) -> bool {
+    app_pattern_matches(&CanonicalAppPattern::Glob(pattern.to_owned()), process)
+}
 
 #[test]
 fn glob_exact_no_wildcard() {
-    assert!(glob_matches("chrome.exe", "chrome.exe"));
-    assert!(!glob_matches("chrome.exe", "firefox.exe"));
+    assert!(glob_names("chrome.exe", "chrome.exe"));
+    assert!(!glob_names("chrome.exe", "firefox.exe"));
 }
 
 #[test]
 fn glob_star_prefix() {
-    assert!(glob_matches("*vpn*.exe", "foovpnbar.exe"));
-    assert!(glob_matches("*vpn*.exe", "vpn.exe"));
-    assert!(!glob_matches("*vpn*.exe", "chrome.exe"));
+    assert!(glob_names("*vpn*.exe", "foovpnbar.exe"));
+    assert!(glob_names("*vpn*.exe", "vpn.exe"));
+    assert!(!glob_names("*vpn*.exe", "chrome.exe"));
 }
 
 #[test]
 fn glob_star_suffix() {
-    assert!(glob_matches("chrome*", "chrome.exe"));
-    assert!(glob_matches("chrome*", "chrome"));
-    assert!(!glob_matches("chrome*", "firefox.exe"));
+    assert!(glob_names("chrome*", "chrome.exe"));
+    assert!(glob_names("chrome*", "chrome"));
+    assert!(!glob_names("chrome*", "firefox.exe"));
 }
 
 #[test]
 fn glob_star_only_matches_everything() {
-    assert!(glob_matches("*", ""));
-    assert!(glob_matches("*", "anything.exe"));
-}
-
-#[test]
-fn glob_empty_pattern_matches_only_empty() {
-    assert!(glob_matches("", ""));
-    assert!(!glob_matches("", "nonempty"));
+    assert!(glob_names("*", ""));
+    assert!(glob_names("*", "anything.exe"));
 }
 
 #[test]
 fn glob_multiple_stars() {
-    assert!(glob_matches("*foo*bar*", "xfooyybarz"));
-    assert!(!glob_matches("*foo*bar*", "xfoobaz"));
+    assert!(glob_names("*foo*bar*", "xfooyybarz"));
+    assert!(!glob_names("*foo*bar*", "xfoobaz"));
+}
+
+#[test]
+fn glob_question_mark_is_a_literal_to_the_rule_engine() {
+    assert!(glob_names("vk?*", "vk?x.exe"));
+    assert!(!glob_names("vk?*", "vk1x.exe"));
+}
+
+#[test]
+fn glob_pathological_pattern_returns_promptly() {
+    let pattern = format!("{}b.exe", "*a".repeat(60));
+    let started = std::time::Instant::now();
+    assert!(!glob_names(&pattern, &"a".repeat(250)));
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
 }
 
 // ── Tier 1: ExactFqdn ─────────────────────────────────────────────────────
@@ -922,7 +934,7 @@ fn a_glob_without_the_suffix_still_names_the_process() {
     assert_eq!(matched_class(&d), Some(MatchClass::Application));
 }
 
-/// A Linux process has no suffix; the rule store canonicalises one on.
+/// A Linux process has no suffix; a rule may still be stored with one.
 #[test]
 fn an_exact_rule_matches_a_process_spelled_without_the_suffix() {
     let rb = book(
@@ -1289,4 +1301,155 @@ fn address_and_app_filter_discard_both_falls_to_default() {
             ..
         }
     ));
+}
+
+// ── Block veto and Block-vs-route ties ────────────────────────────────────
+
+fn blocking(id: &str, addr: CanonicalAddressMatch) -> CanonicalRule {
+    CanonicalRule {
+        action: crate::canonical::RuleAction::Block,
+        ..rule(id, Some(addr), None)
+    }
+}
+
+fn matched_action(decision: &RequestedRouteDecision) -> Option<crate::canonical::RuleAction> {
+    match decision {
+        RequestedRouteDecision::MatchedRoute { candidate } => Some(candidate.action),
+        RequestedRouteDecision::DefaultRoute { .. } => None,
+    }
+}
+
+/// A literal-IP Block drops the address in enforcement whatever name rule a
+/// tenant of it carries, so the engine must not answer "routed" for it.
+#[test]
+fn a_literal_ip_block_vetoes_a_narrower_name_rule_on_either_set() {
+    for block_on_main in [true, false] {
+        let block = blocking("b-ip", exact_ip(192, 0, 2, 10));
+        let route = rule("r-exact", Some(exact_fqdn("a.example")), None);
+        let rb = if block_on_main {
+            book(vec![block], vec![route])
+        } else {
+            book(vec![route], vec![block])
+        };
+        let d = match_rules(
+            &input_full("a.example", Ipv4Addr::new(192, 0, 2, 10), "curl.exe"),
+            &empty_lookup(),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        assert_eq!(
+            matched_rule_id(&d),
+            Some("b-ip"),
+            "block on main: {block_on_main}"
+        );
+        assert_eq!(
+            matched_action(&d),
+            Some(crate::canonical::RuleAction::Block)
+        );
+        assert_eq!(matched_class(&d), Some(MatchClass::ExactIp));
+
+        // Another address of the same host is not vetoed.
+        let d = match_rules(
+            &input_full("a.example", Ipv4Addr::new(192, 0, 2, 11), "curl.exe"),
+            &empty_lookup(),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        assert_eq!(matched_rule_id(&d), Some("r-exact"));
+    }
+}
+
+/// The veto is about Blocks only: a literal ROUTE on the address still waits
+/// for its tier, so the narrower name rule keeps winning.
+#[test]
+fn a_literal_ip_route_does_not_jump_the_tier_order() {
+    let rb = book(
+        vec![rule("r-exact", Some(exact_fqdn("a.example")), None)],
+        vec![rule("r-ip", Some(exact_ip(192, 0, 2, 10)), None)],
+    );
+    let d = match_rules(
+        &input_full("a.example", Ipv4Addr::new(192, 0, 2, 10), "curl.exe"),
+        &empty_lookup(),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("r-exact"));
+}
+
+/// A disabled literal Block vetoes nothing.
+#[test]
+fn a_disabled_literal_ip_block_does_not_veto() {
+    let mut block = blocking("b-ip", exact_ip(192, 0, 2, 10));
+    block.enabled = false;
+    let rb = book(
+        vec![rule("r-exact", Some(exact_fqdn("a.example")), None)],
+        vec![block],
+    );
+    let d = match_rules(
+        &input_full("a.example", Ipv4Addr::new(192, 0, 2, 10), "curl.exe"),
+        &empty_lookup(),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("r-exact"));
+}
+
+/// A Block and a route of identical specificity: the Block wins on whichever
+/// set either sits, as enforcement does.
+#[test]
+fn a_block_beats_a_route_of_equal_specificity_on_either_set() {
+    let shapes = [
+        (exact_fqdn("a.example"), "a.example"),
+        (suffix_domain("a.example"), "x.a.example"),
+        (zone("example"), "x.example"),
+    ];
+    for (addr, host) in shapes {
+        for block_on_main in [true, false] {
+            let block = blocking("b-1", addr.clone());
+            let route = rule("r-1", Some(addr.clone()), None);
+            let rb = if block_on_main {
+                book(vec![block], vec![route])
+            } else {
+                book(vec![route], vec![block])
+            };
+            let d = match_rules(
+                &input_hostname(host),
+                &empty_lookup(),
+                &rb,
+                default_zone_policy(),
+                prefer_primary(),
+            );
+            assert_eq!(
+                matched_rule_id(&d),
+                Some("b-1"),
+                "{host}, block on main: {block_on_main}"
+            );
+            assert_eq!(
+                matched_conflict(&d),
+                Some(ConflictMarker::Detected),
+                "{host}: the two sets still disagree"
+            );
+        }
+    }
+}
+
+/// The tie-break does not lift a Block above a NARROWER route.
+#[test]
+fn a_narrower_route_still_beats_a_wider_block() {
+    let rb = book(
+        vec![rule("r-exact", Some(exact_fqdn("a.example")), None)],
+        vec![blocking("b-suffix", suffix_domain("example"))],
+    );
+    let d = match_rules(
+        &input_hostname("a.example"),
+        &empty_lookup(),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("r-exact"));
 }

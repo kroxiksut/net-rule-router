@@ -64,6 +64,10 @@ mod windows_impl {
     /// File name for the persisted key blob.
     const KEY_FILE_NAME: &str = "db-mac-key.bin";
 
+    /// The re-sign-pending marker, kept beside the key under the same
+    /// DPAPI binding and DACL.
+    const RESIGN_MARKER_FILE_NAME: &str = "db-mac-resign-pending.bin";
+
     /// SDDL granting only `LocalSystem` (`SY`) full file access (`FA`)
     /// on a protected DACL (`P` — block inheritance from the parent).
     /// Administrators are intentionally absent: per the threat model an
@@ -124,11 +128,66 @@ mod windows_impl {
             &self.path
         }
 
-        /// Best-effort: lock the blob file down to `LocalSystem:F`.
+        /// The re-sign-pending marker's path, a sibling of the key blob.
+        pub fn resign_marker_path(&self) -> PathBuf {
+            self.path.with_file_name(RESIGN_MARKER_FILE_NAME)
+        }
+
+        /// Raw ciphertext at `path`; `None` when absent or zero-length (a
+        /// truncated write reads as never written).
+        fn read_blob(path: &Path) -> Result<Option<Vec<u8>>, PlatformError> {
+            match std::fs::read(path) {
+                Ok(bytes) if bytes.is_empty() => Ok(None),
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(PlatformError::Transient {
+                    operation: "key_store::load::read",
+                    detail: format!("read {}: {e}", path.display()),
+                }),
+            }
+        }
+
+        /// DPAPI-protects `plain` and writes it to `path` atomically, then
+        /// applies the SYSTEM-only DACL.
+        fn write_protected(&self, path: &Path, plain: &[u8]) -> Result<(), PlatformError> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| PlatformError::Transient {
+                    operation: "key_store::save::mkdir",
+                    detail: format!("create_dir_all {}: {e}", parent.display()),
+                })?;
+            }
+            let ciphertext = dpapi_protect(plain)?;
+            // Temp file then rename: a crash mid-write never leaves a
+            // truncated blob that would read as "present but corrupt".
+            let tmp = path.with_extension("bin.tmp");
+            std::fs::write(&tmp, &ciphertext).map_err(|e| PlatformError::Transient {
+                operation: "key_store::save::write_tmp",
+                detail: format!("write {}: {e}", tmp.display()),
+            })?;
+            std::fs::rename(&tmp, path).map_err(|e| PlatformError::Transient {
+                operation: "key_store::save::rename",
+                detail: format!("rename {} -> {}: {e}", tmp.display(), path.display()),
+            })?;
+            self.tighten_acl(path);
+            Ok(())
+        }
+
+        fn remove(path: &Path) -> Result<(), PlatformError> {
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(PlatformError::Transient {
+                    operation: "key_store::delete",
+                    detail: format!("remove {}: {e}", path.display()),
+                }),
+            }
+        }
+
+        /// Best-effort: lock `path` down to `LocalSystem:F`.
         /// Logged-and-swallowed on failure — the DPAPI binding is the
         /// real protection and the parent tree is already restrictive.
         /// No-op unless [`Self::harden_acl`] is set (production only).
-        fn tighten_acl(&self) {
+        fn tighten_acl(&self, path: &Path) {
             if !self.harden_acl {
                 return;
             }
@@ -151,13 +210,14 @@ mod windows_impl {
             if let Err(e) = convert {
                 tracing::warn!(
                     target: "nrr::keystore",
+                    msg_key = "win-keystore-descriptor-build-failed",
                     error = %e,
                     "failed to build SYSTEM-only descriptor; relying on parent ACL",
                 );
                 return;
             }
 
-            let mut path_w: Vec<u16> = self.path.as_os_str().encode_wide().chain([0]).collect();
+            let mut path_w: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
             // SAFETY: `path_w` is a valid NUL-terminated wide path;
             // `psd` is the descriptor we just built and still own.
             let set = unsafe {
@@ -166,8 +226,9 @@ mod windows_impl {
             if let Err(e) = set.ok() {
                 tracing::warn!(
                     target: "nrr::keystore",
+                    msg_key = "win-keystore-dacl-apply-failed",
                     error = %e,
-                    path = %self.path.display(),
+                    path = %path.display(),
                     "failed to apply SYSTEM-only DACL; relying on parent ACL",
                 );
             }
@@ -180,22 +241,9 @@ mod windows_impl {
 
     impl KeyStore for WindowsDpapiKeyStore {
         fn load(&self) -> Result<Option<Vec<u8>>, PlatformError> {
-            let ciphertext = match std::fs::read(&self.path) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => {
-                    return Err(PlatformError::Transient {
-                        operation: "key_store::load::read",
-                        detail: format!("read {}: {e}", self.path.display()),
-                    })
-                }
-            };
-            if ciphertext.is_empty() {
-                // A zero-length file is indistinguishable from a fresh
-                // install for our purposes — treat as absent so the
-                // bootstrap regenerates rather than erroring out.
+            let Some(ciphertext) = Self::read_blob(&self.path)? else {
                 return Ok(None);
-            }
+            };
             match dpapi_unprotect(&ciphertext) {
                 Ok(plaintext) => Ok(Some(plaintext)),
                 Err(e) => {
@@ -213,6 +261,7 @@ mod windows_impl {
                     // unsigned.
                     tracing::warn!(
                         target: "nrr::keystore",
+                        msg_key = "win-keystore-blob-undecryptable",
                         error = %e,
                         path = %self.path.display(),
                         "DB-MAC key blob is undecryptable under the current \
@@ -224,38 +273,40 @@ mod windows_impl {
         }
 
         fn save(&self, key: &[u8]) -> Result<(), PlatformError> {
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| PlatformError::Transient {
-                    operation: "key_store::save::mkdir",
-                    detail: format!("create_dir_all {}: {e}", parent.display()),
-                })?;
-            }
-            let ciphertext = dpapi_protect(key)?;
-            // Write to a sibling temp file then rename, so a crash mid
-            // write never leaves a truncated blob that would read as
-            // "key present but corrupt".
-            let tmp = self.path.with_extension("bin.tmp");
-            std::fs::write(&tmp, &ciphertext).map_err(|e| PlatformError::Transient {
-                operation: "key_store::save::write_tmp",
-                detail: format!("write {}: {e}", tmp.display()),
-            })?;
-            std::fs::rename(&tmp, &self.path).map_err(|e| PlatformError::Transient {
-                operation: "key_store::save::rename",
-                detail: format!("rename {} -> {}: {e}", tmp.display(), self.path.display()),
-            })?;
-            self.tighten_acl();
-            Ok(())
+            self.write_protected(&self.path, key)
         }
 
         fn delete(&self) -> Result<(), PlatformError> {
-            match std::fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(PlatformError::Transient {
-                    operation: "key_store::delete",
-                    detail: format!("remove {}: {e}", self.path.display()),
-                }),
+            Self::remove(&self.path)
+        }
+
+        fn save_resign_marker(&self, marker: &[u8]) -> Result<(), PlatformError> {
+            self.write_protected(&self.resign_marker_path(), marker)
+        }
+
+        fn load_resign_marker(&self) -> Result<Option<Vec<u8>>, PlatformError> {
+            let path = self.resign_marker_path();
+            let Some(ciphertext) = Self::read_blob(&path)? else {
+                return Ok(None);
+            };
+            // A blob this account cannot decrypt was not written by it: not a
+            // marker. Only an I/O fault is an `Err`.
+            match dpapi_unprotect(&ciphertext) {
+                Ok(plaintext) => Ok(Some(plaintext)),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "nrr::keystore",
+                        error = %e,
+                        path = %path.display(),
+                        "re-sign marker is undecryptable under the current DPAPI context; ignoring it",
+                    );
+                    Ok(None)
+                }
             }
+        }
+
+        fn delete_resign_marker(&self) -> Result<(), PlatformError> {
+            Self::remove(&self.resign_marker_path())
         }
     }
 
@@ -351,5 +402,46 @@ mod tests {
 
         store.delete().expect("delete");
         assert_eq!(store.load().expect("load after delete"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resign_marker_round_trips_beside_the_key_and_encrypted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sub").join("db-mac-key.bin");
+        let store = WindowsDpapiKeyStore::at(&path);
+        assert_eq!(store.load_resign_marker().expect("load empty"), None);
+
+        let marker = [0x5Au8; 32];
+        store.save_resign_marker(&marker).expect("save marker");
+        let marker_path = store.resign_marker_path();
+        assert_eq!(
+            marker_path.parent(),
+            path.parent(),
+            "marker lives beside the key"
+        );
+        assert_ne!(
+            std::fs::read(&marker_path).expect("read marker"),
+            marker.to_vec(),
+            "marker must be encrypted at rest like the key",
+        );
+        assert_eq!(
+            store.load_resign_marker().expect("load"),
+            Some(marker.to_vec())
+        );
+        assert_eq!(store.load().expect("key untouched"), None);
+
+        store.delete_resign_marker().expect("delete marker");
+        store.delete_resign_marker().expect("delete marker again");
+        assert_eq!(store.load_resign_marker().expect("load after delete"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_planted_plaintext_marker_is_not_a_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = WindowsDpapiKeyStore::at(dir.path().join("db-mac-key.bin"));
+        std::fs::write(store.resign_marker_path(), [0x5Au8; 32]).expect("plant");
+        assert_eq!(store.load_resign_marker().expect("load"), None);
     }
 }

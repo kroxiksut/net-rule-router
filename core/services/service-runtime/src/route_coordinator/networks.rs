@@ -27,6 +27,7 @@ impl SecondaryRouteCoordinator {
                 // networks", which is a different statement entirely.
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-local-networks-unreadable-additional",
                     sid = %sid,
                     "route table could not be read; reporting no local networks for the additional link: {e:?}",
                 );
@@ -54,6 +55,7 @@ impl SecondaryRouteCoordinator {
                 // machine that appears to have no local networks.
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-local-networks-unreadable-screen",
                     sid = %sid,
                     "route table could not be read; the local-networks screen will show nothing: {e:?}",
                 );
@@ -333,6 +335,7 @@ impl SecondaryRouteCoordinator {
                         if self.note_heal_once(sid, role, &binding.stable_id, &healed_id) {
                             tracing::warn!(
                                 target: "nrr::route-coordinator",
+                                msg_key = "route-binding-healed-by-name",
                                 sid = %sid,
                                 role = role,
                                 stale_id = %binding.stable_id,
@@ -361,6 +364,7 @@ impl SecondaryRouteCoordinator {
                                 if self.note_not_usable_once(sid, role, &binding.stable_id) {
                                     tracing::warn!(
                                         target: "nrr::route-coordinator",
+                                        msg_key = "route-binding-down-no-heal",
                                         sid = %sid,
                                         role = role,
                                         stable_id = %binding.stable_id,
@@ -440,6 +444,7 @@ impl SecondaryRouteCoordinator {
                                 {
                                     tracing::warn!(
                                         target: "nrr::route-coordinator",
+                                        msg_key = "route-binding-not-found",
                                         sid = %sid,
                                         role = role,
                                         bound = %binding.stable_id,
@@ -550,6 +555,7 @@ impl SecondaryRouteCoordinator {
                                 if self.note_no_next_hop_once(sid, role) {
                                     tracing::warn!(
                                         target: "nrr::route-coordinator",
+                                        msg_key = "route-binding-no-next-hop",
                                         sid = %sid,
                                         role = role,
                                         stable_id = %binding.stable_id,

@@ -72,6 +72,7 @@ fn the_catch_all_spares_what_its_twin_spares() {
     );
 }
 use super::*;
+use nrr_platform_api::wfp_slotting::pack_v4;
 // The v6 constants moved to `super::v6`; the parent no longer imports the type.
 use std::net::Ipv6Addr;
 

@@ -36,6 +36,18 @@ pub trait KeyStore: Send + Sync {
 
     /// Removes the stored key. Succeeds (no-op) when nothing is stored.
     fn delete(&self) -> Result<(), PlatformError>;
+
+    /// Persists the re-sign-pending marker beside the key, under the same
+    /// protection. Opaque bytes: the caller binds them to the key, so a marker
+    /// planted or replayed from an earlier incident does not match.
+    fn save_resign_marker(&self, marker: &[u8]) -> Result<(), PlatformError>;
+
+    /// The stored marker, `None` when absent or unreadable as a marker.
+    /// `Err` only for an I/O fault reaching it.
+    fn load_resign_marker(&self) -> Result<Option<Vec<u8>>, PlatformError>;
+
+    /// Removes the marker. Succeeds (no-op) when nothing is stored.
+    fn delete_resign_marker(&self) -> Result<(), PlatformError>;
 }
 
 /// Generate a fresh signing key from the OS CSPRNG.
@@ -59,6 +71,7 @@ pub fn generate_signing_key() -> Result<Vec<u8>, PlatformError> {
 #[derive(Default)]
 pub struct InMemKeyStore {
     inner: std::sync::Mutex<Option<Vec<u8>>>,
+    resign_marker: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl InMemKeyStore {
@@ -72,38 +85,45 @@ impl InMemKeyStore {
     pub fn with_key(key: Vec<u8>) -> Self {
         Self {
             inner: std::sync::Mutex::new(Some(key)),
+            ..Self::default()
         }
     }
 }
 
+fn lock_slot(
+    slot: &std::sync::Mutex<Option<Vec<u8>>>,
+) -> Result<std::sync::MutexGuard<'_, Option<Vec<u8>>>, PlatformError> {
+    slot.lock().map_err(|_| PlatformError::StateCorrupted {
+        detail: "InMemKeyStore mutex poisoned".into(),
+    })
+}
+
 impl KeyStore for InMemKeyStore {
     fn load(&self) -> Result<Option<Vec<u8>>, PlatformError> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|_| PlatformError::StateCorrupted {
-                detail: "InMemKeyStore mutex poisoned".into(),
-            })?
-            .clone())
+        Ok(lock_slot(&self.inner)?.clone())
     }
 
     fn save(&self, key: &[u8]) -> Result<(), PlatformError> {
-        *self
-            .inner
-            .lock()
-            .map_err(|_| PlatformError::StateCorrupted {
-                detail: "InMemKeyStore mutex poisoned".into(),
-            })? = Some(key.to_vec());
+        *lock_slot(&self.inner)? = Some(key.to_vec());
         Ok(())
     }
 
     fn delete(&self) -> Result<(), PlatformError> {
-        *self
-            .inner
-            .lock()
-            .map_err(|_| PlatformError::StateCorrupted {
-                detail: "InMemKeyStore mutex poisoned".into(),
-            })? = None;
+        *lock_slot(&self.inner)? = None;
+        Ok(())
+    }
+
+    fn save_resign_marker(&self, marker: &[u8]) -> Result<(), PlatformError> {
+        *lock_slot(&self.resign_marker)? = Some(marker.to_vec());
+        Ok(())
+    }
+
+    fn load_resign_marker(&self) -> Result<Option<Vec<u8>>, PlatformError> {
+        Ok(lock_slot(&self.resign_marker)?.clone())
+    }
+
+    fn delete_resign_marker(&self) -> Result<(), PlatformError> {
+        *lock_slot(&self.resign_marker)? = None;
         Ok(())
     }
 }
@@ -145,6 +165,19 @@ mod tests {
         assert_eq!(store.load().expect("load"), None);
         // Delete is idempotent.
         store.delete().expect("delete again");
+    }
+
+    #[test]
+    fn in_mem_resign_marker_is_independent_of_the_key() {
+        let store = InMemKeyStore::with_key(vec![7; SIGNING_KEY_BYTE_LEN]);
+        assert_eq!(store.load_resign_marker().expect("load"), None);
+        store.save_resign_marker(&[1, 2]).expect("save marker");
+        assert_eq!(store.load_resign_marker().expect("load"), Some(vec![1, 2]));
+        store.delete().expect("delete key");
+        assert_eq!(store.load_resign_marker().expect("load"), Some(vec![1, 2]));
+        store.delete_resign_marker().expect("delete marker");
+        store.delete_resign_marker().expect("delete marker again");
+        assert_eq!(store.load_resign_marker().expect("load"), None);
     }
 
     #[test]

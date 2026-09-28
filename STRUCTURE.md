@@ -25,10 +25,10 @@ Application entry points and UI shells:
 
 ### core/
 Core product domain logic and service runtime:
-- **`core/domain`** — Pure domain primitives and decision engine (routing rules, traffic classification, policy evaluation)
+- **`core/domain`** — Pure domain primitives and decision engine (routing rules, traffic classification, policy evaluation, and the table of rule shapes enforcement can carry out)
 - **`core/application`** — Transport-agnostic backend facade
 - **`core/platform/api`** — Platform-neutral port traits every OS backend implements; compiles on every target and depends on no OS API
-- **`core/platform/windows`** — Windows implementations of those ports (WFP, routes, SCM, DNS, connection observation, VM inventory)
+- **`core/platform/windows`** — Windows implementations of those ports (WFP, routes, SCM, DNS, connection observation, process-start recording, VM inventory)
 - **`core/platform/linux`** — Linux implementations (nftables, systemd, polkit, procfs observation)
 - **`core/platform/nftlink`** — Crate `nftlink`: a standalone nf_tables netlink library, deliberately free of any product dependency so it can leave this repository as its own published crate (enforced by `tests/independence.rs`)
 - **`core/services/windows-service`** — Windows service entrypoint: SCM/console entry, named-pipe server host, production dependency wiring. Orchestration logic belongs in `service-runtime`
@@ -43,7 +43,7 @@ Core product domain logic and service runtime:
 
 ### shared/
 Shared, UI-runtime-independent contracts and types:
-- **`shared/contracts`** — Crate `nrr-shared`: GUI/tray/service contracts, IPC payloads, product identity, diagnostics DTOs
+- **`shared/contracts`** — Crate `nrr-shared`: GUI/tray/service contracts, IPC payloads, product identity, diagnostics DTOs, and the one wildcard matcher every application-pattern check goes through
 
 ### assets/
 UI resources (no business logic):
@@ -78,7 +78,7 @@ Files a platform's delivery installs but the build does not produce:
 - **`packaging/linux`** — the two XDG desktop entries (`netrulerouter.desktop`, `netrulerouter-tray.desktop`). Their basenames are the Wayland `app_id` the Qt host declares via `setDesktopFileName`, which is how a compositor finds the window's name and icon.
 
 ### scripts/
-Developer automation, PowerShell and shell side by side: bootstrap, build, run, check, service install/uninstall/status, desktop-entry install/uninstall, full data purge, network reset, smoke and speed probes, packaging, WSL gate. `scripts/lib/` holds path constants the shell scripts source (never execute); `scripts/dev/` holds one-off maintenance utilities.
+Developer automation, PowerShell and shell side by side: bootstrap, build, run, check, service install/uninstall/status, desktop-entry install/uninstall, full data purge, network reset, smoke and speed probes, packaging, WSL gate. `scripts/lib/` holds path constants and helpers the shell and PowerShell scripts source (never execute); `scripts/dev/` holds one-off maintenance utilities.
 
 ### .github/
 CI/CD workflow definitions (Windows and Linux quality gates)
@@ -87,9 +87,9 @@ CI/CD workflow definitions (Windows and Linux quality gates)
 
 Core configuration files:
 
-- `Cargo.toml` — Rust workspace manifest
+- `Cargo.toml` — Rust workspace manifest and build profiles
 - `Cargo.lock` — Dependency lock
-- `deny.toml` — Dependency/license policy
+- `deny.toml` — Dependency/license policy, checked against the Windows, Linux and macOS dependency graphs
 - `rust-toolchain.toml` — Rust version pin
 - `.env.example` — Non-secret environment placeholder
 - `.editorconfig` — Editor formatting
@@ -150,8 +150,8 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `clean-sync-duplicates` — Remove file-sync conflict copies
 - `install-service` / `uninstall-service` / `service-status` / `service-smoke` — Service lifecycle for development
 - `install-desktop` / `uninstall-desktop` — Linux only: desktop entries and hicolor icons, per user or machine-wide
-- `purge-data` — Remove every trace the product leaves on a machine, so the next install starts clean. Shows what it would delete unless `--yes` / `-Yes` is given; keeps the audit trail unless `--purge-audit` / `-PurgeAudit` is given
-- `reset-network` — Drop network state an abnormally stopped service left behind
+- `purge-data` — Remove every trace the product leaves on a machine, so the next install starts clean. Shows what it would delete unless `--yes` / `-Yes` is given; keeps the audit trail unless `--purge-audit` / `-PurgeAudit` is given; takes the service down first and deletes nothing while it is still registered
+- `reset-network` — Drop network state an abnormally stopped service left behind; on Linux it prefers the daemon's own `cleanup`
 - `wsl-gate` — Run the Linux gate from WSL2
 - `package-windows` — Portable Windows package: binaries, the Qt and Visual C++
   runtimes, payload and a `build-info.json` stamp. See

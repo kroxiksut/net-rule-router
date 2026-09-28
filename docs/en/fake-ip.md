@@ -51,10 +51,9 @@ confirm the genuine driver is present before relying on the feature.
 
 Fake-IP is deliberately not used for every connection:
 
-- **Peer-to-peer and cryptocurrency applications** keep their real addresses:
-  they go over the main channel by default. You can give them a route of your
-  own in **Interfaces and routes → Set up routes**, like any other application
-  group.
+- **Some application groups** keep their real addresses and go over the main
+  channel by default. You can give any of them a route of your own in
+  **Interfaces and routes → Set up routes**.
 - **Addresses typed directly, and local or intranet names** — a bare IP
   address, `localhost`, single-label machine names, `.local` and the like —
   always use the real address, because they have no public destination to

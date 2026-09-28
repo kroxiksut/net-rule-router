@@ -111,7 +111,7 @@ GroupBox {
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
             text: root.tr("settings.service.description",
-                "NetRuleRouter runs as a Windows background service. Install or manage it from here.")
+                "NetRuleRouter runs as a background service. Installing, removing, starting and stopping it needs administrator rights — the system asks for them.")
         }
 
         // ── Status badge ─────────────────────────────────────────

@@ -113,6 +113,10 @@ const DAEMON_RUN_VERB: &str = "run";
 /// daemon died before it could. Internal, like `run`.
 pub const DAEMON_RESTORE_DNS_VERB: &str = "restore-dns";
 
+/// The argument that takes back everything the daemon put on the machine. The
+/// console's `reset-network` runs it; internal, like the other two.
+pub const DAEMON_CLEANUP_VERB: &str = "cleanup";
+
 /// The `RuntimeDirectory=` / `StateDirectory=` leaf. Kept next to the paths in
 /// the IPC address (`/run/netrulerouter/…`) and the secrets store
 /// (`/var/lib/netrulerouter/…`) so all three agree on one directory name.
@@ -129,8 +133,10 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
     let mut s = String::with_capacity(512);
     s.push_str("[Unit]\n");
     s.push_str(&format!("Description={}\n", cfg.description));
-    // Routing/enforcement only makes sense once the network stack is up.
-    s.push_str("After=network-online.target\n");
+    // Routing/enforcement only makes sense once the network stack is up. After
+    // resolved too: detecting the DNS mechanism asks it, and a machine whose
+    // resolved has not started yet must not be read as one without it.
+    s.push_str("After=network-online.target systemd-resolved.service\n");
     s.push_str("Wants=network-online.target\n");
     // Crash-recovery bounds live in [Unit], not [Service]: they cap how often
     // the `Restart=` below is allowed to fire, so a daemon that cannot start is
@@ -764,7 +770,7 @@ mod tests {
     #[test]
     fn unit_orders_after_network_online() {
         let unit = render_service_unit(&sample_config());
-        assert!(unit.contains("After=network-online.target"));
+        assert!(unit.contains("After=network-online.target systemd-resolved.service\n"));
         assert!(unit.contains("Wants=network-online.target"));
     }
 

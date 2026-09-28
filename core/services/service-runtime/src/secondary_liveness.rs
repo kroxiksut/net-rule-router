@@ -209,6 +209,7 @@ impl SecondaryLivenessTracker {
             if state.baseline_hold_logged.insert(ifindex) {
                 tracing::info!(
                     target: "nrr::route-coordinator",
+                    msg_key = "seclive-unprobeable-baseline-missing",
                     ifindex,
                     "secondary next-hop has never answered the liveness probe — treating it as unprobeable (alive), not dead; a gateway that drops ICMP echo cannot fail-close the tunnel",
                 );

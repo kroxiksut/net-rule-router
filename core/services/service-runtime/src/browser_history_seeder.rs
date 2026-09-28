@@ -13,6 +13,7 @@
 //! Mechanism-free: the history read, the rule book, the resolver, and the cache
 //! are injected as traits, so the core is unit-tested with fakes.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -22,7 +23,7 @@ use nrr_storage::dto::ResolutionEntry;
 use nrr_storage::repository::CacheRepository;
 use nrr_storage::resolution_source::StorageResolutionSource;
 
-use crate::dns_observation_consumer::{rule_set_matches, ActiveSidFn};
+use crate::dns_observation_consumer::rule_set_matches;
 use crate::net_filter::is_non_routable;
 use crate::per_sid_orchestrator::RulesProvider;
 use crate::supervised_runtime::RouteRecomputeHook;
@@ -44,33 +45,65 @@ pub struct BrowserHistorySeedSummary {
 /// already a small subset, so this is generous.
 const MAX_SEED_HOSTS: usize = 1000;
 
-/// Reads the browser history, filters to rule hosts for the active user, resolves
-/// them, and caches the results with source
+/// Reads one principal's browser history, filters to that principal's rule
+/// hosts, resolves them, and caches the results with source
 /// [`StorageResolutionSource::BrowserHistorySeed`].
+///
+/// The principal is always named by the caller — the requester's own SID, never
+/// "whoever is active": the consent covers the consenting user's history only.
 pub struct BrowserHistorySeeder {
     history: Arc<dyn BrowserHistoryReadPort>,
     rules: Arc<dyn RulesProvider>,
-    active_sid: ActiveSidFn,
     resolver: Arc<dyn DnsResolverPort>,
     cache: Arc<Mutex<dyn CacheRepository + Send>>,
     recompute: Option<RouteRecomputeHook>,
+    /// Principals with a pass in flight. A second request for the same user
+    /// would read the same history and resolve the same hosts twice over.
+    in_flight: Mutex<HashSet<String>>,
+}
+
+/// One claimed seed pass for a principal. The claim is released when this is
+/// dropped, whether or not [`Self::run`] was reached — a worker that failed to
+/// spawn must not leave the user locked out.
+pub struct SeedRun {
+    seeder: Arc<BrowserHistorySeeder>,
+    sid: String,
+}
+
+impl SeedRun {
+    pub fn sid(&self) -> &str {
+        &self.sid
+    }
+
+    pub fn run(self, now: SystemTime) -> BrowserHistorySeedSummary {
+        self.seeder.seed_for(&self.sid, now)
+    }
+}
+
+impl Drop for SeedRun {
+    fn drop(&mut self) {
+        self.seeder
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.sid);
+    }
 }
 
 impl BrowserHistorySeeder {
     pub fn new(
         history: Arc<dyn BrowserHistoryReadPort>,
         rules: Arc<dyn RulesProvider>,
-        active_sid: ActiveSidFn,
         resolver: Arc<dyn DnsResolverPort>,
         cache: Arc<Mutex<dyn CacheRepository + Send>>,
     ) -> Self {
         Self {
             history,
             rules,
-            active_sid,
             resolver,
             cache,
             recompute: None,
+            in_flight: Mutex::new(HashSet::new()),
         }
     }
 
@@ -81,25 +114,35 @@ impl BrowserHistorySeeder {
         self
     }
 
-    /// Run one opt-in seed pass. Returns the summary (also on partial failure —
+    /// Claim the single seed slot for `sid`; `None` while a pass for that
+    /// principal is still running.
+    pub fn try_begin(self: &Arc<Self>, sid: &str) -> Option<SeedRun> {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if !in_flight.insert(sid.to_owned()) {
+            return None;
+        }
+        Some(SeedRun {
+            seeder: Arc::clone(self),
+            sid: sid.to_owned(),
+        })
+    }
+
+    /// One seed pass for `sid`. Returns the summary (also on partial failure —
     /// a browser or resolver error just lowers the counts, never errors the whole
     /// import). Triggers the recompute hook iff at least one host was cached.
-    pub fn seed(&self, now: SystemTime) -> BrowserHistorySeedSummary {
+    fn seed_for(&self, sid: &str, now: SystemTime) -> BrowserHistorySeedSummary {
         let mut summary = BrowserHistorySeedSummary::default();
-        let Some(sid) = (self.active_sid)() else {
+        let Some(snapshot) = self.rules.active_rules_for(sid) else {
             return summary;
         };
-        let Some(snapshot) = self.rules.active_rules_for(&sid) else {
-            return summary;
-        };
-        // The read is principal-scoped: the service process is
-        // LocalSystem, so the reader must resolve the ACTIVE USER's profile,
-        // not its own (which has no browsers).
-        let hostnames = match self.history.read_history_hostnames(&sid) {
+        // The service runs as LocalSystem, whose own profile has no browsers:
+        // the reader resolves this principal's profile.
+        let hostnames = match self.history.read_history_hostnames(sid) {
             Ok(h) => h,
             Err(e) => {
                 tracing::info!(
                     target: "nrr::browser-history",
+                    msg_key = "browserhistseed-read-failed",
                     error = %e,
                     "browser-history seed: nothing read",
                 );
@@ -149,6 +192,7 @@ impl BrowserHistorySeeder {
         if summary.cached > 0 {
             tracing::info!(
                 target: "nrr::browser-history",
+                msg_key = "browserhistseed-cached",
                 visited = summary.visited,
                 rule_matching = summary.rule_matching,
                 cached = summary.cached,
@@ -264,14 +308,8 @@ mod tests {
         );
         let resolver = Arc::new(FakeResolver { map });
         let cache = in_memory_cache();
-        let seeder = BrowserHistorySeeder::new(
-            history,
-            rules,
-            Arc::new(|| Some("S-1-5-21-A".to_string())),
-            resolver,
-            Arc::clone(&cache),
-        );
-        let s = seeder.seed(SystemTime::now());
+        let seeder = BrowserHistorySeeder::new(history, rules, resolver, Arc::clone(&cache));
+        let s = seeder.seed_for("S-1-5-21-A", SystemTime::now());
         assert_eq!(s.visited, 4);
         assert_eq!(
             s.rule_matching, 3,
@@ -280,26 +318,106 @@ mod tests {
         assert_eq!(s.cached, 2, "two hosts cached; loopback filtered out");
     }
 
-    #[test]
-    fn no_active_sid_seeds_nothing() {
-        let history = Arc::new(MockBrowserHistoryRead {
-            hostnames: vec!["feed.example".into()],
-        });
-        let rules = Arc::new(ScriptedRules(CanonicalRuleSet::from_rules(vec![
-            zone_rule("r-zone", "example"),
-        ])));
-        let seeder = BrowserHistorySeeder::new(
-            history,
-            rules,
-            Arc::new(|| None),
-            Arc::new(FakeResolver {
-                map: Default::default(),
-            }),
-            in_memory_cache(),
+    /// Records whose history was asked for.
+    #[derive(Default)]
+    struct RecordingHistory {
+        asked: Mutex<Vec<String>>,
+    }
+    impl BrowserHistoryReadPort for RecordingHistory {
+        fn read_history_hostnames(
+            &self,
+            principal: &str,
+        ) -> Result<Vec<String>, nrr_platform_api::browser_history::BrowserHistoryError> {
+            self.asked
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(principal.to_owned());
+            Ok(vec!["feed.example".into()])
+        }
+    }
+
+    /// Rules for exactly one principal.
+    struct OnePrincipalRules(&'static str);
+    impl RulesProvider for OnePrincipalRules {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            None
+        }
+        fn active_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
+            (principal == self.0).then(|| ActiveRulesSnapshot {
+                rule_book: CanonicalRuleBook {
+                    primary: CanonicalRuleSet::from_rules(vec![zone_rule("r-zone", "example")]),
+                    secondary: CanonicalRuleSet::from_rules(vec![]),
+                },
+                behavior_mode: RouteBehaviorMode::PreferPrimary,
+            })
+        }
+    }
+
+    fn resolver_for_feed() -> Arc<FakeResolver> {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "feed.example".to_string(),
+            vec![Ipv4Addr::new(203, 0, 113, 100)],
         );
+        Arc::new(FakeResolver { map })
+    }
+
+    /// The consent is the requester's: user B's import must read B's profile
+    /// against B's rules, whoever else is signed in.
+    #[test]
+    fn a_pass_reads_the_named_principals_history_and_rules_only() {
+        let history = Arc::new(RecordingHistory::default());
+        let seeder = Arc::new(BrowserHistorySeeder::new(
+            Arc::clone(&history) as Arc<dyn BrowserHistoryReadPort>,
+            Arc::new(OnePrincipalRules("S-1-5-21-B")),
+            resolver_for_feed(),
+            in_memory_cache(),
+        ));
+        let run = seeder.try_begin("S-1-5-21-B").expect("slot free");
+        let s = run.run(SystemTime::now());
+        assert_eq!(s.cached, 1);
         assert_eq!(
-            seeder.seed(SystemTime::now()),
-            BrowserHistorySeedSummary::default()
+            history.asked.lock().expect("asked").as_slice(),
+            &["S-1-5-21-B".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_principal_without_rules_seeds_nothing_and_reads_no_history() {
+        let history = Arc::new(RecordingHistory::default());
+        let seeder = Arc::new(BrowserHistorySeeder::new(
+            Arc::clone(&history) as Arc<dyn BrowserHistoryReadPort>,
+            Arc::new(OnePrincipalRules("S-1-5-21-A")),
+            resolver_for_feed(),
+            in_memory_cache(),
+        ));
+        let s = seeder
+            .try_begin("S-1-5-21-B")
+            .expect("slot free")
+            .run(SystemTime::now());
+        assert_eq!(s, BrowserHistorySeedSummary::default());
+        assert!(history.asked.lock().expect("asked").is_empty());
+    }
+
+    #[test]
+    fn one_pass_per_principal_at_a_time() {
+        let seeder = Arc::new(BrowserHistorySeeder::new(
+            Arc::new(RecordingHistory::default()),
+            Arc::new(OnePrincipalRules("S-1-5-21-A")),
+            resolver_for_feed(),
+            in_memory_cache(),
+        ));
+        let first = seeder.try_begin("S-1-5-21-A").expect("slot free");
+        assert!(
+            seeder.try_begin("S-1-5-21-A").is_none(),
+            "a second pass for the same user is refused while one runs"
+        );
+        let other = seeder.try_begin("S-1-5-21-B");
+        assert!(other.is_some(), "another user's pass is independent");
+        drop(first);
+        assert!(
+            seeder.try_begin("S-1-5-21-A").is_some(),
+            "the slot is released when the pass ends"
         );
     }
 }

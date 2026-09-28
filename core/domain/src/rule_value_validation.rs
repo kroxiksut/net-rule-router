@@ -320,11 +320,41 @@ fn validate_application(value: &str) -> RuleValueValidation {
     RuleValueValidation::Valid
 }
 
+// ── network domain ────────────────────────────────────────────────────────────
+
+/// The domain a user names for completing short names, in the form it is
+/// stored and queried: lower case, no surrounding dots. `None` when `raw` is
+/// not a usable domain. ASCII only — it goes into a DNS question as typed.
+pub fn normalize_network_domain(raw: &str) -> Option<String> {
+    let domain = raw.trim().trim_matches('.').to_ascii_lowercase();
+    (!domain.is_empty() && domain.is_ascii() && domain.len() <= 253 && is_valid_hostname(&domain))
+        .then_some(domain)
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_network_domain_is_stored_in_one_form() {
+        assert_eq!(
+            normalize_network_domain(" .Corp.Example. ").as_deref(),
+            Some("corp.example")
+        );
+        assert_eq!(normalize_network_domain("corp").as_deref(), Some("corp"));
+        for bad in [
+            "",
+            "..",
+            "corp..example",
+            "-corp.example",
+            "corp example",
+            "пример.рф",
+        ] {
+            assert_eq!(normalize_network_domain(bad), None, "{bad:?}");
+        }
+    }
 
     fn ok(rule_type: &str, value: &str) {
         let r = validate_rule_value(rule_type, value);

@@ -41,19 +41,18 @@ pub fn connect_to<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
     UnixStream::connect(path)
 }
 
-/// A stream whose reads have a deadline and can be abandoned.
+/// A stream whose reads and writes have a deadline and can be abandoned.
 ///
-/// `UnixStream::set_read_timeout` alone is not enough: a timeout mid-frame
-/// tears down a connection that was merely slow, and a 60-second timeout makes
-/// shutdown wait out the whole window. This wrapper sets a SHORT socket
-/// timeout and turns each expiry into a decision — keep waiting, or give up
-/// because the caller asked to stop or the real deadline passed. A `read` that
-/// times out has consumed nothing, so retrying is safe; the framing code above
-/// never sees the expiry at all.
+/// `UnixStream` timeouts alone are not enough: a timeout mid-frame tears down a
+/// connection that was merely slow, and a 60-second timeout makes shutdown wait
+/// out the whole window. This wrapper sets a SHORT socket timeout and turns each
+/// expiry into a decision — keep waiting, or give up because the caller asked
+/// to stop or the real deadline passed. A read or write that times out has
+/// transferred nothing, so retrying is safe.
 pub struct TimedStream {
     inner: UnixStream,
     abort: Arc<AtomicBool>,
-    read_deadline: Duration,
+    deadline: Duration,
     /// Set while the caller is only LOOKING for a frame rather than waiting
     /// for one it asked for. The first read then gives up quickly; once a byte
     /// has arrived the full deadline applies again, because abandoning a frame
@@ -63,26 +62,32 @@ pub struct TimedStream {
     probe_bytes: u64,
 }
 
-/// How long one socket read waits before the wrapper reconsiders. Short enough
+/// How long one socket call waits before the wrapper reconsiders. Short enough
 /// that shutdown is prompt, long enough to cost nothing while idle.
-const READ_TICK: Duration = Duration::from_millis(200);
+const IO_TICK: Duration = Duration::from_millis(200);
 
 impl TimedStream {
-    /// Wrap `stream`; `abort` ends a wait early, `read_deadline` caps the total
-    /// wait for one read.
-    pub fn new(
-        stream: UnixStream,
-        abort: Arc<AtomicBool>,
-        read_deadline: Duration,
-    ) -> io::Result<Self> {
-        stream.set_read_timeout(Some(READ_TICK))?;
+    /// Wrap `stream`; `abort` ends a wait early, `deadline` caps the wait of
+    /// one read or write.
+    pub fn new(stream: UnixStream, abort: Arc<AtomicBool>, deadline: Duration) -> io::Result<Self> {
+        stream.set_read_timeout(Some(IO_TICK))?;
+        // A peer that stops reading fills the socket buffer, and a frame is up
+        // to 1 MiB: without this the write blocks for good and shutdown's join
+        // with it.
+        stream.set_write_timeout(Some(IO_TICK))?;
         Ok(Self {
             inner: stream,
             abort,
-            read_deadline,
+            deadline,
             probe_deadline: None,
             probe_bytes: 0,
         })
+    }
+
+    /// Change the cap on one read or write, e.g. from the handshake's to the
+    /// request loop's.
+    pub fn set_deadline(&mut self, deadline: Duration) {
+        self.deadline = deadline;
     }
 
     /// Look for a server-initiated frame without committing to a long wait.
@@ -100,13 +105,38 @@ impl TimedStream {
         self.probe_deadline = None;
         self.probe_bytes = 0;
     }
+
+    /// True once the current probe has consumed part of a frame. A timeout
+    /// then is not "nothing arrived": the stream is mid-frame and unusable.
+    pub fn probe_in_frame(&self) -> bool {
+        self.probe_bytes != 0
+    }
+
+    /// `Some(error)` when a timed-out socket call must not be retried.
+    fn give_up(&self, deadline: Instant, what: &str) -> Option<io::Error> {
+        if self.abort.load(Ordering::Relaxed) {
+            return Some(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{what} cancelled"),
+            ));
+        }
+        (Instant::now() >= deadline)
+            .then(|| io::Error::new(io::ErrorKind::TimedOut, format!("{what} timed out")))
+    }
+}
+
+fn is_tick_expiry(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 impl io::Read for TimedStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let wait = match self.probe_deadline {
             Some(short) if self.probe_bytes == 0 => short,
-            _ => self.read_deadline,
+            _ => self.deadline,
         };
         let deadline = Instant::now() + wait;
         loop {
@@ -115,17 +145,9 @@ impl io::Read for TimedStream {
                     self.probe_bytes += n as u64;
                     return Ok(n);
                 }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    if self.abort.load(Ordering::Relaxed) {
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, "read cancelled"));
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, "read timed out"));
+                Err(e) if is_tick_expiry(&e) => {
+                    if let Some(err) = self.give_up(deadline, "read") {
+                        return Err(err);
                     }
                 }
                 Err(e) => return Err(e),
@@ -136,7 +158,18 @@ impl io::Read for TimedStream {
 
 impl io::Write for TimedStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        io::Write::write(&mut self.inner, buf)
+        let deadline = Instant::now() + self.deadline;
+        loop {
+            match io::Write::write(&mut self.inner, buf) {
+                Ok(n) => return Ok(n),
+                Err(e) if is_tick_expiry(&e) => {
+                    if let Some(err) = self.give_up(deadline, "write") {
+                        return Err(err);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
         io::Write::flush(&mut self.inner)
@@ -191,6 +224,44 @@ mod tests {
         .expect("wrap stream");
         let mut buf = [0u8; 4];
         let err = timed.read(&mut buf).expect_err("read must not succeed");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// Writes into a peer that never reads until the call returns; `None` if
+    /// it is still blocked after `limit` — which is the hang being guarded.
+    fn write_into_a_deaf_peer(abort: Arc<AtomicBool>, deadline: Duration) -> Option<io::Error> {
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut timed = TimedStream::new(client, abort, deadline).expect("wrap stream");
+            // Far more than any socket buffer holds.
+            let blob = vec![0u8; 16 * 1024 * 1024];
+            let result = io::Write::write_all(&mut timed, &blob);
+            let _ = tx.send(result.err());
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(5)).ok().flatten();
+        drop(server);
+        outcome
+    }
+
+    #[test]
+    fn a_blocked_write_gives_up_when_the_abort_flag_is_raised() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&abort);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let err = write_into_a_deaf_peer(abort, Duration::from_secs(60))
+            .expect("the write must return once shutdown is asked for");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_write_that_outlives_its_deadline_reports_a_timeout() {
+        let err =
+            write_into_a_deaf_peer(Arc::new(AtomicBool::new(false)), Duration::from_millis(150))
+                .expect("the write must return at its deadline");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 

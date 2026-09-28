@@ -165,6 +165,7 @@ pub fn probe_and_heal(
         // exclusion.
         tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "fakeip-vpn-flow-platform-infra",
             hostname,
             image = %image,
             "relayed VPN-client flow targets shared platform infrastructure — NOT excluding it from fake-IP",
@@ -178,6 +179,7 @@ pub fn probe_and_heal(
     flush();
     tracing::info!(
         target: "nrr::fake-ip",
+        msg_key = "fakeip-vpn-flow-healed",
         hostname,
         image = %image,
         "a VPN client is reaching its server through the relay — excluding the server from fake-IP and flushing DNS so it reconnects directly",

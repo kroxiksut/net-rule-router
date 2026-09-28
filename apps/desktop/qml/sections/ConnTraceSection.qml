@@ -426,14 +426,12 @@ ScrollView {
     // connection — by the rule host's name when the service knows it, since a
     // domain rule cannot match a bare address.
     function _explainConnRow(host, ip, process) {
-        var probe = root.ruleDiagnosticsWindow
-        if (!probe || (host === "" && ip === ""))
+        if (host === "" && ip === "")
             return
-        probe._probeInputText = host !== "" ? host : ip
-        probe._probeSampleIp = host !== "" ? ip : ""
-        probe._probeSampleProcess = process === "?" ? "" : process
-        root.openChildWindow(probe)
-        probe._runExplainProbe()
+        root.notificationsController.explainInDiagnostics(
+            host !== "" ? host : ip,
+            host !== "" ? ip : "",
+            process === "?" ? "" : process)
     }
     function _ruleFromConnRow(ruleType, value) {
         if (!root.ruleDialog || String(value || "") === "")

@@ -16,7 +16,7 @@
 use serde_json::Value;
 
 use nrr_shared::ipc::IpcOperationName;
-use nrr_shared::ipc_payloads::ContractNegotiateClientKind;
+use nrr_shared::ipc_payloads::{ContractNegotiateClientKind, ContractNegotiateRequest};
 
 use crate::connection::NegotiateInfo;
 
@@ -46,7 +46,15 @@ pub(crate) enum RequestResponse {
 /// produces the frame is per-transport; this classification is not.
 pub(crate) enum NegotiateParse {
     Ok(NegotiateInfo),
-    ProtocolMismatch { server_version: u32 },
+    ProtocolMismatch {
+        server_version: u32,
+    },
+    /// The service answered and the answer was "no" (identity reject, no free
+    /// slot, a request it would not take). Retrying at full speed only repeats
+    /// the refusal and its audit entry.
+    Refused {
+        message: String,
+    },
     Unexpected(String),
 }
 
@@ -123,20 +131,26 @@ fn declared_client_kind() -> ContractNegotiateClientKind {
 
 /// Build the `ContractNegotiate` handshake request.
 pub(crate) fn build_contract_negotiate(client_version: u32) -> Value {
-    let kind = match declared_client_kind() {
-        ContractNegotiateClientKind::Gui => "gui",
-        ContractNegotiateClientKind::Tray => "tray",
-        ContractNegotiateClientKind::Console => "console",
+    build_contract_negotiate_as(client_version, declared_client_kind())
+}
+
+/// The payload is the service's own request type, so a renamed field or kind
+/// cannot drift between the two ends.
+fn build_contract_negotiate_as(client_version: u32, kind: ContractNegotiateClientKind) -> Value {
+    let payload = ContractNegotiateRequest {
+        client_version,
+        client_kind: kind,
+        supported_features: Vec::new(),
     };
     serde_json::json!({
         "protocol-version": client_version,
         "request-id": "handshake-1",
         "operation": IpcOperationName::ContractNegotiate.slug(),
-        "operation-class": "read-snapshot",
-        "payload": {
-            "client-version": client_version,
-            "client-kind": kind,
-        },
+        "operation-class": operation_class_slug_for_call(
+            IpcOperationName::ContractNegotiate,
+            &Value::Null,
+        ),
+        "payload": payload,
     })
 }
 
@@ -203,6 +217,17 @@ pub(crate) fn interpret_negotiate_response(response: &Value) -> NegotiateParse {
                 parse_server_version_from_message(msg).unwrap_or(CLIENT_PROTOCOL_VERSION);
             return NegotiateParse::ProtocolMismatch { server_version };
         }
+    }
+    // Any other typed error is the service turning us away. Checked after the
+    // version code, which is an error too but asks for an update, not a wait.
+    if is_server_refusal(response) {
+        let message = response
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("service refused the connection")
+            .to_string();
+        return NegotiateParse::Refused { message };
     }
     NegotiateParse::Unexpected(format!("unexpected handshake response: {response}"))
 }
@@ -370,6 +395,56 @@ mod tests {
         assert_eq!(req["operation"], "contract.negotiate");
     }
 
+    // The builders against the service's own types: a key renamed on either
+    // side fails here instead of at the first real connect.
+    #[test]
+    fn the_handshake_the_client_builds_is_what_the_service_reads() {
+        for kind in [
+            ContractNegotiateClientKind::Gui,
+            ContractNegotiateClientKind::Tray,
+            ContractNegotiateClientKind::Console,
+        ] {
+            let json = build_contract_negotiate_as(CLIENT_PROTOCOL_VERSION, kind);
+            let env: nrr_service_runtime::IpcRequestEnvelope =
+                serde_json::from_value(json).expect("service decodes the handshake envelope");
+            assert_eq!(env.operation, IpcOperationName::ContractNegotiate);
+            assert_eq!(
+                env.protocol_version,
+                nrr_service_runtime::IPC_PROTOCOL_VERSION
+            );
+            let body: ContractNegotiateRequest =
+                serde_json::from_value(env.payload).expect("service decodes the payload");
+            assert_eq!(body.client_kind, kind);
+            assert_eq!(body.client_version, CLIENT_PROTOCOL_VERSION);
+        }
+    }
+
+    #[test]
+    fn the_request_envelope_the_client_builds_is_what_the_service_reads() {
+        let json = build_request_envelope(
+            IpcOperationName::MutationSubmit,
+            "req-42",
+            serde_json::json!({
+                "mutation-kind": "rules-update",
+                "payload": {},
+                "dry-run": false,
+                "_envelope_confirmation_token": "tok-1",
+            }),
+        );
+        let env: nrr_service_runtime::IpcRequestEnvelope =
+            serde_json::from_value(json).expect("service decodes the request envelope");
+        assert_eq!(env.request_id, "req-42");
+        assert_eq!(env.operation, IpcOperationName::MutationSubmit);
+        assert_eq!(env.confirmation_token.as_deref(), Some("tok-1"));
+        assert_eq!(
+            env.operation_class,
+            nrr_shared::ipc_transport::canonical_operation_class(
+                IpcOperationName::MutationSubmit,
+                &env.payload
+            )
+        );
+    }
+
     #[test]
     fn parse_server_version_from_message_matches_router_format() {
         let msg = "client speaks v1, service speaks v3";
@@ -457,6 +532,39 @@ mod tests {
             NegotiateParse::ProtocolMismatch { server_version } => assert_eq!(server_version, 4),
             _ => panic!("expected ProtocolMismatch"),
         }
+    }
+
+    #[test]
+    fn a_refused_handshake_is_a_refusal_not_a_transport_failure() {
+        // What the service sends when it turns a connection away before
+        // reading it: no request id, a typed error.
+        let r = serde_json::json!({
+            "request-id": "",
+            "ok": false,
+            "error": { "code": "forbidden", "message": "client rejected" }
+        });
+        match interpret_negotiate_response(&r) {
+            NegotiateParse::Refused { message } => assert_eq!(message, "client rejected"),
+            _ => panic!("expected Refused"),
+        }
+    }
+
+    #[test]
+    fn a_version_error_stays_a_mismatch_although_it_is_an_error_too() {
+        let r = serde_json::json!({
+            "request-id": "handshake-1",
+            "ok": false,
+            "error": {
+                "code": serde_json::to_value(
+                    nrr_shared::ipc_transport::IpcErrorCode::InvalidVersion)
+                    .expect("error code serialises"),
+                "message": "client speaks v1, service speaks v4",
+            }
+        });
+        assert!(matches!(
+            interpret_negotiate_response(&r),
+            NegotiateParse::ProtocolMismatch { server_version: 4 }
+        ));
     }
 
     #[test]

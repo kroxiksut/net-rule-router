@@ -22,16 +22,18 @@ networking on its own.
 
 ## Option 2 — Reset without rebooting
 
-From an administrator console:
+From an administrator console, stop the service if it is still running — a
+live service would put the state straight back — then reset:
 
 ```
+nrr-cli stop
 nrr-cli reset-network --confirm
 ```
 
-It stops the service if it is still running, then restores networking to its
-default state — removing the app's traffic filters, its routes, and its DNS
-redirect — so the network resolves normally again immediately. A reboot
-afterwards is optional and clears any last remainder.
+The reset restores networking to its default state — removing the app's
+traffic filters, its routes, and its DNS redirect — so the network resolves
+normally again immediately. A reboot afterwards is optional and clears any last
+remainder.
 
 `--confirm` is required and never implied: open connections can drop when that
 state goes, so the command tells you what it would remove rather than doing it
@@ -39,6 +41,12 @@ on a bare invocation. Without an administrator console, add `--elevate` (or
 answer the question the console asks) to raise it. If the service has applied no
 network state at all, the command says so instead of pretending to have cleaned
 something. See [the `nrr-cli` console](cli.md).
+
+On Linux the same commands undo the same things — the packet filters, the DNS
+redirect and the routes the service added — with root rights instead of an
+administrator console. There the reset refuses to run until the service is
+stopped. From a source checkout, `./scripts/reset-network.sh` does the same and
+gets the network back even when no service binary is at hand.
 
 > This is a safety escape hatch, not part of normal operation. Reach for it only
 > after an abnormal termination has left the machine's network or DNS stuck.

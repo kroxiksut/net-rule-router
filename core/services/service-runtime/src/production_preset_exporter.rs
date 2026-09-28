@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use nrr_domain::rules_file::{
-    canonical_rule_set_to_rules_file_parsed, write_rules_file_with_passthrough, PassthroughSection,
-    PresetMetadata, RulesFileSection,
+    canonical_rule_set_to_rules_file_parsed, write_rules_file_with_passthrough, HostPlatform,
+    PassthroughSection, PresetMetadata, RulesFileSection,
 };
 use nrr_domain::rules_json_codec;
 use nrr_shared::rules_json;
@@ -184,7 +184,12 @@ impl PresetExportSource for ProductionPresetExporter {
         // before the codec runs.
         let dto = rules_json::from_canonical_string(&record.rules_json)
             .map_err(|e| PresetExportError::DecodeError(format!("wire parse: {e}")))?;
-        let content = rules_json_codec::decode(dto)
+        // Names are spelled for the section they are written under.
+        let platform = self
+            .host_app_section
+            .app_platform()
+            .unwrap_or(HostPlatform::compiled());
+        let content = rules_json_codec::decode(dto, platform)
             .map_err(|e| PresetExportError::DecodeError(format!("codec decode: {e}")))?;
 
         let rule_set = content.rule_book.set_for(route);
@@ -526,6 +531,35 @@ mod tests {
         // Deterministic content_hash: 64 hex chars.
         assert_eq!(out.content_hash_hex.len(), 64);
         assert!(out.content_hash_hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A Linux export writes the name the process has under `--- Linux`; the
+    /// Windows spelling there is a name no file on that machine carries.
+    #[test]
+    fn a_linux_export_writes_app_names_without_the_windows_suffix() {
+        let conn = open_state_db_in_memory();
+        seed_active_revision(
+            &conn,
+            RulesRevisionContent::new(CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![app_rule("r-1", "telegram-desktop")]),
+                secondary: CanonicalRuleSet::default(),
+            }),
+        );
+        let out = ProductionPresetExporter::new(Arc::clone(&conn))
+            .with_host_app_section(RulesFileSection::Linux)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default(),
+            )
+            .expect("export");
+        assert!(
+            out.file_bytes_utf8
+                .contains("--- Linux\ntelegram-desktop\n"),
+            "{}",
+            out.file_bytes_utf8
+        );
     }
 
     #[test]

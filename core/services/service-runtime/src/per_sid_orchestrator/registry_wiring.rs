@@ -25,6 +25,7 @@ pub fn wire_orchestrator_to_registry(
         if let Err(e) = orch.reconcile(snapshot) {
             tracing::error!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-registry-reconcile-failed",
                 "reconcile failed: {e:?}",
             );
         }
@@ -123,6 +124,7 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger
         if self.paused_check.as_ref().is_some_and(|check| check(sid)) {
             tracing::info!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-registry-policy-paused-skip",
                 sid,
                 "policy changed for a routing-paused SID — not recompiling filters (pause = no enforcement)",
             );
@@ -131,11 +133,13 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger
         match self.orchestrator.recompile_for_sid(sid) {
             Ok(count) => tracing::info!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-registry-policy-recompiled",
                 filter_count = count,
                 "route policy changed: recompiled WFP filters for active SID",
             ),
             Err(e) => tracing::error!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-registry-recompile-failed",
                 "route policy recompile failed: {e:?}",
             ),
         }

@@ -1,5 +1,5 @@
-//! Windows side of [`VmInventoryPort`]: where VirtualBox keeps this user's
-//! settings, and whether the host carries VirtualBox's network.
+//! Windows side of [`VmInventoryPort`]: where VirtualBox and VMware keep this
+//! user's settings, and whether the host carries their networks.
 //!
 //! Runs in the user's own launcher and reads only that user's files, so nothing
 //! here needs elevation and nothing here crosses a privilege boundary.
@@ -13,8 +13,11 @@ use std::path::{Path, PathBuf};
 use nrr_platform_api::vm_inventory::virtualbox::{
     self, COMMAND_LINE_TOOL_STEM, GLOBAL_SETTINGS_FILE, TRAFFIC_PROCESS_STEMS,
 };
+use std::net::Ipv4Addr;
+
+use nrr_platform_api::vm_inventory::vmware::{self, HostNetworks, MachineEntry};
 use nrr_platform_api::vm_inventory::{
-    Hypervisor, HypervisorInventory, VirtualMachine, VmInventoryPort,
+    Hypervisor, HypervisorInventory, VirtualMachine, VmControlError, VmInventoryPort,
 };
 use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 
@@ -28,6 +31,10 @@ const INSTALL_KEY: &str = r"SOFTWARE\Oracle\VirtualBox";
 /// How the host-only and bridge adapters VirtualBox installs describe
 /// themselves.
 const ADAPTER_DESCRIPTION_MARKER: &str = "virtualbox";
+
+/// How the adapters VMware installs for its host-only and NAT networks
+/// describe themselves.
+const VMWARE_ADAPTER_DESCRIPTION_MARKER: &str = "vmware virtual ethernet adapter";
 
 #[derive(Debug, Default)]
 pub struct WindowsVmInventory;
@@ -55,12 +62,55 @@ impl VmInventoryPort for WindowsVmInventory {
                 .collect(),
             machines,
         };
-        virtualbox
-            .is_present()
-            .then_some(virtualbox)
+        let vmware = vmware_inventory();
+        [virtualbox, vmware]
             .into_iter()
+            .filter(HypervisorInventory::is_present)
             .collect()
     }
+
+    fn bind_nat(
+        &self,
+        hypervisor: Hypervisor,
+        machine_id: &str,
+        slot: u32,
+        address: Option<Ipv4Addr>,
+    ) -> Result<(), VmControlError> {
+        if hypervisor != Hypervisor::VirtualBox {
+            return Err(VmControlError::Unsupported);
+        }
+        let arguments = virtualbox::nat_bind_arguments(machine_id, slot, address)
+            .ok_or(VmControlError::InvalidTarget)?;
+        let tool = command_line_tool().ok_or(VmControlError::ToolMissing)?;
+        run_tool(&tool, &arguments)
+    }
+}
+
+/// Longest tool message passed on to the user.
+const MAX_TOOL_MESSAGE_CHARS: usize = 300;
+
+fn run_tool(tool: &Path, arguments: &[String]) -> Result<(), VmControlError> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = std::process::Command::new(tool)
+        .args(arguments)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| VmControlError::Failed(error.to_string()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let message = String::from_utf8_lossy(&output.stderr);
+    if virtualbox::refused_as_not_mutable(&message) {
+        return Err(VmControlError::MachineNotMutable);
+    }
+    Err(VmControlError::Failed(
+        message
+            .trim()
+            .chars()
+            .take(MAX_TOOL_MESSAGE_CHARS)
+            .collect(),
+    ))
 }
 
 /// VirtualBox's own override, else the folder it defaults to. The variable is
@@ -97,6 +147,75 @@ fn machines_in(home: &Path) -> Vec<VirtualMachine> {
         .collect()
 }
 
+/// No traffic processes: VMware's NAT runs as a system service that no
+/// application rule binds.
+fn vmware_inventory() -> HypervisorInventory {
+    let networks = vmware_host_networks();
+    let machines = crate::system_shell::roaming_app_data_directory()
+        .map(|appdata| vmware_machines_in(&appdata.join("VMware"), &networks))
+        .unwrap_or_default();
+    HypervisorInventory {
+        hypervisor: Hypervisor::VMware,
+        host_network_seen: host_has_adapter(VMWARE_ADAPTER_DESCRIPTION_MARKER),
+        traffic_processes: Vec::new(),
+        machines,
+    }
+}
+
+/// The installer's networks, corrected by the NAT and DHCP services' own
+/// configuration where a custom network was added.
+fn vmware_host_networks() -> HostNetworks {
+    let mut networks = HostNetworks::default();
+    if let Some(dir) = crate::system_shell::program_data_directory().map(|d| d.join("VMware")) {
+        if let Some(text) = read_settings(&dir.join("vmnetnat.conf")) {
+            networks.apply_nat_config(&text);
+        }
+        if let Some(text) = read_settings(&dir.join("vmnetdhcp.conf")) {
+            networks.apply_dhcp_config(&text);
+        }
+    }
+    networks
+}
+
+/// Workstation's inventory, then Player's recent list, each machine once.
+fn vmware_machines_in(settings: &Path, networks: &HostNetworks) -> Vec<VirtualMachine> {
+    let listed = |file: &str, parse: fn(&str) -> Vec<MachineEntry>| {
+        read_settings(&settings.join(file))
+            .map(|text| parse(&text))
+            .unwrap_or_default()
+    };
+    let mut entries = listed(vmware::INVENTORY_FILE, vmware::inventory_entries);
+    entries.extend(listed(vmware::PREFERENCES_FILE, vmware::recent_entries));
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .into_iter()
+        .filter(|entry| seen.insert(entry.config.to_lowercase()))
+        .filter_map(|entry| {
+            let path = Path::new(&entry.config);
+            if !path.is_absolute() {
+                return None;
+            }
+            vmware::machine(
+                &read_lossy(path)?,
+                &entry.config,
+                entry.display_name.as_deref(),
+                networks,
+            )
+        })
+        .collect()
+}
+
+/// A `.vmx` from an older release may not be UTF-8; its names still show.
+fn read_lossy(path: &Path) -> Option<String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_SETTINGS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_SETTINGS_BYTES).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn read_settings(path: &Path) -> Option<String> {
     let mut text = String::new();
     File::open(path)
@@ -108,14 +227,15 @@ fn read_settings(path: &Path) -> Option<String> {
 }
 
 fn host_has_virtualbox_adapter() -> bool {
+    host_has_adapter(ADAPTER_DESCRIPTION_MARKER)
+}
+
+fn host_has_adapter(marker: &str) -> bool {
     ipconfig::get_adapters()
         .map(|adapters| {
-            adapters.iter().any(|adapter| {
-                adapter
-                    .description()
-                    .to_lowercase()
-                    .contains(ADAPTER_DESCRIPTION_MARKER)
-            })
+            adapters
+                .iter()
+                .any(|adapter| adapter.description().to_lowercase().contains(marker))
         })
         .unwrap_or(false)
 }
@@ -200,12 +320,93 @@ mod tests {
     fn the_live_inventory_names_the_traffic_processes_when_present() {
         for hypervisor in WindowsVmInventory::new().inventory() {
             assert!(hypervisor.is_present());
-            assert_eq!(
-                hypervisor.traffic_processes,
-                vec![
+            let expected: Vec<String> = match hypervisor.hypervisor {
+                Hypervisor::VirtualBox => vec![
                     "VirtualBoxVM.exe".to_string(),
-                    "VBoxHeadless.exe".to_string()
-                ]
+                    "VBoxHeadless.exe".to_string(),
+                ],
+                Hypervisor::VMware => Vec::new(),
+            };
+            assert_eq!(hypervisor.traffic_processes, expected);
+        }
+    }
+
+    #[test]
+    fn vmware_machines_come_from_the_inventory_and_the_recent_list_once_each() {
+        let settings = tempfile::tempdir().expect("settings");
+        let vms = tempfile::tempdir().expect("vms");
+        let vmx = |name: &str, connection: &str| {
+            let path = vms.path().join(name).join(format!("{name}.vmx"));
+            write(
+                &path,
+                &format!(
+                    "config.version = \"8\"
+displayName = \"{name}\"
+                     ethernet0.present = \"TRUE\"
+ethernet0.connectionType = \"{connection}\"
+"
+                ),
+            );
+            path.display().to_string()
+        };
+        let one = vmx("One", "bridged");
+        let two = vmx("Two", "nat");
+        let gone = vms
+            .path()
+            .join("Gone")
+            .join("Gone.vmx")
+            .display()
+            .to_string();
+        write(
+            &settings.path().join(vmware::INVENTORY_FILE),
+            &format!(
+                "vmlist1.config = \"{one}\"
+vmlist2.config = \"{gone}\"
+vmlist3.config = \"Relative\\R.vmx\"
+"
+            ),
+        );
+        write(
+            &settings.path().join(vmware::PREFERENCES_FILE),
+            &format!(
+                "pref.mruVM0.filename = \"{}\"
+pref.mruVM1.filename = \"{two}\"
+",
+                one.to_uppercase()
+            ),
+        );
+        let machines = vmware_machines_in(settings.path(), &HostNetworks::default());
+        let found: Vec<(&str, &VmAttachment)> = machines
+            .iter()
+            .map(|m| (m.name.as_str(), &m.adapters[0].attachment))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("One", &VmAttachment::Bridged),
+                ("Two", &VmAttachment::ServiceNat)
+            ]
+        );
+    }
+
+    /// Prints what this host's hypervisors hold, by mode only.
+    #[test]
+    #[ignore = "reads the real machine"]
+    fn live_inventory_counts() {
+        for hypervisor in WindowsVmInventory::new().inventory() {
+            let mut modes = std::collections::BTreeMap::<String, usize>::new();
+            for adapter in hypervisor.machines.iter().flat_map(|m| &m.adapters) {
+                let mode = serde_json::to_value(&adapter.attachment)
+                    .ok()
+                    .and_then(|v| v["mode"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                *modes.entry(mode).or_default() += 1;
+            }
+            println!(
+                "{:?}: network={} machines={} adapters={modes:?}",
+                hypervisor.hypervisor,
+                hypervisor.host_network_seen,
+                hypervisor.machines.len()
             );
         }
     }

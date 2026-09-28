@@ -22,8 +22,14 @@
 //!  │         Tampered → emit DbTamperDetected (one per revision), block
 //!  └─ no  → generate + save key:
 //!            revisions empty     → fresh install, no alert
-//!            revisions non-empty → emit KeyResetWithExistingData, block
+//!            revisions non-empty → write the re-sign marker, emit a new
+//!                                  KeyResetWithExistingData, block;
+//!                                  no rollback until acknowledged
 //! ```
+//!
+//! The "no rollback" hold is the re-sign marker in the [`KeyStore`], never an
+//! alert row: `security_alerts` is not MAC-protected, so a forged active alert
+//! must not be able to switch the rollback of tampered rows off.
 //!
 //! Tamper detection is a **notification**, never fail-closed: the
 //! kernel WFP filters for the active revision are already applied and
@@ -58,9 +64,24 @@ use rusqlite::Connection;
 /// the alert row directly; it does not dereference this pointer.
 const BOOTSTRAP_AUDIT_FILE: &str = "nrr_bootstrap_integrity_scan.ndjson";
 
-/// Singleton alert id for the key-reset condition (only one is ever
-/// meaningful at a time).
-const KEY_RESET_ALERT_ID: &str = "alt-keyreset";
+/// One alert per key loss: a fixed id would dedup a second incident into an
+/// alert the user already acknowledged, and nobody would be told.
+fn key_reset_alert_id(now_ms: i64) -> String {
+    format!("alt-keyreset-{now_ms}")
+}
+
+/// Domain label for [`resign_marker_for`].
+const RESIGN_MARKER_LABEL: &[u8] = b"nrr-db-mac-resign-pending-v1";
+
+/// The marker is derived from the key it was written for, so a marker from an
+/// earlier incident, or one written without the key, never matches.
+fn resign_marker_for(key: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(RESIGN_MARKER_LABEL);
+    h.update(key);
+    h.finalize().to_vec()
+}
 
 /// Deterministic alert id for a tampered revision, so re-detecting the
 /// same row across restarts updates the single alert rather than
@@ -100,6 +121,12 @@ pub struct TamperBootstrapOutcome {
     /// `true` when a freshly generated key replaced a missing one while
     /// the `revisions` table was non-empty.
     pub key_was_reset: bool,
+    /// `true` while the stored rows predate the current key: it was
+    /// regenerated this boot, or the key store still holds the re-sign
+    /// marker of an unacknowledged regeneration. Every row then reads as
+    /// tampered, so nothing may be rolled back on that verdict — see
+    /// `ActivationCoordinator::enforce_active_integrity_at_boot`.
+    pub key_reset_unacknowledged: bool,
     /// Revisions whose `row_hmac` failed verification at load.
     pub tampered_revision_ids: Vec<String>,
     /// Number of legacy `Unsigned` rows that were lazily backfilled.
@@ -132,6 +159,7 @@ pub fn mutations_blocked_by_alert(alerts_repo: &dyn SecurityAlertsRepository) ->
         Err(e) => {
             tracing::warn!(
                 target: "nrr::tamper",
+                msg_key = "tamper-mutation-gate-query-failed",
                 error = %e,
                 "failed to query active alerts for mutation gate; failing open",
             );
@@ -165,49 +193,44 @@ pub fn run_tamper_bootstrap(
             if !usable {
                 tracing::warn!(
                     target: "nrr::tamper",
+                    msg_key = "tamper-signing-key-too-short",
                     bytes = k.len(),
                     "stored signing key is too short to be usable — treating it as missing and generating a fresh one",
                 );
             }
             usable
         });
-    let (signing_key, key_loaded) = match loaded {
-        Some(k) => (k, true),
-        None => {
-            let k = generate_signing_key()
-                .map_err(|e| TamperBootstrapError::KeyStore(e.to_string()))?;
-            key_store
-                .save(&k)
-                .map_err(|e| TamperBootstrapError::KeyStore(e.to_string()))?;
-            (k, false)
-        }
-    };
-
     // The production alerts repository shares this same connection
     // mutex, so the guard must never be held across an `emit_alert`
     // call — the nested lock would deadlock the startup thread.
     // Every storage pass below takes the lock in its own scope.
-    let mut outcome = TamperBootstrapOutcome {
-        signing_key: signing_key.clone(),
-        key_was_reset: false,
-        tampered_revision_ids: Vec::new(),
-        backfilled_rows: 0,
-        raised_blocking_alert: false,
-    };
-
-    if !key_loaded {
-        // Freshly generated key.
+    let Some(signing_key) = loaded else {
+        let signing_key =
+            generate_signing_key().map_err(|e| TamperBootstrapError::KeyStore(e.to_string()))?;
         let count = {
             let guard = lock_state(conn)?;
-            RevisionsRepository::with_signing_key(&guard, signing_key.clone())
+            RevisionsRepository::new(&guard)
                 .count()
                 .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?
         };
+        // Marker before key: a crash in between leaves no key, so the next
+        // boot resets again; the reverse order would leave a loadable key
+        // with nothing holding the sweep off the unverifiable rows.
+        if count > 0 {
+            key_store
+                .save_resign_marker(&resign_marker_for(&signing_key))
+                .map_err(|e| TamperBootstrapError::KeyStore(e.to_string()))?;
+        }
+        key_store
+            .save(&signing_key)
+            .map_err(|e| TamperBootstrapError::KeyStore(e.to_string()))?;
+        let mut outcome = TamperBootstrapOutcome::clean(signing_key);
         if count == 0 {
             // Fresh install — nothing signed yet, no alert. Future
             // inserts sign with the new key.
             tracing::info!(
                 target: "nrr::tamper",
+                msg_key = "tamper-fresh-install-key-generated",
                 "fresh install: generated DB-MAC key, no existing revisions",
             );
         } else {
@@ -216,22 +239,32 @@ pub fn run_tamper_bootstrap(
             // (that would bless possibly-forged data); raise one alert
             // and block mutations until the user accepts the state.
             outcome.key_was_reset = true;
+            outcome.key_reset_unacknowledged = true;
             outcome.raised_blocking_alert = true;
             tracing::warn!(
                 target: "nrr::tamper",
+                msg_key = "tamper-key-reset-existing-data",
                 revision_count = count,
                 "DB-MAC key was missing with existing revisions; \
                  regenerated and blocking mutations pending acknowledgement",
             );
             emit_alert(
                 alerts_repo,
-                KEY_RESET_ALERT_ID.to_string(),
+                key_reset_alert_id(now_ms),
                 AuditEventKind::KeyResetWithExistingData.as_str(),
                 integrity::KEY_RESET_WITH_EXISTING_DATA.as_str(),
                 now_ms,
             )?;
         }
         return Ok(outcome);
+    };
+    let mut outcome = TamperBootstrapOutcome::clean(signing_key.clone());
+
+    // The key a previous boot regenerated loads fine, but until the user
+    // acknowledges that reset the rows are still signed by the lost one.
+    outcome.key_reset_unacknowledged = resign_pending(key_store, &signing_key);
+    if outcome.key_reset_unacknowledged {
+        ensure_key_reset_alert_active(alerts_repo, now_ms);
     }
 
     // Key loaded — verify every row.
@@ -249,6 +282,7 @@ pub fn run_tamper_bootstrap(
             HmacVerification::Tampered => {
                 tracing::warn!(
                     target: "nrr::tamper",
+                    msg_key = "tamper-row-hmac-mismatch",
                     revision_id = %revision_id,
                     "revision row failed HMAC verification; raising tamper alert",
                 );
@@ -282,6 +316,7 @@ pub fn run_tamper_bootstrap(
             HmacVerification::Tampered => {
                 tracing::warn!(
                     target: "nrr::tamper",
+                    msg_key = "tamper-pointer-hmac-mismatch",
                     principal = %principal,
                     "active-revision pointer failed HMAC verification; raising tamper alert",
                 );
@@ -324,12 +359,87 @@ pub fn run_tamper_bootstrap(
     if !backfill_ids.is_empty() {
         tracing::info!(
             target: "nrr::tamper",
+            msg_key = "tamper-legacy-rows-backfilled",
             backfilled = backfill_ids.len(),
             "lazily backfilled legacy unsigned revision rows",
         );
     }
 
     Ok(outcome)
+}
+
+impl TamperBootstrapOutcome {
+    fn clean(signing_key: Vec<u8>) -> Self {
+        Self {
+            signing_key,
+            key_was_reset: false,
+            key_reset_unacknowledged: false,
+            tampered_revision_ids: Vec::new(),
+            backfilled_rows: 0,
+            raised_blocking_alert: false,
+        }
+    }
+}
+
+/// Whether the key store holds the re-sign marker written for `key`.
+///
+/// An unreadable marker counts as pending: the file sits beside the key under
+/// the same protection, so failing to read it is an OS fault, and guessing
+/// "acknowledged" there would roll every principal's rules back to nothing.
+fn resign_pending(key_store: &dyn KeyStore, key: &[u8]) -> bool {
+    match key_store.load_resign_marker() {
+        Ok(None) => false,
+        Ok(Some(marker)) if marker == resign_marker_for(key) => true,
+        Ok(Some(_)) => {
+            tracing::warn!(
+                target: "nrr::tamper",
+                "re-sign marker does not belong to the current signing key; ignoring it",
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "nrr::tamper",
+                error = %e,
+                "could not read the re-sign marker; keeping every revision until the key reset is acknowledged",
+            );
+            true
+        }
+    }
+}
+
+/// The marker outlives the alert row it was raised with — that row sits in an
+/// unprotected table and may be gone. Re-raise one, so the reset stays
+/// acknowledgeable. Best effort: the marker alone already holds the sweep off.
+fn ensure_key_reset_alert_active(alerts_repo: &Arc<dyn SecurityAlertsRepository>, now_ms: i64) {
+    let kind = AuditEventKind::KeyResetWithExistingData.as_str();
+    let already = match alerts_repo.list_by_state(SecurityAlertState::Active) {
+        Ok(active) => active.iter().any(|a| a.kind == kind),
+        Err(e) => {
+            tracing::warn!(
+                target: "nrr::tamper",
+                error = %e,
+                "could not list active alerts; not re-raising the key-reset alert",
+            );
+            return;
+        }
+    };
+    if already {
+        return;
+    }
+    if let Err(e) = emit_alert(
+        alerts_repo,
+        key_reset_alert_id(now_ms),
+        kind,
+        integrity::KEY_RESET_WITH_EXISTING_DATA.as_str(),
+        now_ms,
+    ) {
+        tracing::warn!(
+            target: "nrr::tamper",
+            error = %e,
+            "could not re-raise the key-reset alert",
+        );
+    }
 }
 
 /// Lock the shared state connection for one storage pass. Kept narrow on
@@ -600,6 +710,60 @@ mod tests {
             1,
             "tamper alert must be deduped by revision id"
         );
+    }
+
+    #[test]
+    fn a_marker_not_bound_to_the_current_key_holds_nothing() {
+        let conn = open_state();
+        let ks = InMemKeyStore::with_key(key());
+        ks.save_resign_marker(&resign_marker_for(&[0x22u8; 32]))
+            .expect("marker of an earlier key");
+        let out = run_tamper_bootstrap(&conn, &ks, &alerts(), NOW).expect("bootstrap");
+        assert!(!out.key_reset_unacknowledged);
+
+        ks.save_resign_marker(&resign_marker_for(&key()))
+            .expect("marker of this key");
+        let out = run_tamper_bootstrap(&conn, &ks, &alerts(), NOW).expect("bootstrap");
+        assert!(out.key_reset_unacknowledged);
+    }
+
+    /// Key present, marker unreadable.
+    struct UnreadableMarker(InMemKeyStore);
+    impl KeyStore for UnreadableMarker {
+        fn load(&self) -> Result<Option<Vec<u8>>, nrr_platform_api::error::PlatformError> {
+            self.0.load()
+        }
+        fn save(&self, k: &[u8]) -> Result<(), nrr_platform_api::error::PlatformError> {
+            self.0.save(k)
+        }
+        fn delete(&self) -> Result<(), nrr_platform_api::error::PlatformError> {
+            self.0.delete()
+        }
+        fn save_resign_marker(
+            &self,
+            m: &[u8],
+        ) -> Result<(), nrr_platform_api::error::PlatformError> {
+            self.0.save_resign_marker(m)
+        }
+        fn load_resign_marker(
+            &self,
+        ) -> Result<Option<Vec<u8>>, nrr_platform_api::error::PlatformError> {
+            Err(nrr_platform_api::error::PlatformError::Transient {
+                operation: "test",
+                detail: "read failed".into(),
+            })
+        }
+        fn delete_resign_marker(&self) -> Result<(), nrr_platform_api::error::PlatformError> {
+            self.0.delete_resign_marker()
+        }
+    }
+
+    #[test]
+    fn an_unreadable_marker_keeps_the_rules() {
+        let conn = open_state();
+        let ks = UnreadableMarker(InMemKeyStore::with_key(key()));
+        let out = run_tamper_bootstrap(&conn, &ks, &alerts(), NOW).expect("bootstrap");
+        assert!(out.key_reset_unacknowledged);
     }
 
     #[test]

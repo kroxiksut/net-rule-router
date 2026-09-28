@@ -120,6 +120,9 @@ windows = { version = "0.58", features = [
     # ControlTraceW) + TDH event parsing (TdhGetProperty) to read the
     # QueryName + QueryResults of event 3008 (DNS query completed).
     "Win32_System_Diagnostics_Etw",
+    # CreateToolhelp32Snapshot: parent pids of running processes, for naming who
+    # launched a blocked program when its parent started before the recorder.
+    "Win32_System_Diagnostics_ToolHelp",
     # OpenTraceW + EVENT_TRACE_LOGFILEW are gated behind this in
     # windows-rs 0.58 (the logfile struct embeds a FILETIME).
     "Win32_System_Time",

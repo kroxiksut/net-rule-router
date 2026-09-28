@@ -66,6 +66,9 @@ unprivileged, nothing prompts at all.
 If you decline the system's own prompt, the exit code is `8`, not `1`: nothing
 ran, and that is worth telling apart from something that ran and failed.
 
+Verbs marked *anyone* never ask. If one of them is refused anyway, the console
+says what to do instead and exits with code `3`.
+
 On Windows the elevated copy runs hidden and reports back to the console you
 started it from, so the output does not vanish with a window you never saw.
 
@@ -114,23 +117,25 @@ platform support a background service at all — and prints one report. That
 report names paths and service states only: no rules, no host names, no
 addresses, so it is safe to attach to an issue.
 
-`diag logs` prints the newest lines of the service's operational log exactly as
-the service wrote them, so what you paste into a report is the service's own
-text rather than this console's rendering of it. It reads a file and nothing
-else — no service needs to be running, which is the state people are in when
-they want a log. The security audit trail is a separate stream and is never
-printed here; it travels in the diagnostic archive instead. On an installation
-whose data directory is locked down — which is every installation where the
-service has run — the log files are readable only by the service account, so
-this command needs an elevated console. It says so and exits with code 3 rather
-than reporting an empty log, and it points at `diag export` first: the service
-hands the archive to whoever asked for it, so that route needs no administrator
-rights and carries the whole log rather than a tail.
+`diag logs` prints the newest records of the service's operational log, one per
+line. It asks the running service, which shows you your own records and the
+machine's — everyone's when the console is elevated — so it needs no
+administrator rights. The security audit trail is a separate stream and is never
+printed here; it travels in the diagnostic archive instead. When the service is
+not running, which is often when a log is wanted, the console reads the log files
+directly and says so before the first line: the files hold every user's records,
+so lines of other users may appear. On an installation whose data directory is
+locked down — every installation where the service has run — only an
+administrator console can read those files. Otherwise the command says so and
+exits with code 3 rather than reporting an empty log; starting the service again
+is the way back to the log without administrator rights.
 
 `reset-network` is for the machine that lost the network because the service
 died without cleaning up after itself. It does not undo anything by itself: it
 runs the service binary's own reset, because the program that applied the state
-is the only one that knows every piece of it. Because open connections can drop
+is the only one that knows every piece of it. Nor does it stop the service: a
+running service would put the state straight back, so stop it first — on Linux
+the reset refuses until you have. Because open connections can drop
 when the state goes, the command refuses without `--confirm` and explains what
 it would remove. Where the service applies no network state yet, it says so and
 exits with code 6 rather than pretending to have cleaned something.

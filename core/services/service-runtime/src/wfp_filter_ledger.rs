@@ -81,12 +81,12 @@ impl WfpFilterLedger {
                     // with nothing on disk to reap it by.
                     Ok(()) => written.extend(fresh),
                     Err(e) => {
-                        tracing::warn!(target: "nrr::wfp-ledger", "ledger append failed: {e}")
+                        tracing::warn!(target: "nrr::wfp-ledger", msg_key = "wfpledger-append-failed", "ledger append failed: {e}")
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(target: "nrr::wfp-ledger", "ledger open-for-append failed: {e}")
+                tracing::warn!(target: "nrr::wfp-ledger", msg_key = "wfpledger-open-failed", "ledger open-for-append failed: {e}")
             }
         }
     }

@@ -47,7 +47,9 @@ pub use allocator::{
 };
 pub use flow_owner::{FlowOwnerLookup, MockFlowOwnerLookup, NoopFlowOwnerLookup};
 pub use scope::{FakeIpScope, FakeIpVerdict, RealIpReason};
-pub use stale_flows::{MockStaleFlowReset, NoopStaleFlowReset, StaleFlowReset, StaleFlowSweep};
+pub use stale_flows::{
+    EstablishedFlow, MockStaleFlowReset, NoopStaleFlowReset, StaleFlowReset, StaleFlowSweep,
+};
 pub use tun::{
     MockTunAdapter, MockTunState, NoopTunAdapter, TunAdapterConfig, TunAdapterPort, TunControl,
     TunDevice, DEFAULT_TUN_MTU, DEFAULT_TUN_RING_CAPACITY_BYTES,

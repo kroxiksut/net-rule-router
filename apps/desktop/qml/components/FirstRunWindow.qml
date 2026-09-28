@@ -221,6 +221,20 @@ Window {
         }
     }
 
+    /// The detected country as words, never the bare code. `form` is "name",
+    /// "in" or "outside": Russian needs a different case for each, so the
+    /// phrase comes whole from the locale rather than being assembled here.
+    function countryText(form) {
+        var cc = detectedCountry
+        var base = "dialog.first-run-wizard.country." + cc + "."
+        var name = root.tr(base + "name", cc.toUpperCase())
+        if (form === "name") return name
+        var generic = form === "in"
+            ? root.tr("dialog.first-run-wizard.country-in-fallback", "in {country}")
+            : root.tr("dialog.first-run-wizard.country-outside-fallback", "outside {country}")
+        return root.tr(base + form, generic.replace("{country}", name))
+    }
+
     function _detectCountryPreset() {
         if (typeof nrrNativeBridge === "undefined"
                 || !nrrNativeBridge
@@ -291,11 +305,10 @@ Window {
     }
 
     function _applyBuiltinDemo() {
-        var primB64 = _readPresetBytes("builtin-demo/rules_primary.txt")
-        var secB64 = _readPresetBytes("builtin-demo/rules_secondary.txt")
-        _finishWith(primB64, secB64,
-            _resolvePresetAbs("builtin-demo/rules_primary.txt"),
-            _resolvePresetAbs("builtin-demo/rules_secondary.txt"))
+        var primRel = root.builtinDemoPreset("rules_primary.txt")
+        var secRel = root.builtinDemoPreset("rules_secondary.txt")
+        _finishWith(_readPresetBytes(primRel), _readPresetBytes(secRel),
+            _resolvePresetAbs(primRel), _resolvePresetAbs(secRel))
     }
 
     function _finishWith(primB64, secB64, primPath, secPath) {
@@ -749,9 +762,8 @@ Window {
                         theme: root.uiTheme
                         Layout.fillWidth: true
                         checked: !firstRunWindow.livingAbroad
-                        text: root.tr("dialog.first-run-wizard.location-home",
-                                "I am in {country}")
-                            .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
+                        text: root.tr("dialog.first-run-wizard.location-home", "I am {where}")
+                            .replace("{where}", firstRunWindow.countryText("in"))
                         onToggled: if (checked) firstRunWindow.livingAbroad = false
                     }
                     ThemedRadioButton {
@@ -759,8 +771,8 @@ Window {
                         Layout.fillWidth: true
                         checked: firstRunWindow.livingAbroad
                         text: root.tr("dialog.first-run-wizard.location-abroad",
-                                "I am outside {country} and need access to its services")
-                            .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
+                                "I am {where} and need access to its services")
+                            .replace("{where}", firstRunWindow.countryText("outside"))
                         onToggled: if (checked) firstRunWindow.livingAbroad = true
                     }
                 }
@@ -773,7 +785,7 @@ Window {
                                 "Load access preset ({country})")
                             : root.tr("dialog.first-run-wizard.option-country-preset",
                                 "Load country preset ({country})"))
-                        .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
+                        .replace("{country}", firstRunWindow.countryText("name"))
                     icon.source: root.uiIconSource("load-list")
                     onClicked: firstRunWindow._applyCountryPreset()
                 }
@@ -845,11 +857,15 @@ Window {
                     Layout.fillWidth: true
                     Layout.leftMargin: root.uiTheme.spacingMd
                     spacing: root.uiTheme.spacingSm
+                    // Both slot captions share the wider one's width so the file
+                    // names line up in either language.
                     Label {
+                        id: primaryFileSlotLabel
                         text: root.tr("dialog.first-run-wizard.primary-file-label",
-                            "Primary:")
+                            "Main route:")
                         color: root.textColor
-                        Layout.preferredWidth: 96
+                        Layout.preferredWidth: Math.max(implicitWidth,
+                            secondaryFileSlotLabel.implicitWidth)
                     }
                     Label {
                         Layout.fillWidth: true
@@ -881,10 +897,12 @@ Window {
                     Layout.leftMargin: root.uiTheme.spacingMd
                     spacing: root.uiTheme.spacingSm
                     Label {
+                        id: secondaryFileSlotLabel
                         text: root.tr("dialog.first-run-wizard.secondary-file-label",
-                            "Secondary:")
+                            "Additional route:")
                         color: root.textColor
-                        Layout.preferredWidth: 96
+                        Layout.preferredWidth: Math.max(implicitWidth,
+                            primaryFileSlotLabel.implicitWidth)
                     }
                     Label {
                         Layout.fillWidth: true

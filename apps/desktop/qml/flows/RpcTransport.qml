@@ -126,9 +126,15 @@ QtObject {
             : ""
     }
     // Hypervisors and their virtual machines (launcher-local); "" == unavailable.
-    function rpcVmInventoryList() {
+    function rpcVmInventoryList(payload) {
         return (bridgeAvailable && typeof bridge.rpcVmInventoryList === "function")
-            ? bridge.rpcVmInventoryList()
+            ? bridge.rpcVmInventoryList(payload || {})
+            : ""
+    }
+    // Pins a VM's NAT adapter to the additional adapter, or unpins it.
+    function rpcVmNatBind(payload) {
+        return (bridgeAvailable && typeof bridge.rpcVmNatBind === "function")
+            ? bridge.rpcVmNatBind(payload || {})
             : ""
     }
     // Persists the confirmed VPN/link-provider executables to the service-side

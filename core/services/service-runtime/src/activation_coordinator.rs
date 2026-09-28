@@ -71,6 +71,7 @@ use crate::active_sid_registry::ActiveSidRegistry;
 use crate::crash_recovery::{ApplyAttemptMarker, ApplyMarkerStore, ApplyPhase};
 
 mod fixtures;
+mod gate;
 mod ports;
 mod types;
 
@@ -104,12 +105,17 @@ pub struct ActivationCoordinator {
     /// re-signs after each status-changing UPDATE, so external tampering
     /// is detectable.
     signing_key: Option<Vec<u8>>,
+    /// Where `signing_key` came from; holds the re-sign marker that an
+    /// acknowledged key reset clears.
+    key_store: Option<Arc<dyn nrr_platform_api::key_store::KeyStore>>,
     /// The no-tray routing-user fallback (console session under
     /// service-driven scope). Without it, an activation with a dead tray
     /// subscription dispatches to NOBODY: `active_sids()` is empty, the
     /// revision goes active in storage, and no WFP filter is ever compiled
     /// until the next tray connect.
     fallback_routing_sid: Option<crate::per_sid_orchestrator::FallbackRoutingSidFn>,
+    activation_gate: gate::ActivationGate,
+    activation_wait: std::time::Duration,
 }
 
 // The coordinator guards its state behind a `Mutex`; `lock().expect(...)`
@@ -141,7 +147,10 @@ impl ActivationCoordinator {
             ids,
             failure_policy: Mutex::new(failure_policy),
             signing_key: None,
+            key_store: None,
             fallback_routing_sid: None,
+            activation_gate: gate::ActivationGate::default(),
+            activation_wait: gate::ACTIVATION_GATE_WAIT,
         }
     }
 
@@ -207,6 +216,17 @@ impl ActivationCoordinator {
         self
     }
 
+    /// The store the signing key was loaded from, so acknowledging a key
+    /// reset can clear its re-sign marker.
+    #[must_use]
+    pub fn with_key_store(
+        mut self,
+        key_store: Arc<dyn nrr_platform_api::key_store::KeyStore>,
+    ) -> Self {
+        self.key_store = Some(key_store);
+        self
+    }
+
     /// Build a `RevisionsRepository` over `conn`, carrying the signing
     /// key when one is configured. Centralises the
     /// signed-vs-unsigned choice so no call site can forget it.
@@ -231,6 +251,21 @@ impl ActivationCoordinator {
             .re_sign_all()
             .map_err(|e| PolicyError::StorageFailure {
                 operation: "re_sign_all",
+                message: e.to_string(),
+            })
+    }
+
+    /// Lets the next boot sweep run again. Only after
+    /// [`Self::re_sign_all_revisions`] succeeded with a key: unsigned, nothing
+    /// was re-signed and the rows still predate the key.
+    pub(crate) fn clear_key_reset_marker(&self) -> Result<(), PolicyError> {
+        let (Some(_), Some(store)) = (&self.signing_key, &self.key_store) else {
+            return Ok(());
+        };
+        store
+            .delete_resign_marker()
+            .map_err(|e| PolicyError::StorageFailure {
+                operation: "delete_resign_marker",
                 message: e.to_string(),
             })
     }
@@ -268,6 +303,18 @@ impl ActivationCoordinator {
         &self,
         submission: CandidateSubmission,
     ) -> Result<RevisionId, PolicyError> {
+        // Before the dedup: resubmitting an old revision's content is a new
+        // submission, while rollback — which re-activates history on purpose —
+        // never comes through here.
+        if let Some((rule_id, reason)) = unsupported_rule_shape(&submission.rules_json) {
+            return Err(PolicyError::UnsupportedRuleShape { rule_id, reason });
+        }
+        if let Some(hit) = control_character_in_rules(&submission.rules_json) {
+            return Err(PolicyError::ControlCharacterInRule {
+                rule_id: hit.rule_id,
+                field: hit.field,
+            });
+        }
         let conn = self.conn.lock().expect("connection mutex poisoned");
         let repo = self.revisions_repo(&conn);
         let principal = submission.principal.as_str();
@@ -360,6 +407,7 @@ impl ActivationCoordinator {
                 Err(failure) => warnings.push(PreFlightWarning {
                     sid: failure.sid,
                     category: PreFlightCategory::InvalidRulesContent,
+                    subjects: Vec::new(),
                     message: failure.message,
                 }),
             }
@@ -433,6 +481,12 @@ impl ActivationCoordinator {
         token: &ConfirmationToken,
         correlation_id: &str,
     ) -> Result<ActivationOutcome, PolicyError> {
+        // Taken before the status check, so a second confirm of the same
+        // revision waits and then finds it already active.
+        let _pass = self
+            .activation_gate
+            .enter(self.activation_wait)
+            .ok_or(PolicyError::ActivationBusy)?;
         let record = self.load_record(revision_id)?;
         if record.status != RevisionStatus::Candidate {
             return Err(PolicyError::RevisionNotInExpectedStatus {
@@ -492,13 +546,26 @@ impl ActivationCoordinator {
         // `apply_target_sids` applies when it builds the set, applied again at
         // the moment it is used.
         let targets = self.still_inheriting(&principal, &phase1.sids);
+        // From here until the pointer commits, every rules read — route hooks,
+        // reconcile ticks, the Linux enforcement pass — must see the revision
+        // being applied, not the one it replaces.
+        let overlay = {
+            let conn = self.conn.lock().expect("connection mutex poisoned");
+            crate::applying_revision_overlay::publish(&conn, &principal, &record.rules_json)
+        };
         let phase2 = self.phase2_apply(&targets, &record.rules_json);
 
         match policy {
             ApplyFailurePolicy::AllOrNothing | ApplyFailurePolicy::PreFlightThenAllOrNothing => {
                 if phase2.failed.is_empty() {
-                    self.phase3a_success(&principal, revision_id, &phase1, vec![], now)
+                    let outcome =
+                        self.phase3a_success(&principal, revision_id, &phase1, vec![], now);
+                    drop(overlay);
+                    outcome
                 } else {
+                    // The revert must restore the stored revision, so readers
+                    // go back to it first.
+                    drop(overlay);
                     let pre_flight_passed =
                         matches!(policy, ApplyFailurePolicy::PreFlightThenAllOrNothing);
                     self.phase3b_revert_and_reject(
@@ -612,6 +679,7 @@ impl ActivationCoordinator {
             // value has been moved elsewhere.
             if let Some(active_now) = self.current_active_for(principal)? {
                 self.audit.emit(ActivationAuditEvent::RolledBack {
+                    principal: principal.to_string(),
                     from_revision_id: new_id.as_str().to_string(),
                     to_revision_id: active_now.revision_id,
                 });
@@ -725,6 +793,35 @@ impl ActivationCoordinator {
     // The three activation phases live in `activation_coordinator::phases`;
     // reading a revision back and trusting it lives in `::integrity`. Same
     // inherent impl, split across files.
+}
+
+/// The first rule in `rules_json` whose shape enforcement cannot carry out.
+///
+/// The submission gate, shared by the coordinator and the executor's
+/// previews. Deliberately NOT part of the decoder: stored revisions must keep
+/// decoding, and an undecodable payload is the validator's refusal, not this
+/// one's.
+pub(crate) fn unsupported_rule_shape(
+    rules_json: &str,
+) -> Option<(String, nrr_domain::rule_shape::UnsupportedShapeReason)> {
+    let dto = nrr_shared::rules_json::from_canonical_string(rules_json).ok()?;
+    let content =
+        nrr_domain::rules_json_codec::decode(dto, nrr_domain::rules_file::HostPlatform::compiled())
+            .ok()?;
+    nrr_domain::rule_shape::first_unsupported(
+        &content.rule_book,
+        crate::wfp_codegen::current_rule_shape_support(),
+    )
+    .map(|(rule, reason)| (rule.id.as_str().to_string(), reason))
+}
+
+/// The first rule whose text would break the rules file on export. `None` for
+/// an undecodable payload: rejecting that is the codec's job, not this gate's.
+pub(crate) fn control_character_in_rules(
+    rules_json: &str,
+) -> Option<nrr_shared::rules_json::ForbiddenFieldText> {
+    let dto = nrr_shared::rules_json::from_canonical_string(rules_json).ok()?;
+    nrr_shared::rules_json::first_forbidden_field_text(&dto)
 }
 
 /// Classifies a verified-history entry against the activation-integrity

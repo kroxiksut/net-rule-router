@@ -1,11 +1,10 @@
 //! Error types for the sidecar database.
 //!
-//! Failures here are non-fatal from the user's perspective — comments
-//! and passthrough sections are decoration, not routing state. The GUI
-//! surfaces a status-line warning and proceeds with reduced fidelity
-//! (e.g. comments missing on this session, passthrough lost on next
-//! export). The bridge translates `SidecarError` to a status string;
-//! it does not propagate failures into mutation flows.
+//! Failures here are non-fatal for the user — comments and passthrough are
+//! decoration, not routing state. The launcher answers a failed `sidecar.*`
+//! request with a `sidecar-error` RPC error and QML degrades (no comments this
+//! session, passthrough missing from the next export); nothing propagates into
+//! mutation flows.
 
 use thiserror::Error;
 
@@ -32,10 +31,25 @@ pub enum SidecarError {
     #[error("sidecar schema migration corrupted: {detail}")]
     MigrationCorrupted { detail: String },
 
-    /// The requested path could not be resolved — no `%APPDATA%` (on
-    /// Windows) and no override via the `NRR_SIDECAR_PATH` env var.
+    /// No usable path: no per-user data directory (`%LOCALAPPDATA%` on
+    /// Windows, `$XDG_DATA_HOME`/`$HOME` elsewhere), or an unusable
+    /// `NRR_SIDECAR_PATH` override.
     #[error("could not resolve sidecar database path: {reason}")]
     PathResolution { reason: String },
+
+    /// The file opened, but the filesystem under it cannot give the database
+    /// what it needs (e.g. WAL on a network share).
+    #[error("sidecar database environment unsupported: {reason}")]
+    Environment { reason: String },
+
+    /// A request or a value to store is malformed — a missing field, a wrong
+    /// type, an empty content hash.
+    #[error("invalid sidecar request: {reason}")]
+    InvalidPayload { reason: String },
+
+    /// The `sidecar.*` operation name is not one this build serves.
+    #[error("unsupported sidecar operation: {operation}")]
+    UnsupportedOperation { operation: String },
 }
 
 /// Convenience alias for sidecar fallible operations.

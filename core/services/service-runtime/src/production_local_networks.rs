@@ -230,6 +230,7 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
                 if let Err(e) = repo.upsert(sid, &rule, now) {
                     tracing::warn!(
                         target: "nrr::local-networks",
+                        msg_key = "prod-networks-store-decision-failed",
                         sid = %sid,
                         cidr = %rule.cidr,
                         "could not store the local-network decision: {e}",
@@ -243,6 +244,7 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
                 {
                     tracing::warn!(
                         target: "nrr::local-networks",
+                        msg_key = "prod-networks-prune-superseded-failed",
                         sid = %sid,
                         adapter = %rule.adapter,
                         "could not prune superseded local-network answers: {e}",
@@ -305,6 +307,7 @@ impl crate::ipc_handlers::providers::RefusingAnchorsWriter for ProductionRefusin
         if let Err(e) = repo.set(sid, hostname, refusing, now) {
             tracing::warn!(
                 target: "nrr::auto-rules",
+                msg_key = "prod-networks-refusing-anchor-store-failed",
                 sid = %sid,
                 "could not record that a site refuses main-link addresses: {e}",
             );
@@ -350,7 +353,7 @@ mod tests {
     fn an_answer_follows_its_adapter_through_a_renumbering() {
         let switch = "Ethernet (Default Switch)";
         let stored = vec![rule(
-            "172.23.208.0/20",
+            "172.16.0.0/20",
             switch,
             true,
             LocalNetworkOrigin::Discovered,
@@ -368,13 +371,13 @@ mod tests {
         let switch = "Ethernet (Default Switch)";
         let stored = vec![
             rule(
-                "172.23.208.0/20",
+                "172.16.0.0/20",
                 switch,
                 true,
                 LocalNetworkOrigin::Discovered,
             ),
             rule(
-                "172.28.176.0/20",
+                "172.16.16.0/20",
                 switch,
                 false,
                 LocalNetworkOrigin::Discovered,
@@ -392,14 +395,14 @@ mod tests {
         let switch = "Ethernet (Default Switch)";
         let stored = vec![
             rule_at(
-                "172.23.208.0/20",
+                "172.16.0.0/20",
                 switch,
                 false,
                 LocalNetworkOrigin::Discovered,
                 1_000,
             ),
             rule_at(
-                "172.28.176.0/20",
+                "172.16.16.0/20",
                 switch,
                 true,
                 LocalNetworkOrigin::Discovered,
@@ -412,14 +415,14 @@ mod tests {
         // approval closes the segment again.
         let reversed = vec![
             rule_at(
-                "172.23.208.0/20",
+                "172.16.0.0/20",
                 switch,
                 true,
                 LocalNetworkOrigin::Discovered,
                 1_000,
             ),
             rule_at(
-                "172.28.176.0/20",
+                "172.16.16.0/20",
                 switch,
                 false,
                 LocalNetworkOrigin::Discovered,

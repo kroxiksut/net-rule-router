@@ -111,5 +111,11 @@ pushing: code that compiles on one platform is not evidence about the other.
 ./scripts/purge-data.sh --yes
 ```
 
-The audit trail is kept unless you add `--purge-audit`. Where each file lives is
+The audit trail is kept unless you add `--purge-audit`. Before deleting
+anything it gives the network back — the packet filters and the DNS redirect
+the service set up — and it stops there if that fails. Where each file lives is
 listed in [Where NetRuleRouter keeps its files](where-files-live.md).
+
+If a crashed service left the machine without network, `./scripts/reset-network.sh`
+undoes only that, and keeps everything else; see
+[Recovering network access](recovering-network-access.md).

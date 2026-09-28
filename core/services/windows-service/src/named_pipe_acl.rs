@@ -1,27 +1,21 @@
 //! DACL/security descriptor construction for the named pipe.
 //!
-//! ## Security descriptor (SDDL)
-//!
 //! ```text
-//! D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)S:(ML;;NW;;;LW)
+//! D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12019b;;;AU)S:(ML;;NW;;;LW)
 //! ```
 //!
-//! - `(A;;GA;;;SY)` — LocalSystem: Generic All
-//! - `(A;;GA;;;BA)` — Builtin Administrators: Generic All
-//! - `(A;;GRGW;;;AU)` — Authenticated Users: Generic Read + Generic Write
-//!   (needed for duplex named-pipe IO; identity check at the application
-//!   layer rejects unknown processes)
-//! - `S:(ML;;NW;;;LW)` — Mandatory Integrity Label: Low IL no-write-up
+//! - `SY`, `BA` — LocalSystem and Administrators: full control.
+//! - `OW` — whoever created the pipe keeps the right to add instances, so the
+//!   server can run its accept loop under any account (tests, a dev console).
+//! - `AU` — Authenticated Users: read + write WITHOUT `FILE_APPEND_DATA`,
+//!   which on a pipe is `FILE_CREATE_PIPE_INSTANCE`. With it any user could
+//!   add an instance of their own; the kernel spreads clients across all
+//!   instances, so that user would receive other users' requests and answer
+//!   them.
+//! - `S:(ML;;NW;;;LW)` — low-integrity processes cannot write up.
 //!
-//! Everyone (`WD`) is *not* listed — absence in DACL means deny by default.
-//!
-//! ## Identity check still required
-//!
-//! The DACL only protects against random local users. Authenticated Users
-//! is a broad SID; applications running under an unprivileged interactive
-//! user account will still be able to *connect*. The application-layer
-//! identity check in `named_pipe_identity` rejects connections from any
-//! process whose exe basename is not on the whitelist.
+//! Authenticated Users can still connect; the application-layer check in
+//! `named_pipe_identity` decides what a connected caller may do.
 
 #![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
@@ -35,10 +29,15 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
-/// SDDL string for the named pipe's security descriptor.
-///
-/// See module documentation for the breakdown.
-pub const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)S:(ML;;NW;;;LW)";
+/// SDDL string for the named pipe's security descriptor; see the module docs.
+pub const PIPE_SDDL: &str =
+    "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12019b;;;AU)S:(ML;;NW;;;LW)";
+
+/// `FILE_GENERIC_READ | FILE_GENERIC_WRITE` minus `FILE_CREATE_PIPE_INSTANCE`.
+#[cfg(test)]
+const AUTHENTICATED_USERS_ACCESS: u32 = 0x0012_019B;
+#[cfg(test)]
+const FILE_CREATE_PIPE_INSTANCE: u32 = 0x0000_0004;
 
 /// Build a `SECURITY_ATTRIBUTES` for `CreateNamedPipeW`.
 ///
@@ -159,8 +158,16 @@ mod tests {
     fn sddl_constant_matches_documented_format() {
         assert!(PIPE_SDDL.contains("(A;;GA;;;SY)"));
         assert!(PIPE_SDDL.contains("(A;;GA;;;BA)"));
-        assert!(PIPE_SDDL.contains("(A;;GRGW;;;AU)"));
+        assert!(PIPE_SDDL.contains("(A;;GA;;;OW)"));
+        assert!(PIPE_SDDL.contains(&format!("(A;;{AUTHENTICATED_USERS_ACCESS:#x};;;AU)")));
         assert!(PIPE_SDDL.contains("S:(ML;;NW;;;LW)"));
+    }
+
+    #[test]
+    fn users_may_connect_but_not_add_an_instance() {
+        assert_eq!(AUTHENTICATED_USERS_ACCESS & FILE_CREATE_PIPE_INSTANCE, 0);
+        let client = nrr_shared::ipc_transport::SERVICE_PIPE_CLIENT_ACCESS;
+        assert_eq!(AUTHENTICATED_USERS_ACCESS & client, client);
     }
 
     #[test]

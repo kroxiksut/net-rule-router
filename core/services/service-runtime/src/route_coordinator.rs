@@ -396,6 +396,7 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger for RouteAndFilterA
             match self.route_coord.recompute_active(&active) {
                 Ok(delta) if !delta.is_noop() => tracing::info!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-policy-recomputed",
                     sid = %sid,
                     added = delta.added,
                     removed = delta.removed,
@@ -404,6 +405,7 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger for RouteAndFilterA
                 Ok(_) => {}
                 Err(e) => tracing::error!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-policy-recompute-failed",
                     sid = %sid,
                     "route recompute after policy change failed: {e:?}",
                 ),

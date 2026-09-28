@@ -1,0 +1,32 @@
+# Patterns of the comment-hygiene gate, read by BOTH check.ps1 (.NET regex) and
+# check.sh (Perl), so the two gates cannot drift apart on what they look for.
+# Keep every pattern inside the syntax both engines share. The fixture under
+# scripts/tests/comment-hygiene is the positive control each gate runs first.
+#
+# One `key=value` per line; the value is taken verbatim, no quoting.
+
+# Task tracking that is never legitimate anywhere in a line: code, identifiers,
+# string literals and comments alike. User-visible strings and test names are as
+# public as comments.
+anywhere=(?<![A-Za-z])(?i:blocks?)[\s_-]*\d|[бБ]лок[а-яё]*\s*\d|TODO\((?i:block)|NRR-\d+|\d\.(?i:qol)\b|(?i:qol)\+|\bHW-\d{4}\b
+
+# Markers judged only inside comment text: string literals and test data carry
+# the same shapes legitimately (timestamps, dotted versions). The sub-block form
+# is fenced on both sides so dotted-quad addresses are not read as block numbers.
+comment=(?<![\d.])1\d\.\d+\.[0-9A-Za-z](?!\.?\d)|(?<![A-Za-z])Block\s+[A-Z]\b|Phase\s+[A-Z]\b|20\d\d-[01]\d-[0-3]\d|\bTASKS_RU\b|(?<!\p{L})П\d
+
+# A comment-tier hit is forgiven when the comment is about time arithmetic.
+exempt=UTC|epoch|RFC|ISO\s?8601|≈|\d_\d{3}_
+
+# Applied to every listed path, whatever its type.
+filename=(?<![A-Za-z])(?i:blocks?)[\s_-]*\d|[бБ]лок|20\d\d-[01]\d-[0-3]\d|(?i:qol)|(?i:phase)[\s_-]*\d
+
+# Extensions whose comments open with `//` (and `/*` blocks), and with `#` (and
+# PowerShell `<#` blocks). Anything else is checked by file name only.
+slash=rs qml cpp h hpp c js rc in
+hash=ps1 psm1 sh toml yml yaml py pl cmake desktop gitignore gitattributes editorconfig example
+hashnames=CMakeLists.txt
+
+# Path prefixes skipped entirely: vendored code, and the fixture that holds the
+# offences on purpose.
+exclude=third_party/ scripts/tests/comment-hygiene/

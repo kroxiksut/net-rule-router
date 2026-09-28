@@ -96,7 +96,7 @@ impl SignInGate {
             action();
             return;
         }
-        tracing::info!(target: "nrr::logon", step = name, "waiting for a signed-in user");
+        tracing::info!(target: "nrr::logon", msg_key = "logon-step-waiting", step = name, "waiting for a signed-in user");
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -107,7 +107,7 @@ impl SignInGate {
     pub fn fire(&self) {
         let held = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()));
         for (name, action) in held {
-            tracing::info!(target: "nrr::logon", step = name, "user signed in — running deferred step");
+            tracing::info!(target: "nrr::logon", msg_key = "logon-step-running", step = name, "user signed in — running deferred step");
             action();
         }
     }

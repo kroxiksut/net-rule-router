@@ -154,6 +154,7 @@ impl AppDestinationMemory {
         if seeded > 0 {
             tracing::info!(
                 target: "nrr::app-routing",
+                msg_key = "appdestmem-preseeded",
                 destinations = seeded,
                 "pre-seeded application destinations from earlier sessions — their routes exist before the first connection",
             );

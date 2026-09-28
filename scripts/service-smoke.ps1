@@ -1,4 +1,4 @@
-# Manual smoke checklist for the Windows service scaffold.
+﻿# Manual smoke checklist for the Windows service scaffold.
 #
 # Run as Administrator. The script walks the canonical SCM lifecycle
 # (install → query → start → query → stop → query → uninstall → query)

@@ -136,12 +136,14 @@ impl PerSidApplyOrchestrator {
         match self.dns_cache_control.flush_resolver_cache() {
             Ok(()) => tracing::info!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-posture-dns-flush-ok",
                 sid,
                 block_all_armed = armed,
                 "flushed OS DNS resolver cache on kill-switch block-all transition — pre-transition cached names will re-query and become observable",
             ),
             Err(e) => tracing::warn!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-posture-dns-flush-failed",
                 sid,
                 block_all_armed = armed,
                 error = ?e,
@@ -267,6 +269,7 @@ impl PerSidApplyOrchestrator {
         }
         tracing::info!(
             target: "nrr::per_sid_orchestrator",
+            msg_key = "persid-posture-app-rules-learning",
             sid,
             apps = %fresh.join(", "),
             "application rules delivered for the first time — their destinations are still being learnt",
@@ -315,6 +318,7 @@ impl PerSidApplyOrchestrator {
         };
         tracing::info!(
             target: "nrr::per_sid_orchestrator",
+            msg_key = "persid-posture-cross-set-duplicates",
             sid,
             count = found.len(),
             sample = %first.match_summary,
@@ -399,12 +403,13 @@ impl PerSidApplyOrchestrator {
         }
     }
 
-    /// Reset the shared unresolved-app set to empty so the GUI banner does
-    /// not keep listing apps for a SID that no longer has any (enforceable)
-    /// rules. No-op when the status is unwired.
-    pub(super) fn clear_app_enforcement_status(&self) {
+    /// Reset the shared unresolved-app set and `sid`'s rule conflicts so the
+    /// GUI does not keep listing them for a SID that no longer has any
+    /// (enforceable) rules. No-op when the status is unwired.
+    pub(super) fn clear_app_enforcement_status(&self, sid: &str) {
         if let Some(status) = self.app_enforcement_status.as_ref() {
             status.set_unresolved(Vec::new());
+            status.set_rule_conflicts(sid, Vec::new());
         }
     }
 }

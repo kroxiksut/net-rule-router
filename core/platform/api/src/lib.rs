@@ -96,6 +96,9 @@ pub mod paths;
 // gone by the time we run again, so this is the only way to learn a wake
 // happened; the mechanism is per-OS, the reaction is neutral.
 pub mod power;
+// Who started a blocked program. The walk over recorded starts is neutral; where
+// the starts come from (ETW, procfs) is per-OS.
+pub mod process_lineage;
 // Where a process's own unstructured error output ends up. The decision (which
 // file) is the caller's; the mechanism (std-handle table / file descriptor) is
 // per-OS.
@@ -154,9 +157,9 @@ pub use adapters::{
     AdapterMonitor, IfOperStatus, InterfaceType, MockAdapterEventSource,
 };
 pub use app_group_discovery::{
-    classify_app, merge_discovered, AppDiscoverySource, AppGroupDiscoveryPort, AppGroupEntry,
-    AppGroupKind, AppGroupTab, DiscoveredApp, MockAppGroupDiscovery, NoopAppGroupDiscovery,
-    APP_GROUP_DICTIONARY,
+    classify_app, guest_network_bypasses_process, merge_discovered, AppDiscoverySource,
+    AppGroupDiscoveryPort, AppGroupEntry, AppGroupKind, AppGroupTab, DiscoveredApp,
+    MockAppGroupDiscovery, NoopAppGroupDiscovery, APP_GROUP_DICTIONARY,
 };
 pub use app_path_resolver::{AppPathResolver, MockAppPathResolver, NoopAppPathResolver};
 pub use autostart::{
@@ -209,6 +212,9 @@ pub use power::{
     NoopPowerEventObserver, PowerEvent, PowerEventCallback, PowerEventObserver,
     PowerEventSubscription,
 };
+pub use process_lineage::{
+    LineageCoverage, NoopProcessLineage, ProcessLineagePort, ProcessStartRing,
+};
 pub use third_party::{
     IntegrityVerdict, MockThirdPartyIntegrity, NoopThirdPartyIntegrity, SignatureStatus,
     ThirdPartyComponent, ThirdPartyComponentStatus, ThirdPartyIntegrityPort,
@@ -219,8 +225,9 @@ pub use types::{
     WfpFilterRecord, WfpFilterSpec, WfpLayerKey,
 };
 pub use vm_inventory::{
-    GuestDnsAdvice, Hypervisor, HypervisorInventory, MockVmInventory, NatAdapter, NoopVmInventory,
-    VirtualMachine, VmAdapter, VmAttachment, VmInventoryPort,
+    classify_bindings, GuestDnsAdvice, Hypervisor, HypervisorInventory, MockVmInventory,
+    NatAdapter, NatBinding, NoopVmInventory, VirtualMachine, VmAdapter, VmAttachment,
+    VmControlError, VmInventoryPort,
 };
 pub use vpn_discovery::{
     looks_like_vpn, merge_candidates, vpn_client_class, MockVpnDiscovery, NoopVpnDiscovery,

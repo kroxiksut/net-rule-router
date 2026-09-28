@@ -45,7 +45,11 @@ fn doh_lockdown_emits_blocks_when_enabled_and_in_scope() {
         snap.doh_lockdown_enabled = true;
         snap.doh_lockdown_scope = scope;
         snap.kill_switch_enabled = kill_switch;
-        snap.doh_resolver_ips = vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(1, 1, 1, 1)];
+        snap.doh_resolver_ips = vec![
+            Ipv4Addr::new(8, 8, 8, 8).into(),
+            Ipv4Addr::new(1, 1, 1, 1).into(),
+            "2001:db8::53".parse().expect("v6"),
+        ];
         source.set("S-1-5-21-DOH", snap);
         let rules = Arc::new(ScriptedRules::default());
         rules.set(rules_with_n_primary_ips(1));
@@ -70,11 +74,11 @@ fn doh_lockdown_emits_blocks_when_enabled_and_in_scope() {
             .filter(|f| f.remote_port == Some(443) || f.remote_port == Some(853))
             .count()
     };
-    // Always scope → blocks regardless of the kill-switch: 2 IPs × (443 TCP+UDP)
-    // + DoT (853 TCP+UDP) = 6.
-    assert_eq!(build(DohLockdownScope::Always, false), 6);
+    // Always scope → blocks regardless of the kill-switch. IPv4: two packed
+    // chunks × (443 TCP+UDP) + DoT (853 TCP+UDP) = 6; IPv6: one chunk + DoT = 4.
+    assert_eq!(build(DohLockdownScope::Always, false), 10);
     // Leak-protection-only + kill-switch ON → applies.
-    assert_eq!(build(DohLockdownScope::LeakProtectionOnly, true), 6);
+    assert_eq!(build(DohLockdownScope::LeakProtectionOnly, true), 10);
     // Leak-protection-only + kill-switch OFF → does NOT apply.
     assert_eq!(build(DohLockdownScope::LeakProtectionOnly, false), 0);
 }
@@ -92,7 +96,10 @@ fn doh_lockdown_blocks_are_published_in_their_own_band() {
     let mut snap = snap_full("Wi-Fi", "TAP");
     snap.doh_lockdown_enabled = true;
     snap.doh_lockdown_scope = DohLockdownScope::Always;
-    snap.doh_resolver_ips = vec![Ipv4Addr::new(8, 8, 4, 4)];
+    snap.doh_resolver_ips = vec![
+        Ipv4Addr::new(8, 8, 4, 4).into(),
+        "2001:db8::53".parse().expect("v6"),
+    ];
     source.set("S-1-5-21-DOHBAND", snap);
     let rules = Arc::new(ScriptedRules::default());
     rules.set(rules_with_n_primary_ips(1));
@@ -441,22 +448,17 @@ fn activation_tears_down_connections_to_the_destinations_it_starts_enforcing() {
     src.set("S-1-5-21-A", snap_full("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
-    let first: Vec<Ipv4Addr> = reset.calls().into_iter().map(|(ip, _)| ip).collect();
     assert!(
-        !first.is_empty(),
+        !reset.queried().is_empty(),
         "the destinations of a first install are all newly enforced"
-    );
-    assert!(
-        reset.calls().iter().all(|(_, prefix)| *prefix == 32),
-        "a destination is torn down as a single address, not as a subnet"
     );
 
     // Re-applying the same policy must NOT tear the same connections down
     // again — those are the ones the first teardown just re-established.
-    let before = reset.calls().len();
+    let before = reset.queried().len();
     orch.install_for_sid("S-1-5-21-A").unwrap();
     assert_eq!(
-        reset.calls().len(),
+        reset.queried().len(),
         before,
         "an unchanged destination set is not re-torn-down"
     );
@@ -483,7 +485,7 @@ fn a_coverage_reconcile_records_and_sweeps_what_it_starts_covering() {
     );
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
-    let after_install: Vec<Ipv4Addr> = reset.calls().into_iter().map(|(ip, _)| ip).collect();
+    let after_install = reset.queried();
     assert!(after_install.contains(&first_ip));
 
     // A rule appears between passes; the coverage reconcile is what installs
@@ -491,7 +493,7 @@ fn a_coverage_reconcile_records_and_sweeps_what_it_starts_covering() {
     // to that address.
     rules.set(rules_with_secondary_ips(&[first_ip, second_ip]));
     orch.reconcile_secondary_coverage("S-1-5-21-A").unwrap();
-    let swept: Vec<Ipv4Addr> = reset.calls().into_iter().map(|(ip, _)| ip).collect();
+    let swept = reset.queried();
     assert!(
         swept.contains(&second_ip),
         "the address this pass started enforcing must be swept by it"
@@ -499,10 +501,10 @@ fn a_coverage_reconcile_records_and_sweeps_what_it_starts_covering() {
 
     // And the install that follows must not re-sweep what the reconcile
     // already recorded as covered.
-    let before = reset.calls().len();
+    let before = reset.queried().len();
     orch.install_for_sid("S-1-5-21-A").unwrap();
     assert_eq!(
-        reset.calls().len(),
+        reset.queried().len(),
         before,
         "an unchanged coverage set is not re-torn-down"
     );
@@ -548,17 +550,12 @@ fn the_additional_link_coming_up_sweeps_every_pinned_destination() {
     src.set("S-1-5-21-A", snap_full("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
-    let after_first = reset.calls().len();
+    let after_first = reset.queried().len();
 
     *live.lock().unwrap_or_else(|p| p.into_inner()) = Some(full_ks_resolution());
     orch.install_for_sid("S-1-5-21-A").unwrap();
 
-    let swept: Vec<Ipv4Addr> = reset
-        .calls()
-        .into_iter()
-        .skip(after_first)
-        .map(|(addr, _)| addr)
-        .collect();
+    let swept: Vec<Ipv4Addr> = reset.queried().into_iter().skip(after_first).collect();
     assert!(
         swept.contains(&ip),
         "the destination was pinned before and after, so only the up-edge can explain sweeping it: {swept:?}"
@@ -566,13 +563,81 @@ fn the_additional_link_coming_up_sweeps_every_pinned_destination() {
 
     // Steady state afterwards: the same install must not keep tearing the
     // reconnected sockets down.
-    let before_third = reset.calls().len();
+    let before_third = reset.queried().len();
     orch.install_for_sid("S-1-5-21-A").unwrap();
     assert_eq!(
-        reset.calls().len(),
+        reset.queried().len(),
         before_third,
         "an unchanged, already-up link sweeps nothing"
     );
+}
+
+/// A cache whose only answer is the shared-address census.
+struct SharedCensus(std::collections::HashSet<Ipv4Addr>);
+
+impl FqdnCacheLookup for SharedCensus {
+    fn ips_for_hostname(&self, _hostname: &str) -> Vec<IpAddr> {
+        Vec::new()
+    }
+
+    fn hostnames_under_suffix(&self, _suffix: &str, _limit: usize) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn shared_direct_ips(&self) -> std::collections::HashSet<Ipv4Addr> {
+        self.0.clone()
+    }
+}
+
+/// These filters are one user's, so the activation edge tears down that
+/// user's connections only: another user's, an unattributed one and one to an
+/// address a direct host shares all stay up.
+#[test]
+fn activation_tears_down_only_the_owners_connections_off_shared_addresses() {
+    use nrr_platform_api::fake_ip::stale_flows::{
+        EstablishedFlow, MockStaleFlowReset, StaleFlowReset,
+    };
+    use std::net::SocketAddrV4;
+    const OWNER: &str = "S-1-5-21-A";
+    let routed = Ipv4Addr::new(203, 0, 113, 9);
+    let shared = Ipv4Addr::new(203, 0, 113, 10);
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let src = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(SharedCensus([shared].into_iter().collect()));
+    let reset = Arc::new(MockStaleFlowReset::new());
+    let flow = |remote: Ipv4Addr, port: u16, owner: Option<&str>| EstablishedFlow {
+        local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), port),
+        remote: SocketAddrV4::new(remote, 443),
+        owner: owner.map(str::to_owned),
+    };
+    let owners = flow(routed, 50_001, Some("s-1-5-21-a"));
+    reset.set_flows(vec![
+        owners.clone(),
+        flow(routed, 50_002, Some("S-1-5-21-B")),
+        flow(routed, 50_003, None),
+        flow(shared, 50_004, Some(OWNER)),
+    ]);
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_stale_flow_reset(Arc::clone(&reset) as Arc<dyn StaleFlowReset>);
+    rules.set(rules_with_secondary_ips(&[routed, shared]));
+    src.set(OWNER, snap_full("Wi-Fi", "TAP"));
+
+    orch.install_for_sid(OWNER).unwrap();
+
+    let queried = reset.queried();
+    assert!(
+        queried.contains(&routed) && queried.contains(&shared),
+        "both addresses are new destinations, so both are candidates: {queried:?}"
+    );
+    assert_eq!(reset.reset_flows(), vec![owners]);
 }
 
 /// Without the port wired, the activation edge is silent and the reactive

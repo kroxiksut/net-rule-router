@@ -18,6 +18,10 @@ QtObject {
     property var hypervisors: []
     property bool scanning: false
     property bool scanFailed: false
+    /// "<machineId>/<slot>" of the adapter being pinned, "" when idle.
+    property string bindingKey: ""
+    /// Last refused pin: { key, error, message }, null when none.
+    property var bindFailure: null
     /// The screen and its sidebar entry exist only when a hypervisor's network
     /// or machines were found.
     readonly property bool available: hypervisors.length > 0
@@ -35,7 +39,7 @@ QtObject {
 
     function refresh() {
         if (!root || !root.bridgeAvailable || scanning) return
-        var corr = root.rpc.rpcVmInventoryList()
+        var corr = root.rpc.rpcVmInventoryList(_additionalAdapter())
         if (!corr || corr === "") {
             scanFailed = true
             return
@@ -50,6 +54,55 @@ QtObject {
             }
             virtualMachinesController.scanFailed = false
             virtualMachinesController.hypervisors = payload.hypervisors || []
+        })
+    }
+
+    function _additionalAdapter() {
+        var prefs = root.prefs || {}
+        return {
+            additionalInterfaceId: String(prefs.selectedSecondaryInterfaceId || ""),
+            additionalInterfaceName: String(prefs.selectedSecondaryInterfaceName || "")
+        }
+    }
+
+    /// Whether an additional adapter is chosen at all; pinning needs one.
+    function hasAdditionalAdapter() {
+        var ref = _additionalAdapter()
+        return ref.additionalInterfaceId !== "" || ref.additionalInterfaceName !== ""
+    }
+
+    function adapterKey(machine, adapter) {
+        return String((machine || {}).id || "") + "/" + String((adapter || {}).slot)
+    }
+
+    /// Pins `adapter` of `machine` to the additional adapter ("additional") or
+    /// removes the pin ("rules"). The hypervisor itself is changed, at once;
+    /// the inventory is re-read afterwards so the screen shows what took.
+    function bindNat(hypervisor, machine, adapter, route) {
+        if (!root || !root.bridgeAvailable || bindingKey !== "") return
+        var key = adapterKey(machine, adapter)
+        var payload = _additionalAdapter()
+        payload.hypervisor = String((hypervisor || {}).hypervisor || "")
+        payload.machineId = String((machine || {}).id || "")
+        payload.slot = Number((adapter || {}).slot)
+        payload.route = route
+        var corr = root.rpc.rpcVmNatBind(payload)
+        if (!corr || corr === "") {
+            bindFailure = { key: key, error: "failed", message: "" }
+            return
+        }
+        bindingKey = key
+        bindFailure = null
+        root.rpc.registerRpcCallback(corr, function(ok, answer, code, msg) {
+            virtualMachinesController.bindingKey = ""
+            if (!ok || !answer || answer.ok !== true) {
+                virtualMachinesController.bindFailure = {
+                    key: key,
+                    error: String((answer && answer.error) || "failed"),
+                    message: String((answer && answer.message) || msg || "")
+                }
+            }
+            virtualMachinesController.refresh()
         })
     }
 

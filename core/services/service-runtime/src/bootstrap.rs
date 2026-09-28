@@ -316,6 +316,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
                     // visible in the files; say so where an operator will see it.
                     tracing::error!(
                         target: "nrr::audit",
+                        msg_key = "bootstrap-audit-tail-truncated",
                         anchor_seq,
                         found_seq = found_seq.unwrap_or(0),
                         "audit tail is shorter than the anchor — events were removed"
@@ -749,12 +750,14 @@ fn reject_orphaned_candidate_revisions(conn: &rusqlite::Connection) {
         ),
         Ok(count) => tracing::warn!(
             target: "nrr::state",
+            msg_key = "bootstrap-orphaned-candidates-rejected",
             count,
             "boot sweep: rejected orphaned candidate revision(s) left over from an \
              interrupted service run"
         ),
         Err(e) => tracing::warn!(
             target: "nrr::state",
+            msg_key = "bootstrap-orphaned-candidates-reject-failed",
             error = %e,
             "boot sweep: failed to reject orphaned candidate revisions"
         ),
@@ -788,6 +791,7 @@ pub fn sweep_signed_orphaned_candidates(
         Err(_) => {
             tracing::warn!(
                 target: "nrr::state",
+                msg_key = "bootstrap-keyed-sweep-mutex-poisoned",
                 "keyed boot sweep: state connection mutex poisoned; skipping"
             );
             return;
@@ -801,12 +805,14 @@ pub fn sweep_signed_orphaned_candidates(
         ),
         Ok(count) => tracing::warn!(
             target: "nrr::state",
+            msg_key = "bootstrap-keyed-orphaned-candidates-rejected",
             count,
             "keyed boot sweep: rejected and re-signed signed orphaned candidate \
              revision(s) left over from an interrupted service run"
         ),
         Err(e) => tracing::warn!(
             target: "nrr::state",
+            msg_key = "bootstrap-keyed-orphaned-candidates-reject-failed",
             error = %e,
             "keyed boot sweep: failed to reject signed orphaned candidate revisions"
         ),

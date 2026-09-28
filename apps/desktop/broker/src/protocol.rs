@@ -14,7 +14,50 @@
 //! file at startup. This is the third of three owner-binding checks
 //! (DACL → PID/SID identity → nonce); see `server.rs`.
 
+use std::time::Duration;
+
+use nrr_platform_api::elevation::POST_ELEVATION_SETTLE;
 use serde::{Deserialize, Serialize};
+
+/// Cap on the service-call timeout a request may ask for, so a buggy or
+/// hostile caller cannot pin the broker's only accept loop on one call.
+pub const MAX_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a `broker.service-control` child may run before the broker kills
+/// it. Generous — `reinstall` restarts a service — but finite: it runs in the
+/// broker's only accept loop.
+pub const SERVICE_CONTROL_BUDGET: Duration = Duration::from_secs(90);
+
+/// What the launcher waits beyond the broker's own bound: scheduling, the frame
+/// round-trip, a service call overrunning its timeout by a reconnect.
+pub const ANSWER_MARGIN: Duration = Duration::from_secs(5);
+
+/// The timeout the broker applies to a relayed service call.
+pub fn relay_timeout(requested_ms: u64) -> Duration {
+    Duration::from_millis(requested_ms.max(1)).min(MAX_FORWARD_TIMEOUT)
+}
+
+/// Longest the broker may legitimately take to answer `operation`. Both ends
+/// derive their timeouts from this one bound: a launcher that gave up earlier
+/// would read a working broker as a dead one.
+pub fn broker_answer_bound(operation: &str, requested: Duration) -> Duration {
+    match operation {
+        BROKER_PING | BROKER_SHUTDOWN => Duration::ZERO,
+        // The first stop after the prompt waits out the settle before its run.
+        BROKER_SERVICE_CONTROL => POST_ELEVATION_SETTLE + SERVICE_CONTROL_BUDGET,
+        _ => relay_timeout(duration_ms(requested)),
+    }
+}
+
+/// How long the launcher waits for the answer to `operation`.
+pub fn client_answer_timeout(operation: &str, requested: Duration) -> Duration {
+    broker_answer_bound(operation, requested) + ANSWER_MARGIN
+}
+
+/// `duration` as the wire's `timeout_ms`, saturating.
+pub fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// CLI flag that puts the launcher binary into elevated-broker mode.
 pub const BROKER_MODE_FLAG: &str = "--nrr-elevated-broker";
@@ -36,8 +79,9 @@ pub const BROKER_SHUTDOWN: &str = "broker.shutdown";
 /// (start/stop/restart/install/uninstall) by executing the service binary
 /// subcommand from the already-elevated broker — so the FIRST elevation
 /// (an apply OR a service action) covers all later privileged actions, no
-/// repeated UAC. Payload: `{ "action": "<verb>", "service-exe-path": "<abs path>" }`.
-/// Handled inside the broker (not forwarded to the service over IPC).
+/// repeated UAC. Payload: `{ "action": "<verb>", "service-exe-path": "<abs path>" }`;
+/// the path is optional and only checked against the broker's own sibling,
+/// which is what runs. Handled inside the broker (not forwarded to the service).
 pub const BROKER_SERVICE_CONTROL: &str = "broker.service-control";
 
 /// Prefix for all broker-local control operations. Slugs that start with
@@ -236,6 +280,54 @@ mod tests {
         assert!(is_control_operation(BROKER_SHUTDOWN));
         assert!(!is_control_operation("mutation.submit"));
         assert!(!is_control_operation("route.policy.update"));
+    }
+
+    #[test]
+    fn the_launcher_outwaits_every_bound_the_broker_may_use() {
+        let requested = [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+        ];
+        let operations = [
+            BROKER_PING,
+            BROKER_SHUTDOWN,
+            BROKER_SERVICE_CONTROL,
+            "mutation.submit",
+            "route.policy.update",
+        ];
+        for operation in operations {
+            for asked in requested {
+                let bound = broker_answer_bound(operation, asked);
+                assert!(
+                    client_answer_timeout(operation, asked) >= bound + ANSWER_MARGIN,
+                    "{operation} asked {asked:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_service_control_wait_covers_the_settle_and_the_whole_child_budget() {
+        // Whatever the caller asks, the child may run for the full budget.
+        let wait = client_answer_timeout(BROKER_SERVICE_CONTROL, Duration::from_secs(1));
+        assert!(wait > POST_ELEVATION_SETTLE + SERVICE_CONTROL_BUDGET);
+    }
+
+    #[test]
+    fn a_relay_is_bounded_by_what_the_broker_applies_to_the_service_call() {
+        let asked = Duration::from_secs(600);
+        assert_eq!(relay_timeout(duration_ms(asked)), MAX_FORWARD_TIMEOUT);
+        assert_eq!(
+            broker_answer_bound("mutation.submit", asked),
+            MAX_FORWARD_TIMEOUT
+        );
+        assert_eq!(
+            broker_answer_bound("mutation.submit", Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]

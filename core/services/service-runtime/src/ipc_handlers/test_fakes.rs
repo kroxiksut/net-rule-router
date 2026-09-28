@@ -572,6 +572,8 @@ impl RoutePolicyWriter for FakeRoutePolicyWriter {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: request.binding_source,
         };
         *self.stored.lock().unwrap() = Some(dto.clone());
@@ -698,7 +700,6 @@ impl ApplyFailurePolicyProvider for FakeApplyFailurePolicy {
         ApplyFailurePolicyDto {
             policy: "all-or-nothing".into(),
             updated_at: 0,
-            set_by_sid: None,
         }
     }
 }
@@ -708,12 +709,11 @@ impl ApplyFailurePolicyWriter for FakeApplyFailurePolicyWriter {
     fn set(
         &self,
         slug: &str,
-        sid: Option<&str>,
+        _sid: Option<&str>,
     ) -> Result<ApplyFailurePolicyDto, SettingsWriteError> {
         Ok(ApplyFailurePolicyDto {
             policy: slug.into(),
             updated_at: 0,
-            set_by_sid: sid.map(str::to_string),
         })
     }
 }
@@ -777,7 +777,7 @@ impl AutostartProvider for FakeAutostart {
 
 pub struct FakeAutostartWriter;
 impl AutostartWriter for FakeAutostartWriter {
-    fn toggle(&self, enabled: bool) -> Result<AutostartDto, SettingsWriteError> {
+    fn toggle(&self, _sid: &str, enabled: bool) -> Result<AutostartDto, SettingsWriteError> {
         Ok(AutostartDto {
             enabled,
             last_known_state: if enabled { "enabled" } else { "disabled" }.into(),

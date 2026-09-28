@@ -57,6 +57,7 @@ impl PerSidApplyOrchestrator {
                 if phantom > 0 {
                     tracing::error!(
                         target: "nrr::per_sid_orchestrator",
+                        msg_key = "persid-apply-phantom-filters",
                         sid,
                         phantom,
                         expected,
@@ -75,6 +76,7 @@ impl PerSidApplyOrchestrator {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-apply-verify-enumerate-failed",
                     sid,
                     "verify-after-apply: could not enumerate live WFP filters (skipping check): {e:?}",
                 );
@@ -209,6 +211,7 @@ impl PerSidApplyOrchestrator {
         }
         tracing::info!(
             target: "nrr::per_sid_orchestrator",
+            msg_key = "persid-apply-adds-refused-teardown",
             sid = %sid,
             stage,
             "teardown in progress — filter adds refused (an added filter outlives the process)",
@@ -356,6 +359,7 @@ impl PerSidApplyOrchestrator {
             // is answerable directly from NDJSON.
             tracing::info!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-filters-installed",
                 sid,
                 installed = count,
                 "per-SID WFP filter set installed",
@@ -365,6 +369,7 @@ impl PerSidApplyOrchestrator {
             let n = apply_outcome.skipped.len();
             tracing::warn!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-best-effort-skipped",
                 sid,
                 installed = count,
                 skipped = n,
@@ -587,6 +592,7 @@ impl PerSidApplyOrchestrator {
                 Err(e) => {
                     tracing::warn!(
                         target: "nrr::per_sid_orchestrator",
+                        msg_key = "persid-apply-delete-superseded-failed",
                         sid,
                         deferred = to_remove.len() as u64,
                         "reconcile coverage: delete of superseded filters best-effort failed — keeping them tracked so the next tick retries: {e:?}",
@@ -604,6 +610,7 @@ impl PerSidApplyOrchestrator {
             if !to_remove.is_empty() {
                 tracing::warn!(
                     target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-apply-delete-deferred",
                     sid,
                     deferred = to_remove.len() as u64,
                     "reconcile coverage: deferred delete of superseded filters — a replacement block add was skipped this tick (fail-safe over-coverage; retry next tick)",
@@ -742,6 +749,7 @@ impl PerSidApplyOrchestrator {
             if let Err(e) = self.session.execute_wfp_plan(&actions) {
                 tracing::warn!(
                     target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-apply-cleanup-delete-failed",
                     "cleanup_wfp: delete-by-tracked-id best-effort failed: {e:?}",
                 );
             }
@@ -783,6 +791,7 @@ impl PerSidApplyOrchestrator {
         }
         tracing::info!(
             target: "nrr::per_sid_orchestrator",
+            msg_key = "persid-apply-cleanup-stripped",
             tracked_deleted,
             swept,
             "cleanup_wfp: stripped all NRR WFP filters (tracked ids + enumerated sweep)",
@@ -812,6 +821,7 @@ impl PerSidApplyOrchestrator {
         if let Err(e) = self.session.execute_wfp_plan(&actions) {
             tracing::warn!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-cleanup-orphans-failed",
                 "cleanup_persisted_orphans: delete-by-id best-effort failed: {e:?}",
             );
         } else {
@@ -822,6 +832,7 @@ impl PerSidApplyOrchestrator {
             // just been cleared.
             tracing::info!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-cleanup-orphans-cleared",
                 ledger_ids = ids.len() as u64,
                 "startup: cleared the previous instance's filter ledger (ids already gone after a reboot are a no-op)",
             );
@@ -900,11 +911,13 @@ impl PerSidApplyOrchestrator {
         match self.dns_cache_control.flush_resolver_cache() {
             Ok(()) => tracing::info!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-dns-flush-ok",
                 sid,
                 "flushed OS DNS resolver cache after a rule change — hosts that just became rule hosts re-query instead of dialling the address they were answered with before",
             ),
             Err(e) => tracing::warn!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-dns-flush-failed",
                 sid,
                 "could not flush the OS DNS resolver cache after a rule change: {e:?}",
             ),
@@ -998,12 +1011,14 @@ impl PerSidApplyOrchestrator {
         match self.session.execute_wfp_plan(&actions) {
             Ok(_) => tracing::info!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-install-removed-superseded",
                 sid,
                 removed = superseded.len() as u64,
                 "install: removed filters the new set supersedes",
             ),
             Err(e) => tracing::warn!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-delete-superseded-install-failed",
                 sid,
                 superseded = superseded.len() as u64,
                 "install: delete of superseded filters best-effort failed: {e:?}",
@@ -1016,18 +1031,6 @@ impl PerSidApplyOrchestrator {
         self.upsert_state_with_destinations(sid, installed, Vec::new(), false);
     }
 
-    /// What a filter set covers: the destinations it scopes to (deduplicated,
-    /// in emission order) and whether the leak guard had a resolved tunnel when
-    /// it was built. Both answers are READ OFF the filters, so the install
-    /// path and the reconcile path cannot derive them differently — deriving
-    /// them independently is what let the reconcile path leave them at
-    /// their defaults.
-    ///
-    /// Only host-scoped filters contribute. Every subnet-scoped filter we emit
-    /// today is an exemption (loopback / LAN / the fake pool), and there is
-    /// nothing to break loose from a permit. A CIDR RULE would change that —
-    /// its pin needs the same sweep a `/32` pin gets, through
-    /// `StaleFlowReset::reset_flows_to(base, prefix)`.
     /// Publish the addresses this filter set PERMITS, so the resolver can tell
     /// "the policy carries this address" from "a name once resolved to it".
     ///
@@ -1048,6 +1051,14 @@ impl PerSidApplyOrchestrator {
         crate::enforced_addresses::global_enforced_addresses().publish(sid, permitted);
     }
 
+    /// What a filter set covers: the destinations it scopes to (deduplicated,
+    /// in emission order) and whether the leak guard had a resolved tunnel when
+    /// it was built. Both are read off the filters, so the install and the
+    /// reconcile path cannot derive them differently.
+    ///
+    /// Only host-scoped filters contribute: every subnet-scoped filter we emit
+    /// is an exemption, with nothing to break loose. A CIDR rule would need
+    /// its range swept too.
     fn coverage_of(filters: &[WfpFilterSpec]) -> (Vec<std::net::Ipv4Addr>, bool) {
         let mut seen = std::collections::HashSet::new();
         let destinations = filters
@@ -1103,6 +1114,10 @@ impl PerSidApplyOrchestrator {
     /// not change while the tunnel was down, so the "new destinations" rule
     /// finds nothing, and the sockets the browser opened over the main link (or
     /// against a fail-closed block) would ride it until they died on their own.
+    ///
+    /// These filters are `sid`'s alone, so only `sid`'s connections are torn
+    /// down, and none to an address a direct host shares — the same cut
+    /// [`crate::routed_host_flow_refresh::flows_to_reset`] makes.
     fn tear_down_flows_to_new_destinations(
         &self,
         sid: &str,
@@ -1123,10 +1138,8 @@ impl PerSidApplyOrchestrator {
             }
         };
         let tunnel_came_up = secondary_resolved && !was_resolved;
-        // One sweep for the whole set. Per-address teardown re-read the entire
-        // TCP table each time, and "the tunnel came up" hands this every pinned
-        // destination at once — hundreds of full table reads on the activation
-        // edge, which is exactly the moment that must not stall.
+        // One table read for the whole set: "the tunnel came up" hands this
+        // every pinned destination at once, on the edge that must not stall.
         let victims: Vec<std::net::Ipv4Addr> = destinations
             .iter()
             .copied()
@@ -1136,7 +1149,19 @@ impl PerSidApplyOrchestrator {
         if victims.is_empty() {
             return;
         }
-        let torn_down = reset.reset_flows_to_any(&victims).torn_down;
+        let candidates = reset.established_flows_to(&victims);
+        if candidates.is_empty() {
+            return;
+        }
+        // Read only when something is connected: the census is a query.
+        let decision = crate::routed_host_flow_refresh::flows_to_reset(
+            candidates,
+            sid,
+            &self.fqdn_cache.shared_direct_ips(),
+            // No anchor here: an apply routes addresses, it offers nothing.
+            &std::collections::HashSet::new(),
+        );
+        let torn_down = reset.reset_established(&decision.reset);
         if torn_down > 0 {
             let reason = if tunnel_came_up {
                 "tore down connections still running beside the additional link that just came up — the application reconnects through it instead of finishing on the main one"
@@ -1145,10 +1170,14 @@ impl PerSidApplyOrchestrator {
             };
             tracing::info!(
                 target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-flows-torn-down",
                 sid,
                 torn_down,
                 destinations = fresh,
                 tunnel_came_up,
+                kept_shared = decision.kept_shared,
+                kept_other_owner = decision.kept_other_owner,
+                kept_unknown_owner = decision.kept_unknown_owner,
                 "{reason}",
             );
         }

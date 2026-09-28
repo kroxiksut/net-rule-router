@@ -225,11 +225,14 @@ QtObject {
         // has no window to hand it to, so it rides the context and is dispatched
         // here through the same one entry point.
         var coldAction = String((root.context || {}).launchAction || "")
-        if (coldAction !== "") {
+        var coldFocus = String((root.context || {}).launchFocus || "")
+        if (coldAction !== "" || coldFocus !== "") {
             Qt.callLater(function() {
                 root.applyGuiActivationRequest({
                     action: coldAction,
-                    reason: String((root.context || {}).launchReason || "")
+                    reason: String((root.context || {}).launchReason || ""),
+                    focus: coldFocus,
+                    focusContext: (root.context || {}).launchFocusContext || {}
                 })
             })
         }

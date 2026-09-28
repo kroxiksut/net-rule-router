@@ -1,9 +1,10 @@
 //! Rules of the two routes that claim the same hosts, and which one wins.
 //!
 //! The narrower rule wins without asking anyone — name over suffix over zone,
-//! a longer suffix or zone over a shorter one, the main route on a tie. This
-//! only names the pairs so the user can see them and confirm or change the
-//! route. `nrr-domain` pins every reported winner against its matcher.
+//! a longer suffix or zone over a shorter one. On a tie a Block beats a route,
+//! then the main route beats the additional one. This only names the pairs so
+//! the user can see them and confirm or change the route. `nrr-domain` pins
+//! every reported winner against its matcher.
 //!
 //! Name rules only: an exact-IP rule claims an address, and whether it sits
 //! under a name rule is a question of resolution, not of the rule book.
@@ -13,7 +14,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::rules_json::{AddressMatchDto, CanonicalRulesJsonV1, RuleDto};
+use crate::rules_json::{AddressMatchDto, CanonicalRulesJsonV1, RuleAction, RuleDto};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -46,6 +47,10 @@ pub struct RouteOverlap {
     /// The rule whose route the shared hosts take.
     pub winner: OverlapRule,
     pub loser: OverlapRule,
+    /// A Block won a tie against a route: the route names the hosts just as
+    /// narrowly and never applies, which the screen warns about.
+    #[serde(default)]
+    pub block_wins_tie: bool,
 }
 
 /// Every pair of enabled name rules on different routes whose hosts
@@ -235,9 +240,16 @@ fn push_if_overlapping(narrow: &NameRule<'_>, wide: &NameRule<'_>, found: &mut V
     if !shares_a_host {
         return;
     }
+    // Only a Block against a route: two Blocks drop the hosts either way.
+    let narrow_blocks = narrow.rule.action == RuleAction::Block;
+    let one_blocks = narrow_blocks != (wide.rule.action == RuleAction::Block);
     let (winner, loser, kind) = match narrow.strength().cmp(&wide.strength()) {
         Ordering::Greater => (narrow, wide, RouteOverlapKind::Nested),
         Ordering::Less => (wide, narrow, RouteOverlapKind::Nested),
+        Ordering::Equal if one_blocks && narrow_blocks => {
+            (narrow, wide, RouteOverlapKind::Duplicate)
+        }
+        Ordering::Equal if one_blocks => (wide, narrow, RouteOverlapKind::Duplicate),
         Ordering::Equal if narrow.route == PRIMARY => (narrow, wide, RouteOverlapKind::Duplicate),
         Ordering::Equal => (wide, narrow, RouteOverlapKind::Duplicate),
     };
@@ -246,6 +258,7 @@ fn push_if_overlapping(narrow: &NameRule<'_>, wide: &NameRule<'_>, found: &mut V
         kind,
         winner: winner.side(),
         loser: loser.side(),
+        block_wins_tie: one_blocks && kind == RouteOverlapKind::Duplicate,
     });
 }
 

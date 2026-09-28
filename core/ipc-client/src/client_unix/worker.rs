@@ -1,10 +1,13 @@
 //! The owned worker thread: one connection at a time, one request in flight,
 //! reconnect with backoff when the socket goes.
-//!
-//! Split out of `client_unix`; the code is unchanged.
 
 use super::frames::*;
 use super::*;
+use crate::connection::DropBackoff;
+
+/// The handshake is a fixed, cheap exchange; anything slower is a socket that
+/// will not serve us. Same bound as the Windows client.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Worker loop ──────────────────────────────────────────────────────────────
 
@@ -18,6 +21,8 @@ pub(super) fn worker_loop(inner: Arc<ClientInner>) {
     };
 
     let mut backoff = ReconnectBackoff::fast();
+    let mut slow_backoff = ReconnectBackoff::slow();
+    let mut drop_backoff = DropBackoff::new();
 
     while !inner.shutdown.load(Ordering::SeqCst) {
         inner.set_status(ConnectionStatus::Connecting);
@@ -35,18 +40,18 @@ pub(super) fn worker_loop(inner: Arc<ClientInner>) {
             }
         };
 
-        // A read must not wait forever: a service that accepts the connection
-        // and then answers nothing would otherwise park this worker for the
-        // life of the process, with the status still reading `Connected`.
+        // Neither a read nor a write may wait forever: a service that accepts
+        // and then goes silent would otherwise park this worker for the life
+        // of the process, with the status still reading `Connected`.
         let mut stream = match transport_unix::TimedStream::new(
             stream,
             Arc::clone(&inner.shutdown),
-            RESPONSE_READ_TIMEOUT,
+            HANDSHAKE_TIMEOUT,
         ) {
             Ok(s) => s,
             Err(e) => {
                 inner.set_status(ConnectionStatus::Disconnected {
-                    last_error: format!("set read timeout: {e}"),
+                    last_error: format!("set socket timeouts: {e}"),
                 });
                 let delay = backoff.next_delay();
                 sleep_observing_shutdown(&inner, delay);
@@ -54,7 +59,6 @@ pub(super) fn worker_loop(inner: Arc<ClientInner>) {
             }
         };
 
-        // Handshake: ContractNegotiate. Interpretation is neutral (protocol).
         let parsed = match negotiate_over(&mut stream) {
             Ok(p) => p,
             Err(e) => {
@@ -73,14 +77,26 @@ pub(super) fn worker_loop(inner: Arc<ClientInner>) {
                 }
                 inner.set_status(ConnectionStatus::Connected);
                 backoff.reset();
+                slow_backoff.reset();
             }
             NegotiateParse::ProtocolMismatch { server_version } => {
+                // Terminal until shutdown / force-reconnect, and the service
+                // gets its connection slot back for that whole time.
+                drop(stream);
                 inner.set_status(ConnectionStatus::ProtocolMismatch {
                     server_version,
                     client_version: CLIENT_PROTOCOL_VERSION,
                 });
-                // Terminal: stop reconnecting until shutdown / force-reconnect.
                 wait_for_shutdown_or_force_reconnect(&inner, &request_rx);
+                continue;
+            }
+            NegotiateParse::Refused { message } => {
+                drop(stream);
+                inner.set_status(ConnectionStatus::Refused { reason: message });
+                // The service is up and has answered; the fast schedule would
+                // re-run the refusal and its audit entry several times a second.
+                let delay = slow_backoff.next_delay();
+                sleep_observing_shutdown(&inner, delay);
                 continue;
             }
             NegotiateParse::Unexpected(msg) => {
@@ -93,7 +109,18 @@ pub(super) fn worker_loop(inner: Arc<ClientInner>) {
             }
         }
 
+        stream.set_deadline(RESPONSE_READ_TIMEOUT);
+        let connected_at = Instant::now();
         serve_requests(&inner, &request_rx, &mut stream);
+        drop(stream);
+
+        // Without a pause a service that closes right after the handshake is
+        // met with connect + handshake at full speed.
+        fail_queued_requests(&inner, &request_rx);
+        if !inner.shutdown.load(Ordering::SeqCst) {
+            let delay = drop_backoff.after_drop(connected_at.elapsed());
+            sleep_observing_shutdown(&inner, delay);
+        }
     }
 
     // Drain any remaining pending requests on shutdown.
@@ -176,7 +203,7 @@ pub(super) fn serve_requests<S: Read + Write + IdleDrain>(
                     )));
             }
             Err(e) => {
-                // Transport dead — fail this request and break to reconnect.
+                // Transport dead: fail this request and reconnect.
                 let _ = pending.response_tx.send(RequestResponse::Disconnected);
                 inner.set_status(ConnectionStatus::Disconnected {
                     last_error: format!("exchange failed: {e}"),
@@ -238,8 +265,20 @@ pub(super) fn drain_push_frames(
                 }
                 stream.begin_probe(PUSH_PROBE_WINDOW);
             }
-            Err(WireError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => break true,
-            Err(_) => break false,
+            // Nothing started arriving within the window: idle, not dead. A
+            // timeout after part of a frame was read is the opposite — the
+            // stream is mid-frame, and the next exchange would read garbage.
+            Err(WireError::Io(e))
+                if e.kind() == std::io::ErrorKind::TimedOut && !stream.probe_in_frame() =>
+            {
+                break true
+            }
+            Err(e) => {
+                inner.set_status(ConnectionStatus::Disconnected {
+                    last_error: format!("idle read failed: {e}"),
+                });
+                break false;
+            }
         }
     };
     stream.end_probe();

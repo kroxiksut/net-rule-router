@@ -26,15 +26,7 @@ impl SqliteStateStore {
 }
 
 impl RevisionMetadataRepository for SqliteStateStore {
-    /// The active revision, read from the pair the activation path maintains:
-    /// `active_revision_pointer` (plus `revisions.status = 'active'`).
-    ///
-    /// It used to consult an `active_revision` singleton first — two
-    /// representations of one fact, grown apart. Reading only the singleton
-    /// meant bootstrap reported "no active revision yet (first run)" on a
-    /// machine that had been enforcing rules for months, and offered a recovery
-    /// that would have written over a pointer nothing read. The singleton is
-    /// gone as of state-DB v60; this is the only representation left.
+    /// The baseline principal's `active_revision_pointer`.
     fn get_active_revision(&self) -> StorageResult<Option<RevisionId>> {
         let conn = self.conn.borrow();
         let live: Option<String> = conn
@@ -53,18 +45,11 @@ impl RevisionMetadataRepository for SqliteStateStore {
         Ok(None)
     }
 
-    /// Writes the pointer the rest of the system reads —
-    /// `active_revision_pointer` for the baseline principal — and not the
-    /// singleton `active_revision` row it used to write. Those were two
-    /// different places: the recovery flow flipped one while every reader
-    /// consulted the other, so an LKG fallback could not take effect even if
-    /// there had been an LKG to fall back to.
+    /// Moves the baseline principal's `active_revision_pointer`.
     fn set_active_revision(&self, revision_id: &RevisionId) -> StorageResult<()> {
         let conn = self.conn.borrow();
-        // Through the repository, not a raw INSERT: the pointer carries an HMAC
-        // and a hand-rolled write here would leave the recovered pointer
-        // unsigned. `apply_attempt_id` is cleared on purpose — recovery is not
-        // an apply in flight.
+        // Through the repository so the pointer is signed. No attempt id:
+        // recovery is not an apply in flight.
         let repo = match self.signing_key() {
             Some(key) => crate::revisions::RevisionsRepository::with_signing_key(&conn, key),
             None => crate::revisions::RevisionsRepository::new(&conn),
@@ -79,15 +64,7 @@ impl RevisionMetadataRepository for SqliteStateStore {
         )
     }
 
-    /// Derived, not stored: the rollback target is the most recent revision
-    /// that WAS active and was replaced, which `revisions` already records.
-    ///
-    /// It used to be read out of a `last_known_good` singleton that nothing
-    /// ever wrote — so the recovery flow always found `None` and every
-    /// "fall back to the last known good" decision resolved to "there is
-    /// nothing to fall back to". Deriving removes the write path instead of
-    /// adding one, and keeps the answer per-principal, which a machine-wide
-    /// singleton could never be.
+    /// Derived, not stored: the baseline's most recently superseded revision.
     fn get_last_known_good(&self) -> StorageResult<Option<RevisionId>> {
         let conn = self.conn.borrow();
         let record = crate::revisions::RevisionsRepository::new(&conn).last_known_good()?;
@@ -111,39 +88,47 @@ impl RevisionMetadataRepository for SqliteStateStore {
             ));
         }
 
-        // 2. Every principal's ACTIVE revision, checked against the live
-        // per-row signature — when this store was given the key. Bootstrap runs
-        // before the platform key store is opened, so there it verifies
-        // structure and format only; the signature sweep over every revision
-        // happens right after, in the keyed tamper bootstrap, which raises its
-        // own blocking alerts. What matters is that neither of them checks the
-        // dead singletons any more. This used to read an `active_revision` singleton
-        // whose `integrity_hash` was written by this same function and read by
-        // nothing else — the check verified its own bookkeeping over a table
-        // the enforcement path had stopped using, so in production it verified
-        // an empty table. `revisions.row_hmac` is what actually protects a row
-        // from being edited underneath us.
+        // 2. Every principal's pointer and the row it names. Signatures are
+        // checked only when this store holds the key: the boot store does not
+        // (the key store opens later) and the keyed tamper bootstrap sweeps
+        // every row and pointer right after. Existence needs no key.
         let repo = match self.signing_key() {
             Some(key) => crate::revisions::RevisionsRepository::with_signing_key(&conn, key),
             None => crate::revisions::RevisionsRepository::new(&conn),
         };
-        let mut active_ids: Vec<String> = Vec::new();
+        let mut pointers: Vec<(String, bool)> = Vec::new();
         {
             let mut stmt = conn
-                .prepare("SELECT revision_id FROM active_revision_pointer")
+                .prepare(
+                    "SELECT p.revision_id,
+                            EXISTS (SELECT 1 FROM revisions r
+                                    WHERE r.principal = p.principal
+                                      AND r.revision_id = p.revision_id)
+                     FROM active_revision_pointer p",
+                )
                 .map_err(db_err)?;
             let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))
                 .map_err(db_err)?;
             for row in rows {
-                active_ids.push(row.map_err(db_err)?);
+                pointers.push(row.map_err(db_err)?);
             }
         }
-        for raw in &active_ids {
+        for (raw, target_exists) in &pointers {
             if RevisionId::from_prefixed_string(raw.clone()).is_err() {
                 return Ok((
                     IntegrityCheckResult::PolicyIntegrityFailed {
                         details: format!("active revision has invalid format: {raw:?}"),
+                    },
+                    RecoveryAction::FallbackToLastKnownGood,
+                ));
+            }
+            // Only an editor running without `foreign_keys` leaves a pointer
+            // dangling, and a deleted row has no signature left to fail.
+            if !target_exists {
+                return Ok((
+                    IntegrityCheckResult::PolicyIntegrityFailed {
+                        details: format!("active revision {raw:?} is missing"),
                     },
                     RecoveryAction::FallbackToLastKnownGood,
                 ));
@@ -162,6 +147,20 @@ impl RevisionMetadataRepository for SqliteStateStore {
                     RecoveryAction::FallbackToLastKnownGood,
                 ));
             }
+        }
+        // Which revision is active is policy too: a pointer moved onto an older,
+        // validly signed row passes every row check above.
+        if repo
+            .verify_all_pointers()?
+            .iter()
+            .any(|(_, v)| *v == crate::revision_hmac::HmacVerification::Tampered)
+        {
+            return Ok((
+                IntegrityCheckResult::PolicyIntegrityFailed {
+                    details: "active revision pointer signature mismatch".to_string(),
+                },
+                RecoveryAction::FallbackToLastKnownGood,
+            ));
         }
 
         // 3. The rollback target, derived from `revisions` (see

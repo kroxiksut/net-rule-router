@@ -148,6 +148,7 @@ impl ActivationCoordinator {
         if kept.len() != sids.len() {
             tracing::info!(
                 target: "nrr::activation",
+                msg_key = "activation-baseline-inheritance-dropped",
                 dropped = (sids.len() - kept.len()) as u64,
                 "a user stopped inheriting the baseline between phases — their own revision stands",
             );
@@ -179,27 +180,19 @@ impl ActivationCoordinator {
         drift: Vec<(String, String)>,
         now: i64,
     ) -> Result<ActivationOutcome, PolicyError> {
-        // Re-signing is a REPAIR of our own edit, never a laundering of somebody
-        // else's. `mark_apply_succeeded` rewrites signed columns on both rows,
-        // so their stored HMACs go stale by design and have to be recomputed -
-        // but recomputing over a row that was ALREADY tampered with mints a
-        // valid signature for the tampering, and the row then sails through the
-        // integrity gate, the `trusted` selection and last-known-good.
-        //
-        // The two rows are treated differently on purpose. Activating a
-        // TAMPERED revision is refused outright. The row being superseded may
-        // well be tampered - that is exactly the case the integrity gate is
-        // rolling us out of - so the activation proceeds and its signature is
-        // simply left alone, still failing verification for whoever looks next.
-        let previous_is_tampered = {
+        // Activating a TAMPERED revision is refused outright. The row being
+        // superseded may well be tampered - that is what the integrity gate
+        // rolls us out of - so it does not stop the activation; the transition
+        // leaves its signature failing for whoever looks next.
+        {
             let conn = self.conn.lock().expect("connection mutex poisoned");
-            let repo = self.revisions_repo(&conn);
-            let verdict = repo.verify_row_hmac(revision_id.as_str()).map_err(|e| {
-                PolicyError::StorageFailure {
+            let verdict = self
+                .revisions_repo(&conn)
+                .verify_row_hmac(revision_id.as_str())
+                .map_err(|e| PolicyError::StorageFailure {
                     operation: "verify_row_hmac",
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             if matches!(
                 verdict,
                 Some(nrr_storage::revision_hmac::HmacVerification::Tampered)
@@ -212,21 +205,9 @@ impl ActivationCoordinator {
                     ),
                 });
             }
-            match phase1.previous_revision.as_ref() {
-                Some(prev) => matches!(
-                    repo.verify_row_hmac(&prev.revision_id).map_err(|e| {
-                        PolicyError::StorageFailure {
-                            operation: "verify_row_hmac",
-                            message: e.to_string(),
-                        }
-                    })?,
-                    Some(nrr_storage::revision_hmac::HmacVerification::Tampered)
-                ),
-                None => false,
-            }
-        };
-        // The status change, the pointer and both re-signings are ONE commit.
-        // Apart, a crash between them leaves a revision marked active that the
+        }
+        // The status change (which re-signs what it rewrites) and the pointer
+        // are ONE commit. Apart, a crash between them leaves a revision marked active that the
         // pointer does not name, or rows whose signatures no longer match their
         // contents - which the integrity gate reads as tampering and answers by
         // discarding the user's rules. The marker file is cleared after the
@@ -267,27 +248,6 @@ impl ActivationCoordinator {
                 operation: "set_active_pointer",
                 message: e.to_string(),
             })?;
-            // `mark_apply_succeeded` mutated
-            // the signed columns of both the newly-active revision
-            // (status/activated_at) and the previously-active one
-            // (status/superseded_at/superseded_by). Re-sign both so a
-            // legitimate activation never trips tamper detection. No-op
-            // when no signing key is configured.
-            repo.re_sign_row(revision_id.as_str())
-                .map_err(|e| PolicyError::StorageFailure {
-                    operation: "re_sign_row(activated)",
-                    message: e.to_string(),
-                })?;
-            if let Some(prev) = phase1.previous_revision.as_ref() {
-                if !previous_is_tampered {
-                    repo.re_sign_row(&prev.revision_id).map_err(|e| {
-                        PolicyError::StorageFailure {
-                            operation: "re_sign_row(superseded)",
-                            message: e.to_string(),
-                        }
-                    })?;
-                }
-            }
             tx.commit().map_err(|e| PolicyError::StorageFailure {
                 operation: "commit_activation_tx",
                 message: e.to_string(),
@@ -313,6 +273,7 @@ impl ActivationCoordinator {
                 });
         }
         self.audit.emit(ActivationAuditEvent::RevisionActivated {
+            principal: principal.to_string(),
             revision_id: revision_id.as_str().to_string(),
             previous_revision_id: phase1
                 .previous_revision
@@ -381,6 +342,7 @@ impl ActivationCoordinator {
                 Err(failure) => {
                     tracing::error!(
                         target: "nrr::activation",
+                        msg_key = "activation-revert-failed",
                         sid = %failure.sid,
                         revision_id = %revision_id,
                         "revert after a failed activation did not succeed; this SID may still                          be enforcing rules from a rejected revision: {}",
@@ -422,13 +384,6 @@ impl ActivationCoordinator {
                     operation: "mark_apply_failed",
                     message: e.to_string(),
                 })?;
-            // Rejection changes status +
-            // rejected_reason; re-sign so the rejected row verifies clean.
-            repo.re_sign_row(revision_id.as_str())
-                .map_err(|e| PolicyError::StorageFailure {
-                    operation: "re_sign_row(rejected)",
-                    message: e.to_string(),
-                })?;
         }
         self.marker_store
             .clear()
@@ -442,6 +397,7 @@ impl ActivationCoordinator {
                 });
         }
         self.audit.emit(ActivationAuditEvent::RevisionRejected {
+            principal: principal.to_string(),
             revision_id: revision_id.as_str().to_string(),
             reason: reason.clone(),
             sid_failures: phase2.failed.clone(),
@@ -473,17 +429,12 @@ impl ActivationCoordinator {
                     operation: "mark_apply_failed",
                     message: e.to_string(),
                 })?;
-            // Re-sign the rejected row.
-            repo.re_sign_row(revision_id.as_str())
-                .map_err(|e| PolicyError::StorageFailure {
-                    operation: "re_sign_row(pre-flight-rejected)",
-                    message: e.to_string(),
-                })?;
         }
         self.marker_store
             .clear()
             .map_err(PolicyError::MarkerWriteFailed)?;
         self.audit.emit(ActivationAuditEvent::RevisionRejected {
+            principal: principal.to_string(),
             revision_id: revision_id.as_str().to_string(),
             reason: reason.clone(),
             sid_failures: sid_failures.clone(),

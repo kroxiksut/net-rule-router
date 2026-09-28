@@ -52,18 +52,13 @@ impl<'c> RevisionsRepository<'c> {
     /// `revisions`, so a fresh process never inherits a prior run's
     /// half-finished mutation.
     ///
-    /// `now_ms` is accepted for interface symmetry with the other status
-    /// transitions in this repository; the `revisions` schema has no
-    /// `rejected_at` column (mirroring [`Self::mark_apply_failed_for`], the
-    /// interactive reject path, which also does not write one).
+    /// `now_ms` is unused: the schema has no `rejected_at` column.
     ///
-    /// Rows are re-signed via [`Self::re_sign_row`] when the repository
-    /// carries a signing key, keeping `row_hmac` consistent with the new
-    /// status. **Without a signing key only unsigned rows (empty
-    /// `row_hmac`) are eligible**: flipping a signed row keyless would
-    /// leave its HMAC stale over the old status and read as `Tampered`
-    /// on the next integrity scan. Signed candidates are left in place
-    /// for a later keyed sweep. Returns the number of rows rejected.
+    /// With a key, flipped rows are re-signed like any other transition (a
+    /// row that already failed verification is not). **Without a key only
+    /// unsigned rows are eligible**: a signed row flipped keyless would read
+    /// as `Tampered` on the next scan, so it waits for a keyed sweep.
+    /// Returns the number of rows rejected.
     pub fn reject_orphaned_candidates(&self, reason: &str, _now_ms: i64) -> StorageResult<usize> {
         // One transaction over the whole sweep. The SELECT collects ids and the
         // UPDATE then matches `status = 'candidate'` again — a WIDER set if a
@@ -100,6 +95,10 @@ impl<'c> RevisionsRepository<'c> {
         if orphan_ids.is_empty() {
             return Ok(0);
         }
+        let verdicts = orphan_ids
+            .iter()
+            .map(|id| self.verdict_before_transition(id))
+            .collect::<StorageResult<Vec<_>>>()?;
 
         let rejected = tx
             .execute(
@@ -114,8 +113,8 @@ impl<'c> RevisionsRepository<'c> {
                 StorageError::Internal(format!("reject_orphaned_candidates update: {e}"))
             })?;
 
-        for id in &orphan_ids {
-            self.re_sign_row(id)?;
+        for (id, before) in orphan_ids.iter().zip(verdicts) {
+            self.re_sign_after_transition(id, before)?;
         }
         tx.commit().map_err(|e| {
             StorageError::Internal(format!("reject_orphaned_candidates commit: {e}"))
@@ -301,17 +300,22 @@ impl<'c> RevisionsRepository<'c> {
             return Ok(0);
         }
         let to_drop = (count - cap_i64) as usize;
-        // Identify the rows to drop: oldest first by `time_col`,
-        // skipping `protect_id` if present.
+        // Oldest first, skipping `protect_id` and the pointer's target for the
+        // same reason as the age pass: the FK makes deleting it fail, and the
+        // failure ended this principal's retention on every run.
         let select_sql = match protect_id {
             Some(_) => format!(
                 "SELECT revision_id FROM revisions
                  WHERE principal = ?1 AND status = ?2 AND revision_id != ?3
+                       AND revision_id NOT IN
+                           (SELECT revision_id FROM active_revision_pointer WHERE principal = ?1)
                  ORDER BY {time_col} ASC, revision_id ASC LIMIT ?4"
             ),
             None => format!(
                 "SELECT revision_id FROM revisions
                  WHERE principal = ?1 AND status = ?2
+                       AND revision_id NOT IN
+                           (SELECT revision_id FROM active_revision_pointer WHERE principal = ?1)
                  ORDER BY {time_col} ASC, revision_id ASC LIMIT ?3"
             ),
         };

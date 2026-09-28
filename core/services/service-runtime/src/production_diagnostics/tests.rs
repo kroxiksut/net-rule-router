@@ -857,3 +857,139 @@ fn a_tagged_events_key_and_scalar_fields_reach_the_log_view() {
     );
     assert!(dto.args.is_empty());
 }
+
+/// A name probed without an address is blocked when a literal-IP Block names
+/// one of its cached addresses, however narrowly a name rule routes it.
+#[test]
+fn a_literal_ip_block_on_a_cached_address_vetoes_the_name_probe() {
+    use nrr_domain::canonical::{
+        CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
+    };
+    use nrr_domain::decision_matching::{RequestedRouteDecision, ZonePriorityPolicy};
+    use nrr_domain::{RouteBehaviorMode, RuleAction, RuleId};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let rule = |id: &str, m: CanonicalAddressMatch, action: RuleAction| CanonicalRule {
+        id: RuleId(id.into()),
+        enabled: true,
+        address_match: Some(m),
+        app_match: None,
+        comment: String::new(),
+        action,
+        origin: None,
+    };
+    let blocked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+    let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+    let book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![rule(
+            "r-exact",
+            CanonicalAddressMatch::ExactFqdn("a.example".into()),
+            RuleAction::Route,
+        )]),
+        secondary: CanonicalRuleSet::from_rules(vec![rule(
+            "b-ip",
+            CanonicalAddressMatch::ExactIp(blocked),
+            RuleAction::Block,
+        )]),
+    };
+    let probe = |ips: &[IpAddr]| {
+        literal_block_veto(
+            &book,
+            "a.example",
+            ips,
+            None,
+            ZonePriorityPolicy::default(),
+            RouteBehaviorMode::PreferPrimary,
+        )
+    };
+
+    let (ip, decision) = probe(&[other, blocked]).expect("the cached blocked address vetoes");
+    assert_eq!(ip, blocked);
+    let RequestedRouteDecision::MatchedRoute { candidate } = decision else {
+        panic!("a veto is a matched Block");
+    };
+    assert_eq!(candidate.rule_id.as_str(), "b-ip");
+    assert_eq!(candidate.action, RuleAction::Block);
+
+    // Positive control: without the blocked address in the cache, no veto.
+    assert!(probe(&[other]).is_none());
+    assert!(probe(&[]).is_none());
+}
+
+/// The engine still names the rule that would win, but a winner enforcement
+/// skips for its shape must not read as enforced.
+#[test]
+fn a_winner_enforcement_cannot_carry_out_is_not_reported_as_enforced() {
+    use nrr_shared::rules_json::{
+        to_canonical_string, AddressMatchDto, AppMatchDto, AppPatternDto, CanonicalRulesJsonV1,
+        RuleDto, RULES_JSON_SCHEMA_VERSION,
+    };
+    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+    use nrr_storage::repository::MigrationRunner;
+
+    let probe = |with_app: bool| {
+        let dir = TempDir::new().expect("tmp");
+        let conn = open_connection(&dir.path().join("state.db")).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+        let rules_json = to_canonical_string(&CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![],
+            secondary: vec![RuleDto {
+                id: "R-0001".into(),
+                enabled: true,
+                address_match: Some(AddressMatchDto::ExactFqdn {
+                    value: "host.example".into(),
+                }),
+                app_match: with_app.then(|| AppMatchDto {
+                    pattern: AppPatternDto::Exact {
+                        value: "app.exe".into(),
+                    },
+                    include_child_processes: false,
+                }),
+                comment: String::new(),
+                action: nrr_shared::rules_json::RuleAction::Route,
+                origin: None,
+            }],
+        })
+        .expect("serialise");
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO revisions (
+                    principal, revision_id, content_hash, rules_json, status, source,
+                    correlation_id, created_at, activated_at
+                 ) VALUES (?1, 'rev-1', 'h', ?2, 'active', 'gui-rules-edit', 'c', 1, 1)",
+                rusqlite::params![nrr_storage::BASELINE_PRINCIPAL, rules_json],
+            )
+            .expect("seed active revision");
+        let alerts: Arc<dyn SecurityAlertsRepository> =
+            Arc::new(InMemorySecurityAlertsRepository::new());
+        let facade =
+            ProductionDiagnosticsFacade::new(dir.path(), dir.path(), None, alerts, Some(conn));
+        let q = ExplainQuery::Synthetic {
+            input_sample: nrr_diagnostics::explain::RuntimeInputSample::new()
+                .with_hostname("host.example")
+                .with_process("app.exe"),
+        };
+        facade
+            .get_explain(&q, ExplainDetailLevel::Diagnostics, "")
+            .expect("explain")
+            .final_action_section
+            .expect("final action")
+    };
+
+    let combined = probe(true);
+    assert_eq!(combined.route_role.as_deref(), Some("secondary"));
+    assert_eq!(
+        combined.reason_key,
+        "diag.explain.reason.rule-shape-not-enforced"
+    );
+    // Positive control: the same rule without the application is enforced.
+    let plain = probe(false);
+    assert_eq!(
+        plain.reason_key,
+        "diag.explain.reason.rule-matched-exact-fqdn"
+    );
+}

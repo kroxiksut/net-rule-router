@@ -118,7 +118,7 @@ fn full_pipeline_parse_then_validate() {
         },
     };
 
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(
         outcome.is_accepted(),
         "pipeline rejected with warnings: {:?}",

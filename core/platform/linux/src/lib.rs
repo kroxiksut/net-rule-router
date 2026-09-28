@@ -70,6 +70,10 @@ pub mod peer_cred;
 /// its tests run on any host.
 pub mod dns_message;
 
+/// Who launched a blocked program, from the live procfs table. Plain file
+/// reads, so its tests run on any host against a fixture tree.
+pub mod process_lineage;
+
 /// Passive observation of DNS resolutions through systemd-resolved's query
 /// monitor — the Linux analog of the ETW DNS-Client source. Silent by design on
 /// a machine whose programs bypass resolved; the module doc says how to tell.
@@ -189,14 +193,13 @@ pub mod nft_policy_enforcer;
 /// empty list until it can be verified on real Linux.
 pub mod vpn_discovery;
 
-/// Linux application-group discovery seam (design + stub).
-/// The neutral port lives in `nrr_platform_api::app_group_discovery`; this
-/// backend documents the /proc + `.desktop` + bridge/daemon mechanism and
-/// returns an empty list until it can be verified on real Linux.
+/// Linux application-group discovery: `/proc` processes, XDG desktop entries
+/// and the libvirt / Docker / Podman bridges, classified by the neutral
+/// dictionary in `nrr_platform_api::app_group_discovery`.
 pub mod app_group_discovery;
 
-/// Linux VirtualBox machine inventory seam (stub). The settings reader is
-/// neutral; the per-user directory and host adapters are not wired yet.
+/// Linux VirtualBox machine inventory: this user's settings directory, the
+/// `vboxnet*` host adapters, and NAT pinning through `VBoxManage`.
 pub mod vm_inventory;
 
 /// Linux fake-IP TUN seam. The kernel provides

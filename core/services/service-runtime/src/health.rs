@@ -74,6 +74,9 @@ pub enum HealthComponent {
     Apply,
     /// Adapter availability / external connectivity.
     Adapters,
+    /// Optional supervised tasks (observers, learning, housekeeping). Degraded
+    /// while one is between a failure and its restart; the message names it.
+    BackgroundTasks,
 }
 
 impl HealthComponent {
@@ -85,6 +88,7 @@ impl HealthComponent {
             Self::Ipc => "ipc",
             Self::Apply => "apply",
             Self::Adapters => "adapters",
+            Self::BackgroundTasks => "background-tasks",
         }
     }
 }

@@ -206,6 +206,7 @@ pub(super) fn paginate<T>(
     if let Some(duplicates) = duplicate_positions(&items, position) {
         tracing::warn!(
             target: "nrr::diagnostics",
+            msg_key = "prod-diag-log-page-duplicate-positions",
             duplicates,
             "log page positions are not unique — paging can drop entries"
         );

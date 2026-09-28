@@ -8,8 +8,9 @@
 //! machine can lift, which is how a kill-switch turns an outage into a permanent
 //! one.
 //!
-//! Skips itself, loudly, without root or `nft`. Uses the product's own table, so
-//! it must not run beside a live daemon on the same host.
+//! Ignored by default: it needs root, `nft` and a real uplink. Run it with
+//! `--ignored`; it then fails, rather than passes, on a host that lacks them.
+//! It installs into a table of its own and refuses to run beside a live daemon.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::expect_used)]
@@ -18,11 +19,12 @@ use std::net::Ipv4Addr;
 use std::process::Command;
 use std::sync::Arc;
 
-use nrr_platform_api::adapters::{AdapterEventSource, IfOperStatus};
+use nrr_platform_api::adapters::{AdapterEventSource, IfOperStatus, InterfaceType};
 use nrr_platform_api::enforcement::{
     EgressBinding, EgressBindingSource, EnforcementPlan, PolicyEnforcer, UserPrincipal,
 };
 use nrr_platform_linux::adapters::LinuxAdapterSource;
+use nrr_platform_linux::lower_linux::NRR_TABLE;
 use nrr_platform_linux::nft_apply::{NftApplyError, NftCliEnforcement};
 use nrr_platform_linux::nft_policy_enforcer::NftPolicyEnforcer;
 use nrr_service_runtime::enforcement_planner::plan_catch_all_kill_switch;
@@ -30,6 +32,7 @@ use nrr_service_runtime::killswitch_codegen::KillSwitchProtocols;
 
 const SERVER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
 const LAN: (Ipv4Addr, u8) = (Ipv4Addr::new(192, 168, 1, 0), 24);
+const IFACE_ENV: &str = "NRR_LIVE_TEST_IFACE";
 
 fn is_root() -> bool {
     std::fs::read_to_string("/proc/self/status")
@@ -43,16 +46,69 @@ fn is_root() -> bool {
         .is_some_and(|uid| uid == "0")
 }
 
-fn probe_environment() -> Result<(), String> {
-    if !is_root() {
-        return Err("needs root: nf_tables refuses an unprivileged caller".to_owned());
-    }
+fn list_tables() -> String {
+    let output = Command::new("nft")
+        .args(["list", "tables"])
+        .output()
+        .expect("nft must be runnable");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Panics with the reason when the host cannot run this: an explicit
+/// `--ignored` run that passes without touching the kernel is false coverage.
+fn require_environment() {
+    assert!(
+        is_root(),
+        "needs root: nf_tables refuses an unprivileged caller"
+    );
     match NftCliEnforcement::new().probe() {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(NftApplyError::NftUnavailable { detail }) => {
-            Err(format!("nft is unavailable ({detail})"))
+            panic!("nft is unavailable ({detail})")
         }
-        Err(other) => Err(format!("nft answered an error: {other}")),
+        Err(other) => panic!("nft answered an error: {other}"),
+    }
+    let product = format!("table inet {NRR_TABLE}");
+    assert!(
+        !list_tables().lines().any(|l| l.trim() == product),
+        "`{product}` exists: a live daemon is enforcing on this host. Stop it first — \
+         this test must not share the kernel with the user's kill-switch",
+    );
+}
+
+/// A real uplink: `NRR_LIVE_TEST_IFACE` when set, else the first link that is
+/// up, is not loopback and carries a default route.
+fn uplink(adapters: &LinuxAdapterSource) -> String {
+    let all = adapters.enumerate_all().expect("adapters must enumerate");
+    if let Ok(wanted) = std::env::var(IFACE_ENV) {
+        let found = all
+            .iter()
+            .find(|a| a.friendly_name == wanted || a.adapter_name == wanted)
+            .unwrap_or_else(|| panic!("{IFACE_ENV}=`{wanted}` names no interface on this host"));
+        assert!(
+            found.oper_status == IfOperStatus::Up,
+            "{IFACE_ENV}=`{wanted}` is not up",
+        );
+        return wanted;
+    }
+    all.into_iter()
+        .find(|a| {
+            a.oper_status == IfOperStatus::Up
+                && a.interface_type != InterfaceType::Loopback
+                && a.has_gateway()
+        })
+        .map(|a| a.friendly_name)
+        .unwrap_or_else(|| {
+            panic!("no up, non-loopback link with a default route; name one in {IFACE_ENV}")
+        })
+}
+
+/// Deletes the test table on every exit, a failed assert included.
+struct TableGuard(String);
+
+impl Drop for TableGuard {
+    fn drop(&mut self) {
+        let _ = NftCliEnforcement::new().teardown(&self.0);
     }
 }
 
@@ -69,9 +125,9 @@ impl EgressBindingSource for BoundToLink {
     }
 }
 
-fn installed_ruleset() -> String {
+fn installed_ruleset(table: &str) -> String {
     let output = Command::new("nft")
-        .args(["list", "table", "inet", "nrr"])
+        .args(["list", "table", "inet", table])
         .output()
         .expect("nft must be runnable");
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -91,20 +147,13 @@ fn line_offset(text: &str, predicate: impl Fn(&str) -> bool) -> Option<usize> {
 }
 
 #[test]
+#[ignore = "needs root, nft and a real uplink, and no live daemon; run with --ignored"]
 fn the_blanket_block_lands_below_the_escapes_it_must_not_cut() {
-    if let Err(reason) = probe_environment() {
-        eprintln!("SKIPPED blanket_block_live: {reason}");
-        return;
-    }
+    require_environment();
 
     let adapters = Arc::new(LinuxAdapterSource);
-    let link = adapters
-        .enumerate_all()
-        .expect("adapters must enumerate")
-        .into_iter()
-        .find(|a| a.oper_status == IfOperStatus::Up)
-        .map(|a| a.friendly_name)
-        .expect("a machine has at least one link that is up");
+    let link = uplink(&adapters);
+    eprintln!("blanket_block_live: binding to `{link}`");
 
     let flows = plan_catch_all_kill_switch(
         "unix:uid:1000",
@@ -116,7 +165,10 @@ fn the_blanket_block_lands_below_the_escapes_it_must_not_cut() {
     );
     assert!(!flows.is_empty(), "the planner refused to plan the block");
 
-    let enforcer = NftPolicyEnforcer::new(Arc::new(BoundToLink(link)), adapters);
+    let table = format!("nrr_test_{}", std::process::id());
+    let _guard = TableGuard(table.clone());
+    let enforcer =
+        NftPolicyEnforcer::new(Arc::new(BoundToLink(link)), adapters).with_table(table.clone());
     enforcer
         .enforce(&[EnforcementPlan {
             principal: UserPrincipal::from_linux_uid(1000),
@@ -126,7 +178,7 @@ fn the_blanket_block_lands_below_the_escapes_it_must_not_cut() {
         }])
         .expect("the kernel must accept the blanket block");
 
-    let installed = installed_ruleset();
+    let installed = installed_ruleset(&table);
     let server_at = line_offset(&installed, |l| l.contains("203.0.113.7"))
         .unwrap_or_else(|| panic!("the tunnel server is not exempt:\n{installed}"));
     let lan_at = line_offset(&installed, |l| l.contains("192.168.1.0/24"))

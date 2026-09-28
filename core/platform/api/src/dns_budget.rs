@@ -97,6 +97,7 @@ impl DnsResolverPort for BudgetedDnsResolver {
             if !self.saturated.swap(true, Ordering::AcqRel) {
                 tracing::warn!(
                     target: "nrr::dns-resolver",
+                    msg_key = "dns-budget-slots-saturated",
                     outstanding = self.max_in_flight,
                     "every resolver slot is held by a query the OS has not answered — refusing new ones until one returns",
                 );
@@ -108,6 +109,7 @@ impl DnsResolverPort for BudgetedDnsResolver {
         if self.saturated.swap(false, Ordering::AcqRel) {
             tracing::info!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-budget-slots-free",
                 outstanding = self.in_flight(),
                 "resolver slots free again",
             );

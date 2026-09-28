@@ -148,6 +148,7 @@ impl ProductionPrincipalPlanSource {
             .map_err(|e| {
                 tracing::warn!(
                     target: "nrr::enforcement",
+                    msg_key = "persid-plan-route-table-unreadable",
                     error = %e,
                     "route table unreadable: the blanket block cannot be armed this pass",
                 );
@@ -159,6 +160,7 @@ impl ProductionPrincipalPlanSource {
             .map_err(|e| {
                 tracing::warn!(
                     target: "nrr::enforcement",
+                    msg_key = "persid-plan-links-unreadable",
                     error = %e,
                     "links unreadable: the blanket block cannot be armed this pass",
                 );
@@ -356,6 +358,7 @@ impl ProductionPrincipalPlanSource {
         if !exemptions.can_arm() {
             tracing::warn!(
                 target: "nrr::enforcement",
+                msg_key = "persid-plan-blanket-block-refused",
                 principal = stored,
                 "the settings ask for a blanket block, but no tunnel-server address could be read from the route table: arming it would seal the tunnel's own reconnect, so it is NOT armed",
             );
@@ -646,6 +649,7 @@ pub fn open_state_connection(path: &std::path::Path) -> Option<Arc<Mutex<rusqlit
         Err(e) => {
             tracing::error!(
                 target: "nrr::enforcement",
+                msg_key = "persid-plan-state-db-unreadable",
                 error = %e,
                 path = %path.display(),
                 "state database could not be opened; NO policy can be enforced",
@@ -673,6 +677,7 @@ pub fn open_cache_store(
         .map_err(|e| {
             tracing::warn!(
                 target: "nrr::enforcement",
+                msg_key = "persid-plan-fqdn-cache-unreadable",
                 error = %e,
                 path = %path.display(),
                 "FQDN cache could not be opened; domain rules will resolve to nothing",
@@ -687,6 +692,7 @@ pub fn open_cache_store(
     if let Err(e) = runner.run_pending_migrations() {
         tracing::warn!(
             target: "nrr::enforcement",
+            msg_key = "persid-plan-fqdn-cache-migration-failed",
             error = %e,
             "FQDN cache migration failed; domain rules will resolve to nothing",
         );
@@ -777,7 +783,7 @@ mod tests {
         fail_closed: bool,
         block_all: bool,
         /// `Some` = DoH lockdown on with scope `Always`, over these resolvers.
-        doh_always: Option<Vec<Ipv4Addr>>,
+        doh_always: Option<Vec<IpAddr>>,
     }
 
     impl Policy {
@@ -1056,8 +1062,9 @@ mod tests {
     #[test]
     fn an_always_on_doh_lockdown_blocks_the_resolvers_without_leak_protection() {
         let resolver = Ipv4Addr::new(198, 51, 100, 53);
+        let resolver_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53);
         let policy = Policy {
-            doh_always: Some(vec![resolver]),
+            doh_always: Some(vec![resolver.into(), resolver_v6.into()]),
             ..Policy::disarmed()
         };
         let (plan, _) = plan(
@@ -1071,6 +1078,14 @@ mod tests {
             .filter(|(dst, port)| *dst == DstMatch::HostV4(resolver) && *port == Some(443))
             .count();
         assert_eq!(https, 2, "TCP and UDP (HTTP/3) on 443: {blocks:?}");
+        let https_v6 = blocks
+            .iter()
+            .filter(|(dst, port)| *dst == DstMatch::HostV6(resolver_v6) && *port == Some(443))
+            .count();
+        assert_eq!(
+            https_v6, 2,
+            "the v6 address is the same resolver: {blocks:?}"
+        );
         assert!(
             blocks.iter().any(|(_, port)| *port == Some(853)),
             "DoT: {blocks:?}"

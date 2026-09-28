@@ -187,6 +187,13 @@ pub struct RoutePolicyDto {
     /// specific address wins, which is what the rule model documents.
     #[serde(default)]
     pub zone_priority_over_ip: bool,
+    /// Complete short names with `short_name_suffix` for a connection that
+    /// announces no domain of its own. Off by default.
+    #[serde(default)]
+    pub short_name_completion: bool,
+    /// The network domain the user named; empty when unset.
+    #[serde(default)]
+    pub short_name_suffix: String,
 }
 
 /// Additive default for [`RoutePolicyDto::auto_rules_mode`] /
@@ -242,13 +249,14 @@ pub struct RouteLinkProviderSetResponse {
 }
 
 /// One row of the shared DoH/DoT resolver baseline list.
-/// `target_kind` is `ip` | `host`; `target` is the IPv4 literal or hostname.
+/// `target_kind` is `ip` | `host`; `target` is an address literal or hostname.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DohResolverEntryDto {
     /// `ip` or `host` (matches `nrr_storage::doh_lockdown::DohTarget::kind_str`).
     pub target_kind: String,
-    /// The IPv4 literal (`8.8.8.8`) or hostname (`dns.google`).
+    /// An address literal of either family (`8.8.8.8`, `2001:4860:4860::8888`)
+    /// or a hostname (`dns.google`).
     pub target: String,
     /// Free-text note (provider/country).
     #[serde(default)]
@@ -283,14 +291,16 @@ pub struct DohResolversSetRequest {
 pub type DohResolversSetResponse = DohResolversGetResponse;
 
 /// `diagnostics.seed-from-browser-history` response. The seed runs asynchronously
-/// on a service worker; `started` is `true` when the worker was launched (a
-/// browser-history reader is wired), `false` when the feature is unavailable on
-/// this build/platform. Per-host counts are logged, not returned (the resolve
-/// outlives this reply).
+/// on a service worker for the calling user; `started` is `true` when the worker
+/// was launched, `false` when it was not. `already-running` says why not when
+/// the caller's previous import is still in progress — only one runs per user.
+/// Per-host counts are logged, not returned (the resolve outlives this reply).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SeedFromBrowserHistoryResponse {
     pub started: bool,
+    #[serde(default)]
+    pub already_running: bool,
 }
 
 /// Wire default for `kill_switch_fail_closed`: fail-closed (`true`). An
@@ -439,6 +449,13 @@ pub struct RoutePolicyUpdateRequest {
     /// specific address wins, which is what the rule model documents.
     #[serde(default)]
     pub zone_priority_over_ip: bool,
+    /// Complete short names with `short_name_suffix` for a connection that
+    /// announces no domain of its own. Off by default.
+    #[serde(default)]
+    pub short_name_completion: bool,
+    /// The network domain the user named; empty when unset.
+    #[serde(default)]
+    pub short_name_suffix: String,
 }
 
 impl RoutePolicyUpdateRequest {
@@ -488,6 +505,8 @@ impl RoutePolicyUpdateRequest {
             primary_probe_repeat_secs,
             local_networks_auto_accept,
             zone_priority_over_ip,
+            short_name_completion,
+            short_name_suffix,
             binding_source: _,
         } = self;
         let RoutePolicyDto {
@@ -517,6 +536,8 @@ impl RoutePolicyUpdateRequest {
             primary_probe_repeat_secs: stored_probe_repeat,
             local_networks_auto_accept: stored_auto_accept,
             zone_priority_over_ip: stored_zone_priority,
+            short_name_completion: stored_short_name_completion,
+            short_name_suffix: stored_short_name_suffix,
             binding_source: _,
         } = current;
 
@@ -547,6 +568,9 @@ impl RoutePolicyUpdateRequest {
             // permissive answers, which become kill-switch exemptions.
             || local_networks_auto_accept != stored_auto_accept
             || zone_priority_over_ip != stored_zone_priority
+            // Decides which resolvers learn the machine's short names.
+            || short_name_completion != stored_short_name_completion
+            || short_name_suffix != stored_short_name_suffix
     }
 }
 

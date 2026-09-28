@@ -104,6 +104,7 @@ fn write_prior_options_note(prior: (Option<u32>, Option<u32>)) {
     if let Err(e) = std::fs::write(&path, body) {
         tracing::warn!(
             target: "nrr::conn-observe",
+            msg_key = "win-conn-observe-prior-options-write-failed",
             error = %e,
             "could not record the previous WFP engine options; a hard kill would leave them changed",
         );
@@ -185,6 +186,7 @@ pub fn restore_engine_options() {
     if code != 0 {
         tracing::warn!(
             target: "nrr::conn-observe",
+            msg_key = "win-conn-observe-reopen-failed",
             code,
             "could not reopen WFP to hand the machine-wide net-event options back",
         );
@@ -364,6 +366,7 @@ impl WfpConnectionObserver {
         // open to find out whether a stop will hand the machine back.
         tracing::info!(
             target: "nrr::conn-observe",
+            msg_key = "win-conn-observe-options-restore-plan",
             source = if note.is_some() {
                 "note-from-an-earlier-instance"
             } else if found_collect.is_some() {
@@ -432,6 +435,7 @@ impl WfpConnectionObserver {
 
         tracing::info!(
             target: "nrr::conn-observe",
+            msg_key = "win-conn-observe-started",
             "WFP net-event connection observer started",
         );
         Ok(Self {
@@ -522,6 +526,7 @@ impl WfpConnectionObserver {
         }
         tracing::info!(
             target: "nrr::conn-observe",
+            msg_key = "win-conn-observe-stopped",
             "WFP net-event connection observer stopped",
         );
     }
@@ -618,6 +623,7 @@ unsafe fn restore_uint32_option(
     if code != 0 {
         tracing::warn!(
             target: "nrr::conn-observe",
+            msg_key = "win-conn-observe-restore-failed",
             code,
             "could not hand a machine-wide WFP engine option back to its previous value",
         );

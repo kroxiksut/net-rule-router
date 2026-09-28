@@ -400,6 +400,10 @@ pub struct AutoRuleCandidatesActionResponse {
     pub unknown: u32,
     /// Pending suggestions left for this caller after the action.
     pub pending: u64,
+    /// Accept only: the page the suggestions were offered next to was left
+    /// running on its old connections, so it needs a reload to pick them up.
+    #[serde(default)]
+    pub anchor_skipped: bool,
 }
 
 /// One suggestion the caller previously declined, as reviewed and possibly
@@ -502,6 +506,9 @@ pub struct BlockNoticeJournalEntryDto {
     /// `BlockReason` slug, same vocabulary the live push event uses.
     pub reason: String,
     pub attempts: u64,
+    /// Same as the live push event's `launched-by`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launched_by: Vec<String>,
 }
 
 /// `block-notices.journal.list` request — no parameters; the caller's own SID

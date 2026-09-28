@@ -784,6 +784,31 @@ fn a_short_name_is_completed_with_the_namespace_its_connection_claims() {
         short_name_listener(false).complete_single_label(&q, "printer", budget),
         None
     );
+    assert_eq!(
+        crate::short_name_completions::global_short_name_completions()
+            .qualify("printer")
+            .as_deref(),
+        Some("printer.branch.corp.example"),
+        "an offer must be able to name the host the answer came from",
+    );
+}
+
+/// A connection that announces no domain: the user named it, and the name is
+/// asked of the resolvers every other name goes to.
+#[test]
+fn a_short_name_is_completed_with_the_domain_the_user_named() {
+    let q = query("printer", QTYPE_A);
+    let budget = Duration::from_secs(2);
+    let asks_this_machine =
+        |l: DnsInterceptListener| l.with_private_resolvers(Arc::new(|| vec![Ipv4Addr::LOCALHOST]));
+    let named = asks_this_machine(short_name_listener(false))
+        .with_short_name_suffix(Arc::new(|| Some("branch.corp.example".to_string())));
+    assert!(named.complete_single_label(&q, "printer", budget).is_some());
+
+    // Positive control: same resolvers, setting off.
+    let unnamed =
+        asks_this_machine(short_name_listener(false)).with_short_name_suffix(Arc::new(|| None));
+    assert_eq!(unnamed.complete_single_label(&q, "printer", budget), None);
 }
 
 // ── Rule-host admission control ───────────────────────────────────────────
@@ -942,4 +967,91 @@ fn a_rule_host_slot_is_returned_after_the_query() {
         l.rule_host_lane.enter(Duration::ZERO).is_some(),
         "slots are free again once the permits drop"
     );
+}
+
+/// Any local process can send the listener a datagram that trips a receive
+/// error. Counting those toward the fatal streak let sixteen of them switch
+/// interception off for the whole machine.
+#[test]
+fn per_datagram_receive_errors_never_count_toward_the_fatal_streak() {
+    use std::io::{Error, ErrorKind};
+    for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+        assert_eq!(
+            classify_recv_error(&Error::from(kind)),
+            RecvErrorClass::Idle
+        );
+    }
+    for kind in [
+        ErrorKind::ConnectionReset,
+        ErrorKind::ConnectionRefused,
+        ErrorKind::ConnectionAborted,
+    ] {
+        assert_eq!(
+            classify_recv_error(&Error::from(kind)),
+            RecvErrorClass::PerDatagram,
+            "{kind:?}"
+        );
+    }
+    // A socket that is genuinely broken still ends the loop.
+    for kind in [
+        ErrorKind::InvalidInput,
+        ErrorKind::PermissionDenied,
+        ErrorKind::Other,
+    ] {
+        assert_eq!(
+            classify_recv_error(&Error::from(kind)),
+            RecvErrorClass::Unrecognised,
+            "{kind:?}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn an_oversized_datagram_is_skipped_on_windows() {
+    // WSAEMSGSIZE, what a datagram past the buffer comes back as.
+    let oversized = std::io::Error::from_raw_os_error(10040);
+    assert_eq!(classify_recv_error(&oversized), RecvErrorClass::PerDatagram);
+    // WSAENOTSOCK: the socket itself is gone.
+    let not_a_socket = std::io::Error::from_raw_os_error(10038);
+    assert_eq!(
+        classify_recv_error(&not_a_socket),
+        RecvErrorClass::Unrecognised
+    );
+}
+
+/// End to end over a real loopback socket: a datagram larger than the
+/// receive buffer is at worst one skipped read on every OS, and the next
+/// query is still read.
+#[test]
+fn an_oversized_datagram_leaves_the_socket_serving() {
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind server");
+    server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("timeout");
+    let client = UdpSocket::bind("127.0.0.1:0").expect("bind client");
+    let target = server.local_addr().expect("server addr");
+    client
+        .send_to(&vec![0u8; DNS_DATAGRAM_BUFFER_BYTES + 512], target)
+        .expect("send oversized");
+    client.send_to(b"next", target).expect("send next");
+
+    let mut buf = [0u8; DNS_DATAGRAM_BUFFER_BYTES];
+    let mut next_seen = false;
+    for _ in 0..2 {
+        match server.recv_from(&mut buf) {
+            // Linux and macOS: the oversized one arrives truncated.
+            Ok((n, _)) if &buf[..n] == b"next" => {
+                next_seen = true;
+                break;
+            }
+            Ok((n, _)) => assert_eq!(n, DNS_DATAGRAM_BUFFER_BYTES),
+            Err(e) => assert_eq!(
+                classify_recv_error(&e),
+                RecvErrorClass::PerDatagram,
+                "an oversized datagram must be per-datagram noise, got {e:?}"
+            ),
+        }
+    }
+    assert!(next_seen, "the query after the oversized one is still read");
 }

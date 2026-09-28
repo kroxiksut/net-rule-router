@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shared path resolution and privileged helpers for the Linux service scripts
-# (install / uninstall / status). Sourced, never executed.
+# (install / uninstall / status / purge / reset-network). Sourced, never executed.
 
 # The checkout these scripts ship in: lib -> scripts -> repository root.
 NRR_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

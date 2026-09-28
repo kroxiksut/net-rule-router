@@ -23,6 +23,7 @@
 #   5. reboot — never without an explicit yes, and the default answer is no.
 #
 # Self-elevates via UAC (WFP, NRPT and the route table all need Administrator).
+# Needs lib\service-paths.ps1 beside it; the package ships scripts\ whole.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File .\scripts\reset-network.ps1
@@ -43,9 +44,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'lib\service-paths.ps1')
+
 $root = Split-Path -Parent $PSScriptRoot
-$exeName = 'nrr-service.exe'
-$serviceName = 'NetRuleRouter'
 # Must match `dns_redirect.rs::NRPT_MARKER` and
 # `route_codegen.rs::SECONDARY_ROUTE_METRIC` — emergency mode reproduces the
 # binary's own sweeps, and a drifted constant here would either miss our state
@@ -53,63 +54,7 @@ $serviceName = 'NetRuleRouter'
 $nrptMarker = 'NetRuleRouter-ModeB-DnsRedirect'
 $routeMetric = 5
 
-# Honour `.cargo/config.toml::build.target-dir` redirect — same resolution
-# as install-service.ps1 / uninstall-service.ps1.
-function Resolve-TargetRoot {
-    param([string] $RepoRoot)
-    $cfg = Join-Path $RepoRoot '.cargo\config.toml'
-    if (Test-Path $cfg) {
-        $content = Get-Content $cfg -Raw
-        if ($content -match '(?m)^\s*target-dir\s*=\s*"([^"]+)"') {
-            $td = $Matches[1] -replace '/', '\'
-            if ([System.IO.Path]::IsPathRooted($td)) { return $td }
-            return (Join-Path $RepoRoot $td)
-        }
-    }
-    return (Join-Path $RepoRoot 'target')
-}
-
 $targetRoot = Resolve-TargetRoot $root
-
-function Resolve-RepoBinary {
-    param([string] $Mode)
-    $debugPath = Join-Path $targetRoot "debug\$exeName"
-    $releasePath = Join-Path $targetRoot "release\$exeName"
-    switch ($Mode) {
-        'dev'     { if (Test-Path $debugPath) { return $debugPath }; return $null }
-        'release' { if (Test-Path $releasePath) { return $releasePath }; return $null }
-        default {
-            if ((Test-Path $debugPath) -and (Test-Path $releasePath)) {
-                $d = (Get-Item $debugPath).LastWriteTime
-                $r = (Get-Item $releasePath).LastWriteTime
-                return $(if ($d -ge $r) { $debugPath } else { $releasePath })
-            }
-            elseif (Test-Path $debugPath) { return $debugPath }
-            elseif (Test-Path $releasePath) { return $releasePath }
-            else { return $null }
-        }
-    }
-}
-
-# The installed service's own binary. `ImagePath` carries SCM arguments and may
-# be quoted, so take the executable and drop the rest.
-function Resolve-InstalledBinary {
-    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
-    if (-not (Test-Path $key)) { return $null }
-    try { $imagePath = (Get-ItemProperty -Path $key -Name ImagePath -ErrorAction Stop).ImagePath }
-    catch { return $null }
-    if ([string]::IsNullOrWhiteSpace($imagePath)) { return $null }
-    $imagePath = $imagePath.Trim()
-    if ($imagePath.StartsWith('"')) {
-        $end = $imagePath.IndexOf('"', 1)
-        if ($end -gt 1) { $imagePath = $imagePath.Substring(1, $end - 1) }
-    }
-    elseif ($imagePath -match '^(?<exe>\S+\.exe)') {
-        $imagePath = $Matches['exe']
-    }
-    if (Test-Path $imagePath) { return $imagePath }
-    return $null
-}
 
 $isAdmin = (
     New-Object Security.Principal.WindowsPrincipal(
@@ -126,23 +71,22 @@ if (-not $isAdmin) {
     # bare spaces, which splits a script path containing a space.
     $argv = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Profile $Profile"
     if ($Reboot) { $argv += ' -Reboot' }
-    # Absolute: a bare name resolves against a PATH the user can prepend to.
-    $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    $powershell = Get-SystemTool 'WindowsPowerShell\v1.0\powershell.exe'
     $p = Start-Process -FilePath $powershell -ArgumentList $argv -Verb RunAs -Wait -PassThru
     exit $p.ExitCode
 }
 
-Write-Host "==> sc stop $serviceName (best-effort)" -ForegroundColor Cyan
-$null = sc.exe stop $serviceName 2>&1
+Write-Host "==> sc stop $NrrServiceName (best-effort)" -ForegroundColor Cyan
+$null = Invoke-NativeCommand -FilePath (Get-SystemTool 'sc.exe') -ArgumentList @('stop', $NrrServiceName) -Quiet
 Start-Sleep -Seconds 2
 
 # ── Step 1-2: a binary that can run `cleanup` ────────────────────────────────
-$exePath = Resolve-RepoBinary -Mode $Profile
+$exePath = Resolve-RepoServiceBinary -TargetRoot $targetRoot -Mode $Profile
 if ($exePath) {
     Write-Host "==> using the repo build: $exePath" -ForegroundColor Cyan
 }
 else {
-    $exePath = Resolve-InstalledBinary
+    $exePath = Resolve-InstalledServiceBinary
     if ($exePath) {
         Write-Host "==> no repo build; using the installed service binary: $exePath" -ForegroundColor Cyan
     }
@@ -151,10 +95,9 @@ else {
 $cleanupOk = $false
 if ($exePath) {
     Write-Host "==> $exePath cleanup" -ForegroundColor Cyan
-    & $exePath cleanup
-    $code = $LASTEXITCODE
+    $code = Invoke-NativeCommand -FilePath $exePath -ArgumentList @('cleanup')
     if ($code -eq 0) { $cleanupOk = $true }
-    else { Write-Warning "cleanup returned $code — falling back to emergency mode." }
+    else { Write-Warning "cleanup returned $code - falling back to emergency mode." }
 }
 else {
     Write-Warning "No NetRuleRouter binary found (no repo build, no installed service)."
@@ -205,27 +148,40 @@ if (-not $cleanupOk) {
     # hand.
     Write-Host "--> restarting the Base Filtering Engine (drops our WFP filters)" -ForegroundColor Cyan
     Write-Warning "Filtering is off for a few seconds, including the Windows firewall."
+    $dependents = @()
     try {
         $dependents = @(Get-Service -Name BFE -ErrorAction Stop |
             Select-Object -ExpandProperty DependentServices |
             Where-Object { $_.Status -eq 'Running' } |
             Select-Object -ExpandProperty Name)
-        $null = net.exe stop bfe /y 2>&1
-        $null = net.exe start bfe 2>&1
-        foreach ($dependent in $dependents) {
-            try { Start-Service -Name $dependent -ErrorAction Stop }
-            catch { Write-Warning "Could not restart dependent service ${dependent}: $($_.Exception.Message)" }
-        }
-        $bfe = Get-Service -Name BFE
-        if ($bfe.Status -ne 'Running') {
-            Write-Warning "BFE is $($bfe.Status) — reboot to restore filtering."
-        }
-        else {
-            Write-Host "    BFE running again; dependents restarted: $($dependents.Count)"
-        }
     }
     catch {
-        Write-Warning "BFE restart failed: $($_.Exception.Message) — a reboot clears our filters."
+        Write-Warning "Could not list the services that depend on BFE: $($_.Exception.Message)"
+    }
+
+    # Judged by the service's state, never by net.exe's exit code or its
+    # localized text: "already stopped" is a stop that succeeded. The start runs
+    # whatever the stop said — a BFE left stopped is the lockout itself.
+    $net = Get-SystemTool 'net.exe'
+    $stopCode = Invoke-NativeCommand -FilePath $net -ArgumentList @('stop', 'bfe', '/y') -Quiet
+    if (-not (Wait-ServiceStatus -Name BFE -Status Stopped -Seconds 5)) {
+        Write-Warning "BFE did not stop (net.exe exit $stopCode); our filters may still be in place."
+    }
+    $null = Invoke-NativeCommand -FilePath $net -ArgumentList @('start', 'bfe') -Quiet
+    $bfeRunning = Wait-ServiceStatus -Name BFE -Status Running -Seconds 30
+    $restarted = 0
+    foreach ($dependent in $dependents) {
+        try {
+            Start-Service -Name $dependent -ErrorAction Stop
+            $restarted += 1
+        }
+        catch { Write-Warning "Could not restart dependent service ${dependent}: $($_.Exception.Message)" }
+    }
+    if ($bfeRunning) {
+        Write-Host "    BFE running again; dependents restarted: $restarted of $($dependents.Count)"
+    }
+    else {
+        Write-Warning "BFE is not running - reboot to restore filtering."
     }
 }
 

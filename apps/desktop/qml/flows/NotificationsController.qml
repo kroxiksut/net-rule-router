@@ -175,15 +175,24 @@ QtObject {
     /// appeared. This carries the host from the block notice into the probe and
     /// runs it, so the answer arrives instead of a search.
     function explainHostInDiagnostics(host) {
+        explainInDiagnostics(host, "", "")
+    }
+    /// The same, for one observed connection: its address and program travel
+    /// with the name so the probe answers for that connection.
+    function explainInDiagnostics(host, ip, process) {
         var subject = String(host || "").trim()
         if (subject === "") return
         pendingExplainHost = subject
+        pendingExplainIp = String(ip || "")
+        pendingExplainProcess = String(process || "")
         root.section = "diagnostics"
     }
 
-    /// Host handed to the Diagnostics panel on its next load. Cleared by the
-    /// panel once consumed, so re-opening the page does not re-probe.
+    /// Sample handed to the Diagnostics probe on its next load. Cleared once
+    /// consumed, so re-opening the page does not re-probe.
     property string pendingExplainHost: ""
+    property string pendingExplainIp: ""
+    property string pendingExplainProcess: ""
 
     function dismissNotification(notificationId) {
         if (notificationId === "app-unresolved") {

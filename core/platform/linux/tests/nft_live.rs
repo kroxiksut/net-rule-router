@@ -6,9 +6,9 @@
 //! tests on any host; this covers the one thing they cannot — that what we
 //! generate is something `nft` and the kernel actually accept.
 //!
-//! Skips itself, loudly, when the host cannot run it (no `nft`, no root, no
-//! nf_tables). A skipped run prints why: a test that silently passes on an
-//! unequipped machine is worse than no test, because it reads as coverage.
+//! Ignored by default: it needs root, `nft` and nf_tables. Run it with
+//! `--ignored`; it then fails, rather than passes, on a host that lacks them —
+//! a silent pass on an unequipped machine reads as coverage.
 //!
 //! The table name carries the pid, so a run cannot collide with the product's
 //! own `nrr` table or with a parallel run.
@@ -23,16 +23,27 @@ use std::process::Command;
 use nrr_platform_linux::nft_apply::{render_batch, NftApplyError, NftCliEnforcement};
 use nrr_platform_linux::nft_ir::{NftFamily, NftMatch, NftRule, NftRuleset, NftVerdict};
 
-fn probe_environment() -> Result<(), String> {
-    if !nix_is_root() {
-        return Err("needs root: nf_tables refuses an unprivileged caller".to_owned());
-    }
+/// Panics with the reason when the host cannot run this.
+fn require_environment() {
+    assert!(
+        nix_is_root(),
+        "needs root: nf_tables refuses an unprivileged caller"
+    );
     match NftCliEnforcement::new().probe() {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(NftApplyError::NftUnavailable { detail }) => {
-            Err(format!("nft is unavailable ({detail})"))
+            panic!("nft is unavailable ({detail})")
         }
-        Err(other) => Err(format!("nft answered an error: {other}")),
+        Err(other) => panic!("nft answered an error: {other}"),
+    }
+}
+
+/// Deletes the test table on every exit, a failed assert included.
+struct TableGuard(String);
+
+impl Drop for TableGuard {
+    fn drop(&mut self) {
+        let _ = NftCliEnforcement::new().teardown(&self.0);
     }
 }
 
@@ -119,13 +130,12 @@ fn table_exists(table: &str) -> bool {
 }
 
 #[test]
+#[ignore = "needs root, nft and nf_tables; run with --ignored"]
 fn the_kernel_accepts_what_we_generate_and_teardown_removes_it() {
-    if let Err(reason) = probe_environment() {
-        eprintln!("SKIPPED nft_live: {reason}");
-        return;
-    }
+    require_environment();
 
     let table = format!("nrr_live_{}", std::process::id());
+    let _guard = TableGuard(table.clone());
     let enforcement = NftCliEnforcement::new();
     let ruleset = live_ruleset(&table);
 

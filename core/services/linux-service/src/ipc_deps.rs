@@ -68,8 +68,9 @@ pub(crate) struct IpcSurface {
 
 /// Turns an approved revision into kernel state by running one enforcement pass.
 ///
-/// The coordinator writes the revision before dispatching, so there is nothing
-/// to pass along: the pass reads the same store the cycle always reads. What the
+/// The pass reads rules through the provider, which serves the revision being
+/// applied for the whole activation window (the stored pointer commits only
+/// after this returns) and the stored one again by revert time. What the
 /// dispatcher adds is timing — the change takes effect now rather than at the
 /// next tick, which is the difference between the GUI reporting a result and
 /// reporting a hope.
@@ -112,8 +113,8 @@ impl RulesApplyDispatcher for CycleApplyDispatcher {
     }
 
     fn revert_for_sid(&self, sid: &str, _previous_rules_json: &str) -> Result<(), DispatchFailure> {
-        // Revert is the same primitive: the coordinator has restored the
-        // previous revision in the store, and a pass makes the machine match it.
+        // Revert is the same primitive: the overlay is withdrawn by now, so
+        // the pass reads the stored revision, which never moved.
         self.run_pass(sid)
     }
 }

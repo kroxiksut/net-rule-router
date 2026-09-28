@@ -80,18 +80,32 @@ pub fn run() -> ExitCode {
 
     tracing::info!(
         target: "nrr::lifecycle",
+        msg_key = "linux-svc-bootstrap-complete",
         "linux-service bootstrap complete; supervised runtime starting",
     );
 
     // Signal readiness: Type=notify holds the unit "activating" until this,
     // matching the Windows "report Running only after bootstrap" contract.
     match notify_ready() {
-        Ok(true) => tracing::info!(target: "nrr::lifecycle", "sd_notify READY sent"),
+        Ok(true) => tracing::info!(
+            target: "nrr::lifecycle",
+            msg_key = "linux-svc-sdnotify-ready-sent",
+            "sd_notify READY sent"
+        ),
         Ok(false) => {
-            tracing::info!(target: "nrr::lifecycle", "no NOTIFY_SOCKET; not under systemd notify")
+            tracing::info!(
+                target: "nrr::lifecycle",
+                msg_key = "linux-svc-sdnotify-not-under-systemd",
+                "no NOTIFY_SOCKET; not under systemd notify"
+            )
         }
         Err(e) => {
-            tracing::warn!(target: "nrr::lifecycle", error = %e, "sd_notify READY failed")
+            tracing::warn!(
+                target: "nrr::lifecycle",
+                msg_key = "linux-svc-sdnotify-ready-failed",
+                error = %e,
+                "sd_notify READY failed"
+            )
         }
     }
 
@@ -105,11 +119,16 @@ pub fn run() -> ExitCode {
     // in which policy is installed and the only way out of it is a kill.
     let stop_on_signal = stop.clone();
     if let Err(e) = nrr_platform_linux::signals::install_stop_signals(move || {
-        tracing::info!(target: "nrr::lifecycle", "stop signal received; shutting down");
+        tracing::info!(
+            target: "nrr::lifecycle",
+            msg_key = "linux-svc-stop-signal-received",
+            "stop signal received; shutting down"
+        );
         stop_on_signal.request_stop();
     }) {
         tracing::error!(
             target: "nrr::lifecycle",
+            msg_key = "linux-svc-stop-signals-install-failed",
             error = %e,
             "stop signals could NOT be installed: a stop will kill the process and leave its filters and routes in the kernel",
         );
@@ -169,6 +188,7 @@ pub fn run() -> ExitCode {
 
     tracing::info!(
         target: "nrr::lifecycle",
+        msg_key = "linux-svc-runtime-stopped",
         reason = ?reason,
         "linux-service runtime stopped",
     );
@@ -196,6 +216,7 @@ fn spawn_watchdog(interval: Duration, stop: StopToken, health: Arc<HealthAggrega
                 if !runtime_looks_alive(&health.snapshot()) {
                     tracing::error!(
                         target: "nrr::lifecycle",
+                        msg_key = "linux-svc-watchdog-heartbeat-stale",
                         "runtime heartbeat is stale — withholding the systemd watchdog ping",
                     );
                     continue;
@@ -206,6 +227,7 @@ fn spawn_watchdog(interval: Duration, stop: StopToken, health: Arc<HealthAggrega
     if let Err(e) = spawned {
         tracing::warn!(
             target: "nrr::lifecycle",
+            msg_key = "linux-svc-watchdog-thread-start-failed",
             error = %e,
             "watchdog thread could not start; systemd may restart the unit on WatchdogSec",
         );
@@ -247,7 +269,12 @@ struct LogController;
 
 impl ServiceController for LogController {
     fn report(&self, state: ServiceRuntimeState) {
-        tracing::info!(target: "nrr::lifecycle", state = ?state, "runtime state");
+        tracing::info!(
+            target: "nrr::lifecycle",
+            msg_key = "linux-svc-runtime-state",
+            state = ?state,
+            "runtime state"
+        );
         if matches!(state, ServiceRuntimeState::Stopping) {
             let _ = notify(&[NotifyState::Stopping]);
         }
@@ -266,11 +293,13 @@ fn report_enforcement_readiness() {
     match NftablesEnforcement::default().probe() {
         Ok(()) => tracing::info!(
             target: "nrr::enforcement",
+            msg_key = "linux-svc-enforcement-available",
             backend = "nftables",
             "enforcement mechanism is available",
         ),
         Err(e) => tracing::error!(
             target: "nrr::enforcement",
+            msg_key = "linux-svc-enforcement-unavailable",
             backend = "nftables",
             error = %e,
             "enforcement mechanism is NOT available — routing rules cannot be applied \
@@ -343,6 +372,7 @@ fn build_dns_observation(
     if probe_resolver_mode() == Some(false) {
         tracing::warn!(
             target: "nrr::dns-observe",
+            msg_key = "linux-svc-dns-resolver-foreign",
             "systemd-resolved is not this machine's resolver (resolv.conf mode: foreign): resolutions bypass it, so domain rules learn addresses only from their own refresh",
         );
     }

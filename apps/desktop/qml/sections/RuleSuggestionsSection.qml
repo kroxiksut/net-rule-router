@@ -539,6 +539,20 @@ ColumnLayout {
         Accessible.name: text
     }
 
+    /// Shown after an accept the service could not finish on its own: the page
+    /// the suggestion came from keeps its old connections until reloaded.
+    Label {
+        Layout.fillWidth: true
+        Layout.preferredWidth: 0
+        visible: root.uiRevision >= 0 && root.autoRuleSuggestionsController.autoRuleReloadHint
+        wrapMode: Text.Wrap
+        color: root.mutedTextColor
+        text: root.tr("rules.suggestions.accept.reload-page",
+                "The rule is applied. Reload the page you were on (F5) so it picks up the new route.")
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
+    }
+
     /// Nothing to act on because the main connection already reaches every
     /// address here. Silence would be worse than a plain statement: the user is
     /// looking at a browser error and came here for an answer. The sentence
@@ -589,7 +603,19 @@ ColumnLayout {
                 ThemedComboBox {
                     id: sortCombo
                     theme: root.uiTheme
-                    width: 220
+                    // Wide enough for the longest option in the current
+                    // language, so neither the closed box nor the list cuts it.
+                    width: {
+                        var widest = 0
+                        if (root.uiRevision >= 0) {
+                            for (var i = 0; i < model.length; i += 1)
+                                widest = Math.max(widest,
+                                    sortLabelMetrics.advanceWidth(section._sortLabel(model[i])))
+                        }
+                        return Math.min(440, Math.max(220, Math.ceil(widest)
+                            + root.uiTheme.spacingSm * 3 + sortLabelMetrics.height * 2))
+                    }
+                    FontMetrics { id: sortLabelMetrics; font: sortCombo.font }
                     model: ["main-route", "newest", "consumers", "name"]
                     labelResolver: function(item) { return section._sortLabel(String(item)) }
                     displayText: root.uiRevision >= 0 ? section._sortLabel(section.sortMode) : ""
@@ -835,7 +861,7 @@ ColumnLayout {
                                     Layout.fillWidth: true
                                     font.pixelSize: 12
                                     color: root.mutedTextColor
-                                    text: root.tr("rules.suggestions.table.group-hosts", "{count} host(s) observed")
+                                    text: root.tr("rules.suggestions.table.group-hosts", "Hosts observed: {count}")
                                         .replace("{count}", String(modelData.hosts.length))
                                         + (modelData.pendingIds.length > 0
                                             ? " · " + root.tr("rules.suggestions.table.status-pending", "Pending")

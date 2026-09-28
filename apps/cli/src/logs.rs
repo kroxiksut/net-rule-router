@@ -1,19 +1,27 @@
 //! `diag logs` — the tail of the service's operational log.
 //!
-//! Reading a file, nothing more: no IPC, no policy, no interpretation. That is
-//! what makes it useful exactly when the service is dead, which is when someone
-//! asks for its log. The lines come out verbatim (NDJSON as written) so what a
-//! user pastes into a bug report is the same text the service produced, not this
-//! console's rendering of it.
+//! Asked of the SERVICE, like every other diagnostics read: it knows who is
+//! asking and answers with that caller's lines plus the machine's (all of them
+//! for an elevated caller). The request carries no audience — the console could
+//! not widen its answer if it tried.
 //!
-//! The price of reading the file directly is that the log tree is closed to
-//! ordinary users, so a non-elevated console is refused. `diag export` is the
-//! way through without administrator rights — the service builds the archive
-//! and hands it to whoever asked — which is why the refusal names it first.
+//! Only when the service is down does the console read the files itself, and it
+//! says so first: the files are unscoped, so every user's lines may appear. The
+//! filesystem still decides whether that read is possible — the log tree is
+//! closed to ordinary users. Lines come out as NDJSON either way, one record per
+//! line, so what lands in a bug report is a record, not this console's prose.
 
 use std::path::PathBuf;
 
+use nrr_ipc_client::{IpcClient, IpcClientError};
+use nrr_shared::diagnostics_dto::LogEntryFilter;
+use nrr_shared::ipc::IpcOperationName;
+use nrr_shared::ipc_payloads::{LogsListRequest, LogsListResponse};
+use nrr_shared::pagination::{PaginationParams, MAX_PAGE_SIZE};
+use nrr_shared::product_identity::PRODUCT_NAME;
+
 use crate::exit;
+use crate::link::Link;
 
 /// Lines printed when `--tail` is not given. Enough to cover a startup or a
 /// failure, short enough to read in a terminal without scrolling away.
@@ -23,7 +31,7 @@ pub const DEFAULT_TAIL: usize = 50;
 /// to scroll — and `diag export` is that answer.
 pub const MAX_TAIL: usize = 2000;
 
-/// What a log request found.
+/// What reading the log files found.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Lines, newest last (reading order).
@@ -153,37 +161,198 @@ pub fn tail_lines(text: &str, lines: usize) -> Vec<String> {
     all
 }
 
-/// Print an outcome and map it onto an exit code.
-pub fn report(outcome: Outcome, exe: &str) -> u8 {
+/// What a run prints, collected so the order of the two streams and the text
+/// itself are testable.
+#[derive(Debug, Default)]
+pub struct Printed {
+    pub out: String,
+    pub err: String,
+}
+
+impl Printed {
+    fn out(&mut self, line: impl AsRef<str>) {
+        self.out.push_str(line.as_ref());
+        self.out.push('\n');
+    }
+
+    fn err(&mut self, line: impl AsRef<str>) {
+        self.err.push_str(line.as_ref());
+        self.err.push('\n');
+    }
+}
+
+/// `diag logs`: ask the service, or — only when it is down — read the files.
+pub fn run(exe: &str, tail: usize) -> u8 {
+    let (client, link) = crate::link::open();
+    let mut printed = Printed::default();
+    let code = tail_log(
+        &client,
+        &link,
+        tail,
+        || read_tail(log_directory(), tail),
+        exe,
+        &mut printed,
+    );
+    // The notice that the files are being read directly comes before the lines
+    // it qualifies.
+    eprint!("{}", printed.err);
+    print!("{}", printed.out);
+    code
+}
+
+/// The decision, with the service and the disk passed in. `disk` is called
+/// only when the service is not reachable at all.
+pub fn tail_log(
+    client: &dyn IpcClient,
+    link: &Link,
+    tail: usize,
+    disk: impl FnOnce() -> Outcome,
+    exe: &str,
+    printed: &mut Printed,
+) -> u8 {
+    let why = match link {
+        Link::Connected => return from_service(client, tail, exe, printed),
+        // The service is up and has answered; reading around it would be a
+        // second opinion on who may see what.
+        Link::Refused(reason) => {
+            printed.err(format!(
+                "The {PRODUCT_NAME} service refused this console: {reason}"
+            ));
+            return exit::FAILED;
+        }
+        Link::NotRunning => "not running",
+        Link::NotAnswering => "not answering",
+    };
+    printed.err(format!(
+        "The {PRODUCT_NAME} service is {why} — reading the log files directly; \
+         lines of all users may be shown."
+    ));
+    report(disk(), exe, printed)
+}
+
+/// Why the service's answer could not be printed.
+#[derive(Debug)]
+enum FetchError {
+    Ipc(IpcClientError),
+    Unreadable(String),
+}
+
+/// The newest `tail` records the service will show this caller, in reading
+/// order. Pages arrive newest-first, so they are gathered then turned round.
+fn fetch(client: &dyn IpcClient, tail: usize) -> Result<Vec<String>, FetchError> {
+    let timeout = nrr_ipc_client::ipc_operation_timeout(IpcOperationName::LogsList);
+    let mut newest_first: Vec<String> = Vec::with_capacity(tail);
+    let mut cursor = None;
+    while newest_first.len() < tail {
+        let wanted = tail - newest_first.len();
+        let request = LogsListRequest {
+            filter: LogEntryFilter::default(),
+            pagination: PaginationParams {
+                cursor: cursor.take(),
+                page_size: u32::try_from(wanted).map_or(MAX_PAGE_SIZE, |n| n.min(MAX_PAGE_SIZE)),
+            },
+        };
+        let payload =
+            serde_json::to_value(&request).map_err(|e| FetchError::Unreadable(e.to_string()))?;
+        let answer = client
+            .call(IpcOperationName::LogsList, payload, timeout)
+            .map_err(FetchError::Ipc)?;
+        let page: LogsListResponse =
+            serde_json::from_value(answer).map_err(|e| FetchError::Unreadable(e.to_string()))?;
+        let last_page = page.items.is_empty() || page.next_cursor.is_none();
+        for entry in page.items.into_iter().take(wanted) {
+            newest_first.push(
+                serde_json::to_string(&entry).map_err(|e| FetchError::Unreadable(e.to_string()))?,
+            );
+        }
+        if last_page {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    newest_first.reverse();
+    Ok(newest_first)
+}
+
+fn from_service(client: &dyn IpcClient, tail: usize, exe: &str, printed: &mut Printed) -> u8 {
+    match fetch(client, tail) {
+        Ok(lines) if lines.is_empty() => {
+            printed.out("The service has no log lines to show you yet.");
+            exit::SUCCESS
+        }
+        Ok(lines) => {
+            for line in lines {
+                printed.out(line);
+            }
+            exit::SUCCESS
+        }
+        Err(FetchError::Unreadable(detail)) => {
+            printed.err(format!(
+                "The service answered with something this console cannot read: {detail}"
+            ));
+            exit::FAILED
+        }
+        Err(FetchError::Ipc(IpcClientError::ServerError { code, message, .. })) => {
+            // The service's own judgement; reported, not reinterpreted.
+            printed.err(format!("The service refused the log request: {message}"));
+            printed.err(format!("  code: {code:?}"));
+            exit::FAILED
+        }
+        Err(FetchError::Ipc(IpcClientError::Timeout)) => {
+            printed.err("The service did not answer the log request in time.");
+            exit::NOT_RESPONDING
+        }
+        Err(FetchError::Ipc(other)) => {
+            printed.err(format!("Could not reach the service: {other}"));
+            printed.err(format!("Check that it is running: {exe} status"));
+            exit::NOT_RESPONDING
+        }
+    }
+}
+
+/// Print a file-read outcome and map it onto an exit code.
+pub fn report(outcome: Outcome, exe: &str, printed: &mut Printed) -> u8 {
     match outcome {
         Outcome::Lines(lines) => {
             for line in lines {
-                println!("{line}");
+                printed.out(line);
             }
             exit::SUCCESS
         }
         Outcome::NoLogDirectory => {
-            eprintln!("This platform declares no service log directory.");
+            printed.err("This platform declares no service log directory.");
             exit::UNSUPPORTED
         }
         Outcome::NoLogFile { directory } => {
-            println!("No operational log in {} yet.", directory.display());
-            println!("The service writes one once it has started at least once.");
+            printed.out(format!(
+                "No operational log in {} yet.",
+                directory.display()
+            ));
+            printed.out("The service writes one once it has started at least once.");
             exit::SUCCESS
         }
+        // Reached only with the service down, so the way through is to bring
+        // it back: it answers without administrator rights.
         Outcome::Forbidden { directory, detail } => {
-            eprintln!("Could not read the log directory {}.", directory.display());
-            eprintln!("  {detail}");
-            eprintln!("Only the service account may read it. Ask the service for the log instead:");
-            eprintln!("  {exe} diag export");
-            eprintln!("That needs no administrator rights and yields the whole log, not a tail.");
-            eprintln!("An elevated console can still read it in place:");
-            eprintln!("  {exe} diag logs");
+            printed.err(format!(
+                "Could not read the log directory {}.",
+                directory.display()
+            ));
+            printed.err(format!("  {detail}"));
+            printed.err("Only administrators and the service account may read the files.");
+            printed.err(
+                "Start the service and run this again; it answers without administrator rights:",
+            );
+            printed.err(format!("  {exe} start"));
+            printed.err("Or run this from an administrator console.");
             exit::NEEDS_PRIVILEGE
         }
         Outcome::Unreadable { directory, detail } => {
-            eprintln!("Could not read the log in {}.", directory.display());
-            eprintln!("  {detail}");
+            printed.err(format!(
+                "Could not read the log in {}.",
+                directory.display()
+            ));
+            printed.err(format!("  {detail}"));
             exit::FAILED
         }
     }
@@ -196,6 +365,7 @@ pub fn log_directory() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -259,6 +429,168 @@ mod tests {
         // "This OS has no such directory" and "the directory is empty" are
         // different answers, and a script has to be able to tell them apart.
         assert_eq!(read_tail(None, 10), Outcome::NoLogDirectory);
+    }
+
+    use crate::link::testing::FakeService;
+    use nrr_ipc_client::ConnectionStatus;
+    use std::cell::Cell;
+
+    fn entry(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "event_id": id,
+            "created_at": 1,
+            "level": "info",
+            "category": "service",
+            "kind": "service.started",
+            "message_key": "",
+            "has_payload": false,
+            "correlation_summary": [],
+        })
+    }
+
+    /// A page as the service sends it: newest first.
+    fn page(ids: &[&str], next: Option<&str>) -> Result<serde_json::Value, IpcClientError> {
+        Ok(serde_json::json!({
+            "items": ids.iter().map(|id| entry(id)).collect::<Vec<_>>(),
+            "next_cursor": next,
+            "total_count": null,
+            "stale": false,
+        }))
+    }
+
+    fn run_with(service: &FakeService, link: Link, tail: usize) -> (u8, Printed, bool) {
+        let disk_read = Cell::new(false);
+        let mut printed = Printed::default();
+        let code = tail_log(
+            service,
+            &link,
+            tail,
+            || {
+                disk_read.set(true);
+                Outcome::Lines(vec!["{\"from\":\"disk\"}".to_string()])
+            },
+            "nrr-cli",
+            &mut printed,
+        );
+        (code, printed, disk_read.get())
+    }
+
+    fn event_ids(out: &str) -> Vec<String> {
+        out.lines()
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).expect("each line is one JSON record");
+                value["event_id"].as_str().unwrap_or_default().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_running_service_is_asked_and_the_disk_is_not_touched() {
+        let service = FakeService::new(ConnectionStatus::Connected).answer(page(&["b", "a"], None));
+        let (code, printed, disk_read) = run_with(&service, Link::Connected, 10);
+        assert_eq!(code, exit::SUCCESS);
+        assert!(
+            !disk_read,
+            "the files must not be read while the service answers"
+        );
+        assert!(
+            printed.err.is_empty(),
+            "no fallback notice: {}",
+            printed.err
+        );
+        assert_eq!(
+            event_ids(&printed.out),
+            ["a", "b"],
+            "reading order, newest last"
+        );
+        let calls = service.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, IpcOperationName::LogsList);
+    }
+
+    #[test]
+    fn a_long_tail_is_paged_until_it_is_full() {
+        let service = FakeService::new(ConnectionStatus::Connected)
+            .answer(page(&["d", "c"], Some("2|c")))
+            .answer(page(&["b", "a"], Some("1|a")));
+        let (code, printed, _) = run_with(&service, Link::Connected, 3);
+        assert_eq!(code, exit::SUCCESS);
+        assert_eq!(event_ids(&printed.out), ["b", "c", "d"]);
+        let calls = service.calls();
+        assert_eq!(calls.len(), 2, "a full tail asks for no further page");
+        assert_eq!(calls[1].1["pagination"]["cursor"], "2|c");
+        assert_eq!(calls[1].1["pagination"]["page_size"], 1);
+    }
+
+    #[test]
+    fn the_console_never_names_an_audience() {
+        // Whose lines come back is the service's decision, derived from the
+        // connection. The request has nothing that could ask for more.
+        let service = FakeService::new(ConnectionStatus::Connected).answer(page(&["a"], None));
+        run_with(&service, Link::Connected, 5);
+        let (_, payload) = &service.calls()[0];
+        let mut keys: Vec<&str> = payload
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["filter", "pagination"]);
+        let text = payload.to_string().to_ascii_lowercase();
+        for word in ["audience", "principal", "sid", "machine"] {
+            assert!(!text.contains(word), "`{word}` in {text}");
+        }
+    }
+
+    #[test]
+    fn a_stopped_service_falls_back_to_the_files_and_says_so_first() {
+        for (link, why) in [
+            (Link::NotRunning, "not running"),
+            (Link::NotAnswering, "not answering"),
+        ] {
+            let service = FakeService::new(ConnectionStatus::ServiceStopped);
+            let (code, printed, disk_read) = run_with(&service, link, 10);
+            assert_eq!(code, exit::SUCCESS);
+            assert!(disk_read);
+            assert!(service.calls().is_empty());
+            assert!(printed.err.contains(why), "{}", printed.err);
+            assert!(
+                printed
+                    .err
+                    .contains("reading the log files directly; lines of all users may be shown"),
+                "{}",
+                printed.err
+            );
+            assert_eq!(printed.out, "{\"from\":\"disk\"}\n");
+        }
+    }
+
+    #[test]
+    fn a_service_that_refused_the_console_is_not_read_around() {
+        let service = FakeService::new(ConnectionStatus::Refused {
+            reason: "no slot".into(),
+        });
+        let (code, _, disk_read) = run_with(&service, Link::Refused("no slot".into()), 10);
+        assert_eq!(code, exit::FAILED);
+        assert!(!disk_read);
+    }
+
+    #[test]
+    fn a_refused_file_read_is_reported_and_offers_no_elevation() {
+        let mut printed = Printed::default();
+        let code = report(
+            Outcome::Forbidden {
+                directory: PathBuf::from("logs"),
+                detail: "access denied".into(),
+            },
+            "nrr-cli",
+            &mut printed,
+        );
+        assert_eq!(code, exit::NEEDS_PRIVILEGE);
+        assert!(!printed.err.contains("--elevate"), "{}", printed.err);
+        assert!(printed.err.contains("nrr-cli start"), "{}", printed.err);
     }
 
     #[test]

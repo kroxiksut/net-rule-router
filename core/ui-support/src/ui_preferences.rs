@@ -223,6 +223,9 @@ pub struct UiPreferences {
     /// `false` (default) hides the screen and its sidebar entry; hypervisor
     /// routing is unverified. Pure device-local UI display preference.
     pub show_virtual_machines_section: bool,
+    /// The one-time offer to route found virtual machines, emulators and
+    /// peer-to-peer programs was answered or closed.
+    pub app_groups_offer_dismissed: bool,
     /// Display toggle: show "remembered but currently absent" ghost rows in
     /// the Interfaces section for confirmed primary/secondary bindings whose
     /// adapter is not among the live adapters (e.g. a VPN TAP that removes

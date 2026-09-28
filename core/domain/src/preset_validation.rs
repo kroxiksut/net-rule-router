@@ -202,6 +202,20 @@ pub enum PresetImportRejectedReason {
         chars: usize,
         limit: usize,
     },
+
+    /// A match value, inline comment, metadata value or section name carries
+    /// a control character (see
+    /// [`nrr_shared::preset_parser::is_forbidden_field_char`]). Kept out
+    /// because the file is written back out: a line break there becomes a
+    /// rule of its own.
+    ///
+    /// `section` is the raw section name, empty for the preamble metadata.
+    /// `field` is `match-value`, `inline-comment`, `metadata` or
+    /// `section-name`.
+    ControlCharacter {
+        section: String,
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for PresetImportRejectedReason {
@@ -241,6 +255,11 @@ impl fmt::Display for PresetImportRejectedReason {
                 f,
                 "inline comment in section '{section}' is {chars} characters, \
                  which exceeds the limit of {limit} characters: '{comment_preview}'"
+            ),
+            Self::ControlCharacter { section, field } => write!(
+                f,
+                "{field} in section '{section}' contains a line break or other \
+                 control character"
             ),
         }
     }
@@ -389,6 +408,11 @@ pub fn validate_preset_bytes(bytes: &[u8]) -> PresetFileValidationOutcome {
         }
     }
 
+    // Stage 4c: control characters in any single-line field.
+    if let Some(reason) = first_control_character(&parse_outcome) {
+        return PresetFileValidationOutcome::Rejected(reason);
+    }
+
     // Stage 5: total rule count check (known + unknown, enabled + disabled).
     let known_count: usize = parse_outcome
         .parsed
@@ -456,6 +480,56 @@ pub fn validate_preset_bytes(bytes: &[u8]) -> PresetFileValidationOutcome {
     }
 }
 
+/// The first field of a parsed file holding a character the format cannot
+/// carry. Lines are already split, so this is the rest of the controls: a lone
+/// carriage return, NUL, escape and the like.
+fn first_control_character(outcome: &ParseOutcome) -> Option<PresetImportRejectedReason> {
+    use nrr_shared::preset_parser::first_forbidden_field_char;
+    let bad = |s: &str| first_forbidden_field_char(s).is_some();
+    let reject = |section: &str, field| {
+        Some(PresetImportRejectedReason::ControlCharacter {
+            section: section.to_string(),
+            field,
+        })
+    };
+    let entry_field = |entry: &crate::rules_file::RulesFileEntry| {
+        if bad(&entry.match_value) {
+            Some("match-value")
+        } else if entry.inline_comment.as_deref().is_some_and(bad) {
+            Some("inline-comment")
+        } else {
+            None
+        }
+    };
+
+    if let Some(meta) = &outcome.preset_metadata {
+        let fields = [
+            &meta.name,
+            &meta.description,
+            &meta.author,
+            &meta.preset_version,
+        ];
+        if fields.into_iter().flatten().any(|v| bad(v)) {
+            return reject("", "metadata");
+        }
+    }
+    for section in &outcome.parsed.sections {
+        if let Some(field) = section.entries.iter().find_map(entry_field) {
+            return reject(section.section.name(), field);
+        }
+    }
+    for unknown in &outcome.unknown_sections {
+        if bad(&unknown.name) {
+            let shown = nrr_shared::preset_parser::neutralize_field(&unknown.name);
+            return reject(&shown, "section-name");
+        }
+        if let Some(field) = unknown.entries.iter().find_map(entry_field) {
+            return reject(&unknown.name, field);
+        }
+    }
+    None
+}
+
 /// Truncates a match value string to 64 bytes for safe inclusion in
 /// error messages. Appends `"…"` when truncation occurs.
 fn truncate_for_display(s: &str) -> String {
@@ -510,6 +584,46 @@ mod tests {
             .entries_for(crate::rules_file::RulesFileSection::Domains);
         assert_eq!(domains.len(), 1);
         assert_eq!(domains[0].match_value, "example.com");
+    }
+
+    /// CRLF files and tabs are ordinary; a control character inside a field
+    /// is not, wherever it sits.
+    #[test]
+    fn a_control_character_in_any_field_is_rejected() {
+        assert!(validate_preset_bytes(b"--- Domains\r\nexample.com\t# a\tnote\r\n").is_accepted());
+
+        let cases: [(&[u8], &str, &str); 5] = [
+            (
+                b"--- Domains\nexample.com  # note\r--- IP\n",
+                "Domains",
+                "inline-comment",
+            ),
+            (b"--- Domains\nexa\x00mple.com\n", "Domains", "match-value"),
+            (
+                b"# name: evil\x1bname\n--- Domains\nexample.com\n",
+                "",
+                "metadata",
+            ),
+            (
+                b"--- CIDR\n10.0.0.0/8  # x\x0by\n",
+                "CIDR",
+                "inline-comment",
+            ),
+            (b"--- CI\x07DR\n10.0.0.0/8\n", "CI DR", "section-name"),
+        ];
+        for (input, section, field) in cases {
+            assert_eq!(
+                validate_preset_bytes(input),
+                PresetFileValidationOutcome::Rejected(
+                    PresetImportRejectedReason::ControlCharacter {
+                        section: section.to_string(),
+                        field,
+                    }
+                ),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
     }
 
     // ── AcceptedWithWarnings ──────────────────────────────────────────────────

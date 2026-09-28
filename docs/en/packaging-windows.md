@@ -115,4 +115,6 @@ to compare against.
 - **The binaries are unsigned**, so SmartScreen warns on first run.
 - **Scripts under `scripts\` that expect a build tree** (`install-service.ps1`,
   `build.ps1`, `run.ps1`) do not work from the package. The ones worth having
-  there are `reset-network.ps1`, `service-status.ps1` and `service-smoke.ps1`.
+  there are `reset-network.ps1`, `service-status.ps1` and `service-smoke.ps1`,
+  and `uninstall-service.ps1` and `purge-data.ps1` work too: they remove the
+  service that is installed, wherever it was registered from.

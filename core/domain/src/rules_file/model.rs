@@ -98,6 +98,17 @@ impl RulesFileSection {
         matches!(self, Self::Windows | Self::Linux | Self::MacOS)
     }
 
+    /// The platform whose application rules this section holds; `None` for
+    /// the cross-platform sections.
+    pub const fn app_platform(self) -> Option<HostPlatform> {
+        match self {
+            Self::Windows => Some(HostPlatform::Windows),
+            Self::Linux => Some(HostPlatform::Linux),
+            Self::MacOS => Some(HostPlatform::MacOS),
+            Self::Zones | Self::Domains | Self::Ip | Self::Auto => None,
+        }
+    }
+
     /// Parses a section header line of the form `--- SectionName`.
     ///
     /// Returns `None` if the line is not a section header or the section name
@@ -176,6 +187,15 @@ impl HostPlatform {
             Self::MacOS
         } else {
             Self::Windows
+        }
+    }
+
+    /// How this platform's application section spells an executable — the
+    /// one fact that decides whether a bare name gets `.exe`.
+    pub const fn executable_naming(self) -> nrr_shared::app_identity::ExecutableNaming {
+        match self {
+            Self::Windows => nrr_shared::app_identity::ExecutableNaming::WindowsExe,
+            Self::Linux | Self::MacOS => nrr_shared::app_identity::ExecutableNaming::AsNamed,
         }
     }
 }

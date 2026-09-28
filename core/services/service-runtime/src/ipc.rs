@@ -352,9 +352,9 @@ impl IpcHandlerRegistry {
 
 // ── Mutation queue ───────────────────────────────────────────────────────────
 
-/// Single-writer guard for mutating operations. Ensures that two
-/// mutations cannot run concurrently and that `BusyConflict` surfaces
-/// when one is already in flight.
+/// Cap on mutating requests in flight at once; past it a request gets
+/// `BusyConflict`. It does NOT serialise them — the activation gate in
+/// `ActivationCoordinator` is what keeps two activations apart.
 #[derive(Default)]
 pub struct MutationQueue {
     /// Live request ids currently being processed.
@@ -426,9 +426,8 @@ enum AuthorizationOutcome {
 
 /// `MutationQueue` slot count for a production router.
 ///
-/// The queue serialises privileged mutations (`Apply`, `Rollback`,
-/// `SafeDisable`); this covers the GUI's worst-case burst of mass-toggle clicks
-/// without hoarding memory. Declared here rather than in one platform's wiring:
+/// Bounds how many mutating requests run at once; this covers the GUI's
+/// worst-case burst of mass-toggle clicks without hoarding memory. Declared here rather than in one platform's wiring:
 /// Windows passed 32 and Linux passed a literal 1, so the same burst that
 /// queued on one OS was refused as a conflict on the other.
 pub const MUTATION_QUEUE_CAPACITY: usize = 32;
@@ -545,6 +544,7 @@ impl IpcRouter {
             // the shared admin baseline.
             tracing::warn!(
                 target: "nrr::ipc::dispatch",
+                msg_key = "ipctop-operation-class-mismatch",
                 operation = op_slug,
                 declared = request.operation_class.slug(),
                 actual = class.slug(),
@@ -994,10 +994,9 @@ mod tests {
     }
 
     #[test]
-    fn mutation_queue_serializes_concurrent_requests() {
-        // Two mutations submitted in series; the second must succeed
-        // because the first's guard is dropped between dispatches.
-        // Concurrent in-flight is tested by manually claiming a slot.
+    fn a_full_mutation_queue_refuses_until_a_slot_frees() {
+        // `make_router` builds a one-slot queue: a held slot refuses the next
+        // mutation, and releasing it lets the same request through.
         let router = make_router();
         let _slot = router.queue.try_enter("manual").unwrap();
         let r = router.dispatch(

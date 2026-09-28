@@ -195,6 +195,11 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.show_virtual_machines_section = parsed;
                 }
             }
+            "app_groups_offer_dismissed" => {
+                if let Some(parsed) = parse_bool(value) {
+                    preferences.app_groups_offer_dismissed = parsed;
+                }
+            }
             "show_remembered_adapters" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.show_remembered_adapters = parsed;
@@ -670,6 +675,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
             "allow_mode_a_killswitch={}\n",
             "routing_detailed_mode={}\n",
             "show_virtual_machines_section={}\n",
+            "app_groups_offer_dismissed={}\n",
             "show_remembered_adapters={}\n",
             "selected_primary_interface_id={}\n",
             "selected_primary_interface_name={}\n",
@@ -766,6 +772,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
         one_line(&preferences.allow_mode_a_killswitch),
         one_line(&preferences.routing_detailed_mode),
         one_line(&preferences.show_virtual_machines_section),
+        one_line(&preferences.app_groups_offer_dismissed),
         one_line(&preferences.show_remembered_adapters),
         one_line(&preferences.selected_primary_interface_id),
         one_line(&preferences.selected_primary_interface_name),

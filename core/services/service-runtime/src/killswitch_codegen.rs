@@ -82,7 +82,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_platform_api::fail_closed::is_exempt_from_blocking;
 use nrr_platform_api::types::{WfpAction, WfpFilterSpec, WfpLayerKey};
-use nrr_platform_api::wfp_slotting::{pack_both, pack_v4, FamilyChunk, V4SlotChunk};
+use nrr_platform_api::wfp_slotting::{pack_both, FamilyChunk, V4SlotChunk};
 // Weight bands come from `wfp_bands`, which holds the complete order and
 // asserts it. This file emits filters; it does not get to invent a band.
 use crate::wfp_bands::{
@@ -243,72 +243,110 @@ const DOT_PORT: u16 = 853;
 /// runaway backstop.
 pub const DOH_MAX_RESOLVER_IPS: usize = 0x0003_0000;
 
-/// Build the DoH/DoT lockdown block filters for `sid`:
-/// - per packed resolver-IP chunk: a `Block` on `443` for TCP and UDP (kills
-///   DoH / DoH-over-HTTP3 to those resolvers without touching their plain DNS
-///   on 53 or general web traffic to other hosts);
+/// The ALE-connect layers the lockdown covers, in emission order. IPv4 first
+/// keeps a v4-only resolver list bit-for-bit on the filters it had before the
+/// v6 half existed.
+pub const DOH_LAYERS: [WfpLayerKey; 2] =
+    [WfpLayerKey::AleAuthConnectV4, WfpLayerKey::AleAuthConnectV6];
+
+/// Build the DoH/DoT lockdown block filters for `sid`, per family:
+/// - per packed resolver-address chunk: a `Block` on `443` for TCP and UDP
+///   (kills DoH / DoH-over-HTTP3 to those resolvers without touching their
+///   plain DNS on 53 or general web traffic to other hosts);
 /// - when `block_dot`: a global `Block` on `853` for TCP and UDP (DoT / DoQ).
 ///
+/// Both families, because a dual-stack browser reaches the same resolver over
+/// IPv6 and a v4-only lockdown reads "active" while DoH keeps working. The
+/// global DoT cut is emitted for v6 even with no v6 resolver listed.
+///
 /// All filters are ALE-connect, SID-scoped, at [`DOH_BLOCK_BASE`]. Loopback /
-/// link-local resolver IPs are skipped (never blocked). Emission order (per
-/// chunk: TCP then UDP; then the global DoT pair) fixes the ascending weights
-/// so the neutral planner mirror reproduces the same arbitration order.
+/// link-local resolver IPs are skipped (never blocked). Each family restarts
+/// the weight at the band base — the two layers arbitrate separately — and
+/// emits its chunks (TCP then UDP) and then its DoT pair; the neutral planner
+/// mirror reproduces the same order.
 pub fn doh_dot_block_filters(
     sid: &str,
-    resolver_ips: &[Ipv4Addr],
+    resolver_ips: &[IpAddr],
     block_dot: bool,
 ) -> Vec<WfpFilterSpec> {
-    let mut filters = Vec::new();
-    let mut weight = DOH_BLOCK_BASE;
-    for chunk in pack_v4(
+    let chunks = pack_both(
         resolver_ips
             .iter()
             .copied()
             .filter(|ip| !is_exempt_from_blocking(*ip))
             .take(DOH_MAX_RESOLVER_IPS),
-    ) {
-        for proto in [PROTO_TCP, PROTO_UDP] {
-            filters.push(doh_port_block(sid, Some(&chunk), DOH_PORT, proto, weight));
-            weight += 1;
+    );
+    let mut filters = Vec::new();
+    for layer in DOH_LAYERS {
+        let mut weight = DOH_BLOCK_BASE;
+        for chunk in chunks
+            .iter()
+            .filter(|c| crate::wfp_codegen::ale_layer(c) == layer)
+        {
+            for proto in [PROTO_TCP, PROTO_UDP] {
+                filters.push(doh_port_block(
+                    sid,
+                    layer,
+                    Some(chunk),
+                    DOH_PORT,
+                    proto,
+                    weight,
+                ));
+                weight += 1;
+            }
         }
-    }
-    if block_dot {
-        for proto in [PROTO_TCP, PROTO_UDP] {
-            filters.push(doh_port_block(sid, None, DOT_PORT, proto, weight));
-            weight += 1;
+        if block_dot {
+            for proto in [PROTO_TCP, PROTO_UDP] {
+                filters.push(doh_port_block(sid, layer, None, DOT_PORT, proto, weight));
+                weight += 1;
+            }
         }
     }
     filters
 }
 
-/// One DoH/DoT block: ALE-connect `Block` narrowed to `(chunk?, port, proto)`.
+/// One DoH/DoT block: ALE-connect `Block` at `layer` narrowed to
+/// `(chunk?, port, proto)`.
 fn doh_port_block(
     sid: &str,
-    scope: Option<&V4SlotChunk>,
+    layer: WfpLayerKey,
+    scope: Option<&FamilyChunk>,
     port: u16,
     proto: u8,
     weight: u64,
 ) -> WfpFilterSpec {
-    let host_seg = scope
-        .map(V4SlotChunk::id_seg)
-        .unwrap_or_else(|| "any".to_string());
+    // The v4 spellings are the ids already installed; the v6 global cut needs
+    // its own, or it would collide with the v4 one.
+    let host_seg = match (scope, layer) {
+        (Some(chunk), _) => chunk.id_seg(),
+        (None, WfpLayerKey::AleAuthConnectV6) => "v6-any".to_string(),
+        (None, _) => "any".to_string(),
+    };
     let tag = format!("{host_seg}-{port}-{proto}");
-    WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
-        action: WfpAction::Block,
-        remote_ip: None,
-        remote_ip_set: scope.map(|c| c.members.clone()).unwrap_or_default(),
-        remote_ip_set_v6: Vec::new(),
-        remote_port: Some(port),
-        weight,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-doh", &tag),
-        user_sid: Some(sid.to_string()),
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: Some(proto),
-    }
+    let id = filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-doh", &tag);
+    let mut spec = match scope {
+        Some(chunk) => crate::wfp_codegen::chunk_spec(chunk, layer, WfpAction::Block, weight, id),
+        None => WfpFilterSpec {
+            layer,
+            action: WfpAction::Block,
+            remote_ip: None,
+            remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
+            remote_port: None,
+            weight,
+            id,
+            user_sid: None,
+            app_pattern: None,
+            local_interface_luid: None,
+            remote_subnet: None,
+            remote_subnet_v6: None,
+            ip_protocol: None,
+        },
+    };
+    spec.remote_port = Some(port);
+    spec.user_sid = Some(sid.to_string());
+    spec.ip_protocol = Some(proto);
+    spec
 }
 
 /// Build the leak-proof kill-switch filter pair for every protected

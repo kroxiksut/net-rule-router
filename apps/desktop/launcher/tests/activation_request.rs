@@ -7,7 +7,7 @@
 //! independent of the shared `%TEMP%\NetRuleRouter\gui-activation.json` slot
 //! that the production code uses.
 
-use nrr_desktop_gui::app_shell::LaunchRequest;
+use nrr_desktop_gui::app_shell::{FocusContext, LaunchRequest};
 use nrr_launcher::write_activation_request;
 use nrr_shared::{ActivationSource, AppSection};
 use std::fs;
@@ -27,6 +27,8 @@ fn make_request(
         first_run_scenario_override: None,
         action: None,
         reason: None,
+        focus: None,
+        focus_context: None,
     }
 }
 
@@ -121,12 +123,51 @@ fn action_and_reason_are_omitted_when_unset() {
     assert!(object.get("reason").is_none());
 }
 
+#[test]
+fn focus_and_its_context_are_propagated_when_set() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("activation.json");
+    let mut request = make_request(Some(AppSection::Settings), false, false);
+    request.focus = Some("doh-lockdown".to_string());
+    request.focus_context = FocusContext::parse(
+        r#"{"reason":"dns-lockdown","apps":["curl.exe"],"addresses":["192.0.2.1"],"more":2}"#,
+    );
+    write_activation_request(&request, &path).expect("write must succeed");
+
+    let object = read_payload(&path);
+    assert_eq!(
+        object.get("focus").and_then(|v| v.as_str()),
+        Some("doh-lockdown")
+    );
+    let context = object
+        .get("focusContext")
+        .and_then(|v| v.as_object())
+        .expect("context is an object");
+    assert_eq!(context["reason"], "dns-lockdown");
+    assert_eq!(context["apps"], serde_json::json!(["curl.exe"]));
+    assert_eq!(context["addresses"], serde_json::json!(["192.0.2.1"]));
+    assert_eq!(context["more"], 2);
+}
+
+#[test]
+fn focus_is_omitted_when_unset() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("activation.json");
+    write_activation_request(&make_request(None, false, false), &path).expect("write must succeed");
+
+    let object = read_payload(&path);
+    assert!(object.get("focus").is_none());
+    assert!(object.get("focusContext").is_none());
+}
+
 /// The cold-start counterpart: with no window running there is no activation
 /// file to hand the intent to, so it has to reach QML through the context.
 #[test]
 fn cold_start_context_carries_the_launch_action() {
     let mut request = make_request(Some(AppSection::Rules), false, false);
     request.action = Some("rules-drift-compare".to_string());
+    request.focus = Some("leak-protection".to_string());
+    request.focus_context = FocusContext::parse(r#"{"reason":"ipv6-blocked","apps":["a.exe"]}"#);
 
     let shell = nrr_shared::gui_shell_v1();
     let preferences = nrr_ui_support::ui_preferences::UiPreferences::default();
@@ -152,4 +193,9 @@ fn cold_start_context_carries_the_launch_action() {
     let json: serde_json::Value = serde_json::from_str(&raw).expect("parse context");
     assert_eq!(json["launchAction"], "rules-drift-compare");
     assert_eq!(json["entrySection"], "rules");
+    assert_eq!(json["launchFocus"], "leak-protection");
+    assert_eq!(
+        json["launchFocusContext"]["apps"],
+        serde_json::json!(["a.exe"])
+    );
 }

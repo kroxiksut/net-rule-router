@@ -2,6 +2,7 @@
 
 use super::parse::BLOCK_FLAG;
 use super::*;
+use nrr_shared::preset_parser::neutralize_field;
 
 /// Serialises a [`RulesFileParsed`] (and optional unsupported sections) back to
 /// canonical rules-file text.
@@ -24,6 +25,10 @@ use super::*;
 ///   (two spaces before `#`, matching docs/en/rules-file-format.md Complete example examples).
 /// - Disabled rule line: `# value` or `# value  # comment`.
 /// - Sections are separated by a blank line for readability.
+/// - A line break or other control character in a single-line field (value,
+///   comment, metadata, section name) is written as a space. Validation
+///   refuses them; this is the backstop for text that bypassed it, since a
+///   line break there would start a rule or section of its own.
 ///
 /// # Round-trip guarantee
 ///
@@ -68,25 +73,19 @@ pub fn write_rules_file_with_passthrough(
         out.push_str("# NetRuleRouter preset \u{2014} version ");
         out.push_str(&CURRENT_PRESET_FORMAT_VERSION.to_string());
         out.push('\n');
-        if let Some(name) = &meta.name {
-            out.push_str("# name: ");
-            out.push_str(name);
-            out.push('\n');
-        }
-        if let Some(description) = &meta.description {
-            out.push_str("# description: ");
-            out.push_str(description);
-            out.push('\n');
-        }
-        if let Some(author) = &meta.author {
-            out.push_str("# author: ");
-            out.push_str(author);
-            out.push('\n');
-        }
-        if let Some(preset_version) = &meta.preset_version {
-            out.push_str("# preset_version: ");
-            out.push_str(preset_version);
-            out.push('\n');
+        for (key, value) in [
+            ("name", &meta.name),
+            ("description", &meta.description),
+            ("author", &meta.author),
+            ("preset_version", &meta.preset_version),
+        ] {
+            if let Some(value) = value {
+                out.push_str("# ");
+                out.push_str(key);
+                out.push_str(": ");
+                out.push_str(&neutralize_field(value));
+                out.push('\n');
+            }
         }
         out.push('\n');
     }
@@ -124,7 +123,7 @@ pub fn write_rules_file_with_passthrough(
         }
         first_section = false;
         out.push_str("--- ");
-        out.push_str(&unknown_section.name);
+        out.push_str(&neutralize_field(&unknown_section.name));
         out.push('\n');
         for entry in &unknown_section.entries {
             write_entry_line(&mut out, entry, false);
@@ -140,7 +139,7 @@ pub fn write_rules_file_with_passthrough(
         }
         first_section = false;
         out.push_str("--- ");
-        out.push_str(&section.name);
+        out.push_str(&neutralize_field(&section.name));
         out.push('\n');
         out.push_str(&section.body);
         if !section.body.is_empty() && !section.body.ends_with('\n') {
@@ -167,7 +166,7 @@ fn write_entry_line(out: &mut String, entry: &RulesFileEntry, emit_origin: bool)
     if !entry.enabled {
         out.push_str("# ");
     }
-    out.push_str(&entry.match_value);
+    out.push_str(&neutralize_field(&entry.match_value));
     if entry.blocked {
         out.push(' ');
         out.push_str(BLOCK_FLAG);
@@ -189,7 +188,7 @@ fn write_entry_line(out: &mut String, entry: &RulesFileEntry, emit_origin: bool)
             }
         }
         if let Some(comment) = &entry.inline_comment {
-            out.push_str(comment);
+            out.push_str(&neutralize_field(comment));
         }
     }
     out.push('\n');

@@ -32,6 +32,11 @@
 //!    SHARED addresses are pinned, not whether an explicit rule can be overruled.
 //! 3. **Block rules claim nothing.** They drop their destination rather than
 //!    steering it, so they never make an address "owned" for the purposes above.
+//! 4. **A Block yields to a narrower rule.** Blocks enter the same specificity
+//!    contest the engine runs: a zone Block does not drop an address an exact
+//!    route names, and an exact Block still drops what a zone route carries.
+//!    A literal-IP Block is the exception: it names the address itself and
+//!    vetoes every route on it.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -73,6 +78,18 @@ pub struct AddressOwnership {
     /// "yes, block it" about an address the main link still names — the third
     /// outcome rule 2 exists to forbid.
     main_claimed: HashSet<IpAddr>,
+    /// The strongest claim any ROUTE rule, on either link, holds on each
+    /// address — what a Block rule is measured against (rule 4).
+    route_rank: HashMap<IpAddr, ClaimRank>,
+    /// Who holds each `route_rank` entry: the host, or the address itself for
+    /// a literal rule. Named in the conflict a yielded Block reports.
+    route_holder: HashMap<IpAddr, String>,
+    /// The strongest route claim on each HOST, to tell a host a narrower rule
+    /// names from one that merely shares its address.
+    host_route_rank: HashMap<String, ClaimRank>,
+    /// Addresses an enabled literal-IP Block names, with the rule id.
+    literal_blocks: HashMap<IpAddr, String>,
+    order: ZoneVsIpOrder,
 }
 
 impl AddressOwnership {
@@ -119,6 +136,21 @@ impl AddressOwnership {
         // The strongest claim the main link holds on each address it carries,
         // which is what the literal contest below compares against.
         let mut main_claim: HashMap<IpAddr, NameClaim> = HashMap::new();
+        let mut route_rank: HashMap<IpAddr, ClaimRank> = HashMap::new();
+        let mut route_holder: HashMap<IpAddr, String> = HashMap::new();
+        let mut host_route_rank: HashMap<String, ClaimRank> = HashMap::new();
+        let mut raise = |ip: IpAddr, rank: ClaimRank, holder: &str| match route_rank.get(&ip) {
+            Some(best) if *best >= rank => {}
+            _ => {
+                route_rank.insert(ip, rank);
+                route_holder.insert(ip, holder.to_string());
+            }
+        };
+        let mut literals: Vec<&IpAddr> = main_literal.union(&additional_literal).collect();
+        literals.sort_unstable();
+        for ip in literals {
+            raise(*ip, literal_rank(order), &ip.to_string());
+        }
 
         let mut hosts: Vec<&str> = main_names
             .keys()
@@ -138,6 +170,13 @@ impl AddressOwnership {
             let ips: Vec<IpAddr> =
                 crate::enforcement_planner::capped_for_host(cache, host, FamilyScope::Both)
                     .collect();
+            if let Some(best) = main_names.get(host).max(additional_names.get(host)) {
+                let rank = host_rank(*best, order);
+                host_route_rank.insert(host.to_string(), rank);
+                for ip in &ips {
+                    raise(*ip, rank, host);
+                }
+            }
             match (main_names.get(host), additional_names.get(host)) {
                 // A tie goes to the main link -- see `owner_of`.
                 (Some(m), Some(a)) if a > m => additional.extend(ips),
@@ -174,6 +213,11 @@ impl AddressOwnership {
             main,
             additional,
             main_claimed,
+            route_rank,
+            route_holder,
+            host_route_rank,
+            literal_blocks: literal_blocks(rule_book),
+            order,
         }
     }
 
@@ -185,6 +229,7 @@ impl AddressOwnership {
             main_claimed: main.clone(),
             main,
             additional,
+            ..Self::default()
         }
     }
 
@@ -250,6 +295,49 @@ impl AddressOwnership {
     #[must_use]
     pub fn may_block(&self, ip: IpAddr) -> bool {
         !self.main_claimed.contains(&ip)
+    }
+
+    /// Whether a Block rule matching `block` must leave `ip` alone because a
+    /// narrower route rule names it. See rule 4; a tie keeps the block.
+    ///
+    /// Per ADDRESS, like every other answer here: a zone Block over a host
+    /// that shares its address with a narrowly routed one leaves the address
+    /// open, the same trade rule 2 makes for a contested address.
+    #[must_use]
+    pub fn block_yields(&self, ip: IpAddr, block: &CanonicalAddressMatch) -> bool {
+        block_rank(block, self.order).is_some_and(|own| self.outranked(ip, own))
+    }
+
+    /// When a Block covering `host` leaves `ip` open although no narrower rule
+    /// names `host` itself: the holder of the narrower claim on the address —
+    /// the host, or the literal address, whose route kept it open. `None` when
+    /// the block holds, or when `host` is narrowly routed in its own right.
+    ///
+    /// This is the leak rule 4 accepts per address: every other tenant of a
+    /// shared address stays reachable under a Block written for it.
+    #[must_use]
+    pub fn block_leak(
+        &self,
+        host: &str,
+        ip: IpAddr,
+        block: &CanonicalAddressMatch,
+    ) -> Option<&str> {
+        let own = block_rank(block, self.order)?;
+        if !self.outranked(ip, own) || self.host_route_rank.get(host).is_some_and(|h| *h > own) {
+            return None;
+        }
+        self.route_holder.get(&ip).map(String::as_str)
+    }
+
+    /// The literal-IP Block rule naming `ip`, if any: its filter drops the
+    /// address whatever route a tenant of it carries.
+    #[must_use]
+    pub fn literal_block_of(&self, ip: IpAddr) -> Option<&str> {
+        self.literal_blocks.get(&ip).map(String::as_str)
+    }
+
+    fn outranked(&self, ip: IpAddr, own: ClaimRank) -> bool {
+        self.route_rank.get(&ip).is_some_and(|route| *route > own)
     }
 
     /// The main link's named addresses, for callers that need the set itself
@@ -321,6 +409,69 @@ impl ZoneVsIpOrder {
         } else {
             Self::ExactIpFirst
         }
+    }
+}
+
+/// A claim's place in the engine's tier order, with the literal address slotted
+/// where [`ZoneVsIpOrder`] puts it against a zone. Compared, never shown.
+type ClaimRank = (u8, usize);
+
+fn host_rank(claim: NameClaim, order: ZoneVsIpOrder) -> ClaimRank {
+    match claim {
+        NameClaim::Zone(labels) => match order {
+            ZoneVsIpOrder::ExactIpFirst => (0, labels),
+            ZoneVsIpOrder::ZoneFirst => (1, labels),
+        },
+        NameClaim::Suffix(labels) => (2, labels),
+        NameClaim::ExactFqdn => (3, 0),
+    }
+}
+
+/// A Block's own place in the contest; `None` for a literal one, which never
+/// yields.
+fn block_rank(block: &CanonicalAddressMatch, order: ZoneVsIpOrder) -> Option<ClaimRank> {
+    let own = match block {
+        CanonicalAddressMatch::ExactIp(_) => return None,
+        CanonicalAddressMatch::ExactFqdn(_) => NameClaim::ExactFqdn,
+        CanonicalAddressMatch::SuffixDomain(s) => NameClaim::Suffix(label_count(s)),
+        CanonicalAddressMatch::Zone(z) => NameClaim::Zone(label_count(z)),
+    };
+    Some(host_rank(own, order))
+}
+
+/// Enabled literal-IP Blocks on either link, the smallest rule id per address.
+/// A Block enforcement skips for its shape vetoes nothing.
+fn literal_blocks(rule_book: &CanonicalRuleBook) -> HashMap<IpAddr, String> {
+    let mut out: HashMap<IpAddr, String> = HashMap::new();
+    for rule in rule_book
+        .primary
+        .rules()
+        .iter()
+        .chain(rule_book.secondary.rules())
+    {
+        if !rule.enabled
+            || !matches!(rule.action, RuleAction::Block)
+            || !crate::wfp_codegen::rule_shape_enforced(rule)
+        {
+            continue;
+        }
+        if let Some(CanonicalAddressMatch::ExactIp(ip)) = &rule.address_match {
+            let id = rule.id.as_str();
+            match out.get(ip) {
+                Some(best) if best.as_str() <= id => {}
+                _ => {
+                    out.insert(*ip, id.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn literal_rank(order: ZoneVsIpOrder) -> ClaimRank {
+    match order {
+        ZoneVsIpOrder::ExactIpFirst => (1, 0),
+        ZoneVsIpOrder::ZoneFirst => (0, 0),
     }
 }
 
@@ -885,5 +1036,50 @@ mod tests {
         let ownership = AddressOwnership::resolve(&book, &cache);
         assert_eq!(ownership.owner_of(IpAddr::V4(ip)), Some(Link::Main));
         assert!(!ownership.address_rule_may_steer(IpAddr::V4(ip), Link::Additional));
+    }
+
+    /// Rule 4 at its edges: only a STRICTLY narrower route makes a Block
+    /// yield, the zone-vs-literal contest follows the setting, and a literal
+    /// Block is never overruled.
+    #[test]
+    fn a_block_yields_only_to_a_strictly_narrower_route() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips("a.corp.example", vec![Ipv4Addr::new(192, 0, 2, 10)]);
+        let zone = |z: &str| CanonicalAddressMatch::Zone(z.into());
+        let exact = CanonicalAddressMatch::ExactFqdn("a.corp.example".into());
+        let literal = CanonicalAddressMatch::ExactIp(ip);
+        let routed =
+            |m: CanonicalAddressMatch| book(vec![], vec![address_rule("s1", m, RuleAction::Route)]);
+
+        let by_zone = AddressOwnership::resolve(&routed(zone("example")), &cache);
+        // A tie keeps the block; a longer zone is narrower.
+        assert!(!by_zone.block_yields(ip, &zone("example")));
+        let by_longer_zone = AddressOwnership::resolve(&routed(zone("corp.example")), &cache);
+        assert!(by_longer_zone.block_yields(ip, &zone("example")));
+        assert!(!by_longer_zone.block_yields(ip, &exact));
+
+        let by_exact = AddressOwnership::resolve(&routed(exact.clone()), &cache);
+        assert!(by_exact.block_yields(ip, &zone("corp.example")));
+        assert!(by_exact.block_yields(
+            ip,
+            &CanonicalAddressMatch::SuffixDomain("corp.example".into())
+        ));
+        assert!(!by_exact.block_yields(ip, &exact));
+        assert!(!by_exact.block_yields(ip, &literal));
+
+        let by_literal = AddressOwnership::resolve(&routed(literal.clone()), &cache);
+        assert!(by_literal.block_yields(ip, &zone("example")));
+        assert!(!by_literal.block_yields(ip, &exact));
+        let zone_first = AddressOwnership::resolve_with_order(
+            &routed(literal),
+            &cache,
+            ZoneVsIpOrder::ZoneFirst,
+        );
+        assert!(!zone_first.block_yields(ip, &zone("example")));
+
+        // Nothing routes an unnamed address, so nothing overrules its block.
+        let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
+        assert!(!by_exact.block_yields(other, &zone("example")));
     }
 }

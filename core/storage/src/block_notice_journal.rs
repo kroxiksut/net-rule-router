@@ -27,6 +27,10 @@ const MAX_ENTRIES_PER_SID: usize = 200;
 /// Age at which an unshown notice stops being news, in milliseconds.
 const MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// Separator of the stored ancestry. Image names never contain it; one that
+/// did is dropped rather than split into two false names.
+const LAUNCHED_BY_SEPARATOR: char = '\n';
+
 /// One journalled notice: the notice itself plus the identity a surface
 /// acknowledges it by.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,8 +60,8 @@ impl<'c> BlockNoticeJournalRepository<'c> {
         self.conn
             .execute(
                 "INSERT INTO block_notice_journal
-                     (sid, raised_at, destination, app, reason, attempts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (sid, raised_at, destination, app, reason, attempts, launched_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     sid,
                     now_ms,
@@ -65,6 +69,7 @@ impl<'c> BlockNoticeJournalRepository<'c> {
                     notice.app,
                     notice.reason.slug(),
                     i64::from(notice.attempts),
+                    encode_launched_by(&notice.launched_by),
                 ],
             )
             .map_err(|e| StorageError::Internal(format!("block_notice_journal append: {e}")))?;
@@ -79,7 +84,7 @@ impl<'c> BlockNoticeJournalRepository<'c> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, raised_at, destination, app, reason, attempts
+                "SELECT id, raised_at, destination, app, reason, attempts, launched_by
                  FROM block_notice_journal WHERE sid = ?1 ORDER BY id ASC",
             )
             .map_err(|e| StorageError::Internal(format!("block_notice_journal prepare: {e}")))?;
@@ -92,12 +97,13 @@ impl<'c> BlockNoticeJournalRepository<'c> {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(|e| StorageError::Internal(format!("block_notice_journal query: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, raised_at, destination, app, reason, attempts) =
+            let (id, raised_at, destination, app, reason, attempts, launched_by) =
                 row.map_err(|e| StorageError::Internal(format!("block_notice_journal row: {e}")))?;
             // An unreadable reason slug drops the row rather than the whole
             // read: the backlog is best-effort news, and refusing to show the
@@ -114,6 +120,7 @@ impl<'c> BlockNoticeJournalRepository<'c> {
                     reason,
                     first_attempt_ms: raised_at.max(0) as u64,
                     attempts: attempts.clamp(0, i64::from(u32::MAX)) as u32,
+                    launched_by: decode_launched_by(&launched_by),
                 },
             });
         }
@@ -160,6 +167,35 @@ impl<'c> BlockNoticeJournalRepository<'c> {
     }
 }
 
+/// Names joined for the TEXT column, within its length bound: the tail of a
+/// longer chain is the least useful part and goes first.
+fn encode_launched_by(names: &[String]) -> String {
+    const MAX_BYTES: usize = 2048;
+    let mut out = String::new();
+    for name in names
+        .iter()
+        .filter(|n| !n.is_empty() && !n.contains(LAUNCHED_BY_SEPARATOR))
+    {
+        let extra = name.len() + usize::from(!out.is_empty());
+        if out.len() + extra > MAX_BYTES {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(LAUNCHED_BY_SEPARATOR);
+        }
+        out.push_str(name);
+    }
+    out
+}
+
+fn decode_launched_by(stored: &str) -> Vec<String> {
+    stored
+        .split(LAUNCHED_BY_SEPARATOR)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -182,7 +218,34 @@ mod tests {
             reason: BlockReason::BlockedByRule,
             first_attempt_ms: 0,
             attempts: 3,
+            launched_by: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_ancestry_survives_the_backlog() {
+        let conn = migrated_conn();
+        let repo = BlockNoticeJournalRepository::new(&conn);
+        let mut raised = notice("a.example");
+        raised.launched_by = vec!["pwsh.exe".into(), "explorer.exe".into()];
+        repo.append("S-1", &raised, 1_000).expect("append");
+        repo.append("S-1", &notice("b.example"), 1_001)
+            .expect("append");
+
+        let pending = repo.list_pending("S-1", 2_000).expect("list");
+        assert_eq!(pending[0].notice.launched_by, raised.launched_by);
+        assert!(pending[1].notice.launched_by.is_empty());
+    }
+
+    #[test]
+    fn a_name_that_would_split_is_dropped_not_stored() {
+        let names = vec!["a.exe".to_string(), "b\nc".to_string(), "d.exe".to_string()];
+        assert_eq!(
+            decode_launched_by(&encode_launched_by(&names)),
+            vec!["a.exe", "d.exe"]
+        );
+        let long = vec!["x".repeat(1500), "y".repeat(1500)];
+        assert_eq!(decode_launched_by(&encode_launched_by(&long)).len(), 1);
     }
 
     #[test]

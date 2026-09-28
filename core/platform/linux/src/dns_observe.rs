@@ -64,6 +64,7 @@ impl ResolvedDnsObserver {
             .map_err(|e| {
                 tracing::info!(
                     target: "nrr::dns",
+                    msg_key = "linux-dns-monitor-unavailable",
                     error = %e,
                     "systemd-resolved's query monitor is not available; DNS resolutions are not \
                      observed on this machine",
@@ -89,6 +90,7 @@ impl ResolvedDnsObserver {
                 // a machine may legitimately stop its resolver.
                 tracing::info!(
                     target: "nrr::dns",
+                    msg_key = "linux-dns-monitor-stream-ended",
                     "the DNS query monitor stream ended; resolutions are no longer observed",
                 );
             })
@@ -242,7 +244,7 @@ mod tests {
     /// caller must be able to tell that apart from a quiet network.
     #[test]
     fn a_foreign_resolv_conf_means_nothing_will_be_observed() {
-        let foreign = "Global\n  resolv.conf mode: foreign\n  Current DNS Server: 172.23.208.1\n";
+        let foreign = "Global\n  resolv.conf mode: foreign\n  Current DNS Server: 192.0.2.53\n";
         let stub = "Global\n  resolv.conf mode: stub\n  Current DNS Server: 127.0.0.53\n";
 
         assert!(!resolutions_pass_through_resolved(foreign));

@@ -170,6 +170,7 @@ fn run_with_timeout(args: &[String], timeout: Duration) -> Option<i32> {
         .map_err(|e| {
             tracing::info!(
                 target: "nrr::authorization",
+                msg_key = "linux-polkit-unavailable",
                 error = %e,
                 "polkit is not available on this machine; privileged operations stay refused",
             );
@@ -186,6 +187,7 @@ fn run_with_timeout(args: &[String], timeout: Duration) -> Option<i32> {
                     let _ = child.wait();
                     tracing::warn!(
                         target: "nrr::authorization",
+                        msg_key = "linux-polkit-check-timed-out",
                         timeout_secs = timeout.as_secs(),
                         "the authorization check did not finish in time; treating it as unanswered",
                     );

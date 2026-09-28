@@ -297,10 +297,11 @@ Process filename match. Both exact names and glob patterns are accepted.
 Glob semantics:
 
 - `*` matches **zero or more characters** (any character, including `.` and
-  `-`).
+  `-`). It is the only wildcard: `?` has no special meaning.
 - A bare `*` as the entire match value is a **validation error** — too
   broad, would match every running process.
-- Matching is **case-insensitive on Windows**; case-sensitive on Linux.
+- Matching is **case-insensitive** on every platform: `Telegram.exe`,
+  `telegram.exe` and `TELEGRAM.EXE` name the same program.
 - Only the **process filename** is matched, not the full path.
 
 Precedence within the Application tier: an exact name always takes
@@ -433,6 +434,15 @@ Key properties:
   (`# telemetry.vendor.example +block`); it is retained but inactive.
 - A matched `+block` rule short-circuits to **DROP** at its evaluation tier
   (§1.5); no lower tier or the default route is consulted for that connection.
+- **An IP block wins over every other rule for that address.** A site whose
+  name you route is still blocked while it answers on an address you blocked.
+- **A block wins a tie.** When a block rule and a route rule name the same
+  destination equally narrowly — even from different files — the destination
+  is blocked. The Overlaps screen points out such pairs.
+- **A narrower route keeps a shared address open.** When a site you route by
+  a narrower rule shares an address with sites a wider block covers, that
+  address stays reachable, and so do those other sites on it. The Overlaps
+  screen lists these cases for the rules currently applied.
 - **Where a block rule is authored.** The flag applies wherever it appears in a
   rules file, and an existing block rule stays one when you open it in the app.
   The Add/Edit Rule dialog does not offer Block as a target for a *new* rule —

@@ -333,6 +333,7 @@ impl DnsRefreshOrchestrator {
             Err(_) => {
                 tracing::warn!(
                     target: "nrr::dns",
+                    msg_key = "dns-refresh-touch-mutex-poisoned",
                     "cache mutex poisoned; skipping touch_last_rebuild_at"
                 );
                 return;
@@ -341,6 +342,7 @@ impl DnsRefreshOrchestrator {
         if let Err(e) = guard.touch_last_rebuild_at(now_ms) {
             tracing::warn!(
                 target: "nrr::dns",
+                msg_key = "dns-refresh-touch-failed",
                 error = %e,
                 "touch_last_rebuild_at failed after successful DNS refresh batch"
             );
@@ -353,6 +355,7 @@ impl DnsRefreshOrchestrator {
             Err(_) => {
                 tracing::warn!(
                     target: "nrr::dns",
+                    msg_key = "dns-refresh-list-mutex-poisoned",
                     "cache mutex poisoned; skipping refresh tick"
                 );
                 return Err(());
@@ -363,6 +366,7 @@ impl DnsRefreshOrchestrator {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::dns",
+                    msg_key = "dns-refresh-list-expired-failed",
                     error = %e,
                     "list_expired_resolutions failed; skipping tick"
                 );
@@ -411,6 +415,7 @@ impl DnsRefreshOrchestrator {
                     if self.note_loopback_log_once(&row.canonical_hostname) {
                         tracing::info!(
                             target: "nrr::dns",
+                            msg_key = "dns-refresh-loopback-pinned",
                             hostname = %row.canonical_hostname,
                             retry_in_secs = wait.as_secs(),
                             "refresh resolved only to loopback/unspecified (hosts file?) — not cached",
@@ -440,6 +445,7 @@ impl DnsRefreshOrchestrator {
             Err(DnsResolverError::UnsupportedPlatform { reason }) => {
                 tracing::info!(
                     target: "nrr::dns",
+                    msg_key = "dns-refresh-unsupported-platform",
                     reason = %reason,
                     "DNS resolver unsupported on this platform; aborting refresh tick"
                 );
@@ -485,6 +491,7 @@ impl DnsRefreshOrchestrator {
         if let Err(e) = guard.upsert_resolution(entry) {
             tracing::warn!(
                 target: "nrr::dns",
+                msg_key = "dns-refresh-upsert-failed",
                 error = %e,
                 "upsert_resolution failed during refresh"
             );
@@ -518,6 +525,7 @@ impl DnsRefreshOrchestrator {
         ) {
             tracing::warn!(
                 target: "nrr::dns",
+                msg_key = "dns-refresh-record-failure-failed",
                 error = %e,
                 hostname = %hostname,
                 "record_failed_resolution failed during refresh"

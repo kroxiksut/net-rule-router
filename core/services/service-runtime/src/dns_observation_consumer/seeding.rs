@@ -66,6 +66,7 @@ impl DnsObservationConsumer {
         if summary.matched > 0 {
             tracing::info!(
                 target: "nrr::dns-observe",
+                msg_key = "dnsobs-os-cache-seeded",
                 matched = summary.matched,
                 refreshed = summary.refreshed,
                 ignored = summary.ignored,
@@ -141,6 +142,7 @@ impl DnsObservationConsumer {
         if kept {
             tracing::info!(
                 target: "nrr::dns-observe",
+                msg_key = "dnsobs-reverse-confirmed-rule-host-cached",
                 hostname = %hostname,
                 addresses = novel.len(),
                 "cached a reverse-confirmed rule host learned from an NRR drop (browser-cache/DoH blind spot)",
@@ -215,6 +217,7 @@ impl DnsObservationConsumer {
         if added > 0 {
             tracing::info!(
                 target: "nrr::dns-observe",
+                msg_key = "dnsobs-reverse-confirmed-direct-host-registered",
                 hostname = %hostname,
                 addresses = added,
                 "registered a reverse-confirmed DIRECT host from an NRR drop — block-all exemption compiles on the next reconcile",

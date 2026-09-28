@@ -1,21 +1,23 @@
 //! Sidecar database handle.
 //!
-//! Owns the single `rusqlite::Connection` for the sidecar SQLite file,
-//! configured with WAL journal mode and a 5000 ms busy timeout per the
-//! convention from `nrr-storage`. The migration runner is invoked
-//! automatically on [`SidecarDb::open`]; DAO methods land on this type
-//! in +0.3..+0.5 and dispatch through the inner `RefCell<Connection>`
-//! so they can take `&self` (one connection, one thread, mirroring
-//! `nrr-storage::store`).
+//! One `rusqlite::Connection` per PROCESS: the GUI launcher and the tray
+//! launcher each open the same per-user file, so every rule here — WAL, the
+//! 5000 ms busy timeout, the migration's write lock, the non-blocking
+//! checkpoint, the replaced-file check — assumes a second live connection.
+//! DAO methods take `&self` and borrow the connection through a `RefCell`
+//! (one connection, one thread, like `nrr-storage::store`).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
 
 use crate::error::{SidecarError, SidecarResult};
 use crate::migration::{self, MigrationSummary};
+
+/// How long a statement waits for the other process's lock before failing.
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 
 /// Owns the sidecar SQLite connection.
 pub struct SidecarDb {
@@ -27,6 +29,8 @@ pub struct SidecarDb {
     /// Outcome of the migration run that happened during `open`.
     /// Exposed for diagnostics; not load-bearing at runtime.
     last_migration: MigrationSummary,
+    /// Which file `path` named when the connection opened it.
+    identity: Option<FileIdentity>,
 }
 
 impl SidecarDb {
@@ -42,9 +46,8 @@ impl SidecarDb {
     /// * `journal_mode = WAL` (verified — some network filesystems
     ///   silently fall back to `delete`, which we treat as a fatal
     ///   environment error).
-    /// * `busy_timeout = 5000 ms` (matches `nrr-storage`; absorbs
-    ///   contention bursts during concurrent reads from the QML
-    ///   side without surfacing `SQLITE_BUSY` to the bridge).
+    /// * `busy_timeout = 5000 ms`, so the other process's short writes
+    ///   never surface as `SQLITE_BUSY`.
     /// * Schema at [`crate::LATEST_SCHEMA_VERSION`].
     pub fn open(path: impl AsRef<Path>) -> SidecarResult<Self> {
         let path = path.as_ref().to_path_buf();
@@ -52,18 +55,16 @@ impl SidecarDb {
         restrict_db_to_owner(&path);
         configure_pragmas(&conn, &path)?;
         let last_migration = migration::migrate(&mut conn)?;
+        let identity = file_identity(&path);
         let db = Self {
             path,
             conn: RefCell::new(conn),
             last_migration,
+            identity,
         };
-        // Startup VACUUM is throttled by file size AND minimum
-        // interval — see `vacuum::maybe_vacuum`. Failures are
-        // intentionally non-fatal: if VACUUM can't run for any
-        // reason the DB is still functional and the next launch will
-        // try again. Logging is left to the caller (the launcher
-        // process will see the error if it surfaces, but we don't
-        // want a transient stat() failure to block GUI startup).
+        // Throttled by size and interval (`vacuum::maybe_vacuum`). A failure
+        // leaves a working database and the next launch tries again, so it must
+        // not block startup.
         let _ = db.maybe_vacuum();
         Ok(db)
     }
@@ -89,6 +90,18 @@ impl SidecarDb {
         &self.last_migration
     }
 
+    /// Whether [`path`](Self::path) no longer names the file this connection
+    /// has open.
+    ///
+    /// On Unix the other process can unlink and recreate the file under a live
+    /// connection (the GUI's reset of an unopenable sidecar, a purge script),
+    /// and this connection would keep serving the orphaned inode until the
+    /// process restarts. Windows refuses to delete an open database, so there
+    /// only a missing file counts. A holder that sees `true` reopens the path.
+    pub fn file_replaced(&self) -> bool {
+        file_identity(&self.path) != self.identity
+    }
+
     /// Full-reset support. Clears every user
     /// data row (rule comments, foreign-OS passthrough sections, parked
     /// pending-apply snapshot, cached external IPs) in one transaction,
@@ -106,16 +119,42 @@ impl SidecarDb {
         Ok(())
     }
 
-    /// Internal accessor used by DAO modules in +0.3..+0.5.
-    #[allow(dead_code)] // wired in +0.3 onwards
+    /// Shared borrow of the connection for DAO reads.
     pub(crate) fn conn(&self) -> std::cell::Ref<'_, Connection> {
         self.conn.borrow()
     }
 
-    /// Internal `&mut` accessor for DAO methods that open transactions.
-    #[allow(dead_code)] // wired in +0.3 onwards
+    /// Exclusive borrow for DAO methods that open transactions.
     pub(crate) fn conn_mut(&self) -> std::cell::RefMut<'_, Connection> {
         self.conn.borrow_mut()
+    }
+}
+
+/// What makes two opens of one path the same file: device and inode on Unix.
+/// Elsewhere an open database cannot be replaced, so existence is enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileIdentity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Some(FileIdentity {
+            device: 0,
+            inode: 0,
+        })
     }
 }
 
@@ -143,21 +182,39 @@ fn restrict_db_to_owner(path: &Path) {
 /// the value is read back to guard against silent filesystem-level
 /// downgrades.
 fn configure_pragmas(conn: &Connection, path: &Path) -> SidecarResult<()> {
-    let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let mode = enable_wal(conn)?;
     if mode != "wal" {
-        return Err(SidecarError::PathResolution {
+        return Err(SidecarError::Environment {
             reason: format!(
                 "WAL mode not supported at {} (returned journal_mode = {mode:?})",
                 path.display()
             ),
         });
     }
-    // The service store enables this on every connection; the copy here did
-    // not, so the same schema enforced its foreign keys in one database and
-    // ignored them in the other. Nothing signalled the difference.
+    // Same as the service store, so the schema's foreign keys mean the same
+    // thing in both databases.
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    conn.busy_timeout(Duration::from_millis(5_000))?;
     Ok(())
+}
+
+/// Switch to WAL, retrying on `SQLITE_BUSY` within [`BUSY_TIMEOUT`].
+///
+/// Converting a fresh file needs an exclusive lock and SQLite answers BUSY
+/// without consulting the busy handler — so when the GUI and the tray open a
+/// new sidecar in the same instant, the loser failed outright.
+fn enable_wal(conn: &Connection) -> SidecarResult<String> {
+    let deadline = Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)) {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return Ok(other?),
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -202,6 +259,74 @@ mod tests {
         assert_eq!(db2.last_migration().from_version, LATEST_SCHEMA_VERSION);
         assert_eq!(db2.last_migration().to_version, LATEST_SCHEMA_VERSION);
         assert!(db2.last_migration().migrations_applied.is_empty());
+        Ok(())
+    }
+
+    /// GUI and tray start together on a fresh install and open the same file
+    /// in the same instant. Reading the version outside the migration's write
+    /// lock let both see 0, and the loser re-ran the v1 DDL.
+    #[test]
+    fn two_processes_opening_a_fresh_file_together_both_succeed() -> SidecarResult<()> {
+        use std::sync::{Arc, Barrier};
+        for round in 0..50 {
+            let tmp = tempfile::tempdir()?;
+            let path = tmp.path().join("sidecar.db");
+            let barrier = Arc::new(Barrier::new(2));
+            let openers: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SidecarDb::open(&path)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            for opener in openers {
+                let outcome = opener
+                    .join()
+                    .unwrap_or_else(|_| Err("opener thread panicked".to_string()));
+                assert_eq!(outcome, Ok(()), "round {round}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Unix lets the GUI unlink and rebuild the file while the tray's connection
+    /// still holds the old inode; the tray has to be able to tell.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_recreated_under_a_live_connection_is_noticed() -> SidecarResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("sidecar.db");
+        let tray = SidecarDb::open(&path)?;
+        assert!(!tray.file_replaced());
+
+        for suffix in ["", "-wal", "-shm"] {
+            let mut victim = path.clone().into_os_string();
+            victim.push(suffix);
+            match std::fs::remove_file(PathBuf::from(victim)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        let gui = SidecarDb::open(&path)?;
+
+        assert!(tray.file_replaced(), "the tray still serves the orphan");
+        assert!(!gui.file_replaced());
+        Ok(())
+    }
+
+    #[test]
+    fn an_untouched_file_is_not_reported_replaced() -> SidecarResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("sidecar.db");
+        let first = SidecarDb::open(&path)?;
+        let second = SidecarDb::open(&path)?;
+        assert!(!first.file_replaced());
+        assert!(!second.file_replaced());
         Ok(())
     }
 

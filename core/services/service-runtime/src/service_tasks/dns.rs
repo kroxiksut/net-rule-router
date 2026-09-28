@@ -86,6 +86,7 @@ pub fn build_rule_hostname_seed_task(
                     progressed = true;
                     tracing::info!(
                         target: "nrr::rule-seed",
+                        msg_key = "svctask-rule-hostname-seed",
                         sid = %sid,
                         resolved = summary.resolved,
                         already_cached = summary.already_cached,

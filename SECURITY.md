@@ -117,6 +117,8 @@ The privileged control-plane boundary is fixed by these rules:
 - User/session context must be checked where operation scope depends on interactive user ownership.
 - Read-only methods and mutating methods must be separated at the API contract level (distinct method sets and authorization paths).
 - Reads are scoped to the caller, not only mutations. A user sees their own diagnostics records and the machine-level ones; the records of another account are not returned to them. An administrator sees everything on the machine. The scope is decided by the service from the connection, never taken from the request.
+- Notifications are scoped the same way: an event about one user's state reaches only that user's connections, and a change to the shared baseline reaches everyone. No request can name another user as the recipient.
+- The client verifies the server as well. Before sending anything, a client confirms that the process answering on the service endpoint is the registered service itself, so a process that took the endpoint name first receives nothing. To let that check run from any session, ordinary users are granted only the right to query the service's status — not to start, stop or reconfigure it.
 
 ## Policy Data Model
 
@@ -262,6 +264,8 @@ If integrity verification fails:
 - record an audit event
 - alert the user
 
+If the service's signing key itself is lost while stored rules exist, nothing can be verified against it any more. The service then generates a new key, does not re-sign the old records, and keeps every user's rules in force — neither re-blessing possibly forged data nor rolling back legitimate rules — until the user acknowledges the reset. The fact that a reset awaits acknowledgement is kept under the same protection as the key, not in the database, so editing the database cannot fake the acknowledgement or shield a tampered revision. Every key loss raises its own alert.
+
 ### Third-Party Edits to Database Files
 
 The service-owned database files are managed by the application and are not a supported external editing surface. Opening and changing them directly with a generic database tool, instead of through the application's own settings, import, and export flows, is unsupported: it can leave the application unable to start, cause it to apply an unintended routing policy, or lose stored rules and settings. There are legitimate reasons to touch these files outside the application — restoring one from a backup or moving it to another machine — so this is not prohibited, but the product's stability guarantees only cover changes made through its own interfaces. Whoever edits these files with an outside tool is responsible for the consequences.
@@ -277,6 +281,8 @@ Required safeguards:
 - reject unknown or unsupported critical fields
 - apply limits on file size, nesting depth, and rule counts
 - normalize data before diffing and persistence
+- reject control characters in single-line fields, so a rule can never turn into several when a file is written back out
+- refuse a rule that enforcement cannot carry out as written instead of enforcing a wider version of it; a stored rule of such a shape is not enforced at all, and the product says so
 
 Rules by application should not rely only on a bare executable name when a stronger identity is available.
 The long-term preferred identity is a normalized executable path, with future room for publisher- or signature-aware verification.
@@ -289,6 +295,7 @@ The service should:
 - apply the candidate policy
 - verify expected post-apply state where possible
 - rollback automatically if application or verification fails
+- while a revision is being applied, serve that revision to every part of the service that reads rules, so no background pass enforces the previous one in the meantime
 
 Fail-Closed must be implemented as a product invariant, not as best effort.
 Traffic associated with `secondary` must not silently fall back to `primary` when that would violate active policy.
@@ -355,6 +362,13 @@ itself is not a security boundary by Microsoft's own design; what this
 model guarantees is that elevation can never be reached by a different
 user — only raised, as intended, by the same one.
 
+The elevated helper is held to narrow rules:
+- it never runs a program path received from the app — only the service executable installed beside itself;
+- before sending anything, the session secret included, the app confirms that the process answering on the helper's channel is an elevated copy of itself, so a process that claimed the channel name first learns nothing;
+- it writes its log only into a directory that no ordinary user could have created, owns, or redirected elsewhere;
+- the administrator prompt is offered only when elevation can actually fix the refusal;
+- a slow operation is never treated as a dead helper: the app neither restarts the helper nor repeats an operation that may already have run.
+
 **Reset to baseline** removes only the caller's own edits. It can never
 delete the baseline itself or another user's data; once a user's edits
 are gone, they are governed by the shared baseline again, exactly as if
@@ -414,6 +428,7 @@ Baseline rules:
 - distinguish user-facing diagnostics from security audit events
 - store cache freshness metadata, source metadata, and timestamps
 - avoid relying on stale or context-free FQDN/IP cache entries
+- import hostnames from browser history only out of the requesting user's own browser profiles, never another account's
 
 ## Application Updates and GitHub Releases
 

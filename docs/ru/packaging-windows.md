@@ -115,4 +115,6 @@ NetRuleRouter\
   запуске.
 - **Сценарии из `scripts\`, рассчитанные на дерево сборки** (`install-service.ps1`,
   `build.ps1`, `run.ps1`), из пакета не работают. Полезны там прежде всего
-  `reset-network.ps1`, `service-status.ps1` и `service-smoke.ps1`.
+  `reset-network.ps1`, `service-status.ps1` и `service-smoke.ps1`; работают
+  и `uninstall-service.ps1` с `purge-data.ps1` — они удаляют установленную
+  службу, откуда бы она ни была зарегистрирована.

@@ -1003,9 +1003,15 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
     let principal = nrr_platform_api::enforcement::UserPrincipal::from_linux_uid(1000);
     let sid = principal.as_stored().to_string();
     let resolvers = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(77, 88, 8, 8)];
+    let resolvers_v6 = [Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53)];
+    let all: Vec<IpAddr> = resolvers
+        .iter()
+        .map(|ip| IpAddr::V4(*ip))
+        .chain(resolvers_v6.iter().map(|ip| IpAddr::V6(*ip)))
+        .collect();
     let plan = EnforcementPlan {
         principal,
-        flows: plan_doh_dot_block(&sid, &resolvers, true),
+        flows: plan_doh_dot_block(&sid, &all, true),
         routes: Vec::new(),
         policy_rules: Vec::new(),
     };
@@ -1044,6 +1050,26 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
             );
         }
     }
+    // A dual-stack browser reaches the resolver over IPv6 too: `ip6 daddr`.
+    for ip in resolvers_v6 {
+        for proto in [6u8, 17u8] {
+            assert!(
+                rules.iter().any(|r| {
+                    r.verdict == NftVerdict::Drop
+                        && r.comment.starts_with("doh-block#")
+                        && r.matches.contains(&NftMatch::DstV6 {
+                            net: ip,
+                            prefix: 128,
+                        })
+                        && r.matches.contains(&NftMatch::Protocol(proto))
+                        && r.matches.contains(&NftMatch::DstPort(443))
+                }),
+                "no v6 443 drop for {ip} proto {proto} in {rules:#?}"
+            );
+        }
+    }
+    // No address match at all: the table is `inet`, so one rule cuts DoT over
+    // both families.
     for proto in [6u8, 17u8] {
         assert!(
             rules.iter().any(|r| {
@@ -1053,7 +1079,7 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
                     && !r
                         .matches
                         .iter()
-                        .any(|m| matches!(m, NftMatch::DstV4 { .. }))
+                        .any(|m| matches!(m, NftMatch::DstV4 { .. } | NftMatch::DstV6 { .. }))
             }),
             "the DoT cut must be global, not per-resolver: {rules:#?}"
         );
@@ -1072,7 +1098,12 @@ fn slice_doh_dot_matches_current_codegen() {
     use nrr_platform_api::wfp_behavioral::{arbitration_order_preserved, behaviorally_equivalent};
 
     let sid = "S-1-5-21-1-2-3-1001";
-    let ips = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(77, 88, 8, 8)];
+    let ips = [
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53)),
+    ];
 
     let check = |block_dot: bool, expected_len: usize| {
         let current = doh_dot_block_filters(sid, &ips, block_dot);
@@ -1100,9 +1131,9 @@ fn slice_doh_dot_matches_current_codegen() {
         );
     };
 
-    // Per packed chunk: TCP+UDP on 443; + global DoT (TCP+UDP on 853).
-    let chunks = nrr_platform_api::wfp_slotting::pack_v4(ips).len();
-    check(true, chunks * 2 + 2);
+    // Per packed chunk: TCP+UDP on 443; + global DoT (TCP+UDP on 853) per family.
+    let chunks = nrr_platform_api::wfp_slotting::pack_both(ips).len();
+    check(true, chunks * 2 + 4);
     // Without DoT: only the packed 443 blocks.
     check(false, chunks * 2);
 }
@@ -1112,10 +1143,12 @@ fn slice_doh_dot_matches_current_codegen() {
 fn doh_lockdown_skips_exempt_resolver_ips() {
     use crate::killswitch_codegen::doh_dot_block_filters;
     let sid = "S-1-5-21-1-2-3-1001";
-    let ips = [
-        Ipv4Addr::new(127, 0, 0, 1),   // loopback — skipped
-        Ipv4Addr::new(169, 254, 1, 1), // link-local — skipped
-        Ipv4Addr::new(9, 9, 9, 9),     // public — blocked
+    let ips: [IpAddr; 5] = [
+        Ipv4Addr::new(127, 0, 0, 1).into(),   // loopback — skipped
+        Ipv4Addr::new(169, 254, 1, 1).into(), // link-local — skipped
+        Ipv6Addr::LOCALHOST.into(),           // loopback — skipped
+        Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into(), // link-local — skipped
+        Ipv4Addr::new(9, 9, 9, 9).into(),     // public — blocked
     ];
     let filters = doh_dot_block_filters(sid, &ips, false);
     assert_eq!(filters.len(), 2, "only the public IP yields TCP+UDP blocks");
@@ -1126,6 +1159,72 @@ fn doh_lockdown_skips_exempt_resolver_ips() {
         .iter()
         .any(|f| f.covers_v4(Ipv4Addr::new(127, 0, 0, 1))
             || f.covers_v4(Ipv4Addr::new(169, 254, 1, 1))));
+}
+
+// A dual-stack browser reaches the same resolver over IPv6. The v6 half lives
+// at the v6 ALE layer with the v4 half's band, ports and protocols, and adding
+// it leaves every v4 filter exactly as a v4-only list produced it.
+#[test]
+fn doh_lockdown_covers_ipv6_without_moving_the_v4_filters() {
+    use crate::killswitch_codegen::doh_dot_block_filters;
+    use crate::wfp_bands::DOH_BLOCK_BASE;
+    use nrr_platform_api::types::{WfpAction, WfpLayerKey};
+
+    let sid = "S-1-5-21-1-2-3-1001";
+    let v4: [IpAddr; 2] = [
+        Ipv4Addr::new(8, 8, 8, 8).into(),
+        Ipv4Addr::new(1, 1, 1, 1).into(),
+    ];
+    let v6 = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+    let mixed: Vec<IpAddr> = v4.iter().copied().chain([IpAddr::V6(v6)]).collect();
+
+    let before = doh_dot_block_filters(sid, &v4, true);
+    let after = doh_dot_block_filters(sid, &mixed, true);
+
+    let v4_half = |filters: &[nrr_platform_api::types::WfpFilterSpec]| {
+        filters
+            .iter()
+            .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV4)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        v4_half(&after),
+        v4_half(&before),
+        "the v4 half must not move"
+    );
+
+    let v6_filters: Vec<_> = after
+        .iter()
+        .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV6)
+        .collect();
+    // One packed chunk × TCP/UDP on 443, then the v6 DoT pair.
+    assert_eq!(v6_filters.len(), 4, "{v6_filters:#?}");
+    for (i, (port, proto)) in [(443, 6), (443, 17), (853, 6), (853, 17)]
+        .into_iter()
+        .enumerate()
+    {
+        let f = v6_filters[i];
+        assert_eq!(f.action, WfpAction::Block);
+        assert_eq!(f.weight, DOH_BLOCK_BASE + i as u64);
+        assert_eq!(f.remote_port, Some(port));
+        assert_eq!(f.ip_protocol, Some(proto));
+        assert_eq!(f.user_sid.as_deref(), Some(sid));
+        assert!(f.remote_ip_set.is_empty());
+        assert_eq!(f.covers_v6(v6), port == 443);
+        f.validate_layer_conditions()
+            .expect("expressible at its layer");
+    }
+    // The two global DoT cuts are distinct filters, not one id twice.
+    let mut ids: Vec<_> = after.iter().map(|f| f.id).collect();
+    ids.sort_unstable_by_key(|id| id.raw);
+    ids.dedup();
+    assert_eq!(ids.len(), after.len(), "filter ids must be unique");
+
+    // With no v6 resolver listed, DoT is still cut over IPv6.
+    assert!(before
+        .iter()
+        .any(|f| f.layer == WfpLayerKey::AleAuthConnectV6 && f.remote_port == Some(853)));
 }
 
 // ── EQUIVALENCE — multi-protocol kill-switch (Windows only) ─────────────────
@@ -1655,5 +1754,63 @@ fn slice5_routes_match_current_codegen() {
                 );
             }
         }
+    }
+}
+
+/// The planner twin of the codegen skip: an application + address rule plans
+/// no flow of any kind, is reported, and leaves the other rules alone.
+#[test]
+fn an_app_and_address_rule_plans_nothing_and_is_reported() {
+    use nrr_domain::canonical::{CanonicalAppMatch, CanonicalAppPattern};
+    use nrr_domain::rule_shape::UnsupportedShapeReason;
+    let combined_ip = Ipv4Addr::new(192, 0, 2, 50);
+    let plain_ip = Ipv4Addr::new(192, 0, 2, 51);
+    let cache = MapCache::default();
+    let mut resolver = MapResolver::default();
+    resolver.0.insert(
+        "chrome.exe".into(),
+        vec![std::path::PathBuf::from("/opt/chrome/chrome.exe")],
+    );
+    let mut obs = MapObs::default();
+    obs.0.insert("chrome.exe".into(), vec![combined_ip]);
+    for (action, reason) in [
+        (
+            RuleAction::Route,
+            UnsupportedShapeReason::AppScopedDestinationRoute,
+        ),
+        (
+            RuleAction::Block,
+            UnsupportedShapeReason::AppScopedDestinationBlock,
+        ),
+    ] {
+        let mut combined = rule(
+            "s-combined",
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(combined_ip)),
+            action,
+        );
+        combined.app_match = Some(CanonicalAppMatch {
+            pattern: CanonicalAppPattern::Exact("chrome.exe".into()),
+            include_child_processes: false,
+        });
+        let rule_book = book(vec![exact_ip_rule("p-plain", plain_ip)], vec![combined]);
+        let (flows, report) = plan_route_rules(
+            &rule_book,
+            "S-1-5-21-1",
+            RouteBehaviorMode::PreferPrimary,
+            &planner_input(&cache, &resolver, &obs),
+        );
+        assert!(
+            flows
+                .iter()
+                .all(|f| f.app == AppScope::Any && f.flow.dst != DstMatch::HostV4(combined_ip)),
+            "{action:?}: nothing planned for the combined rule: {flows:?}"
+        );
+        assert!(flows
+            .iter()
+            .any(|f| f.flow.dst == DstMatch::HostV4(plain_ip)));
+        assert_eq!(
+            report.unsupported_shapes,
+            vec![("s-combined".to_string(), reason)]
+        );
     }
 }

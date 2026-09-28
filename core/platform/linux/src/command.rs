@@ -22,14 +22,46 @@ pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// "permission denied" turned an access refusal into an unclassified mechanism
 /// error.
 pub fn output_with_timeout(exe: &str, args: &[&str], timeout: Duration) -> io::Result<Output> {
+    run_with_budget(exe, args, None, timeout)
+}
+
+/// [`output_with_timeout`] with `input` written to the child's stdin.
+pub fn output_with_input(
+    exe: &str,
+    args: &[&str],
+    input: &str,
+    timeout: Duration,
+) -> io::Result<Output> {
+    run_with_budget(exe, args, Some(input.as_bytes().to_vec()), timeout)
+}
+
+fn run_with_budget(
+    exe: &str,
+    args: &[&str],
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> io::Result<Output> {
     let mut child = Command::new(exe)
         .args(args)
         .env("LC_ALL", "C")
         .env("LANG", "C")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
+    // Written on its own thread and then closed: a child that reads its whole
+    // input before answering waits for the end of it.
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&bytes);
+        });
+    }
 
     // Drained on their own threads: a child that fills a pipe buffer blocks on
     // the write, and a parent that only polls `try_wait` would then wait for a
@@ -112,6 +144,23 @@ mod tests {
         )
         .expect("sh");
         assert_eq!(out.stdout.len(), 1_048_576);
+    }
+
+    #[test]
+    fn input_reaches_the_child_and_ends() {
+        let out = output_with_input(
+            "cat",
+            &[],
+            "nameserver 192.0.2.1
+",
+            DEFAULT_COMMAND_TIMEOUT,
+        )
+        .expect("cat");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "nameserver 192.0.2.1
+"
+        );
     }
 
     #[test]

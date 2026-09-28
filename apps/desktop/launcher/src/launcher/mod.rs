@@ -54,6 +54,16 @@ pub enum LauncherSurface {
     Tray,
 }
 
+impl LauncherSurface {
+    /// The profile the service admits this surface's binary under.
+    pub const fn client_profile(self) -> nrr_shared::ipc::IpcClientProfile {
+        match self {
+            Self::MainGui => nrr_shared::ipc::IpcClientProfile::GuiInteractive,
+            Self::Tray => nrr_shared::ipc::IpcClientProfile::TrayLightweight,
+        }
+    }
+}
+
 /// Configuration handed to [`run`] from the per-binary `main()`.
 #[derive(Clone, Debug)]
 pub struct LauncherConfig {
@@ -185,8 +195,9 @@ fn run_primary(
     diag_log(
         tag,
         &format!(
-            "NRR_LAUNCHER[primary] surface={:?} request_source={:?} request_section={:?}",
-            config.surface, request.source, request.section
+            "NRR_LAUNCHER[primary] surface={:?} request_source={:?} request_section={:?} \
+             request_focus={:?}",
+            config.surface, request.source, request.section, request.focus
         ),
     );
     // Seed the archive raw-log cap from the stored preference so an export
@@ -457,6 +468,7 @@ fn run_primary(
                     std::sync::Arc::clone(&broker_handle),
                     std::sync::Arc::clone(stdin),
                     connect_budget,
+                    config.surface.client_profile(),
                 );
             } else {
                 diag_log(
@@ -688,6 +700,18 @@ pub fn write_activation_request(request: &LaunchRequest, path: &Path) -> io::Res
         payload.insert(
             "reason".to_string(),
             serde_json::Value::String(reason.to_string()),
+        );
+    }
+    if let Some(focus) = request.focus.as_deref() {
+        payload.insert(
+            "focus".to_string(),
+            serde_json::Value::String(focus.to_string()),
+        );
+    }
+    if let Some(context) = request.focus_context.as_ref() {
+        payload.insert(
+            "focusContext".to_string(),
+            serde_json::to_value(context).map_err(io::Error::other)?,
         );
     }
 

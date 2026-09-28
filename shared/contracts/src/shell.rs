@@ -16,6 +16,7 @@ pub enum AppSection {
     VirtualMachines,
     Diagnostics,
     ConnectionTrace,
+    Cache,
     Logs,
     Settings,
 }
@@ -30,7 +31,7 @@ impl AppSection {
         Self::Settings,
     ];
 
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::InterfacesAndRoutes,
         Self::Rules,
         Self::RuleSuggestions,
@@ -38,6 +39,7 @@ impl AppSection {
         Self::VirtualMachines,
         Self::Diagnostics,
         Self::ConnectionTrace,
+        Self::Cache,
         Self::Logs,
         Self::Settings,
     ];
@@ -51,6 +53,7 @@ impl AppSection {
             Self::VirtualMachines => "rule-virtual-machines",
             Self::Diagnostics => "diagnostics",
             Self::ConnectionTrace => "conn-trace",
+            Self::Cache => "cache",
             Self::Logs => "logs",
             Self::Settings => "settings",
         }
@@ -65,6 +68,7 @@ impl AppSection {
             Self::VirtualMachines => "Virtual machines",
             Self::Diagnostics => "Diagnostics",
             Self::ConnectionTrace => "Connection trace",
+            Self::Cache => "Cache",
             Self::Logs => "Logs",
             Self::Settings => "Settings",
         }
@@ -89,6 +93,7 @@ impl FromStr for AppSection {
             "rule-virtual-machines" => Ok(Self::VirtualMachines),
             "diagnostics" => Ok(Self::Diagnostics),
             "conn-trace" => Ok(Self::ConnectionTrace),
+            "cache" => Ok(Self::Cache),
             "logs" => Ok(Self::Logs),
             "settings" => Ok(Self::Settings),
             _ => Err("unknown section id"),

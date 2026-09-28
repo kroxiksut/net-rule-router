@@ -99,4 +99,17 @@ pub trait SystemDnsRedirectPort: Send + Sync {
         let _ = exemptions;
         Ok(0)
     }
+
+    /// Keep single-label names resolvable behind the redirect: the OS
+    /// completes them with the machine's own suffixes, plus `extra` — suffixes
+    /// the user named for their networks.
+    ///
+    /// Called on every guard tick with the current set; an implementation
+    /// writes only on change and takes it all back in `restore`. Default:
+    /// nothing, for platforms whose resolver still completes short names with
+    /// the redirect in place.
+    fn keep_short_names(&self, extra: &[String]) -> Result<(), PlatformError> {
+        let _ = extra;
+        Ok(())
+    }
 }

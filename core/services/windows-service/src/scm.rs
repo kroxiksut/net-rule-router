@@ -168,13 +168,13 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
             // Logged on arrival: without this line a stop that never completes
             // is indistinguishable from a process that died on its own.
             ServiceControl::Stop => {
-                tracing::info!(target: "nrr::lifecycle", control = "stop", "SCM control received");
+                tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "stop", "SCM control received");
                 let _ = tx.send(LifecycleEvent::Stop);
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Shutdown => {
-                tracing::info!(target: "nrr::lifecycle", control = "shutdown", "SCM control received");
+                tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "shutdown", "SCM control received");
                 let _ = tx.send(LifecycleEvent::Shutdown);
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
@@ -184,7 +184,7 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
             // Teardown restores system DNS and unwinds packet filters; cut off
             // halfway it leaves the OS resolving through a listener that is gone.
             ServiceControl::Preshutdown => {
-                tracing::info!(target: "nrr::lifecycle", control = "preshutdown", "SCM control received");
+                tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "preshutdown", "SCM control received");
                 let _ = tx.send(LifecycleEvent::Shutdown);
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
@@ -317,6 +317,7 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
         verbosity_handle = Some(handle);
         tracing::info!(
             target: "nrr::stability",
+            msg_key = "svc-scm-verbose-logging",
             verbose,
             "operational NDJSON verbosity",
         );
@@ -330,6 +331,7 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
     );
     tracing::info!(
         target: "nrr::recovery",
+        msg_key = "svc-scm-crash-recovery-complete",
         outcome = ?recovery_outcome,
         "crash recovery probe complete",
     );
@@ -353,21 +355,23 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
         Some(true) => {}
         Some(false) => tracing::error!(
             target: "nrr::boot",
+            msg_key = "svc-scm-bfe-not-running",
             "the Windows Base Filtering Engine (BFE) service is not running — nothing can be enforced \
              until it is started; every filter operation from here on will fail or hang",
         ),
         None => tracing::warn!(
             target: "nrr::boot",
+            msg_key = "svc-scm-bfe-status-unknown",
             "could not read the state of the Windows Base Filtering Engine (BFE) service",
         ),
     }
 
-    tracing::info!(target: "nrr::boot", stage = "strip-orphaned-filters", "boot stage entered");
+    tracing::info!(target: "nrr::boot", msg_key = "svc-scm-boot-stage-entered", stage = "strip-orphaned-filters", "boot stage entered");
     crate::runtime_deps::strip_orphaned_block_filters_standalone();
 
-    tracing::info!(target: "nrr::boot", stage = "build-deps", "boot stage entered");
+    tracing::info!(target: "nrr::boot", msg_key = "svc-scm-boot-stage-entered", stage = "build-deps", "boot stage entered");
     let deps = crate::runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
-    tracing::info!(target: "nrr::boot", stage = "run-runtime", "boot stage entered");
+    tracing::info!(target: "nrr::boot", msg_key = "svc-scm-boot-stage-entered", stage = "run-runtime", "boot stage entered");
     let _ = run_supervised_runtime(&controller, &stop, artifacts, deps);
 
     // Net-event collection is a MACHINE-WIDE Base Filtering Engine setting, not

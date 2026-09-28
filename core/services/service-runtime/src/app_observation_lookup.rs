@@ -533,35 +533,9 @@ pub fn pattern_matches(pattern: &str, key: &str) -> bool {
     }
 }
 
-/// Minimal glob match: `*` matches any (possibly empty) run of characters; no
-/// other metacharacters. Both sides are already lowercased file names.
+/// `*` is the only metacharacter here; `?` stays literal, as it always has.
 fn glob_match(pattern: &str, name: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == name; // no wildcard
-    }
-    // First segment is an anchored prefix.
-    let Some(mut rest) = name.strip_prefix(parts[0]) else {
-        return false;
-    };
-    let last_idx = parts.len() - 1;
-    for (i, seg) in parts.iter().enumerate().skip(1) {
-        if seg.is_empty() {
-            continue;
-        }
-        if i == last_idx {
-            // Final segment is an anchored suffix of what remains.
-            if !rest.ends_with(seg) {
-                return false;
-            }
-        } else {
-            match rest.find(seg) {
-                Some(idx) => rest = &rest[idx + seg.len()..],
-                None => return false,
-            }
-        }
-    }
-    true
+    nrr_shared::glob::glob_match(pattern, name)
 }
 
 /// Process-wide singleton observation store.

@@ -1714,3 +1714,91 @@ fn the_zone_priority_setting_changes_which_link_the_filters_pin() {
     );
     assert_eq!(zone_first.owner_of(IpAddr::V4(ip)), Some(Link::Main));
 }
+
+fn app_and_address_rule(id: &str, addr: Ipv4Addr, action: nrr_domain::RuleAction) -> CanonicalRule {
+    let mut r = exact_ip_rule(id, addr);
+    r.app_match = app_rule(id, "chrome.exe", false).app_match;
+    r.action = action;
+    r
+}
+
+/// Enforcing only the address half would apply the rule to every process, so
+/// the rule emits nothing at all — and says why.
+#[test]
+fn an_app_and_address_rule_is_skipped_whole_for_either_action() {
+    use nrr_domain::rule_shape::UnsupportedShapeReason;
+    let combined_ip = Ipv4Addr::new(192, 0, 2, 50);
+    let plain_ip = Ipv4Addr::new(192, 0, 2, 51);
+    let cache = MockFqdnCacheLookup::new();
+    let resolver =
+        MockAppPathResolver::new().with("chrome.exe", vec![PathBuf::from(r"C:\Apps\chrome.exe")]);
+    let app_obs = MockAppObservationLookup::new();
+    app_obs.set_ips("chrome.exe", vec![combined_ip]);
+    for (action, reason) in [
+        (
+            nrr_domain::RuleAction::Route,
+            UnsupportedShapeReason::AppScopedDestinationRoute,
+        ),
+        (
+            nrr_domain::RuleAction::Block,
+            UnsupportedShapeReason::AppScopedDestinationBlock,
+        ),
+    ] {
+        let rule_book = book(
+            vec![exact_ip_rule("p-plain", plain_ip)],
+            vec![app_and_address_rule("s-combined", combined_ip, action)],
+        );
+        let out = generate_filters(CodegenInput {
+            sid: "S",
+            rule_book: &rule_book,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &app_obs,
+            app_resolver: &resolver,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
+            families: crate::enforcement_planner::FamilyScope::V4Only,
+        });
+        assert!(
+            out.filters.iter().all(|f| f.app_pattern.is_none()
+                && destination_ips(f).all(|ip| ip != IpAddr::V4(combined_ip))),
+            "{action:?}: no filter of any kind for the combined rule: {:?}",
+            out.filters
+        );
+        assert!(
+            out.filters
+                .iter()
+                .any(|f| destination_ips(f).any(|ip| ip == IpAddr::V4(plain_ip))),
+            "{action:?}: the other rule is untouched"
+        );
+        assert!(out.secondary_dest_ips.is_empty() && out.secondary_app_patterns.is_empty());
+        assert!(out
+            .diagnostics
+            .contains(&CodegenDiagnostic::UnsupportedRuleShape {
+                rule_id: "s-combined".into(),
+                reason,
+            }));
+    }
+}
+
+/// A capability alone never makes a shape the emitters do not implement pass.
+#[test]
+fn no_capability_set_unlocks_an_unimplemented_shape() {
+    use nrr_platform_api::enforcement::AppMatchMechanism;
+    let everything = EnforcementCapabilities {
+        per_user_routing: true,
+        per_app_routing_true: true,
+        per_app_block_leakproof: true,
+        per_user_all_protocol_scoping: true,
+        app_match: AppMatchMechanism::WfpAppId,
+    };
+    for caps in [
+        everything,
+        EnforcementCapabilities::windows(),
+        EnforcementCapabilities::linux_mvp(),
+        EnforcementCapabilities::macos_mvp(),
+    ] {
+        assert_eq!(rule_shape_support(&caps), RuleShapeSupport::NONE);
+    }
+    assert_eq!(current_rule_shape_support(), RuleShapeSupport::NONE);
+}

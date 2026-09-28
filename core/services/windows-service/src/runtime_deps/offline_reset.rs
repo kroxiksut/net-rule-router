@@ -8,10 +8,73 @@
 
 use super::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use nrr_platform_windows::constants::MAX_FILTERS_PER_TRANSACTION;
+use nrr_platform_windows::{ErrorClass, PlatformError, WfpAction};
+
+/// Set once the runtime holds its own engine session. From then on a block
+/// under our provider may be a live kill-switch, and the runtime strips its
+/// predecessor's orphans itself before its first write — so a boot strip that
+/// lands after this point must not delete anything.
+static RUNTIME_OWNS_FILTERS: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn mark_runtime_owns_filters() {
+    RUNTIME_OWNS_FILTERS.store(true, Ordering::SeqCst);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OrphanStrip {
+    Stripped(usize),
+    /// The strip landed after the runtime took over; nothing was deleted.
+    RuntimeOwnsFilters,
+}
+
+/// Deletes the block filters that existed when it enumerated, unless the
+/// runtime has taken over. The check runs inside each open write transaction:
+/// the engine serializes writers, so a check that passes there cannot be
+/// overtaken by a runtime write before the deletes commit.
+fn strip_orphaned_blocks_unless_runtime_armed(
+    session: &WfpSession,
+    runtime_armed: &AtomicBool,
+) -> Result<OrphanStrip, PlatformError> {
+    let orphans: Vec<_> = session
+        .enumerate_our_filters()?
+        .into_iter()
+        .filter(|f| f.action == WfpAction::Block)
+        .map(|f| f.id)
+        .collect();
+    let mut removed = 0usize;
+    for batch in orphans.chunks(MAX_FILTERS_PER_TRANSACTION) {
+        let txn = session.begin_transaction()?;
+        if runtime_armed.load(Ordering::SeqCst) {
+            // Dropping the guard aborts; batches already committed held only
+            // orphans, since the check passed inside their transactions.
+            return Ok(OrphanStrip::RuntimeOwnsFilters);
+        }
+        for id in batch {
+            match session.delete_filter(*id) {
+                Ok(()) => removed += 1,
+                Err(e) if e.classify() == ErrorClass::Idempotent => {}
+                // Best-effort: one block that will not go must not keep the
+                // rest armed.
+                Err(e) => tracing::warn!(
+                    target: "nrr::runtime",
+                    msg_key = "svc-offline-standalone-strip-failed",
+                    "standalone block-filter strip failed: {e:?}",
+                ),
+            }
+        }
+        txn.commit()?;
+    }
+    Ok(OrphanStrip::Stripped(removed))
+}
+
 pub(crate) fn strip_orphaned_block_filters_standalone() {
     let (tx, rx) = std::sync::mpsc::channel();
     // Detached on purpose: if it is stuck in the engine it will not answer a
-    // cancel either, and the cleanup it performs is idempotent whenever it lands.
+    // cancel either. A late landing is safe: it deletes nothing once the
+    // runtime owns the filters.
     std::thread::Builder::new()
         .name("nrr-orphan-strip".to_string())
         .spawn(move || {
@@ -22,6 +85,7 @@ pub(crate) fn strip_orphaned_block_filters_standalone() {
     if rx.recv_timeout(ORPHAN_STRIP_BUDGET).is_err() {
         tracing::warn!(
             target: "nrr::runtime",
+            msg_key = "svc-offline-orphan-strip-timed-out",
             budget_secs = ORPHAN_STRIP_BUDGET.as_secs(),
             "startup: orphaned-filter strip did not finish in time — continuing the boot without it \
              (a leftover kill-switch may still be in force until the strip lands)",
@@ -33,21 +97,31 @@ fn strip_orphaned_block_filters_blocking() {
     tracing::debug!(target: "nrr::runtime", "startup: opening WFP to strip orphaned block filters");
     let api: Arc<dyn WindowsApiPort> = Arc::new(ProductionWindowsApi);
     match WfpSession::open(Arc::clone(&api)) {
-        Ok(session) => match session.cleanup_blocks_only() {
-            Ok(0) => {}
-            Ok(n) => tracing::warn!(
-                target: "nrr::runtime",
-                stripped_blocks = n as u64,
-                "startup: stripped orphaned block/kill-switch WFP filter(s) \
-                 (standalone recovery path)",
-            ),
-            Err(e) => tracing::warn!(
-                target: "nrr::runtime",
-                "standalone block-filter strip failed: {e:?}",
-            ),
-        },
+        Ok(session) => {
+            match strip_orphaned_blocks_unless_runtime_armed(&session, &RUNTIME_OWNS_FILTERS) {
+                Ok(OrphanStrip::Stripped(0)) => {}
+                Ok(OrphanStrip::RuntimeOwnsFilters) => tracing::info!(
+                    target: "nrr::runtime",
+                    "startup: orphaned-filter strip landed after the runtime took over its filters — \
+                     skipped (the runtime already stripped its predecessor's blocks)",
+                ),
+                Ok(OrphanStrip::Stripped(n)) => tracing::warn!(
+                    target: "nrr::runtime",
+                    msg_key = "svc-offline-standalone-blocks-stripped",
+                    stripped_blocks = n as u64,
+                    "startup: stripped orphaned block/kill-switch WFP filter(s) \
+                     (standalone recovery path)",
+                ),
+                Err(e) => tracing::warn!(
+                    target: "nrr::runtime",
+                    msg_key = "svc-offline-standalone-strip-failed",
+                    "standalone block-filter strip failed: {e:?}",
+                ),
+            }
+        }
         Err(e) => tracing::warn!(
             target: "nrr::runtime",
+            msg_key = "svc-offline-standalone-engine-open-failed",
             "standalone block-filter strip: WFP engine open failed: {e:?}",
         ),
     }
@@ -97,8 +171,6 @@ pub(crate) enum SweepOutcome {
 /// opposite things of the person running it, and only the sweep knows which
 /// happened.
 pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
-    use nrr_platform_windows::ErrorClass;
-
     let api: Arc<dyn WindowsApiPort> = Arc::new(ProductionWindowsApi);
 
     // ── WFP filter sweep (the lockout risk) ────────────────────────────
@@ -152,61 +224,21 @@ pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
     nrr_platform_windows::conn_observe::wfp_events::restore_engine_options();
 
     // ── Route sweep (best-effort) ──────────────────────────────────────
-    // Enumerate the live OS route table and adopt every route carrying our
-    // signature (`SECONDARY_ROUTE_METRIC` at prefix /32 or /2 — the secondary
-    // host routes and the mode-A counter-overlay halves), then `clear()`
-    // deletes them. Purely signature-based, so it needs no per-SID binding
-    // state and works fully offline — the same shapes
-    // `SecondaryRouteCoordinator::adopt_orphans_from_table` adopts on startup.
-    // Any failure is non-fatal: our routes are non-persistent and clear on the
-    // next reboot regardless.
-    let routes_removed: Option<usize> = match api.get_ip_forward_table() {
-        Ok(table) => {
-            let orphans: Vec<_> = table
-                .into_iter()
-                .filter(|r| {
-                    // Shape asked of the codegen, family included: `/32` on an
-                    // IPv6 row is a PREFIX, not a host route, and adopting one
-                    // would hand the reconciler a stranger to delete.
-                    r.metric == nrr_service_runtime::route_codegen::SECONDARY_ROUTE_METRIC
-                        && nrr_service_runtime::route_codegen::is_owned_shape(
-                            r.destination,
-                            r.prefix_length,
-                        )
-                })
-                .map(|mut r| {
-                    r.is_ours = true;
-                    r
-                })
-                .collect();
-            if orphans.is_empty() {
-                Some(0)
-            } else {
-                let reconciler =
-                    nrr_service_runtime::route_reconciler::SecondaryRouteReconciler::new(
-                        Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
-                    );
-                reconciler.adopt_owned(orphans);
-                match reconciler.clear() {
-                    Ok(delta) => Some(delta.removed),
-                    Err(e) => {
-                        eprintln!(
-                            "cleanup: route sweep failed ({e:?}); a reboot fully clears any \
-                             remaining NetRuleRouter routes."
-                        );
-                        None
-                    }
-                }
+    // Signature-based, so it needs no per-SID state; the same sweep the Linux
+    // daemon's `cleanup` runs. Non-fatal: our routes do not survive a reboot.
+    let routes_removed: Option<usize> =
+        match nrr_service_runtime::route_reconciler::sweep_owned_routes(
+            Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>
+        ) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!(
+                    "cleanup: route sweep failed ({e}); a reboot fully clears any remaining \
+                     NetRuleRouter routes."
+                );
+                None
             }
-        }
-        Err(e) => {
-            eprintln!(
-                "cleanup: could not enumerate the route table ({e:?}); a reboot fully clears \
-                 any remaining NetRuleRouter routes."
-            );
-            None
-        }
-    };
+        };
 
     // ── NRPT / DNS-redirect sweep (the DNS-lockout risk) ───────────────
     // A crashed Mode-B (Resolver) session leaves an NRPT catch-all rule
@@ -248,5 +280,120 @@ pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
         SweepOutcome::Done
     } else {
         SweepOutcome::Failed
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use nrr_platform_windows::{
+        MockWindowsApi, WfpFilterAction, WfpFilterId, WfpFilterSpec, WfpLayerKey,
+    };
+    use std::net::Ipv4Addr;
+
+    fn filter(id: u64, action: WfpAction) -> WfpFilterSpec {
+        WfpFilterSpec {
+            layer: WfpLayerKey::AleAuthConnectV4,
+            action,
+            remote_ip: Some(Ipv4Addr::new(192, 0, 2, id as u8)),
+            remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
+            remote_port: None,
+            weight: 0x100000 + id,
+            id: WfpFilterId::from_raw(id),
+            user_sid: None,
+            app_pattern: None,
+            local_interface_luid: None,
+            remote_subnet: None,
+            remote_subnet_v6: None,
+            ip_protocol: None,
+        }
+    }
+
+    fn install(session: &WfpSession, filters: &[WfpFilterSpec]) {
+        let actions: Vec<_> = filters
+            .iter()
+            .cloned()
+            .map(WfpFilterAction::AddFilter)
+            .collect();
+        session.execute_wfp_plan(&actions).unwrap();
+    }
+
+    fn installed_ids(api: &MockWindowsApi) -> Vec<u64> {
+        let mut ids: Vec<u64> = api
+            .wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.id.raw)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn session(api: &Arc<MockWindowsApi>) -> WfpSession {
+        WfpSession::open(Arc::clone(api) as Arc<dyn WindowsApiPort>).unwrap()
+    }
+
+    #[test]
+    fn strip_before_the_runtime_arms_removes_orphaned_blocks_and_keeps_permits() {
+        let api = Arc::new(MockWindowsApi::new());
+        let crashed_run = session(&api);
+        install(
+            &crashed_run,
+            &[
+                filter(1, WfpAction::Block),
+                filter(2, WfpAction::Permit),
+                filter(3, WfpAction::Block),
+            ],
+        );
+
+        let outcome =
+            strip_orphaned_blocks_unless_runtime_armed(&session(&api), &AtomicBool::new(false))
+                .unwrap();
+
+        assert_eq!(outcome, OrphanStrip::Stripped(2));
+        assert_eq!(installed_ids(&api), vec![2]);
+    }
+
+    #[test]
+    fn strip_landing_after_the_runtime_armed_leaves_its_blocks_installed() {
+        let api = Arc::new(MockWindowsApi::new());
+        install(
+            &session(&api),
+            &[filter(1, WfpAction::Block), filter(3, WfpAction::Block)],
+        );
+        // The runtime takes over: strips its predecessor's blocks itself, then
+        // arms a kill-switch — one under an id an orphan also carried, since
+        // filter ids are derived deterministically.
+        let armed = AtomicBool::new(true);
+        let runtime = session(&api);
+        runtime.cleanup_blocks_only().unwrap();
+        install(
+            &runtime,
+            &[filter(1, WfpAction::Block), filter(10, WfpAction::Block)],
+        );
+
+        let outcome = strip_orphaned_blocks_unless_runtime_armed(&session(&api), &armed).unwrap();
+
+        assert_eq!(outcome, OrphanStrip::RuntimeOwnsFilters);
+        assert_eq!(installed_ids(&api), vec![1, 10]);
+    }
+
+    #[test]
+    fn strip_crossing_the_batch_cap_removes_every_orphan() {
+        let api = Arc::new(MockWindowsApi::new());
+        let orphans: Vec<_> = (0..(MAX_FILTERS_PER_TRANSACTION as u64 + 3))
+            .map(|id| filter(id, WfpAction::Block))
+            .collect();
+        install(&session(&api), &orphans);
+
+        let outcome =
+            strip_orphaned_blocks_unless_runtime_armed(&session(&api), &AtomicBool::new(false))
+                .unwrap();
+
+        assert_eq!(outcome, OrphanStrip::Stripped(orphans.len()));
+        assert!(installed_ids(&api).is_empty());
     }
 }

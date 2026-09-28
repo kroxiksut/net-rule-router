@@ -115,6 +115,7 @@ fn rename(network: &INetwork, name: &str) -> Rename {
     match unsafe { network.SetName(&BSTR::from(name)) } {
         Ok(()) => tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "win-tun-renamed",
             was = %current,
             now = %name,
             "Windows filed the tunnel as a new network and numbered its name — renamed it back",
@@ -124,6 +125,7 @@ fn rename(network: &INetwork, name: &str) -> Rename {
         Err(e) if e.code() == ERROR_NOT_SUPPORTED.to_hresult() => return Rename::StillIdentifying,
         Err(e) => tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "win-tun-rename-failed",
             was = %current,
             "could not rename the tunnel network: {e}",
         ),

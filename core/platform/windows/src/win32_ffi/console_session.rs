@@ -14,7 +14,9 @@ use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 /// Prefix of a real interactive user's SID (a machine-local or domain
 /// account: `S-1-5-21-<authority>-<rid>`). Service accounts — LocalSystem
@@ -95,6 +97,28 @@ fn current_process_user_sid() -> Option<String> {
     let sid = unsafe { token_user_sid_string(token) };
     // SAFETY: close the token exactly once, regardless of SID outcome.
     let _ = unsafe { CloseHandle(token) };
+    sid
+}
+
+/// The SID of the user process `pid` runs as. `None` when the process is gone
+/// or its token cannot be opened (a protected process, or no rights).
+pub fn process_user_sid(pid: u32) -> Option<String> {
+    // SAFETY: plain FFI call; a failure returns an error, success a process
+    // handle we own and close below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut token = HANDLE::default();
+    // SAFETY: `process` is the handle just opened; `token` is a valid out-param.
+    let sid = if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.is_ok() {
+        // SAFETY: `token` is the just-opened token, valid until closed here.
+        let sid = unsafe { token_user_sid_string(token) };
+        // SAFETY: close the token exactly once.
+        let _ = unsafe { CloseHandle(token) };
+        sid
+    } else {
+        None
+    };
+    // SAFETY: close the process handle exactly once.
+    let _ = unsafe { CloseHandle(process) };
     sid
 }
 

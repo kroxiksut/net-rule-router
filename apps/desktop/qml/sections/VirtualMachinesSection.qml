@@ -72,11 +72,51 @@ ColumnLayout {
         if (mode === "internal")
             return root.tr("rules.vm.internal",
                 "Traffic stays between virtual machines. Nothing to route.")
+        if (mode === "service-nat")
+            return root.tr("rules.vm.service-nat",
+                "This adapter uses the hypervisor's NAT, which runs as a system service: no application rule routes this machine's traffic, and whether your site rules apply inside it has not been checked yet.")
         if (mode === "nat-network")
             return root.tr("rules.vm.nat-network",
                 "NAT Network is not supported yet, so this adapter is not covered here.")
         return root.tr("rules.vm.other",
             "This adapter is not attached, or its kind is not supported yet.")
+    }
+
+    function _pinText(attachment) {
+        var binding = String((attachment || {}).binding || "unbound")
+        if (binding === "additional-route")
+            return root.tr("rules.vm.pin.additional",
+                "All of this machine's traffic goes over {route}.")
+                .replace("{route}", root.routeLabel("secondary"))
+        if (binding === "missing")
+            return root.tr("rules.vm.pin.missing",
+                "This machine is tied to {address}, which your computer no longer has, so it has no network. Power it off and tie it again.")
+                .replace("{address}", String(attachment.boundAddress || ""))
+        if (binding === "other-address")
+            return root.tr("rules.vm.pin.other",
+                "This machine's traffic leaves from {address}.")
+                .replace("{address}", String(attachment.boundAddress || ""))
+        return root.tr("rules.vm.pin.rules",
+            "This machine follows your rules: sites from the rules take their route, everything else goes over {route}.")
+            .replace("{route}", root.routeLabel("primary"))
+    }
+    function _pinFailureText(failure) {
+        var error = String((failure || {}).error || "failed")
+        if (error === "machine-not-mutable")
+            return root.tr("rules.vm.pin.error.running",
+                "The machine is running. Power it off and try again.")
+        if (error === "tool-missing")
+            return root.tr("rules.vm.pin.error.tool-missing",
+                "VBoxManage was not found. Reinstall VirtualBox or change the machine in VirtualBox itself.")
+        if (error === "no-additional-address")
+            return root.tr("rules.vm.pin.error.no-address",
+                "{route} has no IPv4 address right now. Connect it and try again.")
+                .replace("{route}", root.routeLabel("secondary"))
+        var message = String((failure || {}).message || "")
+        return message !== ""
+            ? root.tr("rules.vm.pin.error.refused", "VirtualBox refused: {message}")
+                .replace("{message}", message)
+            : root.tr("rules.vm.pin.error.failed", "The machine could not be changed.")
     }
 
     RowLayout {
@@ -168,6 +208,7 @@ ColumnLayout {
                     spacing: root.uiTheme.spacingMd
                     readonly property var hypervisor: modelData
                     readonly property var machines: hypervisor.machines || []
+                    readonly property bool routable: (hypervisor.trafficProcesses || []).length > 0
                     property int machineIndex: 0
                     readonly property var machine: machineIndex >= 0 && machineIndex < machines.length
                         ? machines[machineIndex] : null
@@ -190,6 +231,21 @@ ColumnLayout {
                             Label {
                                 Layout.fillWidth: true
                                 Layout.preferredWidth: 0
+                                visible: !hypervisorBlock.routable
+                                wrapMode: Text.Wrap
+                                color: root.mutedTextColor
+                                text: root.uiRevision >= 0
+                                    ? root.tr("rules.vm.route-none",
+                                        "{hypervisor} carries its machines' traffic in a system service, so no program rule can route it.")
+                                        .replace("{hypervisor}", section._hypervisorName(hypervisorBlock.hypervisor))
+                                    : ""
+                                Accessible.role: Accessible.StaticText
+                                Accessible.name: text
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                Layout.preferredWidth: 0
+                                visible: hypervisorBlock.routable
                                 wrapMode: Text.Wrap
                                 color: root.mutedTextColor
                                 text: root.uiRevision >= 0
@@ -204,6 +260,7 @@ ColumnLayout {
                             Label {
                                 Layout.fillWidth: true
                                 Layout.preferredWidth: 0
+                                visible: hypervisorBlock.routable
                                 wrapMode: Text.Wrap
                                 color: root.textColor
                                 text: root.uiRevision >= 0 && section.controller.rulesRevision >= 0
@@ -226,6 +283,7 @@ ColumnLayout {
                             // Recipe 32: the layout sees the Item, not the positioner.
                             Item {
                                 Layout.fillWidth: true
+                                visible: hypervisorBlock.routable
                                 Layout.preferredHeight: routeButtons.height
                                 Flow {
                                     id: routeButtons
@@ -392,6 +450,94 @@ ColumnLayout {
                                             Accessible.role: Accessible.Button
                                             Accessible.name: text + " " + String(adapterBlock.advice ? adapterBlock.advice.address : "")
                                             onClicked: root.copyToClipboard(String(adapterBlock.advice.address))
+                                        }
+                                    }
+                                    // Only VirtualBox lets a NAT adapter be tied to a host address.
+                                    ColumnLayout {
+                                        id: pinBlock
+                                        Layout.fillWidth: true
+                                        Layout.topMargin: root.uiTheme.spacingXs
+                                        visible: adapterBlock.attachment.mode === "nat"
+                                            && String(hypervisorBlock.hypervisor.hypervisor || "") === "virtualbox"
+                                        spacing: root.uiTheme.spacingXs
+                                        readonly property string key: section.controller.adapterKey(hypervisorBlock.machine, adapterBlock.adapter)
+                                        readonly property string binding: String(adapterBlock.attachment.binding || "unbound")
+                                        readonly property bool busy: section.controller.bindingKey === key
+                                        readonly property var failure: section.controller.bindFailure
+                                            && section.controller.bindFailure.key === key
+                                            ? section.controller.bindFailure : null
+
+                                        Label {
+                                            Layout.fillWidth: true
+                                            Layout.preferredWidth: 0
+                                            wrapMode: Text.Wrap
+                                            color: pinBlock.binding === "missing" ? root.uiTheme.colorDanger : root.textColor
+                                            text: root.uiRevision >= 0 ? section._pinText(adapterBlock.attachment) : ""
+                                            Accessible.role: Accessible.StaticText
+                                            Accessible.name: text
+                                        }
+                                        Item {
+                                            Layout.fillWidth: true
+                                            Layout.preferredHeight: pinButtons.height
+                                            Flow {
+                                                id: pinButtons
+                                                anchors.left: parent.left
+                                                anchors.right: parent.right
+                                                spacing: root.uiTheme.spacingSm
+                                                ThemedButton {
+                                                    theme: root.uiTheme
+                                                    readonly property bool current: pinBlock.binding === "unbound"
+                                                    text: root.uiRevision >= 0 ? root.tr("rules.vm.pin.follow-rules", "Follow the rules") : ""
+                                                    highlighted: current
+                                                    enabled: !current && !pinBlock.busy
+                                                    Accessible.role: Accessible.Button
+                                                    Accessible.name: text
+                                                    onClicked: section.controller.bindNat(hypervisorBlock.hypervisor,
+                                                        hypervisorBlock.machine, adapterBlock.adapter, "rules")
+                                                }
+                                                ThemedButton {
+                                                    theme: root.uiTheme
+                                                    readonly property bool current: pinBlock.binding === "additional-route"
+                                                    text: root.uiRevision >= 0
+                                                        ? (pinBlock.binding === "missing"
+                                                            ? root.tr("rules.vm.pin.rebind", "Tie to {route} again")
+                                                            : root.tr("rules.vm.pin.all-additional", "Send all traffic over {route}"))
+                                                            .replace("{route}", root.routeLabel("secondary"))
+                                                        : ""
+                                                    highlighted: current
+                                                    enabled: !current && !pinBlock.busy && section.controller.hasAdditionalAdapter()
+                                                    Accessible.role: Accessible.Button
+                                                    Accessible.name: text
+                                                    onClicked: section.controller.bindNat(hypervisorBlock.hypervisor,
+                                                        hypervisorBlock.machine, adapterBlock.adapter, "additional")
+                                                }
+                                            }
+                                        }
+                                        Label {
+                                            Layout.fillWidth: true
+                                            Layout.preferredWidth: 0
+                                            wrapMode: Text.Wrap
+                                            color: root.mutedTextColor
+                                            text: root.uiRevision >= 0
+                                                ? (section.controller.hasAdditionalAdapter()
+                                                    ? root.tr("rules.vm.pin.note",
+                                                        "The change is made in VirtualBox and works only while the machine is powered off. If {route} reconnects with a new address, tie the machine again.")
+                                                    : root.tr("rules.vm.pin.no-additional",
+                                                        "Choose the adapter for {route} first."))
+                                                    .replace("{route}", root.routeLabel("secondary"))
+                                                : ""
+                                            Accessible.role: Accessible.StaticText
+                                            Accessible.name: text
+                                        }
+                                        Label {
+                                            Layout.fillWidth: true
+                                            Layout.preferredWidth: 0
+                                            visible: pinBlock.failure !== null
+                                            wrapMode: Text.Wrap
+                                            color: root.uiTheme.colorDanger
+                                            text: root.uiRevision >= 0 && pinBlock.failure ? section._pinFailureText(pinBlock.failure) : ""
+                                            Accessible.role: Accessible.StaticText
+                                            Accessible.name: text
                                         }
                                     }
                                 }

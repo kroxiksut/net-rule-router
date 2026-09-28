@@ -1,6 +1,11 @@
 ﻿[graph]
+# Every platform we ship for: a cfg(unix) dependency is invisible to a
+# Windows-only graph, so a license or advisory there would pass unchecked.
 targets = [
   { triple = "x86_64-pc-windows-msvc" },
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "aarch64-apple-darwin" },
+  { triple = "x86_64-apple-darwin" },
 ]
 
 [advisories]

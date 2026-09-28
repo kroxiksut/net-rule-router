@@ -103,6 +103,7 @@ where
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::ipc-push",
+                    msg_key = "ipcpush-encode-failed",
                     subscription_id,
                     event_id = entry.event_id,
                     error = %e,
@@ -134,6 +135,7 @@ where
             event_bus.record_drop(subscription_id, 1);
             tracing::warn!(
                 target: "nrr::ipc-push",
+                msg_key = "ipcpush-write-failed",
                 subscription_id,
                 event_id = entry.event_id,
                 event_type,

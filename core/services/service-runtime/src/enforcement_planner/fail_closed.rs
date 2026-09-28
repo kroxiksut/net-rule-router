@@ -240,12 +240,13 @@ pub fn plan_fail_closed_apps(
 
 /// Plan the DoH/DoT lockdown blocks as neutral
 /// [`FlowRule`]s — the neutral equivalent of
-/// [`crate::killswitch_codegen::doh_dot_block_filters`]. Per resolver IP: a
-/// [`PrecedenceClass::DohBlock`] `Block` on `443` for TCP then UDP; then, when
-/// `block_dot`, a global `Block` on `853` for TCP then UDP. Emission order fixes
-/// the ascending `ordinal` so `lower_windows::lower_doh_dot_block` reproduces the
-/// exact same arbitration order as the codegen.
-pub fn plan_doh_dot_block(sid: &str, resolver_ips: &[Ipv4Addr], block_dot: bool) -> Vec<FlowRule> {
+/// [`crate::killswitch_codegen::doh_dot_block_filters`]. Per resolver address of
+/// either family: a [`PrecedenceClass::DohBlock`] `Block` on `443` for TCP then
+/// UDP; then, when `block_dot`, a global `Block` on `853` for TCP then UDP.
+/// The global cut is family-agnostic here: a backend whose filters are
+/// per-family (WFP) lowers it once per family. IPv4 addresses come first, so a
+/// v4-only list keeps the ordinals it had before the v6 half existed.
+pub fn plan_doh_dot_block(sid: &str, resolver_ips: &[IpAddr], block_dot: bool) -> Vec<FlowRule> {
     let principal = principal_scope(sid);
     let mut flows = Vec::new();
     let mut ordinal = 0u32;
@@ -265,14 +266,15 @@ pub fn plan_doh_dot_block(sid: &str, resolver_ips: &[Ipv4Addr], block_dot: bool)
         egress: EgressConstraint::Any,
         coverage: Coverage::ConnectOnly,
     };
-    for ip in resolver_ips
+    let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) = resolver_ips
         .iter()
         .copied()
         .filter(|ip| !nrr_platform_api::is_exempt_from_blocking(*ip))
         .take(crate::killswitch_codegen::DOH_MAX_RESOLVER_IPS)
-    {
+        .partition(IpAddr::is_ipv4);
+    for ip in v4.into_iter().chain(v6) {
         for proto in [L4Proto::Tcp, L4Proto::Udp] {
-            let mut f = flow_for(DstMatch::HostV4(ip), 443, ordinal);
+            let mut f = flow_for(host_match(ip), 443, ordinal);
             f.flow.protocol = Some(proto);
             flows.push(f);
             ordinal += 1;

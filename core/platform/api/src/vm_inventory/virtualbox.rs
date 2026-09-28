@@ -101,6 +101,58 @@ pub fn attach_enable_commands(machines: &mut [VirtualMachine], tool: &str) {
     }
 }
 
+/// Adapters a machine can carry (the ICH9 chipset's limit).
+const MAX_ADAPTERS: u32 = 36;
+
+/// Arguments for the command-line tool that pin adapter `slot` of machine
+/// `machine_id` to `address`, or remove the pin with `None`. `None` when the id
+/// is not a UUID or the slot is out of range, so nothing reaches the tool that
+/// it could read as another option.
+#[must_use]
+pub fn nat_bind_arguments(
+    machine_id: &str,
+    slot: u32,
+    address: Option<Ipv4Addr>,
+) -> Option<Vec<String>> {
+    if !is_uuid(machine_id) || slot >= MAX_ADAPTERS {
+        return None;
+    }
+    // One token: an empty value as its own argument is lost by some shells,
+    // and the tool reads `--option=value` the same way. The unhyphenated
+    // spelling is the only one 6.1 knows; 7.x keeps it as an alias.
+    let value = address.map(|a| a.to_string()).unwrap_or_default();
+    Some(vec![
+        "modifyvm".to_string(),
+        machine_id.to_string(),
+        format!("--natbindip{}={value}", slot + 1),
+    ])
+}
+
+/// `8-4-4-4-12` hex digits, the form [`machine`] reads out of a machine file.
+fn is_uuid(text: &str) -> bool {
+    let groups: Vec<&str> = text.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Whether the tool's error output says the machine cannot be changed now:
+/// running (locked by its session) or saved. The status codes are matched
+/// first: they are the part of the message a localized tool leaves in English.
+#[must_use]
+pub fn refused_as_not_mutable(output: &str) -> bool {
+    [
+        "VBOX_E_INVALID_OBJECT_STATE",
+        "VBOX_E_INVALID_VM_STATE",
+        "is already locked",
+        "is not mutable",
+    ]
+    .iter()
+    .any(|marker| output.contains(marker))
+}
+
 fn adapter(node: Node<'_, '_>, version: (u32, u32)) -> Option<VmAdapter> {
     if !bool_attribute(node, "enabled").unwrap_or(false) {
         return None;
@@ -147,11 +199,13 @@ fn nat(mode: Node<'_, '_>, slot: u32, version: (u32, u32)) -> Option<NatAdapter>
     let host_address = Ipv4Addr::from(u32::from(network) | 2);
     let reachable = bool_attribute(mode, "localhost-reachable")
         .unwrap_or(version < LOOPBACK_CLOSED_BY_DEFAULT_FROM);
-    Some(NatAdapter::new(
-        format!("{network}/{prefix_len}"),
-        host_address,
-        reachable,
-    ))
+    let bound_address = mode
+        .attribute("hostip")
+        .and_then(|text| text.trim().parse().ok());
+    Some(
+        NatAdapter::new(format!("{network}/{prefix_len}"), host_address, reachable)
+            .with_bound_address(bound_address),
+    )
 }
 
 fn parse_network(text: &str) -> Option<(Ipv4Addr, u8)> {
@@ -418,5 +472,75 @@ mod tests {
         assert!(machine("<VirtualBox/>").is_none());
         assert!(machine(r#"<Other><Machine name="x"/></Other>"#).is_none());
         assert!(machine(r#"<VirtualBox><Machine uuid="{x}"/></VirtualBox>"#).is_none());
+    }
+
+    #[test]
+    fn a_pinned_nat_adapter_reads_its_host_address() {
+        let pinned = only_adapter(
+            "1.19-windows",
+            r#"<Adapter slot="0" enabled="true"><NAT hostip="192.0.2.10"/></Adapter>"#,
+        );
+        let free = only_adapter(
+            "1.19-windows",
+            r#"<Adapter slot="0" enabled="true"><NAT hostip=""/></Adapter>"#,
+        );
+        assert_eq!(
+            nat_of(pinned).bound_address,
+            Some(Ipv4Addr::new(192, 0, 2, 10))
+        );
+        assert_eq!(nat_of(free).bound_address, None);
+    }
+
+    #[test]
+    fn the_pin_arguments_count_slots_from_one_and_clear_with_an_empty_value() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        assert_eq!(
+            nat_bind_arguments(id, 1, Some(Ipv4Addr::new(192, 0, 2, 10))),
+            Some(vec![
+                "modifyvm".to_string(),
+                id.to_string(),
+                "--natbindip2=192.0.2.10".to_string()
+            ])
+        );
+        assert_eq!(
+            nat_bind_arguments(id, 0, None).map(|args| args[2].clone()),
+            Some("--natbindip1=".to_string())
+        );
+    }
+
+    #[test]
+    fn the_pin_refuses_what_the_tool_could_read_as_an_option() {
+        assert_eq!(nat_bind_arguments("--nat-bind-ip1", 0, None), None);
+        assert_eq!(
+            nat_bind_arguments("00000000-0000-4000-8000-00000000000g", 0, None),
+            None
+        );
+        assert_eq!(
+            nat_bind_arguments("00000000-0000-4000-8000-000000000001", 36, None),
+            None
+        );
+        assert_eq!(nat_bind_arguments(&"-".repeat(36), 0, None), None);
+        assert_eq!(
+            nat_bind_arguments("0000000000000000000000000000-0000000", 0, None),
+            None
+        );
+    }
+
+    /// VBoxManage's refusals: running, saved, and a localized one.
+    #[test]
+    fn a_running_or_saved_machine_is_refused_as_not_mutable() {
+        let running = "VBoxManage: error: The machine 'Example VM' is already locked for a session (or being unlocked)\n\
+                       VBoxManage: error: Details: code VBOX_E_INVALID_OBJECT_STATE (0x80bb0007), component MachineWrap, interface IMachine";
+        let saved = "VBoxManage: error: The machine is not mutable (state is Saved)\n\
+                     VBoxManage: error: Details: code VBOX_E_INVALID_VM_STATE (0x80bb0002), component SessionMachine, interface IMachine";
+        let localized = "VBoxManage: ошибка: Машина не может быть изменена\n\
+                         VBoxManage: ошибка: Подробности: код VBOX_E_INVALID_VM_STATE (0x80bb0002)";
+        for output in [running, saved, localized] {
+            assert!(refused_as_not_mutable(output), "{output}");
+        }
+        assert!(!refused_as_not_mutable(
+            "VBoxManage: error: Could not find a registered machine named 'x'\n\
+             VBoxManage: error: Details: code VBOX_E_OBJECT_NOT_FOUND (0x80bb0001)"
+        ));
     }
 }

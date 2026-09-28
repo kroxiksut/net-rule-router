@@ -46,8 +46,10 @@ use crate::canonical::{
     CanonicalAddressMatch, CanonicalAppMatch, CanonicalAppPattern, CanonicalRule,
     CanonicalRuleBook, CanonicalRuleSet,
 };
+use crate::rules_file::HostPlatform;
 use crate::rules_revision::{RulesRevisionContent, RULES_REVISION_FORMAT_VERSION};
 use crate::RuleId;
+use nrr_shared::app_identity::ExecutableNaming;
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -215,7 +217,14 @@ fn encode_app_match(m: &CanonicalAppMatch) -> AppMatchDto {
 /// [`CanonicalRuleSet::from_rules`] which re-applies the canonical
 /// sort — so even if the wire arrives out of order, the decoded book
 /// is canonically ordered.
-pub fn decode(dto: CanonicalRulesJsonV1) -> Result<RulesRevisionContent, RulesJsonCodecError> {
+///
+/// `platform` is the one the revision's application rules are for — on the
+/// service, the host it runs on — and decides how their names are spelled.
+pub fn decode(
+    dto: CanonicalRulesJsonV1,
+    platform: HostPlatform,
+) -> Result<RulesRevisionContent, RulesJsonCodecError> {
+    let naming = platform.executable_naming();
     if dto.schema_version != RULES_JSON_SCHEMA_VERSION {
         return Err(RulesJsonCodecError::UnsupportedSchemaVersion {
             got: dto.schema_version,
@@ -226,12 +235,12 @@ pub fn decode(dto: CanonicalRulesJsonV1) -> Result<RulesRevisionContent, RulesJs
     let primary = dto
         .primary
         .into_iter()
-        .map(decode_rule)
+        .map(|rule| decode_rule(rule, naming))
         .collect::<Result<Vec<_>, _>>()?;
     let secondary = dto
         .secondary
         .into_iter()
-        .map(decode_rule)
+        .map(|rule| decode_rule(rule, naming))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(RulesRevisionContent {
@@ -243,14 +252,17 @@ pub fn decode(dto: CanonicalRulesJsonV1) -> Result<RulesRevisionContent, RulesJs
     })
 }
 
-fn decode_rule(dto: RuleDto) -> Result<CanonicalRule, RulesJsonCodecError> {
+fn decode_rule(
+    dto: RuleDto,
+    naming: ExecutableNaming,
+) -> Result<CanonicalRule, RulesJsonCodecError> {
     let address_match = dto
         .address_match
         .map(|m| decode_address_match(&dto.id, m))
         .transpose()?;
     let app_match = dto
         .app_match
-        .map(|m| decode_app_match(&dto.id, m))
+        .map(|m| decode_app_match(&dto.id, m, naming))
         .transpose()?;
     if address_match.is_none() && app_match.is_none() {
         return Err(RulesJsonCodecError::EmptyMatch { rule_id: dto.id });
@@ -310,6 +322,7 @@ fn decode_address_match(
 fn decode_app_match(
     rule_id: &str,
     m: AppMatchDto,
+    naming: ExecutableNaming,
 ) -> Result<CanonicalAppMatch, RulesJsonCodecError> {
     let pattern = match m.pattern {
         // A `*` in an "exact" filename is a client that mislabelled a
@@ -318,9 +331,9 @@ fn decode_app_match(
         AppPatternDto::Exact { value } if value.contains('*') => {
             CanonicalAppPattern::Glob(crate::app_identity::canonical_glob_process_pattern(&value))
         }
-        AppPatternDto::Exact { value } => {
-            CanonicalAppPattern::Exact(crate::app_identity::canonical_exact_process_name(&value).0)
-        }
+        AppPatternDto::Exact { value } => CanonicalAppPattern::Exact(
+            crate::app_identity::canonical_exact_process_name(&value, naming).0,
+        ),
         AppPatternDto::Glob { value } => {
             CanonicalAppPattern::Glob(crate::app_identity::canonical_glob_process_pattern(&value))
         }
@@ -450,7 +463,7 @@ mod tests {
             }],
             secondary: vec![],
         };
-        let decoded = decode(dto).expect("decode");
+        let decoded = decode(dto, HostPlatform::Windows).expect("decode");
         assert_eq!(
             decoded.rule_book.primary.rules()[0]
                 .app_match
@@ -489,17 +502,60 @@ mod tests {
             AppPatternDto::Exact { value: "*".into() },
         ] {
             assert_eq!(
-                decode(dto(pattern)),
+                decode(dto(pattern), HostPlatform::Windows),
                 Err(RulesJsonCodecError::AppGlobTooWide {
                     rule_id: "r-app".into()
                 })
             );
         }
         // A narrower glob is still perfectly legal.
-        assert!(decode(dto(AppPatternDto::Glob {
-            value: "chrome*.exe".into()
-        }))
+        assert!(decode(
+            dto(AppPatternDto::Glob {
+                value: "chrome*.exe".into()
+            }),
+            HostPlatform::Windows
+        )
         .is_ok());
+    }
+
+    /// A submission a Linux service re-spells must come out as the name the
+    /// process has, not the Windows spelling of it.
+    #[test]
+    fn a_linux_revision_keeps_bare_names_while_windows_gains_the_suffix() {
+        let dto = || CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![RuleDto {
+                id: "r-app".into(),
+                enabled: true,
+                address_match: None,
+                app_match: Some(AppMatchDto {
+                    pattern: AppPatternDto::Exact {
+                        value: "Telegram-Desktop".into(),
+                    },
+                    include_child_processes: false,
+                }),
+                comment: String::new(),
+                action: WireRuleAction::default(),
+                origin: None,
+            }],
+            secondary: vec![],
+        };
+        let name = |platform| {
+            decode(dto(), platform)
+                .expect("decode")
+                .rule_book
+                .primary
+                .rules()[0]
+                .app_match
+                .as_ref()
+                .expect("app match")
+                .pattern
+                .as_str()
+                .to_string()
+        };
+        assert_eq!(name(HostPlatform::Linux), "telegram-desktop");
+        assert_eq!(name(HostPlatform::MacOS), "telegram-desktop");
+        assert_eq!(name(HostPlatform::Windows), "telegram-desktop.exe");
     }
 
     #[test]
@@ -507,7 +563,7 @@ mod tests {
         let content =
             RulesRevisionContent::new(book(vec![exact_fqdn("r-1", "api.example.com")], vec![]));
         let dto = encode(&content);
-        let back = decode(dto).expect("decode");
+        let back = decode(dto, HostPlatform::Windows).expect("decode");
         assert_eq!(content, back);
     }
 
@@ -525,7 +581,7 @@ mod tests {
             vec![],
         ));
         let dto = encode(&content);
-        let back = decode(dto).expect("decode");
+        let back = decode(dto, HostPlatform::Windows).expect("decode");
         assert_eq!(content, back);
     }
 
@@ -541,7 +597,7 @@ mod tests {
             dto.primary[0].address_match,
             Some(AddressMatchDto::ExactIpv6 { .. })
         ));
-        assert_eq!(decode(dto).expect("decode"), content);
+        assert_eq!(decode(dto, HostPlatform::Windows).expect("decode"), content);
     }
 
     #[test]
@@ -555,7 +611,11 @@ mod tests {
             s.contains("\"action\":\"block\""),
             "block action must serialize with the kebab slug, got: {s}"
         );
-        let back = decode(from_canonical_string(&s).expect("deserialize")).expect("decode");
+        let back = decode(
+            from_canonical_string(&s).expect("deserialize"),
+            HostPlatform::Windows,
+        )
+        .expect("decode");
         assert_eq!(content, back);
         assert_eq!(
             back.rule_book.primary.rules()[0].action,
@@ -576,7 +636,11 @@ mod tests {
             "route rules must not emit the action field (hash-stability guard), got: {s}"
         );
         // A missing action field decodes back to Route.
-        let back = decode(from_canonical_string(&s).expect("deserialize")).expect("decode");
+        let back = decode(
+            from_canonical_string(&s).expect("deserialize"),
+            HostPlatform::Windows,
+        )
+        .expect("decode");
         assert_eq!(
             back.rule_book.primary.rules()[0].action,
             crate::canonical::RuleAction::Route
@@ -595,7 +659,7 @@ mod tests {
         let dto = encode(&content);
         let s = to_canonical_string(&dto).expect("serialize");
         let parsed = from_canonical_string(&s).expect("deserialize");
-        let back = decode(parsed).expect("decode");
+        let back = decode(parsed, HostPlatform::Windows).expect("decode");
         assert_eq!(content, back);
     }
 
@@ -653,7 +717,7 @@ mod tests {
             ],
             secondary: vec![],
         };
-        let content = decode(dto).expect("decode");
+        let content = decode(dto, HostPlatform::Windows).expect("decode");
         let ids: Vec<&str> = content
             .rule_book
             .primary
@@ -671,7 +735,7 @@ mod tests {
             primary: vec![],
             secondary: vec![],
         };
-        let err = decode(dto).expect_err("must reject");
+        let err = decode(dto, HostPlatform::Windows).expect_err("must reject");
         match err {
             RulesJsonCodecError::UnsupportedSchemaVersion { got, expected } => {
                 assert_eq!(got, 999);
@@ -698,7 +762,7 @@ mod tests {
             }],
             secondary: vec![],
         };
-        let err = decode(dto).expect_err("must reject");
+        let err = decode(dto, HostPlatform::Windows).expect_err("must reject");
         match err {
             RulesJsonCodecError::InvalidIpv4 { rule_id, raw } => {
                 assert_eq!(rule_id, "r-bad");
@@ -723,7 +787,7 @@ mod tests {
             }],
             secondary: vec![],
         };
-        let err = decode(dto).expect_err("must reject");
+        let err = decode(dto, HostPlatform::Windows).expect_err("must reject");
         match err {
             RulesJsonCodecError::EmptyMatch { rule_id } => {
                 assert_eq!(rule_id, "r-empty");
@@ -749,7 +813,7 @@ mod tests {
             }],
             secondary: vec![],
         };
-        let content = decode(dto).expect("decode");
+        let content = decode(dto, HostPlatform::Windows).expect("decode");
         let rule = &content.rule_book.primary.rules()[0];
         assert!(!rule.enabled);
         assert_eq!(rule.comment, "muted by user");
@@ -769,7 +833,7 @@ mod tests {
             primary: vec![],
             secondary: vec![],
         };
-        let content = decode(dto).expect("decode");
+        let content = decode(dto, HostPlatform::Windows).expect("decode");
         assert_eq!(content.format_version, RULES_REVISION_FORMAT_VERSION);
     }
 
@@ -777,7 +841,7 @@ mod tests {
     fn empty_book_round_trips() {
         let content = RulesRevisionContent::new(book(vec![], vec![]));
         let dto = encode(&content);
-        let back = decode(dto).expect("decode");
+        let back = decode(dto, HostPlatform::Windows).expect("decode");
         assert_eq!(content, back);
     }
 

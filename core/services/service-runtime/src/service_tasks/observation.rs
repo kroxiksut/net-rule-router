@@ -1,10 +1,27 @@
 //! Tasks that feed the service from live traffic: the DNS and connection
 //! observation drains, the application-destination fold and the live-connection
 //! refresh.
-//!
-//! Split out of `service_tasks`; the code is unchanged.
 
 use super::*;
+
+use crate::conn_observation_consumer::ConnectionTraceRing;
+
+/// Keeps the connection-trace panel's "watching" flag honest across one tick.
+/// A tick that unwinds clears it — the supervisor restarts the task only after
+/// a backoff, and the panel must not claim to watch meanwhile; a tick that
+/// returns sets it again.
+struct ObserverLiveness<'a>(Option<&'a ConnectionTraceRing>);
+
+impl Drop for ObserverLiveness<'_> {
+    fn drop(&mut self) {
+        let Some(ring) = self.0 else { return };
+        if std::thread::panicking() {
+            ring.mark_observer_down();
+        } else {
+            ring.mark_observer_active();
+        }
+    }
+}
 
 // ── DNS observation ──────────────────────────────────────────────────────────
 
@@ -109,12 +126,14 @@ pub fn build_app_observation_task(
     wiring: AppObservationWiring,
     on_new_destination: Option<crate::supervised_runtime::RouteRecomputeHook>,
 ) -> ServiceTask {
+    let ring = wiring.trace.as_ref().map(|tee| tee.ring());
     ServiceTask::periodic(
         TASK_ID_APP_OBSERVATION,
         TaskClass::Optional,
         APP_OBSERVATION_INTERVAL,
         RECOVERABLE_DEFAULT_MAX_RESTARTS,
         move |_stop| {
+            let _liveness = ObserverLiveness(ring.as_deref());
             let learnt = fold_observations(&wiring);
             if learnt > 0 {
                 tracing::debug!(
@@ -243,6 +262,7 @@ pub fn build_dns_observe_task(
                 if summary.made_progress() {
                     tracing::info!(
                         target: "nrr::dns-observe",
+                        msg_key = "svctask-dns-observe-cached",
                         matched = summary.matched,
                         refreshed = summary.refreshed,
                         ignored = summary.ignored,
@@ -277,12 +297,14 @@ pub fn build_conn_observe_task(
     consumer: Arc<crate::conn_observation_consumer::ConnectionObservationConsumer>,
     on_progress: Option<crate::supervised_runtime::RouteRecomputeHook>,
 ) -> ServiceTask {
+    let ring = consumer.trace_ring().cloned();
     ServiceTask::periodic(
         TASK_ID_CONN_OBSERVE,
         TaskClass::Optional,
         CONN_OBSERVE_INTERVAL,
         0,
         move |_stop| {
+            let _liveness = ObserverLiveness(ring.as_deref());
             let batch = source.drain();
             if !batch.is_empty() {
                 let summary = consumer.consume(&batch, SystemTime::now());
@@ -338,4 +360,33 @@ pub fn build_conn_observe_task(
             TaskOutcome::Continue
         },
     )
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    #[test]
+    fn an_unwinding_tick_clears_the_watching_flag_and_a_clean_tick_restores_it() {
+        let ring = ConnectionTraceRing::new(4);
+        ring.mark_observer_active();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _liveness = ObserverLiveness(Some(&ring));
+            panic!("observer tick blew up");
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            !ring.observer_active(),
+            "the panel must not claim to watch while the task waits for its restart"
+        );
+
+        {
+            let _liveness = ObserverLiveness(Some(&ring));
+        }
+        assert!(
+            ring.observer_active(),
+            "a completed tick means watching again"
+        );
+    }
 }

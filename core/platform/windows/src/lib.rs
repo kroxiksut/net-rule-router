@@ -59,6 +59,8 @@ pub mod dns_scope;
 #[cfg(windows)]
 pub mod elevation;
 pub mod error;
+// The one real-time ETW session scaffold every ETW consumer here starts through.
+pub(crate) mod etw_session;
 // Operator-facing Windows event log (install-time source registration + the
 // runtime sink behind `SystemEventLogPort`).
 pub mod event_log;
@@ -99,6 +101,9 @@ pub mod pinned_file;
 /// Windows mechanism for pointing this process's error stream at a file, so a
 /// process started by another process stops writing into its parent's log.
 pub mod process_error_stream;
+// Process starts from ETW behind the neutral `ProcessLineagePort`: who launched
+// a blocked program.
+pub mod process_lineage;
 pub mod reachability;
 // ICMP echo with a chosen hop limit and source address.
 pub mod icmp_echo;
@@ -204,6 +209,8 @@ pub use nrr_platform_api::vpn_discovery::{
     looks_like_vpn, MockVpnDiscovery, NoopVpnDiscovery, VpnCandidate, VpnCandidateSource,
     VpnDiscoveryPort,
 };
+#[cfg(target_os = "windows")]
+pub use process_lineage::EtwProcessLineage;
 pub use types::{
     ApplyActionPlan, RouteEntry, RoutingAction, WfpAction, WfpFilterAction, WfpFilterId,
     WfpFilterRecord, WfpFilterSpec, WfpLayerKey,

@@ -258,6 +258,7 @@ impl RulesApplyDispatcher for CountingDispatcher {
             vec![PreFlightWarning {
                 sid: sid.to_string(),
                 category: PreFlightCategory::BindingUnresolved,
+                subjects: Vec::new(),
                 message: "from the combined call".to_string(),
             }],
         )
@@ -769,6 +770,7 @@ fn activate_pre_flight_failure_does_not_apply() {
         vec![PreFlightWarning {
             sid: "S-A".into(),
             category: PreFlightCategory::FilterIdCollision,
+            subjects: Vec::new(),
             message: "two filters share UUID".into(),
         }],
     );
@@ -1369,4 +1371,329 @@ fn enforce_active_integrity_all_is_noop_without_signing_key() {
         outcomes.is_empty(),
         "no signing key → gate is skipped, matching the tamper bootstrap's fail-open posture"
     );
+}
+
+/// Two activations never interleave their phases: while one holds the gate
+/// the next waits, and past the wait it is refused as busy — never run
+/// alongside.
+#[test]
+fn an_activation_waits_for_the_one_in_flight_and_is_refused_past_the_wait() {
+    let mut fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    fx.coordinator.activation_wait = std::time::Duration::from_millis(20);
+    fx.registry
+        .on_connect("S-1-5-21-A", IpcClientProfile::TrayLightweight);
+    let id = submit(&fx, "h-gate");
+    let token = issue_token(&fx, &id);
+
+    let held = fx
+        .coordinator
+        .activation_gate
+        .enter(std::time::Duration::ZERO)
+        .expect("free");
+    assert_eq!(
+        fx.coordinator.activate(&id, &token, "c").unwrap_err(),
+        PolicyError::ActivationBusy
+    );
+    assert!(
+        fx.dispatcher.apply_log().is_empty(),
+        "nothing may have been applied"
+    );
+
+    drop(held);
+    let outcome = fx
+        .coordinator
+        .activate(&id, &token, "c")
+        .expect("activates");
+    assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+}
+
+/// Records what a reader on its own connection to the state database sees of
+/// the revision being applied, at the moment each dispatch runs.
+struct OverlayProbe {
+    reader: Mutex<Connection>,
+    fail_apply: bool,
+    seen: Mutex<Vec<(&'static str, Option<String>)>>,
+}
+
+// Test double: lock-poisoning `expect()` is acceptable scaffolding.
+#[allow(clippy::expect_used)]
+impl OverlayProbe {
+    fn record(&self, phase: &'static str) {
+        let reader = self.reader.lock().expect("reader");
+        let applying = crate::applying_revision_overlay::applying_for(
+            &reader,
+            nrr_storage::BASELINE_PRINCIPAL,
+        );
+        self.seen
+            .lock()
+            .expect("seen")
+            .push((phase, applying.map(|s| s.to_string())));
+    }
+}
+
+#[allow(clippy::expect_used)]
+impl RulesApplyDispatcher for OverlayProbe {
+    fn dry_run_for_sid(
+        &self,
+        sid: &str,
+        _rules_json: &str,
+    ) -> Result<SidActionPlanSummary, DispatchFailure> {
+        Ok(SidActionPlanSummary {
+            sid: sid.to_string(),
+            filter_additions: 0,
+            filter_removals: 0,
+            routing_actions: 0,
+        })
+    }
+
+    fn pre_flight_for_sid(
+        &self,
+        _sid: &str,
+        _rules_json: &str,
+    ) -> Result<Vec<PreFlightWarning>, DispatchFailure> {
+        Ok(Vec::new())
+    }
+
+    fn apply_for_sid(&self, sid: &str, _rules_json: &str) -> Result<(), DispatchFailure> {
+        self.record("apply");
+        if self.fail_apply {
+            return Err(DispatchFailure {
+                sid: sid.to_string(),
+                message: "kernel refused".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn revert_for_sid(&self, _sid: &str, _previous: &str) -> Result<(), DispatchFailure> {
+        self.record("revert");
+        Ok(())
+    }
+}
+
+#[allow(clippy::expect_used)]
+fn activate_with_probe(
+    fail_apply: bool,
+) -> (
+    Arc<OverlayProbe>,
+    Connection,
+    ActivationOutcome,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("state.db");
+    let runner = SqliteMigrationRunner::for_state_db(open_connection(&path).expect("open"));
+    runner.run_pending_migrations().expect("migrate");
+    let conn = Arc::new(Mutex::new(runner.into_connection()));
+    let probe = Arc::new(OverlayProbe {
+        reader: Mutex::new(Connection::open(&path).expect("reader")),
+        fail_apply,
+        seen: Mutex::new(Vec::new()),
+    });
+    let registry = Arc::new(ActiveSidRegistry::new());
+    let coordinator = ActivationCoordinator::new(
+        conn,
+        registry.clone(),
+        probe.clone() as Arc<dyn RulesApplyDispatcher>,
+        Arc::new(InMemoryMarkerStore::new()) as Arc<dyn ApplyMarkerStore>,
+        Arc::new(RecordingAudit::new()) as Arc<dyn ActivationAuditEmitter>,
+        FixedClock::new(1_700_000_000) as Arc<dyn Clock>,
+        Arc::new(CounterIds::new()) as Arc<dyn IdGenerator>,
+        ApplyFailurePolicy::AllOrNothing,
+    );
+    registry.on_connect("S-1-5-21-A", IpcClientProfile::TrayLightweight);
+    let id = coordinator
+        .submit_candidate(CandidateSubmission {
+            principal: nrr_storage::BASELINE_PRINCIPAL.to_string(),
+            rules_json: r#"{"applying":1}"#.to_string(),
+            content_hash: "h-overlay".to_string(),
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "corr-1".to_string(),
+            risk_level: Some(RiskLevel::Low),
+            review_summary_json: None,
+        })
+        .expect("submit");
+    let token = coordinator
+        .issue_confirmation_token(&id, 300)
+        .expect("issue token");
+    let outcome = coordinator.activate(&id, &token, "c").expect("activate");
+    let after = Connection::open(&path).expect("after");
+    (probe, after, outcome, dir)
+}
+
+/// Every rules read during phase 2 must see the revision being applied — the
+/// pointer still names the previous one until phase 3a — and none may see it
+/// once the activation is over.
+#[test]
+fn readers_see_the_applying_revision_during_phase_2_and_not_after() {
+    let (probe, after, outcome, _dir) = activate_with_probe(false);
+    assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+    let seen = probe.seen.lock().expect("seen").clone();
+    assert_eq!(seen, vec![("apply", Some(r#"{"applying":1}"#.to_string()))]);
+    assert_eq!(
+        crate::applying_revision_overlay::applying_for(&after, nrr_storage::BASELINE_PRINCIPAL),
+        None
+    );
+}
+
+/// A revert restores the stored revision, so its readers must no longer be
+/// handed the one that just failed.
+#[test]
+fn the_revert_after_a_failed_apply_reads_the_stored_revision() {
+    let (probe, _after, outcome, _dir) = activate_with_probe(true);
+    assert!(matches!(
+        outcome,
+        ActivationOutcome::RolledBackOnFailure { .. }
+    ));
+    let seen = probe.seen.lock().expect("seen").clone();
+    assert_eq!(
+        seen,
+        vec![
+            ("apply", Some(r#"{"applying":1}"#.to_string())),
+            ("revert", None),
+        ]
+    );
+}
+
+mod key_reset;
+
+fn app_and_address_rules_json() -> String {
+    use nrr_shared::rules_json::{
+        AddressMatchDto, AppMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleDto,
+        RULES_JSON_SCHEMA_VERSION,
+    };
+    let dto = CanonicalRulesJsonV1 {
+        schema_version: RULES_JSON_SCHEMA_VERSION,
+        primary: vec![RuleDto {
+            id: "R-0007".into(),
+            enabled: true,
+            address_match: Some(AddressMatchDto::ExactIpv4 {
+                address: "192.0.2.7".into(),
+            }),
+            app_match: Some(AppMatchDto {
+                pattern: AppPatternDto::Exact {
+                    value: "app.exe".into(),
+                },
+                include_child_processes: false,
+            }),
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Block,
+            origin: None,
+        }],
+        secondary: vec![],
+    };
+    nrr_shared::rules_json::to_canonical_string(&dto).expect("serialise")
+}
+
+/// The gate sits before the dedup: content already stored (from an older
+/// build) is still a NEW submission when it arrives again.
+#[test]
+fn submit_candidate_refuses_an_unsupported_shape_even_when_it_would_dedup() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let rules_json = app_and_address_rules_json();
+    {
+        let conn = fx.conn.lock().expect("conn");
+        RevisionsRepository::new(&conn)
+            .insert_candidate(&outside_app_record("rev-old", rules_json.clone()))
+            .expect("stored rows keep decoding and inserting");
+    }
+    let err = fx
+        .coordinator
+        .submit_candidate(CandidateSubmission {
+            principal: nrr_storage::BASELINE_PRINCIPAL.to_string(),
+            rules_json,
+            content_hash: "h-rev-old".to_string(),
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "corr".to_string(),
+            risk_level: None,
+            review_summary_json: None,
+        })
+        .expect_err("refused");
+    assert_eq!(
+        err,
+        PolicyError::UnsupportedRuleShape {
+            rule_id: "R-0007".into(),
+            reason: nrr_domain::rule_shape::UnsupportedShapeReason::AppScopedDestinationBlock,
+        }
+    );
+}
+
+/// A note carrying `\n--- IP\n…` is an IP rule once the book is exported, so
+/// it never becomes a stored candidate — whichever producer submits it.
+#[test]
+fn submit_candidate_refuses_a_line_break_in_a_comment() {
+    use nrr_shared::rules_json::{AddressMatchDto, CanonicalRulesJsonV1, RuleDto};
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let dto = CanonicalRulesJsonV1 {
+        schema_version: nrr_shared::rules_json::RULES_JSON_SCHEMA_VERSION,
+        primary: vec![RuleDto {
+            id: "R-0009".into(),
+            enabled: true,
+            address_match: Some(AddressMatchDto::ExactFqdn {
+                value: "example.com".into(),
+            }),
+            app_match: None,
+            comment: "note\n--- IP\n192.0.2.9".into(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        }],
+        secondary: vec![],
+    };
+    let err = fx
+        .coordinator
+        .submit_candidate(CandidateSubmission {
+            principal: nrr_storage::BASELINE_PRINCIPAL.to_string(),
+            rules_json: nrr_shared::rules_json::to_canonical_string(&dto).expect("serialise"),
+            content_hash: "h-injected".to_string(),
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "corr".to_string(),
+            risk_level: None,
+            review_summary_json: None,
+        })
+        .expect_err("refused");
+    assert_eq!(
+        err,
+        PolicyError::ControlCharacterInRule {
+            rule_id: "R-0009".into(),
+            field: "comment",
+        }
+    );
+}
+
+/// Rollback re-activates history on purpose and does not pass the submission
+/// gate: an old revision holding such a rule comes back, and codegen skips
+/// that one rule rather than refusing the whole rollback.
+#[test]
+fn rollback_to_a_revision_holding_an_unsupported_shape_is_allowed() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    fx.registry
+        .on_connect("S-A", IpcClientProfile::TrayLightweight);
+    {
+        let conn = fx.conn.lock().expect("conn");
+        RevisionsRepository::new(&conn)
+            .insert_candidate(&outside_app_record("rev-old", app_and_address_rules_json()))
+            .expect("insert");
+    }
+    let old = RevisionId::from_prefixed_string("rev-old".to_string()).expect("id");
+    let token = issue_token(&fx, &old);
+    fx.coordinator
+        .activate(&old, &token, "c1")
+        .expect("act old");
+    let newer = submit(&fx, "h-new");
+    let token = issue_token(&fx, &newer);
+    fx.coordinator
+        .activate(&newer, &token, "c2")
+        .expect("act new");
+
+    let outcome = fx
+        .coordinator
+        .rollback_to(nrr_storage::BASELINE_PRINCIPAL, RollbackTarget::Lkg, "c-rb")
+        .expect("rollback is not a submission");
+    assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+    let active = fx
+        .coordinator
+        .current_active()
+        .expect("active")
+        .expect("present");
+    assert_eq!(active.rules_json, app_and_address_rules_json());
 }

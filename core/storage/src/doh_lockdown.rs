@@ -10,14 +10,15 @@
 //!   table) — the resolver set is a machine-wide fact, edited once (with
 //!   elevation), pre-filled with public resolvers by country.
 //!
-//! Subnets/CIDR are not supported; a Free entry is a single IPv4 or a hostname
-//! (resolved to `/32`s by the enforcement layer).
+//! Subnets/CIDR are not supported; a Free entry is a single address of either
+//! family or a hostname (resolved to host addresses by the enforcement layer).
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use rusqlite::{params, Connection};
 
 use crate::error::{StorageError, StorageResult};
+use crate::schema::BASELINE_PRINCIPAL;
 
 /// Where the DoH/DoT lockdown applies. Persisted per-SID as an INTEGER code
 /// (like [`crate::resolution_source`]'s policies), carried on the wire as a slug.
@@ -73,12 +74,15 @@ impl DohLockdownScope {
     pub const ALL_SLUGS: &'static [&'static str] = &["leak-protection-only", "always"];
 }
 
-/// A resolver-list entry target. Free: a literal IPv4 (blocked directly) or a
-/// hostname (the enforcement layer resolves it to `/32`s). No CIDR/subnets.
+/// A resolver-list entry target. Free: a literal address (blocked directly) or
+/// a hostname (the enforcement layer resolves it). No CIDR/subnets.
+///
+/// Both families share the `ip` kind: the column holds text, so an IPv6 row
+/// needs no schema change and every IPv4 row written before decodes unchanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DohTarget {
-    /// A single IPv4 resolver address.
-    Ip(Ipv4Addr),
+    /// A single resolver address, either family.
+    Ip(IpAddr),
     /// A resolver hostname (e.g. `dns.google`), resolved to IPs at apply time.
     Host(String),
 }
@@ -102,15 +106,22 @@ impl DohTarget {
 
     /// Reconstruct from a `(target_kind, target)` pair. `None` on an unparseable
     /// IP or an empty host — the caller drops the row.
+    ///
+    /// An address literal is an `Ip` whichever kind it arrived as: a "host"
+    /// that is really an address would go to the name cache and resolve to
+    /// nothing, leaving the resolver unblocked. A v4-mapped v6 spelling
+    /// collapses to its v4 address so one resolver cannot hold two rows.
     pub fn parse(kind: &str, value: &str) -> Option<Self> {
         let v = value.trim();
         match kind {
-            "ip" => v.parse::<Ipv4Addr>().ok().map(Self::Ip),
-            "host" => {
-                if v.is_empty() {
-                    None
-                } else {
+            "ip" | "host" => {
+                if let Ok(ip) = v.parse::<IpAddr>() {
+                    return Some(Self::Ip(ip.to_canonical()));
+                }
+                if kind == "host" && !v.is_empty() {
                     Some(Self::Host(v.to_ascii_lowercase()))
+                } else {
+                    None
                 }
             }
             _ => None,
@@ -212,31 +223,139 @@ impl<'a> DohResolverEntriesRepository<'a> {
         Ok(())
     }
 
-    /// Seed the list with `entries` ONLY if it is currently empty (first run).
-    /// Returns the number of rows inserted (0 if the list already had entries, so
-    /// a user's edits are never overwritten). Idempotent across restarts.
-    pub fn seed_if_empty(
+    /// Bring the list up to the built-in seed `seed_version`.
+    ///
+    /// An empty list takes every entry. Otherwise only entries introduced after
+    /// the last applied version are added, and only where absent: a row the user
+    /// deleted belongs to an applied version, so it never comes back, and a row
+    /// the user edited keeps the edit. A `retired` entry withdrawn after that
+    /// version is removed only while it still carries its seeded comment — rows
+    /// record no origin, and a changed comment is the one sign of a user's hand.
+    /// Rows and version land in one transaction.
+    pub fn apply_seed(
         &self,
-        entries: &[DohResolverEntry],
+        entries: &[SeedEntry],
+        retired: &[RetiredSeedEntry],
+        seed_version: u32,
         now_epoch_secs: i64,
-    ) -> StorageResult<usize> {
-        let count: i64 = self
+    ) -> StorageResult<SeedApplied> {
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .map_err(|e| StorageError::Internal(format!("begin doh seed tx: {e}")))?;
+        let count: i64 = tx
             .query_row("SELECT COUNT(*) FROM doh_resolver_entries", [], |r| {
                 r.get(0)
             })
             .map_err(|e| StorageError::Internal(format!("count doh entries: {e}")))?;
-        if count > 0 {
-            return Ok(0);
+        let floor = if count == 0 {
+            0
+        } else {
+            // A list seeded before the seed was versioned holds version 1.
+            let applied = applied_seed_version(&tx)?.unwrap_or(1);
+            if applied >= seed_version {
+                return Ok(SeedApplied::default());
+            }
+            applied
+        };
+        let mut removed = 0;
+        for r in retired.iter().filter(|r| r.retired_in > floor) {
+            removed += tx
+                .execute(
+                    "DELETE FROM doh_resolver_entries
+                     WHERE target_kind = ?1 AND target = ?2 AND comment = ?3",
+                    params![r.target.kind_str(), r.target.value_str(), r.comment],
+                )
+                .map_err(|err| StorageError::Internal(format!("retire doh seed entry: {err}")))?;
         }
-        self.replace_all(entries, now_epoch_secs)?;
-        Ok(entries.len())
+        let mut inserted = 0;
+        for s in entries.iter().filter(|s| s.since > floor) {
+            let e = &s.entry;
+            inserted += tx
+                .execute(
+                    "INSERT INTO doh_resolver_entries (target_kind, target, comment, enabled, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(target_kind, target) DO NOTHING",
+                    params![
+                        e.target.kind_str(),
+                        e.target.value_str(),
+                        e.comment,
+                        e.enabled as i64,
+                        now_epoch_secs,
+                    ],
+                )
+                .map_err(|err| StorageError::Internal(format!("insert doh seed entry: {err}")))?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO migration_state (sid, migration_id, completed_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                BASELINE_PRINCIPAL,
+                format!("{SEED_MARKER_PREFIX}{seed_version}"),
+                now_epoch_secs
+            ],
+        )
+        .map_err(|e| StorageError::Internal(format!("mark doh seed version: {e}")))?;
+        tx.commit()
+            .map_err(|e| StorageError::Internal(format!("commit doh seed tx: {e}")))?;
+        Ok(SeedApplied { inserted, removed })
     }
+
+    /// The highest built-in seed version applied to this list, if any.
+    pub fn applied_seed_version(&self) -> StorageResult<Option<u32>> {
+        applied_seed_version(self.conn)
+    }
+}
+
+/// A built-in seed entry and the seed version that introduced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeedEntry {
+    pub entry: DohResolverEntry,
+    pub since: u32,
+}
+
+/// A built-in entry a later seed version withdrew; `comment` is the one it was
+/// seeded with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredSeedEntry {
+    pub target: DohTarget,
+    pub comment: String,
+    pub retired_in: u32,
+}
+
+/// What [`DohResolverEntriesRepository::apply_seed`] changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeedApplied {
+    pub inserted: usize,
+    pub removed: usize,
+}
+
+/// The applied seed version is a machine fact, so it is a one-time marker in
+/// the migration ledger under the baseline principal: one row per version.
+const SEED_MARKER_PREFIX: &str = "doh-resolver-seed-v";
+
+fn applied_seed_version(conn: &Connection) -> StorageResult<Option<u32>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT migration_id FROM migration_state
+             WHERE sid = ?1 AND migration_id LIKE 'doh-resolver-seed-v%'",
+        )
+        .map_err(|e| StorageError::Internal(format!("prepare doh seed version: {e}")))?;
+    let ids = stmt
+        .query_map([BASELINE_PRINCIPAL], |r| r.get::<_, String>(0))
+        .map_err(|e| StorageError::Internal(format!("query doh seed version: {e}")))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| StorageError::Internal(format!("row doh seed version: {e}")))?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| id.strip_prefix(SEED_MARKER_PREFIX)?.parse::<u32>().ok())
+        .max())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn seeded_conn() -> Connection {
         use crate::migration::SqliteMigrationRunner;
@@ -255,7 +374,7 @@ mod tests {
 
         let entries = vec![
             DohResolverEntry {
-                target: DohTarget::Ip(Ipv4Addr::new(8, 8, 8, 8)),
+                target: DohTarget::Ip(Ipv4Addr::new(8, 8, 8, 8).into()),
                 comment: "Google".into(),
                 enabled: true,
             },
@@ -271,24 +390,141 @@ mod tests {
         // Ordered host before ip? Order is (target_kind ASC): 'host' < 'ip'.
         assert_eq!(loaded[0].target, DohTarget::Host("dns.google".into()));
         assert!(!loaded[0].enabled);
-        assert_eq!(loaded[1].target, DohTarget::Ip(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(
+            loaded[1].target,
+            DohTarget::Ip(Ipv4Addr::new(8, 8, 8, 8).into())
+        );
         assert!(loaded[1].enabled);
     }
 
+    fn seed_ip(last: u8, since: u32) -> SeedEntry {
+        SeedEntry {
+            entry: DohResolverEntry {
+                target: DohTarget::Ip(Ipv4Addr::new(192, 0, 2, last).into()),
+                comment: format!("seed {last}"),
+                enabled: true,
+            },
+            since,
+        }
+    }
+
+    fn targets(repo: &DohResolverEntriesRepository<'_>) -> Vec<String> {
+        let mut t: Vec<String> = repo
+            .load_all()
+            .expect("load")
+            .into_iter()
+            .map(|e| e.target.value_str())
+            .collect();
+        t.sort();
+        t
+    }
+
     #[test]
-    fn seed_if_empty_only_seeds_once() {
+    fn fresh_list_takes_every_seed_entry_and_records_the_version() {
         let conn = seeded_conn();
         let repo = DohResolverEntriesRepository::new(&conn);
-        let seed = vec![DohResolverEntry {
-            target: DohTarget::Ip(Ipv4Addr::new(1, 1, 1, 1)),
-            comment: "Cloudflare".into(),
-            enabled: true,
-        }];
-        assert_eq!(repo.seed_if_empty(&seed, 1).expect("seed"), 1);
-        // Second call is a no-op — user edits (even removing all) are respected
-        // only while non-empty; here the list is non-empty so nothing re-seeds.
-        assert_eq!(repo.seed_if_empty(&seed, 2).expect("reseed"), 0);
-        assert_eq!(repo.load_all().expect("load").len(), 1);
+        let seed = [seed_ip(1, 1), seed_ip(2, 2)];
+        assert_eq!(repo.apply_seed(&seed, &[], 2, 1).expect("seed").inserted, 2);
+        assert_eq!(repo.applied_seed_version().expect("version"), Some(2));
+        assert_eq!(
+            repo.apply_seed(&seed, &[], 2, 2).expect("again").inserted,
+            0
+        );
+    }
+
+    #[test]
+    fn newer_seed_adds_only_new_rows_and_never_restores_a_deleted_one() {
+        let conn = seeded_conn();
+        let repo = DohResolverEntriesRepository::new(&conn);
+        let v1 = [seed_ip(1, 1), seed_ip(2, 1)];
+        repo.apply_seed(&v1, &[], 1, 1).expect("v1");
+        // The user deletes one v1 row and disables the other.
+        let mut kept = repo.load_all().expect("load");
+        kept.retain(|e| e.target.value_str() == "192.0.2.1");
+        kept[0].enabled = false;
+        repo.replace_all(&kept, 2).expect("user edit");
+
+        let v2 = [seed_ip(1, 1), seed_ip(2, 1), seed_ip(3, 2)];
+        assert_eq!(repo.apply_seed(&v2, &[], 2, 3).expect("v2").inserted, 1);
+        assert_eq!(targets(&repo), ["192.0.2.1", "192.0.2.3"]);
+        assert!(
+            !repo.load_all().expect("load")[0].enabled,
+            "user edit survives"
+        );
+        assert_eq!(repo.applied_seed_version().expect("version"), Some(2));
+
+        assert_eq!(repo.apply_seed(&v2, &[], 2, 4).expect("rerun").inserted, 0);
+        assert_eq!(targets(&repo), ["192.0.2.1", "192.0.2.3"]);
+    }
+
+    fn retired_ip(last: u8, retired_in: u32) -> RetiredSeedEntry {
+        let s = seed_ip(last, 1);
+        RetiredSeedEntry {
+            target: s.entry.target,
+            comment: s.entry.comment,
+            retired_in,
+        }
+    }
+
+    /// A withdrawn entry leaves an install that still holds it as seeded; one
+    /// whose comment the user changed stays, and a rerun changes nothing.
+    #[test]
+    fn a_retired_entry_is_removed_only_while_it_is_still_the_seeded_row() {
+        let conn = seeded_conn();
+        let repo = DohResolverEntriesRepository::new(&conn);
+        repo.apply_seed(&[seed_ip(1, 1), seed_ip(2, 1), seed_ip(3, 1)], &[], 1, 1)
+            .expect("v1");
+        let mut rows = repo.load_all().expect("load");
+        for row in rows.iter_mut() {
+            match row.target.value_str().as_str() {
+                "192.0.2.2" => row.comment = "my resolver".into(),
+                "192.0.2.3" => row.enabled = false,
+                _ => {}
+            }
+        }
+        repo.replace_all(&rows, 2).expect("user edit");
+
+        let retired = [retired_ip(1, 2), retired_ip(2, 2), retired_ip(3, 2)];
+        let applied = repo
+            .apply_seed(&[seed_ip(4, 2)], &retired, 2, 3)
+            .expect("v2");
+        assert_eq!(
+            applied,
+            SeedApplied {
+                inserted: 1,
+                removed: 2
+            }
+        );
+        assert_eq!(targets(&repo), ["192.0.2.2", "192.0.2.4"]);
+
+        // Withdrawn at a version already applied: never acted on again.
+        let later = repo.apply_seed(&[], &[retired_ip(4, 2)], 3, 5).expect("v3");
+        assert_eq!(later, SeedApplied::default());
+        assert_eq!(targets(&repo), ["192.0.2.2", "192.0.2.4"]);
+    }
+
+    /// Installs seeded before the seed carried a version hold version 1.
+    #[test]
+    fn a_list_without_a_recorded_version_counts_as_version_one() {
+        let conn = seeded_conn();
+        let repo = DohResolverEntriesRepository::new(&conn);
+        repo.replace_all(&[seed_ip(1, 1).entry], 1)
+            .expect("legacy seed");
+        assert_eq!(repo.applied_seed_version().expect("version"), None);
+        let v2 = [seed_ip(1, 1), seed_ip(2, 1), seed_ip(3, 2)];
+        assert_eq!(repo.apply_seed(&v2, &[], 2, 2).expect("v2").inserted, 1);
+        assert_eq!(targets(&repo), ["192.0.2.1", "192.0.2.3"]);
+    }
+
+    /// The marker is a machine fact; a user's full reset must not erase it.
+    #[test]
+    fn seed_version_is_not_a_users_state() {
+        let conn = seeded_conn();
+        let repo = DohResolverEntriesRepository::new(&conn);
+        repo.apply_seed(&[seed_ip(1, 1)], &[], 1, 1).expect("seed");
+        assert!(crate::principal_purge::principals_with_state(&conn)
+            .expect("principals")
+            .is_empty());
     }
 
     #[test]
@@ -311,7 +547,7 @@ mod tests {
     #[test]
     fn target_parse_and_render() {
         let ip = DohTarget::parse("ip", "8.8.8.8").expect("ip");
-        assert_eq!(ip, DohTarget::Ip(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(ip, DohTarget::Ip(Ipv4Addr::new(8, 8, 8, 8).into()));
         assert_eq!(ip.kind_str(), "ip");
         assert_eq!(ip.value_str(), "8.8.8.8");
 
@@ -322,5 +558,70 @@ mod tests {
         assert!(DohTarget::parse("ip", "not-an-ip").is_none());
         assert!(DohTarget::parse("host", "  ").is_none());
         assert!(DohTarget::parse("subnet", "1.2.3.0/24").is_none());
+    }
+
+    #[test]
+    fn both_families_roundtrip_through_the_table() {
+        let conn = seeded_conn();
+        let repo = DohResolverEntriesRepository::new(&conn);
+        let v6: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53).into();
+        let entries = vec![
+            DohResolverEntry {
+                target: DohTarget::Ip(Ipv4Addr::new(192, 0, 2, 53).into()),
+                comment: "v4".into(),
+                enabled: true,
+            },
+            DohResolverEntry {
+                target: DohTarget::Ip(v6),
+                comment: "v6".into(),
+                enabled: true,
+            },
+        ];
+        repo.replace_all(&entries, 1).expect("replace");
+        let loaded = repo.load_all().expect("load");
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|e| e.target == DohTarget::Ip(v6)));
+        assert!(loaded
+            .iter()
+            .any(|e| e.target == DohTarget::Ip(Ipv4Addr::new(192, 0, 2, 53).into())));
+    }
+
+    /// A row written while the list held IPv4 only is plain text in the same
+    /// columns; it must still decode.
+    #[test]
+    fn a_v4_row_written_directly_still_decodes() {
+        let conn = seeded_conn();
+        conn.execute(
+            "INSERT INTO doh_resolver_entries (target_kind, target, comment, enabled, updated_at)
+             VALUES ('ip', '192.0.2.1', 'old', 1, 0)",
+            [],
+        )
+        .expect("insert");
+        let loaded = DohResolverEntriesRepository::new(&conn)
+            .load_all()
+            .expect("load");
+        assert_eq!(
+            loaded[0].target,
+            DohTarget::Ip(Ipv4Addr::new(192, 0, 2, 1).into())
+        );
+    }
+
+    #[test]
+    fn v6_targets_parse_and_normalise() {
+        let v6 = DohTarget::parse("ip", " 2001:DB8::0053 ").expect("v6");
+        assert_eq!(v6.kind_str(), "ip");
+        assert_eq!(v6.value_str(), "2001:db8::53");
+        // An address typed into the host field is still an address.
+        assert_eq!(DohTarget::parse("host", "2001:db8::53"), Some(v6));
+        assert_eq!(
+            DohTarget::parse("host", "192.0.2.7"),
+            Some(DohTarget::Ip(Ipv4Addr::new(192, 0, 2, 7).into()))
+        );
+        // One resolver, one row: the v4-mapped spelling is the v4 address.
+        assert_eq!(
+            DohTarget::parse("ip", "::ffff:192.0.2.7"),
+            Some(DohTarget::Ip(Ipv4Addr::new(192, 0, 2, 7).into()))
+        );
+        assert!(DohTarget::parse("ip", "2001:db8::/32").is_none());
     }
 }

@@ -40,6 +40,7 @@ impl DnsObservationConsumer {
             Ok(0) => {}
             Ok(rows) => tracing::info!(
                 target: "nrr::dns-observe",
+                msg_key = "dnsobs-direct-tenant-forgotten-pending-companion",
                 host = %hostname,
                 rows,
                 "host is a parked suggestion for the additional route — dropped it from the shared-IP census so its addresses stay pinned there",
@@ -150,6 +151,7 @@ impl DnsObservationConsumer {
         if let Err(e) = guard.upsert_resolution(entry) {
             tracing::warn!(
                 target: "nrr::dns-observe",
+                msg_key = "dnsobs-upsert-failed",
                 error = %e,
                 "upsert_resolution failed for observed hostname",
             );

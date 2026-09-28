@@ -77,11 +77,11 @@ pub struct PerSidPolicySnapshot {
     /// [`DohLockdownScope::LeakProtectionOnly`] (only while the kill-switch master
     /// toggle is on) or [`DohLockdownScope::Always`].
     pub doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope,
-    /// the ALREADY-RESOLVED resolver IPv4s to block
-    /// (enabled list entries: literal IPs as-is + host entries resolved through
-    /// the FQDN cache). The composition root resolves these so the orchestrator
-    /// stays mechanism-free. Empty when the lockdown is off or nothing resolved.
-    pub doh_resolver_ips: Vec<std::net::Ipv4Addr>,
+    /// The ALREADY-RESOLVED resolver addresses to block, both families
+    /// (literal entries as-is + host entries through the FQDN cache), resolved
+    /// by the composition root so the orchestrator stays mechanism-free. Empty
+    /// when the lockdown is off or nothing resolved.
+    pub doh_resolver_ips: Vec<std::net::IpAddr>,
     ///  — what the service may do with the companion domains it
     /// discovers for a routed site (the CDN/media hosts its rules do not
     /// cover). [`AutoRulesMode::Suggest`] (the default) collects findings and

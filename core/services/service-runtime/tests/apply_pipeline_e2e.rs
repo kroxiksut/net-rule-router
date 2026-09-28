@@ -240,6 +240,8 @@ fn seed_route_binding(fx: &PipelineFixture, sid: &str, mode: BehaviorMode) {
         primary_probe_repeat_secs: 300,
         local_networks_auto_accept: false,
         zone_priority_over_ip: false,
+        short_name_completion: false,
+        short_name_suffix: String::new(),
         binding_source: BindingSource::UserAssigned,
     };
     repo.update_for_sid(sid, &record, 1_700_000_000)

@@ -195,6 +195,7 @@ impl AutoRulesEngine {
                 Err(e) => {
                     tracing::warn!(
                         target: "nrr::auto-rules",
+                        msg_key = "autorules-ledger-serialize-failed",
                         sid = %sid,
                         error = %e,
                         "could not serialize a pending suggestion — it will not survive a restart",
@@ -292,6 +293,7 @@ impl AutoRulesEngine {
                 if count > 0 {
                     tracing::info!(
                         target: "nrr::auto-rules",
+                        msg_key = "autorules-ledger-auto-added",
                         sid = %sid,
                         added = count,
                         anchor = %top_anchor(fresh),
@@ -303,6 +305,7 @@ impl AutoRulesEngine {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-ledger-auto-add-failed",
                     sid = %sid,
                     code = %e.code,
                     anchor = %top_anchor(fresh),

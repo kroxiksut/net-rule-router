@@ -31,7 +31,9 @@ impl ProductionMutationExecutor {
             Ok(a) => a,
             Err(e) => return preset_failure_summary(&e),
         };
-        if let Err(e) = Self::enforce_free_rule_cap(&assembled.rules_json) {
+        if let Err(e) = Self::enforce_free_rule_cap(&assembled.rules_json)
+            .and_then(|()| Self::enforce_submission_gates(&assembled.rules_json))
+        {
             return malformed_summary(&e.message);
         }
         let scored = self.score_candidate_for_payload(&assembled.rules_json, principal);
@@ -70,6 +72,7 @@ impl ProductionMutationExecutor {
         };
         tracing::info!(
             target: "nrr::mutation::preset",
+            msg_key = "prod-preset-candidate-submitted",
             revision_id = %revision_id,
             content_hash = %assembled.content_hash,
             "preset candidate submitted (a deduped id == an existing/active \
@@ -94,6 +97,7 @@ impl ProductionMutationExecutor {
             Ok(outcome) => {
                 tracing::info!(
                     target: "nrr::mutation::preset",
+                    msg_key = "prod-preset-activate-ok",
                     revision_id = %revision_id,
                     "preset activate OK"
                 );
@@ -102,6 +106,7 @@ impl ProductionMutationExecutor {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::mutation::preset",
+                    msg_key = "prod-preset-activate-failed",
                     revision_id = %revision_id,
                     error = ?e,
                     "preset activate FAILED"
@@ -144,6 +149,7 @@ impl ProductionMutationExecutor {
                 RouteRole::Primary,
                 parsed.include_child_processes,
                 parsed.import_only_active,
+                self.host_platform,
             )?),
             _ => None,
         };
@@ -153,6 +159,7 @@ impl ProductionMutationExecutor {
                 RouteRole::Secondary,
                 parsed.include_child_processes,
                 parsed.import_only_active,
+                self.host_platform,
             )?),
             _ => None,
         };
@@ -169,14 +176,16 @@ impl ProductionMutationExecutor {
                 secondary: secondary_set.expect("BothRoutes implies secondary bytes"),
             },
             PresetImportTarget::SingleRoute(RouteRole::Primary) => {
-                let other = load_active_secondary(self.state_conn.as_ref(), principal);
+                let other =
+                    load_active_secondary(self.state_conn.as_ref(), principal, self.host_platform);
                 CanonicalRuleBook {
                     primary: primary_set.expect("SingleRoute(Primary) implies primary bytes"),
                     secondary: other,
                 }
             }
             PresetImportTarget::SingleRoute(RouteRole::Secondary) => {
-                let other = load_active_primary(self.state_conn.as_ref(), principal);
+                let other =
+                    load_active_primary(self.state_conn.as_ref(), principal, self.host_platform);
                 CanonicalRuleBook {
                     primary: other,
                     secondary: secondary_set
@@ -197,6 +206,7 @@ impl ProductionMutationExecutor {
 
         tracing::info!(
             target: "nrr::mutation::preset",
+            msg_key = "prod-preset-assembled",
             rules_json_len = rules_json.len(),
             content_hash = %content_hash,
             "preset assembled canonical book (rules_json_len is the populated \

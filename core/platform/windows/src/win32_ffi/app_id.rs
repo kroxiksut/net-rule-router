@@ -61,6 +61,7 @@ pub fn app_id_from_path(path: &Path) -> Result<Vec<u8>, PlatformError> {
             if let Some(blob) = app_id_without_opening(path) {
                 tracing::info!(
                     target: "nrr::wfp",
+                    msg_key = "win-ffi-appid-derived-without-open",
                     path = %path.display(),
                     code = *code,
                     "app-id derived without opening the executable (open denied — likely self-protected software)",

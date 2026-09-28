@@ -3,16 +3,18 @@
 use super::*;
 
 /// Lower the DoH/DoT lockdown plan
-/// ([`enforcement_planner::plan_doh_dot_block`]) to WFP filters. `HostV4`
-/// [`PrecedenceClass::DohBlock`] flows are grouped by `(dst_port, protocol)`
-/// and packed — one ALE-connect `Block` per chunk — reproducing the packed
-/// `killswitch_codegen::doh_dot_block_filters`; `Any` flows (the global DoT
-/// cut) stay unconditional.
+/// ([`enforcement_planner::plan_doh_dot_block`]) to WFP filters. Host
+/// [`PrecedenceClass::DohBlock`] flows of either family are grouped by
+/// `(dst_port, protocol)` and packed — one ALE-connect `Block` per chunk — and
+/// `Any` flows (the global DoT cut) become one unconditional block per family,
+/// because a WFP filter lives at one family's layer. Reproduces the packed
+/// `killswitch_codegen::doh_dot_block_filters`.
 pub fn lower_doh_dot_block(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
-    // Grouped by port, protocols in first-seen order — emission then walks
-    // chunk × protocol with one running weight, then the global (`Any`) cuts:
-    // the codegen's exact weight order, which the arbitration oracle pins.
-    type PortGroup = (Option<u16>, Vec<Option<u8>>, Vec<Ipv4Addr>);
+    // Grouped by port, protocols in first-seen order — emission then walks,
+    // per family, chunk × protocol with one running weight, then the global
+    // (`Any`) cuts: the codegen's exact weight order, which the arbitration
+    // oracle pins.
+    type PortGroup = (Option<u16>, Vec<Option<u8>>, Vec<IpAddr>);
     let mut port_groups: Vec<PortGroup> = Vec::new();
     let mut any_cuts: Vec<(Option<u16>, Option<u8>, Option<String>)> = Vec::new();
     let mut set_sid: Option<String> = None;
@@ -22,77 +24,106 @@ pub fn lower_doh_dot_block(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
         }
         let user_sid = flow.principal.0.as_ref().map(|p| p.as_stored().to_string());
         let proto = flow.flow.protocol.map(l4proto_to_ip_number);
-        match flow.flow.dst {
-            DstMatch::HostV4(ip) => {
-                if set_sid.is_none() {
-                    set_sid = user_sid;
-                }
-                let port = flow.flow.dst_port;
-                let at = port_groups
-                    .iter()
-                    .position(|(p, _, _)| *p == port)
-                    .unwrap_or_else(|| {
-                        port_groups.push((port, Vec::new(), Vec::new()));
-                        port_groups.len() - 1
-                    });
-                let group = &mut port_groups[at];
-                if !group.1.contains(&proto) {
-                    group.1.push(proto);
-                }
-                group.2.push(ip);
+        let ip = match flow.flow.dst {
+            DstMatch::HostV4(ip) => IpAddr::V4(ip),
+            DstMatch::HostV6(ip) => IpAddr::V6(ip),
+            DstMatch::Any => {
+                any_cuts.push((flow.flow.dst_port, proto, user_sid));
+                continue;
             }
-            DstMatch::Any => any_cuts.push((flow.flow.dst_port, proto, user_sid)),
-            _ => {} // DoH lockdown only emits HostV4 / Any
+            _ => continue, // DoH lockdown only emits hosts / Any
+        };
+        if set_sid.is_none() {
+            set_sid = user_sid;
         }
+        let port = flow.flow.dst_port;
+        let at = port_groups
+            .iter()
+            .position(|(p, _, _)| *p == port)
+            .unwrap_or_else(|| {
+                port_groups.push((port, Vec::new(), Vec::new()));
+                port_groups.len() - 1
+            });
+        let group = &mut port_groups[at];
+        if !group.1.contains(&proto) {
+            group.1.push(proto);
+        }
+        group.2.push(ip);
     }
     let mut out = Vec::new();
-    let mut weight = DOH_BLOCK_BASE;
-    for (port, protos, ips) in &port_groups {
-        for chunk in pack_v4(ips.iter().copied()) {
-            for proto in protos {
-                out.push(doh_port_block(
-                    Some(&chunk),
-                    *port,
-                    *proto,
-                    weight,
-                    set_sid.clone(),
-                ));
-                weight += 1;
+    for layer in [WfpLayerKey::AleAuthConnectV4, WfpLayerKey::AleAuthConnectV6] {
+        let mut weight = DOH_BLOCK_BASE;
+        for (port, protos, ips) in &port_groups {
+            for chunk in pack_both(ips.iter().copied())
+                .iter()
+                .filter(|c| chunk_layer(c) == layer)
+            {
+                for proto in protos {
+                    out.push(doh_port_block(
+                        layer,
+                        Some(chunk),
+                        *port,
+                        *proto,
+                        weight,
+                        set_sid.clone(),
+                    ));
+                    weight += 1;
+                }
             }
         }
-    }
-    for (port, proto, user_sid) in any_cuts {
-        out.push(doh_port_block(None, port, proto, weight, user_sid));
-        weight += 1;
+        for (port, proto, user_sid) in &any_cuts {
+            out.push(doh_port_block(
+                layer,
+                None,
+                *port,
+                *proto,
+                weight,
+                user_sid.clone(),
+            ));
+            weight += 1;
+        }
     }
     out
 }
 
-/// ALE-connect `Block` narrowed to `(chunk?, port, proto)`. Mirrors the packed
-/// `killswitch_codegen::doh_port_block`.
+fn chunk_layer(chunk: &FamilyChunk) -> WfpLayerKey {
+    match chunk {
+        FamilyChunk::V4(_) => WfpLayerKey::AleAuthConnectV4,
+        FamilyChunk::V6(_) => WfpLayerKey::AleAuthConnectV6,
+    }
+}
+
+/// ALE-connect `Block` at `layer` narrowed to `(chunk?, port, proto)`. Mirrors
+/// the packed `killswitch_codegen::doh_port_block`.
 pub(super) fn doh_port_block(
-    scope: Option<&V4SlotChunk>,
+    layer: WfpLayerKey,
+    scope: Option<&FamilyChunk>,
     remote_port: Option<u16>,
     proto: Option<u8>,
     weight: u64,
     user_sid: Option<String>,
 ) -> WfpFilterSpec {
     let seg = scope
-        .map(V4SlotChunk::id_seg)
+        .map(FamilyChunk::id_seg)
         .unwrap_or_else(|| "any".to_string());
     let id = derive_set_id(
         user_sid.as_deref(),
-        WfpLayerKey::AleAuthConnectV4,
+        layer,
         WfpAction::Block,
         &format!("doh|{seg}"),
         weight,
     );
+    let (remote_ip_set, remote_ip_set_v6) = match scope {
+        Some(FamilyChunk::V4(c)) => (c.members.clone(), Vec::new()),
+        Some(FamilyChunk::V6(c)) => (Vec::new(), c.members.clone()),
+        None => (Vec::new(), Vec::new()),
+    };
     WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
+        layer,
         action: WfpAction::Block,
         remote_ip: None,
-        remote_ip_set: scope.map(|c| c.members.clone()).unwrap_or_default(),
-        remote_ip_set_v6: Vec::new(),
+        remote_ip_set,
+        remote_ip_set_v6,
         remote_port,
         weight,
         id,

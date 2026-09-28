@@ -622,6 +622,9 @@ pub fn write_qt_context_file_at(
         // one has no window to hand it to, so it rides the context.
         "launchAction": request.action,
         "launchReason": request.reason,
+        // Setting to scroll to and highlight, with its display-only context.
+        "launchFocus": request.focus,
+        "launchFocusContext": request.focus_context,
         "preferences": {
             "launchWindowOnStartup": preferences.launch_window_on_startup,
             "minimizeToTrayInsteadOfClose": preferences.minimize_to_tray_instead_of_close,
@@ -635,6 +638,7 @@ pub fn write_qt_context_file_at(
             // Experimental opt-in that reveals the Rules -> Virtual machines
             // screen (default off). Device-local.
             "showVirtualMachinesSection": preferences.show_virtual_machines_section,
+            "appGroupsOfferDismissed": preferences.app_groups_offer_dismissed,
             "reopenLastSectionOnStartup": preferences.reopen_last_section_on_startup,
             "firstRunCompleted": preferences.first_run_completed,
             "acceptedEulaVersion": preferences.accepted_eula_version,
@@ -1211,6 +1215,8 @@ struct QtPreferencesPayload {
     // safe default: the unverified screen stays hidden.
     #[serde(default)]
     show_virtual_machines_section: bool,
+    #[serde(default)]
+    app_groups_offer_dismissed: bool,
     // "Remembered but absent" ghost-row display toggle. Default true
     // (via `default_true`) so a QML build that omits the key keeps the ON
     // default rather than silently flipping the toggle off.

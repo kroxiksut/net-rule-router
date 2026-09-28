@@ -87,6 +87,7 @@ impl BrowserHistoryReadPort for WindowsBrowserHistoryRead {
         // AI-browser paths.
         tracing::info!(
             target: "nrr::browser-history",
+            msg_key = "win-browserhistory-discovery-finished",
             sources = %summarize_sources(&sources),
             "browser-history discovery finished",
         );
@@ -99,6 +100,7 @@ impl BrowserHistoryReadPort for WindowsBrowserHistoryRead {
         if !mail_hosts.is_empty() {
             tracing::info!(
                 target: "nrr::browser-history",
+                msg_key = "win-browserhistory-mail-hosts-discovered",
                 hosts = mail_hosts.len(),
                 "mail-client account servers discovered (thunderbird)",
             );

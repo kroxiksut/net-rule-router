@@ -127,6 +127,7 @@ impl PerSidApplyOrchestrator {
         // grepping for it.
         tracing::warn!(
             target: "nrr::enforcement-plan",
+            msg_key = "persid-shadow-plan-differs",
             sid,
             live = verdict.live,
             neutral = verdict.neutral,

@@ -235,14 +235,20 @@ ScrollView {
     function _consumePendingExplainHost() {
         var host = String(root.notificationsController.pendingExplainHost || "").trim()
         if (host === "") return
-        root.notificationsController.pendingExplainHost = ""
-        // The probe lives in its own window now: hand the host over, then
-        // open it. Opening first would run the probe against an empty input.
-        var probe = root.ruleDiagnosticsWindow
-        if (!probe) return
-        probe._probeInputText = host
-        root.openChildWindow(probe)
-        probe._runExplainProbe()
+        var nc = root.notificationsController
+        var ip = nc.pendingExplainIp
+        var process = nc.pendingExplainProcess
+        nc.pendingExplainHost = ""
+        nc.pendingExplainIp = ""
+        nc.pendingExplainProcess = ""
+        explainPanel.probe(host, ip, process)
+        // The panel sits at the bottom of the page; bring the answer into view.
+        Qt.callLater(function() {
+            var flick = section.contentItem
+            flick.contentY = Math.max(0,
+                Math.min(explainPanel.y, flick.contentHeight - flick.height))
+            explainPanel.focusInput()
+        })
     }
     Connections {
         target: root.refreshAction
@@ -835,165 +841,10 @@ ScrollView {
                                 : "—"))
                     color: root.mutedTextColor
                 }
-                // All cache actions in one wrapping row, right-aligned to the
-                // panel edge (this used to be Show/Clear in one RowLayout plus
-                // Seed-from-browser-history in a separate RowLayout below it,
-                // which left the seed button stranded on its own line). Flow +
-                // RightToLeft is the same idiom as UnsavedChangesGuard.qml: the
-                // FIRST declared button sits at the right edge, so buttons are
-                // declared in reverse visual order to keep the on-screen
-                // left-to-right reading order: Show/Hide entries, Clear app
-                // cache, Clear OS DNS cache, Seed from browser history.
-                Flow {
-                    Layout.fillWidth: true
-                    spacing: root.uiTheme.spacingSm
-                    layoutDirection: Qt.RightToLeft
-                    // Seed the FQDN/IP cache from the local browser history.
-                    // Runs on demand by explicit user consent — the service
-                    // resolves ONLY hosts that match the user's rules (privacy
-                    // boundary), filling the gap for sites visited before the
-                    // service ran.
-                    ThemedButton {
-                        theme: root.uiTheme
-                        text: root.tr("diag.cache.seed-browser-history.button",
-                            "Seed cache from browser history")
-                        onClicked: {
-                            if (!root.bridgeReadyOrWarn())
-                                return
-                            var corr = nrrNativeBridge.rpcSeedFromBrowserHistory()
-                            root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-                                if (!ok) {
-                                    root.statusLine = root.tr("diag.cache.seed-browser-history.unavailable",
-                                        "This feature is unavailable.") + " "
-                                        + ((typeof root.ipcErrorLabel === "function")
-                                            ? root.ipcErrorLabel(String(errorCode || "unknown"))
-                                            : String(errorCode || "unknown"))
-                                    return
-                                }
-                                root.statusLine = (payload && payload["started"] === true)
-                                    ? root.tr("diag.cache.seed-browser-history.started",
-                                        "Import started — hosts matching your rules will appear in the cache.")
-                                    : root.tr("diag.cache.seed-browser-history.unavailable",
-                                        "This feature is unavailable.")
-                                // If the viewer is open, refresh so newly-seeded
-                                // entries (source "Browser history") show up.
-                                if (root.cacheWindow && root.cacheWindow.visible)
-                                    root.cacheWindow._loadCacheEntries(true)
-                            })
-                        }
-                    }
-                    ThemedButton {
-                        theme: root.uiTheme
-                        text: root.tr("diag.cache.clear-os-dns-button", "Clear OS DNS cache")
-                        onClicked: {
-                            // Flushes the OS DNS resolver cache only; the app's
-                            // FQDN/IP cache is left untouched.
-                            if (!root.bridgeReadyOrWarn())
-                                return
-                            var corr = nrrNativeBridge.rpcCacheClear({ "clear-app-cache": false, "flush-os-cache": true })
-                            root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-                                if (!ok) {
-                                    root.statusLine = root.tr("status.cache-cleared-failed",
-                                        "Failed to clear cache: ") + ((typeof root.ipcErrorLabel === "function")
-                                            ? root.ipcErrorLabel(String(errorCode || "unknown"))
-                                            : String(errorCode || "unknown"))
-                                    return
-                                }
-                                // `os-cache-flushed` is true/false/null — true only
-                                // when the OS flush actually ran and succeeded.
-                                root.statusLine = (payload && payload["os-cache-flushed"] === true)
-                                    ? root.tr("diag.cache.os-flush-ok", "OS DNS cache flushed.")
-                                    : root.tr("diag.cache.os-flush-failed", "Could not flush the OS DNS cache.")
-                            })
-                        }
-                    }
-                    // Cache clearing split into two independent
-                    // actions: the app's rebuildable FQDN/IP cache, and the OS
-                    // DNS resolver cache. Each drives the same cache.clear RPC
-                    // with a different flag set.
-                    ThemedButton {
-                        theme: root.uiTheme
-                        text: root.tr("diag.cache.clear-app-button", "Clear app cache")
-                        onClicked: {
-                            // Clears the rebuildable FQDN/IP cache; audit/state
-                            // DBs untouched. OS DNS cache left alone.
-                            if (!root.bridgeReadyOrWarn())
-                                return
-                            var corr = nrrNativeBridge.rpcCacheClear({ "clear-app-cache": true, "flush-os-cache": false })
-                            root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-                                if (!ok) {
-                                    root.statusLine = root.tr("status.cache-cleared-failed",
-                                        "Failed to clear cache: ") + ((typeof root.ipcErrorLabel === "function")
-                                            ? root.ipcErrorLabel(String(errorCode || "unknown"))
-                                            : String(errorCode || "unknown"))
-                                    return
-                                }
-                                var removed = Number((payload && payload["resolutions-removed"]) || 0)
-                                root.statusLine = root.tr("status.cache-cleared",
-                                    "Cache cleared: {count} resolution(s) removed.")
-                                    .replace("{count}", String(removed))
-                                // Cache is now empty — refresh the viewer if it is open.
-                                if (root.cacheWindow && root.cacheWindow.visible)
-                                    root.cacheWindow._loadCacheEntries(true)
-                            })
-                        }
-                    }
-                    ThemedButton {
-                        theme: root.uiTheme
-                        // Single toggle: shows "Show…" when the
-                        // viewer is hidden, "Hide…" once open, replacing the
-                        // separate hide button that lived inside the frame. That
-                        // hide button cleared the search text, which retriggered
-                        // the debounce → `_loadCacheEntries` → re-shown viewer,
-                        // so hiding needed two presses. `_hideCacheEntries()`
-                        // tears down without going through the search-field path.
-                        text: root.tr("diag.cache.open-window", "Open cache")
-                        onClicked: {
-                            var win = root.cacheWindow
-                            if (!win) return
-                            root.openChildWindow(win)
-                            win._loadCacheEntries(true)
-                        }
-                    }
-                }
-                Label {
-                    Layout.fillWidth: true
-                    text: root.tr("diag.cache.seed-browser-history.note",
-                        "Resolves hosts from your browser history that match your rules (closes the gap for sites visited before the service started). Privacy: only names matching your rules are processed.")
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-                }
-                // Opt-in AUTOMATIC seed at service start (per-SID
-                // service-side setting, default OFF). The manual button above
-                // works regardless. Checked state mirrors the service snapshot
-                // (routingState.browserHistoryAutoSeed, refreshed on reconnect).
-                CheckBox {
-                    id: browserHistoryAutoSeedCheckbox
-                    text: root.tr("diag.cache.auto-seed-label",
-                        "Seed the cache from browser history automatically at service start")
-                    checked: root.uiRevision >= 0
-                        ? (root.routingState
-                           && root.routingState.browserHistoryAutoSeed === true)
-                        : false
-                    onToggled: root.routePolicyController.applyBrowserHistoryAutoSeed(checked)
-                    Accessible.role: Accessible.CheckBox
-                    Accessible.name: text
-                }
-                // Dedicated privacy caption directly under the
-                // auto-seed toggle: only visited HOSTNAMES are read from local
-                // browser profiles, nothing leaves the machine. Distinct from
-                // the general seed-feature note above (which explains what the
-                // manual button does); this one specifically scopes what the
-                // automatic, opt-in variant reads and does not send anywhere.
-                Label {
-                    Layout.fillWidth: true
-                    Layout.leftMargin: root.uiTheme.spacingMd
-                    text: root.tr("diag.cache.auto-seed-privacy-note",
-                        "Only visited hostnames are read from local browser profiles — nothing is sent anywhere.")
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("diag.cache.open-window", "Open cache")
+                    onClicked: root.requestSectionChange("cache")
                 }
             }
         }
@@ -1067,38 +918,11 @@ ScrollView {
             }
         }
 
-        // Rule diagnostics moved to its own window: the probe answers
-        // "which rule would win for this destination", and that is read WHILE
-        // editing rules, which a section in a StackLayout cannot allow.
-        Frame {
-            Layout.fillWidth: true
-            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
-            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
-            RowLayout {
-                anchors.fill: parent
-                spacing: root.uiTheme.spacingSm
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: root.uiTheme.spacingXxs
-                    Label {
-                        text: root.tr("diag.explain.title", "Explain sample")
-                        color: root.textColor
-                        font.bold: true
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        text: root.tr("diag.explain.subtitle",
-                            "Enter a hostname or IP to simulate the routing decision against the active rule set.")
-                        color: root.mutedTextColor
-                        wrapMode: Text.WordWrap
-                    }
-                }
-                ThemedButton {
-                    theme: root.uiTheme
-                    text: root.tr("diag.explain.open-window", "Open rule diagnostics")
-                    onClicked: root.openChildWindow(root.ruleDiagnosticsWindow)
-                }
-            }
+        // Which rule would win for a destination. Block notices and the
+        // connection trace land here with the destination already filled in.
+        RuleDiagnosticsPanel {
+            id: explainPanel
+            root: section.root
         }
 
         Item { Layout.fillHeight: true }

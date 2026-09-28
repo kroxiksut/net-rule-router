@@ -23,9 +23,10 @@
 //! read waiting on the server would freeze every other flow. So a TCP flow gets
 //! two worker threads that own the two halves of its upstream socket
 //! ([`RelayStream::into_split`]); a UDP flow gets one (only the receive side
-//! blocks — sends are non-blocking and go out inline). Both exchange bytes with
-//! the poll loop through per-flow buffers; the poll loop never blocks on the
-//! network, and the workers never touch a `smoltcp` socket.
+//! blocks — sends are non-blocking and go out inline). Dials of either kind run
+//! on a worker of their own, since one may resolve a name first. Workers
+//! exchange bytes with the poll loop through per-flow buffers; the poll loop
+//! never blocks on the network, and the workers never touch a `smoltcp` socket.
 //!
 //! ## Test vs. production wiring
 //!
@@ -415,9 +416,9 @@ struct FlowConn {
 // UDP has no handshake, so the model differs from TCP: one smoltcp UDP socket is
 // bound per fake destination endpoint (fake_ip:port) and MULTIPLEXES every
 // client that talks to it, told apart by the datagram's source. Each distinct
-// client gets its own upstream datagram socket (so replies map back correctly)
-// and one reader worker; the send direction is non-blocking, so the poll loop
-// forwards the client's datagrams upstream inline without a writer thread. This
+// client gets its own upstream datagram socket (so replies map back correctly),
+// dialed on a short-lived worker, and one reader worker; the send direction is
+// non-blocking, so the poll loop forwards datagrams upstream inline. This
 // carries QUIC/HTTP-3 (443/udp) unchanged — the relay never inspects payloads.
 
 /// Datagrams coming back from one UDP flow's upstream, filled by its reader
@@ -467,7 +468,33 @@ struct UdpBind {
     local: IpAddress,
     target: super::dialer::UpstreamTarget,
     clients: HashMap<SocketAddr, UdpClientFlow>,
+    /// Clients whose upstream is still being dialed.
+    pending: HashMap<SocketAddr, PendingUdpDial>,
 }
+
+/// What a UDP dial worker hands back to the poll loop.
+type UdpDialOutcome = Result<Box<dyn RelayDatagram>, RelayError>;
+
+/// A client whose upstream dial is running on a worker. The dial may resolve
+/// the name first (seconds under a slow upstream), so it never runs on the
+/// poll thread.
+struct PendingUdpDial {
+    outcome: Arc<Mutex<Option<UdpDialOutcome>>>,
+    /// The client's datagrams held until the dial lands, oldest first.
+    queued: VecDeque<Vec<u8>>,
+    /// Length of the first datagram — what a port-unreachable quotes.
+    first_payload_len: usize,
+    started_at: std::time::Instant,
+}
+
+/// Datagrams held per client while its dial runs. A QUIC handshake opens with
+/// one or two Initials; past this the client's own retransmission covers the
+/// drop, which UDP tolerates.
+const UDP_PENDING_DIAL_QUEUE: usize = 8;
+
+/// Ceiling on UDP dials in flight at once, each holding a worker thread. Past
+/// it a new client's datagram is dropped and its retransmission retries.
+const MAX_PENDING_UDP_DIALS: usize = 128;
 
 /// Metadata ring slots per UDP socket — the max datagrams that can queue before
 /// the oldest is dropped (UDP is lossy; TCP would need more).
@@ -790,6 +817,7 @@ impl FakeIpStack {
             self.last_graveyard_warn = Some(std::time::Instant::now());
             tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-workers-lingering",
                 lingering = self.worker_graveyard.len(),
                 "fake-IP upstream workers are lingering past flow teardown — upstreams are stalling",
             );
@@ -808,6 +836,7 @@ impl FakeIpStack {
         self.last_capacity_warn = Some(std::time::Instant::now());
         tracing::warn!(
             target: "nrr::fake-ip",
+            msg_key = "fakeip-flow-capacity-reached",
             active = self.flows.len(),
             cap = self.max_flows,
             "fake-IP is carrying its maximum number of TCP flows — new connections are being reset until some finish",
@@ -968,6 +997,25 @@ fn spawn_udp_reader(upstream: Arc<dyn RelayDatagram>, replies: Arc<UdpReplies>) 
     })
 }
 
+/// Dial one UDP upstream off the poll thread and wake the loop with the
+/// outcome. Detached like the TCP dial worker: it owns only `Arc`s, and a
+/// result nobody collects any more is simply dropped.
+fn spawn_udp_dial_worker(
+    dialer: Arc<dyn RelayDialer>,
+    target: super::dialer::UpstreamTarget,
+    outcome: Arc<Mutex<Option<UdpDialOutcome>>>,
+    waker: Arc<StackWaker>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("nrr-fakeip-udp-dial".to_string())
+        .spawn(move || {
+            let dialed = dialer.connect_udp(&target);
+            *guard(&outcome) = Some(dialed);
+            waker.wake();
+        })
+        .map(drop)
+}
+
 /// Convert a std [`std::net::IpAddr`] to the `smoltcp` wire type.
 fn smoltcp_address(ip: std::net::IpAddr) -> IpAddress {
     match ip {
@@ -1023,6 +1071,7 @@ impl DialLogGate {
         if self.first(format!("refuse|{destination}|{slug}")) {
             tracing::info!(
                 target: "nrr::fake_ip",
+                msg_key = "fakeip-flow-refused",
                 destination = %destination,
                 hostname = %hostname,
                 verdict = slug,
@@ -1036,6 +1085,7 @@ impl DialLogGate {
         if self.first(format!("ok|{endpoint}")) {
             tracing::info!(
                 target: "nrr::fake_ip",
+                msg_key = "fakeip-dial-connected",
                 hostname = %target.hostname,
                 upstream = %endpoint,
                 route = ?target.route,
@@ -1055,6 +1105,7 @@ impl DialLogGate {
         if self.first(format!("fail|{endpoint}")) {
             tracing::warn!(
                 target: "nrr::fake_ip",
+                msg_key = "fakeip-dial-failed",
                 hostname = %target.hostname,
                 upstream = %endpoint,
                 route = ?target.route,
@@ -1209,6 +1260,7 @@ fn spawn_dial_worker(
                     // per-destination gate above.
                     tracing::info!(
                         target: "nrr::fake-ip",
+                        msg_key = "fakeip-dial-held-succeeded",
                         hostname = %target.hostname,
                         route = ?target.route,
                         elapsed_ms = %elapsed_ms,
@@ -1231,6 +1283,7 @@ fn spawn_dial_worker(
                 if is_policy_refusal {
                     tracing::warn!(
                         target: "nrr::fake-ip",
+                        msg_key = "fakeip-dial-policy-refused",
                         hostname = %target.hostname,
                         route = ?target.route,
                         elapsed_ms = %elapsed_ms,

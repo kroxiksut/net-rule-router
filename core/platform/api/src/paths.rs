@@ -120,61 +120,79 @@ pub fn user_runtime_dir() -> PathBuf {
 /// private to this user.
 ///
 /// Without `XDG_RUNTIME_DIR` the path falls back into `/tmp`, which every local
-/// user can write. A directory another user created there first — with our
-/// exact name — would have us drop the activation hand-off into their hands,
-/// and the launcher and the C++ host DISPATCH what that file says. So: never
-/// follow a symlink, and never accept a directory that grants group or other
-/// any access at all. Windows keeps `%TEMP%`, which is already per-user.
+/// user can write. A directory or symlink another user planted there with our
+/// name would have us drop the activation hand-off into their hands, and the
+/// launcher and the C++ host DISPATCH what that file says. Windows keeps
+/// `%TEMP%`, which is already per-user.
 pub fn ensure_user_runtime_dir() -> std::io::Result<PathBuf> {
     let dir = user_runtime_dir();
-
     #[cfg(windows)]
-    {
-        std::fs::create_dir_all(&dir)?;
-    }
-
+    std::fs::create_dir_all(&dir)?;
     #[cfg(not(windows))]
-    {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
 
-        match std::fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("{} is a symlink; refusing to use it", dir.display()),
-                ));
+/// Creates `dir` owner-only, or accepts it only as this user's private
+/// directory. The check follows the creation: a name planted between a
+/// look and a create is caught either way, and a sticky `/tmp` keeps anyone
+/// else from swapping it afterwards.
+#[cfg(not(windows))]
+fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    let create = || std::fs::DirBuilder::new().mode(0o700).create(dir);
+    match create() {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        // The parent is the runtime base or the temp root, not ours to secure.
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-            Ok(meta) if !meta.is_dir() => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("{} is not a directory", dir.display()),
-                ));
+            match create() {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
             }
-            Ok(meta) if meta.mode() & 0o077 != 0 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{} is readable or writable by other users (mode {:o})",
-                        dir.display(),
-                        meta.mode() & 0o777
-                    ),
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Parents may already exist with looser modes (`/tmp` does);
-                // the mode applies to the ones this call creates, which is the
-                // leaf we are about to own.
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(&dir)?;
-            }
-            Err(e) => return Err(e),
         }
+        Err(e) => return Err(e),
     }
 
-    Ok(dir)
+    let refuse = |why: String| Err(Error::new(ErrorKind::PermissionDenied, why));
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return refuse(format!(
+            "{} is a symlink; refusing to use it",
+            dir.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return refuse(format!("{} is not a directory", dir.display()));
+    }
+    if meta.uid() != effective_uid() {
+        return refuse(format!(
+            "{} belongs to uid {}; refusing to use it",
+            dir.display(),
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return refuse(format!(
+            "{} is readable or writable by other users (mode {:o})",
+            dir.display(),
+            meta.mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[allow(unsafe_code)]
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, cannot fail, and touches no memory.
+    unsafe { libc::geteuid() }
 }
 
 /// Creates `path` for writing, failing if anything is already there.
@@ -247,6 +265,71 @@ mod tests {
         } else {
             assert_eq!(logs, root.join("logs"));
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_fresh_runtime_dir_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().expect("temp");
+        let dir = base.path().join("runtime");
+        ensure_private_dir(&dir).expect("created");
+        let mode = std::fs::metadata(&dir).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        ensure_private_dir(&dir).expect("our own directory is accepted again");
+    }
+
+    /// The race this guards: the name appears between "not there" and
+    /// "create". A recursive create reports success on the planted symlink.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_planted_symlink_is_refused_even_at_the_creation_step() {
+        let base = tempfile::tempdir().expect("temp");
+        let elsewhere = base.path().join("elsewhere");
+        std::fs::DirBuilder::new()
+            .create(&elsewhere)
+            .expect("target");
+        std::fs::set_permissions(
+            &elsewhere,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
+        let dir = base.path().join("runtime");
+        std::os::unix::fs::symlink(&elsewhere, &dir).expect("plant");
+
+        let result = ensure_private_dir(&dir);
+        assert_eq!(
+            result.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_existing_dir_open_to_others_is_refused() {
+        let base = tempfile::tempdir().expect("temp");
+        let dir = base.path().join("runtime");
+        std::fs::DirBuilder::new().create(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        assert!(ensure_private_dir(&dir).is_err());
+    }
+
+    /// Only root can hand a directory to another uid, so this runs only there.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_dir_owned_by_another_user_is_refused() {
+        if effective_uid() != 0 {
+            return;
+        }
+        let base = tempfile::tempdir().expect("temp");
+        let dir = base.path().join("runtime");
+        std::fs::DirBuilder::new().create(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("chmod");
+        std::os::unix::fs::chown(&dir, Some(65_534), None).expect("chown");
+        assert!(ensure_private_dir(&dir).is_err());
     }
 
     #[test]

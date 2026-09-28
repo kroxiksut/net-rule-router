@@ -297,7 +297,6 @@ impl ProductionApplyFailurePolicy {
         ApplyFailurePolicyDto {
             policy: rec.policy,
             updated_at: rec.set_at as u64,
-            set_by_sid: rec.set_by_sid,
         }
     }
 }
@@ -307,7 +306,6 @@ impl ApplyFailurePolicyProvider for ProductionApplyFailurePolicy {
         let default = ApplyFailurePolicyDto {
             policy: nrr_storage::DEFAULT_POLICY_SLUG.to_string(),
             updated_at: 0,
-            set_by_sid: None,
         };
         let conn = match self.conn.lock() {
             Ok(c) => c,
@@ -635,7 +633,7 @@ impl<P> AutostartWriter for ProductionAutostart<P>
 where
     P: nrr_platform_api::autostart::AutostartRegistryPort + Send + Sync + 'static,
 {
-    fn toggle(&self, enabled: bool) -> Result<AutostartDto, SettingsWriteError> {
+    fn toggle(&self, sid: &str, enabled: bool) -> Result<AutostartDto, SettingsWriteError> {
         let helper_outcome = if enabled {
             self.helper.set_enabled(&self.tray_binary_path)
         } else {
@@ -683,8 +681,10 @@ where
             .get_or_default()
             .map_err(|e| SettingsWriteError::Storage(e.to_string()))?;
         let dto = Self::merge_observation(rec, observed);
-        if let Some(bus) = self.event_bus.as_ref() {
+        // A caller the transport could not name has no subscriber to tell.
+        if let Some(bus) = self.event_bus.as_ref().filter(|_| !sid.is_empty()) {
             bus.publish(StatusUpdateEvent::AutostartStateChanged {
+                sid: sid.to_string(),
                 enabled: dto.enabled,
                 last_known_state: dto.last_known_state.clone(),
             });
@@ -1072,6 +1072,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         // resolver-mode write is the "Mode B stored but cannot arm" smoking gun.
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "prod-settings-enforcement-mode-written",
             prior = prior_mode.as_slug(),
             written = written.enforcement_mode.as_slug(),
             changed = prior_mode != written.enforcement_mode,
@@ -1087,6 +1088,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         // and takes effect on the next service start.
         tracing::info!(
             target: "nrr::stability",
+            msg_key = "prod-settings-verbose-logging-written",
             prior = prior_verbose,
             written = written.verbose_logging,
             changed = prior_verbose != written.verbose_logging,
@@ -1123,6 +1125,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         // the service, and did the value actually change?".
         tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "prod-settings-fake-ip-written",
             prior = prior_fake_ip,
             written = written.fake_ip_enabled,
             changed = prior_fake_ip != written.fake_ip_enabled,
@@ -1130,6 +1133,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         );
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "prod-settings-dns-via-secondary-written",
             prior = prior_dns_via_secondary,
             written = written.dns_via_secondary,
             changed = prior_dns_via_secondary != written.dns_via_secondary,
@@ -1146,6 +1150,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         }
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "prod-settings-fast-dns-answers-written",
             prior = prior_dns_fast_answers,
             written = written.dns_fast_answers,
             changed = prior_dns_fast_answers != written.dns_fast_answers,
@@ -1201,6 +1206,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         }
         tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "prod-settings-fake-ip-udp-relay-written",
             prior = prior_udp_relay,
             written = written.fake_ip_udp_relay,
             changed = prior_udp_relay != written.fake_ip_udp_relay,
@@ -1220,6 +1226,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         // restricted account starts editing rules again.
         tracing::info!(
             target: "nrr::stability",
+            msg_key = "prod-settings-rules-lock-written",
             prior = prior_allow_user_rule_edits,
             written = written.allow_user_rule_edits,
             changed = prior_allow_user_rule_edits != written.allow_user_rule_edits,
@@ -1228,6 +1235,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         );
         tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "prod-settings-fake-ip-instant-rst-written",
             prior = prior_instant_rst,
             written = written.fake_ip_instant_rst,
             changed = prior_instant_rst != written.fake_ip_instant_rst,
@@ -1276,3 +1284,47 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
 // `service_stability_handlers.rs` tests) round-tripped through real SQLite.
 #[cfg(test)]
 mod service_stability_tests;
+
+#[cfg(test)]
+mod autostart_push_tests {
+    use super::*;
+    use nrr_platform_api::autostart::{AutostartHelper, MockAutostartRegistry};
+    use nrr_storage::{open_connection, repository::MigrationRunner, SqliteMigrationRunner};
+
+    fn autostart_on(bus: &Arc<EventBus>) -> (tempfile::TempDir, impl AutostartWriter) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let conn = open_connection(&dir.path().join("nrr_service_state.db")).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        let writer = ProductionAutostart::new(
+            Arc::new(Mutex::new(runner.into_connection())),
+            Arc::new(AutostartHelper::new(MockAutostartRegistry::new())),
+            std::env::temp_dir().join("NetRuleRouterTray.exe"),
+        )
+        .with_event_bus(Arc::clone(bus));
+        (dir, writer)
+    }
+
+    /// Autostart lives in the user's own hive. Broadcast, one user's click
+    /// flipped the switch on every other session's settings page.
+    #[test]
+    fn an_autostart_change_reaches_only_the_user_who_made_it() {
+        let bus = Arc::new(EventBus::new());
+        let alice = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
+        let (_dir, autostart) = autostart_on(&bus);
+
+        autostart.toggle("S-1-A", true).expect("toggle");
+
+        let mine = bus.peek_pending_for(&alice.subscription_id, 16);
+        assert_eq!(mine.len(), 1);
+        assert!(matches!(
+            &mine[0].event,
+            StatusUpdateEvent::AutostartStateChanged { sid, enabled: true, .. } if sid == "S-1-A"
+        ));
+        assert!(
+            bus.peek_pending_for(&bob.subscription_id, 16).is_empty(),
+            "another session must not see this user's autostart change"
+        );
+    }
+}

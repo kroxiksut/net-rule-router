@@ -282,8 +282,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             // (no dependence on the friendly-name heal re-firing).
                             // Idempotent + no-op when the binding row is absent.
                             match repo.heal_binding_identity(sid, role, healed_id, healed_name, now) {
-                                Ok(()) => tracing::info!(target: "nrr::route-coordinator", sid = %sid, role = role, healed_id = %healed_id, "persisted auto-healed binding (stale id folded into known-id set)"),
-                                Err(e) => tracing::warn!(target: "nrr::route-coordinator", sid = %sid, error = %e, "auto-heal persist: heal_binding_identity failed"),
+                                Ok(()) => tracing::info!(target: "nrr::route-coordinator", msg_key = "svc-persid-binding-healed", sid = %sid, role = role, healed_id = %healed_id, "persisted auto-healed binding (stale id folded into known-id set)"),
+                                Err(e) => tracing::warn!(target: "nrr::route-coordinator", msg_key = "svc-persid-binding-heal-persist-failed", sid = %sid, error = %e, "auto-heal persist: heal_binding_identity failed"),
                             }
                         })
                     };
@@ -301,7 +301,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                 .map(|d| d.as_secs() as i64)
                                 .unwrap_or(0);
                             if let Err(e) = repo.remember_stable_id(sid, role, anchor_id, now) {
-                                tracing::warn!(target: "nrr::route-coordinator", sid = %sid, error = %e, "MAC anchor persist failed");
+                                tracing::warn!(target: "nrr::route-coordinator", msg_key = "svc-persid-mac-anchor-persist-failed", sid = %sid, error = %e, "MAC anchor persist failed");
                             }
                         })
                     };
@@ -401,7 +401,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         if let Err(e) = nrr_storage::vpn_bootstrap_endpoints::VpnBootstrapEndpointsRepository::new(&guard)
                                 .upsert_observed(ips, now)
                             {
-                                tracing::warn!(target: "nrr::route-coordinator", error = %e, "failed to persist observed VPN bootstrap server IPs — continuing");
+                                tracing::warn!(target: "nrr::route-coordinator", msg_key = "svc-persid-vpn-bootstrap-persist-failed", error = %e, "failed to persist observed VPN bootstrap server IPs — continuing");
                             }
                     })
                 };
@@ -527,6 +527,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                 {
                                     tracing::warn!(
                                         target: "nrr::app-routing",
+                                        msg_key = "svc-persid-app-destination-persist-failed",
                                         error = %e,
                                         "failed to persist application destinations — continuing",
                                     );
@@ -801,6 +802,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     if !survivors.is_empty() {
                         tracing::info!(
                             target: "nrr::vpn-learn",
+                            msg_key = "svc-persid-vpn-client-apps-preseeded",
                             clients = survivors.len(),
                             "pre-seeded verified VPN client apps from the state DB",
                         );
@@ -921,6 +923,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                 if let Err(e) = coord.recompute_active(&registry.active_sids()) {
                                     tracing::warn!(
                                         target: "nrr::route-coordinator",
+                                        msg_key = "svc-persid-route-sync-before-pin-failed",
                                         "route sync before installing new destination pins failed: {e:?}",
                                     );
                                 }
@@ -973,6 +976,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                             .resolve_now(&hosts, std::time::SystemTime::now());
                                         tracing::info!(
                                             target: "nrr::dns",
+                                            msg_key = "svc-persid-rule-host-resolved",
                                             attempted = summary.attempted,
                                             succeeded = summary.succeeded,
                                             "resolved rule hosts that had no confirmed address — enforcement picks them up on the next reconcile",
@@ -1048,12 +1052,14 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     Ok(0) => {}
                     Ok(n) => tracing::warn!(
                         target: "nrr::runtime",
+                        msg_key = "svc-persid-startup-blocks-stripped",
                         stripped_blocks = n as u64,
                         "startup reconciliation: stripped orphaned block/kill-switch \
                          WFP filter(s) left by a prior instance",
                     ),
                     Err(e) => tracing::warn!(
                         target: "nrr::runtime",
+                        msg_key = "svc-persid-startup-block-strip-failed",
                         "startup block-filter reconciliation failed: {e:?}",
                     ),
                 }
@@ -1067,6 +1073,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         if let Err(e) = coord.recompute_active(snapshot) {
                             tracing::error!(
                                 target: "nrr::route-coordinator",
+                                msg_key = "svc-persid-route-recompute-failed",
                                 "route recompute on active-user change failed: {e:?}",
                             );
                         }
@@ -1085,6 +1092,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::runtime",
+                    msg_key = "svc-persid-no-wfp-session-noop",
                     error = %format!("{e:?}"),
                     "no filtering-engine session for orchestrator construction (failed or timed \
                      out); per-SID apply layer will run in noop mode",
@@ -1155,6 +1163,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     Err(e) => {
                         tracing::error!(
                             target: "nrr::per_sid_orchestrator",
+                            msg_key = "svc-persid-pause-read-failed-reconcile",
                             "pause-state read failed; skipping reconcile: {e:?}",
                         );
                         return;
@@ -1177,6 +1186,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 if let Err(e) = orch.reconcile(&active_unpaused) {
                     tracing::error!(
                         target: "nrr::per_sid_orchestrator",
+                        msg_key = "svc-persid-pause-aware-reconcile-failed",
                         "pause-aware reconcile failed: {e:?}",
                     );
                 }
@@ -1212,6 +1222,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     Err(e) => {
                         tracing::error!(
                             target: "nrr::fake-ip",
+                            msg_key = "svc-persid-pause-read-failed-fakeip-replan",
                             "pause-state read failed; skipping fake-IP replan: {e:?}",
                         );
                         return;
@@ -1236,6 +1247,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 if let Err(e) = orch.recompile_for_sid(sid) {
                     tracing::error!(
                         target: "nrr::fake-ip",
+                        msg_key = "svc-persid-fakeip-recompile-failed",
                         sid = %sid,
                         "fake-IP replan: per-SID recompile failed: {e:?}",
                     );

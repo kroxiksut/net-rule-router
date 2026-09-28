@@ -305,11 +305,11 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Best-effort `INTERACTIVE` start grant; a refusal is reported, never fatal.
+/// Best-effort service access grants; a refusal is reported, never fatal.
 #[cfg(windows)]
 fn refresh_interactive_grant() {
-    if let Err(e) = service_config::grant_interactive_service_start() {
-        eprintln!("warning: could not grant SERVICE_START to INTERACTIVE: {e}");
+    if let Err(e) = service_config::grant_service_access() {
+        eprintln!("warning: could not refresh the service access grants: {e}");
     }
 }
 
@@ -403,7 +403,7 @@ fn reinstall_from_this_binary() -> std::process::ExitCode {
 /// service is never left unstartable by the unprivileged launcher.
 #[cfg(windows)]
 fn apply_start_mode(target: nrr_service_runtime::ServiceStartMode) -> std::process::ExitCode {
-    let result = service_config::grant_interactive_service_start()
+    let result = service_config::grant_service_access()
         .and_then(|()| service_config::reconfigure_start_mode(target));
     match result {
         Ok(()) => {
@@ -547,6 +547,7 @@ fn run_console() -> std::process::ExitCode {
         eprintln!("[dbg] step=8 after-install-ndjson-tracing");
         tracing::info!(
             target: "nrr::stability",
+            msg_key = "svc-boot-ndjson-verbosity",
             verbose,
             "operational NDJSON verbosity",
         );
@@ -572,6 +573,7 @@ fn run_console() -> std::process::ExitCode {
     // dev sessions get the same NDJSON anchor for "service started OK".
     tracing::info!(
         target: "nrr::recovery",
+        msg_key = "svc-boot-crash-recovery-complete",
         outcome = ?recovery_outcome,
         "crash recovery probe complete",
     );

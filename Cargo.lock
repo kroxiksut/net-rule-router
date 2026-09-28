@@ -1007,6 +1007,7 @@ dependencies = [
  "nrr-shared",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 

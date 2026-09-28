@@ -10,8 +10,8 @@
 //! |--------------------------|-------------|----------|----------------------------------------------------|
 //! | `health-aggregator-tick` | Recoverable | 5s       | Restarted up to 20× with supervisor backoff        |
 //! | `adapter-monitor-tick`   | Recoverable | 1s       | Restarted up to 20×; degraded mode on retire       |
-//! | `diagnostics-cleanup`    | Optional    | 1h       | Dropped quietly on failure                         |
-//! | `operation-results-gc`   | Optional    | 5min     | Dropped quietly on failure                         |
+//! | `diagnostics-cleanup`    | Optional    | 1h       | Restarted with exponential backoff, never retired |
+//! | `operation-results-gc`   | Optional    | 5min     | Restarted with exponential backoff, never retired |
 //! | `ipc-accept-loop`        | per policy  | event    | Recoverable / Critical from `ServiceStabilityConfig` |
 //!
 //! The IPC bundle is special:

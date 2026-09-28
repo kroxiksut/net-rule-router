@@ -397,6 +397,7 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
                 if let Some(failure) = &routes.failure {
                     tracing::error!(
                         target: "nrr::routes",
+                        msg_key = "principal-routes-apply-failed",
                         trigger,
                         reason = %failure,
                         "routes could NOT be applied: traffic is filtered but not steered",
@@ -405,6 +406,7 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
                 if !routes.unresolved.is_empty() {
                     tracing::warn!(
                         target: "nrr::routes",
+                        msg_key = "principal-routes-unresolved-no-link",
                         trigger,
                         principals = ?routes.unresolved,
                         "no live secondary link to steer through; their routes were not installed",
@@ -427,6 +429,7 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
             if !unprotected.is_empty() {
                 tracing::warn!(
                     target: "nrr::enforcement",
+                    msg_key = "principal-blanket-block-not-armed",
                     trigger,
                     principals = ?unprotected,
                     "the blanket block these settings ask for is NOT armed: traffic outside the routing rules is not blocked. The pass logs the reason when it decides",
@@ -437,7 +440,7 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
             // forever is one an operator learns to scroll past.
             for note in &report.notes {
                 if *changed {
-                    tracing::warn!(target: "nrr::enforcement", trigger, note = %note, "rule not enforced as written");
+                    tracing::warn!(target: "nrr::enforcement", msg_key = "principal-rule-not-enforced-as-written", trigger, note = %note, "rule not enforced as written");
                 } else {
                     tracing::debug!(target: "nrr::enforcement", trigger, note = %note, "rule not enforced as written");
                 }
@@ -468,6 +471,7 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
         }
         CycleOutcome::AuthorityUnavailable { reason } => tracing::warn!(
             target: "nrr::enforcement",
+            msg_key = "principal-authority-unavailable",
             trigger,
             authority,
             reason = %reason,
@@ -475,12 +479,14 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
         ),
         CycleOutcome::EnforcementFailed { reason } => tracing::error!(
             target: "nrr::enforcement",
+            msg_key = "principal-enforcement-failed",
             trigger,
             reason = %reason,
             "policy could NOT be applied — the rules on file are not in effect",
         ),
         CycleOutcome::Stopped => tracing::info!(
             target: "nrr::enforcement",
+            msg_key = "principal-policy-removed-on-stop",
             trigger,
             "policy was removed on stop; this pass installed nothing",
         ),

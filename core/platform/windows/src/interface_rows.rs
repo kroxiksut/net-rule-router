@@ -80,6 +80,7 @@ fn collect_windows_rows_from_snapshot(
             runtime_data_unavailable = true;
             tracing::warn!(
                 target: "nrr::interface-rows",
+                msg_key = "win-iface-runtime-data-unavailable",
                 %error,
                 "adapter runtime data (IP/gateway/DNS) could not be read — every row will report no local IP, which is NOT the same as the machine having no usable adapter",
             );
@@ -182,6 +183,7 @@ fn forwarding_capable_adapter_names() -> Option<std::collections::HashSet<String
     let (Ok(routes), Ok(infos)) = (api.get_ip_forward_table(), api.get_adapter_infos()) else {
         tracing::warn!(
             target: "nrr::interface-rows",
+            msg_key = "win-iface-forwarding-unevaluated",
             "route table or adapter list unreadable — forwarding capability stays unevaluated for every adapter",
         );
         return None;

@@ -76,6 +76,14 @@ ColumnLayout {
     property int primaryProbeRepeatSecs: 300
     property bool primaryProbeLimitsExpanded: false
     property bool localNetworksAutoAccept: false
+    // Short names for a connection that announces no domain: the opt-in and
+    // the domain the user named. Per-SID service setting.
+    property bool shortNameCompletion: false
+    property string shortNameSuffix: ""
+    function _shortNamesApplied(enabled, domain) {
+        panel.shortNameCompletion = enabled
+        panel.shortNameSuffix = domain
+    }
     // Enforcement mechanism: "reactive" (Mode A,
     // default — the existing reactive kill-switch) vs "resolver" (Mode B — a
     // local DNS resolver that enforces BEFORE the app connects). Global service
@@ -375,7 +383,8 @@ ColumnLayout {
         "auto-rules-mode", "auto-rules-eager-delivery-names",
         "primary-probe-auto", "primary-probe-timeout-ms", "primary-probe-max-targets",
         "primary-probe-repeat-secs",
-        "local-networks-auto-accept"
+        "local-networks-auto-accept",
+        "short-name-completion", "short-name-suffix"
     ]
 
     /// Copy the subset of `cur` this panel mirrors into the display mirror.
@@ -526,6 +535,10 @@ ColumnLayout {
             "primary-probe-repeat-secs", root.routePolicyDefault("primary-probe-repeat-secs"))
         panel.localNetworksAutoAccept = _offlineRoutePolicyPick(parked, mirror,
             "local-networks-auto-accept", root.routePolicyDefault("local-networks-auto-accept"))
+        panel.shortNameCompletion = _offlineRoutePolicyPick(parked, mirror,
+            "short-name-completion", root.routePolicyDefault("short-name-completion"))
+        panel.shortNameSuffix = _offlineRoutePolicyPick(parked, mirror,
+            "short-name-suffix", root.routePolicyDefault("short-name-suffix"))
     }
 
     function _loadKillSwitchPosture() {
@@ -577,6 +590,8 @@ ColumnLayout {
                 root._routePolicyEffective(cur, "primary-probe-repeat-secs")
             panel.localNetworksAutoAccept =
                 root._routePolicyEffective(cur, "local-networks-auto-accept")
+            panel.shortNameCompletion = root._routePolicyEffective(cur, "short-name-completion")
+            panel.shortNameSuffix = root._routePolicyEffective(cur, "short-name-suffix")
             // A live read always wins — and refreshes the display mirror the
             // service-stopped seed reads back.
             panel._rememberRoutePolicy(cur)
@@ -937,9 +952,9 @@ ColumnLayout {
                 panel.enforcementMode = want
                 root.statusLine = (want === "resolver")
                     ? root.tr("status.enforcement-mode-resolver",
-                        "Enforcement mode: local DNS resolver (Mode B). Takes effect after the background service restarts.")
+                        "Routing method: local DNS resolver. Applied — the resolver is now active.")
                     : root.tr("status.enforcement-mode-reactive",
-                        "Enforcement mode: reactive kill-switch (Mode A). Takes effect after the background service restarts.")
+                        "Routing method: watching system DNS. Applied — the local DNS resolver is off.")
                 return
             }
             if (code === "uac-declined") {
@@ -1385,6 +1400,136 @@ ColumnLayout {
         _reloadServiceBackedControls()
         panel._backendWasConnected = (typeof root._routingBackendConnected === "function")
             && root._routingBackendConnected()
+        // Built lazily: a request made before this category first opened is
+        // already waiting on the window.
+        _takeFocusRequest()
+    }
+
+    // ── Pointed at from elsewhere (the tray's "Open settings") ──
+    //
+    // A block notice names a program and an address; the switch that caused
+    // it lives here. The request scrolls to that switch, outlines it for a few
+    // seconds and puts the story next to it. The context is text to show and
+    // nothing else: no field of it reaches a setter.
+
+    /// Focus id whose banner is up, "" when none.
+    property string _focusId: ""
+    property var _focusContext: ({})
+    /// Focus id whose outline is lit; cleared by the timer, the banner stays.
+    property string _focusHighlightId: ""
+    property int _focusSerialHandled: 0
+    property int _focusScrollPasses: 0
+
+    function _focusTarget(id) {
+        if (id === "doh-lockdown") return dohEnableCheck
+        if (id === "leak-protection") return killSwitchEnableCheck
+        return null
+    }
+    function _focusBanner(id) {
+        if (id === "doh-lockdown") return dohFocusBanner
+        if (id === "leak-protection") return leakFocusBanner
+        return null
+    }
+
+    /// Keep strings, bound the lists: this arrived from another process.
+    function _plainFocusContext(raw) {
+        var c = raw || {}
+        var strings = function(list, cap) {
+            var out = []
+            for (var i = 0; list && i < list.length && out.length < cap; i += 1) {
+                var v = (list[i] === undefined || list[i] === null) ? "" : String(list[i]).trim()
+                if (v !== "") out.push(v.length > 255 ? v.slice(0, 254) + "…" : v)
+            }
+            return out
+        }
+        return {
+            apps: strings(c.apps, 3),
+            addresses: strings(c.addresses, 5),
+            more: Math.max(0, Math.min(10000, Math.floor(Number(c.more) || 0)))
+        }
+    }
+
+    function _takeFocusRequest() {
+        var request = root.settingsFocusRequest || {}
+        var serial = Number(request.serial || 0)
+        if (serial === 0 || serial === panel._focusSerialHandled) return
+        panel._focusSerialHandled = serial
+        var id = String(request.id || "")
+        if (panel._focusTarget(id) === null) {
+            console.log("RoutingSettings: unknown focus id ignored:", id)
+            return
+        }
+        panel._focusContext = panel._plainFocusContext(request.context)
+        panel._focusId = id
+        panel._focusHighlightId = id
+        focusHighlightTimer.restart()
+        panel._focusScrollPasses = 0
+        focusScrollTimer.restart()
+    }
+
+    function _focusHeadline() {
+        var apps = panel._focusContext.apps || []
+        return root.tr("settings.routing.focus.blocked", "Just blocked: {apps}.")
+            .replace("{apps}", apps.length > 0
+                ? apps.join(", ")
+                : root.tr("notifications.block-notice.app-unknown", "unknown app"))
+    }
+    function _focusDetails() {
+        var addresses = panel._focusContext.addresses || []
+        if (addresses.length === 0) return ""
+        var list = addresses.join(", ")
+        var more = Number(panel._focusContext.more || 0)
+        if (more > 0) {
+            list += ", " + root.tr("notifications.block-notice.backlog.more", "and {count} more")
+                .replace("{count}", String(more))
+        }
+        return root.tr("notifications.block-notice.backlog.destinations", "Destinations: {list}.")
+            .replace("{list}", list)
+    }
+
+    /// The layout of a lazily built page settles over a few frames, so the
+    /// scroll is re-aimed a couple of times rather than trusted once.
+    function _scrollToFocus() {
+        var target = panel._focusTarget(panel._focusId)
+        var banner = panel._focusBanner(panel._focusId)
+        if (target === null || banner === null) return
+        // The enclosing Flickable is the Settings pane's; found by shape, so
+        // this page does not have to know how the pane is built.
+        var flick = null
+        for (var p = panel.parent; p; p = p.parent) {
+            if (p["flickableDirection"] !== undefined && p["contentItem"] !== undefined) {
+                flick = p
+                break
+            }
+        }
+        if (flick !== null) {
+            var at = banner.mapToItem(flick["contentItem"], 0, 0)
+            var maxY = Math.max(0, flick["contentHeight"] - flick.height)
+            flick["contentY"] = Math.max(0, Math.min(at.y - root.uiTheme.spacingLg, maxY))
+        }
+        // Keyboard users land on the switch itself, focus ring and all.
+        if (panel._focusScrollPasses === 0) target.forceActiveFocus()
+    }
+
+    Timer {
+        id: focusScrollTimer
+        interval: 200
+        repeat: true
+        onTriggered: {
+            panel._scrollToFocus()
+            panel._focusScrollPasses += 1
+            if (panel._focusScrollPasses >= 3) stop()
+        }
+    }
+    Timer {
+        id: focusHighlightTimer
+        interval: 4000
+        repeat: false
+        onTriggered: panel._focusHighlightId = ""
+    }
+    Connections {
+        target: root
+        function onSettingsFocusRequestChanged() { panel._takeFocusRequest() }
     }
 
     // Re-read on every visit. The panel is built once and kept alive, so a
@@ -1753,8 +1898,30 @@ ColumnLayout {
             // below stays hidden until the user turns it on here. Replaces the old
             // auto-arm-on-secondary-bound behaviour per an explicit UX
             // decision — enforcement is now the user's explicit choice.
+            SettingFocusBanner {
+                id: leakFocusBanner
+                root: panel.root
+                visible: panel._focusId === "leak-protection"
+                title: root.uiRevision >= 0 ? root.tr("tray.block-notice.title", "Connection blocked") : ""
+                headline: root.uiRevision >= 0 && visible ? panel._focusHeadline() : ""
+                details: root.uiRevision >= 0 && visible ? panel._focusDetails() : ""
+                whatItDoes: root.uiRevision >= 0
+                    ? root.tr("settings.routing.focus.leak-protection.what",
+                        "While leak protection is on, IPv6 stays closed: your rules do not route IPv6 yet, so this is how IPv6 traffic is kept from leaving around them.")
+                    : ""
+                whenSafe: root.uiRevision >= 0
+                    ? root.tr("settings.routing.focus.leak-protection.when-safe",
+                        "Turning leak protection off opens IPv6 again, but it also stops blocking your routed traffic when the additional route goes down. That is safe only if nothing you route needs to stay hidden, for example on a network you trust.")
+                    : ""
+                onDismissed: panel._focusId = ""
+            }
+
             CheckBox {
                 id: killSwitchEnableCheck
+                SettingFocusHighlight {
+                    theme: root.uiTheme
+                    shown: panel._focusHighlightId === "leak-protection"
+                }
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 checked: panel.killSwitchEnabled
@@ -1907,8 +2074,8 @@ ColumnLayout {
                 function _slugLabel(slug) {
                     return root.tr("settings.routing.enforcement-mode.option-" + slug,
                         slug === "resolver"
-                            ? "Local DNS resolver (Mode B) — enforce before connect"
-                            : "Reactive kill-switch (Mode A, default)")
+                            ? "Local DNS resolver (default)"
+                            : "Watching system DNS (legacy)")
                 }
                 // Insert / remove the "reactive" (mode A) row at the head of the
                 // model to match `showModeA`, keeping "resolver" always present.
@@ -1958,7 +2125,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.enforcement-mode.note",
-                    "Mode B sends system DNS through a local resolver so a routed site is enforced before its first packet — closing the leak window Mode A can't. It is invasive (redirects DNS) and IPv4-only; leave it off unless you are testing it. Changing this applies immediately — no service restart needed.")
+                    "The resolver answers site-name lookups itself and sets up the route before the answer reaches the program, so even the first connection takes the right route. It takes over system DNS while the service runs. Changes apply immediately — no service restart needed.")
             }
 
             // Virtual-address routing. Only
@@ -2117,7 +2284,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.fake-ip.note",
-                    "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address — and protection no longer races the first connection. Requires Mode B (local DNS resolver). On Windows, turning this on loads the bundled Wintun virtual-adapter driver (signed by WireGuard LLC). Off by default.")
+                    "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address — and protection no longer races the first connection. Requires the local DNS resolver. On Windows, turning this on loads the bundled Wintun virtual-adapter driver (signed by WireGuard LLC). Off by default.")
             }
             // Driver status line — hidden on builds that ship no driver binary
             // (Linux/macOS: kernel TUN is native) and until the probe answers.
@@ -2249,7 +2416,7 @@ ColumnLayout {
                 color: root.textColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.mode-a-coverage.label",
-                    "When the additional route is unavailable (Mode A)")
+                    "When the additional route is unavailable (watching system DNS)")
             }
             ThemedComboBox {
                 id: modeACoverageCombo
@@ -2765,7 +2932,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.kill-switch.allow-dns-note",
-                    "On by default: a narrow exception (port 53 only) keeps name resolution working over your main link while blocked, so zones keep resolving — a deliberate, narrow DNS leak. Turn this off only for strict blocking: with DNS cut too, you have no working internet at all until the block clears. Useful with the local DNS resolver (Mode B) so zone rules keep working.")
+                    "On by default: a narrow exception (port 53 only) keeps name resolution working over your main link while blocked, so zones keep resolving — a deliberate, narrow DNS leak. Turn this off only for strict blocking: with DNS cut too, you have no working internet at all until the block clears. Useful with the local DNS resolver so zone rules keep working.")
             }
 
             // Pure UI-notification preference (NOT an
@@ -3270,6 +3437,77 @@ ColumnLayout {
         }
     }
 
+    // Short names. The OS completes `wiki` to `wiki.corp.example` with the
+    // domain a connection announces; one that announces none needs the user to
+    // name it. Per-SID, rides route.policy.update.
+    GroupBox {
+        id: shortNamesGroup
+        title: root.tr("settings.routing.short-names.title", "Short names")
+        Layout.fillWidth: true
+
+        ColumnLayout {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingSm
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.tr("settings.routing.short-names.description",
+                    "Work computers are often opened by a short name such as wiki. A work VPN that announces its network domain is picked up automatically. If yours does not, name the domain here.")
+            }
+            CheckBox {
+                id: shortNameCheck
+                Layout.fillWidth: true
+                checked: panel.shortNameCompletion
+                text: root.tr("settings.routing.short-names.enable",
+                    "Complete short names with this domain")
+                Accessible.name: text
+                onToggled: {
+                    // Switching on needs a domain; until one is applied the
+                    // box only unlocks the field.
+                    if (checked && panel.shortNameSuffix === "") return
+                    root.routePolicyController.applyShortNames(checked, panel.shortNameSuffix,
+                        panel._shortNamesApplied)
+                }
+                Connections {
+                    target: panel
+                    function onShortNameCompletionChanged() {
+                        shortNameCheck.checked = panel.shortNameCompletion
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingSm
+                enabled: shortNameCheck.checked
+                ThemedTextField {
+                    id: shortNameSuffixInput
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    text: panel.shortNameSuffix
+                    placeholderText: root.tr("settings.routing.short-names.placeholder",
+                        "For example corp.example")
+                    Accessible.name: root.tr("settings.routing.short-names.field",
+                        "Network domain")
+                    onAccepted: shortNameApply.clicked()
+                }
+                ThemedButton {
+                    id: shortNameApply
+                    theme: root.uiTheme
+                    text: root.tr("action.apply", "Apply")
+                    enabled: shortNameSuffixInput.text.trim() !== ""
+                        && (shortNameSuffixInput.text.trim() !== panel.shortNameSuffix
+                            || !panel.shortNameCompletion)
+                    onClicked: root.routePolicyController.applyShortNames(
+                        true, shortNameSuffixInput.text.trim(), panel._shortNamesApplied)
+                }
+            }
+        }
+    }
+
     // Auto-rules. A site routed over the additional link usually pulls its
     // images, video and API calls from CDN hosts the user's rules never mention,
     // so the page opens but its media does not. The service can spot those
@@ -3586,8 +3824,11 @@ ColumnLayout {
         property bool _dohLoading: false
         property string _dohFilter: ""
 
+        // A hostname never holds ':', an IPv6 literal always does. The service
+        // re-validates and normalises either way.
         function _dohDetectKind(v) {
-            return /^\d{1,3}(\.\d{1,3}){3}$/.test(String(v || "").trim()) ? "ip" : "host"
+            var t = String(v || "").trim()
+            return (/^\d{1,3}(\.\d{1,3}){3}$/.test(t) || t.indexOf(":") >= 0) ? "ip" : "host"
         }
         function _dohRowMatchesFilter(row) {
             var f = String(dohLockdownGroup._dohFilter || "").toLowerCase()
@@ -3692,9 +3933,31 @@ ColumnLayout {
             anchors.right: parent.right
             spacing: root.uiTheme.spacingSm
 
+            SettingFocusBanner {
+                id: dohFocusBanner
+                root: panel.root
+                visible: panel._focusId === "doh-lockdown"
+                title: root.uiRevision >= 0 ? root.tr("tray.block-notice.title", "Connection blocked") : ""
+                headline: root.uiRevision >= 0 && visible ? panel._focusHeadline() : ""
+                details: root.uiRevision >= 0 && visible ? panel._focusDetails() : ""
+                whatItDoes: root.uiRevision >= 0
+                    ? root.tr("settings.routing.focus.doh-lockdown.what",
+                        "This switch keeps programs from using DNS servers of their own, so every name lookup goes through NetRuleRouter and your domain rules can see it.")
+                    : ""
+                whenSafe: root.uiRevision >= 0
+                    ? root.tr("settings.routing.focus.doh-lockdown.when-safe",
+                        "Turning it off is safe if this program does not open the sites your rules route: its lookups will then simply go past your domain rules. Leave it on if you rely on leak protection for everything.")
+                    : ""
+                onDismissed: panel._focusId = ""
+            }
+
             // ── Part A: per-SID master toggle ──
             CheckBox {
                 id: dohEnableCheck
+                SettingFocusHighlight {
+                    theme: root.uiTheme
+                    shown: panel._focusHighlightId === "doh-lockdown"
+                }
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 checked: panel.dohLockdownEnabled

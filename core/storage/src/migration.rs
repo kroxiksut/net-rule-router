@@ -47,8 +47,9 @@ use crate::schema::{
     STATE_DB_V48_DDL, STATE_DB_V49_DDL, STATE_DB_V4_DDL, STATE_DB_V50_DDL, STATE_DB_V51_DDL,
     STATE_DB_V52_DDL, STATE_DB_V53_DDL, STATE_DB_V54_DDL, STATE_DB_V55_DDL, STATE_DB_V56_DDL,
     STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V59_DDL, STATE_DB_V5_DDL, STATE_DB_V60_DDL,
-    STATE_DB_V61_DDL, STATE_DB_V62_DDL, STATE_DB_V63_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL,
-    STATE_DB_V8_DDL, STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL, TRAFFIC_DB_V2_DDL,
+    STATE_DB_V61_DDL, STATE_DB_V62_DDL, STATE_DB_V63_DDL, STATE_DB_V64_DDL, STATE_DB_V65_DDL,
+    STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL, STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL,
+    TRAFFIC_DB_V2_DDL,
 };
 
 // ── schema_migrations bootstrap DDL ──────────────────────────────────────────
@@ -617,6 +618,16 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         version: 63,
         name: "drop_isp_block_candidates_enabled",
         stmts: STATE_DB_V63_DDL,
+    },
+    MigrationDef {
+        version: 64,
+        name: "add_short_name_suffix",
+        stmts: STATE_DB_V64_DDL,
+    },
+    MigrationDef {
+        version: 65,
+        name: "add_block_notice_launched_by",
+        stmts: STATE_DB_V65_DDL,
     },
 ];
 

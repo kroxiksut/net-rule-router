@@ -39,6 +39,7 @@ impl AutoRulesEngine {
                         Some(snapshot) if !snapshot.is_empty() => {
                             tracing::info!(
                                 target: "nrr::auto-rules",
+                                msg_key = "autorules-intake-evidence-restored",
                                 candidates = snapshot.candidates.len(),
                                 anchors = snapshot.anchors.len(),
                                 "restored companion evidence saved before the last restart",
@@ -159,6 +160,7 @@ impl AutoRulesEngine {
         if reached.only_pulled_in() {
             tracing::info!(
                 target: "nrr::auto-rules",
+                msg_key = "autorules-intake-not-offered-companion-burst",
                 sid = %sid,
                 host = %hostname,
                 companions = reached.companions,
@@ -218,6 +220,7 @@ impl AutoRulesEngine {
         }
         tracing::info!(
             target: "nrr::auto-rules",
+            msg_key = "autorules-intake-app-offer-stalled",
             sid = %sid,
             program = %program,
             stalled = stalled.len(),
@@ -374,6 +377,7 @@ impl AutoRulesEngine {
         }
         tracing::info!(
             target: "nrr::auto-rules",
+            msg_key = "autorules-intake-domain-offer",
             sid = %sid,
             host = %host,
             domain = %apex,
@@ -441,6 +445,19 @@ impl AutoRulesEngine {
             );
             return false;
         }
+        // `*.intranet` would claim a whole top-level label; only the full name
+        // our resolver completed it to can be offered.
+        let Some(host) = crate::short_name_completions::global_short_name_completions()
+            .qualify(&host)
+            .map(std::borrow::Cow::into_owned)
+        else {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                host = %host,
+                "not offered: a short name with no known full name",
+            );
+            return false;
+        };
         // A host the main link carries has nothing to move. Checked BEFORE
         // parking, not only before the popup: an offer sitting in the inbox for
         // a site that works is the same false statement, made quietly.

@@ -112,6 +112,13 @@ pub const SERVICE_ENDPOINT_ADDRESS: &str = r"\\.\pipe\NetRuleRouter\service-v1";
 #[cfg(unix)]
 pub const SERVICE_ENDPOINT_ADDRESS: &str = "/run/netrulerouter/service-v1.sock";
 
+/// Access a client requests when it opens the service pipe:
+/// `FILE_GENERIC_READ | FILE_WRITE_DATA`. `GENERIC_WRITE` would also ask for
+/// `FILE_APPEND_DATA`, which on a pipe means "create an instance" — the one
+/// right the pipe DACL withholds from users, so such an open is refused.
+#[cfg(windows)]
+pub const SERVICE_PIPE_CLIENT_ACCESS: u32 = 0x0012_008B;
+
 /// The rules-lock refusal as CLIENTS spell it.
 ///
 /// Two spellings of one condition are legitimate here — the envelope carries

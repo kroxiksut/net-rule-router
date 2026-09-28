@@ -10,6 +10,12 @@ public:
 
     Q_INVOKABLE void triggerTrayAction(const QString &actionId);
 
+    /// Open the main window on one setting (`--focus=`), with display-only
+    /// context for the banner beside it (`--focus-context=`, compact JSON).
+    /// The launcher validates both; the window can only show the context.
+    Q_INVOKABLE void openMainGuiFocused(const QString &section, const QString &focusId,
+                                        const QString &focusContextJson);
+
     Q_INVOKABLE bool savePreferences(const QString &serializedPayload);
 
     Q_INVOKABLE QVariantMap takePendingGuiRequest();
@@ -515,8 +521,12 @@ public:
     Q_INVOKABLE QString rpcAppGroupsDiscover();
     /// Async wrapper over the launcher-local `local.vm-inventory.list` RPC: the
     /// hypervisors on this machine and their virtual machines, answered as
-    /// `{hypervisors:[...]}` on `rpcResponse`. Needs no service.
-    Q_INVOKABLE QString rpcVmInventoryList();
+    /// `{hypervisors:[...]}` on `rpcResponse`. Needs no service. The payload
+    /// names the additional adapter so each NAT pin is read against it.
+    Q_INVOKABLE QString rpcVmInventoryList(const QVariantMap &payload);
+    /// Launcher-local `local.vm-nat.bind`: pins a machine's NAT adapter to the
+    /// additional adapter's address, or removes the pin.
+    Q_INVOKABLE QString rpcVmNatBind(const QVariantMap &payload);
 
     /// Async wrapper over the service `diagnostics.seed-from-browser-history`
     /// RPC. On-demand, explicit-consent import: the service reads the local
@@ -978,7 +988,8 @@ private:
     // Both arguments are optional — when empty they're omitted from
     // the CLI and the launcher falls back to a plain section-switch.
     void launchMainGuiWithAction(const QString &section, bool about, bool license,
-                                 const QString &action, const QString &reason);
+                                 const QString &action, const QString &reason,
+                                 const QString &focus = {}, const QString &focusContext = {});
 
     void openLogsFolder();
 

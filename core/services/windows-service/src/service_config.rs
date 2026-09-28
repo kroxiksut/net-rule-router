@@ -1,5 +1,4 @@
-//! Service start-mode reconfiguration and the targeted `SERVICE_START`
-//! grant.
+//! Service start-mode reconfiguration and the targeted service-object grants.
 //!
 //! Two jobs, both reached ONLY through elevated subcommands (`install`,
 //! `set-start-auto`, `set-start-demand`; the GUI dispatches them via the
@@ -8,12 +7,14 @@
 //! 1. [`reconfigure_start_mode`] flips the SCM start type between
 //!    `SERVICE_AUTO_START` (start with Windows) and `SERVICE_DEMAND_START`
 //!    (start on app launch). [`query_start_mode`] reads it back for the GUI.
-//! 2. [`grant_interactive_service_start`] adds a single `SERVICE_START` ACE for
-//!    the well-known `INTERACTIVE` group on the service object's DACL, so the
+//! 2. [`grant_service_access`] adds a single `SERVICE_START` ACE for the
+//!    well-known `INTERACTIVE` group on the service object's DACL, so the
 //!    unprivileged launcher can start the service with no UAC prompt in EITHER
-//!    start mode. The grant is targeted (one trustee, its default rights plus
-//!    `SERVICE_START`) — never a blanket SDDL widening, and `SetEntriesInAclW`
-//!    merges it into the existing DACL.
+//!    start mode, and `SERVICE_QUERY_STATUS` for Authenticated Users, so a
+//!    client in any session — SSH, a scheduled task — can check that the pipe
+//!    it reached is served by the service's own process. Both grants are
+//!    targeted (one trustee, named rights) — never a blanket SDDL widening, and
+//!    `SetEntriesInAclW` merges them into the existing DACL.
 //!
 //! The trustee is `INTERACTIVE`, not the console user's own SID: a per-SID
 //! grant only ever accumulates — nothing removes it as users come and go — so
@@ -40,8 +41,9 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     CreateWellKnownSid, GetSecurityDescriptorDacl, InitializeSecurityDescriptor,
-    LookupAccountNameW, SetSecurityDescriptorDacl, WinInteractiveSid, ACE_FLAGS, ACL,
-    DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR, SID_NAME_USE,
+    LookupAccountNameW, SetSecurityDescriptorDacl, WinAuthenticatedUserSid, WinInteractiveSid,
+    ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR,
+    SID_NAME_USE, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::System::RemoteDesktop::{
     WTSDomainName, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW,
@@ -65,6 +67,9 @@ const SERVICE_START_RIGHT: u32 = 0x0010;
 /// `INTERACTIVE` is that very trustee: an entry naming only `SERVICE_START`
 /// would replace these, and the unprivileged GUI could not even read status.
 const INTERACTIVE_DEFAULT_RIGHTS: u32 = 0x0001 | 0x0004 | 0x0008 | 0x0080 | 0x0100 | READ_CONTROL;
+/// `SERVICE_QUERY_STATUS`: state and process id, nothing that changes the
+/// service. What a client needs to tell the service's pipe from a squatter's.
+const SERVICE_QUERY_STATUS_RIGHT: u32 = 0x0004;
 /// Standard rights needed to read + rewrite the service object's DACL.
 const READ_CONTROL: u32 = 0x0002_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
@@ -233,33 +238,36 @@ fn wts_query_session_string(session_id: u32, info_class: WTS_INFO_CLASS) -> Opti
 /// Binary SID of the well-known `INTERACTIVE` group (`S-1-5-4`): every session
 /// logged on interactively, which is exactly who may launch the app.
 fn interactive_group_sid() -> Result<Vec<u8>, StartModeError> {
+    well_known_sid(WinInteractiveSid, "INTERACTIVE")
+}
+
+/// Binary SID of Authenticated Users (`S-1-5-11`): every logged-on account,
+/// interactive or not.
+fn authenticated_users_sid() -> Result<Vec<u8>, StartModeError> {
+    well_known_sid(WinAuthenticatedUserSid, "Authenticated Users")
+}
+
+fn well_known_sid(kind: WELL_KNOWN_SID_TYPE, label: &str) -> Result<Vec<u8>, StartModeError> {
     let mut len: u32 = 0;
     // Sizing call — a null buffer with a zero length fills `len` and fails.
     // SAFETY: out-params are valid; no buffer is written on the sizing call.
-    let _ = unsafe {
-        CreateWellKnownSid(
-            WinInteractiveSid,
-            PSID::default(),
-            PSID::default(),
-            &mut len,
-        )
-    };
+    let _ = unsafe { CreateWellKnownSid(kind, PSID::default(), PSID::default(), &mut len) };
     if len == 0 {
-        return Err(StartModeError::Security(
-            "could not size the INTERACTIVE SID".into(),
-        ));
+        return Err(StartModeError::Security(format!(
+            "could not size the {label} SID"
+        )));
     }
     let mut sid = vec![0u8; len as usize];
     // SAFETY: `sid` is `len` bytes, sized by the call above.
     unsafe {
         CreateWellKnownSid(
-            WinInteractiveSid,
+            kind,
             PSID::default(),
             PSID(sid.as_mut_ptr() as *mut c_void),
             &mut len,
         )
     }
-    .map_err(|e| StartModeError::Security(format!("build INTERACTIVE SID: {e}")))?;
+    .map_err(|e| StartModeError::Security(format!("build {label} SID: {e}")))?;
     Ok(sid)
 }
 
@@ -330,7 +338,8 @@ fn lookup_account_sid(account: &str) -> Result<Vec<u8>, StartModeError> {
     Ok(sid)
 }
 
-/// Add the targeted `SERVICE_START` ACE for `INTERACTIVE` to the service DACL
+/// Add the targeted `SERVICE_START` ACE for `INTERACTIVE` and the
+/// `SERVICE_QUERY_STATUS` ACE for Authenticated Users to the service DACL
 /// (trustee rationale: module docs above). Idempotent: `SetEntriesInAclW`
 /// folds the rights into the trustee's existing entry, so re-running never
 /// stacks duplicate ACEs, and re-running on a DACL an earlier version cut
@@ -341,14 +350,15 @@ fn lookup_account_sid(account: &str) -> Result<Vec<u8>, StartModeError> {
 /// GUI's own start button dead, with no way back short of an elevated
 /// console. Starting an already-AutoStart service is not a privilege worth
 /// withholding from whoever is sitting at the machine.
-pub fn grant_interactive_service_start() -> Result<(), StartModeError> {
+pub fn grant_service_access() -> Result<(), StartModeError> {
     let sid = interactive_group_sid()?;
+    let status_sid = authenticated_users_sid()?;
     // Best-effort: an installation that predates the `INTERACTIVE` trustee
     // carries a per-user ACE granting the same right. `REVOKE_ACCESS` drops
     // EVERY entry for that trustee, which is the point — the personal grant is
     // exactly what the well-known group replaces.
     let legacy_sid = console_session_user_sid().ok();
-    write_service_start_ace(&sid, legacy_sid.as_ref())
+    write_service_aces(&sid, &status_sid, legacy_sid.as_ref())
 }
 
 /// A DACL from `SetEntriesInAclW`, freed on every exit path.
@@ -363,12 +373,14 @@ impl Drop for DaclGuard {
     }
 }
 
-/// `old_dacl` plus `SERVICE_START` and the default rights for `sid`, minus
-/// every entry for `legacy_sid`. Pure over its inputs so the merge is testable
-/// against a synthetic DACL without touching the SCM.
-fn merge_start_ace(
+/// `old_dacl` plus `SERVICE_START` and the default rights for `sid`, plus
+/// `SERVICE_QUERY_STATUS` for `status_sid`, minus every entry for `legacy_sid`.
+/// Pure over its inputs so the merge is testable against a synthetic DACL
+/// without touching the SCM.
+fn merge_service_aces(
     old_dacl: Option<*const ACL>,
     sid: &[u8],
+    status_sid: &[u8],
     legacy_sid: Option<&Vec<u8>>,
 ) -> Result<DaclGuard, StartModeError> {
     // `sid` / `legacy_sid` outlive this function, so the raw pointers stashed
@@ -389,6 +401,21 @@ fn merge_start_ace(
             ptstrName: PWSTR(sid.as_ptr() as *mut u16),
         },
     }];
+    entries.push(EXPLICIT_ACCESS_W {
+        grfAccessPermissions: SERVICE_QUERY_STATUS_RIGHT,
+        // GRANT folds into an existing entry for the trustee, so rights an
+        // administrator gave Authenticated Users by hand are kept.
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: ACE_FLAGS(0),
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            // SAFETY contract: as above; `status_sid` outlives the call.
+            ptstrName: PWSTR(status_sid.as_ptr() as *mut u16),
+        },
+    });
     if let Some(legacy) = legacy_sid {
         entries.push(EXPLICIT_ACCESS_W {
             grfAccessPermissions: SERVICE_START_RIGHT,
@@ -418,11 +445,16 @@ fn merge_start_ace(
     Ok(DaclGuard(new_dacl))
 }
 
-/// Read the service DACL, add the `SERVICE_START` ACE for `sid`, revoke every
-/// entry for `legacy_sid` if one was resolved, and write it back. All buffers
+/// Read the service DACL, add the `SERVICE_START` ACE for `sid` and the
+/// `SERVICE_QUERY_STATUS` ACE for `status_sid`, revoke every entry for
+/// `legacy_sid` if one was resolved, and write it back. All buffers
 /// are held in scope until `SetServiceObjectSecurity` returns, because the old
 /// DACL, the SIDs, and the new DACL are referenced by pointer along the way.
-fn write_service_start_ace(sid: &[u8], legacy_sid: Option<&Vec<u8>>) -> Result<(), StartModeError> {
+fn write_service_aces(
+    sid: &[u8],
+    status_sid: &[u8],
+    legacy_sid: Option<&Vec<u8>>,
+) -> Result<(), StartModeError> {
     let (_scm, svc) = open_service(READ_CONTROL | WRITE_DAC)?;
 
     // ── 1. Read the current self-relative security descriptor (DACL only). ──
@@ -477,7 +509,7 @@ fn write_service_start_ace(sid: &[u8], legacy_sid: Option<&Vec<u8>>) -> Result<(
         Some(old_dacl as *const ACL)
     };
     // `old_dacl` points into `sd_buf`, which lives to the end of this function.
-    let new_dacl_guard = merge_start_ace(old_dacl_opt, sid, legacy_sid)?;
+    let new_dacl_guard = merge_service_aces(old_dacl_opt, sid, status_sid, legacy_sid)?;
     let new_dacl = new_dacl_guard.0;
 
     // ── 4. Build a fresh absolute SD carrying just the new DACL, write it. ──
@@ -560,6 +592,10 @@ mod tests {
         out
     }
 
+    fn au() -> Vec<u8> {
+        authenticated_users_sid().expect("authenticated users sid")
+    }
+
     /// SCM's default DACL for a new service, as `sc sdshow` prints it.
     const SCM_DEFAULT: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
 
@@ -567,7 +603,7 @@ mod tests {
     fn the_grant_keeps_interactive_readable_and_adds_start() {
         let sid = interactive_group_sid().expect("interactive sid");
         let (_sd, old) = dacl_of(SCM_DEFAULT);
-        let merged = merge_start_ace(Some(old), &sid, None).expect("merge");
+        let merged = merge_service_aces(Some(old), &sid, &au(), None).expect("merge");
         let text = sddl_of(merged.0);
         // LC (query status) is what the GUI's badge needs; RP is SERVICE_START.
         assert!(text.contains("CCLCSWRPLOCRRC;;;IU)"), "{text}");
@@ -581,9 +617,29 @@ mod tests {
     fn re_running_the_grant_repairs_a_dacl_cut_down_to_start_only() {
         let sid = interactive_group_sid().expect("interactive sid");
         let (_sd, old) = dacl_of("D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;RP;;;IU)");
-        let merged = merge_start_ace(Some(old), &sid, None).expect("merge");
+        let merged = merge_service_aces(Some(old), &sid, &au(), None).expect("merge");
         let text = sddl_of(merged.0);
         assert!(text.contains("CCLCSWRPLOCRRC;;;IU)"), "{text}");
         assert_eq!(text.matches(";;;IU)").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn authenticated_users_get_query_status_and_nothing_more() {
+        let sid = interactive_group_sid().expect("interactive sid");
+        let (_sd, old) = dacl_of(SCM_DEFAULT);
+        let merged = merge_service_aces(Some(old), &sid, &au(), None).expect("merge");
+        let text = sddl_of(merged.0);
+        assert!(text.contains("(A;;LC;;;AU)"), "{text}");
+        assert_eq!(text.matches(";;;AU)").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn an_administrators_existing_grant_to_authenticated_users_is_kept() {
+        let sid = interactive_group_sid().expect("interactive sid");
+        let (_sd, old) = dacl_of(&format!("{SCM_DEFAULT}(A;;RC;;;AU)"));
+        let merged = merge_service_aces(Some(old), &sid, &au(), None).expect("merge");
+        let text = sddl_of(merged.0);
+        assert!(text.contains("(A;;LCRC;;;AU)"), "{text}");
+        assert_eq!(text.matches(";;;AU)").count(), 1, "{text}");
     }
 }

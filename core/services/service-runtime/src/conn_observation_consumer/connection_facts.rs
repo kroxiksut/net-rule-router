@@ -123,13 +123,22 @@ pub(super) fn process_name_matches_vpn(process_path: Option<&str>) -> bool {
 /// `pub(super)` because the predicates moved out of the consumer and it is
 /// now the caller.
 pub(super) fn process_is_p2p_fcrdns_suppressed(process_path: Option<&str>) -> bool {
-    let Some(path) = process_path else {
-        return false;
-    };
+    process_group(process_path)
+        .is_some_and(nrr_platform_api::AppGroupKind::suppresses_fcrdns_learning)
+}
+
+/// Is this a peer-to-peer program? Its peers go unanswered as a matter of
+/// course, so their silence says nothing about the main link, and the group
+/// has its own route choice.
+pub(super) fn process_is_peer_to_peer(process_path: Option<&str>) -> bool {
+    process_group(process_path)
+        .is_some_and(|kind| kind.tab() == nrr_platform_api::AppGroupTab::PeerToPeer)
+}
+
+fn process_group(process_path: Option<&str>) -> Option<nrr_platform_api::AppGroupKind> {
+    let path = process_path?;
     let name = path.rsplit(['\\', '/']).next().unwrap_or(path).trim();
     nrr_platform_api::classify_app(name)
-        .map(|kind| kind.suppresses_fcrdns_learning())
-        .unwrap_or(false)
 }
 
 /// Is `ip` a sensible VPN server to exempt? Skips

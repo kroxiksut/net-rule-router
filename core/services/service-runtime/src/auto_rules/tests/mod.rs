@@ -73,6 +73,7 @@ struct RecordingAuthor {
     rules: Arc<FixedRules>,
     calls: Mutex<Vec<(AutoRuleReason, Vec<AuthoredRule>)>>,
     fail_with: Mutex<Option<AuthorError>>,
+    anchor_skipped: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingAuthor {
@@ -81,7 +82,13 @@ impl RecordingAuthor {
             rules,
             calls: Mutex::new(Vec::new()),
             fail_with: Mutex::new(None),
+            anchor_skipped: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    fn leave_anchor(&self) {
+        self.anchor_skipped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn fail(&self, code: &str) {
@@ -147,6 +154,23 @@ impl AutoRuleAuthor for RecordingAuthor {
         }
         book.secondary = CanonicalRuleSet::from_rules(secondary);
         Ok(rules.len() as u32)
+    }
+
+    fn author_with_outcome(
+        &self,
+        principal: &str,
+        reason: &AutoRuleReason,
+        rules: &[AuthoredRule],
+        now: SystemTime,
+        correlation_id: &str,
+    ) -> Result<AuthoredOutcome, AuthorError> {
+        let authored = self.author(principal, reason, rules, now, correlation_id)?;
+        Ok(AuthoredOutcome {
+            authored,
+            anchor_skipped: self
+                .anchor_skipped
+                .load(std::sync::atomic::Ordering::SeqCst),
+        })
     }
 }
 

@@ -212,9 +212,9 @@ int main(int argc, char *argv[]) {
 
     // Adopt the launcher's coordination directory BEFORE the first flag is
     // touched below — every lock and flag path is derived from it.
-    if (!options.runtimeDirectory.isEmpty()) {
-        g_runtimeDirectoryOverride =
-            QDir::cleanPath(normalizeLocalPath(options.runtimeDirectory));
+    if (!adoptRuntimeDirectory(options.runtimeDirectory)) {
+        qCritical("The runtime directory is not private to this user; refusing to start.");
+        return 2;
     }
 
     // A leftover shutdown flag from a previous tray "Exit" must not cause a

@@ -21,6 +21,7 @@ impl SecondaryRouteCoordinator {
             Ok(_) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-secondary-luid-zero",
                     sid = %sid,
                     ifindex = secondary.interface_index,
                     "secondary interface resolved to a zero LUID — kill-switch stays off (fail-open)",
@@ -30,6 +31,7 @@ impl SecondaryRouteCoordinator {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-secondary-luid-error",
                     sid = %sid,
                     ifindex = secondary.interface_index,
                     "could not resolve secondary interface LUID for kill-switch; staying off (fail-open): {e:?}",
@@ -111,6 +113,7 @@ impl SecondaryRouteCoordinator {
         let Some(policy) = self.route_source.load_for_sid(sid) else {
             tracing::info!(
                 target: "nrr::route-coordinator",
+                msg_key = "route-no-policy-for-user",
                 sid = %sid,
                 "no route policy for this user — no secondary routes will be applied",
             );
@@ -131,6 +134,7 @@ impl SecondaryRouteCoordinator {
                 self.publish_enforcement_status(sid, "adapters-unreadable", "", Vec::new());
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-adapter-enum-failed",
                     sid = %sid,
                     "adapter enumeration failed; cannot resolve route targets: {e:?}",
                 );
@@ -149,6 +153,7 @@ impl SecondaryRouteCoordinator {
             None => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-no-secondary-bound",
                     sid = %sid,
                     "NO SECONDARY ADAPTER BOUND — assign primary+secondary in 'Interfaces & routes' and apply (needs elevation). Without a secondary target nothing is routed out the secondary NIC.",
                 );
@@ -173,6 +178,7 @@ impl SecondaryRouteCoordinator {
                     Some(derived) => {
                         tracing::info!(
                             target: "nrr::route-coordinator",
+                            msg_key = "route-primary-derived",
                             sid = %sid,
                             ifindex = derived.interface_index,
                             gateway = %derived.gateway,
@@ -183,6 +189,7 @@ impl SecondaryRouteCoordinator {
                     None => {
                         tracing::warn!(
                             target: "nrr::route-coordinator",
+                            msg_key = "route-no-primary-derivable",
                             sid = %sid,
                             secondary_ifindex = sec.interface_index,
                             "no primary adapter bound and no OS default route to derive one — in 'direct' mode unmatched traffic stays on the secondary (VPN). Bind a primary adapter in 'Interfaces & routes'.",
@@ -241,6 +248,7 @@ impl SecondaryRouteCoordinator {
         }
         tracing::info!(
             target: "nrr::route-coordinator",
+            msg_key = "route-mac-anchor-remembered",
             sid = %sid,
             role = role,
             anchor = %anchor,

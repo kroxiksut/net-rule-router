@@ -91,6 +91,17 @@ pub fn is_owned_shape(destination: IpAddr, prefix_length: u8) -> bool {
 /// destination — documented in `strategy.rs`'s risk matrix.
 pub const SECONDARY_ROUTE_METRIC: u32 = 5;
 
+/// Whether a row read back from the system table carries our signature. The OS
+/// never marks a route as ours, so crash recovery adopts by this and nothing
+/// else — metric, a shape we emit, and the main table (a Linux dump also
+/// returns other tables, which we never write).
+#[must_use]
+pub fn is_owned_route(route: &RouteEntry) -> bool {
+    route.metric == SECONDARY_ROUTE_METRIC
+        && route.table == nrr_platform_api::RouteTableRef::Main
+        && is_owned_shape(route.destination, route.prefix_length)
+}
+
 /// the two split-default halves. Together they cover all of
 /// IPv4 and, being more specific (`/1`) than the OS default `0.0.0.0/0`, win
 /// over it WITHOUT our ever touching the fail-safe default itself. In mode B we

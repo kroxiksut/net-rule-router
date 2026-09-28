@@ -48,7 +48,7 @@ pub(crate) fn build_supervised_runtime_deps(
     // Same stage announcements as the SCM boot: everything from here to the
     // first component log is silent, so a boot that stops answering inside this
     // function is otherwise indistinguishable from one that stopped at its door.
-    tracing::info!(target: "nrr::boot", stage = "open-state-db", "boot stage entered");
+    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "open-state-db", "boot stage entered");
     let settings_conn = open_settings_connection(&artifacts.topology.state_db_path);
 
     // User-configurable FQDN cache refresh cadence (Settings →
@@ -72,11 +72,11 @@ pub(crate) fn build_supervised_runtime_deps(
     // the DNS refresh task. Both consumers serialise through the same
     // mutex; the cache DB's WAL mode keeps reads from blocking the
     // engine's lookup path.
-    tracing::info!(target: "nrr::boot", stage = "open-cache-db", "boot stage entered");
+    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "open-cache-db", "boot stage entered");
     let cache_store = open_cache_store(&artifacts.topology.cache_db_path, cache_refresh_secs);
 
     // ── Autostart helper ───────────────────────────────────────────────
-    tracing::info!(target: "nrr::boot", stage = "autostart-probe", "boot stage entered");
+    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "autostart-probe", "boot stage entered");
     let tray_path = resolve_tray_binary_path();
     let autostart_helper = Arc::new(AutostartHelper::new(ProductionAutostartRegistry));
 
@@ -102,7 +102,7 @@ pub(crate) fn build_supervised_runtime_deps(
     // Open the rebuildable traffic DB + build the sampler over the
     // Windows octet-counter source. Function-scope so both the IPC
     // provider (reads) and the `traffic-sample-tick` (writes) share it.
-    tracing::info!(target: "nrr::boot", stage = "open-traffic-db", "boot stage entered");
+    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "open-traffic-db", "boot stage entered");
     let traffic_sampler = open_traffic_sampler(&artifacts.topology.traffic_db_path);
     // Active-probe liveness shared state + the ICMP probe. The tracker
     // starts DISABLED (window 0 = safe default; nothing is ever
@@ -444,6 +444,7 @@ pub(crate) fn build_supervised_runtime_deps(
         None => {
             tracing::info!(
                 target: "nrr::stability",
+                msg_key = "svc-boot-stability-defaults-applied",
                 source = "default",
                 "service_stability_config defaults applied (no persisted row or settings DB unavailable)",
             );
@@ -541,6 +542,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 if let Err(e) = coord.recompute_active(&tray_active) {
                     tracing::error!(
                         target: "nrr::route-coordinator",
+                        msg_key = "svc-boot-route-recompute-failed",
                         "route recompute after DNS warm-up failed: {e:?}",
                     );
                 }
@@ -577,6 +579,7 @@ pub(crate) fn build_supervised_runtime_deps(
                         Err(e) => {
                             tracing::error!(
                                 target: "nrr::per_sid_orchestrator",
+                                msg_key = "svc-boot-pause-state-read-failed",
                                 "pause-state read failed; skipping enforcement reconcile: {e:?}",
                             );
                             dns_ctl.tick();
@@ -592,6 +595,7 @@ pub(crate) fn build_supervised_runtime_deps(
                     if let Err(e) = orch.reconcile(&unpaused) {
                         tracing::error!(
                             target: "nrr::per_sid_orchestrator",
+                            msg_key = "svc-boot-enforcement-reconcile-failed",
                             "periodic enforcement reconcile failed: {e:?}",
                         );
                     }
@@ -609,6 +613,7 @@ pub(crate) fn build_supervised_runtime_deps(
                                 if changed {
                                     tracing::info!(
                                         target: "nrr::per_sid_orchestrator",
+                                        msg_key = "svc-boot-leak-guard-reconciled",
                                         sid = %sid,
                                         added = n,
                                         "leak-guard reconciled (coverage grown / LUID-aware permit refresh)",
@@ -624,6 +629,7 @@ pub(crate) fn build_supervised_runtime_deps(
                             }
                             Err(e) => tracing::warn!(
                                 target: "nrr::per_sid_orchestrator",
+                                msg_key = "svc-boot-leak-guard-reconcile-failed",
                                 sid = %sid,
                                 "leak-guard reconcile failed: {e:?}",
                             ),
@@ -751,6 +757,7 @@ pub(crate) fn build_supervised_runtime_deps(
                                 .join(", ");
                             tracing::info!(
                                 target: "nrr::lifecycle",
+                                msg_key = "svc-boot-teardown-connections-live",
                                 processes = %summary,
                                 "connections live at teardown — removing our routes changes their path, and an established session does not survive that",
                             );
@@ -761,11 +768,13 @@ pub(crate) fn build_supervised_runtime_deps(
                             match coord.teardown_keep_secondary_hosts() {
                                 Ok(delta) => tracing::info!(
                                     target: "nrr::route-coordinator",
+                                    msg_key = "svc-boot-teardown-persist-routes",
                                     removed_overlays = delta.removed as u64,
                                     "service stopping — kept secondary rule-routes on the VPN; removed NRR overlays (general traffic returns to the OS/VPN default)",
                                 ),
                                 Err(e) => tracing::warn!(
                                     target: "nrr::route-coordinator",
+                                    msg_key = "svc-boot-teardown-keep-secondary-failed",
                                     "route keep-secondary teardown on shutdown failed: {e:?}",
                                 ),
                             }
@@ -774,10 +783,12 @@ pub(crate) fn build_supervised_runtime_deps(
                             match coord.teardown() {
                                 Ok(_) => tracing::info!(
                                     target: "nrr::route-coordinator",
+                                    msg_key = "svc-boot-teardown-full-restore",
                                     "service stopping — all NRR routes torn down (routing restored to pristine)",
                                 ),
                                 Err(e) => tracing::warn!(
                                     target: "nrr::route-coordinator",
+                                    msg_key = "svc-boot-teardown-full-failed",
                                     "route teardown on shutdown failed: {e:?}",
                                 ),
                             }
@@ -787,11 +798,13 @@ pub(crate) fn build_supervised_runtime_deps(
                         match orch.cleanup_wfp() {
                             Ok(n) => tracing::info!(
                                 target: "nrr::route-coordinator",
+                                msg_key = "svc-boot-wfp-filters-stripped",
                                 stripped_filters = n as u64,
                                 "service stopping — all NRR WFP filters stripped",
                             ),
                             Err(e) => tracing::warn!(
                                 target: "nrr::route-coordinator",
+                                msg_key = "svc-boot-wfp-strip-failed",
                                 "WFP filter strip on shutdown failed: {e:?}",
                             ),
                         }
@@ -864,6 +877,7 @@ pub(crate) fn build_supervised_runtime_deps(
                             if seeded.matched > 0 {
                                 tracing::info!(
                                     target: "nrr::dns-observe",
+                                    msg_key = "svc-boot-dns-cache-seed",
                                     matched = seeded.matched,
                                     "seed from OS resolver cache before flush",
                                 );
@@ -879,10 +893,12 @@ pub(crate) fn build_supervised_runtime_deps(
                             {
                                 Ok(()) => tracing::info!(
                                     target: "nrr::dns-observe",
+                                    msg_key = "svc-boot-dns-cache-flushed",
                                     "flushed OS DNS resolver cache — names cached before the service started will re-query and become observable",
                                 ),
                                 Err(e) => tracing::warn!(
                                     target: "nrr::dns-observe",
+                                    msg_key = "svc-boot-dns-cache-flush-failed",
                                     error = ?e,
                                     "OS DNS resolver cache flush failed — names cached before the service started stay invisible until their TTL expires",
                                 ),
@@ -895,6 +911,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 Err(e) => {
                     tracing::warn!(
                         target: "nrr::dns-observe",
+                        msg_key = "svc-boot-dns-etw-unavailable",
                         "DNS-Client ETW observer unavailable; suffix/zone routing will not \
                          observe new sub-hostnames: {e}",
                     );
@@ -941,6 +958,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 {
                     tracing::warn!(
                         target: "nrr::vpn-learn",
+                        msg_key = "svc-boot-vpn-client-app-persist-failed",
                         error = %e,
                         "failed to persist learned VPN client app — continuing",
                     );
@@ -966,6 +984,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 {
                     tracing::warn!(
                         target: "nrr::app-routing",
+                        msg_key = "svc-boot-app-destination-forget-failed",
                         error = %e,
                         "failed to delete a withdrawn application destination — it will age out of the freshness window instead",
                     );
@@ -1028,13 +1047,25 @@ pub(crate) fn build_supervised_runtime_deps(
     ) {
         Ok(removed) => tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "svc-boot-nrpt-sweep-finished",
             removed,
             "startup: orphaned NRPT redirect sweep finished",
         ),
         Err(e) => tracing::warn!(
             target: "nrr::dns-resolver",
+            msg_key = "svc-boot-nrpt-cleanup-failed",
             "Mode B: orphan NRPT cleanup at boot failed ({e})",
         ),
+    }
+    // A search list a killed instance wrote outlives it across a reboot.
+    if let Err(e) = nrr_platform_windows::dns_redirect::release_search_list(
+        &nrr_platform_windows::dns_redirect::WindowsSearchList,
+    ) {
+        tracing::warn!(
+            target: "nrr::dns-resolver",
+            msg_key = "svc-boot-search-list-release-failed",
+            "startup: could not take back a DNS suffix search list left by a previous run ({e})",
+        );
     }
     // Install the platform resolver factory now that the cache / routing-SID /
     // recompute-hook inputs exist, and read the persisted boot mode. The factory
@@ -1072,6 +1103,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 Err(e) => {
                     tracing::warn!(
                         target: "nrr::fake-ip",
+                        msg_key = "svc-boot-fakeip-bindings-load-failed",
                         error = %e,
                         "loading persisted fake-IP bindings failed — starting with an empty pool",
                     );
@@ -1109,6 +1141,7 @@ pub(crate) fn build_supervised_runtime_deps(
         if restored > 0 {
             tracing::info!(
                 target: "nrr::fake-ip",
+                msg_key = "svc-boot-fakeip-bindings-restored",
                 restored,
                 "restored persisted fake-IP bindings — hostnames keep their virtual addresses",
             );
@@ -1165,6 +1198,7 @@ pub(crate) fn build_supervised_runtime_deps(
             }
             tracing::info!(
                 target: "nrr::fake-ip",
+                msg_key = "svc-boot-vpn-exclusions-seeded",
                 seeded,
                 total = hosts.len(),
                 "pre-seeded VPN self-heal exclusions from persistence — known VPN servers resolve to their real addresses from the first query",
@@ -1219,6 +1253,7 @@ pub(crate) fn build_supervised_runtime_deps(
                         {
                             tracing::warn!(
                                 target: "nrr::fake-ip",
+                                msg_key = "svc-boot-fakeip-watchdog-flush-failed",
                                 error = ?e,
                                 "OS DNS resolver cache flush after watchdog rebuild failed — stale answers persist until TTL",
                             );
@@ -1229,6 +1264,7 @@ pub(crate) fn build_supervised_runtime_deps(
         if let Err(e) = spawned {
             tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "svc-boot-fakeip-watchdog-spawn-failed",
                 error = %e,
                 "could not spawn fake-IP datapath watchdog worker",
             );
@@ -1280,6 +1316,7 @@ pub(crate) fn build_supervised_runtime_deps(
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "svc-boot-dns-via-secondary-loaded",
             enabled,
             "DNS-over-secondary setting loaded at boot",
         );
@@ -1288,6 +1325,7 @@ pub(crate) fn build_supervised_runtime_deps(
             .store(fast, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "svc-boot-dns-fast-answers-loaded",
             enabled = fast,
             "fast-DNS-answers setting loaded at boot",
         );
@@ -1299,6 +1337,7 @@ pub(crate) fn build_supervised_runtime_deps(
             .store(udp_relay, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "svc-boot-fakeip-udp-relay-loaded",
             enabled = udp_relay,
             "fake-IP UDP relay setting loaded at boot",
         );
@@ -1310,6 +1349,7 @@ pub(crate) fn build_supervised_runtime_deps(
             .store(instant_rst, std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "svc-boot-fakeip-instant-rst-loaded",
             enabled = instant_rst,
             "fake-IP instant reset setting loaded at boot",
         );
@@ -1332,6 +1372,7 @@ pub(crate) fn build_supervised_runtime_deps(
         // anything, so its boot value has to be visible on its own.
         tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "svc-boot-fakeip-setting-loaded",
             enabled = toggle,
             mode = ?dns_resolver_boot_mode,
             bringing_up = desired,
@@ -1361,6 +1402,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 {
                     tracing::warn!(
                         target: "nrr::fake-ip",
+                        msg_key = "svc-boot-fakeip-bringup-flush-failed",
                         error = ?e,
                         "OS DNS resolver cache flush after fake-IP boot bring-up failed — stale real answers persist until TTL",
                     );

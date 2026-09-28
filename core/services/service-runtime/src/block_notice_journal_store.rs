@@ -102,6 +102,7 @@ impl BlockNoticeJournalStore for SqliteBlockNoticeJournalStore {
         {
             tracing::warn!(
                 target: "nrr::block-notice",
+                msg_key = "blocknotice-journal-append-failed",
                 error = %e,
                 "could not journal a block notice — it is lost if no surface is up",
             );
@@ -117,6 +118,7 @@ impl BlockNoticeJournalStore for SqliteBlockNoticeJournalStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::block-notice",
+                    msg_key = "blocknotice-journal-read-failed",
                     error = %e,
                     "could not read the block-notice backlog — this session shows none",
                 );
@@ -134,6 +136,7 @@ impl BlockNoticeJournalStore for SqliteBlockNoticeJournalStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::block-notice",
+                    msg_key = "blocknotice-journal-ack-failed",
                     error = %e,
                     "could not clear shown notices — they may be shown again",
                 );
@@ -155,6 +158,7 @@ mod tests {
             reason: BlockReason::BlockedByRule,
             first_attempt_ms: 0,
             attempts: 1,
+            launched_by: Vec::new(),
         }
     }
 

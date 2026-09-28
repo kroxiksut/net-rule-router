@@ -206,6 +206,7 @@ impl WfpSession {
                         Err(e) if e.is_sublayer_registration_failure() => {
                             tracing::error!(
                                 target: "nrr::wfp",
+                                msg_key = "wfp-sublayer-registration-failed",
                                 filter_id = format_args!("{:016x}", spec.id.raw),
                                 error = %e,
                                 "sub-layer registration failed — aborting batch (no filter in it can install)"
@@ -253,6 +254,7 @@ impl WfpSession {
                                 if first_time_this_session {
                                     tracing::warn!(
                                         target: "nrr::wfp",
+                                        msg_key = "wfp-filter-skip-unmaterializable",
                                         filter_id = format_args!("{:016x}", spec.id.raw),
                                         action = ?spec.action,
                                         remote_ip = ?spec.remote_ip,
@@ -287,6 +289,7 @@ impl WfpSession {
                             FilterFailureMode::Strict => {
                                 tracing::error!(
                                     target: "nrr::wfp",
+                                    msg_key = "wfp-filter-abort-unmaterializable-strict",
                                     filter_id = format_args!("{:016x}", spec.id.raw),
                                     action = ?spec.action,
                                     remote_ip = ?spec.remote_ip,
@@ -305,6 +308,7 @@ impl WfpSession {
                             // filter identity for diagnosis.
                             tracing::error!(
                                 target: "nrr::wfp",
+                                msg_key = "wfp-filter-add-failed",
                                 filter_id = format_args!("{:016x}", spec.id.raw),
                                 error = %e,
                                 "filter add failed with a non-recoverable error — aborting batch"
@@ -329,6 +333,7 @@ impl WfpSession {
                         Err(e) if mode == FilterFailureMode::BestEffort => {
                             tracing::warn!(
                                 target: "nrr::wfp",
+                                msg_key = "wfp-filter-delete-failed",
                                 filter_id = format_args!("{:016x}", id.raw),
                                 error = %e,
                                 "filter delete failed — continuing so the rest of the set still comes off"

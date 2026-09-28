@@ -15,7 +15,9 @@
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 pub mod client;
+mod log_location;
 pub mod protocol;
+mod server_identity;
 pub mod spawn;
 pub mod trusted_env;
 

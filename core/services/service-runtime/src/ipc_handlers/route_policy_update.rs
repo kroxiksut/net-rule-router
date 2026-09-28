@@ -110,7 +110,8 @@ fn map_write_error(err: RoutePolicyWriteError) -> IpcError {
         RoutePolicyWriteError::UnknownAdapter { .. }
         | RoutePolicyWriteError::PlaceholderAdapter { .. }
         | RoutePolicyWriteError::PrimaryEqualsSecondary
-        | RoutePolicyWriteError::StrictModeRequiresSecondary => IpcError {
+        | RoutePolicyWriteError::StrictModeRequiresSecondary
+        | RoutePolicyWriteError::InvalidNetworkDomain => IpcError {
             code: IpcErrorCode::PreconditionFailed,
             message: err.to_string(),
             diagnostics_id: None,
@@ -202,6 +203,8 @@ mod tests {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
         }
     }
@@ -239,6 +242,8 @@ mod tests {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -347,6 +352,8 @@ mod tests {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -388,6 +395,8 @@ mod tests {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -428,6 +437,8 @@ mod tests {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -471,6 +482,8 @@ mod tests {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: dto.binding_source,
         })
         .unwrap();
@@ -534,6 +547,8 @@ mod tests {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: dto.binding_source,
         })
         .unwrap();
@@ -584,6 +599,8 @@ mod tests {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();

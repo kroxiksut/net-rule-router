@@ -198,3 +198,55 @@ fn each_pair_is_reported_once_with_a_key_naming_both_routes() {
         .iter()
         .all(|o| o.key.contains("primary:") && o.key.contains("secondary:")));
 }
+
+fn blocking(mut rule: RuleDto) -> RuleDto {
+    rule.action = RuleAction::Block;
+    rule
+}
+
+#[test]
+fn a_block_wins_a_tie_against_a_route_on_either_set() {
+    for block_on_main in [true, false] {
+        let block = blocking(exact("B1", "a.example"));
+        let route = exact("R1", "a.example");
+        let dto = if block_on_main {
+            book(vec![block], vec![route])
+        } else {
+            book(vec![route], vec![block])
+        };
+        let found = overlaps(&dto);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, RouteOverlapKind::Duplicate);
+        assert_eq!(
+            found[0].winner.rule_id, "B1",
+            "block on main: {block_on_main}"
+        );
+        assert_eq!(found[0].loser.rule_id, "R1");
+        assert!(found[0].block_wins_tie);
+    }
+}
+
+#[test]
+fn only_a_block_against_a_route_raises_the_tie_warning() {
+    let routes = overlaps(&book(
+        vec![exact("P1", "a.example")],
+        vec![exact("S1", "a.example")],
+    ));
+    assert_eq!(routes[0].winner.rule_id, "P1");
+    assert!(!routes[0].block_wins_tie);
+
+    let blocks = overlaps(&book(
+        vec![blocking(exact("P1", "a.example"))],
+        vec![blocking(exact("S1", "a.example"))],
+    ));
+    assert!(!blocks[0].block_wins_tie);
+
+    // A narrower route over a wider block is a plain nesting, no warning.
+    let nested = overlaps(&book(
+        vec![exact("P1", "a.example")],
+        vec![blocking(zone("S1", "example"))],
+    ));
+    assert_eq!(nested[0].winner.rule_id, "P1");
+    assert_eq!(nested[0].kind, RouteOverlapKind::Nested);
+    assert!(!nested[0].block_wins_tie);
+}

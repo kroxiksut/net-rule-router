@@ -39,6 +39,7 @@ impl SecondaryRouteCoordinator {
             // No effective rules for this principal → no routes.
             tracing::info!(
                 target: "nrr::route-coordinator",
+                msg_key = "route-no-active-rules",
                 sid = %sid,
                 "no active rules for this user — no secondary routes",
             );
@@ -181,6 +182,7 @@ impl SecondaryRouteCoordinator {
                     any = true;
                     tracing::info!(
                         target: "nrr::route-coordinator",
+                        msg_key = "route-counter-overlay-live",
                         sid = %sid,
                         destination = %r.destination,
                         ifindex = r.interface_index,
@@ -193,6 +195,7 @@ impl SecondaryRouteCoordinator {
                 if !any {
                     tracing::warn!(
                         target: "nrr::route-coordinator",
+                        msg_key = "route-counter-overlay-missing",
                         sid = %sid,
                         "no /2 counter-overlay routes in the live table — mode-A selectivity is NOT in force; unmatched traffic will ride the VPN's redirect",
                     );
@@ -240,6 +243,7 @@ impl SecondaryRouteCoordinator {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-orphan-enum-failed",
                     "route table enumeration failed during startup orphan adoption: {e:?}",
                 );
                 return;
@@ -247,14 +251,10 @@ impl SecondaryRouteCoordinator {
         };
         let orphans: Vec<RouteEntry> = table
             .into_iter()
-            .filter(|r| {
-                // Shape asked of the codegen, never restated here: a mode that
-                // grows a shape this list does not know leaves those routes
-                // unadopted after a crash, pointing traffic at a dead tunnel
-                // with nothing left to reclaim them.
-                r.metric == crate::route_codegen::SECONDARY_ROUTE_METRIC
-                    && crate::route_codegen::is_owned_shape(r.destination, r.prefix_length)
-            })
+            // Signature asked of the codegen, never restated here: a mode that
+            // grows a shape a local copy does not know leaves those routes
+            // unadopted after a crash, pointing traffic at a dead tunnel.
+            .filter(crate::route_codegen::is_owned_route)
             .map(|mut r| {
                 r.is_ours = true;
                 r
@@ -263,6 +263,7 @@ impl SecondaryRouteCoordinator {
         if !orphans.is_empty() {
             tracing::info!(
                 target: "nrr::route-coordinator",
+                msg_key = "route-orphans-adopted",
                 count = orphans.len(),
                 "adopted orphaned secondary routes from a previous run",
             );

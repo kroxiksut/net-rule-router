@@ -270,6 +270,7 @@ impl IpcHandler for BlockNoticeJournalListHandler {
                 app: e.notice.app,
                 reason: e.notice.reason.slug().to_string(),
                 attempts: u64::from(e.notice.attempts),
+                launched_by: e.notice.launched_by,
             })
             .collect();
         serialize(
@@ -534,6 +535,7 @@ mod tests {
             reason: nrr_domain::block_notice::BlockReason::NotCoveredByRules,
             first_attempt_ms: 10,
             attempts: 4,
+            launched_by: vec!["cmd.exe".to_string()],
         };
         journal.append("S-A", &notice, 10);
         journal.append("S-B", &notice, 10);
@@ -554,6 +556,7 @@ mod tests {
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].destination, "cdn.example");
         assert_eq!(parsed.entries[0].attempts, 4);
+        assert_eq!(parsed.entries[0].launched_by, vec!["cmd.exe".to_string()]);
 
         let ack = BlockNoticeJournalAckHandler::new(Arc::clone(&store));
         ack.handle(

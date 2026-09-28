@@ -50,6 +50,9 @@ pub use nrr_platform_api::key_store::{
 /// File name for the persisted key. Stable across versions.
 const KEY_FILE_NAME: &str = "db-mac-key.bin";
 
+/// The re-sign-pending marker, kept beside the key under the same mode.
+const RESIGN_MARKER_FILE_NAME: &str = "db-mac-resign-pending.bin";
+
 /// Canonical production directory — root-owned service state, the Linux analog
 /// of the Windows `systemprofile` tree.
 const DEFAULT_STATE_DIR: &str = "/var/lib/netrulerouter";
@@ -93,22 +96,26 @@ impl FileKeyStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
 
-impl KeyStore for FileKeyStore {
-    fn load(&self) -> Result<Option<Vec<u8>>, PlatformError> {
-        match std::fs::read(&self.path) {
+    /// The re-sign-pending marker's path, a sibling of the key file.
+    pub fn resign_marker_path(&self) -> PathBuf {
+        self.path.with_file_name(RESIGN_MARKER_FILE_NAME)
+    }
+
+    /// Contents at `path`; `None` when absent or zero-length.
+    fn read_owner_only(path: &Path) -> Result<Option<Vec<u8>>, PlatformError> {
+        match std::fs::read(path) {
             // A zero-length file is indistinguishable from a fresh install —
             // treat as absent so the bootstrap regenerates (mirrors Windows).
             Ok(bytes) if bytes.is_empty() => Ok(None),
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(classify("key_store::load::read", &self.path, e)),
+            Err(e) => Err(classify("key_store::load::read", path, e)),
         }
     }
 
-    fn save(&self, key: &[u8]) -> Result<(), PlatformError> {
-        if let Some(parent) = self.path.parent() {
+    fn write_owner_only(&self, path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| classify("key_store::save::mkdir", parent, e))?;
             if self.harden_dir {
@@ -118,8 +125,8 @@ impl KeyStore for FileKeyStore {
         }
         // Write to a sibling temp file (created `0600`) then rename, so a crash
         // mid-write never leaves a truncated blob that reads as "present but
-        // corrupt", and the key is never briefly world-readable.
-        let tmp = self.path.with_extension("bin.tmp");
+        // corrupt", and the content is never briefly world-readable.
+        let tmp = path.with_extension("bin.tmp");
         {
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
@@ -128,24 +135,49 @@ impl KeyStore for FileKeyStore {
                 .mode(FILE_MODE)
                 .open(&tmp)
                 .map_err(|e| classify("key_store::save::open_tmp", &tmp, e))?;
-            f.write_all(key)
+            f.write_all(bytes)
                 .map_err(|e| classify("key_store::save::write_tmp", &tmp, e))?;
         }
         // `OpenOptions::mode` only applies when creating; enforce `0600` in case
         // a stale temp pre-existed with looser perms.
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(FILE_MODE))
             .map_err(|e| classify("key_store::save::chmod_tmp", &tmp, e))?;
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| classify("key_store::save::rename", &self.path, e))?;
+        std::fs::rename(&tmp, path).map_err(|e| classify("key_store::save::rename", path, e))?;
         Ok(())
     }
 
-    fn delete(&self) -> Result<(), PlatformError> {
-        match std::fs::remove_file(&self.path) {
+    fn remove(path: &Path) -> Result<(), PlatformError> {
+        match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(classify("key_store::delete", &self.path, e)),
+            Err(e) => Err(classify("key_store::delete", path, e)),
         }
+    }
+}
+
+impl KeyStore for FileKeyStore {
+    fn load(&self) -> Result<Option<Vec<u8>>, PlatformError> {
+        Self::read_owner_only(&self.path)
+    }
+
+    fn save(&self, key: &[u8]) -> Result<(), PlatformError> {
+        self.write_owner_only(&self.path, key)
+    }
+
+    fn delete(&self) -> Result<(), PlatformError> {
+        Self::remove(&self.path)
+    }
+
+    fn save_resign_marker(&self, marker: &[u8]) -> Result<(), PlatformError> {
+        self.write_owner_only(&self.resign_marker_path(), marker)
+    }
+
+    fn load_resign_marker(&self) -> Result<Option<Vec<u8>>, PlatformError> {
+        Self::read_owner_only(&self.resign_marker_path())
+    }
+
+    fn delete_resign_marker(&self) -> Result<(), PlatformError> {
+        Self::remove(&self.resign_marker_path())
     }
 }
 
@@ -259,6 +291,31 @@ mod tests {
         store.delete().expect("delete");
         assert_eq!(store.load().expect("load"), None);
         store.delete().expect("delete again is ok");
+    }
+
+    #[test]
+    fn resign_marker_round_trips_beside_the_key_as_0600() {
+        let dir = temp_dir();
+        let store = store_in(&dir);
+        assert_eq!(store.load_resign_marker().expect("load empty"), None);
+        store
+            .save_resign_marker(&[0x5Au8; 32])
+            .expect("save marker");
+        let marker_path = store.resign_marker_path();
+        assert_eq!(marker_path.parent(), store.path().parent());
+        let mode = std::fs::metadata(&marker_path)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, FILE_MODE, "marker must be rw------- (0600)");
+        assert_eq!(
+            store.load_resign_marker().expect("load"),
+            Some(vec![0x5Au8; 32])
+        );
+        assert_eq!(store.load().expect("key untouched"), None);
+        store.delete_resign_marker().expect("delete marker");
+        store.delete_resign_marker().expect("delete marker again");
+        assert_eq!(store.load_resign_marker().expect("load after delete"), None);
     }
 
     #[test]

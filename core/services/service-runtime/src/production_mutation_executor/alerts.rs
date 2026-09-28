@@ -122,13 +122,32 @@ impl ProductionMutationExecutor {
         // a still-tampered row would simply be re-flagged next boot,
         // deduped against the now-acknowledged alert).
         if crate::tamper_bootstrap::is_blocking_alert_kind(&alert.kind) {
-            match self.coordinator.re_sign_all_revisions() {
+            let resigned = self.coordinator.re_sign_all_revisions();
+            // By kind, not id: every key loss raises its own alert id. A failed
+            // re-sign keeps the marker, so the next boot still spares the rows.
+            if resigned.is_ok()
+                && alert.kind
+                    == nrr_diagnostics::audit::kind::AuditEventKind::KeyResetWithExistingData
+                        .as_str()
+            {
+                if let Err(e) = self.coordinator.clear_key_reset_marker() {
+                    tracing::warn!(
+                        target: "nrr::tamper",
+                        alert_id = %parsed.alert_id,
+                        error = ?e,
+                        "rows re-signed but the key-reset marker could not be cleared; \
+                         the next boot will skip the integrity sweep again",
+                    );
+                }
+            }
+            match resigned {
                 // Rows that did NOT match their signature before this call are
                 // named, at warn level: acknowledging the alert adopts their
                 // current contents as legitimate, and that decision must be
                 // visible afterwards rather than buried in a row count.
                 Ok(report) if !report.adopted_tampered.is_empty() => tracing::warn!(
                     target: "nrr::tamper",
+                    msg_key = "prod-alert-resign-adopted-tampered",
                     alert_id = %parsed.alert_id,
                     re_signed = report.re_signed,
                     adopted = report.adopted_tampered.len(),
@@ -137,12 +156,14 @@ impl ProductionMutationExecutor {
                 ),
                 Ok(report) => tracing::info!(
                     target: "nrr::tamper",
+                    msg_key = "prod-alert-resign-ok",
                     alert_id = %parsed.alert_id,
                     re_signed = report.re_signed,
                     "re-signed revision rows on tamper-alert acknowledgement",
                 ),
                 Err(e) => tracing::warn!(
                     target: "nrr::tamper",
+                    msg_key = "prod-alert-resign-failed",
                     alert_id = %parsed.alert_id,
                     error = ?e,
                     "re-sign after tamper-alert acknowledgement failed",

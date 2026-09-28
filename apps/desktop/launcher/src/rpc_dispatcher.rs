@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use nrr_broker::BrokerHandle;
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
-use nrr_shared::ipc::IpcOperationName;
+use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
 use nrr_shared::launcher_rpc::{
     encode_push_line, encode_response_line, parse_request_line, LauncherRpcPush,
     LauncherRpcRequest, LauncherRpcResponse,
@@ -60,6 +60,9 @@ const LOCAL_OPERATION_PREFIX: &str = "local.";
 /// privileged service-control action through the session elevation
 /// broker. Matched before the generic `local.` handler.
 const SERVICE_CONTROL_OP: &str = "local.service-control";
+/// The elevated broker is alive but still on an earlier (or this) operation.
+/// Not `Forbidden`: nothing was refused, and a retry must not look needed.
+const BROKER_BUSY_CODE: &str = "elevated-operation-running";
 
 /// The GUI's "revoke administrator approval" action. Retires the live
 /// session elevation broker (the elevated process exits) so the next
@@ -187,6 +190,7 @@ impl LaneClients {
 /// relies on the child's stdout EOF to signal everything has settled.
 ///
 /// `connect_budget` comes from [`LaneClients::client_for`]; zero dispatches at once.
+/// `profile` is the surface the service knows this launcher as.
 pub fn spawn_dispatch_worker(
     line: String,
     client: Arc<dyn IpcClient>,
@@ -194,12 +198,13 @@ pub fn spawn_dispatch_worker(
     broker: BrokerHandle,
     stdin: SharedStdin,
     connect_budget: Duration,
+    profile: IpcClientProfile,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         if !connect_budget.is_zero() {
             wait_until_connected(client.as_ref(), connect_budget);
         }
-        dispatch_request(&line, &client, &sidecar, &broker, &stdin);
+        dispatch_request(&line, &client, &sidecar, &broker, &stdin, profile);
     })
 }
 
@@ -246,6 +251,7 @@ pub fn dispatch_request(
     sidecar: &SidecarHandle,
     broker: &BrokerHandle,
     stdin: &SharedStdin,
+    profile: IpcClientProfile,
 ) {
     let parsed = match parse_request_line(line) {
         Some(Ok(req)) => req,
@@ -318,6 +324,9 @@ pub fn dispatch_request(
             }
             Err(nrr_broker::BrokerCallError::Unavailable(e)) => {
                 LauncherRpcResponse::err(parsed.correlation_id.clone(), "broker-unavailable", e)
+            }
+            Err(nrr_broker::BrokerCallError::StillRunning(e)) => {
+                LauncherRpcResponse::err(parsed.correlation_id.clone(), BROKER_BUSY_CODE, e)
             }
         };
         write_response(stdin, &response);
@@ -432,17 +441,12 @@ pub fn dispatch_request(
     };
 
     let mut response = handle_request(&parsed, client.as_ref());
-    // Transparent session elevation. A `Forbidden` from a
-    // privileged mutation means the GUI (hence this launcher) is not
-    // elevated. Relay the SAME call through the session elevation broker:
-    // the FIRST such relay spawns a long-lived elevated broker (one UAC
-    // prompt); every later relay reuses it with no prompt. On success the
-    // user never has to relaunch the whole app as Administrator; on UAC
-    // decline we surface a localizable `uac-declined` slug; on any plumbing
-    // failure we keep the original `Forbidden`. The broker uses a dedicated
-    // entrypoint (`run_broker_server`) so it never re-triggers elevation.
-    if response_is_forbidden(&response) {
-        if let Some(op) = IpcOperationName::from_slug(&parsed.operation) {
+    // Transparent session elevation: a `Forbidden` that elevation can cure is
+    // relayed through the session broker (one UAC, reused all session). On UAC
+    // decline we surface `uac-declined`; on any plumbing failure we keep the
+    // original `Forbidden`.
+    if let Some(op) = IpcOperationName::from_slug(&parsed.operation) {
+        if broker_may_retry(op, &parsed.payload, profile, &response) {
             match broker.call(
                 &parsed.operation,
                 &parsed.payload,
@@ -461,6 +465,13 @@ pub fn dispatch_request(
                 Err(nrr_broker::BrokerCallError::ServerError { code, message }) => {
                     response =
                         LauncherRpcResponse::err(parsed.correlation_id.clone(), &code, message);
+                }
+                Err(nrr_broker::BrokerCallError::StillRunning(message)) => {
+                    response = LauncherRpcResponse::err(
+                        parsed.correlation_id.clone(),
+                        BROKER_BUSY_CODE,
+                        message,
+                    );
                 }
                 Err(nrr_broker::BrokerCallError::Unavailable(_)) => {
                     // Keep the original Forbidden response.
@@ -756,8 +767,7 @@ pub(crate) fn ipc_error_to_wire(err: &nrr_ipc_client::IpcClientError) -> (&'stat
     nrr_ipc_client::ipc_error_to_wire(err)
 }
 
-/// True when a response is a `forbidden` server error (the only signal
-/// the launcher uses to trigger session elevation).
+/// True when a response is a `forbidden` server error.
 fn response_is_forbidden(resp: &LauncherRpcResponse) -> bool {
     !resp.ok
         && resp
@@ -765,6 +775,28 @@ fn response_is_forbidden(resp: &LauncherRpcResponse) -> bool {
             .as_ref()
             .map(|e| e.code == "forbidden")
             .unwrap_or(false)
+}
+
+/// Whether a service answer to `op` may be retried through the elevated broker.
+///
+/// The service answers `Forbidden` both for "needs an administrator" and for
+/// "this surface may not call that at all". Only the first is curable by
+/// elevation; relaying the second raised a UAC prompt from a tray read. The
+/// surface refusal is recognised by running the service's own profile gates
+/// here: when this profile passes them, the refusal came from a later check.
+fn broker_may_retry(
+    op: IpcOperationName,
+    payload: &serde_json::Value,
+    profile: IpcClientProfile,
+    response: &LauncherRpcResponse,
+) -> bool {
+    if !response_is_forbidden(response) {
+        return false;
+    }
+    let class = nrr_shared::ipc_transport::canonical_operation_class(op, payload);
+    profile.permits(class)
+        && nrr_shared::ipc::ipc_operation_spec(op)
+            .is_none_or(|spec| spec.allowed_clients.contains(&profile))
 }
 
 fn write_response(stdin: &SharedStdin, resp: &LauncherRpcResponse) {
@@ -1132,6 +1164,103 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, "forbidden");
         assert_eq!(err.message, "non-admin GUI cannot mutate");
+    }
+
+    fn forbidden() -> LauncherRpcResponse {
+        LauncherRpcResponse::err("c-f", "forbidden", "refused".to_string())
+    }
+
+    fn open_to(op: IpcOperationName, profile: IpcClientProfile) -> bool {
+        nrr_shared::ipc::ipc_operation_spec(op)
+            .is_none_or(|spec| spec.allowed_clients.contains(&profile))
+    }
+
+    /// The tray asking for a GUI-only operation is refused for its surface;
+    /// elevation cannot change that, so no UAC prompt and no relay.
+    #[test]
+    fn a_surface_refusal_is_not_relayed_through_the_broker() {
+        let op = IpcOperationName::ApplyFailurePolicySet;
+        assert!(!open_to(op, IpcClientProfile::TrayLightweight));
+        let payload = serde_json::json!({});
+        assert!(!broker_may_retry(
+            op,
+            &payload,
+            IpcClientProfile::TrayLightweight,
+            &forbidden()
+        ));
+        assert!(!broker_may_retry(
+            IpcOperationName::MutationSubmit,
+            &serde_json::json!({ "mutation-kind": "rules-update", "dry-run": false }),
+            IpcClientProfile::AdminConsole,
+            &forbidden()
+        ));
+    }
+
+    #[test]
+    fn no_operation_closed_to_the_tray_is_ever_relayed_for_it() {
+        for op in IpcOperationName::ALL {
+            if !open_to(op, IpcClientProfile::TrayLightweight) {
+                assert!(
+                    !broker_may_retry(
+                        op,
+                        &serde_json::json!({}),
+                        IpcClientProfile::TrayLightweight,
+                        &forbidden()
+                    ),
+                    "{}",
+                    op.slug()
+                );
+            }
+        }
+    }
+
+    /// Both elevation gates answer `Forbidden`: the class gate (a baseline
+    /// mutation) and the by-value gate (a machine-wide setting actually changed).
+    #[test]
+    fn an_elevation_refusal_is_relayed_through_the_broker() {
+        let submit = serde_json::json!({ "mutation-kind": "rules-update", "dry-run": false });
+        for profile in [
+            IpcClientProfile::GuiInteractive,
+            IpcClientProfile::TrayLightweight,
+        ] {
+            assert!(open_to(IpcOperationName::MutationSubmit, profile));
+            assert!(broker_may_retry(
+                IpcOperationName::MutationSubmit,
+                &submit,
+                profile,
+                &forbidden()
+            ));
+        }
+        assert!(broker_may_retry(
+            IpcOperationName::ApplyFailurePolicySet,
+            &serde_json::json!({}),
+            IpcClientProfile::GuiInteractive,
+            &forbidden()
+        ));
+    }
+
+    #[test]
+    fn only_a_forbidden_answer_is_ever_retried() {
+        let op = IpcOperationName::MutationSubmit;
+        let payload = serde_json::json!({});
+        let profile = IpcClientProfile::GuiInteractive;
+        let ok = LauncherRpcResponse::ok("c-o", serde_json::json!({}));
+        let other = LauncherRpcResponse::err("c-e", "rules-locked", "locked".to_string());
+        assert!(!broker_may_retry(op, &payload, profile, &ok));
+        assert!(!broker_may_retry(op, &payload, profile, &other));
+    }
+
+    #[test]
+    fn each_surface_names_the_profile_the_service_admits_it_under() {
+        use crate::launcher::LauncherSurface;
+        assert_eq!(
+            LauncherSurface::MainGui.client_profile(),
+            IpcClientProfile::GuiInteractive
+        );
+        assert_eq!(
+            LauncherSurface::Tray.client_profile(),
+            IpcClientProfile::TrayLightweight
+        );
     }
 
     fn lane_of(op: IpcOperationName, payload: serde_json::Value) -> RpcLane {

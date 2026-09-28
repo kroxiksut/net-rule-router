@@ -112,7 +112,7 @@ fn missing_primary_is_rejected() {
         vec![],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(!outcome.is_accepted());
     assert!(outcome
         .errors()
@@ -128,7 +128,7 @@ fn role_conflict_is_rejected() {
         vec![],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(!outcome.is_accepted());
     assert!(outcome
         .errors()
@@ -138,7 +138,7 @@ fn role_conflict_is_rejected() {
 
 #[test]
 fn valid_config_no_rules_is_accepted_clean() {
-    let outcome = validate_and_canonicalize(&minimal_config());
+    let outcome = validate_and_canonicalize(&minimal_config(), HostPlatform::Windows);
     assert!(outcome.is_clean());
     let profile = outcome.profile().expect("profile must be present");
     assert!(profile.rule_book.primary.is_empty());
@@ -156,7 +156,7 @@ fn missing_secondary_with_strict_fail_closed_is_warning() {
         vec![],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(outcome.is_accepted()); // not rejected
     assert!(outcome
         .warnings()
@@ -172,7 +172,7 @@ fn missing_secondary_with_prefer_primary_is_clean() {
         vec![],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(outcome.is_clean());
 }
 
@@ -263,7 +263,7 @@ fn canonical_zone(raw: &str) -> String {
         vec![zone_rule("r-1", raw)],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     let profile = outcome.profile().expect("profile must be present");
     match &profile.rule_book.primary.rules()[0].address_match {
         Some(CanonicalAddressMatch::Zone(name)) => name.clone(),
@@ -330,7 +330,7 @@ fn zone_unicode_and_punycode_forms_produce_empty_diff() {
             vec![zone_rule("r-1", raw)],
             vec![],
         );
-        validate_and_canonicalize(&config)
+        validate_and_canonicalize(&config, HostPlatform::Windows)
             .profile()
             .expect("profile must be present")
             .clone()
@@ -388,8 +388,13 @@ fn process_name_exact_uppercased_lowercased() {
         windows_service_name: None,
     };
     let mut warnings = Vec::new();
-    let result = normalize_app_match(&app, &RuleId("r-1".to_string()), &mut warnings)
-        .expect("Exact pattern must normalize successfully");
+    let result = normalize_app_match(
+        &app,
+        ExecutableNaming::WindowsExe,
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    )
+    .expect("Exact pattern must normalize successfully");
     assert_eq!(result.pattern.as_str(), "chrome.exe");
     assert!(warnings.is_empty()); // uppercase → lowercase is silent, .exe already present
 }
@@ -402,12 +407,90 @@ fn process_name_exact_missing_exe_gets_appended_with_warning() {
         windows_service_name: None,
     };
     let mut warnings = Vec::new();
-    let result = normalize_app_match(&app, &RuleId("r-1".to_string()), &mut warnings)
-        .expect("Exact pattern must normalize successfully");
+    let result = normalize_app_match(
+        &app,
+        ExecutableNaming::WindowsExe,
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    )
+    .expect("Exact pattern must normalize successfully");
     assert_eq!(result.pattern.as_str(), "chrome.exe");
     assert!(warnings
         .iter()
         .any(|w| matches!(w, ValidationWarning::ProcessNameMissingExeSuffix { .. })));
+}
+
+/// `.exe` is how Windows names a program. A Linux or macOS rule that gained it
+/// warned about a "fix" the user could not undo and stored a name no file has.
+#[test]
+fn unix_rules_keep_their_names_and_raise_no_suffix_warning() {
+    for platform in [HostPlatform::Linux, HostPlatform::MacOS] {
+        let config = config_with_rules(
+            Some(primary()),
+            None,
+            RouteBehaviorMode::PreferPrimary,
+            vec![
+                app_rule("r-1", "telegram-desktop"),
+                app_rule("r-2", "org.telegram.desktop"),
+                Rule {
+                    app_match: Some(AppMatch {
+                        pattern: AppMatchPattern::Glob("Codex*".to_string()),
+                        include_child_processes: false,
+                        windows_service_name: None,
+                    }),
+                    ..app_rule("r-3", "")
+                },
+            ],
+            vec![],
+        );
+        let outcome = validate_and_canonicalize(&config, platform);
+        let names: Vec<&str> = outcome
+            .profile()
+            .expect("accepted")
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .filter_map(|r| r.app_match.as_ref().map(|a| a.pattern.as_str()))
+            .collect();
+        assert_eq!(
+            names.len(),
+            3,
+            "{platform:?}: every rule survives: {names:?}"
+        );
+        for expected in ["telegram-desktop", "org.telegram.desktop", "codex*"] {
+            assert!(names.contains(&expected), "{platform:?}: {names:?}");
+        }
+        assert!(
+            !outcome
+                .warnings()
+                .iter()
+                .any(|w| matches!(w, ValidationWarning::ProcessNameMissingExeSuffix { .. })),
+            "{platform:?}: {:?}",
+            outcome.warnings()
+        );
+    }
+}
+
+#[test]
+fn a_unix_path_is_still_reduced_to_its_file_name() {
+    let app = AppMatch {
+        pattern: AppMatchPattern::Exact("/usr/bin/Signal-Desktop".to_string()),
+        include_child_processes: false,
+        windows_service_name: None,
+    };
+    let mut warnings = Vec::new();
+    let result = normalize_app_match(
+        &app,
+        ExecutableNaming::AsNamed,
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    )
+    .expect("Exact pattern must normalize successfully");
+    assert_eq!(result.pattern.as_str(), "signal-desktop");
+    assert!(warnings
+        .iter()
+        .all(|w| matches!(w, ValidationWarning::ProcessNameContainedPath { .. })));
 }
 
 #[test]
@@ -418,8 +501,13 @@ fn process_name_exact_windows_path_stripped_with_warning() {
         windows_service_name: None,
     };
     let mut warnings = Vec::new();
-    let result = normalize_app_match(&app, &RuleId("r-1".to_string()), &mut warnings)
-        .expect("Exact pattern must normalize successfully");
+    let result = normalize_app_match(
+        &app,
+        ExecutableNaming::WindowsExe,
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    )
+    .expect("Exact pattern must normalize successfully");
     assert_eq!(result.pattern.as_str(), "chrome.exe");
     assert!(warnings
         .iter()
@@ -434,8 +522,13 @@ fn process_name_exact_double_slash_path_stripped() {
         windows_service_name: None,
     };
     let mut warnings = Vec::new();
-    let result = normalize_app_match(&app, &RuleId("r-1".to_string()), &mut warnings)
-        .expect("Exact pattern must normalize successfully");
+    let result = normalize_app_match(
+        &app,
+        ExecutableNaming::WindowsExe,
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    )
+    .expect("Exact pattern must normalize successfully");
     assert_eq!(result.pattern.as_str(), "chrome.exe");
     assert!(warnings
         .iter()
@@ -450,8 +543,13 @@ fn process_name_exact_forward_slash_path_stripped() {
         windows_service_name: None,
     };
     let mut warnings = Vec::new();
-    let result = normalize_app_match(&app, &RuleId("r-1".to_string()), &mut warnings)
-        .expect("Exact pattern must normalize successfully");
+    let result = normalize_app_match(
+        &app,
+        ExecutableNaming::WindowsExe,
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    )
+    .expect("Exact pattern must normalize successfully");
     assert_eq!(result.pattern.as_str(), "firefox.exe");
 }
 
@@ -463,8 +561,13 @@ fn process_name_glob_is_lowercased() {
         windows_service_name: None,
     };
     let mut warnings = Vec::new();
-    let result = normalize_app_match(&app, &RuleId("r-1".to_string()), &mut warnings)
-        .expect("Glob pattern must normalize successfully");
+    let result = normalize_app_match(
+        &app,
+        ExecutableNaming::WindowsExe,
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    )
+    .expect("Glob pattern must normalize successfully");
     assert_eq!(result.pattern.as_str(), "*vpn*.exe");
     assert!(warnings.is_empty());
 }
@@ -477,7 +580,12 @@ fn process_name_glob_bare_star_is_rejected() {
         windows_service_name: None,
     };
     let mut warnings = Vec::new();
-    let result = normalize_app_match(&app, &RuleId("r-1".to_string()), &mut warnings);
+    let result = normalize_app_match(
+        &app,
+        ExecutableNaming::WindowsExe,
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    );
     assert!(matches!(
         result,
         Err(ValidationError::AppGlobTooWide { .. })
@@ -492,8 +600,13 @@ fn process_name_glob_accepted_no_exe_appended() {
         windows_service_name: None,
     };
     let mut warnings = Vec::new();
-    let result = normalize_app_match(&app, &RuleId("r-1".to_string()), &mut warnings)
-        .expect("Glob pattern must normalize successfully");
+    let result = normalize_app_match(
+        &app,
+        ExecutableNaming::WindowsExe,
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    )
+    .expect("Glob pattern must normalize successfully");
     assert_eq!(result.pattern.as_str(), "nord*");
     assert!(warnings.is_empty()); // no .exe appended for globs
 }
@@ -518,7 +631,7 @@ fn rule_with_empty_match_is_rejected() {
         vec![rule],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(!outcome.is_accepted());
     assert!(outcome
         .errors()
@@ -539,7 +652,7 @@ fn ipv6_rule_is_accepted() {
         vec![rule],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(outcome.is_accepted(), "{:?}", outcome.errors());
 }
 
@@ -557,7 +670,7 @@ fn duplicate_within_set_deduplicated_with_warning() {
         ],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(outcome.is_accepted());
     let profile = outcome.profile().expect("profile must be present");
     assert_eq!(profile.rule_book.primary.len(), 1);
@@ -584,7 +697,7 @@ fn a_rule_and_its_opposite_over_the_same_destination_both_survive() {
         vec![domain_rule("r-route", "example.com"), blocked],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(outcome.is_accepted());
     let profile = outcome.profile().expect("profile must be present");
     assert_eq!(profile.rule_book.primary.len(), 2);
@@ -610,7 +723,7 @@ fn a_disabled_copy_does_not_swallow_the_enabled_rule() {
         vec![disabled, domain_rule("r-on", "example.com")],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     let profile = outcome.profile().expect("profile must be present");
     assert!(profile
         .rule_book
@@ -629,7 +742,7 @@ fn duplicate_across_sets_produces_warning_not_error() {
         vec![domain_rule("r-pri", "example.com")],
         vec![domain_rule("r-sec", "example.com")],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(outcome.is_accepted()); // not rejected
                                     // Both rules are kept — cross-set duplicate is a warning for the GUI
     let profile = outcome.profile().expect("profile must be present");
@@ -652,7 +765,7 @@ fn canonical_profile_has_correct_binding_and_mode() {
         vec![],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     let profile = outcome.profile().expect("profile must be present");
     assert_eq!(profile.primary.adapter.stable_id, "eth0");
     assert_eq!(
@@ -682,7 +795,7 @@ fn canonical_profile_rules_are_in_canonical_order() {
         ],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     let profile = outcome.profile().expect("profile must be present");
     let types: Vec<&str> = profile
         .rule_book
@@ -712,24 +825,30 @@ fn equivalent_configs_different_rule_order_produce_equal_profiles() {
         domain_rule("r-1", "example.com"),
     ];
 
-    let profile_a = validate_and_canonicalize(&config_with_rules(
-        Some(primary()),
-        None,
-        RouteBehaviorMode::PreferPrimary,
-        rules_a,
-        vec![],
-    ))
+    let profile_a = validate_and_canonicalize(
+        &config_with_rules(
+            Some(primary()),
+            None,
+            RouteBehaviorMode::PreferPrimary,
+            rules_a,
+            vec![],
+        ),
+        HostPlatform::Windows,
+    )
     .profile()
     .cloned()
     .expect("profile a");
 
-    let profile_b = validate_and_canonicalize(&config_with_rules(
-        Some(primary()),
-        None,
-        RouteBehaviorMode::PreferPrimary,
-        rules_b,
-        vec![],
-    ))
+    let profile_b = validate_and_canonicalize(
+        &config_with_rules(
+            Some(primary()),
+            None,
+            RouteBehaviorMode::PreferPrimary,
+            rules_b,
+            vec![],
+        ),
+        HostPlatform::Windows,
+    )
     .profile()
     .cloned()
     .expect("profile b");
@@ -754,12 +873,12 @@ fn domain_case_variants_produce_equal_canonical_rules() {
         vec![],
     );
 
-    let book_upper = validate_and_canonicalize(&config_upper)
+    let book_upper = validate_and_canonicalize(&config_upper, HostPlatform::Windows)
         .profile()
         .cloned()
         .expect("upper profile")
         .rule_book;
-    let book_lower = validate_and_canonicalize(&config_lower)
+    let book_lower = validate_and_canonicalize(&config_lower, HostPlatform::Windows)
         .profile()
         .cloned()
         .expect("lower profile")
@@ -780,7 +899,7 @@ fn comment_is_trimmed_in_canonical_rule() {
         vec![rule],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     let profile = outcome.profile().expect("profile");
     let canonical_rule = &profile.rule_book.primary.rules()[0];
     assert_eq!(canonical_rule.comment, "my comment");
@@ -814,7 +933,7 @@ fn multiple_errors_all_collected() {
         vec![r1, r2],
         vec![],
     );
-    let outcome = validate_and_canonicalize(&config);
+    let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
     assert!(!outcome.is_accepted());
     assert_eq!(
         outcome

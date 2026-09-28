@@ -181,12 +181,17 @@ impl ProductionActivationAuditEmitter {
         self
     }
 
-    fn publish_status_change(&self, revision_id: &str, status: &str) {
+    /// A user's revision is their news alone. The baseline's goes to everyone:
+    /// each user who has not diverged runs it, and it is the shared default the
+    /// rest can reset to, so none of them may be left refreshing late.
+    fn publish_status_change(&self, principal: &str, revision_id: &str, status: &str) {
         if let Some(bus) = self.event_bus.as_ref() {
+            let sid = (principal != nrr_storage::BASELINE_PRINCIPAL).then(|| principal.to_string());
             bus.publish(
                 nrr_shared::ipc_payloads::StatusUpdateEvent::RevisionStatusChanged {
                     revision_id: revision_id.to_string(),
                     status: status.to_string(),
+                    sid,
                 },
             );
         }
@@ -219,6 +224,7 @@ impl ProductionActivationAuditEmitter {
         if let Err(e) = self.writer.append(input) {
             tracing::error!(
                 target: "nrr::audit",
+                msg_key = "prod-coord-activation-audit-append-failed",
                 error = ?e,
                 "audit append failed for activation event",
             );
@@ -345,6 +351,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 );
             }
             ActivationAuditEvent::RevisionActivated {
+                principal,
                 revision_id,
                 previous_revision_id,
                 succeeded_sids,
@@ -363,9 +370,10 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                     Some(revision_id.clone()),
                     Some(payload),
                 );
-                self.publish_status_change(&revision_id, "active");
+                self.publish_status_change(&principal, &revision_id, "active");
             }
             ActivationAuditEvent::RevisionRejected {
+                principal,
                 revision_id,
                 reason,
                 sid_failures: _,
@@ -381,7 +389,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                     Some(revision_id.clone()),
                     Some(payload),
                 );
-                self.publish_status_change(&revision_id, "rejected");
+                self.publish_status_change(&principal, &revision_id, "rejected");
             }
             ActivationAuditEvent::RollbackRequested {
                 target,
@@ -397,6 +405,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 );
             }
             ActivationAuditEvent::RolledBack {
+                principal,
                 from_revision_id,
                 to_revision_id,
             } => {
@@ -413,8 +422,8 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 // Both ends of a rollback transitioned: previous active
                 // → rolled-back, target → active. Two events so the GUI
                 // can update both rows in its history view.
-                self.publish_status_change(&from_revision_id, "rolled-back");
-                self.publish_status_change(&to_revision_id, "active");
+                self.publish_status_change(&principal, &from_revision_id, "rolled-back");
+                self.publish_status_change(&principal, &to_revision_id, "active");
             }
             ActivationAuditEvent::ResetToBaseline {
                 principal,
@@ -473,9 +482,9 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                     Some(rejected_revision_id.clone()),
                     Some(payload),
                 );
-                self.publish_status_change(&rejected_revision_id, "rolled-back");
+                self.publish_status_change(&principal, &rejected_revision_id, "rolled-back");
                 if let Some(new_id) = &new_active_revision_id {
-                    self.publish_status_change(new_id, "active");
+                    self.publish_status_change(&principal, new_id, "active");
                 }
             }
         }
@@ -751,6 +760,7 @@ fn preview_to_warnings(
         warnings.push(PreFlightWarning {
             sid: sid.to_string(),
             category: PreFlightCategory::FilterIdCollision,
+            subjects: Vec::new(),
             message: format!(
                 "{} filter id(s) appear twice in the computed set; the engine keeps one of each \
                  pair, so the applied policy would enforce less than it lists",
@@ -764,6 +774,7 @@ fn preview_to_warnings(
         warnings.push(PreFlightWarning {
             sid: sid.to_string(),
             category: PreFlightCategory::BatchOverflow,
+            subjects: Vec::new(),
             message: format!(
                 "{} filters exceed the {} per transaction, so the apply commits in several \
                  batches and is no longer all-or-nothing",
@@ -776,6 +787,7 @@ fn preview_to_warnings(
         warnings.push(PreFlightWarning {
             sid: sid.to_string(),
             category: PreFlightCategory::AppRuleUnenforceable,
+            subjects: preview.unresolved_apps.clone(),
             message: format!(
                 "no executable matched: {} — these rules would be stored but enforce nothing",
                 preview.unresolved_apps.join(", ")
@@ -786,6 +798,7 @@ fn preview_to_warnings(
         warnings.push(PreFlightWarning {
             sid: sid.to_string(),
             category: PreFlightCategory::BindingUnresolved,
+            subjects: Vec::new(),
             message: "the additional route's adapter cannot be resolved right now; the rules \
                       apply and their leak guard stays fail-closed until it returns"
                 .to_string(),
@@ -825,6 +838,7 @@ impl RulesApplyDispatcher for ProductionRulesApplyDispatcher {
             return Ok(vec![PreFlightWarning {
                 sid: sid.to_string(),
                 category: PreFlightCategory::InvalidRulesContent,
+                subjects: Vec::new(),
                 message: "rules content failed to decode".to_string(),
             }]);
         };
@@ -852,6 +866,7 @@ impl RulesApplyDispatcher for ProductionRulesApplyDispatcher {
                 vec![PreFlightWarning {
                     sid: sid.to_string(),
                     category: PreFlightCategory::InvalidRulesContent,
+                    subjects: Vec::new(),
                     message: "rules content failed to decode".to_string(),
                 }],
             );
@@ -1286,6 +1301,87 @@ mod tests {
                 PreFlightCategory::BindingUnresolved,
             ]
         );
+    }
+
+    // ── Revision status push ─────────────────────────────────────────────────
+
+    fn emitter_on(
+        bus: &Arc<crate::ipc_handlers::event_bus::EventBus>,
+    ) -> (ProductionActivationAuditEmitter, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = Arc::new(AuditWriter::open(
+            nrr_diagnostics::audit::writer::AuditWriterConfig::new(dir.path()),
+        ));
+        let emitter =
+            ProductionActivationAuditEmitter::new(writer, Arc::new(ProductionIdGenerator::new()))
+                .with_event_bus(Arc::clone(bus));
+        (emitter, dir)
+    }
+
+    /// One user's activation, rejection or rollback made every other session's
+    /// GUI refresh and handed it that user's revision ids.
+    #[test]
+    fn a_users_revision_change_reaches_only_that_user() {
+        let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+        let alice = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
+        let (emitter, _dir) = emitter_on(&bus);
+
+        emitter.emit(ActivationAuditEvent::RevisionActivated {
+            principal: "S-1-A".into(),
+            revision_id: "rev-a".into(),
+            previous_revision_id: None,
+            succeeded_sids: vec!["S-1-A".into()],
+            drift_sids: vec![],
+        });
+        emitter.emit(ActivationAuditEvent::RevisionRejected {
+            principal: "S-1-A".into(),
+            revision_id: "rev-a2".into(),
+            reason: "test".into(),
+            sid_failures: vec![],
+        });
+        emitter.emit(ActivationAuditEvent::RolledBack {
+            principal: "S-1-A".into(),
+            from_revision_id: "rev-a3".into(),
+            to_revision_id: "rev-a".into(),
+        });
+
+        assert_eq!(bus.peek_pending_for(&alice.subscription_id, 16).len(), 4);
+        assert!(
+            bus.peek_pending_for(&bob.subscription_id, 16).is_empty(),
+            "another user must not see this user's revisions"
+        );
+    }
+
+    /// The baseline is what every un-diverged user runs, so its change is news
+    /// for all of them — addressing it to the `__baseline__` sentinel would
+    /// reach nobody at all.
+    #[test]
+    fn a_baseline_revision_change_reaches_every_user() {
+        let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+        let alice = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
+        let (emitter, _dir) = emitter_on(&bus);
+
+        emitter.emit(ActivationAuditEvent::RevisionActivated {
+            principal: nrr_storage::BASELINE_PRINCIPAL.into(),
+            revision_id: "rev-base".into(),
+            previous_revision_id: None,
+            succeeded_sids: vec!["S-1-A".into(), "S-1-B".into()],
+            drift_sids: vec![],
+        });
+
+        for sub in [&alice, &bob] {
+            let pending = bus.peek_pending_for(&sub.subscription_id, 16);
+            assert_eq!(pending.len(), 1);
+            assert!(matches!(
+                &pending[0].event,
+                nrr_shared::ipc_payloads::StatusUpdateEvent::RevisionStatusChanged {
+                    sid: None,
+                    ..
+                }
+            ));
+        }
     }
 
     // ── ProductionApplyMarkerStore ───────────────────────────────────────────

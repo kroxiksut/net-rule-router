@@ -217,9 +217,11 @@ impl EventBus {
 
         let mut subs = self.subscribers.lock().expect("subscribers poisoned");
         let now = Instant::now();
-        // One client, one subscription: drop any existing entry for this
-        // client_id before inserting the new one.
-        subs.retain(|_, sub| sub.client_id != client_id);
+        // One client, one subscription — but only the SAME principal's client
+        // replaces it. `client_id` is chosen by the client (the GUI mints
+        // `gui-<ms>`), so matching on it alone let another user guess the id and
+        // silently cut a victim's push channel.
+        subs.retain(|_, sub| sub.client_id != client_id || sub.principal != principal);
         subs.retain(|_, sub| now.duration_since(sub.last_activity) < SUBSCRIPTION_IDLE_TTL);
         // Still full: drop the one nobody has touched in the longest time. It is
         // the likeliest corpse, and refusing the new subscriber instead would
@@ -363,6 +365,32 @@ mod tests {
     /// A block notice, an auto-rule offer and the additional link's external
     /// ADDRESS are facts about ONE user's session. Published on an unscoped bus
     /// they reached every logged-in user's GUI.
+    #[test]
+    fn another_user_cannot_evict_a_subscription_by_reusing_its_client_id() {
+        let bus = EventBus::new();
+        let victim = bus.subscribe_as("gui-1".into(), Some("S-1-A".into()), None);
+        bus.subscribe_as("gui-1".into(), Some("S-1-B".into()), None);
+        bus.publish_for(
+            "S-1-A",
+            StatusUpdateEvent::HealthChanged {
+                service_state: "running".into(),
+                worst_severity: "ok".into(),
+            },
+        );
+        assert_eq!(
+            bus.peek_pending_for(&victim.subscription_id, 8).len(),
+            1,
+            "the victim's subscription must survive"
+        );
+
+        let reopened = bus.subscribe_as("gui-1".into(), Some("S-1-A".into()), None);
+        assert!(
+            bus.peek_pending_for(&victim.subscription_id, 8).is_empty(),
+            "the same user re-subscribing still replaces its own entry"
+        );
+        assert_ne!(reopened.subscription_id, victim.subscription_id);
+    }
+
     #[test]
     fn a_users_own_event_reaches_only_their_own_subscriber() {
         let bus = EventBus::new();

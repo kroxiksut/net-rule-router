@@ -39,7 +39,7 @@ use std::time::SystemTime;
 use rusqlite::{params, OptionalExtension};
 
 use crate::db::SidecarDb;
-use crate::error::SidecarResult;
+use crate::error::{SidecarError, SidecarResult};
 
 /// Pre-computed counts surfaced by the "Apply pending changes?" toast.
 ///
@@ -127,6 +127,13 @@ impl SidecarDb {
         content_hash: &str,
         now_ms: i64,
     ) -> SidecarResult<()> {
+        // The hash is the park's identity: the GUI treats equal hashes as "this
+        // work is already parked", so an empty one would match another empty one.
+        if content_hash.trim().is_empty() {
+            return Err(SidecarError::InvalidPayload {
+                reason: "a parked change needs a content hash".into(),
+            });
+        }
         let expires_at = now_ms.saturating_add(PENDING_APPLY_TTL_MS);
         let conn = self.conn_mut();
         conn.execute(
@@ -256,6 +263,30 @@ mod tests {
             .conn()
             .query_row("SELECT COUNT(*) FROM pending_apply", [], |r| r.get(0))?;
         assert_eq!(rows, 0, "the expired row must be gone from the file");
+        Ok(())
+    }
+
+    /// The GUI decides "this work is already parked" by comparing hashes, and
+    /// `"" === ""` holds: an empty hash silenced the stale-park warning and let
+    /// the old park be overwritten unseen.
+    #[test]
+    fn a_park_without_a_content_hash_is_refused() -> SidecarResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = open_sidecar(&tmp)?;
+        db.write_pending_apply_at("summary", "earlier", T0)?;
+        for blank in ["", "   "] {
+            match db.write_pending_apply_at("summary", blank, T0 + 1) {
+                Err(SidecarError::InvalidPayload { reason }) => {
+                    assert!(reason.contains("content hash"), "{reason}");
+                }
+                other => panic!("expected InvalidPayload for {blank:?}, got {other:?}"),
+            }
+        }
+        let kept = db.read_pending_apply_at(T0 + 2)?.expect("row");
+        assert_eq!(
+            kept.content_hash, "earlier",
+            "the refused write changed nothing"
+        );
         Ok(())
     }
 

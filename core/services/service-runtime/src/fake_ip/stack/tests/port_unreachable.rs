@@ -236,7 +236,7 @@ fn client_bound_after_udp_datagrams(
     // EARLIER datagram, which is a reply this caller has already seen — the
     // stack then never gets the steps its last datagram needs.
     let mut depth_at_last_send: Option<usize> = None;
-    for _ in 0..200 {
+    for _ in 0..1000 {
         now_ms += 5;
         let t = SmolInstant::from_millis(i64::try_from(now_ms).unwrap_or(i64::MAX));
         client.poll(t, &mut client_device, &mut client_sockets);
@@ -257,6 +257,14 @@ fn client_bound_after_udp_datagrams(
         }
         if depth_at_last_send.is_some_and(|depth| guard(&s2c).len() > depth) {
             break;
+        }
+        // The dial runs on a worker; give it the chance to land.
+        if stack
+            .udp_binds
+            .values()
+            .any(|bind| !bind.pending.is_empty())
+        {
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
     let emitted: Vec<Vec<u8>> = guard(&s2c).iter().cloned().collect();

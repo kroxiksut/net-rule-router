@@ -131,7 +131,9 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 70] = [
         name: IpcOperationName::LogsList,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        // The console too: `diag logs` must read through the service, which
+        // scopes the answer to the caller — the files on disk are unscoped.
+        allowed_clients: &CLIENTS_ALL,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {

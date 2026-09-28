@@ -352,6 +352,61 @@ pub fn exceeds_free_rule_cap(rules_json: &str) -> bool {
     user_rule_count(rules_json) > FREE_MAX_RULES
 }
 
+// ── Field text ──────────────────────────────────────────────────────────────
+
+/// A rule field holding a character the rules file cannot carry — see
+/// [`crate::preset_parser::is_forbidden_field_char`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForbiddenFieldText {
+    /// Id of the offending rule.
+    pub rule_id: String,
+    /// Which field: `address-match`, `app-match`, `comment` or `origin`.
+    pub field: &'static str,
+}
+
+/// The first rule whose text would not survive the rules file intact.
+///
+/// Every field checked here is written into that file on export, where a line
+/// break inside a note becomes a rule of its own. Refusing it on the way in is
+/// what keeps one principal's text from turning into another's routing.
+pub fn first_forbidden_field_text(dto: &CanonicalRulesJsonV1) -> Option<ForbiddenFieldText> {
+    use crate::auto_rule::RuleOrigin;
+    use crate::preset_parser::first_forbidden_field_char;
+
+    let bad = |s: &str| first_forbidden_field_char(s).is_some();
+    dto.primary.iter().chain(&dto.secondary).find_map(|rule| {
+        let address = rule.address_match.as_ref().is_some_and(|m| match m {
+            AddressMatchDto::ExactFqdn { value } => bad(value),
+            AddressMatchDto::SuffixDomain { suffix } => bad(suffix),
+            AddressMatchDto::Zone { name } => bad(name),
+            AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
+                bad(address)
+            }
+        });
+        let app = rule.app_match.as_ref().is_some_and(|m| match &m.pattern {
+            AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => bad(value),
+        });
+        let origin = rule.origin.as_ref().is_some_and(|o| match o {
+            RuleOrigin::Auto { anchor, added, .. } => bad(anchor) || bad(added),
+        });
+        let field = if address {
+            "address-match"
+        } else if app {
+            "app-match"
+        } else if bad(&rule.comment) {
+            "comment"
+        } else if origin {
+            "origin"
+        } else {
+            return None;
+        };
+        Some(ForbiddenFieldText {
+            rule_id: rule.id.clone(),
+            field,
+        })
+    })
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 // ── Comparison folding ──────────────────────────────────────────────────────
@@ -405,8 +460,15 @@ fn fold_rule(rule: &mut RuleDto) {
     }
     if let Some(app) = rule.app_match.as_mut() {
         match &mut app.pattern {
+            // A comparison needs one representative per match class, not the
+            // stored spelling: every matcher treats `x` and `x.exe` alike, so
+            // folding to the suffixed form is exact on every platform.
             AppPatternDto::Exact { value } => {
-                *value = crate::app_identity::canonical_exact_process_name(value).0
+                *value = crate::app_identity::canonical_exact_process_name(
+                    value,
+                    crate::app_identity::ExecutableNaming::WindowsExe,
+                )
+                .0
             }
             AppPatternDto::Glob { value } => {
                 *value = crate::app_identity::canonical_glob_process_pattern(value)
@@ -1106,5 +1168,54 @@ mod tests {
         })
         .expect("serialize");
         assert!(exceeds_free_rule_cap(&s_over));
+    }
+
+    /// A note carrying a line break is a second rule once exported; the check
+    /// names the rule and the field, and leaves tabs and plain text alone.
+    #[test]
+    fn a_line_break_in_rule_text_is_found_and_plain_text_is_not() {
+        let dto = |rule: RuleDto| CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![sample_exact_fqdn("r-1", "a.test")],
+            secondary: vec![rule],
+        };
+        let injected = RuleDto {
+            comment: "note\n--- IP\n192.0.2.9".into(),
+            ..sample_exact_fqdn("r-2", "b.test")
+        };
+        assert_eq!(
+            first_forbidden_field_text(&dto(injected)),
+            Some(ForbiddenFieldText {
+                rule_id: "r-2".into(),
+                field: "comment",
+            })
+        );
+        let carriage_return = sample_exact_fqdn("r-3", "c.test\rd.test");
+        assert_eq!(
+            first_forbidden_field_text(&dto(carriage_return)).map(|hit| hit.field),
+            Some("address-match")
+        );
+        let app = sample_app_rule("r-4", "a\u{0}b.exe", false);
+        assert_eq!(
+            first_forbidden_field_text(&dto(app)).map(|hit| hit.field),
+            Some("app-match")
+        );
+        let origin = RuleDto {
+            origin: Some(RuleOriginDto::auto(
+                crate::AutoRuleReason::SiteCompanion,
+                "anchor.test\n--- IP",
+                "2026-09-01",
+            )),
+            ..sample_exact_fqdn("r-5", "e.test")
+        };
+        assert_eq!(
+            first_forbidden_field_text(&dto(origin)).map(|hit| hit.field),
+            Some("origin")
+        );
+        let plain = RuleDto {
+            comment: "tabbed\tnote, пример".into(),
+            ..sample_exact_fqdn("r-6", "f.test")
+        };
+        assert_eq!(first_forbidden_field_text(&dto(plain)), None);
     }
 }

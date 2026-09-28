@@ -208,11 +208,11 @@ mod tests {
     #[test]
     fn an_attached_session_counts() {
         let users =
-            parse_live_users(r#"[{"uid":1000,"user":"krox","linger":false,"state":"active"}]"#)
+            parse_live_users(r#"[{"uid":1000,"user":"alice","linger":false,"state":"active"}]"#)
                 .expect("parses");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].uid, 1000);
-        assert_eq!(users[0].name, "krox");
+        assert_eq!(users[0].name, "alice");
         assert!(!users[0].lingering);
     }
 
@@ -222,7 +222,7 @@ mod tests {
         // not. `online` means sessions exist without one being in the
         // foreground.
         let users =
-            parse_live_users(r#"[{"uid":1000,"user":"krox","linger":false,"state":"online"}]"#)
+            parse_live_users(r#"[{"uid":1000,"user":"alice","linger":false,"state":"online"}]"#)
                 .expect("parses");
         assert_eq!(users.len(), 1);
     }
@@ -242,7 +242,7 @@ mod tests {
     fn a_user_on_the_way_out_does_not_count() {
         // Enforcing for someone who just logged out would outlive them.
         let users =
-            parse_live_users(r#"[{"uid":1000,"user":"krox","linger":false,"state":"closing"}]"#)
+            parse_live_users(r#"[{"uid":1000,"user":"alice","linger":false,"state":"closing"}]"#)
                 .expect("parses");
         assert!(users.is_empty());
     }
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn an_unknown_state_does_not_count() {
         let users =
-            parse_live_users(r#"[{"uid":1000,"user":"krox","linger":false,"state":"whatever"}]"#)
+            parse_live_users(r#"[{"uid":1000,"user":"alice","linger":false,"state":"whatever"}]"#)
                 .expect("parses");
         assert!(users.is_empty());
     }
@@ -292,7 +292,7 @@ mod tests {
         // uid 2 to a first-field parser — a fabricated user is worse than a
         // refusal, so this must be an error.
         let err = parse_live_users(
-            "1000 krox no active
+            "1000 alice no active
 2 users listed.
 ",
         )

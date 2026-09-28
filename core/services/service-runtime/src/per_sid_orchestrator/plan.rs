@@ -41,7 +41,7 @@ impl PerSidApplyOrchestrator {
                     // no enforceable policy → no
                     // app rules are unenforced; clear any stale unresolved-app set so
                     // the GUI banner does not keep listing a now-phantom app.
-                    self.clear_app_enforcement_status();
+                    self.clear_app_enforcement_status(sid);
                     // policy gone ⇒ any block-all is disarming.
                     self.note_block_all_state(sid, false);
                     self.note_fail_closed_state(sid, false);
@@ -79,7 +79,7 @@ impl PerSidApplyOrchestrator {
             Some(r) => r,
             None => {
                 if intent.publishes() {
-                    self.clear_app_enforcement_status();
+                    self.clear_app_enforcement_status(sid);
                     // rules gone ⇒ any block-all is disarming.
                     self.note_block_all_state(sid, false);
                     self.note_fail_closed_state(sid, false);
@@ -120,6 +120,7 @@ impl PerSidApplyOrchestrator {
             if !primary_apps.is_empty() || !secondary_apps.is_empty() {
                 tracing::info!(
                     target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-plan-app-rules-delivered",
                     sid,
                     primary_app_rules = primary_apps.join(", "),
                     secondary_app_rules = secondary_apps.join(", "),
@@ -245,6 +246,7 @@ impl PerSidApplyOrchestrator {
         // hear which one won, or the app will look mis-routed for no visible
         // reason.
         let mut claimed_by_main: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
+        let mut unsupported_shapes: Vec<String> = Vec::new();
         for diag in &codegen_out.diagnostics {
             match diag {
                 crate::wfp_codegen::CodegenDiagnostic::AppUnresolved { app, .. } => {
@@ -281,6 +283,9 @@ impl PerSidApplyOrchestrator {
                 } => {
                     truncated_suffixes.push((rule_id.clone(), suffix.clone(), *cap));
                 }
+                crate::wfp_codegen::CodegenDiagnostic::UnsupportedRuleShape { rule_id, reason } => {
+                    unsupported_shapes.push(format!("{rule_id} ({reason})"));
+                }
                 _ => {}
             }
         }
@@ -306,6 +311,7 @@ impl PerSidApplyOrchestrator {
                     unresolved_hosts.truncate(UNRESOLVED_HOST_RESOLVE_CAP);
                     tracing::info!(
                         target: "nrr::wfp-codegen",
+                        msg_key = "persid-plan-unresolved-hosts-dns-query",
                         sid = %sid,
                         hosts = unresolved_hosts.len(),
                         dropped,
@@ -317,6 +323,7 @@ impl PerSidApplyOrchestrator {
             if !unresolved_apps.is_empty() {
                 tracing::warn!(
                     target: "nrr::app-resolver",
+                    msg_key = "persid-plan-app-rules-unresolved",
                     sid = %sid,
                     count = unresolved_apps.len(),
                     apps = %unresolved_apps.join(", "),
@@ -333,6 +340,7 @@ impl PerSidApplyOrchestrator {
                     .collect();
                 tracing::warn!(
                     target: "nrr::wfp-codegen",
+                    msg_key = "persid-plan-app-claimed-by-main",
                     sid = %sid,
                     count = claimed_by_main.len(),
                     conflicts = %shown.join(", "),
@@ -342,15 +350,27 @@ impl PerSidApplyOrchestrator {
             if !over_capped.is_empty() {
                 tracing::warn!(
                     target: "nrr::app-resolver",
+                    msg_key = "persid-plan-app-rules-overcapped",
                     sid = %sid,
                     count = over_capped.len(),
                     apps = %over_capped.join(", "),
                     "application rules PARTIALLY enforced: exe name/glob resolved to more paths than the per-app filter cap (app: cap/resolved)",
                 );
             }
+            if !unsupported_shapes.is_empty() {
+                tracing::warn!(
+                    target: "nrr::wfp-codegen",
+                    msg_key = "persid-plan-rule-shape-unsupported",
+                    sid = %sid,
+                    count = unsupported_shapes.len(),
+                    rules = %unsupported_shapes.join(", "),
+                    "rules not enforced: they limit an address to one application, which enforcement cannot scope yet, so they were skipped rather than applied to every application",
+                );
+            }
             for (rule_id, suffix, cap) in &truncated_suffixes {
                 tracing::warn!(
                     target: "nrr::wfp-codegen",
+                    msg_key = "persid-plan-suffix-truncated",
                     sid = %sid,
                     rule_id = %rule_id,
                     suffix = %suffix,
@@ -365,6 +385,13 @@ impl PerSidApplyOrchestrator {
             .filter(|_| intent.publishes())
         {
             status.set_unresolved(unresolved_apps.clone());
+            status.set_rule_conflicts(
+                sid,
+                crate::app_enforcement_status::rule_conflicts_from(
+                    &codegen_out.diagnostics,
+                    &rules.rule_book,
+                ),
+            );
         }
         timings.mark("codegen");
         let mut filters = codegen_out.filters;
@@ -387,6 +414,9 @@ impl PerSidApplyOrchestrator {
         // whether THIS compute left the guard blocking with the additional link
         // unresolved (either posture) — see `note_fail_closed_state`.
         let mut fail_closed_armed = false;
+        // A per-app block carries no destination, so it needs the same floor a
+        // blanket block does — see `destination_less_block_floor` below.
+        let mut app_block_emitted = false;
         if leak_guard_armed {
             // `fail_closed` (default) → block rather than leak when the leak-proof
             // kill-switch cannot arm because the secondary is unresolvable.
@@ -412,6 +442,7 @@ impl PerSidApplyOrchestrator {
             if policy.mode_a_coverage_strategy == ModeACoverageStrategy::ZoneWidening {
                 tracing::warn!(
                     target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-plan-zone-widening-unimplemented",
                     sid,
                     "mode-A coverage strategy 'zone-widening' selected but not yet enforced — falling back to per-IP pinning",
                 );
@@ -583,6 +614,7 @@ impl PerSidApplyOrchestrator {
             if protectable.len() != codegen_out.secondary_dest_ips.len() {
                 tracing::info!(
                     target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-plan-pin-set-trimmed",
                     sid,
                     kept = protectable.len(),
                     dropped = codegen_out.secondary_dest_ips.len() - protectable.len(),
@@ -622,6 +654,7 @@ impl PerSidApplyOrchestrator {
                 {
                     tracing::info!(
                         target: "nrr::per_sid_orchestrator",
+                        msg_key = "persid-plan-shared-ip-excluded",
                         sid,
                         excluded = ks_shared_excluded_ips.len(),
                         pinned = ks_dest_ips.len(),
@@ -783,12 +816,14 @@ impl PerSidApplyOrchestrator {
                             // Main-named addresses need no rescue permits: the
                             // app block sits below the primary rule band, so the
                             // primary rules' own permits carry them.
-                            ks.extend(crate::killswitch_codegen::app_kill_switch_filters(
+                            let app_pair = crate::killswitch_codegen::app_kill_switch_filters(
                                 sid,
                                 &codegen_out.secondary_app_patterns,
                                 resolution.secondary_luid,
                                 protocols,
-                            ));
+                            );
+                            app_block_emitted |= !app_pair.is_empty();
+                            ks.extend(app_pair);
                             ks
                         }
                         RouteBehaviorMode::PreferSecondaryWhenAvailable
@@ -867,17 +902,20 @@ impl PerSidApplyOrchestrator {
                             // so a secondary-routed app is cut here by its own
                             // unconditional block instead — same coverage the
                             // egress pair would give with a usable tunnel.
-                            fc.extend(crate::killswitch_codegen::fail_closed_block_apps(
+                            let app_blocks = crate::killswitch_codegen::fail_closed_block_apps(
                                 sid,
                                 &codegen_out.secondary_app_patterns,
                                 protocols,
-                            ));
+                            );
+                            app_block_emitted |= !app_blocks.is_empty();
+                            fc.extend(app_blocks);
                             // full-level only on posture change;
                             // the ~5 s reconcile re-deriving the same state
                             // logs at debug (NDJSON flood → archive-cap burn).
                             if self.posture_changed_for(intent, sid, "pair-empty-fail-closed") {
                                 tracing::warn!(
                                     target: "nrr::per_sid_orchestrator",
+                                    msg_key = "persid-plan-pair-empty-fail-closed",
                                     sid,
                                     mode = ?behavior_mode,
                                     fail_closed_filters = fc.len(),
@@ -907,6 +945,7 @@ impl PerSidApplyOrchestrator {
                         } else if self.posture_changed_for(intent, sid, "pair-empty-fail-open") {
                             tracing::warn!(
                                 target: "nrr::per_sid_orchestrator",
+                                msg_key = "persid-plan-pair-empty-fail-open",
                                 sid,
                                 mode = ?behavior_mode,
                                 "kill-switch requested but not armed this cycle (fail-open)",
@@ -923,6 +962,7 @@ impl PerSidApplyOrchestrator {
                         if self.posture_changed_for(intent, sid, "active") {
                             tracing::info!(
                                 target: "nrr::per_sid_orchestrator",
+                                msg_key = "persid-plan-kill-switch-active",
                                 sid,
                                 mode = ?behavior_mode,
                                 kill_switch_filters = ks.len(),
@@ -1035,11 +1075,13 @@ impl PerSidApplyOrchestrator {
                         // observed destinations, and its UN-observed ones never
                         // had a block in this branch at all — first contact used
                         // to egress the primary until the observer caught up.
-                        fc.extend(crate::killswitch_codegen::fail_closed_block_apps(
+                        let app_blocks = crate::killswitch_codegen::fail_closed_block_apps(
                             sid,
                             &codegen_out.secondary_app_patterns,
                             protocols,
-                        ));
+                        );
+                        app_block_emitted |= !app_blocks.is_empty();
+                        fc.extend(app_blocks);
                         // Full-level only on a posture change or a heartbeat (the
                         // block-all/per-IP split is part of the posture, so a
                         // coverage escalation still re-logs immediately); steady
@@ -1058,6 +1100,7 @@ impl PerSidApplyOrchestrator {
                             PostureLogEvent::Transition => {
                                 tracing::warn!(
                                     target: "nrr::per_sid_orchestrator",
+                                    msg_key = "persid-plan-secondary-unresolved-fail-closed",
                                     sid,
                                     mode = ?behavior_mode,
                                     block_all = effective_block_all,
@@ -1082,6 +1125,7 @@ impl PerSidApplyOrchestrator {
                             PostureLogEvent::Heartbeat { elapsed } => {
                                 tracing::warn!(
                                     target: "nrr::per_sid_orchestrator",
+                                    msg_key = "persid-plan-secondary-unresolved-heartbeat",
                                     sid,
                                     mode = ?behavior_mode,
                                     block_all = effective_block_all,
@@ -1123,6 +1167,7 @@ impl PerSidApplyOrchestrator {
                     } else if self.posture_changed_for(intent, sid, "unresolved-fail-open") {
                         tracing::warn!(
                             target: "nrr::per_sid_orchestrator",
+                            msg_key = "persid-plan-secondary-unresolved-fail-open",
                             sid,
                             "kill-switch requested but secondary interface unresolved — leaving it off (fail-open)",
                         );
@@ -1135,6 +1180,14 @@ impl PerSidApplyOrchestrator {
                     }
                 }
             }
+        }
+        // Strict's default block is destination-less too, and while the guard
+        // is on only the blanket postures used to carry its floor.
+        if app_block_emitted
+            || (leak_guard_armed && behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed)
+        {
+            let floor = self.destination_less_block_floor(sid, &filters);
+            filters.extend(floor);
         }
         timings.mark("kill-switch");
         // leak-guard disarmed ⇒ reset the posture latch so a
@@ -1264,6 +1317,7 @@ impl PerSidApplyOrchestrator {
                 alarmed.insert(sid.to_string(), filters.len());
                 tracing::warn!(
                     target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-plan-standing-filter-alarm",
                     sid,
                     filters = filters.len(),
                     previous_peak = previous,
@@ -1279,6 +1333,7 @@ impl PerSidApplyOrchestrator {
             } else if filters.len() <= STANDING_FILTER_ALARM && alarmed.remove(sid).is_some() {
                 tracing::info!(
                     target: "nrr::per_sid_orchestrator",
+                    msg_key = "persid-plan-standing-filter-recovered",
                     sid,
                     filters = filters.len(),
                     "standing WFP filter volume back under the alarm line",
@@ -1305,5 +1360,34 @@ impl PerSidApplyOrchestrator {
             filters,
             unresolved_apps,
         }))
+    }
+
+    /// The loopback / link-local / LAN / tunnel-server floor for a block with no
+    /// destination condition, minus what a blanket posture already emitted.
+    ///
+    /// Such a block matches everything its scope sends off the tunnel, so
+    /// without the floor a pinned app cannot reach 127.0.0.1, its router or a
+    /// NAS even while the tunnel is up. The floor is the one the blanket
+    /// postures carry, so both spare exactly the same things; its ids match
+    /// theirs, which is how a posture that already carries it is recognised.
+    fn destination_less_block_floor(
+        &self,
+        sid: &str,
+        emitted: &[WfpFilterSpec],
+    ) -> Vec<WfpFilterSpec> {
+        let exemptions = match (self.kill_switch_resolver)(sid) {
+            Some(resolution) => FailClosedExemptions {
+                bootstrap_server_ips: resolution.bootstrap_server_ips,
+                local_subnets: resolution.local_subnets,
+                ..FailClosedExemptions::default()
+            },
+            None => (self.fail_closed_exemptions_resolver)(sid),
+        };
+        let present: std::collections::HashSet<nrr_platform_api::types::WfpFilterId> =
+            emitted.iter().map(|f| f.id).collect();
+        crate::killswitch_codegen::default_block_exemptions(sid, &exemptions)
+            .into_iter()
+            .filter(|f| !present.contains(&f.id))
+            .collect()
     }
 }

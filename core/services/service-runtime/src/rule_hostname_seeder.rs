@@ -443,6 +443,7 @@ impl RuleHostnameSeeder {
                         progressed = true;
                         tracing::info!(
                             target: "nrr::rule-seed",
+                            msg_key = "hostseed-proactive-seed-progress",
                             sid = %sid,
                             resolved = summary.resolved,
                             "proactively seeded rule hostnames before recompute (leak-guard coverage)",
@@ -466,6 +467,7 @@ impl RuleHostnameSeeder {
         {
             tracing::warn!(
                 target: "nrr::rule-seed",
+                msg_key = "hostseed-seed-worker-spawn-failed",
                 "could not start the rule-host seed worker — recomputing from the cache as it is: {e}",
             );
             return SeedWait::Detached;
@@ -481,6 +483,7 @@ impl RuleHostnameSeeder {
         *guard = Handoff::Abandoned;
         tracing::info!(
             target: "nrr::rule-seed",
+            msg_key = "hostseed-seed-still-resolving",
             budget_ms = budget.as_millis(),
             "rule-host seed is still resolving — routes recompute from the cache now, and again if the seed lands anything",
         );
@@ -566,6 +569,7 @@ impl RuleHostnameSeeder {
                         if self.note_loopback_warn_once(&host) {
                             tracing::info!(
                                 target: "nrr::rule-seed",
+                                msg_key = "hostseed-loopback-only-resolution",
                                 hostname = %host,
                                 retry_in_secs = wait.as_secs(),
                                 "rule hostname resolved only to loopback/unspecified (hosts file?) — not cached or routed",
@@ -603,6 +607,7 @@ impl RuleHostnameSeeder {
                         summary.apex_absent = summary.apex_absent.saturating_add(1);
                         tracing::info!(
                             target: "nrr::rule-seed",
+                            msg_key = "hostseed-apex-parked-no-address",
                             hostname = %host,
                             confirmations = SEED_APEX_ABSENT_CONFIRMATIONS,
                             "suffix-rule apex publishes no address record — parked until the rule book changes; subdomain coverage is unaffected",
@@ -621,6 +626,7 @@ impl RuleHostnameSeeder {
                 Err(reason) => {
                     tracing::info!(
                         target: "nrr::rule-seed",
+                        msg_key = "hostseed-resolver-unsupported",
                         reason = %reason,
                         "DNS resolver unsupported; aborting rule-hostname seed pass",
                     );
@@ -703,6 +709,7 @@ impl RuleHostnameSeeder {
         if let Err(e) = guard.upsert_resolution(entry) {
             tracing::warn!(
                 target: "nrr::rule-seed",
+                msg_key = "hostseed-upsert-failed",
                 error = %e,
                 "upsert_resolution failed during rule-hostname seed",
             );

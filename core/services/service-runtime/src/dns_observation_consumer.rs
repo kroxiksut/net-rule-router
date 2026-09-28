@@ -275,7 +275,7 @@ pub(crate) fn rule_set_match_origin(hostname: &str, set: &CanonicalRuleSet) -> R
     out
 }
 
-fn rule_covers(rule: &nrr_domain::canonical::CanonicalRule, hostname: &str) -> bool {
+pub(crate) fn rule_covers(rule: &nrr_domain::canonical::CanonicalRule, hostname: &str) -> bool {
     match &rule.address_match {
         Some(CanonicalAddressMatch::ExactFqdn(h)) => h == hostname,
         // `*.s` covers the apex `s` and every subdomain; a zone rule covers

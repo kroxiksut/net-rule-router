@@ -28,7 +28,8 @@ Item {
         + emptyRulesBanner.height + policyInactiveBanner.height
         + blockAllBanner.height
         + rulesFolderSuggestionBanner.height + revisionIntegrityBanner.height
-        + localNetworkOfferBanner.height + bindingDivergenceBanner.height
+        + localNetworkOfferBanner.height + appGroupsOfferBanner.height
+        + bindingDivergenceBanner.height
     height: totalHeight
 
     // Expansion state of the combined amber banner. Local to the stack — the
@@ -1055,6 +1056,55 @@ Item {
         }
     }
 
+    // Found virtual machines, emulators or peer-to-peer programs: asked once,
+    // and either answer closes it for good; the routes stay reachable from
+    // Interfaces and routes.
+    Rectangle {
+        id: appGroupsOfferBanner
+        anchors.top: localNetworkOfferBanner.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: root.appGroupsOfferVisible
+            ? Math.max(36, appGroupsOfferRow.implicitHeight + 2 * root.uiTheme.spacingSm)
+            : 0
+        visible: root.appGroupsOfferVisible
+        color: "#2f7d5b"
+        z: 90
+        RowLayout {
+            id: appGroupsOfferRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: root.uiTheme.spacingMd
+            anchors.rightMargin: root.uiTheme.spacingMd
+            spacing: root.uiTheme.spacingSm
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: "white"
+                text: root.appGroupsOfferText
+                verticalAlignment: Text.AlignVCenter
+                wrapMode: Text.WordWrap
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("app-groups.open-button", "Set up routes")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: root.openAppGroupRouting()
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("status.app-groups-offer-keep", "Leave as they are")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: root.dismissAppGroupsOffer()
+            }
+        }
+    }
+
     // The app and the service disagree about which adapter carries which role.
     // Amber, and never resolved silently: the app's own value is what the user
     // last chose, the service's is what traffic is actually following, and
@@ -1062,7 +1112,7 @@ Item {
     // a dismissed question leaves the two stores diverged with nothing saying so.
     Rectangle {
         id: bindingDivergenceBanner
-        anchors.top: localNetworkOfferBanner.bottom
+        anchors.top: appGroupsOfferBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         height: root.routeBindingDivergenceVisible

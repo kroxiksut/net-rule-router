@@ -12,20 +12,25 @@
 //! meaningful and avoids counting expected refusals as lost teardowns.
 //! Deleting a control block needs administrator rights; without them every
 //! row is simply skipped, which is why teardown is best-effort by contract.
+//!
+//! The owner of a listed connection is the user of its owning process
+//! (`dwOwningPid` -> process token -> SID string), resolved once per process.
 
 #![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
 
-use std::net::Ipv4Addr;
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use windows::Win32::NetworkManagement::IpHelper::{
     SetTcpEntry, MIB_TCPROW_LH, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
     MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB,
 };
 
-use nrr_platform_api::fake_ip::stale_flows::{StaleFlowReset, StaleFlowSweep};
+use nrr_platform_api::fake_ip::stale_flows::{EstablishedFlow, StaleFlowReset, StaleFlowSweep};
 
-use crate::flow_owner::read_tcp_owner_pid_table;
+use crate::flow_owner::{read_tcp_owner_pid_table, row_endpoint};
+use crate::win32_ffi::console_session::process_user_sid;
 
 /// Production [`StaleFlowReset`] over the Windows TCP connection table.
 #[derive(Debug, Default, Clone, Copy)]
@@ -56,7 +61,7 @@ pub fn established_connections_by_process(cap: usize) -> Vec<(String, usize)> {
     let Some(buffer) = read_tcp_owner_pid_table() else {
         return Vec::new();
     };
-    let mut by_pid: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut by_pid: HashMap<u32, usize> = HashMap::new();
     // SAFETY: `read_tcp_owner_pid_table` fills the buffer with a valid
     // `MIB_TCPTABLE_OWNER_PID`; its `dwNumEntries` header is followed by that
     // many contiguous rows, and only those rows are read.
@@ -106,7 +111,7 @@ impl StaleFlowReset for WindowsStaleFlowReset {
                     continue;
                 }
                 sweep.found += 1;
-                if delete_established_row(row) {
+                if delete_tcb(&delete_tcb_entry(row)) {
                     sweep.torn_down += 1;
                 }
             }
@@ -114,18 +119,15 @@ impl StaleFlowReset for WindowsStaleFlowReset {
         sweep
     }
 
-    /// One table read for the whole address set — a policy apply hands us
-    /// hundreds of freshly-pinned addresses at once.
-    fn reset_flows_to_any(&self, targets: &[Ipv4Addr]) -> StaleFlowSweep {
+    fn established_flows_to(&self, targets: &[Ipv4Addr]) -> Vec<EstablishedFlow> {
         if targets.is_empty() {
-            return StaleFlowSweep::default();
+            return Vec::new();
         }
-        let wanted: std::collections::HashSet<u32> =
-            targets.iter().copied().map(u32::from).collect();
+        let wanted: HashSet<u32> = targets.iter().copied().map(u32::from).collect();
         let Some(buffer) = read_tcp_owner_pid_table() else {
-            return StaleFlowSweep::default();
+            return Vec::new();
         };
-        let mut sweep = StaleFlowSweep::default();
+        let mut matched: Vec<(SocketAddrV4, SocketAddrV4, u32)> = Vec::new();
         // SAFETY: same invariant as `reset_flows_to` above — the buffer holds a
         // valid `MIB_TCPTABLE_OWNER_PID` and we read only its declared rows.
         unsafe {
@@ -134,20 +136,45 @@ impl StaleFlowReset for WindowsStaleFlowReset {
             let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
             for i in 0..count {
                 let row = &*rows.add(i);
-                if row.dwState != MIB_TCP_STATE_ESTAB.0 as u32 {
-                    continue;
-                }
-                if !wanted.contains(&u32::from_be(row.dwRemoteAddr)) {
-                    continue;
-                }
-                sweep.found += 1;
-                if delete_established_row(row) {
-                    sweep.torn_down += 1;
+                if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32
+                    && wanted.contains(&u32::from_be(row.dwRemoteAddr))
+                {
+                    let (local, remote) = row_endpoints(row);
+                    matched.push((local, remote, row.dwOwningPid));
                 }
             }
         }
-        sweep
+        // A browser holds many connections to one front; ask for its token once.
+        let mut owners: HashMap<u32, Option<String>> = HashMap::new();
+        matched
+            .into_iter()
+            .map(|(local, remote, pid)| EstablishedFlow {
+                local,
+                remote,
+                owner: owners
+                    .entry(pid)
+                    .or_insert_with(|| process_user_sid(pid))
+                    .clone(),
+            })
+            .collect()
     }
+
+    fn reset_established(&self, flows: &[EstablishedFlow]) -> usize {
+        flows
+            .iter()
+            .filter(|flow| delete_tcb(&delete_tcb_entry_for(flow)))
+            .count()
+    }
+}
+
+/// A table row's local and remote endpoints, host order.
+fn row_endpoints(row: &MIB_TCPROW_OWNER_PID) -> (SocketAddrV4, SocketAddrV4) {
+    let (local_ip, local_port) = row_endpoint(row.dwLocalAddr, row.dwLocalPort);
+    let (remote_ip, remote_port) = row_endpoint(row.dwRemoteAddr, row.dwRemotePort);
+    (
+        SocketAddrV4::new(local_ip, local_port),
+        SocketAddrV4::new(remote_ip, remote_port),
+    )
 }
 
 /// `ESTABLISHED` and its remote address inside `base`/`prefix_len` — the only
@@ -191,13 +218,27 @@ fn delete_tcb_entry(row: &MIB_TCPROW_OWNER_PID) -> MIB_TCPROW_LH {
     entry
 }
 
-/// Ask the OS to tear down one `ESTABLISHED` row. Best-effort: a refusal
-/// (typically missing administrator rights) just leaves this row standing.
-fn delete_established_row(row: &MIB_TCPROW_OWNER_PID) -> bool {
-    let entry = delete_tcb_entry(row);
+/// The same delete request for a listed connection: the inverse of
+/// [`row_endpoints`], back to network byte order.
+fn delete_tcb_entry_for(flow: &EstablishedFlow) -> MIB_TCPROW_LH {
+    let mut entry = MIB_TCPROW_LH {
+        dwLocalAddr: u32::from(*flow.local.ip()).to_be(),
+        dwLocalPort: u32::from(flow.local.port().to_be()),
+        dwRemoteAddr: u32::from(*flow.remote.ip()).to_be(),
+        dwRemotePort: u32::from(flow.remote.port().to_be()),
+        ..Default::default()
+    };
+    entry.Anonymous.State = MIB_TCP_STATE_DELETE_TCB;
+    entry
+}
+
+/// Ask the OS to tear down one `ESTABLISHED` connection. Best-effort: a
+/// refusal (typically missing administrator rights, or the connection already
+/// gone) just leaves it standing.
+fn delete_tcb(entry: &MIB_TCPROW_LH) -> bool {
     // SAFETY: `entry` is a fully initialized, stack-local `MIB_TCPROW_LH`;
     // `SetTcpEntry` reads it and does not retain the pointer past the call.
-    unsafe { SetTcpEntry(&entry) == 0 }
+    unsafe { SetTcpEntry(entry) == 0 }
 }
 
 #[cfg(test)]
@@ -267,5 +308,59 @@ mod tests {
         // SAFETY: reading back the union field this same function just wrote.
         let state = unsafe { entry.Anonymous.State };
         assert_eq!(state, MIB_TCP_STATE_DELETE_TCB);
+    }
+
+    /// A listed connection must reset the very row it was listed from: the
+    /// decision runs on host-order endpoints, `SetTcpEntry` on the raw row.
+    #[test]
+    fn a_listed_connection_deletes_exactly_the_row_it_came_from() {
+        let row = MIB_TCPROW_OWNER_PID {
+            dwState: MIB_TCP_STATE_ESTAB.0 as u32,
+            dwLocalAddr: u32::from_le_bytes([192, 0, 2, 7]),
+            dwLocalPort: 0x0000_50C3, // 50000, network order in the low word
+            dwRemoteAddr: u32::from_le_bytes([203, 0, 113, 9]),
+            dwRemotePort: 0x0000_BB01, // 443
+            dwOwningPid: 4242,
+        };
+        let (local, remote) = row_endpoints(&row);
+        assert_eq!(
+            local,
+            SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), 50_000)
+        );
+        assert_eq!(
+            remote,
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 443)
+        );
+
+        let flow = EstablishedFlow {
+            local,
+            remote,
+            owner: None,
+        };
+        let from_flow = delete_tcb_entry_for(&flow);
+        let from_row = delete_tcb_entry(&row);
+        assert_eq!(from_flow.dwLocalAddr, from_row.dwLocalAddr);
+        assert_eq!(from_flow.dwLocalPort, from_row.dwLocalPort);
+        assert_eq!(from_flow.dwRemoteAddr, from_row.dwRemoteAddr);
+        assert_eq!(from_flow.dwRemotePort, from_row.dwRemotePort);
+        // SAFETY: reading back the union field this same function just wrote.
+        let state = unsafe { from_flow.Anonymous.State };
+        assert_eq!(state, MIB_TCP_STATE_DELETE_TCB);
+    }
+
+    /// Listing only reads the table, so it is safe against the live machine.
+    #[test]
+    fn listing_an_address_nothing_talks_to_finds_nothing() {
+        let nobody = Ipv4Addr::new(192, 0, 2, 254);
+        assert!(WindowsStaleFlowReset
+            .established_flows_to(&[nobody])
+            .is_empty());
+        assert!(WindowsStaleFlowReset.established_flows_to(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_owner_of_our_own_process_resolves_to_a_sid() {
+        let sid = process_user_sid(std::process::id()).expect("own token is readable");
+        assert!(sid.starts_with("S-1-"), "{sid}");
     }
 }

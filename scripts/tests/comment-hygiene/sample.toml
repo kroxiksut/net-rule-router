@@ -1,0 +1,4 @@
+# Pinned for the minimum supported toolchain.
+# Block 16 (2026-06-27) starts the service on demand.
+key = "value" # block 19.2
+released = 2026-06-27

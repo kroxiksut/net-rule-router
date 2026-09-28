@@ -6,6 +6,7 @@
 //! - `install` / `uninstall` — write/remove the unit + logrotate drop-in and
 //!   enable/disable the service via `systemctl`. Require root.
 //! - `status` — print a one-shot banner and exit.
+//! - `cleanup` — undo what a dead daemon left on the machine (see [`cleanup`]).
 //! - `help` / no args — usage.
 //!
 //! Argv parsing lives in [`cli`] as a pure, unit-tested function; the OS verbs
@@ -13,9 +14,10 @@
 //! non-Linux host (the Windows dev box) the crate still builds — those verbs
 //! just print a "Linux only" message — so the workspace compiles everywhere.
 
+mod cleanup;
 mod cli;
 
-// The local DNS resolver over systemd-resolved.
+// The local DNS resolver over the machine's DNS mechanism.
 #[cfg(target_os = "linux")]
 mod dns_stack;
 #[cfg(target_os = "linux")]
@@ -59,10 +61,16 @@ fn main() -> ExitCode {
         Command::Uninstall => install::uninstall_service(),
         #[cfg(target_os = "linux")]
         Command::RestoreDns => restore_dns(),
+        #[cfg(target_os = "linux")]
+        Command::Cleanup => run_cleanup(),
         #[cfg(not(target_os = "linux"))]
-        Command::Run | Command::Install | Command::Uninstall | Command::RestoreDns => {
+        Command::Run
+        | Command::Install
+        | Command::Uninstall
+        | Command::RestoreDns
+        | Command::Cleanup => {
             eprintln!(
-                "the `run`, `install` and `uninstall` verbs run only on Linux \
+                "the `run`, `install`, `uninstall` and `cleanup` verbs run only on Linux \
                  (this is the systemd daemon entrypoint)"
             );
             ExitCode::from(2)
@@ -70,7 +78,7 @@ fn main() -> ExitCode {
         Command::Unknown(verb) => {
             eprintln!(
                 "unknown subcommand `{verb}`; expected one of: \
-                 run, install, uninstall, status, help"
+                 run, install, uninstall, status, cleanup, help"
             );
             ExitCode::from(2)
         }
@@ -93,6 +101,18 @@ fn restore_dns() -> ExitCode {
     }
 }
 
+/// Undo what a dead daemon left behind; [`cleanup`] owns the exit codes.
+#[cfg(target_os = "linux")]
+fn run_cleanup() -> ExitCode {
+    let outcome = cleanup::cleanup(&cleanup::SystemHost {
+        data_dir: nrr_platform_api::paths::production_data_root(),
+    });
+    let (out, err) = cleanup::render(&outcome);
+    print!("{out}");
+    eprint!("{err}");
+    ExitCode::from(cleanup::exit_code(&outcome))
+}
+
 fn print_usage() {
     let exe = DAEMON_NAME;
     let product = nrr_shared::product_identity::PRODUCT_NAME;
@@ -104,6 +124,7 @@ fn print_usage() {
          \x20   install      Install and enable the systemd service (requires root)\n\
          \x20   uninstall    Disable and remove the systemd service (requires root)\n\
          \x20   status       Print a status banner and exit\n\
+         \x20   cleanup      Undo the network state a stopped service left behind (requires root)\n\
          \x20   help         Show this help"
     );
 }

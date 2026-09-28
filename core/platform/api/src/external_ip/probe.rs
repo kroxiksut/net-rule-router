@@ -60,6 +60,20 @@ pub const PROBE_BUDGET: Duration = Duration::from_millis(3_200);
 /// exactly what the user should be told about it.
 #[must_use]
 pub fn probe_external_ipv4_batch(sources: &[Ipv4Addr]) -> Vec<ExternalIpProbeOutcome> {
+    run_batch(sources, probe_one, |work| {
+        thread::Builder::new()
+            .name("nrr-extip-probe".to_string())
+            .spawn(work)
+            .map(drop)
+    })
+}
+
+/// [`probe_external_ipv4_batch`] with the probe and the thread start injected.
+fn run_batch<P, S>(sources: &[Ipv4Addr], probe: P, mut spawn: S) -> Vec<ExternalIpProbeOutcome>
+where
+    P: Fn(Ipv4Addr) -> ExternalIpProbeOutcome + Copy + Send + 'static,
+    S: FnMut(Box<dyn FnOnce() + Send>) -> io::Result<()>,
+{
     let mut outcomes = vec![ExternalIpProbeOutcome::Unreachable; sources.len()];
     if sources.is_empty() {
         return outcomes;
@@ -73,16 +87,16 @@ pub fn probe_external_ipv4_batch(sources: &[Ipv4Addr]) -> Vec<ExternalIpProbeOut
 
     for (index, source) in sources.iter().copied().enumerate() {
         let sender = sender.clone();
-        let spawned = thread::Builder::new()
-            .name("nrr-extip-probe".to_string())
-            .spawn(move || {
-                // The receiver may already be gone; that is the normal
-                // "budget expired" path and needs no handling.
-                let _ = sender.send((index, probe_one(source)));
-            });
+        let spawned = spawn(Box::new(move || {
+            // The receiver may already be gone; that is the normal
+            // "budget expired" path and needs no handling.
+            let _ = sender.send((index, probe(source)));
+        }));
         match spawned {
-            Ok(_detached) => workers += 1,
+            Ok(()) => workers += 1,
             Err(error) => {
+                // Nothing went out, so nothing was dropped by the network.
+                outcomes[index] = ExternalIpProbeOutcome::Skipped;
                 tracing::debug!(
                     target: "nrr::interfaces",
                     error = %error,
@@ -143,6 +157,7 @@ fn probe_one(source: Ipv4Addr) -> ExternalIpProbeOutcome {
         if is_benchmark_range(*target.ip()) {
             tracing::warn!(
                 target: "nrr::interfaces",
+                msg_key = "extip-probe-benchmark-range-poisoned",
                 server,
                 resolved = %target.ip(),
                 source = %source,
@@ -156,6 +171,7 @@ fn probe_one(source: Ipv4Addr) -> ExternalIpProbeOutcome {
             Ok(Some(address)) => {
                 tracing::info!(
                     target: "nrr::interfaces",
+                    msg_key = "extip-probe-address-obtained",
                     server,
                     source = %source,
                     "external-address probe: reflexive address obtained",
@@ -198,6 +214,7 @@ fn probe_one(source: Ipv4Addr) -> ExternalIpProbeOutcome {
     // operational log at the default filter.
     tracing::info!(
         target: "nrr::interfaces",
+        msg_key = "extip-probe-finished-unreachable",
         source = %source,
         attempts,
         outcome = ?outcome,
@@ -328,6 +345,33 @@ mod tests {
     #[test]
     fn empty_input_never_touches_the_network() {
         assert!(probe_external_ipv4_batch(&[]).is_empty());
+    }
+
+    /// A worker that never started sent nothing, so the network cannot have
+    /// dropped it.
+    #[test]
+    fn a_worker_that_did_not_start_is_skipped_not_unreachable() {
+        let resolved = Ipv4Addr::new(192, 0, 2, 1);
+        let mut started = 0;
+        let outcomes = run_batch(
+            &[Ipv4Addr::new(192, 0, 2, 10), Ipv4Addr::new(192, 0, 2, 11)],
+            move |_| ExternalIpProbeOutcome::Resolved(resolved),
+            |work| {
+                started += 1;
+                if started == 1 {
+                    return Err(io::Error::other("no threads left"));
+                }
+                work();
+                Ok(())
+            },
+        );
+        assert_eq!(
+            outcomes,
+            vec![
+                ExternalIpProbeOutcome::Skipped,
+                ExternalIpProbeOutcome::Resolved(resolved)
+            ]
+        );
     }
 
     #[test]

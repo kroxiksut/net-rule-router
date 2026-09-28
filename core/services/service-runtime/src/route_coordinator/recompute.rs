@@ -24,6 +24,7 @@ impl SecondaryRouteCoordinator {
         let Some(sid) = self.effective_routing_sid(active_sids) else {
             tracing::info!(
                 target: "nrr::route-coordinator",
+                msg_key = "route-no-routing-user",
                 active_count = active_sids.len(),
                 "no routing user to enforce (no tray, and either app-driven scope or no console session) — tearing down secondary routes",
             );
@@ -42,6 +43,7 @@ impl SecondaryRouteCoordinator {
                 PausedRouteDisposition::ClearAll => {
                     tracing::info!(
                         target: "nrr::route-coordinator",
+                        msg_key = "route-paused-teardown",
                         sid = %sid,
                         "routing paused for this user (teardown policy) — tearing down secondary routes",
                     );
@@ -50,6 +52,7 @@ impl SecondaryRouteCoordinator {
                 PausedRouteDisposition::KeepSecondaryHosts => {
                     tracing::info!(
                         target: "nrr::route-coordinator",
+                        msg_key = "route-paused-persist",
                         sid = %sid,
                         "routing paused for this user (persist policy) — keeping /32 rule-routes, dropping overlays only",
                     );

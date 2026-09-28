@@ -57,6 +57,8 @@ pub enum PresetImportErrorCategory {
     /// At least one inline comment exceeds
     /// [`crate::preset_validation::MAX_INLINE_COMMENT_CHARS`] characters.
     InlineCommentTooLong,
+    /// A field carries a line break or another control character.
+    ControlCharacter,
 }
 
 impl PresetImportErrorCategory {
@@ -68,6 +70,7 @@ impl PresetImportErrorCategory {
             PresetImportRejectedReason::TooManyRules { .. } => Self::TooManyRules,
             PresetImportRejectedReason::MatchValueTooLong { .. } => Self::MatchValueTooLong,
             PresetImportRejectedReason::InlineCommentTooLong { .. } => Self::InlineCommentTooLong,
+            PresetImportRejectedReason::ControlCharacter { .. } => Self::ControlCharacter,
         }
     }
 
@@ -81,6 +84,7 @@ impl PresetImportErrorCategory {
             Self::InlineCommentTooLong => {
                 "dialog.preset-import.error.inline-comment-too-long.title"
             }
+            Self::ControlCharacter => "dialog.preset-import.error.control-character.title",
         }
     }
 
@@ -96,6 +100,7 @@ impl PresetImportErrorCategory {
             Self::InlineCommentTooLong => {
                 "dialog.preset-import.error.inline-comment-too-long.description"
             }
+            Self::ControlCharacter => "dialog.preset-import.error.control-character.description",
         }
     }
 }
@@ -317,6 +322,15 @@ mod tests {
             ),
             PresetImportErrorCategory::InlineCommentTooLong
         );
+        assert_eq!(
+            PresetImportErrorCategory::from_rejected_reason(
+                &PresetImportRejectedReason::ControlCharacter {
+                    section: "Domains".to_string(),
+                    field: "inline-comment",
+                }
+            ),
+            PresetImportErrorCategory::ControlCharacter
+        );
     }
 
     #[test]
@@ -327,6 +341,7 @@ mod tests {
             PresetImportErrorCategory::TooManyRules,
             PresetImportErrorCategory::MatchValueTooLong,
             PresetImportErrorCategory::InlineCommentTooLong,
+            PresetImportErrorCategory::ControlCharacter,
         ];
 
         let title_keys: Vec<_> = categories.iter().map(|c| c.locale_key_title()).collect();

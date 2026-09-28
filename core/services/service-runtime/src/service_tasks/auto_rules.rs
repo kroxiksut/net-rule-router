@@ -159,6 +159,7 @@ pub fn build_auto_rules_task(
             if summary.parked > 0 || summary.authored > 0 {
                 tracing::info!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-tick-companion-domain-summary",
                     sid = %sid,
                     parked = summary.parked,
                     authored = summary.authored,

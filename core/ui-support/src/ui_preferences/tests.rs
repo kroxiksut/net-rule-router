@@ -288,6 +288,8 @@ fn save_then_load_roundtrip_is_stable() {
         routing_detailed_mode: true,
         // Non-default (default is false) — proves the field persists.
         show_virtual_machines_section: true,
+        // Non-default (default is false) — proves the field persists.
+        app_groups_offer_dismissed: true,
         // Non-default (default is true) so the round-trip test proves the
         // field actually persists rather than reading the default.
         show_remembered_adapters: false,

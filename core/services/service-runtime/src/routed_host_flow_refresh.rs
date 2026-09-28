@@ -27,16 +27,22 @@
 //!
 //! Nothing here sits on the data path: one pass over the connection table per
 //! accepted suggestion, never per packet or per observation. Only established
-//! TCP connections to the exact addresses behind those hostnames are torn
-//! down — connections whose route just changed under them anyway. Both the
-//! address count and the per-suffix expansion are capped so a broad rule over a
-//! warm cache cannot turn into an unbounded sweep.
+//! TCP connections to the exact addresses behind those hostnames are
+//! candidates, and of those only the ones [`flows_to_reset`] keeps: the rule
+//! belongs to one user, so another user's connection to the same address is
+//! none of its business, and an address the shared-IP census has seen serving
+//! a direct host is spared for the same reason the kill-switch spares it —
+//! except the anchor's. Only the owner's own connections go, their browser
+//! reconnects at once, and sparing a CDN-hosted anchor is what left the page
+//! waiting for a manual reload.
+//! Both the address count and the per-suffix expansion are capped so a broad
+//! rule over a warm cache cannot turn into an unbounded sweep.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use nrr_platform_api::fake_ip::stale_flows::{StaleFlowReset, StaleFlowSweep};
+use nrr_platform_api::fake_ip::stale_flows::{EstablishedFlow, StaleFlowReset, StaleFlowSweep};
 
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 
@@ -57,6 +63,69 @@ pub enum RoutedHost {
     Exact(String),
     /// A domain and everything under it.
     Suffix(String),
+    /// The site a suggestion was offered next to, matched exactly: not routed
+    /// by the rule, torn down so the page asks for its resources again.
+    Anchor(String),
+}
+
+/// What one [`RoutedHostFlowRefresh::refresh`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FlowRefreshOutcome {
+    pub sweep: StaleFlowSweep,
+    /// An anchor was named but none of its connections went, so the page will
+    /// not complete by itself — the user has to reload it.
+    pub anchor_skipped: bool,
+}
+
+/// What [`flows_to_reset`] decided for one pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FlowRefreshDecision {
+    pub reset: Vec<EstablishedFlow>,
+    /// Of `reset`, the connections to an anchor address.
+    pub anchor_reset: usize,
+    /// Aimed at an address a direct host shares.
+    pub kept_shared: usize,
+    /// Owned by a user other than the one whose rules changed.
+    pub kept_other_owner: usize,
+    /// Owner unknown: tearing down a connection nobody can vouch for is how
+    /// another user's session gets cut.
+    pub kept_unknown_owner: usize,
+}
+
+/// Which `candidates` a rule change by `rule_owner` may tear down: the owner's
+/// own connections, to addresses no direct host shares unless they are in
+/// `anchors`.
+#[must_use]
+pub fn flows_to_reset(
+    candidates: Vec<EstablishedFlow>,
+    rule_owner: &str,
+    shared_direct: &HashSet<Ipv4Addr>,
+    anchors: &HashSet<Ipv4Addr>,
+) -> FlowRefreshDecision {
+    let mut decision = FlowRefreshDecision::default();
+    for flow in candidates {
+        let anchor = anchors.contains(flow.remote.ip());
+        if !anchor && shared_direct.contains(flow.remote.ip()) {
+            decision.kept_shared += 1;
+            continue;
+        }
+        match flow.owner.as_deref() {
+            None => decision.kept_unknown_owner += 1,
+            // SID strings compare case-insensitively.
+            Some(owner) if owner.eq_ignore_ascii_case(rule_owner) => {
+                decision.anchor_reset += usize::from(anchor);
+                decision.reset.push(flow);
+            }
+            Some(_) => decision.kept_other_owner += 1,
+        }
+    }
+    decision
+}
+
+/// The addresses one pass looks at, and which of them are the anchors'.
+struct RefreshTargets {
+    addresses: Vec<Ipv4Addr>,
+    anchors: HashSet<Ipv4Addr>,
 }
 
 /// Tears down established connections to hosts whose route just changed.
@@ -71,49 +140,96 @@ impl RoutedHostFlowRefresh {
         Self { cache, reset }
     }
 
-    /// Tear down every established connection aimed at an address behind
-    /// `hosts`. Best-effort by contract: the worst case is the old behaviour,
-    /// an application sitting on a socket over the previous route.
+    /// Tear down `principal`'s established connections aimed at an address
+    /// behind `hosts`. Best-effort by contract: the worst case is the old
+    /// behaviour, an application sitting on a socket over the previous route.
     ///
     /// Call this only once the rule is applied. Tearing down first would have
     /// the application reconnect over the route that is still in force.
-    pub fn refresh(&self, hosts: &[RoutedHost]) -> StaleFlowSweep {
-        let addresses = self.addresses_behind(hosts);
-        let mut total = StaleFlowSweep::default();
-        for address in &addresses {
-            let sweep = self.reset.reset_flows_to(*address, 32);
-            total.found = total.found.saturating_add(sweep.found);
-            total.torn_down = total.torn_down.saturating_add(sweep.torn_down);
-        }
-        if total.found > 0 {
-            tracing::info!(
+    pub fn refresh(&self, principal: &str, hosts: &[RoutedHost]) -> FlowRefreshOutcome {
+        let has_anchor = hosts.iter().any(|h| matches!(h, RoutedHost::Anchor(_)));
+        let RefreshTargets { addresses, anchors } = self.addresses_behind(hosts);
+        let candidates = self.reset.established_flows_to(&addresses);
+        if candidates.is_empty() {
+            tracing::debug!(
                 target: "nrr::auto-rules",
                 addresses = addresses.len(),
-                found = total.found,
-                torn_down = total.torn_down,
+                "no connection was left on the previous route",
+            );
+            return FlowRefreshOutcome {
+                sweep: StaleFlowSweep::default(),
+                anchor_skipped: has_anchor,
+            };
+        }
+        // Read only when something is connected: the census is a query.
+        let decision = flows_to_reset(
+            candidates,
+            principal,
+            &self.cache.shared_direct_ips(),
+            &anchors,
+        );
+        let anchor_skipped = has_anchor && decision.anchor_reset == 0;
+        if decision.kept_unknown_owner > 0 {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                sid = %principal,
+                kept = decision.kept_unknown_owner,
+                "left connections standing whose owner could not be resolved",
+            );
+        }
+        let sweep = StaleFlowSweep {
+            found: decision.reset.len(),
+            torn_down: self.reset.reset_established(&decision.reset),
+        };
+        if sweep.found > 0 {
+            tracing::info!(
+                target: "nrr::auto-rules",
+                msg_key = "flowrefresh-torn-down",
+                sid = %principal,
+                addresses = addresses.len(),
+                found = sweep.found,
+                torn_down = sweep.torn_down,
+                anchor_reset = decision.anchor_reset,
+                anchor_skipped,
+                kept_shared = decision.kept_shared,
+                kept_other_owner = decision.kept_other_owner,
                 "tore down connections still running over the previous route — \
                  the application reconnects under the new rule",
             );
         } else {
             tracing::debug!(
                 target: "nrr::auto-rules",
+                sid = %principal,
                 addresses = addresses.len(),
-                "no connection was left on the previous route",
+                kept_shared = decision.kept_shared,
+                kept_other_owner = decision.kept_other_owner,
+                "every connection on the previous route belongs to someone else",
             );
         }
-        total
+        FlowRefreshOutcome {
+            sweep,
+            anchor_skipped,
+        }
     }
 
-    /// Cached addresses behind `hosts`, deduplicated and capped. Sorted because
-    /// `BTreeSet` makes the pass order deterministic, which keeps a log line
-    /// from one run comparable with the next.
-    fn addresses_behind(&self, hosts: &[RoutedHost]) -> Vec<Ipv4Addr> {
+    /// Cached addresses behind `hosts`, deduplicated and capped, the anchors'
+    /// first so the cap never drops them. Sorted because `BTreeSet` makes the
+    /// pass order deterministic, which keeps a log line from one run
+    /// comparable with the next.
+    fn addresses_behind(&self, hosts: &[RoutedHost]) -> RefreshTargets {
+        let mut anchors = BTreeSet::new();
+        for host in hosts {
+            if let RoutedHost::Anchor(name) = host {
+                self.collect_into(&mut anchors, name);
+            }
+        }
         let mut addresses = BTreeSet::new();
         for host in hosts {
             match host {
                 RoutedHost::Exact(name) => {
                     self.collect_into(&mut addresses, name);
                 }
+                RoutedHost::Anchor(_) => {}
                 RoutedHost::Suffix(label) => {
                     // The expansion helper is the same one enforcement uses, so
                     // the set torn down cannot drift from the set routed.
@@ -129,7 +245,17 @@ impl RoutedHostFlowRefresh {
                 break;
             }
         }
-        addresses.into_iter().take(MAX_ADDRESSES_PER_PASS).collect()
+        let anchors: Vec<Ipv4Addr> = anchors.into_iter().take(MAX_ADDRESSES_PER_PASS).collect();
+        let rest = addresses.into_iter().filter(|a| !anchors.contains(a));
+        RefreshTargets {
+            addresses: anchors
+                .iter()
+                .copied()
+                .chain(rest)
+                .take(MAX_ADDRESSES_PER_PASS)
+                .collect(),
+            anchors: anchors.into_iter().collect(),
+        }
     }
 
     fn collect_into(&self, addresses: &mut BTreeSet<Ipv4Addr>, hostname: &str) {
@@ -143,16 +269,20 @@ impl RoutedHostFlowRefresh {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::net::{IpAddr, SocketAddrV4};
 
     use nrr_platform_api::fake_ip::MockStaleFlowReset;
 
     use super::*;
-    use std::net::IpAddr;
+
+    const OWNER: &str = "S-1-5-21-1-2-3-1001";
+    const OTHER_USER: &str = "S-1-5-21-1-2-3-1002";
 
     #[derive(Default)]
     struct FakeCache {
         addresses: HashMap<String, Vec<IpAddr>>,
         under_suffix: HashMap<String, Vec<String>>,
+        shared_direct: HashSet<Ipv4Addr>,
     }
 
     impl FqdnCacheLookup for FakeCache {
@@ -164,6 +294,10 @@ mod tests {
             let mut hosts = self.under_suffix.get(suffix).cloned().unwrap_or_default();
             hosts.truncate(limit);
             hosts
+        }
+
+        fn shared_direct_ips(&self) -> HashSet<Ipv4Addr> {
+            self.shared_direct.clone()
         }
     }
 
@@ -179,59 +313,290 @@ mod tests {
         cache
     }
 
-    fn refresh_with(cache: FakeCache, hosts: &[RoutedHost]) -> (StaleFlowSweep, Vec<Ipv4Addr>) {
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().expect("test address")
+    }
+
+    fn flow(remote: &str, local_port: u16, owner: Option<&str>) -> EstablishedFlow {
+        EstablishedFlow {
+            local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), local_port),
+            remote: SocketAddrV4::new(ip(remote), 443),
+            owner: owner.map(str::to_string),
+        }
+    }
+
+    fn addresses_of(cache: FakeCache, hosts: &[RoutedHost]) -> Vec<Ipv4Addr> {
+        RoutedHostFlowRefresh::new(Arc::new(cache), Arc::new(MockStaleFlowReset::new()))
+            .addresses_behind(hosts)
+            .addresses
+    }
+
+    // ── the decision ──────────────────────────────────────────────────────
+
+    #[test]
+    fn the_rule_owners_connection_to_a_routed_only_address_is_reset() {
+        let mine = flow("203.0.113.10", 50_000, Some(OWNER));
+        let decision = flows_to_reset(vec![mine.clone()], OWNER, &HashSet::new(), &HashSet::new());
+        assert_eq!(decision.reset, vec![mine]);
+    }
+
+    #[test]
+    fn another_users_connection_to_the_same_address_is_kept() {
+        let mine = flow("203.0.113.10", 50_000, Some(OWNER));
+        let theirs = flow("203.0.113.10", 50_001, Some(OTHER_USER));
+        let decision = flows_to_reset(
+            vec![mine.clone(), theirs],
+            OWNER,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(decision.reset, vec![mine]);
+        assert_eq!(decision.kept_other_owner, 1);
+    }
+
+    #[test]
+    fn a_connection_to_an_address_a_direct_host_shares_is_kept() {
+        let shared = HashSet::from([ip("203.0.113.10")]);
+        let to_shared = flow("203.0.113.10", 50_000, Some(OWNER));
+        let to_routed = flow("203.0.113.11", 50_001, Some(OWNER));
+        let decision = flows_to_reset(
+            vec![to_shared, to_routed.clone()],
+            OWNER,
+            &shared,
+            &HashSet::new(),
+        );
+        assert_eq!(decision.reset, vec![to_routed]);
+        assert_eq!(decision.kept_shared, 1);
+    }
+
+    #[test]
+    fn a_connection_whose_owner_is_unknown_is_kept() {
+        let decision = flows_to_reset(
+            vec![flow("203.0.113.10", 50_000, None)],
+            OWNER,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert!(decision.reset.is_empty());
+        assert_eq!(decision.kept_unknown_owner, 1);
+    }
+
+    #[test]
+    fn the_owner_matches_regardless_of_sid_letter_case() {
+        let mine = flow("203.0.113.10", 50_000, Some("s-1-5-21-1-2-3-1001"));
+        assert_eq!(
+            flows_to_reset(vec![mine], OWNER, &HashSet::new(), &HashSet::new())
+                .reset
+                .len(),
+            1
+        );
+    }
+
+    // ── the pass ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_pass_resets_only_what_the_decision_keeps() {
+        let mut cache = cache_with(&[
+            ("cdn.example", "203.0.113.10"),
+            ("cdn.example", "203.0.113.11"),
+        ]);
+        cache.shared_direct.insert(ip("203.0.113.11"));
         let reset = Arc::new(MockStaleFlowReset::new());
+        let mine = flow("203.0.113.10", 50_000, Some(OWNER));
+        reset.set_flows(vec![
+            mine.clone(),
+            flow("203.0.113.10", 50_001, Some(OTHER_USER)),
+            flow("203.0.113.10", 50_002, None),
+            flow("203.0.113.11", 50_003, Some(OWNER)),
+            // Not behind the routed host at all.
+            flow("203.0.113.99", 50_004, Some(OWNER)),
+        ]);
         let refresher = RoutedHostFlowRefresh::new(
             Arc::new(cache),
             Arc::clone(&reset) as Arc<dyn StaleFlowReset>,
         );
-        let sweep = refresher.refresh(hosts);
-        let swept = reset.calls().into_iter().map(|(base, _)| base).collect();
-        (sweep, swept)
+
+        let outcome = refresher.refresh(OWNER, &[RoutedHost::Exact("cdn.example".into())]);
+
+        assert_eq!(reset.reset_flows(), vec![mine]);
+        assert_eq!(
+            outcome,
+            FlowRefreshOutcome {
+                sweep: StaleFlowSweep {
+                    found: 1,
+                    torn_down: 1
+                },
+                anchor_skipped: false,
+            }
+        );
     }
 
     #[test]
-    fn every_address_behind_the_named_hosts_is_swept_once() {
+    fn a_host_the_cache_never_saw_resets_nothing() {
+        let reset = Arc::new(MockStaleFlowReset::new());
+        reset.set_flows(vec![flow("203.0.113.10", 50_000, Some(OWNER))]);
+        let refresher = RoutedHostFlowRefresh::new(
+            Arc::new(FakeCache::default()),
+            Arc::clone(&reset) as Arc<dyn StaleFlowReset>,
+        );
+        let outcome = refresher.refresh(OWNER, &[RoutedHost::Exact("unknown.example".into())]);
+        assert!(reset.reset_flows().is_empty());
+        assert_eq!(outcome, FlowRefreshOutcome::default());
+    }
+
+    // ── the anchor ────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_owners_anchor_connection_on_a_shared_address_is_reset() {
+        let shared = HashSet::from([ip("203.0.113.10")]);
+        let anchor = flow("203.0.113.10", 50_000, Some(OWNER));
+        let decision = flows_to_reset(vec![anchor.clone()], OWNER, &shared, &shared);
+        assert_eq!(decision.reset, vec![anchor]);
+        assert_eq!(decision.anchor_reset, 1);
+        assert_eq!(decision.kept_shared, 0);
+    }
+
+    #[test]
+    fn a_non_anchor_connection_on_a_shared_address_is_still_kept() {
+        let shared = HashSet::from([ip("203.0.113.10"), ip("203.0.113.11")]);
+        let anchors = HashSet::from([ip("203.0.113.11")]);
+        let decision = flows_to_reset(
+            vec![flow("203.0.113.10", 50_000, Some(OWNER))],
+            OWNER,
+            &shared,
+            &anchors,
+        );
+        assert!(decision.reset.is_empty());
+        assert_eq!(decision.kept_shared, 1);
+    }
+
+    #[test]
+    fn another_users_or_an_unattributed_anchor_connection_is_kept() {
+        let anchors = HashSet::from([ip("203.0.113.10")]);
+        let decision = flows_to_reset(
+            vec![
+                flow("203.0.113.10", 50_000, Some(OTHER_USER)),
+                flow("203.0.113.10", 50_001, None),
+            ],
+            OWNER,
+            &anchors,
+            &anchors,
+        );
+        assert!(decision.reset.is_empty());
+        assert_eq!(decision.anchor_reset, 0);
+        assert_eq!(decision.kept_other_owner, 1);
+        assert_eq!(decision.kept_unknown_owner, 1);
+    }
+
+    #[test]
+    fn an_anchor_on_a_shared_address_is_torn_down_and_reported_done() {
+        let mut cache = cache_with(&[
+            ("cdn.example", "203.0.113.11"),
+            ("site.example", "203.0.113.10"),
+        ]);
+        cache.shared_direct.insert(ip("203.0.113.10"));
+        cache.shared_direct.insert(ip("203.0.113.11"));
+        let reset = Arc::new(MockStaleFlowReset::new());
+        let anchor = flow("203.0.113.10", 50_000, Some(OWNER));
+        reset.set_flows(vec![
+            anchor.clone(),
+            flow("203.0.113.11", 50_001, Some(OWNER)),
+        ]);
+        let refresher = RoutedHostFlowRefresh::new(
+            Arc::new(cache),
+            Arc::clone(&reset) as Arc<dyn StaleFlowReset>,
+        );
+
+        let outcome = refresher.refresh(
+            OWNER,
+            &[
+                RoutedHost::Exact("cdn.example".into()),
+                RoutedHost::Anchor("site.example".into()),
+            ],
+        );
+
+        assert_eq!(reset.reset_flows(), vec![anchor]);
+        assert!(!outcome.anchor_skipped);
+    }
+
+    #[test]
+    fn an_anchor_nothing_could_tear_down_is_reported_skipped() {
+        let cache = cache_with(&[("site.example", "203.0.113.10")]);
+        let reset = Arc::new(MockStaleFlowReset::new());
+        reset.set_flows(vec![flow("203.0.113.10", 50_000, None)]);
+        let refresher = RoutedHostFlowRefresh::new(
+            Arc::new(cache),
+            Arc::clone(&reset) as Arc<dyn StaleFlowReset>,
+        );
+        let anchor = [RoutedHost::Anchor("site.example".into())];
+
+        assert!(
+            refresher.refresh(OWNER, &anchor).anchor_skipped,
+            "unknown owner"
+        );
+
+        reset.set_flows(Vec::new());
+        assert!(
+            refresher.refresh(OWNER, &anchor).anchor_skipped,
+            "no connection"
+        );
+        assert!(
+            !refresher
+                .refresh(OWNER, &[RoutedHost::Exact("site.example".into())])
+                .anchor_skipped,
+            "no anchor named, nothing to report"
+        );
+    }
+
+    #[test]
+    fn the_cap_never_drops_an_anchor_address() {
+        let mut rows: Vec<(String, String)> = (0..=MAX_ADDRESSES_PER_PASS)
+            .map(|i| {
+                (
+                    "cdn.example".to_string(),
+                    format!("10.0.{}.{}", i / 250, i % 250),
+                )
+            })
+            .collect();
+        rows.push(("site.example".into(), "203.0.113.200".into()));
+        let rows: Vec<(&str, &str)> = rows.iter().map(|(h, a)| (h.as_str(), a.as_str())).collect();
+        let listed = addresses_of(
+            cache_with(&rows),
+            &[
+                RoutedHost::Exact("cdn.example".into()),
+                RoutedHost::Anchor("site.example".into()),
+            ],
+        );
+        assert_eq!(listed.len(), MAX_ADDRESSES_PER_PASS);
+        assert!(listed.contains(&ip("203.0.113.200")));
+    }
+
+    // ── the address set ───────────────────────────────────────────────────
+
+    #[test]
+    fn every_address_behind_the_named_hosts_is_listed_once() {
         let cache = cache_with(&[
             ("cdn.example", "203.0.113.10"),
             ("cdn.example", "203.0.113.11"),
             ("site.example", "203.0.113.20"),
+            ("mirror.example", "203.0.113.10"),
         ]);
-        let (_, swept) = refresh_with(
+        let listed = addresses_of(
             cache,
             &[
                 RoutedHost::Exact("cdn.example".into()),
                 RoutedHost::Exact("site.example".into()),
+                RoutedHost::Exact("mirror.example".into()),
             ],
         );
         assert_eq!(
-            swept,
-            vec![
-                "203.0.113.10".parse::<Ipv4Addr>().expect("addr"),
-                "203.0.113.11".parse().expect("addr"),
-                "203.0.113.20".parse().expect("addr"),
-            ]
+            listed,
+            vec![ip("203.0.113.10"), ip("203.0.113.11"), ip("203.0.113.20")]
         );
     }
 
     #[test]
-    fn an_address_shared_by_two_hosts_is_swept_once() {
-        let cache = cache_with(&[
-            ("cdn.example", "203.0.113.10"),
-            ("site.example", "203.0.113.10"),
-        ]);
-        let (_, swept) = refresh_with(
-            cache,
-            &[
-                RoutedHost::Exact("cdn.example".into()),
-                RoutedHost::Exact("site.example".into()),
-            ],
-        );
-        assert_eq!(swept.len(), 1);
-    }
-
-    #[test]
-    fn a_suffix_sweeps_the_hosts_it_covers() {
+    fn a_suffix_lists_the_hosts_it_covers() {
         let mut cache = cache_with(&[
             ("img.site.example", "203.0.113.30"),
             ("api.site.example", "203.0.113.31"),
@@ -241,18 +606,8 @@ mod tests {
             "site.example".to_string(),
             vec!["api.site.example".into(), "img.site.example".into()],
         );
-        let (_, swept) = refresh_with(cache, &[RoutedHost::Suffix("site.example".into())]);
-        assert_eq!(swept.len(), 2);
-        assert!(!swept.contains(&"203.0.113.99".parse().expect("addr")));
-    }
-
-    #[test]
-    fn a_host_the_cache_never_saw_sweeps_nothing() {
-        let (sweep, swept) = refresh_with(
-            FakeCache::default(),
-            &[RoutedHost::Exact("unknown.example".into())],
-        );
-        assert!(swept.is_empty());
-        assert_eq!(sweep, StaleFlowSweep::default());
+        let listed = addresses_of(cache, &[RoutedHost::Suffix("site.example".into())]);
+        assert_eq!(listed.len(), 2);
+        assert!(!listed.contains(&ip("203.0.113.99")));
     }
 }

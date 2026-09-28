@@ -40,6 +40,7 @@ use nrr_shared::product_identity::PRODUCT_NAME;
 
 use crate::exit;
 use crate::parse::Command;
+use crate::verbs::Privilege;
 
 /// Marker that puts this process into relay mode. Not a verb — see the module
 /// docs.
@@ -71,10 +72,20 @@ impl ElevationPlan {
     }
 }
 
-/// Decide the plan. Pure, so the one rule that keeps scripts safe — no prompt
-/// and no dialog without either a flag or a terminal — is a test rather than a
-/// reading of the wiring.
-pub fn plan(requested: bool, supported: bool, interactive: bool) -> ElevationPlan {
+/// Decide the plan. Pure, so the two rules that keep it honest are tests rather
+/// than a reading of the wiring: no prompt and no dialog without either a flag or
+/// a terminal, and none at all for a verb the table does not mark as needing
+/// administrator rights — an access-denied from such a verb is a report, not an
+/// invitation to grant privilege.
+pub fn plan(
+    privilege: Privilege,
+    requested: bool,
+    supported: bool,
+    interactive: bool,
+) -> ElevationPlan {
+    if privilege != Privilege::Administrator {
+        return ElevationPlan::NotOffered;
+    }
     match (requested, supported, interactive) {
         (true, false, _) => ElevationPlan::Unsupported,
         (true, true, _) => ElevationPlan::Requested,
@@ -430,29 +441,69 @@ pub fn retry(
 mod tests {
     use super::*;
     use crate::parse;
+    use nrr_platform_api::elevation::MockPrivilegedRelaunch;
+
+    const ADMIN: Privilege = Privilege::Administrator;
+
+    #[test]
+    fn a_verb_that_runs_as_anyone_is_never_offered_elevation() {
+        // Whatever the terminal, and even if a flag somehow reached here: the
+        // table says this verb needs no rights, so an access-denied from it is
+        // reported and exits 3, with no question and no relaunch.
+        for (requested, interactive) in [(false, true), (true, true), (true, false)] {
+            let chosen = plan(Privilege::Any, requested, true, interactive);
+            assert_eq!(chosen, ElevationPlan::NotOffered);
+            let port = MockPrivilegedRelaunch::inheriting(ElevatedRun::Completed {
+                exit_code: Some(exit::SUCCESS),
+            });
+            for command in [
+                Command::Status,
+                Command::DiagDoctor,
+                Command::DiagLogs { tail: 5 },
+            ] {
+                assert_eq!(retry(chosen, Some(&port), &command), None);
+            }
+            assert!(port.calls().is_empty(), "nothing may be relaunched");
+        }
+    }
+
+    #[test]
+    fn an_administrator_verb_is_still_relaunched_when_asked() {
+        let port = MockPrivilegedRelaunch::inheriting(ElevatedRun::Completed {
+            exit_code: Some(exit::SUCCESS),
+        });
+        let chosen = plan(ADMIN, true, true, false);
+        assert_eq!(
+            retry(chosen, Some(&port), &Command::Stop),
+            Some(exit::SUCCESS)
+        );
+        let calls = port.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, vec!["stop".to_string()]);
+    }
 
     #[test]
     fn nothing_pops_up_without_a_flag_or_a_terminal() {
         // The rule automation depends on. A console under a pipe, a scheduled
         // task or CI must behave exactly as it did before this module existed.
-        assert_eq!(plan(false, true, false), ElevationPlan::NotOffered);
-        assert_eq!(plan(false, false, false), ElevationPlan::NotOffered);
+        assert_eq!(plan(ADMIN, false, true, false), ElevationPlan::NotOffered);
+        assert_eq!(plan(ADMIN, false, false, false), ElevationPlan::NotOffered);
         assert!(!ElevationPlan::NotOffered.acts());
     }
 
     #[test]
     fn a_terminal_gets_the_question_and_the_flag_skips_it() {
-        assert_eq!(plan(false, true, true), ElevationPlan::Offer);
-        assert_eq!(plan(true, true, true), ElevationPlan::Requested);
+        assert_eq!(plan(ADMIN, false, true, true), ElevationPlan::Offer);
+        assert_eq!(plan(ADMIN, true, true, true), ElevationPlan::Requested);
         // The flag works without a terminal too: that is what makes it usable
         // from a wrapper script that has already decided.
-        assert_eq!(plan(true, true, false), ElevationPlan::Requested);
+        assert_eq!(plan(ADMIN, true, true, false), ElevationPlan::Requested);
     }
 
     #[test]
     fn asking_for_elevation_where_there_is_none_says_so() {
         // A flag that silently does nothing is worse than an unsupported one.
-        assert_eq!(plan(true, false, true), ElevationPlan::Unsupported);
+        assert_eq!(plan(ADMIN, true, false, true), ElevationPlan::Unsupported);
         assert!(!ElevationPlan::Unsupported.acts());
     }
 

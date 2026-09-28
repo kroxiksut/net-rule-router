@@ -621,6 +621,42 @@ fn prune_protects_lkg_even_when_age_exceeds_threshold() {
 }
 
 #[test]
+fn count_cap_skips_the_row_the_pointer_names() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::new(&conn);
+    drive_to_status(&repo, "rev-A", "h-A");
+    repo.mark_apply_succeeded("rev-A", None, 100).expect("a");
+    drive_to_status(&repo, "rev-B", "h-B");
+    repo.mark_apply_succeeded("rev-B", Some("rev-A"), 200)
+        .expect("b");
+    drive_to_status(&repo, "rev-C", "h-C");
+    repo.mark_apply_succeeded("rev-C", Some("rev-B"), 300)
+        .expect("c");
+    // A recovery left the pointer on the OLDEST superseded row, the first
+    // one the count cap reaches for.
+    repo.set_active_pointer(&ActiveRevisionPointer {
+        revision_id: "rev-A".to_string(),
+        activated_at: 400,
+        apply_attempt_id: None,
+    })
+    .expect("pointer");
+
+    let settings = RetentionSettings {
+        superseded_days: 3650,
+        superseded_count_cap: 1,
+        pin_lkg: false,
+        ..RetentionSettings::DEFAULT
+    };
+    let summary = repo
+        .prune_by_retention_for(BASELINE_PRINCIPAL, &settings, 1_000)
+        .expect("the pointer's target must be skipped, not fail the pass on its FK");
+    assert_eq!(summary.superseded_dropped, 1);
+    assert!(repo.get_by_id("rev-A").expect("query").is_some());
+    assert!(repo.get_by_id("rev-B").expect("query").is_none());
+}
+
+#[test]
 fn prune_drops_lkg_when_pin_lkg_disabled_and_threshold_passed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let conn = open_state_db(&dir);
@@ -1026,30 +1062,86 @@ fn verify_with_different_key_is_tampered() {
 }
 
 #[test]
-fn re_sign_row_repairs_after_status_change() {
+fn status_transitions_re_sign_what_they_rewrite() {
     let dir = tempfile::tempdir().expect("temp dir");
     let conn = open_state_db(&dir);
     let repo = RevisionsRepository::with_signing_key(&conn, hmac_key());
 
-    repo.insert_candidate(&sample_record("rev-s", "h-s"))
+    repo.insert_candidate(&sample_record("rev-a", "h-a"))
+        .expect("insert a");
+    repo.mark_apply_succeeded("rev-a", None, 100)
+        .expect("activate a");
+    repo.insert_candidate(&sample_record("rev-b", "h-b"))
+        .expect("insert b");
+    repo.mark_apply_succeeded("rev-b", Some("rev-a"), 200)
+        .expect("activate b");
+    repo.insert_candidate(&sample_record("rev-c", "h-c"))
+        .expect("insert c");
+    repo.mark_apply_failed("rev-c", "apply failed", 300)
+        .expect("reject c");
+    repo.mark_rolled_back("rev-b", 400).expect("roll back b");
+
+    // What the next start's tamper scan sees: nobody edited anything.
+    for (id, verdict) in repo.verify_all().expect("verify all") {
+        assert_eq!(
+            verdict,
+            crate::revision_hmac::HmacVerification::Verified,
+            "{id} went stale across its own transition"
+        );
+    }
+}
+
+#[test]
+fn a_transition_never_re_signs_a_row_that_already_failed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::with_signing_key(&conn, hmac_key());
+    repo.insert_candidate(&sample_record("rev-t", "h-t"))
         .expect("insert");
-    // Activate via the standard path. The UPDATE invalidates the
-    // HMAC because activation changes both `status` and
-    // `activated_at`. Until the coordinator wires re-sign in
-    // automatically, we call it manually.
-    repo.mark_apply_succeeded("rev-s", None, 1_700_001_000)
+    repo.mark_apply_succeeded("rev-t", None, 100)
         .expect("activate");
+    conn.execute(
+        "UPDATE revisions SET rules_json = '{\"tampered\":true}' WHERE revision_id = 'rev-t'",
+        [],
+    )
+    .expect("tamper");
+
+    repo.mark_rolled_back("rev-t", 200).expect("roll back");
+
     assert_eq!(
-        repo.verify_row_hmac("rev-s").expect("verify"),
+        repo.verify_row_hmac("rev-t").expect("verify"),
         Some(crate::revision_hmac::HmacVerification::Tampered),
-        "post-activate row diverges from insert-time HMAC"
+        "re-signing would have minted a valid signature for the edit"
+    );
+}
+
+#[test]
+fn orphan_sweep_does_not_re_sign_a_tampered_candidate() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::with_signing_key(&conn, hmac_key());
+    repo.insert_candidate(&sample_record("rev-ok", "h-ok"))
+        .expect("insert ok");
+    repo.insert_candidate(&sample_record("rev-bad", "h-bad"))
+        .expect("insert bad");
+    conn.execute(
+        "UPDATE revisions SET rules_json = '{\"tampered\":true}' WHERE revision_id = 'rev-bad'",
+        [],
+    )
+    .expect("tamper");
+
+    assert_eq!(
+        repo.reject_orphaned_candidates("orphan", 0).expect("sweep"),
+        2
     );
 
-    repo.re_sign_row("rev-s").expect("re-sign");
     assert_eq!(
-        repo.verify_row_hmac("rev-s").expect("verify"),
-        Some(crate::revision_hmac::HmacVerification::Verified),
-        "re-sign repairs the HMAC against the current row"
+        repo.verify_row_hmac("rev-ok").expect("verify ok"),
+        Some(crate::revision_hmac::HmacVerification::Verified)
+    );
+    assert_eq!(
+        repo.verify_row_hmac("rev-bad").expect("verify bad"),
+        Some(crate::revision_hmac::HmacVerification::Tampered)
     );
 }
 

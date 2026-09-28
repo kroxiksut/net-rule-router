@@ -9,9 +9,9 @@
 //! rtnetlink. So this adds a route on the loopback interface, finds it in a
 //! real dump, deletes it, and checks it is gone.
 //!
-//! Skips itself, loudly, when the host cannot run it (no root). A skipped run
-//! prints why: a test that silently passes on an unequipped machine is worse
-//! than no test, because it reads as coverage.
+//! The mutating tests are ignored by default: they need root. Run them with
+//! `--ignored`; they then fail, rather than pass, without it — a silent pass
+//! reads as coverage.
 //!
 //! The destination sits in TEST-NET-3 (RFC 5737, reserved for documentation)
 //! and the host part carries the pid, so a run cannot collide with real traffic
@@ -43,6 +43,18 @@ fn is_root() -> bool {
                 .and_then(|l| l.split_whitespace().nth(1).map(str::to_owned))
         })
         .is_some_and(|uid| uid == "0")
+}
+
+const NEEDS_ROOT: &str =
+    "needs root — the kernel refuses route mutations from an unprivileged caller";
+
+/// Deletes the route on every exit, a failed assert included.
+struct RouteGuard(RouteEntry);
+
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        let _ = LinuxApi.delete_ip_forward_entry(&self.0);
+    }
 }
 
 /// Loopback is index 1 on every Linux host and is always up, so the route has
@@ -91,17 +103,13 @@ fn test_route_v6() -> RouteEntry {
 }
 
 #[test]
+#[ignore = "needs root to modify the route table; run with --ignored"]
 fn a_route_can_be_added_found_and_removed_on_a_live_kernel() {
-    if !is_root() {
-        eprintln!(
-            "SKIPPED a_route_can_be_added_found_and_removed_on_a_live_kernel: \
-             needs root — the kernel refuses route mutations from an unprivileged caller"
-        );
-        return;
-    }
+    assert!(is_root(), "{NEEDS_ROOT}");
 
     let api = LinuxApi;
     let route = test_route();
+    let _guard = RouteGuard(route.clone());
 
     // Leftovers from a killed previous run would make the add fail with
     // EEXIST; deleting first is harmless when there is nothing there.
@@ -149,17 +157,13 @@ fn a_route_can_be_added_found_and_removed_on_a_live_kernel() {
 /// have to recognise it in. Everything below the neutral plan is per-family
 /// mechanism, so it needs its own contact with the kernel.
 #[test]
+#[ignore = "needs root to modify the route table; run with --ignored"]
 fn a_v6_host_route_can_be_added_found_and_removed_on_a_live_kernel() {
-    if !is_root() {
-        eprintln!(
-            "SKIPPED a_v6_host_route_can_be_added_found_and_removed_on_a_live_kernel: \
-             needs root — the kernel refuses route mutations from an unprivileged caller"
-        );
-        return;
-    }
+    assert!(is_root(), "{NEEDS_ROOT}");
 
     let api = LinuxApi;
     let route = test_route_v6();
+    let _guard = RouteGuard(route.clone());
 
     let _ = api.delete_ip_forward_entry(&route);
 
@@ -223,14 +227,9 @@ fn a_route_mixing_families_is_refused_before_the_kernel_sees_it() {
 /// the reconcile loop deletes routes it believes it owns, and a route the user
 /// already removed by hand must not abort the pass.
 #[test]
+#[ignore = "needs root to modify the route table; run with --ignored"]
 fn deleting_an_absent_route_is_idempotent() {
-    if !is_root() {
-        eprintln!(
-            "SKIPPED deleting_an_absent_route_is_idempotent: \
-             needs root — the kernel refuses route mutations from an unprivileged caller"
-        );
-        return;
-    }
+    assert!(is_root(), "{NEEDS_ROOT}");
 
     let api = LinuxApi;
     let mut route = test_route();
@@ -257,19 +256,15 @@ fn deleting_an_absent_route_is_idempotent() {
 /// generic failure — the apply layer treats `Conflict` on add as "already in
 /// the state we wanted".
 #[test]
+#[ignore = "needs root to modify the route table; run with --ignored"]
 fn adding_the_same_route_twice_is_a_conflict() {
-    if !is_root() {
-        eprintln!(
-            "SKIPPED adding_the_same_route_twice_is_a_conflict: \
-             needs root — the kernel refuses route mutations from an unprivileged caller"
-        );
-        return;
-    }
+    assert!(is_root(), "{NEEDS_ROOT}");
 
     let api = LinuxApi;
     let mut route = test_route();
     route.destination = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 252));
     let _ = api.delete_ip_forward_entry(&route);
+    let _guard = RouteGuard(route.clone());
 
     api.create_ip_forward_entry(&route).expect("first add");
     let second = api.create_ip_forward_entry(&route);

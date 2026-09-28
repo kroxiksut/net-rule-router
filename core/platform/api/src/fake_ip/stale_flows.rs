@@ -21,7 +21,7 @@
 //! the worst case is the old behaviour, an application waiting on a dead
 //! socket, so callers log the outcome and carry on.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Mutex;
 
 /// What one teardown pass did.
@@ -41,32 +41,43 @@ impl StaleFlowSweep {
     }
 }
 
+/// One established TCP connection and the user it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstablishedFlow {
+    pub local: SocketAddrV4,
+    pub remote: SocketAddrV4,
+    /// The owning user in the stored principal form (`S-1-5-21-…`,
+    /// `unix:uid:<n>`). `None` when the owner could not be resolved — the
+    /// process exited, or the OS refused to say.
+    pub owner: Option<String>,
+}
+
 /// Tear down established TCP connections aimed at a range of addresses.
 pub trait StaleFlowReset: Send + Sync {
     /// Tear down every established TCP connection whose REMOTE address falls
-    /// inside `base`/`prefix_len`. Returns what the pass found and closed.
+    /// inside `base`/`prefix_len`, whoever owns it. Returns what the pass found
+    /// and closed. Only for a range no user's traffic can legitimately reach,
+    /// like the fake-IP pool; a real destination goes through
+    /// [`Self::established_flows_to`] so the caller can decide per owner.
     ///
     /// Called once as the stack comes up, so it may read the whole connection
     /// table, but it must not block for long: a slow sweep delays the moment
     /// policy starts being enforced.
     fn reset_flows_to(&self, base: Ipv4Addr, prefix_len: u8) -> StaleFlowSweep;
 
-    /// Same teardown, for many exact addresses at once.
-    ///
-    /// A policy apply can newly pin hundreds of addresses in one pass, and each
-    /// of those hosts may be sitting on a connection that predates the pin.
-    /// Calling [`Self::reset_flows_to`] per address would re-read the entire
-    /// connection table per address; an implementation overrides this to sweep
-    /// once. The default keeps the naive shape so a platform without a batched
-    /// mechanism still works.
-    fn reset_flows_to_any(&self, targets: &[Ipv4Addr]) -> StaleFlowSweep {
-        let mut sweep = StaleFlowSweep::default();
-        for ip in targets {
-            let pass = self.reset_flows_to(*ip, 32);
-            sweep.found += pass.found;
-            sweep.torn_down += pass.torn_down;
-        }
-        sweep
+    /// Established TCP connections to any of `targets`, each with its owner,
+    /// from one read of the connection table. Lets a caller decide per
+    /// connection instead of per address, when one address serves several
+    /// users. The default lists nothing, so a platform without the mechanism
+    /// tears nothing down.
+    fn established_flows_to(&self, _targets: &[Ipv4Addr]) -> Vec<EstablishedFlow> {
+        Vec::new()
+    }
+
+    /// Tear down exactly `flows`, as listed by [`Self::established_flows_to`].
+    /// Returns how many the OS agreed to close.
+    fn reset_established(&self, _flows: &[EstablishedFlow]) -> usize {
+        0
     }
 }
 
@@ -92,7 +103,10 @@ pub struct MockStaleFlowReset {
 #[derive(Debug, Default)]
 struct MockInner {
     calls: Vec<(Ipv4Addr, u8)>,
+    queried: Vec<Ipv4Addr>,
     answer: StaleFlowSweep,
+    flows: Vec<EstablishedFlow>,
+    reset: Vec<EstablishedFlow>,
 }
 
 impl MockStaleFlowReset {
@@ -115,6 +129,32 @@ impl MockStaleFlowReset {
             .calls
             .clone()
     }
+
+    /// Every address [`StaleFlowReset::established_flows_to`] was asked about,
+    /// in call order.
+    #[must_use]
+    pub fn queried(&self) -> Vec<Ipv4Addr> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .queried
+            .clone()
+    }
+
+    /// The connection table [`StaleFlowReset::established_flows_to`] reads.
+    pub fn set_flows(&self, flows: Vec<EstablishedFlow>) {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).flows = flows;
+    }
+
+    /// Every connection this double was asked to tear down, in call order.
+    #[must_use]
+    pub fn reset_flows(&self) -> Vec<EstablishedFlow> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reset
+            .clone()
+    }
 }
 
 impl StaleFlowReset for MockStaleFlowReset {
@@ -122,6 +162,23 @@ impl StaleFlowReset for MockStaleFlowReset {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.calls.push((base, prefix_len));
         inner.answer
+    }
+
+    fn established_flows_to(&self, targets: &[Ipv4Addr]) -> Vec<EstablishedFlow> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.queried.extend_from_slice(targets);
+        inner
+            .flows
+            .iter()
+            .filter(|flow| targets.contains(flow.remote.ip()))
+            .cloned()
+            .collect()
+    }
+
+    fn reset_established(&self, flows: &[EstablishedFlow]) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.reset.extend_from_slice(flows);
+        flows.len()
     }
 }
 
@@ -152,5 +209,35 @@ mod tests {
         assert_eq!(sweep.torn_down, 7);
         assert!(!sweep.is_empty());
         assert_eq!(mock.calls(), vec![(POOL, 15)]);
+    }
+
+    #[test]
+    fn noop_lists_and_resets_nothing() {
+        assert!(NoopStaleFlowReset.established_flows_to(&[POOL]).is_empty());
+        let flow = EstablishedFlow {
+            local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000),
+            remote: SocketAddrV4::new(POOL, 443),
+            owner: None,
+        };
+        assert_eq!(NoopStaleFlowReset.reset_established(&[flow]), 0);
+    }
+
+    #[test]
+    fn mock_lists_only_flows_to_the_asked_addresses() {
+        let mock = MockStaleFlowReset::new();
+        let to = |ip: Ipv4Addr| EstablishedFlow {
+            local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000),
+            remote: SocketAddrV4::new(ip, 443),
+            owner: Some("S-1-5-21-1-2-3-1001".into()),
+        };
+        let wanted = Ipv4Addr::new(203, 0, 113, 1);
+        mock.set_flows(vec![to(wanted), to(Ipv4Addr::new(203, 0, 113, 2))]);
+
+        let listed = mock.established_flows_to(&[wanted]);
+
+        assert_eq!(listed, vec![to(wanted)]);
+        assert_eq!(mock.queried(), vec![wanted]);
+        assert_eq!(mock.reset_established(&listed), 1);
+        assert_eq!(mock.reset_flows(), listed);
     }
 }

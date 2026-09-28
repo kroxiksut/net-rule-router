@@ -273,6 +273,37 @@ impl ReconnectBackoff {
     }
 }
 
+/// How long a connection must have served before its loss counts as an
+/// ordinary drop (service restart) rather than the service hanging up on us.
+const STABLE_CONNECTION: Duration = Duration::from_secs(10);
+
+/// Pause before reconnecting after an ESTABLISHED connection dropped.
+///
+/// Separate from the connect backoff, which a successful handshake resets: a
+/// service that accepts, handshakes and hangs up would otherwise be met with
+/// connect + handshake ten times a second, each costing a connection slot and
+/// an audit line. Only a connection that held for [`STABLE_CONNECTION`]
+/// restarts this schedule.
+pub(crate) struct DropBackoff {
+    backoff: ReconnectBackoff,
+}
+
+impl DropBackoff {
+    pub(crate) fn new() -> Self {
+        Self {
+            backoff: ReconnectBackoff::fast(),
+        }
+    }
+
+    /// Delay after a connection that lived `lived`.
+    pub(crate) fn after_drop(&mut self, lived: Duration) -> Duration {
+        if lived >= STABLE_CONNECTION {
+            self.backoff.reset();
+        }
+        self.backoff.next_delay()
+    }
+}
+
 /// Small deterministic-but-varied jitter generator returning ±20.
 /// Source: linear congruential generator seeded by attempt + nanos so
 /// concurrent clients don't pick identical sequences.
@@ -370,6 +401,28 @@ mod tests {
         }
         b.reset();
         let d = b.next_delay();
+        assert!(d <= Duration::from_millis(200), "{d:?}");
+    }
+
+    #[test]
+    fn a_connection_that_keeps_dropping_right_away_backs_off_further() {
+        let mut b = DropBackoff::new();
+        let first = b.after_drop(Duration::from_millis(5));
+        for _ in 0..5 {
+            let _ = b.after_drop(Duration::from_millis(5));
+        }
+        let later = b.after_drop(Duration::from_millis(5));
+        assert!(first <= Duration::from_millis(200), "{first:?}");
+        assert!(later >= Duration::from_secs(3), "{later:?}");
+    }
+
+    #[test]
+    fn a_connection_that_held_restarts_the_drop_schedule() {
+        let mut b = DropBackoff::new();
+        for _ in 0..6 {
+            let _ = b.after_drop(Duration::from_millis(5));
+        }
+        let d = b.after_drop(STABLE_CONNECTION);
         assert!(d <= Duration::from_millis(200), "{d:?}");
     }
 

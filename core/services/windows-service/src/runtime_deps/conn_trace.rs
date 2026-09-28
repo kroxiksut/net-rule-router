@@ -81,6 +81,7 @@ pub(super) fn spawn_fcrdns_learner_worker(
                     ) {
                         tracing::info!(
                             target: "nrr::fcrdns",
+                            msg_key = "svc-conntrace-fcrdns-recent-match",
                             ip = %ip,
                             host = %host,
                             what,
@@ -92,6 +93,7 @@ pub(super) fn spawn_fcrdns_learner_worker(
                 match learner.learn_scoped(ip, allow_direct) {
                     LearnOutcome::Learned => tracing::info!(
                         target: "nrr::fcrdns",
+                        msg_key = "svc-conntrace-fcrdns-reverse-confirmed-rule",
                         ip = %ip,
                         what,
                         "reverse-confirmed into a rule host — permit compiles on the next reconcile",
@@ -100,6 +102,7 @@ pub(super) fn spawn_fcrdns_learner_worker(
                     // positively-direct destination the block-all was cutting.
                     LearnOutcome::LearnedDirect => tracing::info!(
                         target: "nrr::fcrdns",
+                        msg_key = "svc-conntrace-fcrdns-reverse-confirmed-direct",
                         ip = %ip,
                         what,
                         "reverse-confirmed into a DIRECT host — block-all exemption compiles on the next reconcile",
@@ -109,7 +112,7 @@ pub(super) fn spawn_fcrdns_learner_worker(
             }
         });
     if let Err(e) = spawned {
-        tracing::warn!(target: "nrr::fcrdns", error = %e, "could not spawn FCrDNS learner worker");
+        tracing::warn!(target: "nrr::fcrdns", msg_key = "svc-conntrace-fcrdns-worker-spawn-failed", error = %e, "could not spawn FCrDNS learner worker");
     }
 }
 
@@ -233,6 +236,7 @@ pub(super) fn build_conn_trace_pair(
     let (Some(coord), Some(active_sid)) = (route_coordinator, active_routing_sid) else {
         tracing::warn!(
             target: "nrr::conn-trace",
+            msg_key = "svc-conntrace-route-path-unavailable",
             "connection observer: route path unavailable — trace disabled",
         );
         return (None, None, None);
@@ -288,6 +292,7 @@ pub(super) fn build_conn_trace_pair(
                 if learned.register(ip, std::time::SystemTime::now()) {
                     tracing::info!(
                         target: "nrr::vpn-learn",
+                        msg_key = "svc-conntrace-vpn-endpoint-learned",
                         server = %ip,
                         "reactive learner: new role-verified VPN bootstrap endpoint",
                     );
@@ -356,6 +361,7 @@ pub(super) fn build_conn_trace_pair(
                 }
                 tracing::info!(
                     target: "nrr::vpn-learn",
+                    msg_key = "svc-conntrace-vpn-client-app-learned",
                     path = %path_str,
                     "learned VPN client application from a role-verified kill-switch drop — app-scoped block-all exemption compiles on the next reconcile",
                 );
@@ -450,10 +456,11 @@ pub(super) fn build_conn_trace_pair(
                     );
                 }
             }));
-        // Programs the main link carries none of: offered whole, and withdrawn
-        // the moment one of their connections completes there.
+        // Programs most of whose addresses fail on the main link: offered whole,
+        // unless the additional link already carries part of them.
         {
             let sid_for_app = Arc::clone(active_sid);
+            let engine_split = Arc::clone(&engine_app);
             let reach = nrr_service_runtime::app_main_link_reach::global_app_main_link_reach();
             consumer_builder = consumer_builder.with_app_main_link(Arc::new(
                 move |program: &str, remote: std::net::IpAddr, stalled: bool, named: bool| {
@@ -477,6 +484,22 @@ pub(super) fn build_conn_trace_pair(
                     }
                 },
             ));
+            let sid_for_split = Arc::clone(active_sid);
+            let reach = nrr_service_runtime::app_main_link_reach::global_app_main_link_reach();
+            consumer_builder =
+                consumer_builder.with_app_additional_link(Arc::new(move |program: &str| {
+                    let at_ms = nrr_service_runtime::conn_observation_consumer::now_unix_ms();
+                    if reach.note_additional_link(program, at_ms).is_none() {
+                        return;
+                    }
+                    if let Some(sid) = sid_for_split() {
+                        engine_split.withdraw_app_offer(
+                            &sid,
+                            program,
+                            std::time::SystemTime::now(),
+                        );
+                    }
+                }));
         }
         // A censored host somebody actually went to. The placeholder answer
         // alone says only that the provider cuts the name — for everyone, ad
@@ -521,12 +544,15 @@ pub(super) fn build_conn_trace_pair(
     // center folds them into episodes and logs the survivors. Always wired —
     // unlike the VPN learners this needs no role-verification gate of its
     // own beyond what the consumer already applies.
+    let notice_center = Arc::clone(vpn_learning.block_notice_center);
     {
         let recent = nrr_service_runtime::recent_rule_addresses::global_recent_rule_addresses();
-        let center = Arc::clone(vpn_learning.block_notice_center);
+        let center = Arc::clone(&notice_center);
         consumer_builder = consumer_builder.with_block_notice(
             Arc::new(move |ip| recent.lookup(ip)),
-            Arc::new(move |sid: &str, attempt| center.record(sid, &attempt)),
+            Arc::new(move |sid: &str, attempt, seen_at| {
+                center.record_observed(sid, &attempt, seen_at)
+            }),
         );
     }
     // A flow older than the pin that caught it can never reach the tunnel;
@@ -602,6 +628,7 @@ pub(super) fn build_conn_trace_pair(
                     }
                     Err(e) => tracing::warn!(
                         target: "nrr::conn-trace",
+                        msg_key = "svc-conntrace-etw-unavailable-merged",
                         "ETW connection observer unavailable (merged mode) — continuing with WFP only: {e}",
                     ),
                 }
@@ -619,6 +646,7 @@ pub(super) fn build_conn_trace_pair(
                     }
                     Err(e) => tracing::warn!(
                         target: "nrr::conn-trace",
+                        msg_key = "svc-conntrace-wfp-unavailable-merged",
                         "WFP connection observer unavailable (merged mode) — continuing with ETW only: {e}",
                     ),
                 }
@@ -644,12 +672,30 @@ pub(super) fn build_conn_trace_pair(
             }
         };
     match started {
-        Ok((source, stops)) => {
+        Ok((source, mut stops)) => {
             tracing::info!(
                 target: "nrr::conn-trace",
+                msg_key = "svc-conntrace-trace-enabled",
                 backend = backend.slug(),
                 "connection trace enabled",
             );
+            // Who launched a blocked program. Recorded only while drops are
+            // observed — nothing else asks — and stopped with the observers.
+            match nrr_platform_windows::process_lineage::EtwProcessLineage::start() {
+                Ok(lineage) => {
+                    let lineage = Arc::new(lineage);
+                    notice_center.attach_process_lineage(Arc::clone(&lineage)
+                        as Arc<dyn nrr_platform_api::process_lineage::ProcessLineagePort>);
+                    stops.push(Arc::new(move || {
+                        use nrr_platform_api::process_lineage::ProcessLineagePort;
+                        lineage.stop();
+                    }) as StopFn);
+                }
+                Err(e) => tracing::warn!(
+                    target: "nrr::block-notice",
+                    "process-start recorder unavailable; block notices will not name who launched the program: {e}",
+                ),
+            }
             // Only now is the ring actually being fed: the panel may say so.
             if let Some(ring) = trace_ring_flag {
                 ring.mark_observer_active();
@@ -664,6 +710,7 @@ pub(super) fn build_conn_trace_pair(
         Err(e) => {
             tracing::warn!(
                 target: "nrr::conn-trace",
+                msg_key = "svc-conntrace-trace-unavailable",
                 backend = backend.slug(),
                 "connection observer unavailable; connection trace disabled: {e}",
             );

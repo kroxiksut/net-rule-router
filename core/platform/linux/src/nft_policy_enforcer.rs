@@ -35,6 +35,9 @@ pub struct NftPolicyEnforcer {
     bindings: Arc<dyn EgressBindingSource>,
     adapters: Arc<dyn AdapterEventSource>,
     cli: NftCliEnforcement,
+    /// The table this enforcer owns — the product's unless a live test moved it
+    /// aside, so a test run can never replace or tear down a daemon's ruleset.
+    table: String,
     /// Asks a layer above whether the additional link is actually carrying
     /// traffic, by interface index. A link can be `Up` with an address and still
     /// be a tunnel whose far end is gone — the state of the interface says
@@ -60,6 +63,7 @@ impl NftPolicyEnforcer {
             bindings,
             adapters,
             cli: NftCliEnforcement::new(),
+            table: crate::lower_linux::NRR_TABLE.to_owned(),
             liveness: None,
         }
     }
@@ -70,6 +74,15 @@ impl NftPolicyEnforcer {
     #[must_use]
     pub fn with_liveness(mut self, oracle: LivenessOracle) -> Self {
         self.liveness = Some(oracle);
+        self
+    }
+
+    /// Install into `table` instead of the product's own. For live tests only:
+    /// the daemon and a test sharing one table would wipe each other's rules.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_table(mut self, table: impl Into<String>) -> Self {
+        self.table = table.into();
         self
     }
 
@@ -120,7 +133,8 @@ impl PolicyEnforcer for NftPolicyEnforcer {
             .map(|(plan, egress)| ScopedPlan { plan, egress })
             .collect();
 
-        let lowered = lower_scoped(&scoped);
+        let mut lowered = lower_scoped(&scoped);
+        lowered.ruleset.table.clone_from(&self.table);
         // Best-effort for the same reason as the other enforcement entry: a
         // single rule the kernel refuses must not cost the user every other
         // rule they have.
@@ -179,7 +193,7 @@ impl PolicyEnforcer for NftPolicyEnforcer {
 
     fn teardown(&self) -> Result<(), EnforcementFailure> {
         self.cli
-            .teardown(crate::lower_linux::NRR_TABLE)
+            .teardown(&self.table)
             .map_err(|e| EnforcementFailure::new(e.to_string()))
     }
 }

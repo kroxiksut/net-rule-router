@@ -507,6 +507,13 @@ Window {
             }
         }
 
+        // Takes the slack the hidden list leaves; without a filler the layout
+        // spreads the remaining blocks over the whole window height.
+        Item {
+            Layout.fillHeight: true
+            visible: root.candidates.length === 0
+        }
+
         // Footer: Skip (left) — spacer — confirm (accent, right).
         RowLayout {
             Layout.fillWidth: true

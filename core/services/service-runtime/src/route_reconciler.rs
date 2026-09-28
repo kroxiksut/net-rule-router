@@ -428,6 +428,7 @@ impl SecondaryRouteReconciler {
         if refused > 0 {
             tracing::info!(
                 target: "nrr::route-reconciler",
+                msg_key = "routerecon-teardown-refused",
                 refused = refused as u64,
                 "teardown in progress — route adds refused (a route added behind the stop outlives the process)",
             );
@@ -532,6 +533,49 @@ impl SecondaryRouteReconciler {
             .collect();
         self.reconcile_owned(&keep, owned)
     }
+}
+
+/// Why an offline route sweep stopped.
+#[derive(Debug)]
+pub enum RouteSweepError {
+    /// The table could not be read, so nothing was touched.
+    Enumerate(PlatformError),
+    /// Removing what was found failed part-way.
+    Delete(PlatformError),
+}
+
+impl std::fmt::Display for RouteSweepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Enumerate(e) => write!(f, "could not read the route table: {e}"),
+            Self::Delete(e) => write!(f, "could not remove the routes found: {e}"),
+        }
+    }
+}
+
+/// Remove every route in the table that carries our signature, with no service
+/// running to say which it installed. Returns how many went. Recognition is
+/// [`crate::route_codegen::is_owned_route`] alone, so this needs no stored state.
+pub fn sweep_owned_routes(api: Arc<dyn RouteTablePort>) -> Result<usize, RouteSweepError> {
+    let orphans: Vec<RouteEntry> = api
+        .get_ip_forward_table()
+        .map_err(RouteSweepError::Enumerate)?
+        .into_iter()
+        .filter(crate::route_codegen::is_owned_route)
+        .map(|mut r| {
+            r.is_ours = true;
+            r
+        })
+        .collect();
+    if orphans.is_empty() {
+        return Ok(0);
+    }
+    let reconciler = SecondaryRouteReconciler::new(api);
+    reconciler.adopt_owned(orphans);
+    reconciler
+        .clear()
+        .map(|delta| delta.removed)
+        .map_err(RouteSweepError::Delete)
 }
 
 #[cfg(test)]
@@ -829,6 +873,38 @@ mod tests {
         assert_eq!(
             table_dests(&api),
             HashSet::from([Ipv4Addr::new(1, 1, 1, 1)])
+        );
+    }
+
+    #[test]
+    fn offline_sweep_removes_our_signature_and_nothing_else() {
+        let api = Arc::new(MockWindowsApi::new());
+        let ours = route([192, 0, 2, 1], [10, 0, 0, 1], 7);
+        let foreign_metric = RouteEntry {
+            metric: 100,
+            ..route([192, 0, 2, 2], [10, 0, 0, 1], 7)
+        };
+        let foreign_table = RouteEntry {
+            table: nrr_platform_api::RouteTableRef::Tagged(51820),
+            ..route([192, 0, 2, 3], [10, 0, 0, 1], 7)
+        };
+        api.set_route_table(vec![ours, foreign_metric, foreign_table]);
+
+        let removed = sweep_owned_routes(Arc::clone(&api) as Arc<dyn RouteTablePort>).unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            table_dests(&api),
+            HashSet::from([Ipv4Addr::new(192, 0, 2, 2), Ipv4Addr::new(192, 0, 2, 3)])
+        );
+    }
+
+    #[test]
+    fn offline_sweep_of_a_clean_table_removes_nothing() {
+        let api = Arc::new(MockWindowsApi::new());
+        assert_eq!(
+            sweep_owned_routes(Arc::clone(&api) as Arc<dyn RouteTablePort>).unwrap(),
+            0
         );
     }
 

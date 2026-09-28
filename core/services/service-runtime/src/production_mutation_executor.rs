@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 
 use crate::activation_coordinator::{
     ActivationCoordinator, ActivationOutcome, CandidateSubmission, ConfirmationToken,
-    DryRunSummary, PolicyError, PreFlightWarning, RollbackTarget,
+    DryRunSummary, PolicyError, PreFlightCategory, PreFlightWarning, RollbackTarget,
 };
 use crate::crash_recovery::{
     execute_safe_disable, RecoveryAuditSink, SafeDisableOutcome, SafeDisableRequest,
@@ -133,11 +133,15 @@ pub struct ProductionMutationExecutor {
     /// executor without passing any handler at all. `None` leaves the gate
     /// open (degraded boot / tests).
     stability: Option<Arc<dyn ServiceStabilityConfigProvider>>,
+    /// Whose application section incoming rules belong to, which decides how
+    /// their names are spelled: always the host outside tests.
+    host_platform: HostPlatform,
 }
 
 impl ProductionMutationExecutor {
     pub fn new(coordinator: Arc<ActivationCoordinator>) -> Self {
         Self {
+            host_platform: HostPlatform::compiled(),
             coordinator,
             recovery_audit_sink: None,
             alerts_repo: None,
@@ -165,6 +169,13 @@ impl ProductionMutationExecutor {
     /// caller's live WFP filters. Without it, the reset still clears the
     /// stored divergence (read-through resumes on the next snapshot/apply)
     /// but does not eagerly recompile.
+    /// Test seam: canonicalize as another platform's service would.
+    #[doc(hidden)]
+    pub fn with_host_platform(mut self, platform: HostPlatform) -> Self {
+        self.host_platform = platform;
+        self
+    }
+
     pub fn with_apply_trigger(mut self, trigger: Arc<dyn RoutePolicyApplyTrigger>) -> Self {
         self.apply_trigger = Some(trigger);
         self
@@ -232,6 +243,20 @@ impl ProductionMutationExecutor {
         })
     }
 
+    /// The gates `submit_candidate` enforces (rule shape, control characters),
+    /// run early so a preview refuses the same rules the execute would.
+    fn enforce_submission_gates(rules_json: &str) -> Result<(), OperationError> {
+        if let Some((rule_id, reason)) =
+            crate::activation_coordinator::unsupported_rule_shape(rules_json)
+        {
+            return Err(unsupported_rule_shape_error(&rule_id, reason));
+        }
+        match crate::activation_coordinator::control_character_in_rules(rules_json) {
+            Some(hit) => Err(control_character_error(&hit.rule_id, hit.field)),
+            None => Ok(()),
+        }
+    }
+
     /// Defense-in-depth Free-tier rule cap. The GUI already refuses to add past
     /// `freeRulesMaxCount`, but a hand-edited preset file or a crafted IPC
     /// payload could carry more; the service rejects those authoritatively here.
@@ -267,13 +292,13 @@ impl ProductionMutationExecutor {
     ///
     /// A payload we cannot decode is left exactly as it came: rejecting it is
     /// the validation layer's call, not this one's.
-    fn canonicalize_rules_payload(payload: &mut RulesUpdatePayload) {
+    fn canonicalize_rules_payload(payload: &mut RulesUpdatePayload, platform: HostPlatform) {
         let Ok(dto) = serde_json::from_str::<nrr_shared::rules_json::CanonicalRulesJsonV1>(
             &payload.rules_json,
         ) else {
             return;
         };
-        let Ok(content) = nrr_domain::rules_json_codec::decode(dto) else {
+        let Ok(content) = nrr_domain::rules_json_codec::decode(dto, platform) else {
             return;
         };
         let Ok(canonical) = nrr_shared::rules_json::to_canonical_string(
@@ -324,8 +349,10 @@ impl ProductionMutationExecutor {
         };
         // Same spelling the execute path will store, so the preview scores and
         // dedupes against exactly what would be applied.
-        Self::canonicalize_rules_payload(&mut parsed);
-        if let Err(e) = Self::enforce_free_rule_cap(&parsed.rules_json) {
+        Self::canonicalize_rules_payload(&mut parsed, self.host_platform);
+        if let Err(e) = Self::enforce_free_rule_cap(&parsed.rules_json)
+            .and_then(|()| Self::enforce_submission_gates(&parsed.rules_json))
+        {
             return malformed_summary(&e.message);
         }
         // The score is reflected back into the wire `ReviewSummaryResponse`.
@@ -338,7 +365,8 @@ impl ProductionMutationExecutor {
             .coordinator
             .dry_run_rules(principal, &parsed.rules_json, "ipc-dry-run");
         let mut response = dry_run_to_review_summary(&summary, scored);
-        response.cross_set_duplicates = cross_set_duplicates_of(&parsed.rules_json);
+        response.cross_set_duplicates =
+            cross_set_duplicates_of(&parsed.rules_json, self.host_platform);
         response
     }
 
@@ -362,13 +390,13 @@ impl ProductionMutationExecutor {
         principal: &str,
     ) -> Option<ScoredCandidate> {
         let conn = self.state_conn.as_ref()?;
-        let candidate_book = decode_rule_book(rules_json)?;
+        let candidate_book = decode_rule_book(rules_json, self.host_platform)?;
         // Diff against the CALLER's per-principal active book,
         // not the baseline: comparing every candidate against the
         // (often-populated) baseline would make a user whose own active set
         // differs see "no changes" even though their edit/preset genuinely
         // differed.
-        let prev_book = load_active_rule_book(conn, principal);
+        let prev_book = load_active_rule_book(conn, principal, self.host_platform);
 
         let prev_profile = prev_book.map(|book| profile_for(conn, principal, book));
         let next_profile = profile_for(conn, principal, candidate_book);
@@ -469,6 +497,7 @@ impl MutationExecutor for ProductionMutationExecutor {
     fn execute(&self, stored: StoredMutation, principal: &str) -> MutationOutcome {
         tracing::info!(
             target: "nrr::mutation::execute",
+            msg_key = "prod-mutation-execute-started",
             kind = ?stored.kind,
             principal = %principal,
             correlation_id = stored.correlation_id.as_deref().unwrap_or(""),
@@ -496,6 +525,7 @@ impl MutationExecutor for ProductionMutationExecutor {
             };
             tracing::warn!(
                 target: "nrr::mutation::execute",
+                msg_key = "prod-mutation-locked",
                 kind = ?stored.kind,
                 principal = %principal,
                 "mutation refused — rule changes are locked by the administrator",
@@ -540,6 +570,7 @@ impl MutationExecutor for ProductionMutationExecutor {
             MutationOutcome::Completed(_) => {
                 tracing::info!(
                     target: "nrr::mutation::execute",
+                    msg_key = "prod-mutation-execute-completed",
                     kind = ?stored.kind,
                     correlation_id = stored.correlation_id.as_deref().unwrap_or(""),
                     "mutation execute completed",
@@ -549,6 +580,7 @@ impl MutationExecutor for ProductionMutationExecutor {
             MutationOutcome::Failed(err) => {
                 tracing::warn!(
                     target: "nrr::mutation::execute",
+                    msg_key = "prod-mutation-execute-failed",
                     kind = ?stored.kind,
                     correlation_id = stored.correlation_id.as_deref().unwrap_or(""),
                     error_code = %err.code,
@@ -721,8 +753,8 @@ fn reset_review_summary(
 /// two copies simply disagree about where the traffic goes, and only the user
 /// can settle that. An undecodable candidate yields nothing — the malformed
 /// path already speaks for it.
-fn cross_set_duplicates_of(rules_json: &str) -> Vec<CrossSetDuplicateDto> {
-    let Some(book) = decode_rule_book(rules_json) else {
+fn cross_set_duplicates_of(rules_json: &str, platform: HostPlatform) -> Vec<CrossSetDuplicateDto> {
+    let Some(book) = decode_rule_book(rules_json, platform) else {
         return Vec::new();
     };
     nrr_domain::validation::enabled_duplicates_across_sets(&book)
@@ -827,6 +859,7 @@ fn canonicalize_route_bytes(
     route: RouteRole,
     include_child_processes: bool,
     import_only_active: bool,
+    platform: HostPlatform,
 ) -> Result<CanonicalRuleSet, OperationError> {
     let bytes = BASE64_STANDARD
         .decode(b64.as_bytes())
@@ -871,6 +904,7 @@ fn canonicalize_route_bytes(
             .sum();
         tracing::info!(
             target: "nrr::mutation::preset",
+            msg_key = "prod-mutation-preset-parsed",
             route = ?route,
             known_sections = parse_outcome.parsed.sections.len(),
             known_rules,
@@ -879,12 +913,8 @@ fn canonicalize_route_bytes(
             "preset bytes parsed (server-side)"
         );
     }
-    let canonicalized = canonicalize_preset_rules(
-        &parse_outcome,
-        route,
-        HostPlatform::compiled(),
-        include_child_processes,
-    );
+    let canonicalized =
+        canonicalize_preset_rules(&parse_outcome, route, platform, include_child_processes);
     // "Import only active": drop rules disabled in the source preset
     // (commented recognizable lines — e.g. application rules left off pending
     // per-process routing) so they don't enter the revision at all. Filtering
@@ -962,6 +992,10 @@ fn rejection_to_operation_error(
             "inline-comment-too-long",
             format!("section '{section}' comment {chars} chars (limit {limit})"),
         ),
+        PresetImportRejectedReason::ControlCharacter { section, field } => (
+            CONTROL_CHARACTER_CODE,
+            format!("section '{section}' {field} contains a control character"),
+        ),
         // Forward-compat: `#[non_exhaustive]` enum — map any future
         // variant to a generic code rather than panic.
         _ => (
@@ -978,20 +1012,26 @@ fn rejection_to_operation_error(
 /// Single-route preset import preserves the OTHER route's rules from
 /// the currently active revision. Returns empty when no active revision
 /// exists or any storage/decode failure occurs (first-import scenario).
-fn load_active_primary(conn: Option<&Arc<Mutex<Connection>>>, principal: &str) -> CanonicalRuleSet {
-    load_active_book_or_empty(conn, principal).primary
+fn load_active_primary(
+    conn: Option<&Arc<Mutex<Connection>>>,
+    principal: &str,
+    platform: HostPlatform,
+) -> CanonicalRuleSet {
+    load_active_book_or_empty(conn, principal, platform).primary
 }
 
 fn load_active_secondary(
     conn: Option<&Arc<Mutex<Connection>>>,
     principal: &str,
+    platform: HostPlatform,
 ) -> CanonicalRuleSet {
-    load_active_book_or_empty(conn, principal).secondary
+    load_active_book_or_empty(conn, principal, platform).secondary
 }
 
 fn load_active_book_or_empty(
     conn: Option<&Arc<Mutex<Connection>>>,
     principal: &str,
+    platform: HostPlatform,
 ) -> CanonicalRuleBook {
     let Some(conn) = conn else {
         return CanonicalRuleBook::default();
@@ -1008,7 +1048,7 @@ fn load_active_book_or_empty(
         Ok(d) => d,
         Err(_) => return CanonicalRuleBook::default(),
     };
-    match rules_json_codec::decode(dto) {
+    match rules_json_codec::decode(dto, platform) {
         Ok(c) => c.rule_book,
         Err(_) => CanonicalRuleBook::default(),
     }
@@ -1071,9 +1111,9 @@ fn map_rule_entry(
 /// Decode a canonical rules-json string into a domain
 /// [`CanonicalRuleBook`]. Returns `None` on any wire/codec failure —
 /// the caller falls back to the heuristic path.
-fn decode_rule_book(rules_json: &str) -> Option<CanonicalRuleBook> {
+fn decode_rule_book(rules_json: &str, platform: HostPlatform) -> Option<CanonicalRuleBook> {
     let dto = nrr_shared::rules_json::from_canonical_string(rules_json).ok()?;
-    let content = nrr_domain::rules_json_codec::decode(dto).ok()?;
+    let content = nrr_domain::rules_json_codec::decode(dto, platform).ok()?;
     Some(content.rule_book)
 }
 
@@ -1085,11 +1125,12 @@ fn decode_rule_book(rules_json: &str) -> Option<CanonicalRuleBook> {
 fn load_active_rule_book(
     conn: &Arc<Mutex<Connection>>,
     principal: &str,
+    platform: HostPlatform,
 ) -> Option<CanonicalRuleBook> {
     let guard = conn.lock().ok()?;
     let repo = nrr_storage::revisions::RevisionsRepository::new(&guard);
     let record = repo.get_active_for(principal).ok()??;
-    decode_rule_book(&record.rules_json)
+    decode_rule_book(&record.rules_json, platform)
 }
 
 /// Wrap a rule book into the [`CanonicalProfile`] the risk scorer compares.
@@ -1166,29 +1207,36 @@ fn dry_run_to_review_summary(
         .sum();
     let total_removals: u32 = summary.action_plans.iter().map(|p| p.filter_removals).sum();
     let warning_count = summary.pre_flight_warnings.len();
-    let (risk_level, risk_signals, rules_added, rules_removed, rules_modified, rules_retargeted) =
-        match scored {
-            Some(s) => (
-                s.level,
-                s.signals,
-                s.rules_added,
-                s.rules_removed,
-                s.rules_modified,
-                s.rules_retargeted,
+    let (
+        risk_level,
+        mut risk_signals,
+        rules_added,
+        rules_removed,
+        rules_modified,
+        rules_retargeted,
+    ) = match scored {
+        Some(s) => (
+            s.level,
+            s.signals,
+            s.rules_added,
+            s.rules_removed,
+            s.rules_modified,
+            s.rules_retargeted,
+        ),
+        None => (
+            classify_risk_heuristic(
+                total_additions,
+                total_removals,
+                &summary.pre_flight_warnings,
             ),
-            None => (
-                classify_risk_heuristic(
-                    total_additions,
-                    total_removals,
-                    &summary.pre_flight_warnings,
-                ),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ),
-        };
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
+    risk_signals.extend(pre_flight_signals(&summary.pre_flight_warnings));
     ReviewSummaryResponse {
         diff_summary: format!(
             "{} SID(s); +{total_additions} / -{total_removals} filters; {warning_count} pre-flight warning(s)",
@@ -1215,6 +1263,39 @@ fn dry_run_to_review_summary(
         extended_sections: Vec::new(),
         cross_set_duplicates: Vec::new(),
     }
+}
+
+/// Pre-apply findings the user can act on, one signal per kind: the review
+/// otherwise showed only their count.
+fn pre_flight_signals(warnings: &[PreFlightWarning]) -> Vec<RiskSignalDto> {
+    let mut executables: Vec<String> = Vec::new();
+    let (mut adapter_missing, mut refused) = (false, false);
+    for w in warnings {
+        match w.category {
+            PreFlightCategory::AppRuleUnenforceable => {
+                executables.extend(w.subjects.iter().cloned());
+            }
+            PreFlightCategory::BindingUnresolved => adapter_missing = true,
+            PreFlightCategory::SidLeftRegistry
+            | PreFlightCategory::FilterIdCollision
+            | PreFlightCategory::BatchOverflow
+            | PreFlightCategory::RoutingConflict
+            | PreFlightCategory::InvalidRulesContent => refused = true,
+        }
+    }
+    executables.sort_unstable();
+    executables.dedup();
+    let mut signals = Vec::new();
+    if refused {
+        signals.push(RiskSignalDto::ApplyWillBeRefused);
+    }
+    if adapter_missing {
+        signals.push(RiskSignalDto::AdditionalAdapterUnresolved);
+    }
+    if !executables.is_empty() {
+        signals.push(RiskSignalDto::AppRuleUnenforceable { executables });
+    }
+    signals
 }
 
 /// Legacy count-based heuristic, kept as the
@@ -1282,6 +1363,33 @@ fn activation_to_outcome(outcome: ActivationOutcome) -> MutationOutcome {
     }
 }
 
+/// The refusal for a rule enforcement cannot carry out as written. One code
+/// for both actions: the GUI shows one message, the log keeps the reason.
+fn unsupported_rule_shape_error(
+    rule_id: &str,
+    reason: nrr_domain::rule_shape::UnsupportedShapeReason,
+) -> OperationError {
+    OperationError {
+        code: "unsupported-rule-shape".into(),
+        message: format!(
+            "rule {rule_id} names both an application and an address ({reason});              enforcement cannot limit that address to the application, so the change was refused"
+        ),
+    }
+}
+
+/// One code for the rules payload and the preset file alike: the GUI shows one
+/// message, the detail names the rule or section.
+const CONTROL_CHARACTER_CODE: &str = "control-character";
+
+fn control_character_error(rule_id: &str, field: &str) -> OperationError {
+    OperationError {
+        code: CONTROL_CHARACTER_CODE.into(),
+        message: format!(
+            "rule {rule_id:?}: {field} contains a line break or other control character"
+        ),
+    }
+}
+
 fn policy_error_outcome(err: &PolicyError) -> MutationOutcome {
     let (code, message) = match err {
         PolicyError::ConfirmationTokenUnknown => (
@@ -1309,6 +1417,10 @@ fn policy_error_outcome(err: &PolicyError) -> MutationOutcome {
         ),
         PolicyError::StorageFailure { .. } => ("storage-failure", format!("{err:?}")),
         PolicyError::MarkerWriteFailed(_) => ("marker-write-failed", format!("{err:?}")),
+        PolicyError::ActivationBusy => (
+            "busy-conflict",
+            "another rules change is still being applied".into(),
+        ),
         PolicyError::RevisionIntegrityRejected {
             revision_id,
             reason,
@@ -1319,6 +1431,12 @@ fn policy_error_outcome(err: &PolicyError) -> MutationOutcome {
                 revision_id.as_str()
             ),
         ),
+        PolicyError::UnsupportedRuleShape { rule_id, reason } => {
+            return MutationOutcome::Failed(unsupported_rule_shape_error(rule_id, *reason));
+        }
+        PolicyError::ControlCharacterInRule { rule_id, field } => {
+            return MutationOutcome::Failed(control_character_error(rule_id, field));
+        }
     };
     MutationOutcome::Failed(OperationError {
         code: code.into(),

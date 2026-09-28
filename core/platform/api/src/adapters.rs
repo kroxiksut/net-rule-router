@@ -195,25 +195,36 @@ const VIRTUAL_ADAPTER_SUBSTRINGS: &[&str] = &[
     "6to4",
 ];
 
-/// Lowercase substrings that, found in an adapter's name/description/type
-/// string, indicate a VPN/tunnel adapter. Single source of truth shared by
-/// the "Interfaces & routes" `vpn_tunnel_likelihood` heuristic
-/// (`interface_rows::derive_assessment`) and the traffic counter's
-/// tunnel-overlap classification (block T) — both must agree on what counts
-/// as "this is a VPN adapter", or the double-counting fix could subtract
-/// against a different notion of "tunnel" than what the GUI labels as one.
-pub const VPN_TUNNEL_ADAPTER_MARKERS: &[&str] =
-    &["vpn", "wireguard", "tunnel", "ppp", "tap", "tun", "openvpn"];
+/// Lowercase markers that name a VPN/tunnel adapter wherever they appear:
+/// branded names embed them (`NordVPN`, `WireGuard Tunnel`).
+const VPN_TUNNEL_ADAPTER_MARKERS: &[&str] = &["vpn", "wireguard", "tunnel", "openvpn"];
 
-/// Whether `haystack` (any case) contains a VPN/tunnel marker. `MIB_IF_ROW2::
-/// Type == IF_TYPE_TUNNEL` alone under-detects real VPN adapters: a
-/// TAP-Windows adapter presents as plain Ethernet, and a wintun (WireGuard)
-/// adapter presents as `IF_TYPE_PROP_VIRTUAL` — neither trips the raw-type
-/// check, so callers that need to recognize a VPN adapter reliably should
-/// combine the raw type with this name/description heuristic.
+/// Device words that name a tunnel only as a word of their own, index allowed
+/// (`TAP-Windows`, `tun0`, `WAN Miniport (L2TP)`): as substrings they hit
+/// `Neptune` or `Stapler`. The longer spellings keep the device names that
+/// embed one (`utun3`, `tunl0`, `gretap1`, `Wintun`) recognised.
+///
+/// PPPoE is deliberately absent, and `ppp` cannot reach it across the word
+/// boundary: for many providers PPPoE IS the internet link, and an uplink read
+/// as a tunnel is exempted from the kill-switch. Mobile broadband and USB
+/// tethering are uplinks for the same reason and match nothing here.
+const VPN_TUNNEL_DEVICE_WORDS: &[&str] = &[
+    "tap", "tun", "ppp", "utun", "tunl", "gretap", "wintun", "l2tp", "pptp", "sstp", "ikev2",
+];
+
+/// Whether `haystack` (any case) names a VPN/tunnel adapter. The one notion of
+/// "this reads as a tunnel" for the interface assessment, the traffic counter,
+/// the VM-network tie-break and the foreign-tunnel exemption.
+///
+/// `MIB_IF_ROW2::Type == IF_TYPE_TUNNEL` alone under-detects: a TAP-Windows
+/// adapter presents as plain Ethernet and a wintun adapter as
+/// `IF_TYPE_PROP_VIRTUAL`, so callers combine the raw type with this.
 pub fn text_indicates_vpn_tunnel(haystack: &str) -> bool {
     let text = haystack.to_ascii_lowercase();
     VPN_TUNNEL_ADAPTER_MARKERS.iter().any(|m| text.contains(m))
+        || VPN_TUNNEL_DEVICE_WORDS
+            .iter()
+            .any(|w| crate::app_group_discovery::keyword_matches_ignoring_digits(&text, w))
 }
 
 /// Is this the host side of a LOCAL virtual-machine network — a hypervisor's
@@ -508,11 +519,13 @@ impl AdapterMonitor {
             match drift {
                 IdentityDrift::SameNameNewIdentity { name, was, now } => tracing::info!(
                     target: "nrr::adapters",
+                    msg_key = "adapter-identity-changed-same-name",
                     adapter = %name, was = %was, now = %now,
                     "adapter kept its name and changed identity",
                 ),
                 IdentityDrift::SameIdentityNewName { id, was, now } => tracing::info!(
                     target: "nrr::adapters",
+                    msg_key = "adapter-renamed-same-identity",
                     identity = %id, was = %was, now = %now,
                     "adapter kept its identity and was renamed",
                 ),
@@ -1086,5 +1099,88 @@ mod tests {
         assert!(!text_indicates_vpn_tunnel("Intel(R) Ethernet Connection"));
         assert!(!text_indicates_vpn_tunnel("Realtek Wi-Fi 6E"));
         assert!(!text_indicates_vpn_tunnel(""));
+    }
+
+    #[test]
+    fn a_device_word_inside_an_ordinary_word_is_not_a_tunnel() {
+        for name in [
+            "Neptune Host-Only Network",
+            "Stapler LAN",
+            "Happpy NIC",
+            "Fortune",
+        ] {
+            assert!(!text_indicates_vpn_tunnel(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn device_names_with_an_index_or_an_embedded_marker_stay_tunnels() {
+        for name in [
+            "tun0",
+            "tap1",
+            "ppp0",
+            "tap0901",
+            "utun3",
+            "tunl0",
+            "ip6gretap0",
+            "Wintun Userspace",
+            "TAP-ProtonVPN Windows Adapter V9",
+        ] {
+            assert!(text_indicates_vpn_tunnel(name), "{name}");
+        }
+    }
+
+    /// The built-in Windows VPN protocols are tunnels by their miniport name.
+    #[test]
+    fn built_in_windows_vpn_miniports_are_tunnels() {
+        for name in [
+            "WAN Miniport (L2TP)",
+            "WAN Miniport (PPTP)",
+            "WAN Miniport (SSTP)",
+            "WAN Miniport (IKEv2)",
+        ] {
+            assert!(text_indicates_vpn_tunnel(name), "{name}");
+        }
+    }
+
+    /// An uplink read as a tunnel is exempted from the kill-switch, and for
+    /// many providers PPPoE is the internet link itself; mobile broadband and
+    /// USB tethering are uplinks too.
+    #[test]
+    fn pppoe_mobile_broadband_and_tethering_are_not_tunnels() {
+        for name in [
+            "WAN Miniport (PPPOE)",
+            "PPPoE",
+            "PPPoE connection",
+            "pppoe-wan",
+            "Generic Mobile Broadband Adapter",
+            "Mobile Broadband Connection",
+            "Qualcomm Snapdragon X55 5G WWAN",
+            "wwan0",
+            "Remote NDIS based Internet Sharing Device",
+            "Samsung Mobile USB Remote NDIS Network Device",
+            "Android USB Ethernet/RNDIS",
+            "rndis0",
+            "usb0",
+            "Apple Mobile Device Ethernet",
+        ] {
+            assert!(!text_indicates_vpn_tunnel(name), "{name}");
+        }
+    }
+
+    /// PPPoE is an uplink even on a hypervisor host: the VM-network tie-break
+    /// reads the same notion of "tunnel", so dropping PPPoE from it must not
+    /// turn a PPPoE link into a VM network either.
+    #[test]
+    fn a_pppoe_link_is_neither_a_tunnel_nor_a_vm_network() {
+        assert!(!names_indicate_virtual_machine_network(
+            "WAN Miniport (PPPOE)",
+            "Home Internet"
+        ));
+        // The tie-break still keeps a tunnel out of the VM exemption.
+        assert!(!names_indicate_virtual_machine_network(
+            "WAN Miniport (L2TP)",
+            "Hyper-V Work VPN"
+        ));
     }
 }

@@ -42,9 +42,15 @@ pub(super) fn open_wfp_session_budgeted(
         move || WfpSession::open(api),
     );
     let elapsed = started.elapsed();
+    // Every runtime filter write goes through this session, so from here a late
+    // boot strip could hit a live kill-switch.
+    if opened.is_ok() {
+        super::offline_reset::mark_runtime_owns_filters();
+    }
     match &opened {
         Ok(_) if elapsed >= WFP_OPEN_SLOW_THRESHOLD => tracing::warn!(
             target: "nrr::boot",
+            msg_key = "svc-boot-wfp-session-slow",
             elapsed_ms = elapsed.as_millis() as u64,
             "the filtering engine took a long time to hand out a session — enforcement is up, \
              but the engine on this machine is answering slowly",
@@ -52,6 +58,7 @@ pub(super) fn open_wfp_session_budgeted(
         Ok(_) => {}
         Err(_) => tracing::error!(
             target: "nrr::boot",
+            msg_key = "svc-boot-wfp-session-timeout",
             elapsed_ms = elapsed.as_millis() as u64,
             budget_secs = WFP_OPEN_BUDGET.as_secs(),
             "could not get a filtering-engine session within the boot budget — the service will \
@@ -93,6 +100,7 @@ where
     rx.recv_timeout(budget).unwrap_or_else(|_| {
         tracing::warn!(
             target: "nrr::boot",
+            msg_key = "svc-boot-step-budget-exceeded",
             what,
             budget_secs = budget.as_secs(),
             "step did not answer within its budget — continuing without it",

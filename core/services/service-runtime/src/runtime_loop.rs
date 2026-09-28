@@ -27,8 +27,11 @@
 //!   server in dispatch mode).
 //! - **`Recoverable`** — fail → mark `Degraded`, restart up to N times
 //!   with backoff. Used for periodic refreshers (cache, health pull).
-//! - **`Optional`** — fail → log + drop the task; service stays
-//!   `Running`. Used for diagnostics cleanup.
+//! - **`Optional`** — fail → restart with exponential backoff
+//!   ([`RestartBackoff`]), never retired. The failure sink hears about the
+//!   outage and the recovery, so health can say which one is down meanwhile.
+//!   Used for observers and housekeeping: losing one costs freshness, and
+//!   losing it until a restart costs the feature.
 //!
 //! ## Shutdown ordering
 //!
@@ -162,6 +165,46 @@ impl Default for BackoffSchedule {
     }
 }
 
+/// Restart schedule for `TaskClass::Optional`: `initial × 2^(attempt-1)`,
+/// capped. The attempt counter resets only after `healthy_reset` of clean
+/// running, so a task that dies a minute after every restart stays at the cap
+/// instead of hammering from `initial` again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RestartBackoff {
+    pub initial: Duration,
+    pub cap: Duration,
+    pub healthy_reset: Duration,
+}
+
+impl RestartBackoff {
+    pub const fn new(initial: Duration, cap: Duration, healthy_reset: Duration) -> Self {
+        Self {
+            initial,
+            cap,
+            healthy_reset,
+        }
+    }
+
+    /// `attempt` is 1-based, as in [`BackoffSchedule::delay_for_attempt`].
+    pub fn delay_for_attempt(&self, attempt: u8) -> Duration {
+        let initial_ms = u64::try_from(self.initial.as_millis()).unwrap_or(u64::MAX);
+        let cap_ms = u64::try_from(self.cap.as_millis()).unwrap_or(u64::MAX);
+        let shift = u32::from(attempt.saturating_sub(1)).min(63);
+        let scaled = initial_ms.saturating_mul(1u64 << shift);
+        Duration::from_millis(scaled.min(cap_ms))
+    }
+}
+
+impl Default for RestartBackoff {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_secs(1),
+            cap: Duration::from_secs(5 * 60),
+            healthy_reset: Duration::from_secs(10 * 60),
+        }
+    }
+}
+
 /// One supervised task.
 pub struct ServiceTask {
     pub id: TaskId,
@@ -230,12 +273,29 @@ impl ServiceTask {
 pub trait TaskFailureSink: Send + Sync {
     fn task_failed(&self, id: &TaskId, class: TaskClass, attempt: u8, message: &str);
     fn task_terminated_fatal(&self, id: &TaskId, message: &str);
+    /// The failed task runs again after `delay`; until
+    /// [`Self::task_recovered`] it is not doing its job.
+    fn task_restart_scheduled(
+        &self,
+        _id: &TaskId,
+        _class: TaskClass,
+        _attempt: u8,
+        _delay: Duration,
+        _message: &str,
+    ) {
+    }
+    /// A restarted task completed a tick again.
+    fn task_recovered(&self, _id: &TaskId, _class: TaskClass) {}
 }
 
 #[derive(Default)]
 pub struct CountingFailureSink {
     pub failures: AtomicU64,
     pub fatal: AtomicU64,
+    pub restarts: AtomicU64,
+    pub recovered: AtomicU64,
+    /// Every scheduled restart delay, in order.
+    pub delays: Mutex<Vec<Duration>>,
 }
 
 impl TaskFailureSink for CountingFailureSink {
@@ -244,6 +304,23 @@ impl TaskFailureSink for CountingFailureSink {
     }
     fn task_terminated_fatal(&self, _id: &TaskId, _message: &str) {
         self.fatal.fetch_add(1, Ordering::SeqCst);
+    }
+    fn task_restart_scheduled(
+        &self,
+        _id: &TaskId,
+        _class: TaskClass,
+        _attempt: u8,
+        delay: Duration,
+        _message: &str,
+    ) {
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+        self.delays
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(delay);
+    }
+    fn task_recovered(&self, _id: &TaskId, _class: TaskClass) {
+        self.recovered.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -269,6 +346,7 @@ pub struct ServiceSupervisor {
     sink: Arc<dyn TaskFailureSink>,
     /// Maximum total wait time during shutdown. Defaults to `STOP_TIMEOUT`.
     stop_timeout: Duration,
+    optional_restart: RestartBackoff,
 }
 
 impl ServiceSupervisor {
@@ -279,11 +357,19 @@ impl ServiceSupervisor {
             started: AtomicBool::new(false),
             sink,
             stop_timeout: STOP_TIMEOUT,
+            optional_restart: RestartBackoff::default(),
         }
     }
 
     pub fn with_stop_timeout(mut self, d: Duration) -> Self {
         self.stop_timeout = d;
+        self
+    }
+
+    /// Override the restart schedule of `Optional` tasks.
+    #[must_use]
+    pub fn with_optional_restart(mut self, backoff: RestartBackoff) -> Self {
+        self.optional_restart = backoff;
         self
     }
 
@@ -301,10 +387,14 @@ impl ServiceSupervisor {
         let max_restarts = task.max_restarts;
         let interval = task.interval;
         let backoff = task.backoff;
+        let optional_restart = self.optional_restart;
         let handle = thread::Builder::new()
             .name(format!("nrr-task-{}", id.0))
             .spawn(move || {
                 let mut attempt: u8 = 0;
+                // Set between a scheduled restart and the first clean tick after it.
+                let mut down = false;
+                let mut restarted_at: Option<Instant> = None;
                 while !stop.is_stop_requested() {
                     // A panic in a tick is a task failure like any other. Left
                     // uncaught it killed the thread in silence: no
@@ -323,7 +413,21 @@ impl ServiceSupervisor {
                         };
                     match outcome {
                         TaskOutcome::Continue => {
-                            attempt = 0;
+                            if down {
+                                down = false;
+                                sink.task_recovered(&id, class);
+                            }
+                            match class {
+                                TaskClass::Optional => {
+                                    if restarted_at.is_some_and(|at| {
+                                        at.elapsed() >= optional_restart.healthy_reset
+                                    }) {
+                                        attempt = 0;
+                                        restarted_at = None;
+                                    }
+                                }
+                                TaskClass::Critical | TaskClass::Recoverable => attempt = 0,
+                            }
                             if let Some(d) = interval {
                                 sleep_observing_stop(&stop, d);
                             } else {
@@ -347,15 +451,19 @@ impl ServiceSupervisor {
                                         sink.task_terminated_fatal(&id, &msg);
                                         break;
                                     }
-                                    // Per-task back-off. Default schedule =
-                                    // 100 ms × attempt capped at 1 s;
-                                    // `ipc-accept-loop` derives base / cap
-                                    // from ServiceStabilityConfig.
-                                    sleep_observing_stop(&stop, backoff.delay_for_attempt(attempt));
+                                    let delay = backoff.delay_for_attempt(attempt);
+                                    sink.task_restart_scheduled(&id, class, attempt, delay, &msg);
+                                    down = true;
+                                    sleep_observing_stop(&stop, delay);
                                 }
                                 TaskClass::Optional => {
-                                    // Drop quietly.
-                                    break;
+                                    // Never retired: a dropped observer froze its
+                                    // feature until the next service restart.
+                                    let delay = optional_restart.delay_for_attempt(attempt);
+                                    sink.task_restart_scheduled(&id, class, attempt, delay, &msg);
+                                    down = true;
+                                    sleep_observing_stop(&stop, delay);
+                                    restarted_at = Some(Instant::now());
                                 }
                             }
                         }
@@ -626,26 +734,119 @@ mod tests {
         assert_eq!(sink.failures.load(Ordering::SeqCst), 1);
     }
 
+    fn wait_until(deadline: Duration, cond: impl Fn() -> bool) -> bool {
+        let until = Instant::now() + deadline;
+        while Instant::now() < until {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// The silent version: one panic and the observer was gone until the next
+    /// service restart, with nothing but a warn claiming it would be retried.
     #[test]
-    fn optional_task_failure_is_silent_drop() {
+    fn a_panicking_optional_task_is_restarted_after_backoff_and_reports_recovery() {
         let stop = StopToken::new();
         let sink = counting_sink();
         let supervisor =
-            ServiceSupervisor::new(stop.clone(), sink.clone() as Arc<dyn TaskFailureSink>);
+            ServiceSupervisor::new(stop.clone(), sink.clone() as Arc<dyn TaskFailureSink>)
+                .with_optional_restart(RestartBackoff::new(
+                    Duration::from_millis(200),
+                    Duration::from_secs(1),
+                    Duration::from_secs(60),
+                ));
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_in_task = Arc::clone(&ticks);
         supervisor
             .spawn(ServiceTask::periodic(
-                "optional",
+                "observer",
                 TaskClass::Optional,
                 Duration::from_millis(5),
-                3,
-                |_stop| TaskOutcome::Failed("cleanup glitched".into()),
+                0,
+                move |_stop| {
+                    if ticks_in_task.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("first tick blew up");
+                    }
+                    TaskOutcome::Continue
+                },
             ))
-            .unwrap();
-        thread::sleep(Duration::from_millis(100));
+            .expect("spawn");
+
+        assert!(wait_until(Duration::from_secs(2), || {
+            sink.restarts.load(Ordering::SeqCst) == 1
+        }));
+        // Inside the backoff: not ticked again, not reported recovered.
+        assert_eq!(ticks.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.recovered.load(Ordering::SeqCst), 0);
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                sink.recovered.load(Ordering::SeqCst) == 1
+            }),
+            "the task must run again after the backoff"
+        );
+        assert!(ticks.load(Ordering::SeqCst) >= 2);
         let _ = supervisor.shutdown();
-        // One failure recorded, no fatal.
         assert_eq!(sink.failures.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.fatal.load(Ordering::SeqCst), 0, "never retired");
+        assert_eq!(
+            sink.delays.lock().expect("delays").as_slice(),
+            &[Duration::from_millis(200)]
+        );
+    }
+
+    #[test]
+    fn an_optional_task_that_keeps_failing_backs_off_exponentially_to_the_cap() {
+        let stop = StopToken::new();
+        let sink = counting_sink();
+        let supervisor =
+            ServiceSupervisor::new(stop.clone(), sink.clone() as Arc<dyn TaskFailureSink>)
+                .with_optional_restart(RestartBackoff::new(
+                    Duration::from_millis(10),
+                    Duration::from_millis(40),
+                    Duration::from_secs(60),
+                ));
+        supervisor
+            .spawn(ServiceTask::periodic(
+                "always-panics",
+                TaskClass::Optional,
+                Duration::from_millis(5),
+                0,
+                |_stop| panic!("still broken"),
+            ))
+            .expect("spawn");
+        assert!(wait_until(Duration::from_secs(3), || {
+            sink.restarts.load(Ordering::SeqCst) >= 5
+        }));
+        let _ = supervisor.shutdown();
+        let delays = sink.delays.lock().expect("delays").clone();
+        assert_eq!(
+            &delays[..5],
+            &[
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+                Duration::from_millis(40),
+                Duration::from_millis(40),
+            ]
+        );
+        assert_eq!(sink.recovered.load(Ordering::SeqCst), 0);
         assert_eq!(sink.fatal.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn restart_backoff_doubles_saturates_and_caps() {
+        let b = RestartBackoff::default();
+        assert_eq!(b.delay_for_attempt(1), Duration::from_secs(1));
+        assert_eq!(b.delay_for_attempt(2), Duration::from_secs(2));
+        assert_eq!(b.delay_for_attempt(9), Duration::from_secs(256));
+        assert_eq!(b.delay_for_attempt(10), Duration::from_secs(300));
+        assert_eq!(b.delay_for_attempt(255), Duration::from_secs(300));
+        // Attempt 0 is not produced by the supervisor; it must still not underflow.
+        assert_eq!(b.delay_for_attempt(0), Duration::from_secs(1));
     }
 
     #[test]

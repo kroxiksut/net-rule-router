@@ -139,6 +139,7 @@ impl DismissalStore for SqliteDismissalStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-store-refused-read-failed",
                     error = %e,
                     "could not read refused suggestions — this session may re-offer a host the user already declined",
                 );
@@ -152,6 +153,7 @@ impl DismissalStore for SqliteDismissalStore {
         if let Err(e) = AutoRuleDismissalsRepository::new(&guard).record(sid, dismissals, now_ms) {
             tracing::warn!(
                 target: "nrr::auto-rules",
+                msg_key = "autorules-store-refused-persist-failed",
                 error = %e,
                 count = dismissals.len(),
                 "could not persist refused suggestions — the refusal holds for this session only",
@@ -166,6 +168,7 @@ impl DismissalStore for SqliteDismissalStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-store-declined-read-failed",
                     error = %e,
                     "could not read declined suggestions for review",
                 );
@@ -181,6 +184,7 @@ impl DismissalStore for SqliteDismissalStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-store-declined-undo-failed",
                     error = %e,
                     "could not undo a declined suggestion — it stays refused for this session",
                 );
@@ -275,6 +279,7 @@ impl PendingSuggestionStore for SqlitePendingStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-store-pending-read-failed",
                     error = %e,
                     "could not read pending suggestions — this session starts with an empty offer set",
                 );
@@ -288,6 +293,7 @@ impl PendingSuggestionStore for SqlitePendingStore {
         if let Err(e) = AutoRulePendingRepository::new(&guard).replace(sid, candidates) {
             tracing::warn!(
                 target: "nrr::auto-rules",
+                msg_key = "autorules-store-pending-persist-failed",
                 error = %e,
                 count = candidates.len(),
                 "could not persist pending suggestions — they will not survive a restart",
@@ -300,6 +306,7 @@ impl PendingSuggestionStore for SqlitePendingStore {
         if let Err(e) = AutoRulePendingRepository::new(&guard).clear(sid) {
             tracing::warn!(
                 target: "nrr::auto-rules",
+                msg_key = "autorules-store-pending-clear-failed",
                 error = %e,
                 "could not clear persisted pending suggestions",
             );
@@ -387,6 +394,7 @@ impl EvidenceStore for SqliteEvidenceStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-store-companion-read-failed",
                     error = %e,
                     "could not read saved companion evidence — learning starts over this session",
                 );
@@ -400,6 +408,7 @@ impl EvidenceStore for SqliteEvidenceStore {
                 // evidence re-accumulates, a wrong reconstruction would not.
                 tracing::warn!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-store-companion-format-mismatch",
                     error = %e,
                     "saved companion evidence is not readable by this build — starting over",
                 );
@@ -414,6 +423,7 @@ impl EvidenceStore for SqliteEvidenceStore {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::auto-rules",
+                    msg_key = "autorules-store-companion-serialize-failed",
                     error = %e,
                     "could not serialise companion evidence",
                 );
@@ -424,6 +434,7 @@ impl EvidenceStore for SqliteEvidenceStore {
         if let Err(e) = AutoRuleEvidenceRepository::new(&guard).save(sid, &json, now_ms) {
             tracing::warn!(
                 target: "nrr::auto-rules",
+                msg_key = "autorules-store-companion-persist-failed",
                 error = %e,
                 "could not persist companion evidence — it will not survive a restart",
             );
@@ -435,6 +446,7 @@ impl EvidenceStore for SqliteEvidenceStore {
         if let Err(e) = AutoRuleEvidenceRepository::new(&guard).clear(sid) {
             tracing::warn!(
                 target: "nrr::auto-rules",
+                msg_key = "autorules-store-companion-clear-failed",
                 error = %e,
                 "could not clear saved companion evidence",
             );

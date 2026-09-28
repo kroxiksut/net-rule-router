@@ -48,7 +48,7 @@ const RESOLVE_BUDGET: Duration = Duration::from_secs(3);
 const MAX_DATAGRAM: usize = 512;
 
 /// Where the machine's resolvers are configured.
-pub const RESOLV_CONF: &str = "/etc/resolv.conf";
+pub use crate::dns_redirect::resolv_conf::RESOLV_CONF;
 
 /// The IPv4 nameservers from `/etc/resolv.conf`.
 #[derive(Debug, Clone, Default)]
@@ -66,25 +66,10 @@ impl SystemDnsServersPort for ResolvConfDnsServers {
     }
 }
 
-/// Read the `nameserver` lines of a `resolv.conf`. Pure, so its tests run
-/// anywhere.
+/// Read the `nameserver` lines of a `resolv.conf`.
 #[must_use]
 pub fn parse_nameservers(text: &str) -> Vec<Ipv4Addr> {
-    let mut servers = Vec::new();
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some(rest) = line.strip_prefix("nameserver") else {
-            continue;
-        };
-        // IPv6 nameservers are skipped rather than mis-parsed: this resolver
-        // asks for A records, and the transport it asks over is v4.
-        if let Ok(server) = rest.trim().parse::<Ipv4Addr>() {
-            if !servers.contains(&server) {
-                servers.push(server);
-            }
-        }
-    }
-    servers
+    crate::dns_redirect::resolv_conf::nameservers(text)
 }
 
 /// Resolves A records by asking the machine's configured servers directly.

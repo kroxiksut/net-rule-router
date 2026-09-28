@@ -99,7 +99,8 @@ pub fn handle_local_request(
         "local.service-info" => handle_service_info(client),
         "local.vpn.discover" => handle_vpn_discover(),
         "local.app-groups.discover" => handle_app_groups_discover(),
-        "local.vm-inventory.list" => handle_vm_inventory_list(),
+        "local.vm-inventory.list" => handle_vm_inventory_list(payload),
+        "local.vm-nat.bind" => handle_vm_nat_bind(payload),
         "local.system-theme" => Ok(handle_system_theme()),
         other => Err(LocalHandlerError::UnknownOperation(other.to_string())),
     }
@@ -152,8 +153,7 @@ fn discover_vpn_candidates_os() -> Vec<nrr_platform_api::VpnCandidate> {
 /// onboarding UI. Runs LOCALLY in the launcher for the same reason as VPN
 /// discovery (non-elevated process + registry enumeration, no service needed),
 /// so the route-assignment onboarding works before the service is installed.
-/// The OS mechanism is [`nrr_platform_windows::WindowsAppGroupDiscovery`] on
-/// Windows, a Noop elsewhere until the Linux / macOS backends fill the seam.
+/// macOS finds nothing until its backend fills the seam.
 fn handle_app_groups_discover() -> LocalHandlerResult {
     let apps = discover_app_groups_os();
     Ok(json!({ "apps": apps }))
@@ -165,7 +165,13 @@ fn discover_app_groups_os() -> Vec<nrr_platform_api::DiscoveredApp> {
     nrr_platform_windows::WindowsAppGroupDiscovery::new().discover_app_groups()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn discover_app_groups_os() -> Vec<nrr_platform_api::DiscoveredApp> {
+    use nrr_platform_api::AppGroupDiscoveryPort;
+    nrr_platform_linux::app_group_discovery::LinuxAppGroupDiscovery::new().discover_app_groups()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn discover_app_groups_os() -> Vec<nrr_platform_api::DiscoveredApp> {
     Vec::new()
 }
@@ -173,8 +179,167 @@ fn discover_app_groups_os() -> Vec<nrr_platform_api::DiscoveredApp> {
 /// The hypervisors on this machine with their virtual machines, for the rules
 /// screen that routes them. Local for the same reason as the discoveries above:
 /// the settings files are the user's own and the service is not needed.
-fn handle_vm_inventory_list() -> LocalHandlerResult {
-    Ok(json!({ "hypervisors": vm_inventory_os() }))
+/// The payload names the additional adapter the way the preferences store it,
+/// so each NAT pin can be read against its current address.
+fn handle_vm_inventory_list(payload: &Value) -> LocalHandlerResult {
+    let mut hypervisors = vm_inventory_os();
+    let (host, additional) = host_addresses(&interface_rows_os(), &AdapterRef::from(payload));
+    nrr_platform_api::classify_bindings(&mut hypervisors, &host, additional);
+    Ok(json!({ "hypervisors": hypervisors }))
+}
+
+/// Pins a machine's NAT adapter to the additional adapter's current address
+/// (`"route": "additional"`), or removes the pin (`"route": "rules"`). Answers
+/// `{ "ok": true }` or `{ "ok": false, "error": <slug>, "message": <tool text> }`
+/// — a refusal is an outcome the screen explains, not a transport failure.
+fn handle_vm_nat_bind(payload: &Value) -> LocalHandlerResult {
+    let hypervisor = match payload.get("hypervisor").and_then(Value::as_str) {
+        Some("virtualbox") => nrr_platform_api::Hypervisor::VirtualBox,
+        _ => {
+            return Ok(bind_outcome(Err(
+                nrr_platform_api::VmControlError::Unsupported,
+            )))
+        }
+    };
+    let machine_id = payload
+        .get("machineId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let slot = payload
+        .get("slot")
+        .and_then(Value::as_u64)
+        .and_then(|slot| u32::try_from(slot).ok());
+    let Some(slot) = slot else {
+        return Ok(bind_outcome(Err(
+            nrr_platform_api::VmControlError::InvalidTarget,
+        )));
+    };
+    let address = match payload.get("route").and_then(Value::as_str) {
+        Some("rules") => None,
+        Some("additional") => {
+            let (_, additional) = host_addresses(&interface_rows_os(), &AdapterRef::from(payload));
+            match additional {
+                Some(address) => Some(address),
+                None => return Ok(json!({ "ok": false, "error": "no-additional-address" })),
+            }
+        }
+        _ => {
+            return Ok(bind_outcome(Err(
+                nrr_platform_api::VmControlError::InvalidTarget,
+            )))
+        }
+    };
+    Ok(bind_outcome(vm_bind_nat_os(
+        hypervisor, machine_id, slot, address,
+    )))
+}
+
+fn bind_outcome(result: Result<(), nrr_platform_api::VmControlError>) -> Value {
+    match result {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => {
+            let message = match &error {
+                nrr_platform_api::VmControlError::Failed(text) => text.clone(),
+                _ => String::new(),
+            };
+            json!({ "ok": false, "error": error.slug(), "message": message })
+        }
+    }
+}
+
+/// The additional adapter as the preferences name it: by id, else by name.
+struct AdapterRef<'a> {
+    id: &'a str,
+    name: &'a str,
+}
+
+impl<'a> From<&'a Value> for AdapterRef<'a> {
+    fn from(payload: &'a Value) -> Self {
+        let field = |key: &str| payload.get(key).and_then(Value::as_str).unwrap_or_default();
+        Self {
+            id: field("additionalInterfaceId"),
+            name: field("additionalInterfaceName"),
+        }
+    }
+}
+
+/// Every IPv4 address the host's adapters carry, and the additional adapter's.
+fn host_addresses(
+    rows: &[nrr_platform_api::InterfaceRouteRow],
+    additional: &AdapterRef<'_>,
+) -> (Vec<std::net::Ipv4Addr>, Option<std::net::Ipv4Addr>) {
+    let ipv4 = |row: &nrr_platform_api::InterfaceRouteRow| {
+        row.local_ip
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .find_map(|part| part.parse::<std::net::Ipv4Addr>().ok())
+    };
+    let host = rows.iter().filter_map(ipv4).collect();
+    let is_additional = |row: &&nrr_platform_api::InterfaceRouteRow| {
+        if additional.id.is_empty() {
+            !additional.name.is_empty() && row.windows_name == additional.name
+        } else {
+            row.persistent_id == additional.id
+        }
+    };
+    let address = rows.iter().find(is_additional).and_then(ipv4);
+    (host, address)
+}
+
+/// Live adapter rows; the preview rows a failed enumeration falls back to
+/// would pin a machine to an address the host does not have.
+#[cfg(target_os = "windows")]
+fn interface_rows_os() -> Vec<nrr_platform_api::InterfaceRouteRow> {
+    match nrr_platform_windows::collect_interfaces_rows(false) {
+        (nrr_platform_api::InterfacesDataSource::WindowsLive, rows) => rows,
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn interface_rows_os() -> Vec<nrr_platform_api::InterfaceRouteRow> {
+    match nrr_platform_linux::interface_rows::collect_interfaces_rows(false) {
+        (nrr_platform_api::InterfacesDataSource::LinuxLive, rows) => rows,
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn interface_rows_os() -> Vec<nrr_platform_api::InterfaceRouteRow> {
+    Vec::new()
+}
+
+#[cfg(target_os = "windows")]
+fn vm_bind_nat_os(
+    hypervisor: nrr_platform_api::Hypervisor,
+    machine_id: &str,
+    slot: u32,
+    address: Option<std::net::Ipv4Addr>,
+) -> Result<(), nrr_platform_api::VmControlError> {
+    use nrr_platform_api::VmInventoryPort;
+    nrr_platform_windows::WindowsVmInventory::new().bind_nat(hypervisor, machine_id, slot, address)
+}
+
+#[cfg(target_os = "linux")]
+fn vm_bind_nat_os(
+    hypervisor: nrr_platform_api::Hypervisor,
+    machine_id: &str,
+    slot: u32,
+    address: Option<std::net::Ipv4Addr>,
+) -> Result<(), nrr_platform_api::VmControlError> {
+    use nrr_platform_api::VmInventoryPort;
+    nrr_platform_linux::vm_inventory::LinuxVmInventory::new()
+        .bind_nat(hypervisor, machine_id, slot, address)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn vm_bind_nat_os(
+    hypervisor: nrr_platform_api::Hypervisor,
+    machine_id: &str,
+    slot: u32,
+    address: Option<std::net::Ipv4Addr>,
+) -> Result<(), nrr_platform_api::VmControlError> {
+    use nrr_platform_api::VmInventoryPort;
+    nrr_platform_api::NoopVmInventory.bind_nat(hypervisor, machine_id, slot, address)
 }
 
 #[cfg(target_os = "windows")]
@@ -183,7 +348,13 @@ fn vm_inventory_os() -> Vec<nrr_platform_api::HypervisorInventory> {
     nrr_platform_windows::WindowsVmInventory::new().inventory()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn vm_inventory_os() -> Vec<nrr_platform_api::HypervisorInventory> {
+    use nrr_platform_api::VmInventoryPort;
+    nrr_platform_linux::vm_inventory::LinuxVmInventory::new().inventory()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn vm_inventory_os() -> Vec<nrr_platform_api::HypervisorInventory> {
     Vec::new()
 }
@@ -664,5 +835,67 @@ mod tests {
         let resp = handle_local_request("local.vm-inventory.list", &json!({}), &empty_client())
             .expect("ok");
         assert!(resp["hypervisors"].is_array(), "{resp}");
+    }
+
+    fn row(id: &str, name: &str, ip: &str) -> nrr_platform_api::InterfaceRouteRow {
+        let mut row = nrr_platform_api::interface_rows::fallback_rows()
+            .into_iter()
+            .next()
+            .expect("a preview row");
+        row.persistent_id = id.to_string();
+        row.windows_name = name.to_string();
+        row.local_ip = ip.to_string();
+        row
+    }
+
+    #[test]
+    fn the_additional_address_is_found_by_id_else_by_name() {
+        let rows = [
+            row("id-a", "Ethernet", "192.0.2.10"),
+            row("id-b", "Tunnel", "198.51.100.7"),
+            row("id-c", "Offline", "-"),
+        ];
+        let by_id = AdapterRef {
+            id: "id-b",
+            name: "Ethernet",
+        };
+        let (host, additional) = host_addresses(&rows, &by_id);
+        assert_eq!(host.len(), 2, "an adapter without an address adds none");
+        assert_eq!(additional, Some(std::net::Ipv4Addr::new(198, 51, 100, 7)));
+        let by_name = AdapterRef {
+            id: "",
+            name: "Tunnel",
+        };
+        assert_eq!(host_addresses(&rows, &by_name).1, additional);
+        let unset = AdapterRef { id: "", name: "" };
+        assert_eq!(host_addresses(&rows, &unset).1, None);
+    }
+
+    /// A refusal is an answer the screen explains, not a transport error.
+    #[test]
+    fn a_pin_that_cannot_be_made_answers_with_a_reason() {
+        let client = empty_client();
+        for (payload, error) in [
+            (
+                json!({ "hypervisor": "other", "machineId": "x", "slot": 0, "route": "rules" }),
+                "unsupported",
+            ),
+            (
+                json!({ "hypervisor": "virtualbox", "machineId": "x", "route": "rules" }),
+                "invalid-target",
+            ),
+            (
+                json!({ "hypervisor": "virtualbox", "machineId": "x", "slot": 0, "route": "sideways" }),
+                "invalid-target",
+            ),
+            (
+                json!({ "hypervisor": "virtualbox", "machineId": "--help", "slot": 0, "route": "rules" }),
+                "invalid-target",
+            ),
+        ] {
+            let resp = handle_local_request("local.vm-nat.bind", &payload, &client).expect("ok");
+            assert_eq!(resp["ok"], false, "{payload}");
+            assert_eq!(resp["error"], error, "{payload}");
+        }
     }
 }

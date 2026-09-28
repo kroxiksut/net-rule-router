@@ -73,7 +73,8 @@ impl ExplainGetHandler {
         let Some((policy, fqdn, active_sid)) = self.enforcement.as_ref() else {
             return none;
         };
-        if hostname.is_empty() {
+        // A blocked host has no kill-switch caveat: nothing reaches any link.
+        if hostname.is_empty() || route == "blocked" {
             return none;
         }
         let Some(sid) = active_sid() else {

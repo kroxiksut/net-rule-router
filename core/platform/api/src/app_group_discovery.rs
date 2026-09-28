@@ -5,9 +5,9 @@
 //! whole group at once (default: primary):
 //!
 //! - **Virtual machines & emulators** — a hypervisor's or emulator's guest
-//!   traffic egresses as ordinary sockets of the host process (VMware, QEMU,
-//!   DOSBox, Android/console emulators), so an ordinary application rule
-//!   routes it. VirtualBox is not listed here: its machines have their own
+//!   traffic egresses as ordinary sockets of the host process (QEMU, DOSBox,
+//!   Android/console emulators), so an ordinary application rule routes it.
+//!   VirtualBox and VMware are not listed here: their machines have their own
 //!   screen, fed by [`crate::vm_inventory`]. Kernel-NAT stacks (WSL2, Hyper-V, Docker
 //!   Desktop) have NO owning process — their traffic cannot be routed by an
 //!   application rule — so they are surfaced for DISPLAY only (route fixed to
@@ -44,7 +44,7 @@ pub enum AppGroupTab {
 #[serde(rename_all = "kebab-case")]
 pub enum AppGroupKind {
     /// Usermode-NAT hypervisor — guest traffic is the host process's sockets,
-    /// so an application rule routes it (VMware, QEMU, DOSBox).
+    /// so an application rule routes it (QEMU, DOSBox).
     Hypervisor,
     /// Kernel-NAT virtual network (WSL2, Hyper-V, Docker Desktop). Guest
     /// traffic has no owning user process, so it CANNOT be routed by an
@@ -104,7 +104,7 @@ impl AppGroupKind {
         )
     }
 
-    /// Whether this group must keep REAL addresses when fake-IP is on (Block D).
+    /// Whether this group must keep REAL addresses when fake-IP is on.
     /// True for the peer-to-peer groups: they talk to thousands of bare-IP peers
     /// that were never resolved by name, so a per-hostname fake address has
     /// nothing to key on and would only add a relay hop. The mirror image of
@@ -189,12 +189,12 @@ pub struct AppGroupEntry {
 /// against every entry via [`classify_app`].
 pub const APP_GROUP_DICTIONARY: &[AppGroupEntry] = &[
     // ── Virtualization: usermode-NAT hypervisors (route-assignable) ──────────
-    // No VirtualBox: the names this list could match are the manager and its
-    // COM server, which carry no guest traffic, while the processes that do are
-    // named per machine on the virtual machines screen.
+    // No VirtualBox or VMware: the names this list could match are managers
+    // and helper services that carry no guest traffic; their machines have the
+    // virtual machines screen.
     AppGroupEntry {
         kind: AppGroupKind::Hypervisor,
-        keywords: &["vmware", "vmware-vmx", "qemu", "dosbox"],
+        keywords: &["qemu", "dosbox"],
     },
     // ── Virtualization: kernel-NAT stacks (display-only, primary-pinned) ──────
     AppGroupEntry {
@@ -210,7 +210,15 @@ pub const APP_GROUP_DICTIONARY: &[AppGroupEntry] = &[
             "dockerd",
         ],
     },
+    // ── Virtualization: console/computer emulators with network traffic ──────
+    // Ahead of the Android entry: "Dolphin Emulator" must not be caught by its
+    // generic `emulator`.
+    AppGroupEntry {
+        kind: AppGroupKind::ConsoleEmulator,
+        keywords: &["retroarch", "dolphin", "pcsx2", "rpcs3", "cemu", "citra"],
+    },
     // ── Virtualization: Android emulators ────────────────────────────────────
+    // The AVD's own backend, `qemu-system-*`, is a hypervisor by the entry above.
     AppGroupEntry {
         kind: AppGroupKind::AndroidEmulator,
         keywords: &[
@@ -221,14 +229,8 @@ pub const APP_GROUP_DICTIONARY: &[AppGroupEntry] = &[
             "ldplayer",
             "dnplayer", // LDPlayer engine process
             "memu",
-            "qemu-system-x86_64", // Android Studio AVD backend
-            "emulator",           // Android Studio `emulator` launcher
+            "emulator", // Android Studio `emulator` launcher
         ],
-    },
-    // ── Virtualization: console/computer emulators with network traffic ──────
-    AppGroupEntry {
-        kind: AppGroupKind::ConsoleEmulator,
-        keywords: &["retroarch", "dolphin", "pcsx2", "rpcs3", "cemu", "citra"],
     },
     // ── Peer-to-peer: BitTorrent clients ─────────────────────────────────────
     AppGroupEntry {
@@ -305,7 +307,17 @@ pub fn classify_app(text: &str) -> Option<AppGroupKind> {
 /// that already carry separators (`docker desktop`, `hyper-v`) work unchanged —
 /// the boundary test is applied around the whole keyword, not inside it.
 fn keyword_matches(text: &str, keyword: &str) -> bool {
-    let is_word = |c: char| c.is_ascii_alphanumeric();
+    keyword_between(text, keyword, |c| c.is_ascii_alphanumeric())
+}
+
+/// [`keyword_matches`] where only letters continue a word, so a device index
+/// (`tun0`, `ppp1`) leaves the keyword whole.
+pub(crate) fn keyword_matches_ignoring_digits(text: &str, keyword: &str) -> bool {
+    keyword_between(text, keyword, |c| c.is_ascii_alphabetic())
+}
+
+/// Does `keyword` occur in `text` with no `is_word` character on either side?
+fn keyword_between(text: &str, keyword: &str, is_word: impl Fn(char) -> bool) -> bool {
     let bytes = text.as_bytes();
     let mut from = 0usize;
     while let Some(offset) = text[from..].find(keyword) {
@@ -322,6 +334,62 @@ fn keyword_matches(text: &str, keyword: &str) -> bool {
         }
     }
     false
+}
+
+/// QEMU network backends whose frames leave through the kernel or another
+/// program, never as the hypervisor process's own sockets.
+const PROCESS_BYPASSING_BACKENDS: &[&str] = &[
+    "tap",
+    "bridge",
+    "vhost-user",
+    "vhost-vdpa",
+    "af-xdp",
+    "netmap",
+    "vde",
+    "vmnet-host",
+    "vmnet-shared",
+    "vmnet-bridged",
+];
+
+/// Whether a hypervisor started with these arguments puts its guest on a
+/// backend such as a tap device or a bridge. Such a guest's traffic never
+/// becomes the process's own sockets (libvirt's system machines are the common
+/// case), so no application rule routes it and the row belongs with the kernel
+/// virtual networks.
+#[must_use]
+pub fn guest_network_bypasses_process<'a>(args: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut network_option = false;
+    for arg in args {
+        if network_option && backend_bypasses_process(arg) {
+            return true;
+        }
+        // QEMU reads `--netdev` as `-netdev`.
+        let arg = arg.trim();
+        network_option =
+            arg.starts_with('-') && matches!(arg.trim_start_matches('-'), "netdev" | "nic" | "net");
+    }
+    false
+}
+
+/// The backend a `-netdev`/`-nic`/`-net` value names: libvirt's JSON form, or
+/// QEMU's `key=value` list whose first bare word is the implied `type`.
+fn backend_bypasses_process(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    if value.starts_with('{') {
+        let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+        return PROCESS_BYPASSING_BACKENDS
+            .iter()
+            .any(|backend| compact.contains(&format!("\"type\":\"{backend}\"")));
+    }
+    value
+        .split(',')
+        .enumerate()
+        .find_map(|(position, element)| match element.split_once('=') {
+            Some((key, kind)) if key.trim() == "type" => Some(kind.trim()),
+            None if position == 0 => Some(element.trim()),
+            _ => None,
+        })
+        .is_some_and(|kind| PROCESS_BYPASSING_BACKENDS.contains(&kind))
 }
 
 /// Merge discovered apps from several sources into a stable, deduplicated list.
@@ -498,7 +566,7 @@ mod tests {
         );
         assert_eq!(classify_app("btweb.exe"), Some(AppGroupKind::BitTorrent));
         assert_eq!(
-            classify_app("vmware-vmx.exe"),
+            classify_app("qemu-system-x86_64.exe"),
             Some(AppGroupKind::Hypervisor)
         );
         assert_eq!(
@@ -531,6 +599,49 @@ mod tests {
         ] {
             assert_eq!(classify_app(name), None, "{name}");
         }
+    }
+
+    /// VMware's NAT runs as a system service no application rule binds, and
+    /// the names listed here matched its manager and helper services.
+    #[test]
+    fn vmware_is_left_to_the_virtual_machines_screen() {
+        for name in [
+            "vmware.exe",
+            "vmware-vmx.exe",
+            "vmware-authd.exe",
+            "vmware-tray.exe",
+            "vmware-usbarbitrator64.exe",
+            "VMware Workstation",
+        ] {
+            assert_eq!(classify_app(name), None, "{name}");
+        }
+    }
+
+    /// A keyword an earlier entry already claims can never classify as its
+    /// own group.
+    #[test]
+    fn every_keyword_reaches_its_own_group() {
+        for entry in APP_GROUP_DICTIONARY {
+            for keyword in entry.keywords {
+                assert_eq!(classify_app(keyword), Some(entry.kind), "{keyword}");
+            }
+        }
+    }
+
+    #[test]
+    fn console_emulators_are_not_taken_for_android_by_their_title() {
+        assert_eq!(
+            classify_app("Dolphin Emulator"),
+            Some(AppGroupKind::ConsoleEmulator)
+        );
+        assert_eq!(
+            classify_app("PCSX2 Emulator"),
+            Some(AppGroupKind::ConsoleEmulator)
+        );
+        assert_eq!(
+            classify_app("emulator.exe"),
+            Some(AppGroupKind::AndroidEmulator)
+        );
     }
 
     #[test]
@@ -644,6 +755,86 @@ mod tests {
         )]);
         assert_eq!(m.discover_app_groups().len(), 1);
     }
+    #[test]
+    fn a_guest_on_a_tap_or_bridge_bypasses_the_process() {
+        let libvirt_json = [
+            "qemu-system-x86_64",
+            "-netdev",
+            r#"{"type":"tap","fd":"30","id":"hostnet0"}"#,
+        ];
+        assert!(guest_network_bypasses_process(libvirt_json));
+        assert!(guest_network_bypasses_process([
+            "qemu",
+            "-netdev",
+            "tap,id=n0,fd=31"
+        ]));
+        assert!(guest_network_bypasses_process([
+            "qemu",
+            "-nic",
+            "bridge,br=br0"
+        ]));
+        // Positive control: user-mode networking is the process's own sockets.
+        assert!(!guest_network_bypasses_process([
+            "qemu",
+            "-netdev",
+            "user,id=n0"
+        ]));
+        assert!(!guest_network_bypasses_process(["qemu", "-nic", "user"]));
+        // The word alone, outside a network option, says nothing.
+        assert!(!guest_network_bypasses_process(["qemu", "-name", "tap"]));
+    }
+
+    #[test]
+    fn the_double_dash_spelling_is_the_same_option() {
+        assert!(guest_network_bypasses_process([
+            "qemu",
+            "--netdev",
+            "tap,id=n0"
+        ]));
+        assert!(guest_network_bypasses_process([
+            "qemu",
+            "--nic",
+            "bridge,br=br0"
+        ]));
+        assert!(!guest_network_bypasses_process([
+            "qemu",
+            "--netdev",
+            "user,id=n0"
+        ]));
+    }
+
+    #[test]
+    fn the_backend_is_read_from_an_explicit_type_and_every_kernel_backend_counts() {
+        for value in [
+            "type=tap,id=n0",
+            "id=n0,type=bridge",
+            "vhost-user,id=n0,chardev=c0",
+            "type=vhost-vdpa,vhostdev=/dev/vhost-vdpa-0",
+            "vmnet-shared,id=n0",
+            "af-xdp,ifname=eth0",
+            r#"{"type":"vhost-user","id":"n0"}"#,
+        ] {
+            assert!(
+                guest_network_bypasses_process(["qemu", "-netdev", value]),
+                "{value}"
+            );
+        }
+        for value in [
+            "user,id=n0",
+            "type=user,id=n0",
+            "socket,id=n0,listen=:1234",
+            // Only the implied first word is a type; a later bare word is not.
+            "user,tap",
+            "id=tap0,type=user",
+            r#"{"type":"user","id":"tap"}"#,
+        ] {
+            assert!(
+                !guest_network_bypasses_process(["qemu", "-netdev", value]),
+                "{value}"
+            );
+        }
+    }
+
     /// The dictionary matches WORDS, not substrings.
     ///
     /// Each of these was a real misfire: a Windows component read as a crypto

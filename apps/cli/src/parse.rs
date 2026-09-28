@@ -7,7 +7,7 @@
 
 use nrr_platform_api::service_control::ServiceStartMode;
 
-use crate::verbs::{self, VerbSpec};
+use crate::verbs::{self, Privilege, VerbSpec};
 
 /// One validated invocation: what to do, and whether the user asked for
 /// administrator rights up front.
@@ -22,6 +22,9 @@ pub struct Invocation {
     pub command: Command,
     /// `--elevate` was given.
     pub elevate: bool,
+    /// What the verb table declares this verb needs. Only an `Administrator`
+    /// verb may be offered elevation, whatever its failure looked like.
+    pub privilege: Privilege,
 }
 
 /// A parsed, validated command.
@@ -149,10 +152,7 @@ struct ParsedFlag {
 /// Parse argv (without the executable name) into an invocation.
 pub fn parse(args: &[String]) -> Result<Invocation, ParseError> {
     let Some(first) = args.first() else {
-        return Ok(Invocation {
-            command: Command::Help,
-            elevate: false,
-        });
+        return Ok(help());
     };
 
     // Leading dashes and case are normalised so `--status`, `status` and
@@ -160,10 +160,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, ParseError> {
     // entrypoints already grant.
     let verb_word = first.trim_start_matches('-').to_ascii_lowercase();
     if verb_word.is_empty() || verb_word == "h" {
-        return Ok(Invocation {
-            command: Command::Help,
-            elevate: false,
-        });
+        return Ok(help());
     }
     let Some(spec) = verbs::find(&verb_word) else {
         return Err(ParseError::UnknownVerb { verb: verb_word });
@@ -193,7 +190,16 @@ pub fn parse(args: &[String]) -> Result<Invocation, ParseError> {
     Ok(Invocation {
         command: build(&spelling, spec, &flags)?,
         elevate: flag(&flags, verbs::ELEVATE_FLAG.name).is_some(),
+        privilege: spec.privilege,
     })
+}
+
+fn help() -> Invocation {
+    Invocation {
+        command: Command::Help,
+        elevate: false,
+        privilege: Privilege::Any,
+    }
 }
 
 /// Split the remaining arguments into flags, rejecting anything the verb does
@@ -343,14 +349,16 @@ mod tests {
             inv(&["stop"]),
             Ok(Invocation {
                 command: Command::Stop,
-                elevate: false
+                elevate: false,
+                privilege: Privilege::Administrator,
             })
         );
         assert_eq!(
             inv(&["stop", "--elevate"]),
             Ok(Invocation {
                 command: Command::Stop,
-                elevate: true
+                elevate: true,
+                privilege: Privilege::Administrator,
             })
         );
     }
@@ -361,7 +369,8 @@ mod tests {
             inv(&["uninstall", "--purge", "--elevate"]),
             Ok(Invocation {
                 command: Command::Uninstall { purge: true },
-                elevate: true
+                elevate: true,
+                privilege: Privilege::Administrator,
             })
         );
         assert_eq!(
@@ -370,7 +379,8 @@ mod tests {
                 command: Command::Install {
                     start_mode: ServiceStartMode::OnAppLaunch
                 },
-                elevate: true
+                elevate: true,
+                privilege: Privilege::Administrator,
             })
         );
     }
@@ -393,6 +403,19 @@ mod tests {
                 flag: "elevate".to_string()
             })
         );
+    }
+
+    #[test]
+    fn the_privilege_comes_from_the_verb_table() {
+        for (spelling, spec) in verbs::invocable() {
+            let words: Vec<&str> = spelling.split(' ').collect();
+            assert_eq!(
+                inv(&words).map(|i| i.privilege),
+                Ok(spec.privilege),
+                "`{spelling}`"
+            );
+        }
+        assert_eq!(inv(&[]).map(|i| i.privilege), Ok(Privilege::Any));
     }
 
     #[test]

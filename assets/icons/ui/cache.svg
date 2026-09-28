@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="cache">
+  <!-- Source icon: Tabler Icons (MIT), name: database -->
+  <defs>
+    <linearGradient id="nrr-grad" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="#1EA7FF"/>
+      <stop offset="1" stop-color="#8A3FFC"/>
+    </linearGradient>
+  </defs>
+
+  <title>cache</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 6m-8 0a8 3 0 1 0 16 0a8 3 0 1 0 -16 0" />
+    <path d="M4 6v6a8 3 0 0 0 16 0v-6" />
+    <path d="M4 12v6a8 3 0 0 0 16 0v-6" />
+  </g>
+</svg>

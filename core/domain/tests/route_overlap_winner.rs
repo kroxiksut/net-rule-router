@@ -6,6 +6,7 @@
 
 use nrr_domain::decision_engine_input::match_sample;
 use nrr_domain::decision_matching::{RequestedRouteDecision, ZonePriorityPolicy};
+use nrr_domain::rules_file::HostPlatform;
 use nrr_domain::rules_json_codec::decode;
 use nrr_domain::RouteBehaviorMode;
 use nrr_shared::rules_json::{
@@ -48,6 +49,11 @@ fn zone(id: &str, name: &str) -> RuleDto {
     rule(id, AddressMatchDto::Zone { name: name.into() })
 }
 
+fn blocking(mut rule: RuleDto) -> RuleDto {
+    rule.action = RuleAction::Block;
+    rule
+}
+
 #[test]
 fn every_reported_winner_is_the_engines_winner() {
     let dto = CanonicalRulesJsonV1 {
@@ -57,6 +63,8 @@ fn every_reported_winner_is_the_engines_winner() {
             suffix("P2", "ai.search.example"),
             exact("P3", "dup.example"),
             suffix("P4", "longer.zone.test"),
+            exact("P5", "tie.block.example"),
+            blocking(suffix("P6", "blocked.example")),
         ],
         secondary: vec![
             exact("S1", "www.site.example"),
@@ -64,10 +72,14 @@ fn every_reported_winner_is_the_engines_winner() {
             suffix("S3", "example"),
             exact("S4", "dup.example"),
             zone("S5", "test"),
+            blocking(exact("S6", "tie.block.example")),
+            suffix("S7", "blocked.example"),
+            exact("S8", "open.blocked.example"),
         ],
     };
     let found = find_route_overlaps(&dto, false);
-    assert!(found.len() >= 5, "{found:?}");
+    assert!(found.len() >= 8, "{found:?}");
+    assert!(found.iter().any(|o| o.block_wins_tie), "{found:?}");
     for overlap in &found {
         // The screen states a pairwise fact, so the engine is asked about a
         // book holding only the two rules of the pair.
@@ -95,7 +107,9 @@ fn every_reported_winner_is_the_engines_winner() {
             };
             target.push(pick(side));
         }
-        let book = decode(pair).expect("pair decodes").rule_book;
+        let book = decode(pair, HostPlatform::Windows)
+            .expect("pair decodes")
+            .rule_book;
         let host = match overlap.winner.rule_type.as_str() {
             "exact-fqdn" => overlap.winner.value.clone(),
             _ if overlap.loser.rule_type == "exact-fqdn" => overlap.loser.value.clone(),

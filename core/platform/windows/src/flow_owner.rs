@@ -86,7 +86,7 @@ fn owning_pid_v4(local: Endpoint, remote: Endpoint) -> Option<u32> {
 /// Decode a table row's address+port pair into a host-order [`Endpoint`].
 /// `MIB_TCPROW_OWNER_PID` stores the address as a network-order `u32` and the
 /// port in the low two bytes in network byte order.
-fn row_endpoint(addr: u32, port: u32) -> Endpoint {
+pub(crate) fn row_endpoint(addr: u32, port: u32) -> Endpoint {
     let ip = Ipv4Addr::from(u32::from_be(addr));
     let port = (((port & 0xff) << 8) | ((port >> 8) & 0xff)) as u16;
     (ip, port)

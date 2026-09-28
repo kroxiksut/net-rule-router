@@ -271,6 +271,7 @@ pub fn log_report(report: &StallReport) {
     match report.behavior {
         PrimaryBehavior::Stalls => tracing::info!(
             target: "nrr::primary-stall",
+            msg_key = "stallreg-destination-stalling",
             hostname = %report.hostname,
             stalls = report.stalls,
             "destination does not answer on the main link — connections start and nothing comes back",

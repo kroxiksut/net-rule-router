@@ -47,6 +47,8 @@ pub struct BehavioralKey {
     pub remote_ip: Option<Ipv4Addr>,
     /// Canonical (sorted) packed-set condition — set membership is behavior.
     pub remote_ip_set: Vec<Ipv4Addr>,
+    /// The IPv6 packed set, canonical (sorted) like its v4 twin.
+    pub remote_ip_set_v6: Vec<Ipv6Addr>,
     pub remote_port: Option<u16>,
     pub user_sid: Option<String>,
     pub app_pattern: Option<String>,
@@ -83,6 +85,11 @@ pub fn behavioral_key(f: &WfpFilterSpec) -> BehavioralKey {
         remote_ip: f.remote_ip,
         remote_ip_set: {
             let mut set = f.remote_ip_set.clone();
+            set.sort_unstable();
+            set
+        },
+        remote_ip_set_v6: {
+            let mut set = f.remote_ip_set_v6.clone();
             set.sort_unstable();
             set
         },
@@ -189,6 +196,14 @@ impl core::fmt::Display for BehavioralKey {
                 " ip_set[{}]={:?}",
                 self.remote_ip_set.len(),
                 self.remote_ip_set
+            )?;
+        }
+        if !self.remote_ip_set_v6.is_empty() {
+            write!(
+                f,
+                " ip6_set[{}]={:?}",
+                self.remote_ip_set_v6.len(),
+                self.remote_ip_set_v6
             )?;
         }
         if let Some((net, len)) = self.remote_subnet {

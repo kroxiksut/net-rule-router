@@ -87,6 +87,7 @@ impl PersistentAppPathResolver {
         let Ok(guard) = self.conn.lock() else {
             tracing::warn!(
                 target: "nrr::persistent-app-resolver",
+                msg_key = "apppersist-lock-poisoned-write",
                 pattern,
                 "state-DB lock poisoned; skipping app-path persistence (write-through)",
             );
@@ -103,6 +104,7 @@ impl PersistentAppPathResolver {
             }
             Err(e) => tracing::warn!(
                 target: "nrr::persistent-app-resolver",
+                msg_key = "apppersist-persist-failed",
                 pattern,
                 error = %e,
                 "failed to persist last-good app-path resolution (write-through) — continuing",
@@ -116,6 +118,7 @@ impl PersistentAppPathResolver {
         let Ok(guard) = self.conn.lock() else {
             tracing::warn!(
                 target: "nrr::persistent-app-resolver",
+                msg_key = "apppersist-lock-poisoned-read",
                 pattern,
                 "state-DB lock poisoned; no persisted app-path fallback available",
             );
@@ -131,6 +134,7 @@ impl PersistentAppPathResolver {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::persistent-app-resolver",
+                    msg_key = "apppersist-load-failed",
                     pattern,
                     error = %e,
                     "failed to load persisted app-path fallback — treating as none",

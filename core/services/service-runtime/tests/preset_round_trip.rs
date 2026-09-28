@@ -292,6 +292,8 @@ fn settings_export_full_yaml_conforms_to_formats_md_2_4() {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            short_name_completion: false,
+            short_name_suffix: String::new(),
             binding_source: BindingSource::UserAssigned,
         };
         repo.update_for_sid("S-1-5-21-test", &record, 1)

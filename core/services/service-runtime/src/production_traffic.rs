@@ -442,6 +442,7 @@ impl SamplerAdapterAddressRecorder {
     fn warn(op: &str, adapter_key: &str, e: &impl std::fmt::Display) {
         tracing::warn!(
             target: "nrr::traffic",
+            msg_key = "prod-traffic-address-store-failed",
             error = %e,
             adapter_key,
             op,
@@ -458,6 +459,7 @@ impl crate::production_handlers_misc::AdapterAddressRecorder for SamplerAdapterA
         {
             tracing::warn!(
                 target: "nrr::traffic",
+                msg_key = "prod-traffic-address-persist-failed",
                 error = %e,
                 adapter_key,
                 "failed to persist observed adapter address",

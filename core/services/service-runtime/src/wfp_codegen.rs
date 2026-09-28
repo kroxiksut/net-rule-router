@@ -16,6 +16,7 @@
 //! | [`SuffixDomain(suffix)`] | Σ | for the apex and each cached subdomain × its cached IPv4 set. Cold cache → 0 + diagnostic. |
 //! | [`Zone(zone)`] | Σ | same fan-out as `SuffixDomain` minus the apex — the bare zone label is not a member of its zone. |
 //! | App match (no address) | N | one per resolved exe path — the name/glob is resolved to concrete on-disk paths (`app_pattern` = absolute Win32 path). Unresolved name/glob → 0 + `AppUnresolved` diagnostic. |
+//! | App match + address | 0 | not enforceable as written: skipped with an `UnsupportedRuleShape` diagnostic, never widened to every application. |
 //! | Default (`StrictSecondaryFailClosed`) | 1 | catch-all `Block` filter at the lowest weight. |
 //! | Default (other modes) | 0 | the OS routing table is the catch-all. |
 //!
@@ -71,6 +72,10 @@ use nrr_domain::canonical::{
     CanonicalAddressMatch, CanonicalAppMatch, CanonicalAppPattern, CanonicalRule,
     CanonicalRuleBook, RuleAction,
 };
+use nrr_domain::rule_shape::{
+    rule_verdict, RuleShapeSupport, ShapeVerdict, UnsupportedShapeReason,
+};
+use nrr_platform_api::enforcement::EnforcementCapabilities;
 use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey};
 use nrr_shared::{RouteBehaviorMode, RouteRole};
 
@@ -137,6 +142,39 @@ pub const SUFFIX_FANOUT_BACKSTOP: usize = 4096;
 /// the cap is generous to keep edge-case CDN responses from being
 /// silently truncated, but bounded to avoid runaway filter sets.
 pub const PER_HOSTNAME_IP_CAP: usize = 64;
+
+// Whether THIS codegen and `enforcement_planner::plan_route_rules` emit an
+// application + destination rule scoped to the application. Flipped only in
+// the change that implements the emitters: a platform capability alone must
+// never make an unimplemented shape pass the submission gate.
+const EMITS_APP_SCOPED_DESTINATION_BLOCK: bool = false;
+const EMITS_APP_SCOPED_DESTINATION_ROUTE: bool = false;
+
+/// The rule shapes enforcement carries out, given `caps`: what the emitters
+/// implement AND what the platform can hold.
+#[must_use]
+pub fn rule_shape_support(caps: &EnforcementCapabilities) -> RuleShapeSupport {
+    RuleShapeSupport {
+        app_scoped_destination_block: EMITS_APP_SCOPED_DESTINATION_BLOCK
+            && caps.per_app_block_leakproof,
+        app_scoped_destination_route: EMITS_APP_SCOPED_DESTINATION_ROUTE
+            && caps.per_app_routing_true,
+    }
+}
+
+/// [`rule_shape_support`] for the OS this service runs on — the one answer the
+/// submission gate, the emitters and the explain probe share.
+#[must_use]
+pub fn current_rule_shape_support() -> RuleShapeSupport {
+    rule_shape_support(&EnforcementCapabilities::current())
+}
+
+/// Whether enforcement carries `rule` out as written. A rule that fails this is
+/// skipped entirely, never narrowed to its destination half.
+#[must_use]
+pub fn rule_shape_enforced(rule: &CanonicalRule) -> bool {
+    rule_verdict(rule, current_rule_shape_support()).is_supported()
+}
 
 // ── Input / output ──────────────────────────────────────────────────────────
 
@@ -325,6 +363,34 @@ pub enum CodegenDiagnostic {
         ip: IpAddr,
         count: usize,
     },
+    /// A Block rule left addresses alone because a narrower route rule names
+    /// them (a zone Block against an exact route). Aggregated like
+    /// [`Self::AddressClaimedByPrimary`].
+    BlockYieldedToNarrowerRule {
+        rule_id: String,
+        ip: IpAddr,
+        count: usize,
+    },
+    /// The yield above left a host the Block names reachable: `host` is not
+    /// routed by any narrower rule, it only shares `ip` with `via_host`, which
+    /// is. Aggregated per rule — one example, `count` addresses.
+    BlockLeaksSharedAddress {
+        rule_id: String,
+        ip: IpAddr,
+        host: String,
+        via_host: String,
+        count: usize,
+    },
+    /// A route rule's address is dropped by a literal-IP Block, which vetoes
+    /// every route on the address. `host` is the route's host at `ip` (empty
+    /// for a literal route). Aggregated per rule like the ones above.
+    RouteOverriddenByLiteralBlock {
+        rule_id: String,
+        block_rule_id: String,
+        ip: IpAddr,
+        host: String,
+        count: usize,
+    },
     /// An `Application` rule observed a destination a process the rule set
     /// never named is ALSO using, so the address was not pinned.
     ///
@@ -379,6 +445,13 @@ pub enum CodegenDiagnostic {
     /// impossible after `RulesJsonCodec::decode` (block 16.12.A.2)
     /// enforces the invariant, but kept as defence-in-depth.
     SkippedNoMatch { rule_id: String },
+    /// The rule's shape cannot be enforced as written (see
+    /// [`nrr_domain::rule_shape`]), so it emitted nothing. Enforcing the
+    /// destination half alone would apply it to every application.
+    UnsupportedRuleShape {
+        rule_id: String,
+        reason: UnsupportedShapeReason,
+    },
     /// Fail-closed catch-all `Block` filter was emitted. Exactly
     /// one of these appears per codegen output when
     /// `behavior_mode == StrictSecondaryFailClosed`. Useful for
@@ -409,6 +482,7 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
     // filter from this offset on is secondary-driven — that slice gives
     // us the kill-switch's protected destination set.
     let mut secondary_filter_start = 0usize;
+    let shapes = current_rule_shape_support();
     // Who owns which address, decided once by the arbiter every mechanism reads.
     // Resolved from the UNFILTERED cache: the denylist view exists to trim what
     // goes to the tunnel, and reading it here would understate what the main
@@ -459,6 +533,7 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
                 &ownership,
                 input.app_resolver,
                 input.families,
+                shapes,
                 &mut out,
             );
         }
@@ -601,6 +676,7 @@ fn generate_for_rule(
     ownership: &crate::address_ownership::AddressOwnership,
     app_resolver: &dyn nrr_platform_api::AppPathResolver,
     families: crate::enforcement_planner::FamilyScope,
+    shapes: RuleShapeSupport,
     out: &mut CodegenOutput,
 ) {
     if !rule.enabled {
@@ -618,6 +694,14 @@ fn generate_for_rule(
         out.diagnostics.push(CodegenDiagnostic::SkippedNoMatch {
             rule_id: rule.id.as_str().to_string(),
         });
+        return;
+    }
+    if let ShapeVerdict::Unsupported { reason } = rule_verdict(rule, shapes) {
+        out.diagnostics
+            .push(CodegenDiagnostic::UnsupportedRuleShape {
+                rule_id: rule.id.as_str().to_string(),
+                reason,
+            });
         return;
     }
 
@@ -643,15 +727,40 @@ fn generate_for_rule(
         RouteRole::Primary => crate::address_ownership::Link::Main,
         RouteRole::Secondary => crate::address_ownership::Link::Additional,
     };
+    // A rule naming both matches as AND; the shape gate above let one through
+    // only once the emitters below can scope the address to the application.
     if let Some(addr_match) = rule.address_match.as_ref() {
-        // A Block rule claims nothing and steers nothing — it drops its
-        // destination, so the arbiter has no say over it (module rule 3).
-        let steerable = |ip: IpAddr| {
-            matches!(rule.action, RuleAction::Block) || ownership.address_rule_may_steer(ip, link)
+        // Conflicts the user must see, noted while the fan-out walks hosts.
+        let conflicts = std::cell::RefCell::new(RuleConflicts::default());
+        // A Block steers nothing, but it still loses an address a narrower
+        // rule names — the engine's order, not the weight band, decides.
+        let steerable = |host: Option<&str>, ip: IpAddr| match rule.action {
+            RuleAction::Block => {
+                if let Some(host) = host {
+                    if let Some(via) = ownership.block_leak(host, ip, addr_match) {
+                        conflicts.borrow_mut().note_leak(ip, host, via);
+                    }
+                }
+                !ownership.block_yields(ip, addr_match)
+            }
+            RuleAction::Route => {
+                let steers = ownership.address_rule_may_steer(ip, link);
+                if steers {
+                    if let Some(block) = ownership.literal_block_of(ip) {
+                        conflicts
+                            .borrow_mut()
+                            .note_vetoed(ip, host.unwrap_or_default(), block);
+                    }
+                }
+                steers
+            }
         };
         emit_for_address_match(
             sid, role_slug, ctx, pos, rule, addr_match, cache, &steerable, out,
         );
+        conflicts
+            .into_inner()
+            .emit(rule.id.as_str(), &mut out.diagnostics);
     } else if let Some(app) = rule.app_match.as_ref() {
         emit_for_app_match(
             sid,
@@ -679,7 +788,7 @@ fn emit_for_address_match(
     rule: &CanonicalRule,
     addr_match: &CanonicalAddressMatch,
     cache: &dyn FqdnCacheLookup,
-    steerable: &dyn Fn(IpAddr) -> bool,
+    steerable: &dyn Fn(Option<&str>, IpAddr) -> bool,
     out: &mut CodegenOutput,
 ) {
     let mut held: Option<(IpAddr, usize)> = None;
@@ -688,7 +797,7 @@ fn emit_for_address_match(
         CanonicalAddressMatch::ExactIp(addr) if !ctx.families.admits(*addr) => {}
         CanonicalAddressMatch::ExactIp(addr) => {
             let addr = *addr;
-            if steerable(addr) {
+            if steerable(None, addr) {
                 emit_packed_ip_filters(
                     sid,
                     role_slug,
@@ -715,7 +824,7 @@ fn emit_for_address_match(
             }
             let mut steerable_ips = Vec::new();
             for ip in crate::enforcement_planner::capped_for_host(cache, hostname, ctx.families) {
-                if steerable(ip) {
+                if steerable(Some(hostname), ip) {
                     steerable_ips.push(ip);
                 } else {
                     note_held(&mut held, ip);
@@ -777,12 +886,57 @@ fn emit_for_address_match(
         }
     }
     if let Some((ip, count)) = held {
-        out.diagnostics
-            .push(CodegenDiagnostic::AddressClaimedByPrimary {
-                rule_id: rule.id.as_str().to_string(),
+        let rule_id = rule.id.as_str().to_string();
+        out.diagnostics.push(if ctx.is_block() {
+            CodegenDiagnostic::BlockYieldedToNarrowerRule { rule_id, ip, count }
+        } else {
+            CodegenDiagnostic::AddressClaimedByPrimary { rule_id, ip, count }
+        });
+    }
+}
+
+/// The two conflicts one address rule can run into, each kept as one example
+/// plus a count of distinct addresses.
+#[derive(Default)]
+struct RuleConflicts {
+    leak: Option<(IpAddr, String, String)>,
+    leaked: std::collections::HashSet<IpAddr>,
+    vetoed: Option<(IpAddr, String, String)>,
+    vetoed_ips: std::collections::HashSet<IpAddr>,
+}
+
+impl RuleConflicts {
+    fn note_leak(&mut self, ip: IpAddr, host: &str, via_host: &str) {
+        if self.leaked.insert(ip) && self.leak.is_none() {
+            self.leak = Some((ip, host.to_string(), via_host.to_string()));
+        }
+    }
+
+    fn note_vetoed(&mut self, ip: IpAddr, host: &str, block_rule_id: &str) {
+        if self.vetoed_ips.insert(ip) && self.vetoed.is_none() {
+            self.vetoed = Some((ip, host.to_string(), block_rule_id.to_string()));
+        }
+    }
+
+    fn emit(self, rule_id: &str, out: &mut Vec<CodegenDiagnostic>) {
+        if let Some((ip, host, via_host)) = self.leak {
+            out.push(CodegenDiagnostic::BlockLeaksSharedAddress {
+                rule_id: rule_id.to_string(),
                 ip,
-                count,
+                host,
+                via_host,
+                count: self.leaked.len(),
             });
+        }
+        if let Some((ip, host, block_rule_id)) = self.vetoed {
+            out.push(CodegenDiagnostic::RouteOverriddenByLiteralBlock {
+                rule_id: rule_id.to_string(),
+                block_rule_id,
+                ip,
+                host,
+                count: self.vetoed_ips.len(),
+            });
+        }
     }
 }
 
@@ -819,7 +973,7 @@ fn emit_suffix_fanout<F>(
     suffix_or_zone: &str,
     kind: SuffixFanoutKind,
     cache: &dyn FqdnCacheLookup,
-    steerable: &dyn Fn(IpAddr) -> bool,
+    steerable: &dyn Fn(Option<&str>, IpAddr) -> bool,
     held: &mut Option<(IpAddr, usize)>,
     out: &mut CodegenOutput,
     empty_diagnostic: F,
@@ -867,7 +1021,7 @@ fn emit_suffix_fanout<F>(
             continue;
         }
         for ip in crate::enforcement_planner::capped_for_host(cache, &sub, ctx.families) {
-            if steerable(ip) {
+            if steerable(Some(&sub), ip) {
                 fanout_ips.push(ip);
             } else {
                 note_held(held, ip);

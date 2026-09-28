@@ -680,6 +680,43 @@ fn reconciler_reports_deadline_exceeded_for_a_slow_hook() {
 }
 
 #[test]
+fn a_panicking_hook_fails_its_round_promptly_and_the_next_round_still_runs() {
+    // A dead worker left `worker_spawned` set, so every later reconcile
+    // waited out its deadline and every rule host was withheld until restart.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&calls);
+    let hook: RouteRecomputeHook = Arc::new(move || {
+        if c.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("reconcile blew up");
+        }
+    });
+    let reconciler = HookSyncReconciler::new(hook);
+    let deadline = Duration::from_secs(5);
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        reconciler.reconcile_now(deadline),
+        ReconcileOutcome::DeadlineExceeded,
+        "a panicked round did not install"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the failure is reported at once, not at the deadline ({:?})",
+        started.elapsed()
+    );
+
+    assert_eq!(
+        reconciler.reconcile_now(deadline),
+        ReconcileOutcome::Installed
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one run per round, no retry spin"
+    );
+}
+
+#[test]
 fn concurrent_reconciles_coalesce_onto_a_shared_run() {
     // under the armed block-all a burst of direct-host answers
     // used to spawn a full reconcile EACH, convoying on the orchestrator

@@ -156,12 +156,14 @@ pub(crate) fn build_runtime_deps(
             if let Err(reason) = cycle.teardown() {
                 tracing::error!(
                     target: "nrr::enforcement",
+                    msg_key = "linux-svc-policy-teardown-failed",
                     reason = %reason,
                     "policy could NOT be removed on stop: the machine may still be enforcing rules no service is maintaining",
                 );
             } else {
                 tracing::info!(
                     target: "nrr::enforcement",
+                    msg_key = "linux-svc-policy-teardown-ok",
                     "policy removed on stop: filters and owned routes are gone",
                 );
             }
@@ -247,7 +249,10 @@ pub(crate) fn build_runtime_deps(
             Arc::new(
                 nrr_service_runtime::dns_refresh::DnsRefreshOrchestrator::new(
                     Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
-                        Arc::new(crate::dns_stack::service_dns_resolver(dns_capture)),
+                        Arc::new(crate::dns_stack::service_dns_resolver(
+                            dns_capture,
+                            &artifacts.topology.data_dir,
+                        )),
                     )),
                     store,
                 ),
@@ -395,6 +400,7 @@ pub(crate) fn build_ipc_server(
         None => {
             tracing::error!(
                 target: "nrr::ipc",
+                msg_key = "linux-svc-no-state-database",
                 "no state database: only the handshake, subscription and health operations \
                  are served — the GUI will show the service as needing recovery",
             );
@@ -465,6 +471,7 @@ fn app_destination_memory(
                     {
                         tracing::warn!(
                             target: "nrr::app-routing",
+                            msg_key = "linux-svc-app-destinations-persist-failed",
                             error = %e,
                             "application destinations could not be persisted — continuing",
                         );
@@ -489,6 +496,7 @@ fn app_destination_memory(
     if admitted > 0 {
         tracing::info!(
             target: "nrr::app-routing",
+            msg_key = "linux-svc-app-destinations-restored",
             admitted,
             "application destinations restored from the previous session",
         );
@@ -640,6 +648,7 @@ fn open_traffic_sampler(path: &std::path::Path) -> Option<TrafficSamplerHandle> 
         Err(e) => {
             tracing::warn!(
                 target: "nrr::runtime",
+                msg_key = "linux-svc-traffic-db-unavailable",
                 error = %e,
                 path = %path.display(),
                 "traffic-stats DB unavailable; the traffic counter is off",
@@ -650,6 +659,7 @@ fn open_traffic_sampler(path: &std::path::Path) -> Option<TrafficSamplerHandle> 
     if let Some(reason) = &opened.rebuilt_reason {
         tracing::info!(
             target: "nrr::runtime",
+            msg_key = "linux-svc-traffic-db-recreated",
             path = %path.display(),
             reason = %reason,
             "traffic-stats DB was recreated after an open/migration failure",
@@ -662,6 +672,7 @@ fn open_traffic_sampler(path: &std::path::Path) -> Option<TrafficSamplerHandle> 
         Err(e) => {
             tracing::warn!(
                 target: "nrr::runtime",
+                msg_key = "linux-svc-traffic-sampler-prime-failed",
                 error = %e,
                 "traffic sampler could not be primed; the traffic counter is off",
             );
@@ -762,6 +773,7 @@ pub(crate) fn build_policy_stack(
         None => {
             tracing::error!(
                 target: "nrr::enforcement",
+                msg_key = "linux-svc-no-fqdn-cache",
                 "no FQDN cache: rules naming a domain will be enforced for NO addresses",
             );
             return None;
@@ -794,7 +806,10 @@ pub(crate) fn build_policy_stack(
     let rule_seeder = Arc::new(
         RuleHostnameSeeder::new(
             Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
-                Arc::new(crate::dns_stack::service_dns_resolver(dns_capture)),
+                Arc::new(crate::dns_stack::service_dns_resolver(
+                    dns_capture,
+                    &artifacts.topology.data_dir,
+                )),
             )),
             Arc::clone(&cache_store),
             Arc::clone(&fqdn_cache),

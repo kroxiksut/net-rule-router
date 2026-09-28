@@ -15,17 +15,36 @@
 //!
 //! `Clone` shares the inner `Mutex` (it wraps an `Arc`), so the writer and
 //! reader observe the same state.
+//!
+//! The same hand-off carries the rule conflicts the compute found (a literal-IP
+//! Block over a route, a Block leaking a shared address): they are the other
+//! half of "what the last compute enforced differently from the rules", and
+//! riding the existing channel keeps one writer and one reader for both.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
+use nrr_shared::ipc_payloads::RuleConflictDto;
+
+/// Ceiling on the conflicts kept per principal, so one pathological rule book
+/// cannot grow the snapshot past a frame.
+const MAX_RULE_CONFLICTS: usize = 128;
+
 /// Latest set of application rules whose exe could not be resolved to a path
-/// (so their per-process `ALE_APP_ID` filter was not built). Written by the
-/// orchestrator on every filter compute, read by the `SnapshotInitial`
-/// handler for the GUI banner. Entries are the rule's app pattern (e.g.
-/// `"ab.exe"`, `"disko*.exe"`), stored sorted + deduped.
+/// (so their per-process `ALE_APP_ID` filter was not built), plus each
+/// principal's rule conflicts. Written by the orchestrator on every applying
+/// compute, read by the `SnapshotInitial` handler. App entries are the rule's
+/// pattern (e.g. `"ab.exe"`, `"disko*.exe"`), stored sorted + deduped.
 #[derive(Clone, Default)]
-pub struct AppEnforcementStatus(Arc<Mutex<Vec<String>>>);
+pub struct AppEnforcementStatus(Arc<Mutex<EnforcementState>>);
+
+#[derive(Default)]
+struct EnforcementState {
+    unresolved: Vec<String>,
+    /// Per principal: a conflict names that user's own rules and addresses.
+    conflicts: HashMap<String, Vec<RuleConflictDto>>,
+}
 
 impl AppEnforcementStatus {
     /// Construct an empty status (no unresolved app rules).
@@ -40,14 +59,41 @@ impl AppEnforcementStatus {
         apps.sort();
         apps.dedup();
         if let Ok(mut guard) = self.0.lock() {
-            *guard = apps;
+            guard.unresolved = apps;
         }
     }
 
     /// Snapshot the current set (already sorted + deduped). A poisoned lock
     /// recovers the inner value rather than panicking.
     pub fn unresolved(&self) -> Vec<String> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unresolved
+            .clone()
+    }
+
+    /// Replace `principal`'s rule conflicts; an empty list forgets them.
+    pub fn set_rule_conflicts(&self, principal: &str, mut conflicts: Vec<RuleConflictDto>) {
+        conflicts.truncate(MAX_RULE_CONFLICTS);
+        if let Ok(mut guard) = self.0.lock() {
+            if conflicts.is_empty() {
+                guard.conflicts.remove(principal);
+            } else {
+                guard.conflicts.insert(principal.to_string(), conflicts);
+            }
+        }
+    }
+
+    /// `principal`'s rule conflicts from its last applying compute.
+    pub fn rule_conflicts(&self, principal: &str) -> Vec<RuleConflictDto> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .conflicts
+            .get(principal)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -183,9 +229,127 @@ impl FailClosedPostureStatus {
     }
 }
 
+/// The rule conflicts in one codegen pass, projected for the GUI.
+///
+/// Read off the codegen's own diagnostics rather than re-derived, so what the
+/// user is told is exactly what was enforced.
+#[must_use]
+pub fn rule_conflicts_from(
+    diagnostics: &[crate::wfp_codegen::CodegenDiagnostic],
+    rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+) -> Vec<RuleConflictDto> {
+    use crate::wfp_codegen::CodegenDiagnostic;
+    use nrr_shared::ipc_payloads::RuleConflictKind;
+
+    let rule_of = |rule_id: &str| {
+        rule_book
+            .primary
+            .rules()
+            .iter()
+            .chain(rule_book.secondary.rules())
+            .find(|r| r.id.as_str() == rule_id)
+    };
+    let value_of = |rule_id: &str| -> String {
+        rule_of(rule_id)
+            .and_then(|r| r.address_match.as_ref())
+            .map(display_value)
+            .unwrap_or_default()
+    };
+    diagnostics
+        .iter()
+        .filter_map(|d| match d {
+            CodegenDiagnostic::RouteOverriddenByLiteralBlock {
+                rule_id,
+                block_rule_id,
+                ip,
+                host,
+                count,
+            } => Some(RuleConflictDto {
+                kind: RuleConflictKind::LiteralBlockOverridesRoute,
+                rule_id: rule_id.clone(),
+                rule_value: value_of(rule_id),
+                ip: ip.to_string(),
+                count: u32::try_from(*count).unwrap_or(u32::MAX),
+                other_rule_id: block_rule_id.clone(),
+                host: host.clone(),
+                via_host: String::new(),
+                app: String::new(),
+            }),
+            CodegenDiagnostic::BlockLeaksSharedAddress {
+                rule_id,
+                ip,
+                host,
+                via_host,
+                count,
+            } => Some(RuleConflictDto {
+                kind: RuleConflictKind::BlockLeaksSharedAddress,
+                rule_id: rule_id.clone(),
+                rule_value: value_of(rule_id),
+                ip: ip.to_string(),
+                count: u32::try_from(*count).unwrap_or(u32::MAX),
+                other_rule_id: String::new(),
+                host: host.clone(),
+                via_host: via_host.clone(),
+                app: String::new(),
+            }),
+            CodegenDiagnostic::UnsupportedRuleShape { rule_id, .. } => Some(RuleConflictDto {
+                kind: RuleConflictKind::UnsupportedRuleShape,
+                rule_id: rule_id.clone(),
+                rule_value: value_of(rule_id),
+                ip: String::new(),
+                count: 0,
+                other_rule_id: String::new(),
+                host: String::new(),
+                via_host: String::new(),
+                app: rule_of(rule_id)
+                    .and_then(|r| r.app_match.as_ref())
+                    .map(|a| a.pattern.as_str().to_string())
+                    .unwrap_or_default(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A rule's address as the rules table spells it.
+fn display_value(m: &nrr_domain::canonical::CanonicalAddressMatch) -> String {
+    use nrr_domain::canonical::CanonicalAddressMatch;
+    match m {
+        CanonicalAddressMatch::ExactFqdn(host) => host.clone(),
+        CanonicalAddressMatch::SuffixDomain(suffix) => format!("*.{suffix}"),
+        CanonicalAddressMatch::Zone(zone) => zone.clone(),
+        CanonicalAddressMatch::ExactIp(ip) => ip.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_conflicts_are_kept_per_principal_and_cleared_by_an_empty_set() {
+        use nrr_shared::ipc_payloads::RuleConflictKind;
+        let status = AppEnforcementStatus::new();
+        let conflict = RuleConflictDto {
+            kind: RuleConflictKind::BlockLeaksSharedAddress,
+            rule_id: "b1".into(),
+            rule_value: "example".into(),
+            ip: "192.0.2.10".into(),
+            count: 1,
+            other_rule_id: String::new(),
+            host: "b.example".into(),
+            via_host: "a.example".into(),
+            app: String::new(),
+        };
+        status.set_rule_conflicts("S-1", vec![conflict.clone()]);
+        assert_eq!(status.rule_conflicts("S-1"), vec![conflict]);
+        assert!(
+            status.rule_conflicts("S-2").is_empty(),
+            "another user sees none"
+        );
+        status.set_rule_conflicts("S-1", Vec::new());
+        assert!(status.rule_conflicts("S-1").is_empty());
+    }
 
     #[test]
     fn fail_closed_posture_round_trips_and_shares_state() {

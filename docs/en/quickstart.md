@@ -90,8 +90,9 @@ four ways:
 | Application | `chrome.exe` | all traffic from that process |
 
 Rules are applied from specific to general: an exact domain beats
-subdomains, subdomains beat zones. A rule can combine address **and**
-application — then both conditions must match.
+subdomains, subdomains beat zones. A rule names either an address or an
+application: a rule that limits an address to one application cannot be
+carried out yet, so the service refuses it.
 
 ![Rules: each rule names what it matches and which route it takes](images/rules.png)
 
@@ -149,6 +150,11 @@ connection. Answering is not the same as serving — some sites answer a
 main-connection address with a refusal — so the decision stays yours: open the
 list and add it if the site is not actually working for you.
 
+When you accept a suggestion, the app refreshes your own open connections to
+that site so the page picks up the new route; other programs and other people
+on the PC are left alone. If the page could not be refreshed, the app asks you
+to reload it (F5).
+
 ![Suggested addresses: the whole list, with the site each address belongs to](images/suggested-addresses.png)
 
 ### Overlapping rules
@@ -162,10 +168,28 @@ wildcard, a wildcard beats a zone, a longer name beats a shorter one.
 take. Press **Correct** to confirm a pair, or send those sites over the other
 route. A confirmed pair leaves the list; **Show resolved** brings it back.
 The number next to the entry counts the pairs you have not confirmed yet; the
-entry is hidden while there are none. A change here is an ordinary edit of
-your rules list and takes effect after **Apply**.
+entry is hidden while there is nothing to show. A change here is an ordinary
+edit of your rules list and takes effect after **Apply**.
+
+Above the pairs, **Conflicts in the applied rules** lists rules the service
+carries out differently from how they read: a blocked address that also stops
+a site you route, a block that cannot close a site because it shares an
+address with one a narrower rule routes, or a rule that is not enforced at
+all. The list reflects the rules currently applied and updates after
+**Apply**.
 
 ![Overlaps: which rule wins, over which route, and a decision for each pair](images/rule-overlaps.png)
+
+### Work computers by a short name
+
+Machines at work are often opened by a short name such as `wiki` or
+`timesheet`. With a work VPN connected these names keep working: a VPN that
+announces its network domain is picked up on its own. If yours does not, name
+the domain in Settings → *Routing* → **Short names**.
+
+Suggestions never offer a bare short name: a rule for `wiki` alone would reach
+far beyond the one machine. When the app knows the full name, such as
+`wiki.corp.example`, that is what it offers.
 
 ### If you have no additional connection
 

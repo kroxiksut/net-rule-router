@@ -127,6 +127,7 @@ fn build_dns_resolver_instance(
         if !signed_in() {
             tracing::info!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-stack-modeb-no-signed-in-user",
                 "Mode B: no signed-in user yet — staying reactive until sign-in",
             );
             return None;
@@ -140,6 +141,7 @@ fn build_dns_resolver_instance(
     let Some(upstream_dns) = upstream_pool.refresh() else {
         tracing::warn!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-stack-modeb-no-upstream-answered",
             "Mode B requested but no upstream IPv4 DNS answered a probe; staying reactive",
         );
         return None;
@@ -233,6 +235,8 @@ fn build_dns_resolver_instance(
         crate::dns_resolver_ports::ActiveSidEnforcedAddresses::new(Arc::clone(active_sid)),
     ));
     listener = listener.with_private_resolvers(private_resolvers);
+    let user_suffix = short_name_suffix(Arc::clone(&inputs.settings_conn), Arc::clone(active_sid));
+    listener = listener.with_short_name_suffix(Arc::clone(&user_suffix));
     listener = listener.with_ipv6_disposition({
         let sid = Arc::clone(active_sid);
         Arc::new(move || {
@@ -303,6 +307,7 @@ fn build_dns_resolver_instance(
     }
     tracing::info!(
         target: "nrr::dns-resolver",
+        msg_key = "dns-stack-modeb-armed",
         upstream = %upstream_dns,
         listener = %platform.listen_addr,
         "Mode B armed: the local DNS resolver forwards non-rule queries to an upstream that answered a probe",
@@ -318,8 +323,28 @@ fn build_dns_resolver_instance(
         .with_namespace_exemptions(Arc::clone(&platform.claimed_namespaces))
         // A VPN connecting mid-session claims its namespace the moment its link
         // appears, not on the next guard tick.
-        .with_namespace_recheck(Arc::clone(namespace_recheck())),
+        .with_namespace_recheck(Arc::clone(namespace_recheck()))
+        // The OS completes a short name before it asks anyone, and the redirect
+        // can cost it the suffixes to complete with.
+        .with_short_name_suffixes(Arc::new(move || user_suffix().into_iter().collect())),
     )
+}
+
+/// The routing principal's short-name domain, read when a bare label comes
+/// back unanswered — rare enough that a settings read per lookup costs nothing.
+fn short_name_suffix(
+    settings: Arc<Mutex<Connection>>,
+    active_sid: crate::supervised_runtime::ActiveRoutingSidFn,
+) -> crate::dns_listener::ShortNameSuffixFn {
+    Arc::new(move || {
+        let sid = active_sid()?;
+        let conn = settings.lock().unwrap_or_else(|p| p.into_inner());
+        let policy = nrr_storage::route_bindings::RouteBindingsRepository::new(&conn)
+            .load_for_sid(&sid)
+            .ok()?;
+        (policy.short_name_completion && !policy.short_name_suffix.is_empty())
+            .then_some(policy.short_name_suffix)
+    })
 }
 
 /// The persisted enforcement mode. The default on a lock or read failure, like
@@ -365,4 +390,50 @@ pub fn routing_principal_from(
         *cached = Some((std::time::Instant::now(), principal.clone()));
         principal
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+    use nrr_storage::repository::MigrationRunner;
+    use nrr_storage::route_bindings::{BindingSource, RouteBindingsRepository, RoutePolicyRecord};
+
+    const SID: &str = "S-1-5-21-0-0-0-1001";
+
+    fn settings_with(
+        completion: bool,
+        suffix: &str,
+    ) -> (tempfile::TempDir, Arc<Mutex<Connection>>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runner = SqliteMigrationRunner::for_state_db(
+            open_connection(&dir.path().join("state.db")).expect("open"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        let conn = runner.into_connection();
+        let mut policy = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        policy.short_name_completion = completion;
+        policy.short_name_suffix = suffix.to_string();
+        RouteBindingsRepository::new(&conn)
+            .update_for_sid(SID, &policy, 0)
+            .expect("write policy");
+        (dir, Arc::new(Mutex::new(conn)))
+    }
+
+    fn suffix_for(conn: Arc<Mutex<Connection>>, sid: Option<&'static str>) -> Option<String> {
+        short_name_suffix(conn, Arc::new(move || sid.map(str::to_string)))()
+    }
+
+    #[test]
+    fn the_listener_reads_the_routing_users_short_name_domain() {
+        let (_dir, conn) = settings_with(true, "corp.example");
+        assert_eq!(
+            suffix_for(Arc::clone(&conn), Some(SID)).as_deref(),
+            Some("corp.example")
+        );
+        assert_eq!(suffix_for(conn, None), None, "nobody routed, nothing named");
+
+        let (_dir, off) = settings_with(false, "corp.example");
+        assert_eq!(suffix_for(off, Some(SID)), None, "the switch is off");
+    }
 }

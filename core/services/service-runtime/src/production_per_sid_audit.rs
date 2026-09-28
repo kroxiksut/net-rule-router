@@ -108,6 +108,7 @@ impl PerSidApplyAudit for ProductionPerSidApplyAudit {
         if let Err(e) = self.writer.append(input) {
             tracing::error!(
                 target: "nrr::audit",
+                msg_key = "prod-audit-per-sid-append-failed",
                 error = %format!("{e:?}"),
                 sid = %record.sid,
                 kind = %record.kind.slug(),

@@ -84,7 +84,9 @@ The full walkthrough, including what to do if you lose network access, is in
 - **Per-name routing** — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
 - **Fail-Closed** — if `secondary` goes down, matching traffic is held rather than silently leaking to `primary`.
 - **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
-- **Overlaps** — when rules of the two routes cover the same sites (a zone on one route, a site inside it on the other), the narrower rule wins, and the app lists every such pair with the route its sites actually take. Confirm each one, or send those sites over the other route in one click.
+- **Overlaps** — when rules of the two routes cover the same sites (a zone on one route, a site inside it on the other), the narrower rule wins, and the app lists every such pair with the route its sites actually take. Confirm each one, or send those sites over the other route in one click. The same screen points out applied rules that work
+  differently from how they read — for example an address block that also
+  stops a site you route.
 - **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
 - **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
 - **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a background service that applies policy at startup. The tray menu and its notices are still being shaped ahead of the first release; what they contain and how they look may change between builds.
@@ -109,7 +111,9 @@ and stops at the first match:
 Notes:
 
 - An **exact IP** always wins over the zone it sits in: the narrower rule wins.
-- A rule may combine an address match **and** an app match — both must hold (logical **AND**).
+- A rule names a destination **or** an application. A rule that limits an
+  address to one application cannot be carried out yet, so the service refuses
+  it rather than applying it to every application.
 - **CIDR subnets and IP ranges arrive in the next alpha.** Ports and protocols
   are not supported.
 - IPv6 addresses work in rules. They travel the additional connection when it

@@ -297,6 +297,7 @@ mod windows_impl {
             if reader.is_none() {
                 tracing::warn!(
                     target: "nrr::fake-ip",
+                    msg_key = "win-fakeip-reader-spawn-failed",
                     "wintun reader thread failed to spawn — device reads will report end-of-stream",
                 );
             }
@@ -394,6 +395,7 @@ mod windows_impl {
                 Err(err) => {
                     tracing::warn!(
                         target: "nrr::fake-ip",
+                        msg_key = "win-fakeip-receive-failed",
                         error = %err,
                         "wintun receive failed — reader thread exiting",
                     );
@@ -515,6 +517,7 @@ impl TunDevice for windows_impl::WintunDevice {
                 if packet.len() > buf.len() {
                     tracing::warn!(
                         target: "nrr::fake-ip",
+                        msg_key = "win-fakeip-packet-too-large",
                         packet_len = packet.len(),
                         buf_len = buf.len(),
                         "inbound TUN packet exceeds the read buffer — dropped",

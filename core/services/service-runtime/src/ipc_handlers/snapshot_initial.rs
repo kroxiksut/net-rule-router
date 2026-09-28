@@ -164,6 +164,8 @@ impl IpcHandler for SnapshotInitialHandler {
         // Block-all posture for the "leak protection is blocking
         // unknown traffic" banner.
         let kill_switch_block_all_armed = self.block_all_posture.armed();
+        // The caller's own conflicts only: they name its rules and addresses.
+        let rule_conflicts = self.app_enforcement.rule_conflicts(ctx.caller_stored());
 
         let resp = SnapshotInitialResponse {
             health,
@@ -182,6 +184,7 @@ impl IpcHandler for SnapshotInitialHandler {
             kill_switch_shared_ip_exemptions,
             kill_switch_shared_ip_exemption_addresses,
             kill_switch_block_all_armed,
+            rule_conflicts,
         };
         serde_json::to_value(resp).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
@@ -331,5 +334,80 @@ mod tests {
         );
         // The block-all posture rides the same snapshot.
         assert!(parsed.kill_switch_block_all_armed);
+    }
+
+    /// Conflicts are read for the CALLER: they name its own rules and
+    /// addresses, and another user's never reach it.
+    #[test]
+    fn surfaces_only_the_callers_rule_conflicts() {
+        use nrr_domain::user_principal::UserPrincipal;
+        use nrr_shared::ipc_payloads::{RuleConflictDto, RuleConflictKind};
+        let caller = UserPrincipal::from_linux_uid(1000);
+        let conflict = RuleConflictDto {
+            kind: RuleConflictKind::LiteralBlockOverridesRoute,
+            rule_id: "r1".into(),
+            rule_value: "a.example".into(),
+            ip: "192.0.2.10".into(),
+            count: 1,
+            other_rule_id: "b1".into(),
+            host: "a.example".into(),
+            via_host: String::new(),
+            app: String::new(),
+        };
+        let unsupported = RuleConflictDto {
+            kind: RuleConflictKind::UnsupportedRuleShape,
+            rule_id: "c1".into(),
+            rule_value: "c.example".into(),
+            ip: String::new(),
+            count: 0,
+            other_rule_id: String::new(),
+            host: String::new(),
+            via_host: String::new(),
+            app: "app.exe".into(),
+        };
+        let app_enforcement = AppEnforcementStatus::new();
+        app_enforcement.set_rule_conflicts(
+            caller.as_stored(),
+            vec![conflict.clone(), unsupported.clone()],
+        );
+        app_enforcement.set_rule_conflicts(
+            UserPrincipal::from_linux_uid(1001).as_stored(),
+            vec![RuleConflictDto {
+                rule_id: "other".into(),
+                ..conflict.clone()
+            }],
+        );
+        let h = SnapshotInitialHandler::new(
+            Arc::new(FakeHealth {
+                state: ServiceRuntimeState::Running,
+                severity: ServiceHealthSeverity::Ok,
+            }),
+            Arc::new(FakePolicy { revision: None }),
+            Arc::new(FakeAdapters::empty()),
+            Arc::new(FakeDiagnostics::healthy()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutePolicy::default()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeApplyFailurePolicy),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutingPause),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeAutostart),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRetention),
+            app_enforcement,
+            crate::app_enforcement_status::SharedIpExemptionStatus::new(),
+            crate::app_enforcement_status::BlockAllPostureStatus::new(),
+        );
+        let ctx = IpcRequestContext {
+            caller_principal: Some(caller),
+            ..ctx()
+        };
+
+        let resp = h.handle(&req(), &ctx).unwrap();
+        assert_eq!(
+            resp["rule-conflicts"][0]["kind"],
+            "literal-block-overrides-route"
+        );
+        assert_eq!(resp["rule-conflicts"][1]["kind"], "unsupported-rule-shape");
+        assert_eq!(resp["rule-conflicts"][1]["app"], "app.exe");
+        assert!(resp["rule-conflicts"][0].get("app").is_none());
+        let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
+        assert_eq!(parsed.rule_conflicts, vec![conflict, unsupported]);
     }
 }

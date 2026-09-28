@@ -14,6 +14,17 @@ can always choose **"My VPN isn't listed / pick it manually"** and point at the
 program's `.exe` yourself. The list below only makes the program show up
 automatically so you don't have to.
 
+## A second VPN beside yours
+
+If you also run another VPN — typically a corporate one for work — next to the
+connection you route through, leak protection leaves that VPN's own connection
+alone rather than cutting it off along with everything else. On Windows this
+includes the VPN connections built into the system (L2TP, PPTP, SSTP, IKEv2).
+
+A connection your provider delivers the internet itself over — PPPoE, or a
+mobile-broadband modem — is not someone else's VPN: it is treated as an
+ordinary main connection, and leak protection covers it like any other.
+
 ## How detection works
 
 The app scans your **running programs** and **installed programs** and flags any

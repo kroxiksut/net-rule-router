@@ -11,18 +11,17 @@
 //! `set_by_sid` captures `IpcRequestContext.caller_stored()` for the audit
 //! trail.
 //!
-//! Elevation: the catalogue marks this operation as requiring the service
-//! mutation privilege, but the envelope class it travels under does not, and
-//! the router gates on the class. Every field here is therefore writable by an
-//! ordinary client — which is fine for stability and diagnostics toggles, and
-//! is NOT fine for the administrative rules lock. That one field is checked
-//! against the caller's elevation inside the Set handler; see
-//! `rules_lock_change_is_authorised`.
+//! Elevation: the row is one per machine — enforcement mode, fake-IP, the
+//! stop policy and the rules lock apply to every user. The envelope class does
+//! not demand elevation, so the Set handler checks the VALUE (see
+//! `crate::machine_scoped`): an unelevated save passes only when it leaves the
+//! row as stored. An unelevated GUI gets `Forbidden` and the launcher retries
+//! through the elevation broker.
 
 use std::sync::Arc;
 
 use nrr_shared::ipc_payloads::{
-    ServiceStabilityConfigGetRequest, ServiceStabilityConfigSetRequest,
+    ServiceStabilityConfigDto, ServiceStabilityConfigGetRequest, ServiceStabilityConfigSetRequest,
 };
 
 use crate::ipc::{
@@ -87,8 +86,8 @@ impl IpcHandler for ServiceStabilityConfigGetHandler {
 pub struct ServiceStabilityConfigSetHandler {
     writer: Arc<dyn ServiceStabilityConfigWriter>,
     /// Reader for the current row, used to tell an actual change of the
-    /// administrative rules lock from a client merely echoing it back. `None`
-    /// (stub wiring) leaves that check inert — there is no stored lock to
+    /// machine-wide change from a client merely echoing the row back. `None`
+    /// (stub wiring) leaves that check inert — there is no stored row to
     /// protect when the whole settings subsystem is a stub.
     provider: Option<Arc<dyn ServiceStabilityConfigProvider>>,
 }
@@ -101,56 +100,54 @@ impl ServiceStabilityConfigSetHandler {
         }
     }
 
-    /// Attach the reader so the handler can enforce that only an elevated
-    /// caller changes the administrative rules lock.
+    /// Attach the reader so the handler can tell a change from an echo.
     #[must_use]
     pub fn with_provider(mut self, provider: Arc<dyn ServiceStabilityConfigProvider>) -> Self {
         self.provider = Some(provider);
         self
     }
 
-    /// The lock is the one field on this row that a restricted user must not
-    /// be able to write — otherwise it would be lifted by the very account it
-    /// restricts, and the whole feature would be decorative.
-    ///
-    /// The envelope class this operation travels under does not demand
-    /// elevation (every other field here is an ordinary settings toggle), so
-    /// the check lives at the field, not at the class: a non-elevated caller
-    /// may save anything as long as it leaves the lock where it found it.
-    /// That distinction matters because clients read-modify-write the whole
-    /// row — refusing every save that merely echoes the current value would
-    /// break settings for exactly the users the lock applies to.
-    fn rules_lock_change_is_authorised(
-        &self,
-        requested: Option<bool>,
-        caller_is_elevated: bool,
-    ) -> bool {
-        if caller_is_elevated {
-            return true;
-        }
-        let (Some(requested), Some(provider)) = (requested, self.provider.as_ref()) else {
-            return true;
+    /// Wire names of the fields this request would change. Clients
+    /// read-modify-write the whole row, so an unelevated save is normally a
+    /// pure echo and must keep passing; anything else is an administrator's
+    /// call. A lock of `None` means "leave it alone" and is never a change.
+    fn machine_changes(&self, requested: &ServiceStabilityConfigDto) -> Vec<String> {
+        let Some(provider) = self.provider.as_ref() else {
+            return Vec::new();
         };
-        // A stored `None` means the row has never carried an opinion, so
-        // there is nothing yet for a request to contradict.
-        match provider.get().allow_user_rule_edits {
-            None => true,
-            Some(stored) => stored == requested,
+        let current = provider.get();
+        let (Ok(serde_json::Value::Object(mut want)), Ok(serde_json::Value::Object(have))) = (
+            serde_json::to_value(requested),
+            serde_json::to_value(&current),
+        ) else {
+            return vec!["config".to_string()];
+        };
+        if requested.allow_user_rule_edits.is_none() {
+            want.remove(RULES_LOCK_WIRE_KEY);
         }
+        want.into_iter()
+            .filter(|(key, value)| have.get(key) != Some(value))
+            .map(|(key, _)| key)
+            .collect()
     }
 }
+
+const RULES_LOCK_WIRE_KEY: &str = "allow-user-rule-edits";
 
 impl IpcHandler for ServiceStabilityConfigSetHandler {
     fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         const OP: &str = "settings.service-stability.set";
         let req: ServiceStabilityConfigSetRequest =
             serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?;
-        if !self.rules_lock_change_is_authorised(
-            req.config.allow_user_rule_edits,
-            ctx.caller_is_elevated,
-        ) {
+        let changed = if ctx.caller_is_elevated {
+            Vec::new()
+        } else {
+            self.machine_changes(&req.config)
+        };
+        if changed.iter().any(|key| key == RULES_LOCK_WIRE_KEY) {
             tracing::warn!(
                 target: "nrr::stability",
+                msg_key = "svcstability-rules-lock-refused",
                 caller = %ctx.caller_stored(),
                 requested = ?req.config.allow_user_rule_edits,
                 "refused a non-elevated attempt to change the administrative rules lock",
@@ -160,6 +157,18 @@ impl IpcHandler for ServiceStabilityConfigSetHandler {
                 message: "changing who may edit routing rules requires an elevated client".into(),
                 diagnostics_id: None,
             });
+        }
+        if !changed.is_empty() {
+            tracing::warn!(
+                target: "nrr::stability",
+                msg_key = "svcstability-machine-change-refused",
+                caller = %ctx.caller_stored(),
+                fields = %changed.join(", "),
+                "refused a non-elevated change of machine-wide service settings",
+            );
+            return Err(crate::machine_scoped::machine_scoped_refusal(
+                "This service setting",
+            ));
         }
         let sid = if ctx.caller_stored().is_empty() {
             None
@@ -172,6 +181,7 @@ impl IpcHandler for ServiceStabilityConfigSetHandler {
         // prior→written lines at the same timestamp.
         tracing::info!(
             target: "nrr::stability",
+            msg_key = "svcstability-set-requested",
             origin = req.origin.as_deref().unwrap_or("unspecified"),
             requested_enforcement_mode = %req.config.enforcement_mode,
             requested_verbose = req.config.verbose_logging,
@@ -187,6 +197,7 @@ impl IpcHandler for ServiceStabilityConfigSetHandler {
         let outcome = self.writer.set(&req.config, sid);
         tracing::info!(
             target: "nrr::stability",
+            msg_key = "svcstability-set-completed",
             origin = req.origin.as_deref().unwrap_or("unspecified"),
             elapsed_ms = started.elapsed().as_millis() as u64,
             ok = outcome.is_ok(),
@@ -205,7 +216,6 @@ impl IpcHandler for ServiceStabilityConfigSetHandler {
 mod tests {
     use super::*;
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
-    use nrr_shared::ipc_payloads::ServiceStabilityConfigDto;
     use std::sync::Mutex;
 
     use crate::ipc::{IpcOperationClass, IpcRequestContext, IpcRequestEnvelope};
@@ -361,12 +371,13 @@ mod tests {
         }
     }
 
+    /// The stored row is decoded from the same JSON the tests send, so an
+    /// unchanged payload really is an echo field for field.
     fn provider_with_lock(allow: bool) -> Arc<dyn ServiceStabilityConfigProvider> {
+        let stored =
+            serde_json::from_value(set_lock_payload(allow)["config"].clone()).expect("stored row");
         Arc::new(FakeProvider {
-            config: Mutex::new(ServiceStabilityConfigDto {
-                allow_user_rule_edits: Some(allow),
-                ..Default::default()
-            }),
+            config: Mutex::new(stored),
         })
     }
 
@@ -468,6 +479,31 @@ mod tests {
         )
         .expect("a save with no opinion on the lock must pass");
         assert!(writer2.config.lock().unwrap().is_some());
+    }
+
+    /// Enforcement mode, fake-IP and the rest apply to every user of the
+    /// machine; one user switching them would switch them for all.
+    #[test]
+    fn a_non_elevated_caller_cannot_change_a_machine_wide_setting() {
+        let writer = recording_writer();
+        let h = handler_with(Arc::clone(&writer) as Arc<dyn ServiceStabilityConfigWriter>);
+        let mut payload = set_lock_payload(false);
+        payload["config"]["enforcement-mode"] = serde_json::json!("reactive");
+        let err = h
+            .handle(
+                &env(payload.clone(), IpcOperationName::ServiceStabilityConfigSet),
+                &non_elevated_ctx(),
+            )
+            .expect_err("switching the enforcement mode is an administrator's call");
+        assert_eq!(err.code, IpcErrorCode::Forbidden);
+        assert!(writer.config.lock().unwrap().is_none());
+
+        h.handle(
+            &env(payload, IpcOperationName::ServiceStabilityConfigSet),
+            &ctx(),
+        )
+        .expect("an elevated caller may change it");
+        assert!(writer.config.lock().unwrap().is_some());
     }
 
     /// The administrator sets and lifts it freely.

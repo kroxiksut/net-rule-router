@@ -15,6 +15,9 @@ QtObject {
 
     /// Pairs from the last `local.rules-overlaps` pass.
     property var overlaps: []
+    /// Address conflicts in the applied rules, from the service snapshot.
+    readonly property var conflicts: root && root.uiRevision >= 0
+        ? (root.routingState.ruleConflicts || []) : []
 
     readonly property int pendingCount: root && root.uiRevision >= 0 ? _pending().length : 0
 

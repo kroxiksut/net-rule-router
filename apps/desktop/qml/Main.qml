@@ -50,7 +50,7 @@ ApplicationWindow {
             "This is not available on your operating system yet, so the controls here stay off. "
             + "Nothing here is sent to the background service.")
         : ""
-    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
+    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, appGroupsOfferDismissed: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
     // The section open at launch loads synchronously: an asynchronous first
     // load could stall with an empty pane until the user clicked something.
@@ -780,10 +780,8 @@ ApplicationWindow {
     // An id is not a property: without the alias `root.aboutWindow` is undefined
     // and the About-on-launch path opens nothing.
     property alias aboutWindow: aboutWindow
-    property alias ruleDiagnosticsWindow: ruleDiagnosticsWindow
-    property alias cacheWindow: cacheWindow
     // Cache row count, shown both on the Diagnostics summary card and in the
-    // cache window. One number with one writer per refresh, so the two
+    // cache section. One number with one writer per refresh, so the two
     // surfaces cannot disagree. -1 = not read yet.
     property int diagCacheEntriesTotal: -1
     // Same reason: the extracted startup and backlog controllers re-arm these
@@ -983,6 +981,7 @@ ApplicationWindow {
         if (id === "rule-virtual-machines") return tr("rules.vm.nav-label", "Virtual machines")
         if (id === "diagnostics") return tr("section.diagnostics", "Diagnostics")
         if (id === "conn-trace") return tr("diag.conn-trace.title", "Connection trace")
+        if (id === "cache") return tr("diag.cache.title", "Cache")
         if (id === "logs") return tr("section.logs", "Logs")
         if (id === "settings") return tr("section.settings", "Settings")
         return id
@@ -1375,6 +1374,34 @@ ApplicationWindow {
         requestSectionChange("settings", function() { window.settingsCategory = target })
     }
 
+    /// A setting another surface asked to point at (the tray's "Open
+    /// settings" on a block notice): `{ id, context, serial }`. The category
+    /// that owns the id scrolls to it and says why; `serial` makes a repeat of
+    /// the same request a new one. `context` is display-only text.
+    property var settingsFocusRequest: ({ id: "", context: ({}), serial: 0 })
+
+    /// Focus id -> Settings category holding it.
+    readonly property var _settingsFocusCategories: ({
+        "doh-lockdown": "routing",
+        "leak-protection": "routing"
+    })
+
+    function focusSetting(focusId, context) {
+        var id = String(focusId || "")
+        var category = _settingsFocusCategories[id]
+        if (category === undefined) {
+            console.log("focusSetting: unknown focus id ignored:", id)
+            return false
+        }
+        settingsFocusRequest = {
+            id: id,
+            context: context || {},
+            serial: Number(settingsFocusRequest.serial || 0) + 1
+        }
+        openSettingsCategory(category)
+        return true
+    }
+
     /// Disclosure ("Show details" / expand-a-list) state for the sections
     /// below. Lives on the window, not the section, so switching tabs and
     /// coming back never re-collapses what the user opened.
@@ -1493,6 +1520,7 @@ ApplicationWindow {
         // Experimental opt-in for the Rules -> Virtual machines screen
         // (default off). Only an explicit true opts in.
         normalized.showVirtualMachinesSection = !!normalized.showVirtualMachinesSection
+        normalized.appGroupsOfferDismissed = !!normalized.appGroupsOfferDismissed
         // "remembered but absent" ghost-row display toggle. Default ON
         // (a missing value coerces to true) so the user can see a remembered
         // binding at a glance; only an explicit false turns it off.
@@ -1807,6 +1835,48 @@ ApplicationWindow {
     function dismissRulesFolderSuggestion() {
         rulesFolderSuggestionPath = ""
         updatePrefs({ rulesFolderSuggestionDismissed: true })
+        emitPrefs()
+    }
+
+    // Virtual machines, emulators and peer-to-peer programs found on this
+    // computer, offered once for a route: a hypervisor installed long before
+    // this app would otherwise never be noticed. Filled once per launch.
+    property var appGroupsOfferApps: []
+    readonly property bool appGroupsOfferVisible: uiRevision >= 0
+        ? appGroupsOfferApps.length > 0
+            && prefs.firstRunCompleted === true
+            && prefs.appGroupsOfferDismissed !== true
+        : false
+    readonly property string appGroupsOfferText: {
+        if (appGroupsOfferApps.length === 0) return ""
+        var names = []
+        for (var i = 0; i < appGroupsOfferApps.length && i < 3; i += 1)
+            names.push(String(appGroupsOfferApps[i].displayName || ""))
+        var text = tr("status.app-groups-offer",
+            "Found programs that can be given their own route: {names}.")
+            .replace("{names}", names.join(", "))
+        if (appGroupsOfferApps.length <= 3) return text
+        return text + " " + tr("status.local-network-offer-more",
+            "{count} more found.").replace("{count}", String(appGroupsOfferApps.length - 3))
+    }
+
+    function probeAppGroupsOffer() {
+        if (!bridgeAvailable || prefs.appGroupsOfferDismissed === true) return
+        var corr = rpc.rpcAppGroupsDiscover()
+        if (!corr || corr === "") return
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (!ok || !payload) return
+            // Kernel virtual networks have no program to route; they are
+            // shown in the dialog but are no reason to ask.
+            window.appGroupsOfferApps = (payload.apps || []).filter(function(app) {
+                return app && String(app.kind || "") !== "kernel-virtual-net"
+            })
+        })
+    }
+
+    function dismissAppGroupsOffer() {
+        if (prefs.appGroupsOfferDismissed === true) return
+        updatePrefs({ appGroupsOfferDismissed: true })
         emitPrefs()
     }
 
@@ -2169,7 +2239,11 @@ ApplicationWindow {
         // Mirror of the service block-all posture (kill-switch
         // fail-closed + secondary adapter unresolved). Drives the warning
         // banner; refreshed from the connect snapshot.
-        killSwitchBlockAllArmed: false
+        killSwitchBlockAllArmed: false,
+        // Where the applied rules are enforced differently from how they
+        // read (a literal-IP block over a route, a block leaking a shared
+        // address). Shown on the Overlaps screen; refreshed from the snapshot.
+        ruleConflicts: []
     })
 
     function updateRoutingState(patch) {
@@ -2225,7 +2299,9 @@ ApplicationWindow {
                 // top-of-window warning banner reflects the live fail-closed
                 // state (kill-switch armed + secondary adapter unresolved).
                 killSwitchBlockAllArmed:
-                    p["kill-switch-block-all-armed"] === true
+                    p["kill-switch-block-all-armed"] === true,
+                ruleConflicts: (p["rule-conflicts"] instanceof Array)
+                    ? p["rule-conflicts"] : []
             }
             // Autostart is the LAUNCHER's answer, not the service's: the
             // service runs as LocalSystem and its registry hive is not the
@@ -3697,7 +3773,7 @@ ApplicationWindow {
     function uiIconSource(name) { return Qt.resolvedUrl("../../../assets/icons/" + (highContrastIcons ? "ui-hc/" : "ui/") + name + ".svg") }
     // The same icon for a control painted with the accent fill. The normal
     // set is a blue/indigo gradient, which on that fill is invisible; the
-    // high-contrast set is the same 42 icons painted white, which is what
+    // high-contrast set is the same icons painted white, which is what
     // `palette.highlightedText` puts next to them.
     function uiIconSourceOnAccent(name) { return Qt.resolvedUrl("../../../assets/icons/ui-hc/" + name + ".svg") }
     function sectionIconSource(sectionId) {
@@ -3774,8 +3850,6 @@ ApplicationWindow {
             { win: loadListWindow,           overlay: true,  titleBar: true },
             { win: licenseWindow,            overlay: true,  titleBar: true },
             { win: aboutWindow,              overlay: true,  titleBar: true },
-            { win: ruleDiagnosticsWindow,    overlay: true,  titleBar: true },
-            { win: cacheWindow,             overlay: true,  titleBar: true },
             { win: firstRunWindow,           overlay: true,  titleBar: true },
             { win: eulaAgreementWindow,      overlay: false, titleBar: true },
             { win: appGroupRoutingDialog,    overlay: false, titleBar: true },
@@ -3986,6 +4060,7 @@ ApplicationWindow {
     // this window-level entry point (a visible "Set up routes" button is added
     // by the Interfaces/Routes section, not inlined here).
     function openAppGroupRouting() {
+        dismissAppGroupsOffer()
         if (typeof appGroupRoutingDialog !== "undefined" && appGroupRoutingDialog) {
             appGroupRoutingDialog.open()
         }
@@ -4597,8 +4672,9 @@ ApplicationWindow {
         if (!request || Object.keys(request).length === 0) return
         // Tray hand-off may target a different
         // section while editor state is dirty. Route through the
-        // guard.
-        if (request.section) requestSectionChange(String(request.section))
+        // guard. A focused setting opens its own category instead.
+        var focused = request.focus ? focusSetting(request.focus, request.focusContext) : false
+        if (request.section && !focused) requestSectionChange(String(request.section))
         if (request.openAbout) openChildWindow(aboutWindow)
         if (request.openLicense) openChildWindow(licenseWindow)
         window.show()
@@ -4914,6 +4990,7 @@ ApplicationWindow {
             settingsAutosaveSecs: 60,
             allowModeAKillswitch: false,
             showVirtualMachinesSection: false,
+            appGroupsOfferDismissed: false,
             showRememberedAdapters: true,
             autoConfirmAdapterIdChange: true,
             // Show the block-all warning banner (default on).
@@ -5039,6 +5116,7 @@ ApplicationWindow {
         // The sidebar offers Virtual machines only when there are some, and
         // needs the answer before the user opens Rules.
         if (prefs.showVirtualMachinesSection === true) virtualMachinesController.refresh()
+        probeAppGroupsOffer()
 
         // The desktop can switch light/dark while the window is open. The
         // context file was written before the window existed, so without this
@@ -6294,6 +6372,16 @@ ApplicationWindow {
                     onActiveChanged: if (active) keepLoaded = true
                     asynchronous: window.sectionLoadsAsync
                     visible: StackLayout.isCurrentItem
+                    sourceComponent: Component { CacheSection { root: window } }
+                }
+                Loader {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    property bool keepLoaded: false
+                    active: StackLayout.isCurrentItem || keepLoaded
+                    onActiveChanged: if (active) keepLoaded = true
+                    asynchronous: window.sectionLoadsAsync
+                    visible: StackLayout.isCurrentItem
                     sourceComponent: Component { LogsSection { root: window } }
                 }
                 Loader {
@@ -6399,6 +6487,12 @@ ApplicationWindow {
     })
 
 
+    /// The demo set in the UI language: its rule comments land in the table.
+    function builtinDemoPreset(file) {
+        var lang = resolveLanguageId(currentLanguage)
+        return (lang === "ru" ? "builtin-demo/ru/" : "builtin-demo/") + file
+    }
+
     /// User-triggered demo rules loader. MERGES the bundled built-in demo
     /// preset (`builtin-demo/rules_{primary,secondary}.txt`) into the
     /// existing `rulesModel`, skipping rules the user already has (by
@@ -6421,9 +6515,9 @@ ApplicationWindow {
             return
         }
         var primaryPath = nrrNativeBridge.resolvePresetPath(
-            "builtin-demo/rules_primary.txt")
+            builtinDemoPreset("rules_primary.txt"))
         var secondaryPath = nrrNativeBridge.resolvePresetPath(
-            "builtin-demo/rules_secondary.txt")
+            builtinDemoPreset("rules_secondary.txt"))
         var primB64 = primaryPath ? nrrNativeBridge.readFileBytes(primaryPath) : ""
         var secB64 = secondaryPath ? nrrNativeBridge.readFileBytes(secondaryPath) : ""
         if (!primB64 && !secB64) {
@@ -7685,13 +7779,6 @@ ApplicationWindow {
     // Safe rollback confirm → RollbackRequest recovery action.
 
     AboutWindow { id: aboutWindow; root: window }
-
-    // Rule diagnostics: the explain probe, moved out of the Diagnostics
-    // section so it can stay open beside the rules table.
-    RuleDiagnosticsWindow { id: ruleDiagnosticsWindow; root: window }
-
-    // FQDN/IP cache viewer, same reasoning.
-    CacheWindow { id: cacheWindow; root: window }
 
     // "Licenses" window — Help menu / About "License" button / welcome
     // window "View EULA" button all funnel here. Two tabs: the MPL-2.0

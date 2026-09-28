@@ -160,9 +160,10 @@ impl ProductionMergePreviewSource {
                 let dto = rules_json::from_canonical_string(&rec.rules_json).map_err(|e| {
                     MergePreviewError::ServiceDecodeError(format!("wire parse: {e}"))
                 })?;
-                let content = rules_json_codec::decode(dto).map_err(|e| {
-                    MergePreviewError::ServiceDecodeError(format!("codec decode: {e}"))
-                })?;
+                let content =
+                    rules_json_codec::decode(dto, HostPlatform::compiled()).map_err(|e| {
+                        MergePreviewError::ServiceDecodeError(format!("codec decode: {e}"))
+                    })?;
                 Ok(content.rule_book)
             }
             None => Ok(CanonicalRuleBook::default()),

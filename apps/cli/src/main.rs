@@ -14,6 +14,7 @@ mod doctor;
 mod elevate;
 mod exit;
 mod export;
+mod link;
 mod logs;
 mod parse;
 mod platform;
@@ -62,6 +63,7 @@ fn main() -> ExitCode {
     let ctx = Ctx {
         exe: &exe,
         elevation: elevate::plan(
+            invocation.privilege,
             invocation.elevate,
             relaunch.is_some(),
             elevate::interactive(),
@@ -72,9 +74,10 @@ fn main() -> ExitCode {
     if code != exit::NEEDS_PRIVILEGE {
         return ExitCode::from(code);
     }
-    // Only a verb that got as far as being refused for privilege is worth
-    // re-running: elevation cannot help anything else, and asking anyway would
-    // train the user to grant rights for unrelated failures.
+    // Only a verb the table marks as needing administrator rights, refused for
+    // exactly that, is worth re-running (the plan is `NotOffered` for any
+    // other): asking anyway would train the user to grant rights for failures
+    // elevation does not fix.
     match elevate::retry(ctx.elevation, relaunch.as_deref(), &invocation.command) {
         Some(elevated) => ExitCode::from(elevated),
         None => ExitCode::from(code),
@@ -111,9 +114,7 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
             print!("{}", doctor::render(&findings));
             doctor::exit_code(&findings, &facts.registration)
         }
-        Command::DiagLogs { tail } => {
-            logs::report(logs::read_tail(logs::log_directory(), tail), exe)
-        }
+        Command::DiagLogs { tail } => logs::run(exe, tail),
         Command::DiagExport => export::run(exe),
         Command::ResetNetwork { confirmed } => reset_network(confirmed, ctx),
         Command::Install { start_mode } => with_port(exe, "install", |port| {
@@ -146,7 +147,8 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                     // is invisible to the operator precisely because it works.
                     if report.event_source_registered == Some(false) {
                         println!(
-                            "  system event log:  source not registered; lifecycle records will                              show without their description"
+                            "  system event log:  source not registered; lifecycle records will \
+                             show without their description"
                         );
                     }
                     println!(
@@ -411,7 +413,8 @@ fn reset_network(confirmed: bool, ctx: &Ctx<'_>) -> u8 {
     let Some(verb) = platform::offline_reset_verb() else {
         eprintln!("This build has no network reset.");
         eprintln!(
-            "The service applies network state on this platform, but its binary carries no              reset verb yet, so there is nothing for this command to run."
+            "The service binary on this platform carries no reset verb, so there is \
+             nothing for this command to run."
         );
         eprintln!("Stop the service, and reboot if the machine is still cut off.");
         return exit::UNSUPPORTED;
@@ -432,32 +435,52 @@ fn reset_network(confirmed: bool, ctx: &Ctx<'_>) -> u8 {
     };
     // Inherited stdio: the service binary reports what it removed, and that
     // report is the useful part of running this at all.
-    match std::process::Command::new(&binary).arg(verb).status() {
-        Ok(status) if status.success() => exit::SUCCESS,
-        // The reset verb answers with this console's own privilege code when
-        // the engine refused it, so the answer arrives already classified: no
-        // guessing from a generic failure, and the elevation offer in `main`
-        // fires for the one command a locked-out user was told to run.
-        Ok(status) if status.code() == Some(i32::from(exit::NEEDS_PRIVILEGE)) => {
+    let run = std::process::Command::new(&binary)
+        .arg(verb)
+        .status()
+        .map(|status| status.code());
+    match read_reset_run(&run) {
+        ResetRun::Done => exit::SUCCESS,
+        ResetRun::NeedsPrivilege => {
             needs_elevation("reset-network", ctx, "reset-network --confirm")
         }
-        Ok(status) => {
-            eprintln!(
-                "The service binary could not finish the reset ({}).",
-                describe_exit(&status)
-            );
+        ResetRun::Unfinished(how) => {
+            eprintln!("The service binary could not finish the reset ({how}).");
             exit::FAILED
         }
-        // Windows refuses to start a binary that demands elevation
-        // (`ERROR_ELEVATION_REQUIRED`) rather than starting it and letting it
-        // fail, so the refusal can arrive here instead of as an exit code.
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            needs_elevation("reset-network", ctx, "reset-network --confirm")
-        }
-        Err(err) => {
+        ResetRun::NotStarted(err) => {
             eprintln!("could not run `{} {verb}`: {err}", binary.display());
             exit::FAILED
         }
+    }
+}
+
+/// How the service binary's reset run ended, as this console acts on it.
+#[derive(Debug, PartialEq, Eq)]
+enum ResetRun {
+    Done,
+    NeedsPrivilege,
+    /// It ran and did not succeed; it has already said why.
+    Unfinished(String),
+    NotStarted(String),
+}
+
+/// Classify a finished run: its exit code, or `None` for a signal.
+fn read_reset_run(run: &std::io::Result<Option<i32>>) -> ResetRun {
+    match run {
+        Ok(Some(0)) => ResetRun::Done,
+        // The reset verb answers with this console's own privilege code when
+        // it was refused, on every platform, so the answer arrives already
+        // classified and the elevation offer in `main` fires for the one
+        // command a locked-out user was told to run.
+        Ok(Some(code)) if *code == i32::from(exit::NEEDS_PRIVILEGE) => ResetRun::NeedsPrivilege,
+        Ok(Some(code)) => ResetRun::Unfinished(format!("exit code {code}")),
+        Ok(None) => ResetRun::Unfinished("terminated by a signal".to_string()),
+        // Windows refuses to start a binary that demands elevation
+        // (`ERROR_ELEVATION_REQUIRED`) rather than letting it fail, so the
+        // refusal can arrive here instead of as an exit code.
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => ResetRun::NeedsPrivilege,
+        Err(err) => ResetRun::NotStarted(err.to_string()),
     }
 }
 
@@ -476,14 +499,6 @@ fn needs_elevation(operation: &str, ctx: &Ctx<'_>, repeat_as: &str) -> u8 {
         );
     }
     exit::NEEDS_PRIVILEGE
-}
-
-/// Human-readable form of a child process's exit status.
-fn describe_exit(status: &std::process::ExitStatus) -> String {
-    match status.code() {
-        Some(code) => format!("exit code {code}"),
-        None => "terminated by a signal".to_string(),
-    }
 }
 
 /// Absolute path of the service binary to register: the one sitting next to
@@ -521,5 +536,76 @@ fn yes_no(value: bool) -> &'static str {
         "configured"
     } else {
         "not configured"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(elevation: elevate::ElevationPlan) -> Ctx<'static> {
+        Ctx {
+            exe: "nrr-cli",
+            elevation,
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn this_platform_has_a_reset_to_run() {
+        assert!(platform::offline_reset_verb().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_reset_is_the_daemons_cleanup() {
+        assert_eq!(
+            platform::offline_reset_verb(),
+            Some(nrr_platform_linux::systemd::DAEMON_CLEANUP_VERB)
+        );
+        assert_eq!(BinaryRole::Service.host_file_name(), "nrr-serviced");
+    }
+
+    #[test]
+    fn a_refused_reset_becomes_the_consoles_privilege_code() {
+        let refused = Ok(Some(i32::from(exit::NEEDS_PRIVILEGE)));
+        assert_eq!(read_reset_run(&refused), ResetRun::NeedsPrivilege);
+        let unstartable = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(read_reset_run(&unstartable), ResetRun::NeedsPrivilege);
+        // The exit code `main` retries on and a script reads.
+        assert_eq!(
+            needs_elevation(
+                "reset-network",
+                &ctx(elevate::ElevationPlan::NotOffered),
+                "reset-network --confirm"
+            ),
+            exit::NEEDS_PRIVILEGE
+        );
+    }
+
+    #[test]
+    fn other_endings_are_failures_not_privilege() {
+        assert_eq!(read_reset_run(&Ok(Some(0))), ResetRun::Done);
+        assert_eq!(
+            read_reset_run(&Ok(Some(4))),
+            ResetRun::Unfinished("exit code 4".to_string())
+        );
+        assert!(matches!(read_reset_run(&Ok(None)), ResetRun::Unfinished(_)));
+        assert!(matches!(
+            read_reset_run(&Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            ResetRun::NotStarted(_)
+        ));
+    }
+
+    #[test]
+    fn an_unconfirmed_reset_runs_nothing() {
+        assert_eq!(
+            reset_network(false, &ctx(elevate::ElevationPlan::NotOffered)),
+            if platform::offline_reset_verb().is_some() {
+                exit::NOT_CONFIRMED
+            } else {
+                exit::UNSUPPORTED
+            }
+        );
     }
 }

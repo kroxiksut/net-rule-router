@@ -1,26 +1,23 @@
 //! Schema migration runner for the sidecar database.
 //!
-//! Mirrors the convention from `nrr-storage::migration` (block 12.4):
+//! Mirrors the convention of `nrr-storage::migration`:
 //!
-//! * `schema_migrations` table stores one row per applied migration
-//!   with name, checksum and `app_version` of the binary that ran it.
-//! * Each migration's DDL plus its `schema_migrations` INSERT execute
-//!   in a single transaction so a crash mid-migration cannot leave
-//!   the database in a half-applied state.
-//! * On every open we re-validate the stored checksums against the
-//!   currently-embedded SQL; any drift is fatal (corrupted history).
-//! * Downgrades are refused — `current > LATEST_SCHEMA_VERSION`
-//!   means the user opened a sidecar produced by a newer build.
+//! * `schema_migrations` stores one row per applied migration with name,
+//!   checksum and the `app_version` of the binary that ran it.
+//! * The version read, the history check and every pending migration run in
+//!   ONE immediate transaction. The GUI and the tray open this file from two
+//!   processes, often in the same second on a fresh install; a version read
+//!   outside the write lock let both see 0 and the loser re-ran the DDL.
+//! * Stored checksums are re-validated on every open; drift is fatal.
+//! * Downgrades are refused — a version above [`LATEST_SCHEMA_VERSION`]
+//!   means a newer build wrote the file.
 //!
-//! Sidecar contents are rebuildable (comments are decoration,
-//! passthrough only matters until the next import, `pending_apply`
-//! self-expires after seven days). Despite that we treat schema
-//! corruption strictly — silently truncating user-typed comments
-//! would be a much worse failure mode than refusing to open.
+//! The contents are rebuildable, yet corruption is treated strictly: silently
+//! truncating user-typed comments is worse than refusing to open.
 
 use std::time::SystemTime;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::{SidecarError, SidecarResult};
 use crate::schema::{SIDECAR_DB_V1_DDL, SIDECAR_DB_V2_DDL, SIDECAR_DB_V3_DDL};
@@ -95,31 +92,27 @@ pub struct MigrationSummary {
 
 /// Apply any pending schema migrations on `conn`.
 ///
-/// The sequence is:
+/// Inside one `BEGIN IMMEDIATE` transaction:
 ///
 /// 1. Ensure the `schema_migrations` table exists.
 /// 2. Read the current version (`MAX(version)`); zero when empty.
-/// 3. Refuse to open if `current > LATEST_SCHEMA_VERSION`
+/// 3. Refuse a version above [`LATEST_SCHEMA_VERSION`]
 ///    ([`SidecarError::SchemaTooNew`]) — before the history is judged, so a
 ///    database from a newer build is named as such.
-/// 4. Re-validate the applied history against the currently-embedded SQL: a
-///    changed checksum OR a missing row below the maximum returns
-///    [`SidecarError::MigrationCorrupted`].
-/// 5. For each pending migration in order: open a transaction,
-///    execute the DDL statements, insert the bookkeeping row,
-///    commit.
+/// 4. Re-validate the applied history: a changed checksum OR a missing row
+///    below the maximum is [`SidecarError::MigrationCorrupted`].
+/// 5. Apply each pending migration and its bookkeeping row, then commit.
 ///
-/// The connection's WAL/busy_timeout pragmas are not touched here;
-/// `db::SidecarDb::open` configures them before calling us so the
-/// migration transactions inherit the right behaviour.
+/// A second opener blocks on the write lock (the caller's `busy_timeout`) and
+/// then reads the version the first one committed.
 pub fn migrate(conn: &mut Connection) -> SidecarResult<MigrationSummary> {
-    ensure_migrations_table(conn)?;
-    let from_version = current_version(conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    ensure_migrations_table(&tx)?;
+    let from_version = current_version(&tx)?;
 
     // Before the history is validated. A database written by a NEWER build
     // carries migrations this one has never heard of, and "you are running an
-    // older binary" is the diagnosis the caller can act on — checking it second
-    // reported a missing v1 instead.
+    // older binary" is the diagnosis the caller can act on.
     if from_version > LATEST_SCHEMA_VERSION {
         return Err(SidecarError::SchemaTooNew {
             found: from_version,
@@ -127,7 +120,7 @@ pub fn migrate(conn: &mut Connection) -> SidecarResult<MigrationSummary> {
         });
     }
 
-    validate_applied_checksums(conn, from_version)?;
+    validate_applied_checksums(&tx, from_version)?;
 
     let pending: Vec<&MigrationDef> = MIGRATIONS
         .iter()
@@ -136,9 +129,10 @@ pub fn migrate(conn: &mut Connection) -> SidecarResult<MigrationSummary> {
 
     let mut applied = Vec::with_capacity(pending.len());
     for migration in &pending {
-        apply_migration(conn, migration)?;
+        apply_migration(&tx, migration)?;
         applied.push(migration.name.to_string());
     }
+    tx.commit()?;
 
     let to_version = pending.last().map(|m| m.version).unwrap_or(from_version);
 
@@ -226,20 +220,14 @@ fn validate_applied_checksums(conn: &Connection, applied_up_to: u32) -> SidecarR
     Ok(())
 }
 
-/// Execute one migration step atomically.
-fn apply_migration(conn: &mut Connection, migration: &MigrationDef) -> SidecarResult<()> {
-    // IMMEDIATE, like the sibling runner: a deferred transaction asks for the
-    // write lock at the first DDL statement, and a concurrent writer then
-    // answers SQLITE_BUSY_SNAPSHOT, which `busy_timeout` does not retry.
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+/// Execute one migration step inside the caller's immediate transaction.
+fn apply_migration(conn: &Connection, migration: &MigrationDef) -> SidecarResult<()> {
     for stmt in migration.stmts {
-        tx.execute_batch(stmt)?;
+        conn.execute_batch(stmt)?;
     }
-    // IGNORE, not REPLACE. REPLACE overwrote the stored checksum of an
-    // already-applied migration, which is precisely what
-    // `validate_applied_checksums` exists to catch — the guard could be
-    // defeated by the code it guards.
-    tx.execute(
+    // IGNORE, not REPLACE: REPLACE overwrote the stored checksum of an
+    // already-applied migration — the guard defeated by the code it guards.
+    conn.execute(
         "INSERT OR IGNORE INTO schema_migrations
             (version, name, applied_at, checksum, app_version)
             VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -251,7 +239,6 @@ fn apply_migration(conn: &mut Connection, migration: &MigrationDef) -> SidecarRe
             env!("CARGO_PKG_VERSION"),
         ],
     )?;
-    tx.commit()?;
     Ok(())
 }
 

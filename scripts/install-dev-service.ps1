@@ -1,4 +1,4 @@
-# Install the NetRuleRouter service from a directory only administrators can
+﻿# Install the NetRuleRouter service from a directory only administrators can
 # write to, instead of straight from the build tree.
 #
 # `target\...` is writable by whoever built it, so a service registered there
@@ -20,8 +20,9 @@ param(
     [ValidateSet('dev', 'release')]
     [string] $Profile = 'dev',
 
+    # Defaults to $NrrDevStageDir, the location purge-data.ps1 cleans up.
     [Parameter()]
-    [string] $StageDir = (Join-Path $env:ProgramW6432 'NetRuleRouter-dev'),
+    [string] $StageDir,
 
     [Parameter()]
     [switch] $NoStart
@@ -29,23 +30,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$root = Split-Path -Parent $PSScriptRoot
-$serviceName = 'NetRuleRouter'
+. (Join-Path $PSScriptRoot 'lib\service-paths.ps1')
 
-# Honour `.cargo/config.toml::build.target-dir`; same rule as install-service.ps1.
-function Resolve-TargetRoot {
-    param([string] $RepoRoot)
-    $cfg = Join-Path $RepoRoot '.cargo\config.toml'
-    if (Test-Path $cfg) {
-        $content = Get-Content $cfg -Raw
-        if ($content -match '(?m)^\s*target-dir\s*=\s*"([^"]+)"') {
-            $td = $Matches[1] -replace '/', '\'
-            if ([System.IO.Path]::IsPathRooted($td)) { return $td }
-            return (Join-Path $RepoRoot $td)
-        }
-    }
-    return (Join-Path $RepoRoot 'target')
-}
+$root = Split-Path -Parent $PSScriptRoot
+$serviceName = $NrrServiceName
+if (-not $StageDir) { $StageDir = $NrrDevStageDir }
+if (-not $StageDir) { throw 'ProgramW6432 is not set; pass -StageDir.' }
 
 $buildDir = Join-Path (Resolve-TargetRoot $root) $(if ($Profile -eq 'release') { 'release' } else { 'debug' })
 

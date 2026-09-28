@@ -72,6 +72,16 @@ impl AuthorError {
     }
 }
 
+/// What one authoring call did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuthoredOutcome {
+    /// Rules that were actually new.
+    pub authored: u32,
+    /// The page a rule was offered next to keeps its old connections, so it
+    /// will not finish loading until the user reloads it.
+    pub anchor_skipped: bool,
+}
+
 /// Appends accepted suggestions to a principal's own rule set.
 pub trait AutoRuleAuthor: Send + Sync {
     /// Author `rules` for `principal`, stamping every rule with `reason`.
@@ -85,6 +95,23 @@ pub trait AutoRuleAuthor: Send + Sync {
         now: SystemTime,
         correlation_id: &str,
     ) -> Result<u32, AuthorError>;
+
+    /// [`Self::author`], also saying whether the anchor page was left for the
+    /// user to reload. An author that tears nothing down reports nothing.
+    fn author_with_outcome(
+        &self,
+        principal: &str,
+        reason: &AutoRuleReason,
+        rules: &[AuthoredRule],
+        now: SystemTime,
+        correlation_id: &str,
+    ) -> Result<AuthoredOutcome, AuthorError> {
+        self.author(principal, reason, rules, now, correlation_id)
+            .map(|authored| AuthoredOutcome {
+                authored,
+                anchor_skipped: false,
+            })
+    }
 }
 
 /// Production author: read-modify-write through the mutation executor.
@@ -122,8 +149,20 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
         now: SystemTime,
         correlation_id: &str,
     ) -> Result<u32, AuthorError> {
+        self.author_with_outcome(principal, reason, rules, now, correlation_id)
+            .map(|outcome| outcome.authored)
+    }
+
+    fn author_with_outcome(
+        &self,
+        principal: &str,
+        reason: &AutoRuleReason,
+        rules: &[AuthoredRule],
+        now: SystemTime,
+        correlation_id: &str,
+    ) -> Result<AuthoredOutcome, AuthorError> {
         if rules.is_empty() {
-            return Ok(0);
+            return Ok(AuthoredOutcome::default());
         }
         // Read-through to the admin baseline when the user has not diverged yet
         // is exactly what we want: their first accepted suggestion is also the
@@ -150,7 +189,7 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
             // Everything was already present — a no-op that must NOT enter the
             // mutation queue (submitting identical content would dedup to the
             // active revision and log a spurious activation).
-            return Ok(0);
+            return Ok(AuthoredOutcome::default());
         }
         evict_over_budget(&mut book, principal);
 
@@ -183,10 +222,16 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
                 // Strictly after the executor returns: it applies the policy
                 // synchronously, so tearing down any earlier would have the
                 // application reconnect over the route still in force.
-                if let Some(refresh) = self.flow_refresh.as_ref() {
-                    refresh.refresh(&hosts_to_refresh(&landed));
-                }
-                Ok(authored)
+                let hosts = hosts_to_refresh(&landed);
+                let has_anchor = hosts.iter().any(|h| matches!(h, RoutedHost::Anchor(_)));
+                let anchor_skipped = match self.flow_refresh.as_ref() {
+                    Some(refresh) => refresh.refresh(principal, &hosts).anchor_skipped,
+                    None => has_anchor,
+                };
+                Ok(AuthoredOutcome {
+                    authored,
+                    anchor_skipped,
+                })
             }
             // The executor already reports the Free rule cap, the tamper gate's
             // refusal while a security alert is unacknowledged, and every policy
@@ -224,6 +269,7 @@ fn evict_over_budget(book: &mut CanonicalRuleBook, principal: &str) {
     // exactly the thing they will come looking for in the log.
     tracing::info!(
         target: "nrr::auto-rules",
+        msg_key = "autorules-authored-over-budget",
         sid = %principal,
         dropped = doomed.len(),
         budget = MAX_AUTO_RULES,
@@ -241,7 +287,8 @@ fn evict_over_budget(book: &mut CanonicalRuleBook, principal: &str) {
 /// which is what pulls the newly routed addresses in without a manual refresh.
 fn hosts_to_refresh(landed: &[&AuthoredRule]) -> Vec<RoutedHost> {
     let mut hosts = Vec::with_capacity(landed.len() * 2);
-    let mut seen = HashSet::new();
+    let mut seen_routed = HashSet::new();
+    let mut seen_anchor = HashSet::new();
     for rule in landed {
         let routed = match rule.match_kind {
             AuthoredMatchKind::ExactHost => RoutedHost::Exact(rule.value.clone()),
@@ -249,11 +296,13 @@ fn hosts_to_refresh(landed: &[&AuthoredRule]) -> Vec<RoutedHost> {
             // A program has no host to refresh; its next connection takes the rule.
             AuthoredMatchKind::Application => continue,
         };
-        if seen.insert(rule.value.clone()) {
+        if seen_routed.insert(rule.value.clone()) {
             hosts.push(routed);
         }
-        if !rule.anchor.is_empty() && seen.insert(rule.anchor.clone()) {
-            hosts.push(RoutedHost::Exact(rule.anchor.clone()));
+        // Named as an anchor even when a rule routes it too: the anchor is
+        // torn down on a shared address, a routed host is not.
+        if !rule.anchor.is_empty() && seen_anchor.insert(rule.anchor.clone()) {
+            hosts.push(RoutedHost::Anchor(rule.anchor.clone()));
         }
     }
     hosts
@@ -520,7 +569,7 @@ mod tests {
                 RoutedHost::Suffix("cdn.example".into()),
                 // Dropping the anchor's connections is what makes the page ask
                 // for its images again instead of sitting on loaded ones.
-                RoutedHost::Exact("site.example".into()),
+                RoutedHost::Anchor("site.example".into()),
             ]
         );
     }
@@ -533,7 +582,7 @@ mod tests {
         assert_eq!(
             hosts
                 .iter()
-                .filter(|h| matches!(h, RoutedHost::Exact(v) if v == "site.example"))
+                .filter(|h| matches!(h, RoutedHost::Anchor(v) if v == "site.example"))
                 .count(),
             1
         );

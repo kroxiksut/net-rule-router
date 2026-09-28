@@ -46,6 +46,56 @@ impl InterfaceDnsScopePort for WindowsInterfaceDnsScopes {
     }
 }
 
+/// Claims of the connections the OS is using right now, our own tunnel aside.
+///
+/// A disconnected VPN keeps its registry values, and honouring them would send
+/// a namespace to a resolver nothing can reach; our tunnel claiming one would
+/// point it back at us.
+pub fn live_dns_scopes() -> Vec<InterfaceDnsScope> {
+    use nrr_platform_api::route_table::RouteTablePort;
+    use nrr_platform_api::{classify_availability, AdapterAvailability};
+    use nrr_shared::product_identity::PRODUCT_NAME;
+
+    let live = crate::windows_api::ProductionWindowsApi
+        .get_adapter_infos()
+        .unwrap_or_default();
+    WindowsInterfaceDnsScopes
+        .dns_scopes()
+        .into_iter()
+        .filter(|scope| {
+            live.iter().any(|a| {
+                a.adapter_name.eq_ignore_ascii_case(&scope.adapter_id)
+                    && classify_availability(a) == Some(AdapterAvailability::Available)
+                    && !a.description.contains(PRODUCT_NAME)
+                    && !a.friendly_name.contains(PRODUCT_NAME)
+            })
+        })
+        .collect()
+}
+
+/// Machine-wide DNS client parameters.
+const PARAMETERS_KEY: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters";
+
+/// Where a domain policy sets the search list; it overrides the local one.
+const POLICY_KEY: &str = r"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient";
+
+/// The machine's global DNS suffix search list, as configured.
+pub fn global_search_list() -> Vec<String> {
+    read_value(PARAMETERS_KEY, "SearchList")
+        .map(|raw| raw.split(',').filter_map(normalize_suffix).collect())
+        .unwrap_or_default()
+}
+
+/// The primary DNS suffix, if the machine has one.
+pub fn primary_dns_suffix() -> Option<String> {
+    read_value(PARAMETERS_KEY, "Domain").and_then(|v| normalize_suffix(&v))
+}
+
+/// Does a domain policy own the search list?
+pub fn search_list_is_policy_managed() -> bool {
+    read_value(POLICY_KEY, "SearchList").is_some()
+}
+
 /// Read one interface's claim. `None` when it claims no namespace.
 fn scope_for_interface(guid: &str) -> Option<InterfaceDnsScope> {
     let subkey = format!(r"{INTERFACES_KEY}\{guid}");

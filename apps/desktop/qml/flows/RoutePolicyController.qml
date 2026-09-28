@@ -378,6 +378,32 @@ QtObject {
         })
     }
 
+    /// Complete short names with `suffix` for a connection that announces no
+    /// domain. One write for both keys, so the domain is never stored switched
+    /// on but empty. The service validates the domain.
+    function applyShortNames(enabled, suffix, onApplied) {
+        var want = enabled === true
+        var domain = String(suffix || "")
+        _applyRoutePolicyKeys({
+            "short-name-completion": want,
+            "short-name-suffix": domain
+        }, {
+            onApplied: function() {
+                root.updateRoutingState({ shortNameCompletion: want, shortNameSuffix: domain })
+                if (onApplied) onApplied(want, domain)
+            },
+            ok: want
+                ? root.tr("status.short-names-on",
+                    "Short names will be completed with {domain}.").replace("{domain}", domain)
+                : root.tr("status.short-names-off",
+                    "Short names are completed only with the domain a connection announces."),
+            uac: root.tr("status.route-policy-uac-declined",
+                "Administrator approval was declined; the setting was not changed."),
+            failPrefix: root.tr("status.short-names-failed",
+                "Could not change short-name completion: ")
+        })
+    }
+
     /// Skip the co-activity evidence for hosts whose NAME already looks like a
     /// delivery endpoint, so they are offered on first sight. Trades precision
     /// for speed: ad and tracking CDNs share that shape, so this can put hosts

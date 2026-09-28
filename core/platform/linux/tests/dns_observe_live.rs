@@ -1,9 +1,9 @@
 //! One live test against the real mechanism: a resolution systemd-resolved
 //! performs must reach the observer.
 //!
-//! Needs root (the query-monitor socket is `0600`, owned by systemd-resolve) and
-//! a running systemd-resolved. Without either it skips loudly — a container with
-//! no resolver is not a broken observer.
+//! Ignored by default: it needs root (the query-monitor socket is `0600`, owned
+//! by systemd-resolve) and a running systemd-resolved. Run it with `--ignored`
+//! on a host that has both; without them it fails with the reason.
 //!
 //! The query is made through `resolvectl` on purpose: on a machine whose
 //! `/etc/resolv.conf` bypasses resolved (WSL, and any host with
@@ -35,15 +35,11 @@ fn is_root() -> bool {
 }
 
 #[test]
+#[ignore = "needs root and a running systemd-resolved; run with --ignored"]
 fn a_resolution_through_resolved_reaches_the_observer() {
-    if !is_root() {
-        eprintln!("SKIPPED dns_observe_live: the query monitor socket needs root");
-        return;
-    }
-    let Some(observer) = ResolvedDnsObserver::start() else {
-        eprintln!("SKIPPED dns_observe_live: systemd-resolved's query monitor is unavailable");
-        return;
-    };
+    assert!(is_root(), "the query monitor socket needs root");
+    let observer = ResolvedDnsObserver::start()
+        .expect("systemd-resolved's query monitor is unavailable on this host");
     // The monitor attaches asynchronously; a query sent before it is listening
     // would be missed and the test would blame the parser.
     std::thread::sleep(Duration::from_millis(500));
@@ -53,10 +49,10 @@ fn a_resolution_through_resolved_reaches_the_observer() {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    if !queried {
-        eprintln!("SKIPPED dns_observe_live: the machine could not resolve {NAME}");
-        return;
-    }
+    assert!(
+        queried,
+        "the machine could not resolve {NAME} through resolvectl"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = Vec::new();

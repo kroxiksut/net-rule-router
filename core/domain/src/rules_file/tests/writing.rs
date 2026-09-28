@@ -346,3 +346,56 @@ fn write_round_trips_input_with_empty_section_header() {
     // Domains header survived even though it has no entries.
     assert!(written.contains("--- Domains\n"), "got:\n{written}");
 }
+
+/// Text that bypassed validation still cannot open a section: the writer is
+/// the last place a note carrying a line break turns into a rule.
+#[test]
+fn a_line_break_in_any_field_never_becomes_a_rule_or_section() {
+    let injected = "note\n--- IP\n192.0.2.9\r--- Zones\rinjected";
+    let parsed = RulesFileParsed {
+        sections: vec![SectionContent {
+            section: RulesFileSection::Domains,
+            entries: vec![
+                RulesFileEntry {
+                    inline_comment: Some(injected.to_string()),
+                    ..RulesFileEntry::enabled("example.com")
+                },
+                RulesFileEntry::enabled("a.example\n--- IP\n192.0.2.10"),
+            ],
+        }],
+    };
+    let unknown = [UnknownSection {
+        name: "CIDR\n--- IP\n192.0.2.11".to_string(),
+        entries: vec![],
+    }];
+    let meta = PresetMetadata {
+        name: Some(injected.to_string()),
+        description: Some(injected.to_string()),
+        author: Some(injected.to_string()),
+        preset_version: Some(injected.to_string()),
+    };
+    let text = write_rules_file(&parsed, &unknown, Some(&meta));
+
+    assert!(!text.contains('\r'), "written text:\n{text}");
+    let outcome = parse_rules_file(&text);
+    let sections: Vec<RulesFileSection> =
+        outcome.parsed.sections.iter().map(|s| s.section).collect();
+    assert_eq!(
+        sections,
+        [RulesFileSection::Domains],
+        "written text:\n{text}"
+    );
+    assert_eq!(outcome.unknown_sections.len(), 1, "written text:\n{text}");
+    let values: Vec<&str> = outcome.parsed.sections[0]
+        .entries
+        .iter()
+        .map(|e| e.match_value.as_str())
+        .collect();
+    assert_eq!(values.len(), 2, "written text:\n{text}");
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.trim() == "192.0.2.9" || l.trim() == "--- IP"),
+        "written text:\n{text}"
+    );
+}

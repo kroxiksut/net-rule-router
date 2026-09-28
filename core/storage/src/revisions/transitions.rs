@@ -1,5 +1,11 @@
 //! Candidate insertion and the `Candidate → Active/Rejected/RolledBack`
 //! status transitions that drive the apply/rollback lifecycle.
+//!
+//! Every transition rewrites signed columns, so every transition re-signs
+//! what it wrote. Left to the callers, one forgotten re-sign turned an
+//! untouched database into a tamper alert on the next start.
+
+use crate::revision_hmac::HmacVerification;
 
 use super::*;
 
@@ -8,13 +14,8 @@ impl<'c> RevisionsRepository<'c> {
     /// regardless of what the caller put in `record.status` — only the
     /// activation coordinator may move a revision out of `Candidate`.
     ///
-    /// When the repository was constructed with
-    /// [`Self::with_signing_key`], an HMAC-SHA256 over the canonical
-    /// row payload is computed and stored in the `row_hmac` column.
-    /// Without a signing key the column stays at its schema
-    /// default (empty blob); a later `read_verified` flags such
-    /// rows as `Unsigned` and the C2 ack flow can backfill via
-    /// [`Self::re_sign_all`].
+    /// Signed with the repository's key; without one the row stays
+    /// `Unsigned` until the boot backfill or [`Self::re_sign_all`].
     pub fn insert_candidate(&self, record: &RevisionRecord) -> StorageResult<()> {
         self.insert_candidate_for(BASELINE_PRINCIPAL, record)
     }
@@ -43,10 +44,7 @@ impl<'c> RevisionsRepository<'c> {
                 "insert_candidate: empty content_hash".into(),
             ));
         }
-        // Effective field set: candidate status, no activation /
-        // supersede / rejection timestamps yet. Mirrors the
-        // INSERT below so the HMAC is computed over what the row
-        // will actually look like in the DB.
+        // Signed over exactly what the INSERT below writes.
         let row_hmac: Vec<u8> = match self.key() {
             Some(key) => {
                 let fields = crate::revision_hmac::RowFields {
@@ -95,13 +93,9 @@ impl<'c> RevisionsRepository<'c> {
         Ok(())
     }
 
-    /// Phase 3a — Candidate `target_id` becomes Active; the previously
-    /// active revision (if any) becomes Superseded with `superseded_by`
-    /// pointing at the new target.
-    ///
-    /// Caller wraps this in a `BEGIN IMMEDIATE` transaction together
-    /// with the `set_active_pointer` call so the partial unique index
-    /// fires atomically.
+    /// Candidate `target_id` becomes Active; the previously active revision
+    /// (if any) becomes Superseded by it. The caller commits this together
+    /// with the pointer update in one transaction.
     pub fn mark_apply_succeeded(
         &self,
         target_id: &str,
@@ -111,10 +105,8 @@ impl<'c> RevisionsRepository<'c> {
         self.mark_apply_succeeded_for(BASELINE_PRINCIPAL, target_id, previous_id, now)
     }
 
-    /// Principal-scoped Phase 3a. Both the supersede of the
-    /// previous active and the activation of the target are constrained to
-    /// `principal`, so one user's activation can never supersede another
-    /// user's active revision.
+    /// Principal-scoped [`Self::mark_apply_succeeded`]: one user's activation
+    /// can never supersede another user's active revision.
     pub fn mark_apply_succeeded_for(
         &self,
         principal: &str,
@@ -122,6 +114,11 @@ impl<'c> RevisionsRepository<'c> {
         previous_id: Option<&str>,
         now: i64,
     ) -> StorageResult<()> {
+        let target_before = self.verdict_before_transition(target_id)?;
+        let previous_before = match previous_id {
+            Some(prev) => self.verdict_before_transition(prev)?,
+            None => None,
+        };
         if let Some(prev) = previous_id {
             let superseded = self
                 .conn
@@ -164,11 +161,15 @@ impl<'c> RevisionsRepository<'c> {
                  (revision_id={target_id} principal={principal} may not be in candidate status)"
             )));
         }
+        self.re_sign_after_transition(target_id, target_before)?;
+        if let Some(prev) = previous_id {
+            self.re_sign_after_transition(prev, previous_before)?;
+        }
         Ok(())
     }
 
     /// Was `revision_id` already retired in favour of `target_id`? Lets a
-    /// retried Phase 3a tell "nothing to do" from "the wrong revision".
+    /// retried activation tell "nothing to do" from "the wrong revision".
     fn already_superseded_by(
         &self,
         principal: &str,
@@ -188,14 +189,13 @@ impl<'c> RevisionsRepository<'c> {
             .map_err(|e| StorageError::Internal(format!("revisions supersede check: {e}")))
     }
 
-    /// Phase 3b — Candidate `target_id` becomes Rejected with the given
-    /// reason. Active pointer is left unchanged (rollback already handled
-    /// by the apply layer, if needed).
+    /// Candidate `target_id` becomes Rejected with `reason`. The pointer is
+    /// left alone: undoing the apply is the apply layer's job.
     pub fn mark_apply_failed(&self, target_id: &str, reason: &str, now: i64) -> StorageResult<()> {
         self.mark_apply_failed_for(BASELINE_PRINCIPAL, target_id, reason, now)
     }
 
-    /// Principal-scoped Phase 3b.
+    /// Principal-scoped [`Self::mark_apply_failed`].
     pub fn mark_apply_failed_for(
         &self,
         principal: &str,
@@ -203,6 +203,7 @@ impl<'c> RevisionsRepository<'c> {
         reason: &str,
         _now: i64,
     ) -> StorageResult<()> {
+        let before = self.verdict_before_transition(target_id)?;
         let updated = self
             .conn
             .execute(
@@ -218,14 +219,11 @@ impl<'c> RevisionsRepository<'c> {
                  (revision_id={target_id} principal={principal} may not be in candidate status)"
             )));
         }
-        Ok(())
+        self.re_sign_after_transition(target_id, before)
     }
 
-    /// Active → RolledBack. Used during rollback flow when the user
-    /// explicitly decides to leave the current active behind. The
-    /// rollback target itself is activated via a fresh
-    /// `mark_apply_succeeded` call — this method only marks the
-    /// outgoing revision.
+    /// Active → RolledBack for the outgoing revision only; the rollback
+    /// target is activated through [`Self::mark_apply_succeeded`].
     pub fn mark_rolled_back(&self, revision_id: &str, now: i64) -> StorageResult<()> {
         self.mark_rolled_back_for(BASELINE_PRINCIPAL, revision_id, now)
     }
@@ -237,6 +235,7 @@ impl<'c> RevisionsRepository<'c> {
         revision_id: &str,
         now: i64,
     ) -> StorageResult<()> {
+        let before = self.verdict_before_transition(revision_id)?;
         let updated = self
             .conn
             .execute(
@@ -251,6 +250,35 @@ impl<'c> RevisionsRepository<'c> {
                 "revisions rolled_back: expected 1 row updated, got {updated} \
                  (revision_id={revision_id} principal={principal} may not be in active status)"
             )));
+        }
+        self.re_sign_after_transition(revision_id, before)
+    }
+
+    /// What the row's signature says before a transition rewrites it; `None`
+    /// without a key, where there is nothing to re-sign with.
+    pub(super) fn verdict_before_transition(
+        &self,
+        revision_id: &str,
+    ) -> StorageResult<Option<HmacVerification>> {
+        if self.key().is_none() {
+            return Ok(None);
+        }
+        self.verify_row_hmac(revision_id)
+    }
+
+    /// Re-signs a row a transition just rewrote — unless it already failed
+    /// verification before, where a fresh signature would legitimise somebody
+    /// else's edit and the row has to keep failing for whoever looks next.
+    pub(super) fn re_sign_after_transition(
+        &self,
+        revision_id: &str,
+        before: Option<HmacVerification>,
+    ) -> StorageResult<()> {
+        if matches!(
+            before,
+            Some(HmacVerification::Verified | HmacVerification::Unsigned)
+        ) {
+            self.re_sign_row(revision_id)?;
         }
         Ok(())
     }

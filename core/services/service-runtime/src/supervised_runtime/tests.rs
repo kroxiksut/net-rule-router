@@ -418,3 +418,118 @@ fn fatal_failure_routing_table_is_complete() {
         None
     );
 }
+
+fn background_tasks(health: &HealthAggregator) -> Option<crate::health::HealthComponentSnapshot> {
+    health
+        .snapshot()
+        .components
+        .into_iter()
+        .find(|c| c.component == HealthComponent::BackgroundTasks)
+}
+
+fn wait_for(deadline: Duration, cond: impl Fn() -> bool) -> bool {
+    let until = Instant::now() + deadline;
+    while Instant::now() < until {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    cond()
+}
+
+/// An observer that panicked used to vanish with health still `Ok`. It must
+/// now show as degraded — by name — for exactly as long as it is down.
+#[test]
+fn a_panicked_optional_task_is_degraded_in_health_until_its_restart_ticks() {
+    use crate::runtime_loop::{RestartBackoff, ServiceTask, TaskOutcome};
+
+    let health = Arc::new(HealthAggregator::new());
+    health.clear_lifecycle_override();
+    health.record(HealthComponent::Ipc, ServiceHealthSeverity::Ok, "ok");
+    let stop = StopToken::new();
+    let supervisor = ServiceSupervisor::new(
+        stop.clone(),
+        Arc::new(HealthFailureSink::new(Arc::clone(&health))),
+    )
+    .with_optional_restart(RestartBackoff::new(
+        Duration::from_millis(300),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    ));
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let ticks_in_task = Arc::clone(&ticks);
+    supervisor
+        .spawn(ServiceTask::periodic(
+            crate::service_tasks::TASK_ID_CONN_OBSERVE,
+            TaskClass::Optional,
+            Duration::from_millis(5),
+            0,
+            move |_stop| {
+                if ticks_in_task.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("observer blew up");
+                }
+                TaskOutcome::Continue
+            },
+        ))
+        .expect("spawn");
+
+    assert!(wait_for(Duration::from_secs(2), || background_tasks(
+        &health
+    )
+    .is_some_and(|c| c.severity == ServiceHealthSeverity::Degraded)));
+    let down = background_tasks(&health).expect("component recorded");
+    assert!(
+        down.message
+            .contains(crate::service_tasks::TASK_ID_CONN_OBSERVE),
+        "the degraded record must name the task: {}",
+        down.message
+    );
+    assert_eq!(health.snapshot().state, ServiceRuntimeState::Degraded);
+    assert_eq!(ticks.load(Ordering::SeqCst), 1, "still inside the backoff");
+
+    assert!(
+        wait_for(Duration::from_secs(3), || background_tasks(&health)
+            .is_some_and(|c| c.severity == ServiceHealthSeverity::Ok)),
+        "health must clear once the restarted task ticks"
+    );
+    assert!(ticks.load(Ordering::SeqCst) >= 2);
+    assert_eq!(health.snapshot().state, ServiceRuntimeState::Running);
+    let _ = supervisor.shutdown();
+}
+
+#[test]
+fn one_task_recovering_does_not_clear_another_that_is_still_down() {
+    let health = Arc::new(HealthAggregator::new());
+    let sink = HealthFailureSink::new(Arc::clone(&health));
+    let a = TaskId::new("dns-observe-tick");
+    let b = TaskId::new("auto-rules-tick");
+    let delay = Duration::from_secs(1);
+    sink.task_restart_scheduled(&a, TaskClass::Optional, 1, delay, "task panicked: a");
+    sink.task_restart_scheduled(&b, TaskClass::Optional, 1, delay, "task panicked: b");
+    sink.task_recovered(&b, TaskClass::Optional);
+
+    let rec = background_tasks(&health).expect("component recorded");
+    assert_eq!(rec.severity, ServiceHealthSeverity::Degraded);
+    assert!(rec.message.contains("dns-observe-tick"));
+    assert!(!rec.message.contains("auto-rules-tick"));
+
+    // A recoverable restart is brief and bounded; it stays out of the roll-up.
+    sink.task_restart_scheduled(
+        &TaskId::new("adapter-monitor-tick"),
+        TaskClass::Recoverable,
+        1,
+        delay,
+        "boom",
+    );
+    let rec = background_tasks(&health).expect("component recorded");
+    assert!(!rec.message.contains("adapter-monitor-tick"));
+
+    sink.task_recovered(&a, TaskClass::Optional);
+    assert_eq!(
+        background_tasks(&health)
+            .expect("component recorded")
+            .severity,
+        ServiceHealthSeverity::Ok
+    );
+}

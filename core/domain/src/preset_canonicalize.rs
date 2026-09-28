@@ -41,7 +41,8 @@
 //! | Unicode IDN domain       | Punycode (IDNA2008)     | Yes      |
 //! | IPv4-mapped IPv6 address | IPv4                    | Yes      |
 //! | `C:\path\chrome.exe`     | `chrome.exe`            | Yes      |
-//! | `chrome` (no `.exe`)     | `chrome.exe`            | Yes      |
+//! | `chrome` in `--- Windows` | `chrome.exe`           | Yes      |
+//! | `Telegram` in `--- Linux` | `telegram`             | No       |
 //! | Duplicate rule (same set)| First occurrence kept   | Yes      |
 //!
 //! # Discarded after canonicalization
@@ -164,7 +165,7 @@ pub fn canonicalize_preset_rules(
         rules_file_to_route_rule_set(&parse_outcome.parsed, platform, include_child_processes);
 
     let config = stub_config_for_route(route, rule_set);
-    let validation = validate_and_canonicalize(&config);
+    let validation = validate_and_canonicalize(&config, platform);
 
     match validation {
         crate::validation::ValidationOutcome::Accepted(profile) => {
@@ -476,6 +477,49 @@ mod tests {
             .app_match
             .as_ref()
             .is_some_and(|a| a.pattern.as_str() == "browser.exe"));
+    }
+
+    /// The shipped presets' `--- Linux` sections are bare names and a `codex*`
+    /// glob; on their own platform they are imported as written, with nothing
+    /// to report.
+    #[test]
+    fn a_unix_section_imports_its_names_unchanged_on_its_own_platform() {
+        for (platform, section) in [
+            (HostPlatform::Linux, "Linux"),
+            (HostPlatform::MacOS, "MacOS"),
+        ] {
+            let parsed = parse_rules_file(&format!(
+                "--- {section}\ntelegram-desktop\nsignal-desktop\ncodex*\n--- Windows\nbrowser\n"
+            ));
+            let outcome = canonicalize_preset_rules(&parsed, RouteRole::Secondary, platform, false);
+            assert!(
+                matches!(outcome, PresetRulesCanonicalizeOutcome::Accepted { .. }),
+                "{platform:?}: no warning to raise, got {:?}",
+                outcome.warnings()
+            );
+            let mut values = match_values(outcome.rule_set().expect("accepted"));
+            values.sort();
+            assert_eq!(
+                values,
+                ["codex*", "signal-desktop", "telegram-desktop"],
+                "{platform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_windows_section_still_gains_the_suffix_and_says_so() {
+        let parsed = parse_rules_file("--- Windows\nbrowser\n");
+        let outcome =
+            canonicalize_preset_rules(&parsed, RouteRole::Secondary, HostPlatform::Windows, false);
+        assert_eq!(
+            match_values(outcome.rule_set().expect("accepted")),
+            ["browser.exe"]
+        );
+        assert!(outcome
+            .warnings()
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::ProcessNameMissingExeSuffix { .. })));
     }
 
     // ── Discarded: unsupported section entries ───────────────────────────────────

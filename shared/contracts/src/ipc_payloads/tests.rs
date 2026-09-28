@@ -121,6 +121,8 @@ fn route_policy_update_request_sample(auto_rules_mode: &str) -> RoutePolicyUpdat
         primary_probe_repeat_secs: 300,
         local_networks_auto_accept: false,
         zone_priority_over_ip: false,
+        short_name_completion: false,
+        short_name_suffix: String::new(),
         binding_source: BindingSourceDto::UserAssigned,
     }
 }
@@ -195,6 +197,7 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
         StatusUpdateEvent::RevisionStatusChanged {
             revision_id: "rev-1".into(),
             status: "active".into(),
+            sid: Some("S-1-5-21".into()),
         },
         StatusUpdateEvent::RoutingPauseStateChanged {
             sid: "S-1-5-21".into(),
@@ -204,6 +207,7 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             policy: "best-effort".into(),
         },
         StatusUpdateEvent::AutostartStateChanged {
+            sid: "S-1-5-21".into(),
             enabled: true,
             last_known_state: "enabled".into(),
         },
@@ -234,6 +238,7 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             app: "messenger.exe".into(),
             reason: "not-covered-by-rules".into(),
             attempts: 1,
+            launched_by: vec!["launcher.exe".into()],
         },
     ]
 }
@@ -293,6 +298,7 @@ fn push_event_keys_the_ui_reads_are_stable() {
     let revision = serde_json::to_value(StatusUpdateEvent::RevisionStatusChanged {
         revision_id: "rev-1".into(),
         status: "active".into(),
+        sid: None,
     })
     .expect("serialise");
     assert_eq!(revision["revision-id"], "rev-1");
@@ -303,12 +309,133 @@ fn push_event_keys_the_ui_reads_are_stable() {
         app: "messenger.exe".into(),
         reason: "not-covered-by-rules".into(),
         attempts: 1,
+        launched_by: vec!["cmd.exe".into(), "explorer.exe".into()],
     })
     .expect("serialise");
     assert_eq!(notice["type"], "block-notice-raised");
     assert_eq!(notice["destination"], "cdn.example");
     assert_eq!(notice["reason"], "not-covered-by-rules");
     assert_eq!(notice["attempts"], 1);
+    assert_eq!(notice["launched-by"][0], "cmd.exe");
+    assert_eq!(notice["launched-by"][1], "explorer.exe");
+}
+
+/// An unknown ancestry is absent, not an empty list, and a payload from before
+/// the field existed still reads.
+#[test]
+fn launched_by_is_omitted_when_unknown_and_optional_on_read() {
+    let notice = serde_json::to_value(StatusUpdateEvent::BlockNoticeRaised {
+        sid: "S-1-5-21".into(),
+        destination: "cdn.example".into(),
+        app: "curl.exe".into(),
+        reason: "blocked-by-rule".into(),
+        attempts: 1,
+        launched_by: Vec::new(),
+    })
+    .expect("serialise");
+    assert!(notice.get("launched-by").is_none(), "{notice}");
+
+    let old_event: StatusUpdateEvent = serde_json::from_value(serde_json::json!({
+        "type": "block-notice-raised",
+        "sid": "S-1-5-21",
+        "destination": "cdn.example",
+        "app": "curl.exe",
+        "reason": "blocked-by-rule",
+        "attempts": 2,
+    }))
+    .expect("an event without launched-by parses");
+    match old_event {
+        StatusUpdateEvent::BlockNoticeRaised { launched_by, .. } => assert!(launched_by.is_empty()),
+        other => panic!("expected BlockNoticeRaised, got {other:?}"),
+    }
+
+    let entry = BlockNoticeJournalEntryDto {
+        id: 1,
+        raised_at_unix_ms: 10,
+        destination: "cdn.example".into(),
+        app: "curl.exe".into(),
+        reason: "blocked-by-rule".into(),
+        attempts: 1,
+        launched_by: vec!["pwsh.exe".into()],
+    };
+    let json = serde_json::to_value(&entry).expect("serialise");
+    assert_eq!(json["launched-by"][0], "pwsh.exe");
+    let old_entry: BlockNoticeJournalEntryDto = serde_json::from_value(serde_json::json!({
+        "id": 1,
+        "raised-at-unix-ms": 10,
+        "destination": "cdn.example",
+        "app": "curl.exe",
+        "reason": "blocked-by-rule",
+        "attempts": 1,
+    }))
+    .expect("a journal entry without launched-by parses");
+    assert!(old_entry.launched_by.is_empty());
+    let empty = serde_json::to_value(BlockNoticeJournalEntryDto {
+        launched_by: Vec::new(),
+        ..entry
+    })
+    .expect("serialise");
+    assert!(empty.get("launched-by").is_none());
+}
+
+/// Autostart lives in one user's registry hive and a user revision is one
+/// user's rules; both went to every session. The baseline revision is the one
+/// exception — every user who has not diverged runs it.
+#[test]
+fn per_user_settings_events_name_their_addressee() {
+    let autostart = StatusUpdateEvent::AutostartStateChanged {
+        sid: "S-1-5-21-A".into(),
+        enabled: true,
+        last_known_state: "enabled".into(),
+    };
+    assert_eq!(autostart.addressee(), Some("S-1-5-21-A"));
+
+    let own = StatusUpdateEvent::RevisionStatusChanged {
+        revision_id: "rev-1".into(),
+        status: "active".into(),
+        sid: Some("S-1-5-21-A".into()),
+    };
+    assert_eq!(own.addressee(), Some("S-1-5-21-A"));
+
+    let baseline = StatusUpdateEvent::RevisionStatusChanged {
+        revision_id: "rev-2".into(),
+        status: "active".into(),
+        sid: None,
+    };
+    assert_eq!(baseline.addressee(), None);
+    let json = serde_json::to_value(&baseline).expect("serialise");
+    assert!(
+        json.get("sid").is_none(),
+        "no SID key for the baseline: {json}"
+    );
+}
+
+/// The machine-wide policy is read by every user; who last wrote it is not
+/// theirs to learn, and nothing in the GUI read it.
+#[test]
+fn apply_failure_policy_does_not_carry_its_writer() {
+    let dto = ApplyFailurePolicyDto {
+        policy: "best-effort".into(),
+        updated_at: 7,
+    };
+    let json = serde_json::to_value(&dto).expect("serialise");
+    let keys: Vec<&str> = json
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys.len(), 2, "unexpected wire keys: {keys:?}");
+    assert!(json.get("set-by-sid").is_none());
+
+    // An older service that still sends the key must not break the reader.
+    let legacy: ApplyFailurePolicyDto = serde_json::from_value(serde_json::json!({
+        "policy": "best-effort",
+        "updated-at": 7,
+        "set-by-sid": "S-1-5-21-A",
+    }))
+    .expect("unknown key is ignored");
+    assert_eq!(legacy, dto);
 }
 
 // ── PresetImportPayload ──────────────────────────────────────────────────

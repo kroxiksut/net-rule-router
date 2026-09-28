@@ -54,6 +54,10 @@ pub mod wire_error;
 #[cfg(target_os = "windows")]
 mod transport;
 
+/// Only the Windows client consumes it; the decision is tested on every host.
+#[cfg(any(target_os = "windows", test))]
+mod server_identity;
+
 /// Unix `AF_UNIX` transport primitive. Public so it is a discoverable
 /// building block for the Unix client; the Windows `transport` stays
 /// private because only `client` consumes it.

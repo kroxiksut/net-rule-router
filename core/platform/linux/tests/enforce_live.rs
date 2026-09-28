@@ -6,11 +6,10 @@
 //! both survive one apply. That is the property no pure test can establish,
 //! because the thing that would break it is the kernel replacing a table.
 //!
-//! Skips itself, loudly, when the host cannot run it. A silent pass on an
-//! unequipped machine reads as coverage it does not have.
-//!
-//! Uses the product's own table name — the enforcer owns it — so this test must
-//! not run beside a live daemon on the same host.
+//! Ignored by default: it needs root, `nft` and a real uplink. Run it with
+//! `--ignored`; it then fails, rather than passes, on a host that lacks them —
+//! a silent pass reads as coverage it does not have. Each test installs into a
+//! table of its own and refuses to run beside a live daemon.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::expect_used)]
@@ -18,13 +17,14 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use nrr_platform_api::adapters::AdapterEventSource;
+use nrr_platform_api::adapters::{AdapterEventSource, IfOperStatus, InterfaceType};
 use nrr_platform_api::enforcement::{
     AppScope, Coverage, DstMatch, EgressBinding, EgressBindingSource, EgressConstraint, EgressRef,
     EnforcementPlan, FlowMatch, FlowRule, PolicyEnforcer, Precedence, PrecedenceClass,
     PrincipalScope, UserPrincipal, Verdict,
 };
 use nrr_platform_linux::adapters::LinuxAdapterSource;
+use nrr_platform_linux::lower_linux::NRR_TABLE;
 use nrr_platform_linux::nft_apply::{NftApplyError, NftCliEnforcement};
 use nrr_platform_linux::nft_policy_enforcer::NftPolicyEnforcer;
 use nrr_shared::RouteRole;
@@ -41,17 +41,83 @@ fn is_root() -> bool {
         .is_some_and(|uid| uid == "0")
 }
 
-fn probe_environment() -> Result<(), String> {
-    if !is_root() {
-        return Err("needs root: nf_tables refuses an unprivileged caller".to_owned());
-    }
+const IFACE_ENV: &str = "NRR_LIVE_TEST_IFACE";
+
+fn list_tables() -> String {
+    let output = Command::new("nft")
+        .args(["list", "tables"])
+        .output()
+        .expect("nft must be runnable");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Panics with the reason when the host cannot run this: an explicit
+/// `--ignored` run that passes without touching the kernel is false coverage.
+fn require_environment() {
+    assert!(
+        is_root(),
+        "needs root: nf_tables refuses an unprivileged caller"
+    );
     match NftCliEnforcement::new().probe() {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(NftApplyError::NftUnavailable { detail }) => {
-            Err(format!("nft is unavailable ({detail})"))
+            panic!("nft is unavailable ({detail})")
         }
-        Err(other) => Err(format!("nft answered an error: {other}")),
+        Err(other) => panic!("nft answered an error: {other}"),
     }
+    let product = format!("table inet {NRR_TABLE}");
+    assert!(
+        !list_tables().lines().any(|l| l.trim() == product),
+        "`{product}` exists: a live daemon is enforcing on this host. Stop it first — \
+         this test must not share the kernel with the user's kill-switch",
+    );
+}
+
+/// Per test, not per process: the tests in this file run in parallel threads.
+fn test_table(test: &str) -> String {
+    format!("nrr_test_{}_{test}", std::process::id())
+}
+
+/// Deletes the test table on every exit, a failed assert included.
+struct TableGuard(String);
+
+impl Drop for TableGuard {
+    fn drop(&mut self) {
+        let _ = NftCliEnforcement::new().teardown(&self.0);
+    }
+}
+
+/// A real uplink: `NRR_LIVE_TEST_IFACE` when set, else the first link that is
+/// up, is not loopback and carries a default route.
+fn uplink(adapters: &LinuxAdapterSource) -> String {
+    let all = adapters.enumerate_all().expect("adapters must enumerate");
+    if let Ok(wanted) = std::env::var(IFACE_ENV) {
+        let found = all
+            .iter()
+            .find(|a| a.friendly_name == wanted || a.adapter_name == wanted)
+            .unwrap_or_else(|| panic!("{IFACE_ENV}=`{wanted}` names no interface on this host"));
+        assert!(
+            found.oper_status == IfOperStatus::Up,
+            "{IFACE_ENV}=`{wanted}` is not up",
+        );
+        return wanted;
+    }
+    all.into_iter()
+        .find(|a| {
+            a.oper_status == IfOperStatus::Up
+                && a.interface_type != InterfaceType::Loopback
+                && a.has_gateway()
+        })
+        .map(|a| {
+            if a.friendly_name.is_empty() {
+                a.adapter_name
+            } else {
+                a.friendly_name
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!("no up, non-loopback link with a default route; name one in {IFACE_ENV}")
+        })
 }
 
 /// Everyone is bound to the same live link, named as the machine names it.
@@ -91,9 +157,9 @@ fn plan_for(uid: u32, last_octet: u8) -> EnforcementPlan {
     }
 }
 
-fn list_our_table() -> String {
+fn list_our_table(table: &str) -> String {
     let output = Command::new("nft")
-        .args(["list", "table", "inet", "nrr"])
+        .args(["list", "table", "inet", table])
         .output()
         .expect("nft must be runnable");
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -127,25 +193,26 @@ fn guarded_plan(uid: u32, guarded: std::net::Ipv4Addr) -> EnforcementPlan {
 }
 
 #[test]
+#[ignore = "needs root and nft, and no live daemon; run with --ignored"]
 fn the_leak_guard_reaches_the_kernel_as_a_drop() {
-    if let Err(reason) = probe_environment() {
-        eprintln!("SKIPPED enforce_live: {reason}");
-        return;
-    }
+    require_environment();
 
+    let table = test_table("leak_guard");
+    let _guard = TableGuard(table.clone());
     // The binding names a link that does NOT exist — the shape of a tunnel that
     // went away, which is exactly when the guard has to hold.
     let enforcer = NftPolicyEnforcer::new(
         Arc::new(BoundToLink("nrr-absent-link".to_owned())),
         Arc::new(LinuxAdapterSource),
-    );
+    )
+    .with_table(table.clone());
 
     let guarded = std::net::Ipv4Addr::new(198, 51, 100, 66);
     enforcer
         .enforce(&[guarded_plan(1000, guarded)])
         .expect("the kernel must accept the guard");
 
-    let installed = list_our_table();
+    let installed = list_our_table(&table);
     assert!(
         installed.contains("198.51.100.66") && installed.contains("drop"),
         "the guarded address must be dropped:\n{installed}",
@@ -160,31 +227,20 @@ fn the_leak_guard_reaches_the_kernel_as_a_drop() {
 }
 
 #[test]
+#[ignore = "needs root, nft and a real uplink, and no live daemon; run with --ignored"]
 fn two_principals_survive_one_apply_on_a_live_kernel() {
-    if let Err(reason) = probe_environment() {
-        eprintln!("SKIPPED enforce_live: {reason}");
-        return;
-    }
+    require_environment();
 
     // A link the machine really has, so the pin resolves the way it would in
     // production instead of being reported unsupported.
     let adapters = Arc::new(LinuxAdapterSource);
-    let link = adapters
-        .enumerate_all()
-        .expect("adapters must enumerate")
-        .into_iter()
-        .find(|a| a.oper_status == nrr_platform_api::adapters::IfOperStatus::Up)
-        .map(|a| {
-            if a.friendly_name.is_empty() {
-                a.adapter_name
-            } else {
-                a.friendly_name
-            }
-        })
-        .expect("at least one link must be up");
+    let link = uplink(&adapters);
     eprintln!("enforce_live: binding both principals to `{link}`");
 
-    let enforcer = NftPolicyEnforcer::new(Arc::new(BoundToLink(link)), adapters);
+    let table = test_table("two_principals");
+    let _guard = TableGuard(table.clone());
+    let enforcer =
+        NftPolicyEnforcer::new(Arc::new(BoundToLink(link)), adapters).with_table(table.clone());
     let report = enforcer
         .enforce(&[plan_for(1000, 7), plan_for(1001, 8)])
         .expect("the kernel must accept the plans");
@@ -192,7 +248,7 @@ fn two_principals_survive_one_apply_on_a_live_kernel() {
     assert_eq!(report.skipped, 0, "notes: {:?}", report.notes);
     assert!(report.applied >= 4, "each pin lowers to a pair: {report:?}");
 
-    let installed = list_our_table();
+    let installed = list_our_table(&table);
     assert!(
         installed.contains("skuid 1000") && installed.contains("skuid 1001"),
         "both users must be enforced after ONE apply; got:\n{installed}",
@@ -208,16 +264,13 @@ fn two_principals_survive_one_apply_on_a_live_kernel() {
     enforcer
         .enforce(&[plan_for(1000, 7), plan_for(1001, 8)])
         .expect("re-apply must succeed");
-    let after = list_our_table().matches("skuid").count();
+    let after = list_our_table(&table).matches("skuid").count();
     assert_eq!(before, after, "re-apply duplicated rules");
 
     enforcer.teardown().expect("teardown must succeed");
-    let remaining = Command::new("nft")
-        .args(["list", "tables"])
-        .output()
-        .expect("nft must be runnable");
+    let ours = format!("table inet {table}");
     assert!(
-        !String::from_utf8_lossy(&remaining.stdout).contains("table inet nrr"),
+        !list_tables().lines().any(|l| l.trim() == ours),
         "teardown must remove our table",
     );
 }

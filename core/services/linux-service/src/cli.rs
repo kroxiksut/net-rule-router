@@ -17,6 +17,8 @@ pub enum Command {
     Status,
     /// The unit's stop hook: undo the DNS redirect a dead daemon left behind.
     RestoreDns,
+    /// Undo everything a dead daemon left on the machine: DNS, nft, routes.
+    Cleanup,
     /// `help` / `--help` / no arguments — print usage.
     Help,
     /// Any unrecognised verb — a hard error, never a daemon start.
@@ -39,6 +41,7 @@ pub fn parse_command(args: &[String]) -> Command {
         "uninstall" => Command::Uninstall,
         "status" => Command::Status,
         "restore-dns" => Command::RestoreDns,
+        "cleanup" => Command::Cleanup,
         "help" | "h" | "" => Command::Help,
         other => Command::Unknown(other.to_string()),
     }
@@ -61,6 +64,16 @@ mod tests {
         assert_eq!(
             parse(&[nrr_platform_linux::systemd::DAEMON_RESTORE_DNS_VERB]),
             Command::RestoreDns
+        );
+    }
+
+    /// The console's `reset-network` runs this word.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_console_reset_verb_is_one_this_daemon_knows() {
+        assert_eq!(
+            parse(&[nrr_platform_linux::systemd::DAEMON_CLEANUP_VERB]),
+            Command::Cleanup
         );
     }
 

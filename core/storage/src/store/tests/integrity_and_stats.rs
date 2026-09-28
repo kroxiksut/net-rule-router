@@ -2,14 +2,6 @@ use super::*;
 
 // ── integrity checks ─────────────────────────────────────────────────────
 
-/// Seed the legacy singleton rows `check_integrity` still verifies.
-///
-/// They are seeded by SQL because nothing in the product writes them any
-/// more: `set_active_revision` now writes `active_revision_pointer`, where
-/// the readers look, and the LKG is derived from `revisions`. The checks
-/// below therefore cover code that is still present, over data that is no
-/// longer produced — see the open half of §36.12.2 (moving tamper detection
-/// onto `revisions.row_hmac`).
 /// A signed revision row, written the way production writes one.
 fn seed_signed_revision(conn: &Connection, key: &[u8], revision_id: &str, status: &str) {
     let repo = crate::revisions::RevisionsRepository::with_signing_key(conn, key.to_vec());
@@ -116,6 +108,62 @@ fn state_store_check_integrity_detects_a_tampered_rollback_target() {
     assert!(
         matches!(action, RecoveryAction::RequireUserAction(_)),
         "corrupt LKG must require user action, got {action:?}"
+    );
+}
+
+/// Deleting the active row leaves no signature to fail; the pointer that
+/// still names it is the only trace, and it needs no key to see.
+#[test]
+fn state_store_check_integrity_fails_on_a_pointer_to_a_deleted_revision() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_state_store(&dir);
+    seed_revision(&store, "rev-deleted", "active");
+    let rev = RevisionId::from_prefixed_string("rev-deleted".to_string()).expect("rev");
+    store.set_active_revision(&rev).expect("set active");
+    {
+        let conn = store.conn.borrow();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM revisions WHERE revision_id = 'rev-deleted';
+             PRAGMA foreign_keys = ON;",
+        )
+        .expect("external delete");
+    }
+
+    let (result, action) = store.check_integrity().expect("check");
+    assert!(
+        matches!(result, IntegrityCheckResult::PolicyIntegrityFailed { .. }),
+        "a pointer to a missing revision must fail, got {result:?}"
+    );
+    assert_eq!(action, RecoveryAction::FallbackToLastKnownGood);
+}
+
+/// Moving the pointer onto an older, validly signed row passes every row
+/// check; only the pointer's own signature catches it.
+#[test]
+fn state_store_check_integrity_detects_a_redirected_pointer() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_state_store(&dir).with_signing_key(TEST_SIGNING_KEY.to_vec());
+    {
+        let conn = store.conn.borrow();
+        seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-old-001", "superseded");
+        seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-new-002", "active");
+    }
+    let rev = RevisionId::from_prefixed_string("rev-new-002".to_string()).expect("rev");
+    store.set_active_revision(&rev).expect("set active");
+    {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "UPDATE active_revision_pointer SET revision_id = 'rev-old-001'",
+            [],
+        )
+        .expect("redirect pointer");
+    }
+
+    let (result, _) = store.check_integrity().expect("check");
+    assert!(
+        matches!(result, IntegrityCheckResult::PolicyIntegrityFailed { .. }),
+        "a redirected pointer must fail, got {result:?}"
     );
 }
 

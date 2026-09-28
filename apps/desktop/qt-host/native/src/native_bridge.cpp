@@ -1,4 +1,5 @@
 #include "native_bridge.h"
+#include <QSaveFile>
 
 NrrNativeBridge::NrrNativeBridge(const QString &applicationDir, QObject *parent)
     : QObject(parent),
@@ -212,6 +213,20 @@ void NrrNativeBridge::openContainingFolder(const QString &path) {
 #endif
 }
 
+// SystemTrayIcon (Qt.labs.platform) takes its icon only as a URL, so a derived
+// icon has to exist as a file. It goes to the per-user runtime directory, and
+// through QSaveFile: a fresh exclusive temp file renamed over the name, so a
+// link planted at that name is replaced, never written through.
+static QString saveTrayIconPng(const QImage &image, const QString &fileName) {
+    const QString outPath = QDir(appRuntimeDirectoryPath()).filePath(fileName);
+    QSaveFile file(outPath);
+    if (!file.open(QIODevice::WriteOnly) || !image.save(&file, "PNG") || !file.commit()) {
+        qWarning().noquote() << "Failed to save tray icon to" << outPath;
+        return {};
+    }
+    return outPath;
+}
+
 QString NrrNativeBridge::prepareTrayGrayscaleIcon(const QString &sourceUrl) {
     if (sourceUrl.isEmpty()) {
         return {};
@@ -242,12 +257,8 @@ QString NrrNativeBridge::prepareTrayGrayscaleIcon(const QString &sourceUrl) {
             row[x] = qRgba(gray, gray, gray, qAlpha(pixel));
         }
     }
-    const QString outDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
-                           + QStringLiteral("/NetRuleRouter");
-    QDir().mkpath(outDir);
-    const QString outPath = outDir + QStringLiteral("/tray-grayscale.png");
-    if (!grayscale.save(outPath, "PNG")) {
-        qWarning().noquote() << "Failed to save grayscale tray icon to" << outPath;
+    const QString outPath = saveTrayIconPng(grayscale, QStringLiteral("tray-grayscale.png"));
+    if (outPath.isEmpty()) {
         return {};
     }
     grayscaleIconCacheSource_ = sourceUrl;
@@ -280,13 +291,18 @@ QString NrrNativeBridge::prepareTrayStatusIcon(const QString &sourceUrl,
     }
     QImage composited = source.convertToFormat(QImage::Format_ARGB32);
     const int dotDiameter = qMax(composited.width(), composited.height()) / 3;
+    // The slug names the output file, so only a known one may reach it.
+    QString slug = statusKind;
     QColor dotColor;
-    if      (statusKind == QStringLiteral("running"))       dotColor = QColor("#2eb872");
-    else if (statusKind == QStringLiteral("stopped"))       dotColor = QColor("#d4a017");
-    else if (statusKind == QStringLiteral("pending"))       dotColor = QColor("#888888");
-    else if (statusKind == QStringLiteral("not-installed")) dotColor = QColor("#c0392b");
-    else if (statusKind == QStringLiteral("paused"))        dotColor = QColor("#f39c12");
-    else                                                    dotColor = QColor("#888888");
+    if      (slug == QStringLiteral("running"))       dotColor = QColor("#2eb872");
+    else if (slug == QStringLiteral("stopped"))       dotColor = QColor("#d4a017");
+    else if (slug == QStringLiteral("pending"))       dotColor = QColor("#888888");
+    else if (slug == QStringLiteral("not-installed")) dotColor = QColor("#c0392b");
+    else if (slug == QStringLiteral("paused"))        dotColor = QColor("#f39c12");
+    else {
+        slug = QStringLiteral("unknown");
+        dotColor = QColor("#888888");
+    }
 
     QPainter painter(&composited);
     painter.setRenderHint(QPainter::Antialiasing, true);
@@ -299,13 +315,9 @@ QString NrrNativeBridge::prepareTrayStatusIcon(const QString &sourceUrl,
         dotDiameter);
     painter.end();
 
-    const QString outDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
-                           + QStringLiteral("/NetRuleRouter");
-    QDir().mkpath(outDir);
-    const QString outPath = outDir + QStringLiteral("/tray-status-") + statusKind
-                            + QStringLiteral(".png");
-    if (!composited.save(outPath, "PNG")) {
-        qWarning().noquote() << "prepareTrayStatusIcon: failed to save" << outPath;
+    const QString outPath = saveTrayIconPng(
+        composited, QStringLiteral("tray-status-") + slug + QStringLiteral(".png"));
+    if (outPath.isEmpty()) {
         return {};
     }
     statusIconCacheKey_ = cacheKey;

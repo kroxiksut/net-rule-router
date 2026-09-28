@@ -63,7 +63,8 @@ ones that match your active rules, without waiting for you to visit them
 again. It is available from the Diagnostics screen and can be triggered
 **on demand**, or turned on to run **automatically every time the service
 starts**. Either way it is strictly opt-in — nothing is read from your
-browsers unless you enable it.
+browsers unless you enable it. On a PC several people use, seeding reads only
+the browsers of the person who asked for it, never another user's history.
 
 Only hostnames are ever extracted. Full URLs, page titles, visit timestamps,
 and visit counts never leave the machine, and hostnames that do not match any

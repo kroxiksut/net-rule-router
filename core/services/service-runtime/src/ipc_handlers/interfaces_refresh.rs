@@ -64,6 +64,7 @@ impl IpcHandler for InterfacesRefreshHandler {
 
         tracing::info!(
             target: "nrr::interfaces",
+            msg_key = "ifacerefresh-requested",
             "external-address refresh requested — re-enumerating adapters and probing",
         );
         let started = std::time::Instant::now();
@@ -80,6 +81,7 @@ impl IpcHandler for InterfacesRefreshHandler {
                 });
         tracing::info!(
             target: "nrr::interfaces",
+            msg_key = "ifacerefresh-finished",
             rows = resp.rows.len(),
             attempted,
             resolved,

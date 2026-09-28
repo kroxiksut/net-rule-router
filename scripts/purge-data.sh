@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Remove every trace of the product from this machine: the systemd unit and the
-# rest of the install footprint, the service data tree, the live nft table, and
-# the files the desktop surfaces write into the caller's own profile. Linux
-# counterpart of purge-data.ps1.
+# rest of the install footprint, the service data tree, the live nft table and
+# DNS redirect, and the files the desktop surfaces write into the caller's own
+# profile. Linux counterpart of purge-data.ps1.
 #
 # Dry-run by default: it prints what it would remove and touches nothing. Only
 # --yes deletes, and only the paths declared in lib/service-paths.sh — no
 # pattern is ever expanded against the home directory.
 #
-# The desktop entries and icons go through uninstall-desktop.sh, which owns
-# those paths.
+# The desktop entries and icons go through uninstall-desktop.sh, and the nft
+# table and DNS redirect through reset-network.sh; each owns its footprint.
 #
 # The audit trail is not part of a user cleanup, so /var/lib/netrulerouter/audit
 # survives unless --purge-audit says otherwise.
@@ -144,31 +144,21 @@ purge_state_dir() {
   fi
 }
 
-# Whatever the daemon left loaded. Listing the table needs root, so the dry run
-# states the intent instead of probing.
-purge_nft_table() {
-  local label="nft table $NRR_NFT_FAMILY $NRR_NFT_TABLE"
+# Whatever the daemon left in the kernel and in the machine's DNS. Before the
+# state tree goes: it holds the only copy of a resolv.conf the daemon replaced,
+# so a failed reset stops the purge rather than lose that file.
+run_network_reset() {
+  local label="nft table $NRR_NFT_FAMILY $NRR_NFT_TABLE, DNS redirect"
   if [ "$apply" -eq 0 ]; then
-    nrr_yellow "  would remove $label (if loaded)"
+    nrr_yellow "  would run    $script_dir/reset-network.sh ($label, if present)"
     return
   fi
-  if ! command -v nft >/dev/null 2>&1; then
-    nrr_gray "  absent       $label (nft is not installed)"
-    mark_absent "$label"
+  if bash "$script_dir/reset-network.sh" --profile "$profile"; then
+    mark_removed "$label (whatever was left)"
     return
   fi
-  if ! nrr_run_privileged nft list table "$NRR_NFT_FAMILY" "$NRR_NFT_TABLE" >/dev/null 2>&1; then
-    nrr_gray "  absent       $label"
-    mark_absent "$label"
-    return
-  fi
-  if nrr_run_privileged nft delete table "$NRR_NFT_FAMILY" "$NRR_NFT_TABLE"; then
-    nrr_green "  removed      $label"
-    mark_removed "$label"
-  else
-    nrr_yellow "  FAILED       $label"
-    mark_failed "$label"
-  fi
+  nrr_yellow "reset-network.sh failed; nothing machine-wide was deleted. Fix the network state, then re-run."
+  exit 1
 }
 
 # Take the unit down before the data goes, so a running daemon cannot rewrite
@@ -208,6 +198,9 @@ fi
 nrr_cyan "==> service"
 run_uninstall
 
+nrr_cyan "==> network state"
+run_network_reset
+
 nrr_cyan "==> machine-wide footprint"
 purge_path "$NRR_UNIT_FILE" system
 purge_path "$NRR_LOGROTATE_CONFIG" system
@@ -216,7 +209,6 @@ purge_path "$NRR_SERVICE_INSTALL_DIR" system
 purge_state_dir
 purge_path "$NRR_LOG_DIR" system
 purge_path "$NRR_RUNTIME_DIR" system
-purge_nft_table
 
 nrr_cyan "==> profile of $(id -un)"
 run_uninstall_desktop

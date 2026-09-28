@@ -241,6 +241,7 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
                 );
                 tracing::info!(
                     target: "nrr::auto-rules",
+                    msg_key = "prod-autorule-main-link-checked",
                     answered = summary.answered,
                     silent = summary.silent,
                     indeterminate = summary.indeterminate,
@@ -284,6 +285,7 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
                 );
                 tracing::info!(
                     target: "nrr::auto-rules",
+                    msg_key = "prod-autorule-secondary-reach-checked",
                     answered = second.answered,
                     silent = second.silent,
                     indeterminate = second.indeterminate,
@@ -293,6 +295,7 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
         if let Err(e) = spawned {
             tracing::warn!(
                 target: "nrr::auto-rules",
+                msg_key = "prod-autorule-probe-spawn-failed",
                 "could not start the main-link probe pass: {e}",
             );
             return AutoRuleCandidatesProbeResponse::default();

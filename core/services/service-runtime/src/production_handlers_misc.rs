@@ -404,11 +404,9 @@ fn rule_type_slugs() -> Vec<String> {
 /// "no filters to install").
 pub struct ProductionRoutePolicySource {
     conn: Arc<Mutex<Connection>>,
-    /// Optional FQDN cache so DoH-resolver-list HOST entries
-    /// (`dns.google`) resolve to IPs for the lockdown. IP entries need no cache;
-    /// host entries contribute nothing until this is wired (best-effort). The
-    /// seed list carries an IP for every resolver, so the lockdown is fully
-    /// functional by IP even without host resolution.
+    /// Optional FQDN cache so DoH-resolver-list HOST entries (`dns.google`)
+    /// resolve for the lockdown. Host entries contribute nothing without it;
+    /// the seed carries literal addresses, so the lockdown still works by IP.
     fqdn_cache: Option<Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>>,
     /// Set where the platform has no other way to turn browser DoH off.
     doh_lockdown_forced: bool,
@@ -441,23 +439,23 @@ impl ProductionRoutePolicySource {
         self
     }
 
-    /// Resolves the ENABLED DoH-resolver-list entries to the IPv4s
-    /// the lockdown blocks: literal IP entries as-is, host entries through the
-    /// FQDN cache (best-effort — an un-cached host yields nothing). Reads the
-    /// shared `doh_resolver_entries` baseline via the already-held state-DB conn.
-    fn resolve_doh_resolver_ips(&self, conn: &Connection) -> Vec<std::net::Ipv4Addr> {
+    /// Resolves the ENABLED DoH-resolver-list entries to the addresses the
+    /// lockdown blocks: literal entries as-is, host entries through the FQDN
+    /// cache with their AAAA answers kept — a dual-stack browser reaches the
+    /// resolver over either family. An un-cached host yields nothing.
+    fn resolve_doh_resolver_ips(&self, conn: &Connection) -> Vec<std::net::IpAddr> {
         use nrr_storage::doh_lockdown::{DohResolverEntriesRepository, DohTarget};
         let entries = match DohResolverEntriesRepository::new(conn).load_all() {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
-        let mut ips: Vec<std::net::Ipv4Addr> = Vec::new();
+        let mut ips: Vec<std::net::IpAddr> = Vec::new();
         for entry in entries.into_iter().filter(|e| e.enabled) {
             match entry.target {
                 DohTarget::Ip(ip) => ips.push(ip),
                 DohTarget::Host(host) => {
                     if let Some(cache) = self.fqdn_cache.as_ref() {
-                        ips.extend(crate::dns_wire::only_v4(&cache.ips_for_hostname(&host)));
+                        ips.extend(cache.ips_for_hostname(&host));
                     }
                 }
             }
@@ -666,6 +664,11 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
         if sid.is_empty() {
             return Err(RoutePolicyWriteError::EmptySid);
         }
+        let short_name_suffix = match request.short_name_suffix.trim() {
+            "" => String::new(),
+            raw => nrr_domain::rule_value_validation::normalize_network_domain(raw)
+                .ok_or(RoutePolicyWriteError::InvalidNetworkDomain)?,
+        };
         let record = RoutePolicyRecord {
             primary: request.primary.as_ref().map(dto_binding_to_record),
             secondary: request.secondary.as_ref().map(dto_binding_to_record),
@@ -716,6 +719,8 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             primary_probe_repeat_secs: request.primary_probe_repeat_secs,
             local_networks_auto_accept: request.local_networks_auto_accept,
             zone_priority_over_ip: request.zone_priority_over_ip,
+            short_name_completion: request.short_name_completion,
+            short_name_suffix,
             binding_source: dto_source_to_storage(request.binding_source),
         };
         let conn = self
@@ -887,6 +892,8 @@ fn record_to_dto(
         primary_probe_repeat_secs: rec.primary_probe_repeat_secs,
         local_networks_auto_accept: rec.local_networks_auto_accept,
         zone_priority_over_ip: rec.zone_priority_over_ip,
+        short_name_completion: rec.short_name_completion,
+        short_name_suffix: rec.short_name_suffix,
         binding_source: storage_source_to_dto(rec.binding_source),
     }
 }
@@ -1245,6 +1252,7 @@ impl MonitoredAdaptersSnapshotProvider {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::adapters",
+                    msg_key = "prodmisc-adapter-infos-failed",
                     error = %format!("{e:?}"),
                     "get_adapter_infos failed; returning empty snapshot",
                 );
@@ -1285,6 +1293,7 @@ impl MonitoredAdaptersSnapshotProvider {
         if !source.is_live() {
             tracing::warn!(
                 target: "nrr::snapshot-interfaces",
+                msg_key = "prodmisc-adapter-enum-empty-placeholder",
                 data_source = source.title(),
                 rows = rich_rows.len(),
                 "live adapter enumeration produced nothing — answering with the deterministic placeholder dataset, marked as such",
@@ -1360,6 +1369,7 @@ impl ProductionFailClosedProbe {
         if changed {
             tracing::info!(
                 target: "nrr::stability",
+                msg_key = "prodmisc-failclosed-state",
                 fail_closed_active = new_state,
                 "secondary route fail-closed state",
             );
@@ -1384,6 +1394,7 @@ impl crate::ipc_handlers::providers::FailClosedStateProbe for ProductionFailClos
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::stability",
+                    msg_key = "prodmisc-route-bindings-load-failed",
                     error = %e,
                     "RouteBindingsRepository::load_for_sid failed; suppressing Fail-Closed banner",
                 );
@@ -1493,5 +1504,57 @@ mod route_binding_dto_tests {
         let wire = serde_json::to_value(&dto).expect("serializes");
         assert_eq!(wire["stable-id"], "win-adapter:{a}");
         assert!(wire.get("known-stable-ids").is_none());
+    }
+}
+
+#[cfg(test)]
+mod doh_resolver_ip_tests {
+    use super::*;
+    use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
+    use nrr_storage::doh_lockdown::{DohResolverEntriesRepository, DohResolverEntry, DohTarget};
+    use nrr_storage::repository::MigrationRunner;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// A host entry's AAAA answers are blocked too: the browser bootstraps its
+    /// DoH hostname through the system resolver and may connect over either
+    /// family.
+    #[test]
+    fn a_host_entry_contributes_both_families_from_the_cache() {
+        let runner = nrr_storage::migration::SqliteMigrationRunner::for_state_db(
+            Connection::open_in_memory().expect("in-memory"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        let conn = runner.into_connection();
+        let literal_v6: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53).into();
+        DohResolverEntriesRepository::new(&conn)
+            .replace_all(
+                &[
+                    DohResolverEntry {
+                        target: DohTarget::Host("doh.example".into()),
+                        comment: String::new(),
+                        enabled: true,
+                    },
+                    DohResolverEntry {
+                        target: DohTarget::Ip(literal_v6),
+                        comment: String::new(),
+                        enabled: true,
+                    },
+                ],
+                0,
+            )
+            .expect("write");
+        let cached_v4: IpAddr = Ipv4Addr::new(192, 0, 2, 10).into();
+        let cached_v6: IpAddr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10).into();
+        let cache = Arc::new(MockFqdnCacheLookup::new());
+        cache.set_addresses("doh.example", vec![cached_v4, cached_v6]);
+
+        let source = ProductionRoutePolicySource::new(Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("unused"),
+        )))
+        .with_fqdn_cache(cache);
+        let ips = source.resolve_doh_resolver_ips(&conn);
+        for ip in [cached_v4, cached_v6, literal_v6] {
+            assert!(ips.contains(&ip), "{ip} missing from {ips:?}");
+        }
     }
 }

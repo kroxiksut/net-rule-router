@@ -1,16 +1,12 @@
 //! Frames on the wire: the handshake, one request/response exchange, the push
 //! stream, and what has to be replayed after a reconnect.
-//!
-//! Split out of `client_unix`; the code is unchanged.
 
 use super::*;
 
 // ── Transport-generic frame exchanges ────────────────────────────────────────
 //
-// Generic over `Read + Write` so the identical framing / push-routing logic
-// runs over a real `UnixStream` and a test `socketpair`. Written generically so
-// a future migration of the Windows client onto this shared path (under
-// HW-verify) can lift these as-is; today only the Unix client consumes them.
+// Generic over `Read + Write` so the same code runs over the production
+// `TimedStream` and a test `socketpair`.
 
 /// Perform the `ContractNegotiate` handshake over `stream`: write the request,
 /// read the response, interpret it (neutral). `Err` on transport failure.
@@ -22,8 +18,9 @@ pub(super) fn negotiate_over<S: Read + Write>(stream: &mut S) -> Result<Negotiat
 }
 
 /// Write one request envelope and read frames until the matching response
-/// arrives, handing push frames (empty `request-id`) to `push`. `Err` means the
-/// transport died and the caller should reconnect.
+/// arrives, handing push frames (empty `request-id`) to `push`. An `Err` that
+/// is not [`WireError::is_transport_dead`] was refused by the codec before a
+/// byte was written; every other `Err` means reconnect.
 pub(super) fn exchange<S: Read + Write>(
     stream: &mut S,
     envelope: &Value,
@@ -33,7 +30,7 @@ pub(super) fn exchange<S: Read + Write>(
     let op = crate::protocol::envelope_operation(envelope);
     write_frame(stream, envelope)?;
     loop {
-        let frame: Value = read_frame(stream)?;
+        let frame: Value = read_frame(stream).map_err(read_failure_is_fatal)?;
         let frame_request_id = frame
             .get("request-id")
             .or_else(|| frame.get("request_id"))
@@ -57,6 +54,19 @@ pub(super) fn exchange<S: Read + Write>(
         eprintln!(
             "nrr-ipc-client(unix): discarding frame with unexpected request_id={frame_request_id}"
         );
+    }
+}
+
+/// Any failed READ leaves the stream at an unknown offset — a garbage length or
+/// an undecodable body included — so it is fatal, as it is on Windows. Only a
+/// write the codec refused up front leaves the connection usable.
+fn read_failure_is_fatal(e: WireError) -> WireError {
+    match e {
+        WireError::Io(_) => e,
+        other => WireError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            other.to_string(),
+        )),
     }
 }
 
@@ -228,6 +238,23 @@ pub(super) fn wait_for_shutdown_or_force_reconnect(
     }
 }
 
+/// The connection is gone: nothing queued may wait out the backoff, nor be sent
+/// later on a connection its caller never saw. The status flips first so that
+/// no new request is admitted behind the drain.
+pub(super) fn fail_queued_requests(
+    inner: &Arc<ClientInner>,
+    request_rx: &Receiver<PendingRequest>,
+) {
+    if inner.status.read().is_ok_and(|s| s.is_connected()) {
+        inner.set_status(ConnectionStatus::Disconnected {
+            last_error: "connection closed".into(),
+        });
+    }
+    while let Ok(p) = request_rx.try_recv() {
+        let _ = p.response_tx.send(RequestResponse::Disconnected);
+    }
+}
+
 pub(super) fn sleep_observing_shutdown(inner: &Arc<ClientInner>, total: Duration) {
     let granularity = Duration::from_millis(50);
     let deadline = Instant::now() + total;
@@ -235,13 +262,8 @@ pub(super) fn sleep_observing_shutdown(inner: &Arc<ClientInner>, total: Duration
         if inner.shutdown.load(Ordering::SeqCst) {
             return;
         }
-        // Consume (swap), not just observe: see the matching comment in
-        // `client.rs::sleep_observing_shutdown` — a `force_reconnect()` nudge
-        // that fires during backoff must not survive past the wake-up it
-        // causes, or the NEXT successful connect gets torn down by
-        // `serve_requests`' own top-of-loop check before serving a request,
-        // and the worker livelocks between "reconnect" and "instant
-        // disconnect" for as long as callers keep nudging on failure.
+        // Consume, not just observe: a nudge left set would tear down the next
+        // connection before it served a request — see the Windows twin.
         if inner.force_reconnect.swap(false, Ordering::SeqCst) {
             return;
         }

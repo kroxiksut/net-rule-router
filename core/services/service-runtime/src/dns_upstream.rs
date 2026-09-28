@@ -253,6 +253,7 @@ impl UpstreamDnsPool {
         if replacement != retired {
             tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-upstream-rotated",
                 retired = ?retired,
                 active = ?replacement,
                 "upstream DNS stopped answering — switched to another server",
@@ -280,6 +281,7 @@ impl UpstreamDnsPool {
         if selected != previous {
             tracing::info!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-upstream-reselected",
                 previous = ?previous,
                 active = ?selected,
                 "upstream DNS re-selected after a network change",
@@ -328,6 +330,7 @@ impl UpstreamDnsPool {
             self.background_refresh.store(false, Ordering::SeqCst);
             tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-upstream-worker-spawn-failed",
                 "could not start the upstream DNS re-selection worker: {e}",
             );
         }

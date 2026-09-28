@@ -454,7 +454,6 @@ impl nrr_service_runtime::ApplyFailurePolicyProvider for EmptyApplyFailurePolicy
         nrr_service_runtime::ipc_handlers::payloads::ApplyFailurePolicyDto {
             policy: "all-or-nothing".into(),
             updated_at: 0,
-            set_by_sid: None,
         }
     }
 }
@@ -464,7 +463,7 @@ impl nrr_service_runtime::ApplyFailurePolicyWriter for EmptyApplyFailurePolicyWr
     fn set(
         &self,
         slug: &str,
-        sid: Option<&str>,
+        _sid: Option<&str>,
     ) -> Result<
         nrr_service_runtime::ipc_handlers::payloads::ApplyFailurePolicyDto,
         nrr_service_runtime::SettingsWriteError,
@@ -473,7 +472,6 @@ impl nrr_service_runtime::ApplyFailurePolicyWriter for EmptyApplyFailurePolicyWr
             nrr_service_runtime::ipc_handlers::payloads::ApplyFailurePolicyDto {
                 policy: slug.into(),
                 updated_at: 0,
-                set_by_sid: sid.map(str::to_string),
             },
         )
     }
@@ -545,6 +543,7 @@ struct EmptyAutostartWriter;
 impl nrr_service_runtime::AutostartWriter for EmptyAutostartWriter {
     fn toggle(
         &self,
+        _sid: &str,
         enabled: bool,
     ) -> Result<
         nrr_service_runtime::ipc_handlers::payloads::AutostartDto,
@@ -613,6 +612,8 @@ impl nrr_service_runtime::RoutePolicyWriter for EmptyRoutePolicyWriter {
                 primary_probe_repeat_secs: 300,
                 local_networks_auto_accept: false,
                 zone_priority_over_ip: false,
+                short_name_completion: false,
+                short_name_suffix: String::new(),
                 binding_source: request.binding_source,
             },
         )

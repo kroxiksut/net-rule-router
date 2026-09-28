@@ -70,6 +70,7 @@ fn action_response(summary: ActionSummary) -> HandlerOutcome {
         applied: summary.applied,
         unknown: summary.unknown,
         pending: summary.pending as u64,
+        anchor_skipped: summary.anchor_skipped,
     })
     .map_err(|e| IpcError {
         code: IpcErrorCode::Internal,

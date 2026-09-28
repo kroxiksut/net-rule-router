@@ -31,7 +31,8 @@ pub(super) fn build_dns_resolver_factory(
     >,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverFactory> {
     use nrr_platform_windows::dns_redirect::{
-        NrptDnsRedirect, PowerShellRunner, TransactedNrptStore, WindowsSystemDnsServers,
+        NrptDnsRedirect, PowerShellRunner, TransactedNrptStore, WindowsSearchList,
+        WindowsSystemDnsServers,
     };
     use nrr_service_runtime::dns_stack::{DnsStackInputs, DnsStackPlatform};
 
@@ -54,7 +55,10 @@ pub(super) fn build_dns_resolver_factory(
     let platform = DnsStackPlatform {
         system_dns: Arc::new(WindowsSystemDnsServers),
         upstream_pool: upstream_dns_pool(),
-        redirect: Arc::new(NrptDnsRedirect::new(PowerShellRunner, TransactedNrptStore)),
+        redirect: Arc::new(
+            NrptDnsRedirect::new(PowerShellRunner, TransactedNrptStore)
+                .with_search_list(Arc::new(WindowsSearchList)),
+        ),
         listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 53)),
         claimed_namespaces: Arc::new(claimed_namespaces),
     };
@@ -205,6 +209,7 @@ pub(super) fn build_fake_ip_stack_factory(
         if !adapter.is_available() {
             tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "svc-dns-fakeip-wintun-unavailable",
                 "fake-IP requested but the Wintun driver is unavailable; feature stays off (fail-open)",
             );
             return None;
@@ -218,6 +223,7 @@ pub(super) fn build_fake_ip_stack_factory(
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::fake-ip",
+                    msg_key = "svc-dns-fakeip-tun-open-failed",
                     error = %e,
                     "fake-IP: TUN adapter open failed; feature stays off (fail-open)",
                 );
@@ -257,6 +263,7 @@ pub(super) fn build_fake_ip_stack_factory(
             None => {
                 tracing::warn!(
                     target: "nrr::fake-ip",
+                    msg_key = "svc-dns-fakeip-no-route-coordinator",
                     "no route coordinator — relay dials are unbound (OS default route decides the egress link)",
                 );
             }
@@ -302,6 +309,7 @@ pub(super) fn build_fake_ip_stack_factory(
                 {
                     tracing::warn!(
                         target: "nrr::fake-ip",
+                        msg_key = "svc-dns-fakeip-selfheal-persist-failed",
                         error = %e,
                         "failed to persist a VPN self-heal exclusion — it will be re-learned next session",
                     );
@@ -319,10 +327,12 @@ pub(super) fn build_fake_ip_stack_factory(
                 match nrr_platform_windows::WindowsDnsCacheControl::new().flush_resolver_cache() {
                     Ok(()) => tracing::info!(
                         target: "nrr::fake-ip",
+                        msg_key = "svc-dns-fakeip-selfheal-flush-ok",
                         "flushed OS DNS resolver cache after a VPN self-heal exclusion",
                     ),
                     Err(e) => tracing::warn!(
                         target: "nrr::fake-ip",
+                        msg_key = "svc-dns-fakeip-selfheal-flush-failed",
                         error = ?e,
                         "DNS flush after a VPN self-heal exclusion failed — the client reconnects on its own TTL",
                     ),
@@ -345,6 +355,7 @@ pub(super) fn build_fake_ip_stack_factory(
             };
         tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "svc-dns-fakeip-stack-up",
             "fake-IP TUN adapter is open with the pool route in place — bringing the userspace stack up",
         );
         Some(
@@ -453,46 +464,17 @@ pub(super) fn upstream_dns_pool() -> Arc<nrr_service_runtime::dns_upstream::Upst
 
 pub(super) use nrr_service_runtime::dns_stack::namespace_recheck;
 
-/// The namespaces the product must not answer for, read fresh on every call.
-///
-/// Two exclusions beyond the neutral rules. Our OWN tunnel never counts — a
-/// namespace pointed back at us is the loop this feature exists to break. And
-/// a claim from a connection the OS is not currently using is dropped: a
-/// disconnected VPN keeps its registry values, and honouring them would send
-/// a whole namespace to a resolver nothing can reach.
+/// The namespaces the product must not answer for, read fresh on every call:
+/// actionable claims of the connections in use, our own tunnel aside.
 fn claimed_namespaces() -> Vec<nrr_platform_api::dns_redirect::DnsNamespaceExemption> {
-    use nrr_platform_api::dns_scope::{is_actionable_scope, InterfaceDnsScopePort};
-    use nrr_platform_api::route_table::RouteTablePort;
-
-    let live = nrr_platform_windows::windows_api::ProductionWindowsApi
-        .get_adapter_infos()
-        .unwrap_or_default();
-    nrr_platform_windows::dns_scope::WindowsInterfaceDnsScopes
-        .dns_scopes()
+    nrr_platform_windows::dns_scope::live_dns_scopes()
         .into_iter()
-        .filter(is_actionable_scope)
-        .filter_map(|scope| {
-            let adapter = live
-                .iter()
-                .find(|a| a.adapter_name.eq_ignore_ascii_case(&scope.adapter_id))?;
-            if nrr_platform_api::classify_availability(adapter)
-                != Some(nrr_platform_api::AdapterAvailability::Available)
-            {
-                return None;
-            }
-            if adapter
-                .description
-                .contains(nrr_shared::product_identity::PRODUCT_NAME)
-                || adapter
-                    .friendly_name
-                    .contains(nrr_shared::product_identity::PRODUCT_NAME)
-            {
-                return None;
-            }
-            Some(nrr_platform_api::dns_redirect::DnsNamespaceExemption {
+        .filter(nrr_platform_api::dns_scope::is_actionable_scope)
+        .map(
+            |scope| nrr_platform_api::dns_redirect::DnsNamespaceExemption {
                 suffix: scope.suffix,
                 servers: scope.servers,
-            })
-        })
+            },
+        )
         .collect()
 }

@@ -9,4 +9,4 @@ Expected structure:
 - qa/<pack-name>/rules_secondary.txt
 
 Author: repository contributors
-Note: initial pack content can be AI-generated and unverified.
+Note: initial pack content may be unverified.

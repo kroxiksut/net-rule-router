@@ -99,10 +99,8 @@ pub fn build_derived_assessment(
     .to_ascii_lowercase();
 
     let mut vpn_score = 0;
-    // Shared with the traffic counter's tunnel-overlap classification (block
-    // T) via `crate::adapters::VPN_TUNNEL_ADAPTER_MARKERS` — one definition
-    // of "this text reads as a VPN adapter".
-    if contains_any(&haystack, crate::adapters::VPN_TUNNEL_ADAPTER_MARKERS) {
+    // The traffic counter's notion of "tunnel" too, so the two cannot drift.
+    if crate::adapters::text_indicates_vpn_tunnel(&haystack) {
         vpn_score += 2;
         signals.push("vpn_tunnel_marker_in_name_or_type".to_string());
     }

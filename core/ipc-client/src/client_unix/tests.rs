@@ -720,3 +720,261 @@ fn sleep_observing_shutdown_consumes_force_reconnect_flag() {
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(!inner.force_reconnect.load(Ordering::SeqCst));
 }
+
+// ── Parity with the Windows client ───────────────────────────────────────
+
+/// Accept connections until `stop`, handing each one (with its 0-based index)
+/// to `serve`. Returns the number of connections accepted.
+fn spawn_scripted_server(
+    listener: UnixListener,
+    stop: Arc<AtomicBool>,
+    serve: impl Fn(usize, UnixStream) + Send + 'static,
+) -> thread::JoinHandle<usize> {
+    let _ = listener.set_nonblocking(true);
+    thread::spawn(move || {
+        let mut accepted = 0usize;
+        while !stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    let _ = conn.set_nonblocking(false);
+                    serve(accepted, conn);
+                    accepted += 1;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+        accepted
+    })
+}
+
+fn negotiate_ok_reply() -> Value {
+    serde_json::json!({
+        "ok": true,
+        "request-id": "handshake-1",
+        "payload": {
+            "server-version": 1,
+            "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
+            "service-version": "stub",
+            "session-id": "stub-session",
+        }
+    })
+}
+
+#[test]
+fn a_refused_handshake_is_reported_as_refused_not_as_a_dead_link() {
+    // The "action required" banner keys off `Refused`; `Disconnected` also
+    // put the client on the fast schedule, re-running the refusal (and its
+    // audit line) several times a second.
+    let sock = temp_sock_path();
+    let listener = UnixListener::bind(&sock.0).expect("bind");
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = spawn_scripted_server(listener, Arc::clone(&stop), |_, mut conn| {
+        let _ = read_frame::<_, Value>(&mut conn);
+        let refusal = serde_json::json!({
+            "request-id": "",
+            "ok": false,
+            "error": { "code": "forbidden", "message": "client rejected" }
+        });
+        let _ = write_frame(&mut conn, &refusal);
+    });
+
+    let client = UnixIpcClient::start_at(sock.0.clone());
+    assert!(
+        wait_until(Duration::from_secs(3), || matches!(
+            client.connection_status(),
+            ConnectionStatus::Refused { ref reason } if reason == "client rejected"
+        )),
+        "status: {:?}",
+        client.connection_status()
+    );
+    // Slow schedule: 1 s base, so well under a handful of attempts.
+    thread::sleep(Duration::from_millis(1500));
+    stop.store(true, Ordering::SeqCst);
+    drop(client);
+    let attempts = server.join().expect("server thread");
+    assert!(attempts <= 3, "{attempts} handshakes in 1.5 s");
+}
+
+#[test]
+fn a_protocol_mismatch_gives_the_socket_back() {
+    // Terminal state lasts until the process exits; holding the socket for
+    // that long kept one of the service's connection slots.
+    let sock = temp_sock_path();
+    let listener = UnixListener::bind(&sock.0).expect("bind");
+    let stop = Arc::new(AtomicBool::new(false));
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<bool>();
+    let server = spawn_scripted_server(listener, Arc::clone(&stop), move |_, mut conn| {
+        let _ = read_frame::<_, Value>(&mut conn);
+        let reply = serde_json::json!({
+            "ok": true,
+            "request-id": "handshake-1",
+            "payload": { "server-version": 99, "negotiated-protocol": 99 }
+        });
+        let _ = write_frame(&mut conn, &reply);
+        let _ = conn.set_read_timeout(Some(Duration::from_secs(3)));
+        let mut buf = [0u8; 1];
+        let closed = matches!(conn.read(&mut buf), Ok(0));
+        let _ = closed_tx.send(closed);
+    });
+
+    let client = UnixIpcClient::start_at(sock.0.clone());
+    let closed = closed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server saw the handshake");
+    assert!(
+        matches!(
+            client.connection_status(),
+            ConnectionStatus::ProtocolMismatch {
+                server_version: 99,
+                ..
+            }
+        ),
+        "status: {:?}",
+        client.connection_status()
+    );
+    assert!(closed, "the client kept the socket open while terminal");
+    stop.store(true, Ordering::SeqCst);
+    drop(client);
+    let _ = server.join();
+}
+
+#[test]
+fn a_service_that_hangs_up_after_the_handshake_is_not_hammered() {
+    let sock = temp_sock_path();
+    let listener = UnixListener::bind(&sock.0).expect("bind");
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = spawn_scripted_server(listener, Arc::clone(&stop), |_, mut conn| {
+        let _ = read_frame::<_, Value>(&mut conn);
+        let _ = write_frame(&mut conn, &negotiate_ok_reply());
+        // Dropping `conn` hangs up.
+    });
+
+    let client = UnixIpcClient::start_at(sock.0.clone());
+    thread::sleep(Duration::from_millis(1500));
+    stop.store(true, Ordering::SeqCst);
+    drop(client);
+    let attempts = server.join().expect("server thread");
+    // 100 + 200 + 400 + 800 ms (±20 %) fit about five connects into 1.5 s;
+    // without the pause it was hundreds.
+    assert!(attempts <= 7, "{attempts} connects in 1.5 s");
+}
+
+#[test]
+fn a_timeout_in_the_middle_of_a_push_frame_ends_the_connection() {
+    // Only "nothing started arriving" is idle. Swallowing a timeout with part
+    // of a frame read left the next exchange reading from mid-frame.
+    let inner = Arc::new(ClientInner::new(PathBuf::from("/nonexistent.sock")));
+    let (client_side, mut server_side) = UnixStream::pair().expect("socketpair");
+    let mut timed = transport_unix::TimedStream::new(
+        client_side,
+        Arc::clone(&inner.shutdown),
+        Duration::from_millis(150),
+    )
+    .expect("wrap stream");
+    // A header announcing 100 bytes, then only ten of them.
+    server_side
+        .write_all(&100u32.to_be_bytes())
+        .expect("partial header");
+    server_side.write_all(&[b' '; 10]).expect("partial body");
+
+    assert!(
+        !drain_push_frames(&inner, &mut timed),
+        "a torn frame must not be reported as an idle socket"
+    );
+}
+
+#[test]
+fn an_undecodable_reply_ends_the_connection_instead_of_blaming_the_request() {
+    // Windows treats every failed read as a dead link; here a decode error
+    // came back as the caller's `BadResponse` and the desynchronised stream
+    // stayed in use.
+    let (mut client, mut server) = UnixStream::pair().expect("socketpair");
+    let server_thread = thread::spawn(move || {
+        let _ = read_frame::<_, Value>(&mut server);
+        let junk = b"not json";
+        server
+            .write_all(&(junk.len() as u32).to_be_bytes())
+            .expect("header");
+        server.write_all(junk).expect("body");
+    });
+    let envelope = serde_json::json!({ "request-id": "req-1", "operation": "x" });
+    let err = exchange(&mut client, &envelope, "req-1", &|_| {})
+        .err()
+        .expect("junk is not an answer");
+    assert!(err.is_transport_dead(), "{err}");
+    server_thread.join().expect("server thread");
+}
+
+#[test]
+fn requests_queued_when_the_link_drops_fail_at_once_and_never_reach_the_next_connection() {
+    let sock = temp_sock_path();
+    let listener = UnixListener::bind(&sock.0).expect("bind");
+    let stop = Arc::new(AtomicBool::new(false));
+    let (got_first_tx, got_first_rx) = std::sync::mpsc::channel::<()>();
+    let later_requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let later = Arc::clone(&later_requests);
+    let server = spawn_scripted_server(listener, Arc::clone(&stop), move |index, mut conn| {
+        let _ = read_frame::<_, Value>(&mut conn);
+        let _ = write_frame(&mut conn, &negotiate_ok_reply());
+        if index == 0 {
+            // Take the first request, give the second time to queue behind
+            // it, then drop the link without answering.
+            let _ = read_frame::<_, Value>(&mut conn);
+            let _ = got_first_tx.send(());
+            thread::sleep(Duration::from_millis(300));
+            return;
+        }
+        let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+        while let Ok(frame) = read_frame::<_, Value>(&mut conn) {
+            let rid = frame["request-id"].as_str().unwrap_or("").to_string();
+            later.lock().expect("lock").push(rid.clone());
+            let resp = serde_json::json!({ "ok": true, "request-id": rid, "payload": {} });
+            if write_frame(&mut conn, &resp).is_err() {
+                break;
+            }
+        }
+    });
+
+    let client = UnixIpcClient::start_at(sock.0.clone());
+    assert!(wait_until(Duration::from_secs(3), || client
+        .connection_status()
+        .is_connected()));
+    let first_client = client.clone();
+    let first = thread::spawn(move || {
+        first_client.call(
+            IpcOperationName::ServiceHealthGet,
+            serde_json::json!({}),
+            Duration::from_secs(5),
+        )
+    });
+    got_first_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("first request reached the service");
+    let started = Instant::now();
+    let second = client.call(
+        IpcOperationName::ServiceHealthGet,
+        serde_json::json!({}),
+        Duration::from_secs(5),
+    );
+    assert!(
+        matches!(second, Err(IpcClientError::Disconnected)),
+        "queued request must fail with the link: {second:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(
+        first.join().expect("first caller"),
+        Err(IpcClientError::Disconnected)
+    ));
+    // Let the reconnect happen, then check nothing leaked onto it.
+    thread::sleep(Duration::from_millis(600));
+    stop.store(true, Ordering::SeqCst);
+    drop(client);
+    let _ = server.join();
+    assert!(
+        later_requests.lock().expect("lock").is_empty(),
+        "a request from the dead connection was replayed on the new one"
+    );
+}

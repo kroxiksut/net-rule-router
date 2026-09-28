@@ -37,7 +37,7 @@ DiskO*.exe
 YandexDis*.exe
 avp.exe
 gamecenter.exe
-hidemy.name VPN 3.0.exe
+# Процесс вашего ВПН-клиента задаётся в мастере первого запуска
 icq.exe
 kavfs.exe
 mail.ru_cloud*.exe

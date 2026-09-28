@@ -36,6 +36,36 @@ pub fn looks_like_a_rule_value(value: &str) -> bool {
     !value.is_empty() && !value.contains(char::is_whitespace)
 }
 
+/// A character one field of this line-oriented format cannot carry: a line
+/// break ends the field, and whatever follows is read as a rule or a section of
+/// its own. The other controls are invisible in an editor and mean nothing in a
+/// host, a program name or a note. Tab is ordinary whitespace here.
+#[must_use]
+pub fn is_forbidden_field_char(c: char) -> bool {
+    c.is_control() && c != '\t'
+}
+
+/// The first character of `field` the format cannot carry, if any.
+#[must_use]
+pub fn first_forbidden_field_char(field: &str) -> Option<char> {
+    field.chars().find(|&c| is_forbidden_field_char(c))
+}
+
+/// `field` with every character it cannot carry replaced by a space — for a
+/// writer, so a value that bypassed validation still cannot start a line.
+#[must_use]
+pub fn neutralize_field(field: &str) -> std::borrow::Cow<'_, str> {
+    if first_forbidden_field_char(field).is_none() {
+        return std::borrow::Cow::Borrowed(field);
+    }
+    std::borrow::Cow::Owned(
+        field
+            .chars()
+            .map(|c| if is_forbidden_field_char(c) { ' ' } else { c })
+            .collect(),
+    )
+}
+
 pub(super) fn has_file_extension(value: &str) -> bool {
     value.rsplit_once('.').is_some_and(|(stem, ext)| {
         !stem.trim().is_empty()

@@ -1,5 +1,7 @@
 // Overlaps: rules of the two routes that claim the same sites, which one wins,
-// and a way to confirm it or send those sites over the other route.
+// and a way to confirm it or send those sites over the other route. Below the
+// intro, the conflicts the service found in the APPLIED rules: rules that
+// share addresses rather than names, and rules it cannot enforce as written.
 //
 // Nothing here decides a winner — the pairs come from Rust. The buttons edit
 // the rules list; nothing reaches the service until the user applies it.
@@ -31,7 +33,13 @@ ColumnLayout {
     readonly property real tableWidth: Math.max(table.width, 2 * colRuleMinWidth + _fixedWidth)
     readonly property real colRuleWidth: (tableWidth - _fixedWidth) / 2
 
-    Component.onCompleted: root.refreshRulesOverlaps()
+    readonly property var conflicts: section.controller.conflicts
+
+    Component.onCompleted: {
+        root.refreshRulesOverlaps()
+        if (typeof root.refreshUnenforcedAppRules === "function")
+            root.refreshUnenforcedAppRules()
+    }
 
     function _describe(side) {
         var type = String(side["rule-type"])
@@ -46,14 +54,22 @@ ColumnLayout {
     function _routeText(side) {
         return root.routeLabel(section.controller.routeOf(side))
     }
+    function _blockWinsTie(overlap) {
+        return !!overlap && overlap["block-wins-tie"] === true
+    }
     function _reason(overlap) {
+        if (section._blockWinsTie(overlap))
+            return root.tr("rules.overlaps.reason.block-tie", "A block wins a tie")
         return String(overlap.kind) === "duplicate"
             ? root.tr("rules.overlaps.reason.duplicate", "Same rule on both routes")
             : root.tr("rules.overlaps.reason.nested", "Narrower rule")
     }
     /// The whole row as one sentence, for a screen reader.
     function _explain(overlap) {
-        var sentence = String(overlap.kind) === "duplicate"
+        var sentence = section._blockWinsTie(overlap)
+            ? root.tr("rules.overlaps.block-tie",
+                "{winner} names the same sites as {loser} on {loser-route}. They are blocked: on a tie a block wins over a route.")
+            : String(overlap.kind) === "duplicate"
             ? root.tr("rules.overlaps.duplicate",
                 "{winner} is set on both routes. It goes over {winner-route}: on a tie the main route wins.")
             : root.tr("rules.overlaps.nested",
@@ -63,6 +79,30 @@ ColumnLayout {
             .replace("{loser}", section._describe(overlap.loser))
             .replace("{winner-route}", section._routeText(overlap.winner))
             .replace("{loser-route}", section._routeText(overlap.loser))
+    }
+
+    /// One service-reported conflict as a sentence.
+    function _conflictText(c) {
+        var ip = String(c.ip || "")
+        var kind = String(c.kind)
+        var text = kind === "literal-block-overrides-route"
+            ? root.tr("rules.overlaps.conflicts.literal-block",
+                "{rule}: {host} resolves to {ip}, and a block of that address wins over any name rule, so the address is blocked.")
+            : kind === "unsupported-rule-shape"
+            ? root.tr("rules.overlaps.conflicts.unsupported-shape",
+                "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application.")
+            : root.tr("rules.overlaps.conflicts.leak",
+                "{rule} does not block {host}: it shares {ip} with {via}, which a narrower rule routes, so the address stays open.")
+        text = text.split("{rule}").join(String(c["rule-value"] || c["rule-id"] || ""))
+            .split("{app}").join(String(c.app || ""))
+            .split("{host}").join(String(c.host || c["rule-value"] || ""))
+            .split("{via}").join(String(c["via-host"] || ""))
+            .split("{ip}").join(ip)
+        var more = Number(c.count || 0) - 1
+        if (more > 0)
+            text += " " + root.tr("rules.overlaps.conflicts.more", "Addresses affected besides this one: {count}.")
+                .replace("{count}", String(more))
+        return text
     }
 
     component HeaderCell: Label {
@@ -111,6 +151,48 @@ ColumnLayout {
             Accessible.role: Accessible.Button
             Accessible.name: text
             onClicked: section.controller.confirmAll()
+        }
+    }
+
+    Frame {
+        Layout.fillWidth: true
+        visible: section.conflicts.length > 0
+        padding: root.uiTheme.spacingSm
+        background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+        ColumnLayout {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingXs
+            Label {
+                Layout.fillWidth: true
+                font.bold: true
+                wrapMode: Text.Wrap
+                color: root.textColor
+                text: root.tr("rules.overlaps.conflicts.title", "Conflicts in the applied rules")
+                Accessible.role: Accessible.Heading
+                Accessible.name: text
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: root.mutedTextColor
+                text: root.tr("rules.overlaps.conflicts.hint",
+                    "Rules the service enforces differently from how they read, as it enforces them now. They update after you apply changes.")
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            Repeater {
+                model: section.conflicts
+                delegate: Label {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    color: root.uiTheme.colorWarning
+                    text: section._conflictText(modelData)
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: text
+                }
+            }
         }
     }
 
@@ -221,6 +303,13 @@ ColumnLayout {
                             color: root.mutedTextColor
                             text: root.tr("rules.overlaps.via", "via {route}")
                                 .replace("{route}", section._routeText(row.overlap.winner))
+                        }
+                        Cell {
+                            Layout.fillWidth: true
+                            visible: section._blockWinsTie(row.overlap)
+                            color: root.uiTheme.colorWarning
+                            text: root.tr("rules.overlaps.block-tie-warning",
+                                "The other rule names the same sites and never applies.")
                         }
                     }
                     ColumnLayout {

@@ -62,7 +62,7 @@ impl ProductionDiagnosticsFacade {
     ) -> ExplainResponse {
         use nrr_diagnostics::explain::response::{
             ExplainCorrelationSection, ExplainFinalActionSection, ExplainInputSection,
-            ExplainSummarySection,
+            ExplainLookupSection, ExplainMatchSection, ExplainSummarySection,
         };
 
         let detail_level_str = match level {
@@ -141,7 +141,7 @@ impl ProductionDiagnosticsFacade {
             })
             .map(String::as_str);
         let match_host = host.or(reverse_matched_host);
-        let decision = nrr_domain::decision_engine_input::match_sample(
+        let mut decision = nrr_domain::decision_engine_input::match_sample(
             &rule_book,
             match_host,
             observed_ipaddr,
@@ -149,7 +149,55 @@ impl ProductionDiagnosticsFacade {
             zone_policy,
             behavior_mode,
         );
-        let (route_role, action_key, reason_key) = match &decision {
+        // A name probed without an address: enforcement acts on the addresses
+        // the name resolves to, so a literal-IP Block on any cached one of
+        // them is the answer, whatever the name rules say.
+        let mut blocking_ip = literal_block_ip(&decision, observed_ipaddr);
+        if let (Some(name), None) = (host, observed_ipaddr) {
+            if let Some((ip, veto)) = literal_block_veto(
+                &rule_book,
+                name,
+                &self.forward_resolve_host_ips(name),
+                sample.process_name.as_deref(),
+                zone_policy,
+                behavior_mode,
+            ) {
+                decision = veto;
+                blocking_ip = Some(ip);
+            }
+        }
+        // The engine's answer stands, but a winner enforcement skips for its
+        // shape must not read as enforced.
+        let shape_not_enforced = match &decision {
+            nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { candidate } => {
+                rule_book
+                    .primary
+                    .rules()
+                    .iter()
+                    .chain(rule_book.secondary.rules())
+                    .find(|r| r.id == candidate.rule_id)
+                    .is_some_and(|r| !crate::wfp_codegen::rule_shape_enforced(r))
+            }
+            _ => false,
+        };
+        let (route_role, action_key, mut reason_key) = match &decision {
+            nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { candidate }
+                if candidate.action == nrr_domain::RuleAction::Block =>
+            {
+                let reason = if blocking_ip.is_some() && host.is_some() {
+                    "diag.explain.reason.blocked-by-ip-rule".to_string()
+                } else {
+                    format!(
+                        "diag.explain.reason.rule-matched-{}",
+                        match_class_reason_slug(candidate.match_class)
+                    )
+                };
+                (
+                    None,
+                    "diag.explain.final-action.blocked".to_string(),
+                    reason,
+                )
+            }
             nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { candidate } => {
                 let kind = match_class_reason_slug(candidate.match_class);
                 let (role, action) = match candidate.route_role {
@@ -186,6 +234,9 @@ impl ProductionDiagnosticsFacade {
                 )
             }
         };
+        if shape_not_enforced {
+            reason_key = "diag.explain.reason.rule-shape-not-enforced".to_string();
+        }
 
         // Compact-view-friendly population. At `CompactUi` we elide
         // the raw IP per the redaction policy; the wire DTO still
@@ -223,6 +274,33 @@ impl ProductionDiagnosticsFacade {
             summary_key: reason_key,
             is_simulation: true,
         };
+        // Which rule blocked it, so the GUI can name the address from its own
+        // rules list; the address itself only at Diagnostics+, as documented.
+        let (match_section, lookup_section) = match (&decision, blocking_ip) {
+            (
+                nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { candidate },
+                Some(ip),
+            ) => (
+                Some(ExplainMatchSection {
+                    outcome_key: "explain.match.rule_matched".to_string(),
+                    matched_rule_id: Some(candidate.rule_id.as_str().to_string()),
+                    match_class_label: Some("ExactIp".to_string()),
+                    route_role: None,
+                    conflict_resolved: false,
+                    default_reason_key: None,
+                }),
+                Some(ExplainLookupSection {
+                    cache_state_key: "explain.lookup.cache_hit".to_string(),
+                    cache_hit: observed_ipaddr.is_none(),
+                    has_errors: false,
+                    selected_ip: (!matches!(level, ExplainDetailLevel::CompactUi))
+                        .then(|| ip.to_string()),
+                    is_multi_ip: false,
+                    ttl_seconds: None,
+                }),
+            ),
+            _ => (None, None),
+        };
 
         ExplainResponse {
             query_kind: "synthetic".to_string(),
@@ -230,8 +308,8 @@ impl ProductionDiagnosticsFacade {
             availability_key: ExplainDataAvailability::Available.ui_key().to_string(),
             summary,
             input: Some(input_section),
-            match_section: None,
-            lookup_section: None,
+            match_section,
+            lookup_section,
             availability_section: None,
             final_action_section: Some(final_action_section),
             warnings: Vec::new(),
@@ -264,7 +342,8 @@ impl ProductionDiagnosticsFacade {
                 .or_else(|| repo.get_active().ok().flatten())?
         };
         let dto = nrr_shared::rules_json::from_canonical_string(&active.rules_json).ok()?;
-        nrr_domain::rules_json_codec::decode(dto).ok()
+        nrr_domain::rules_json_codec::decode(dto, nrr_domain::rules_file::HostPlatform::compiled())
+            .ok()
     }
 
     /// Reads the caller's per-SID `include_subdomains` flag
@@ -324,6 +403,36 @@ impl ProductionDiagnosticsFacade {
     /// answer a bare-IP probe by the route its owning hostname takes, instead of
     /// the misleading rule-less DEFAULT. Empty on a missing cache DB, lock/query
     /// error, or when the IP is not cached.
+    /// The addresses the FQDN cache holds for `host`, newest first. Empty
+    /// without a cache or on any read error: the probe then answers from the
+    /// name rules alone, as it did before it looked.
+    fn forward_resolve_host_ips(&self, host: &str) -> Vec<std::net::IpAddr> {
+        let Some(conn_arc) = self.cache_conn.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(conn) = conn_arc.lock() else {
+            return Vec::new();
+        };
+        let canonical = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT i.canonical_ip \
+             FROM hostname_ip_resolutions r \
+             JOIN hostnames h ON h.id = r.hostname_id \
+             JOIN ip_addresses i ON i.id = r.ip_id \
+             WHERE h.canonical_host = ?1 \
+             ORDER BY r.resolved_at DESC LIMIT 16",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(rusqlite::params![canonical], |row| row.get::<_, String>(0))
+        else {
+            return Vec::new();
+        };
+        rows.filter_map(Result::ok)
+            .filter_map(|ip| ip.parse().ok())
+            .collect()
+    }
+
     fn reverse_resolve_ip_hosts(&self, ip: &str) -> Vec<String> {
         let Some(conn_arc) = self.cache_conn.as_ref() else {
             return Vec::new();
@@ -473,6 +582,50 @@ impl ProductionDiagnosticsFacade {
             // cleanup path would have to record when it last ran.
             last_cleanup_at: None,
         }
+    }
+}
+
+/// The first of `cached_ips` a literal-IP Block vetoes for `host`, with the
+/// engine's answer for it. Goes through `match_sample`, so the probe cannot
+/// disagree with the matcher about what a veto is.
+pub(super) fn literal_block_veto(
+    rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+    host: &str,
+    cached_ips: &[std::net::IpAddr],
+    process_name: Option<&str>,
+    zone_policy: nrr_domain::decision_matching::ZonePriorityPolicy,
+    behavior_mode: nrr_domain::RouteBehaviorMode,
+) -> Option<(
+    std::net::IpAddr,
+    nrr_domain::decision_matching::RequestedRouteDecision,
+)> {
+    cached_ips.iter().find_map(|ip| {
+        let decision = nrr_domain::decision_engine_input::match_sample(
+            rule_book,
+            Some(host),
+            Some(*ip),
+            process_name,
+            zone_policy,
+            behavior_mode,
+        );
+        literal_block_ip(&decision, Some(*ip)).map(|ip| (ip, decision))
+    })
+}
+
+/// `ip` when `decision` is a literal-IP Block on it.
+fn literal_block_ip(
+    decision: &nrr_domain::decision_matching::RequestedRouteDecision,
+    ip: Option<std::net::IpAddr>,
+) -> Option<std::net::IpAddr> {
+    use nrr_domain::decision_matching::{MatchClass, RequestedRouteDecision};
+    match decision {
+        RequestedRouteDecision::MatchedRoute { candidate }
+            if candidate.action == nrr_domain::RuleAction::Block
+                && candidate.match_class == MatchClass::ExactIp =>
+        {
+            ip
+        }
+        _ => None,
     }
 }
 

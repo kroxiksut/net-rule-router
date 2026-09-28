@@ -29,6 +29,7 @@ pub(super) fn open_cache_store(
         Err(e) => {
             tracing::warn!(
                 target: "nrr::runtime",
+                msg_key = "svc-boot-cache-open-failed",
                 error = %e,
                 path = %path.display(),
                 "failed to open FQDN cache connection; FQDN lookups + DNS refresh disabled",
@@ -47,6 +48,7 @@ pub(super) fn open_cache_store(
     if let Err(e) = runner.run_pending_migrations() {
         tracing::warn!(
             target: "nrr::runtime",
+            msg_key = "svc-boot-cache-migration-failed",
             error = %e,
             path = %path.display(),
             "FQDN cache migration failed; FQDN lookups + DNS refresh disabled",
@@ -73,11 +75,13 @@ pub(super) fn open_cache_store(
             Ok(0) => {}
             Ok(removed) => tracing::info!(
                 target: "nrr::fake-ip",
+                msg_key = "svc-boot-fakeip-cache-purged",
                 removed,
                 "purged fake-pool addresses from the FQDN cache at open",
             ),
             Err(e) => tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "svc-boot-fakeip-cache-sweep-failed",
                 error = %e,
                 "fake-pool FQDN-cache sweep failed at open",
             ),
@@ -110,6 +114,7 @@ pub(super) fn open_traffic_sampler(
         Err(e) => {
             tracing::warn!(
                 target: "nrr::runtime",
+                msg_key = "svc-boot-traffic-db-migration-failed",
                 error = %e,
                 path = %path.display(),
                 "traffic-stats DB migration failed; traffic counter disabled",
@@ -120,6 +125,7 @@ pub(super) fn open_traffic_sampler(
     if let Some(reason) = &opened.rebuilt_reason {
         tracing::info!(
             target: "nrr::runtime",
+            msg_key = "svc-boot-traffic-db-rebuilt",
             path = %path.display(),
             reason = %reason,
             "traffic-stats DB was deleted and recreated after an open/migration failure",
@@ -133,6 +139,7 @@ pub(super) fn open_traffic_sampler(
         Err(e) => {
             tracing::warn!(
                 target: "nrr::runtime",
+                msg_key = "svc-boot-traffic-sampler-prime-failed",
                 error = %e,
                 "failed to prime traffic sampler; traffic counter disabled",
             );
@@ -158,6 +165,7 @@ pub(super) fn open_settings_connection(path: &std::path::Path) -> Option<Arc<Mut
         Err(e) => {
             tracing::warn!(
                 target: "nrr::runtime",
+                msg_key = "svc-boot-settings-open-failed",
                 error = %e,
                 path = %path.display(),
                 "failed to open settings connection; settings IPC ops will be unavailable",
@@ -168,28 +176,28 @@ pub(super) fn open_settings_connection(path: &std::path::Path) -> Option<Arc<Mut
 }
 
 /// Run the DB-MAC tamper bootstrap over the
-/// state DB and return the row-MAC signing key (loaded or freshly
-/// generated). On failure, returns `None` so the coordinator runs
-/// unsigned (routing is unaffected). Alerts raised here land in the
+/// state DB and return its outcome, which carries the row-MAC signing key
+/// (loaded or freshly generated). On failure, returns `None` so the
+/// coordinator runs unsigned (routing is unaffected). Alerts raised here land in the
 /// same `security_alerts` table the IPC handlers read, so the GUI
 /// surfaces them and the mutation gate engages until acknowledged.
 ///
-/// This whole module is `#![cfg(target_os = "windows")]`, so the DPAPI
-/// key store is always available here.
-pub(super) fn run_db_mac_tamper_bootstrap(conn: &Arc<Mutex<Connection>>) -> Option<Vec<u8>> {
-    use nrr_platform_windows::key_store::WindowsDpapiKeyStore;
-    let key_store = WindowsDpapiKeyStore::default_systemprofile();
+pub(super) fn run_db_mac_tamper_bootstrap(
+    conn: &Arc<Mutex<Connection>>,
+    key_store: &dyn nrr_platform_api::key_store::KeyStore,
+) -> Option<nrr_service_runtime::tamper_bootstrap::TamperBootstrapOutcome> {
     let alerts_repo: Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository> =
         Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(conn)));
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    match run_tamper_bootstrap(conn, &key_store, &alerts_repo, now_ms) {
+    match run_tamper_bootstrap(conn, key_store, &alerts_repo, now_ms) {
         Ok(outcome) => {
             if outcome.raised_blocking_alert {
                 tracing::warn!(
                     target: "nrr::tamper",
+                    msg_key = "svc-boot-tamper-blocking-alert",
                     tampered = outcome.tampered_revision_ids.len(),
                     key_reset = outcome.key_was_reset,
                     backfilled = outcome.backfilled_rows,
@@ -199,15 +207,17 @@ pub(super) fn run_db_mac_tamper_bootstrap(conn: &Arc<Mutex<Connection>>) -> Opti
             } else {
                 tracing::info!(
                     target: "nrr::tamper",
+                    msg_key = "svc-boot-tamper-clean",
                     backfilled = outcome.backfilled_rows,
                     "DB-MAC tamper bootstrap clean",
                 );
             }
-            Some(outcome.signing_key)
+            Some(outcome)
         }
         Err(e) => {
             tracing::error!(
                 target: "nrr::tamper",
+                msg_key = "svc-boot-tamper-bootstrap-failed",
                 error = %e,
                 "DB-MAC tamper bootstrap failed; coordinator will run unsigned",
             );
@@ -216,7 +226,13 @@ pub(super) fn run_db_mac_tamper_bootstrap(conn: &Arc<Mutex<Connection>>) -> Opti
     }
 }
 
-/// Runs [`ActivationCoordinator::enforce_active_integrity_all`] and, for
+/// The DB-MAC key store. This whole module is `#![cfg(target_os = "windows")]`,
+/// so the DPAPI store is always available here.
+pub(super) fn production_key_store() -> Arc<dyn nrr_platform_api::key_store::KeyStore> {
+    Arc::new(nrr_platform_windows::key_store::WindowsDpapiKeyStore::default_systemprofile())
+}
+
+/// Runs [`ActivationCoordinator::enforce_active_integrity_at_boot`] and, for
 /// every principal it rolled back or cleared, raises a (non-blocking)
 /// `security_alerts` row so the GUI surfaces it — same dedup mechanism
 /// as [`run_db_mac_tamper_bootstrap`]'s alerts, reused via
@@ -226,21 +242,24 @@ pub(super) fn run_db_mac_tamper_bootstrap(conn: &Arc<Mutex<Connection>>) -> Opti
 pub(super) fn run_active_integrity_enforcement(
     coordinator: &ActivationCoordinator,
     conn: &Arc<Mutex<Connection>>,
+    bootstrap: &nrr_service_runtime::tamper_bootstrap::TamperBootstrapOutcome,
 ) {
     use nrr_service_runtime::activation_coordinator::ActiveIntegrityOutcome;
     use nrr_service_runtime::tamper_bootstrap::emit_alert;
 
-    let outcomes = match coordinator.enforce_active_integrity_all("svc-boot-integrity-scan") {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::error!(
-                target: "nrr::tamper",
-                error = ?e,
-                "active-revision integrity sweep failed",
-            );
-            return;
-        }
-    };
+    let outcomes =
+        match coordinator.enforce_active_integrity_at_boot(bootstrap, "svc-boot-integrity-scan") {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(
+                    target: "nrr::tamper",
+                    msg_key = "svc-boot-integrity-sweep-failed",
+                    error = ?e,
+                    "active-revision integrity sweep failed",
+                );
+                return;
+            }
+        };
     let rejected: Vec<_> = outcomes
         .into_iter()
         .filter(|(_, outcome)| {
@@ -274,6 +293,7 @@ pub(super) fn run_active_integrity_enforcement(
         };
         tracing::warn!(
             target: "nrr::tamper",
+            msg_key = "svc-boot-revision-integrity-rejected",
             principal = %principal,
             rejected_revision_id = %rejected_revision_id,
             outcome = ?outcome,
@@ -288,6 +308,7 @@ pub(super) fn run_active_integrity_enforcement(
         ) {
             tracing::error!(
                 target: "nrr::tamper",
+                msg_key = "svc-boot-revision-alert-failed",
                 error = ?e,
                 rejected_revision_id = %rejected_revision_id,
                 "failed to raise untrusted-revision-rejected alert",
@@ -319,6 +340,7 @@ pub(super) fn read_log_retention_config(
         Err(e) => {
             tracing::warn!(
                 target: "nrr::runtime",
+                msg_key = "svc-boot-log-retention-read-failed",
                 error = %e,
                 "log_retention_config read failed; using retention defaults",
             );
@@ -343,6 +365,7 @@ pub(super) fn read_service_stability_config(
         Err(e) => {
             tracing::warn!(
                 target: "nrr::runtime",
+                msg_key = "svc-boot-stability-config-read-failed",
                 error = %e,
                 "service_stability_config read failed; using runtime defaults",
             );
@@ -353,6 +376,7 @@ pub(super) fn read_service_stability_config(
         IpcAcceptPolicyRecord::Critical => {
             tracing::info!(
                 target: "nrr::stability",
+                msg_key = "svc-boot-stability-config-loaded-critical",
                 kind = "critical",
                 "service_stability_config loaded",
             );
@@ -371,6 +395,7 @@ pub(super) fn read_service_stability_config(
             // healthy.
             tracing::info!(
                 target: "nrr::stability",
+                msg_key = "svc-boot-stability-config-loaded-recoverable",
                 kind = "recoverable",
                 max_restarts,
                 backoff_base_ms,

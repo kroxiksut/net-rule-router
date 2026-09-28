@@ -60,6 +60,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use nrr_platform_linux::peer_cred::classify_unix_client;
+use nrr_service_runtime::connection_slot::PerPrincipalSlots;
 use nrr_service_runtime::ipc_push::{
     adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
 };
@@ -78,57 +79,6 @@ pub const SOCKET_PATH: &str = nrr_shared::ipc_transport::SERVICE_ENDPOINT_ADDRES
 
 /// Hard limit on concurrent connections (matches the Windows server).
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 32;
-
-/// Hard limit on concurrent connections held by ONE user.
-///
-/// Any local user can reach this socket — that is the design, with identity and
-/// authorization done above it — so the global cap alone let one unprivileged
-/// account hold all 32 slots and lock every other user, and the daemon's own
-/// clients, out of the service without sending a single malformed byte. A
-/// desktop session needs three (window, tray, the occasional console); eight
-/// leaves room for a reconnect storm and still leaves 24 slots for everyone
-/// else.
-pub const MAX_CONNECTIONS_PER_UID: usize = 8;
-
-/// Concurrent connections per uid. Held only while connections are open, so an
-/// idle machine keeps an empty map.
-#[derive(Debug, Default)]
-struct PerUidSlots(Mutex<std::collections::HashMap<u32, usize>>);
-
-impl PerUidSlots {
-    /// Claim a slot for `uid`, or `None` when that user is already at the cap.
-    fn claim(self: &Arc<Self>, uid: u32) -> Option<PerUidSlot> {
-        let mut map = self.0.lock().ok()?;
-        let count = map.entry(uid).or_insert(0);
-        if *count >= MAX_CONNECTIONS_PER_UID {
-            return None;
-        }
-        *count += 1;
-        Some(PerUidSlot {
-            slots: Arc::clone(self),
-            uid,
-        })
-    }
-}
-
-/// Releases the per-uid slot on drop, including when the worker panics.
-struct PerUidSlot {
-    slots: Arc<PerUidSlots>,
-    uid: u32,
-}
-
-impl Drop for PerUidSlot {
-    fn drop(&mut self) {
-        if let Ok(mut map) = self.slots.0.lock() {
-            if let Some(count) = map.get_mut(&self.uid) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    map.remove(&self.uid);
-                }
-            }
-        }
-    }
-}
 
 /// What an accepted caller may ask for when the program behind the connection
 /// cannot be named. The most restricted profile on purpose: a client the
@@ -273,7 +223,7 @@ impl IpcServer for UnixDomainSocketServer {
             socket_path: self.socket_path.clone(),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             active_count: Arc::new(AtomicUsize::new(0)),
-            per_uid: Arc::new(PerUidSlots::default()),
+            per_uid: Arc::new(PerPrincipalSlots::default()),
             worker_handles: Arc::new(Mutex::new(Vec::new())),
         }))
     }
@@ -294,7 +244,7 @@ pub struct UnixDomainSocketAcceptor {
     shutdown_requested: Arc<AtomicBool>,
     active_count: Arc<AtomicUsize>,
     /// Per-user share of `active_count`, so one account cannot take the lot.
-    per_uid: Arc<PerUidSlots>,
+    per_uid: Arc<PerPrincipalSlots<u32>>,
     worker_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -335,7 +285,14 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
             Ok(id) => id,
             Err(_) => return AcceptOutcome::Idle,
         };
-        let Some(uid_slot) = self.per_uid.claim(identity.uid) else {
+        let Some(uid_slot) = self.per_uid.claim(&identity.uid) else {
+            tracing::warn!(
+                target: "nrr::ipc",
+                msg_key = "svc-ipc-principal-connection-cap",
+                uid = identity.uid,
+                cap = nrr_service_runtime::connection_slot::MAX_CONNECTIONS_PER_PRINCIPAL,
+                "refused a connection: this account already holds its share of the service's connection slots"
+            );
             let _ = write_busy_response(stream);
             return AcceptOutcome::Idle;
         };
@@ -437,7 +394,12 @@ fn handle_connection(
     let mut reader = match stream.try_clone() {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(target: "nrr::ipc", error = %e, "socket clone failed, dropping connection");
+            tracing::warn!(
+                target: "nrr::ipc",
+                msg_key = "linux-svc-socket-clone-failed",
+                error = %e,
+                "socket clone failed, dropping connection"
+            );
             return;
         }
     };
@@ -671,29 +633,6 @@ mod tests {
         if let Ok(mut g) = FORCED_PROFILE.lock() {
             *g = Some(profile);
         }
-    }
-
-    /// One account must not be able to take every slot: the cap is per uid, and
-    /// the slot has to come back when the connection ends — a leak here would
-    /// lock the user out of their own service after eight windows.
-    #[test]
-    fn one_user_cannot_hold_more_than_its_share_of_the_slots() {
-        let slots = Arc::new(PerUidSlots::default());
-        let mut held = Vec::new();
-        for _ in 0..MAX_CONNECTIONS_PER_UID {
-            held.push(slots.claim(1000).expect("under the cap"));
-        }
-        assert!(
-            slots.claim(1000).is_none(),
-            "the cap must refuse the next connection from the same uid"
-        );
-        // Another user is unaffected — that is the point of a per-uid cap.
-        assert!(slots.claim(1001).is_some());
-        drop(held.pop());
-        assert!(
-            slots.claim(1000).is_some(),
-            "a closed connection must give its slot back"
-        );
     }
 
     /// Hand-rolled temp dir (zero dev-deps, same idiom as `peer_cred`).

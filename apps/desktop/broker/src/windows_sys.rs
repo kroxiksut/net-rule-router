@@ -12,6 +12,7 @@
 //!
 //! and for the **client** (launcher):
 //! - [`connect_pipe`] — `CreateFileW` against the broker pipe.
+//! - [`pipe_server_facts`] — who serves the pipe, for the impostor check.
 //! - [`current_process_user_sid`] — the launcher's own SID (sent to the
 //!   broker so it can pin the DACL + the accept-time identity check).
 //!
@@ -32,11 +33,12 @@ use windows::Win32::Foundation::{
     WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_USER,
+    GetTokenInformation, TokenElevation, TokenUser, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE,
@@ -44,12 +46,13 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT,
+    GetNamedPipeServerProcessId, WaitNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, WaitForMultipleObjects,
-    WaitForSingleObject, INFINITE, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    WaitForMultipleObjects, WaitForSingleObject, INFINITE, PROCESS_ACCESS_RIGHTS,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -445,6 +448,12 @@ fn query_user_sid(token: HANDLE) -> Result<String, WinError> {
             code: 0,
         });
     }
+    // SAFETY: psid points into `aligned`, alive for the call.
+    unsafe { sid_to_string(psid) }
+}
+
+/// SAFETY: `psid` must point at a valid SID for the duration of the call.
+unsafe fn sid_to_string(psid: PSID) -> Result<String, WinError> {
     let mut wide_ptr: PWSTR = PWSTR::null();
     // SAFETY: psid is a valid PSID from Win32; out-pointer receives a
     // LocalAlloc'd UTF-16 string we free below.
@@ -488,6 +497,23 @@ unsafe fn read_pwstr(p: PWSTR) -> String {
 /// not have created its first instance yet (UAC just dismissed, process
 /// starting), so transient `ERROR_FILE_NOT_FOUND` / `ERROR_PIPE_BUSY` are
 /// retried. Returns the connected handle on success.
+/// `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND`: no instance of the name
+/// exists. Every other refusal — busy, access denied — means someone serves it.
+pub fn is_pipe_absent_code(code: u32) -> bool {
+    matches!(code, 2 | 3)
+}
+
+/// Whether any process still serves `pipe_name`. Waits on the name instead of
+/// opening it, so the probe never takes the broker's listening instance.
+pub fn pipe_name_served(pipe_name: &str) -> bool {
+    let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: wide is null-terminated UTF-16 that outlives the call.
+    if unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), 1) }.as_bool() {
+        return true;
+    }
+    !is_pipe_absent_code(last_error())
+}
+
 pub fn connect_pipe(pipe_name: &str, timeout: Duration) -> Result<OwnedHandle, WinError> {
     let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
     let deadline = Instant::now() + timeout;
@@ -509,7 +535,7 @@ pub fn connect_pipe(pipe_name: &str, timeout: Duration) -> Result<OwnedHandle, W
         match result {
             Ok(h) if !h.is_invalid() => return Ok(OwnedHandle(h)),
             Ok(_) => last_code = 0,
-            Err(e) => last_code = e.code().0 as u32,
+            Err(e) => last_code = win32_code(&e),
         }
         if Instant::now() >= deadline {
             return Err(WinError {
@@ -519,6 +545,133 @@ pub fn connect_pipe(pipe_name: &str, timeout: Duration) -> Result<OwnedHandle, W
         }
         std::thread::sleep(Duration::from_millis(40));
     }
+}
+
+// ── Server identity (launcher side) ───────────────────────────────────────────
+
+/// Who serves the broker pipe `pipe`: process id, image path, elevation and
+/// the pipe's owner. Only the id is required; the rest is reported per query
+/// so the decision in `server_identity` can fail closed on any of them.
+pub fn pipe_server_facts(pipe: HANDLE) -> Result<crate::server_identity::ServerFacts, WinError> {
+    let mut pid: u32 = 0;
+    // SAFETY: pipe is a connected client handle; the call only writes `pid`.
+    unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) }.map_err(|e| WinError {
+        context: "GetNamedPipeServerProcessId",
+        code: win32_code(&e),
+    })?;
+    let pipe_owner = pipe_owner_sid(pipe).map_err(|e| e.code);
+    // SAFETY: minimal query right, granted across integrity levels; the handle
+    // is owned by OwnedHandle.
+    let process = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, BOOL(0), pid) } {
+        Ok(handle) => OwnedHandle(handle),
+        Err(e) => {
+            let code = win32_code(&e);
+            return Ok(crate::server_identity::ServerFacts {
+                pid,
+                image: Err(code),
+                elevated: Err(code),
+                pipe_owner,
+            });
+        }
+    };
+    Ok(crate::server_identity::ServerFacts {
+        pid,
+        image: process_image_path(process.raw()).map_err(|e| e.code),
+        elevated: open_process_token(process.raw())
+            .and_then(|token| token_is_elevated(token.raw()))
+            .map_err(|e| e.code),
+        pipe_owner,
+    })
+}
+
+/// String SID of the owner of the pipe object, which is its creator's
+/// default owner: Administrators for an elevated administrator.
+fn pipe_owner_sid(pipe: HANDLE) -> Result<String, WinError> {
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the client handle carries READ_CONTROL (GENERIC_READ); `owner`
+    // points into `descriptor`, which is LocalAlloc'd and freed by the guard.
+    let status = unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    let _descriptor_guard = LocalFreeGuard(descriptor.0);
+    if status.0 != 0 {
+        return Err(WinError {
+            context: "GetSecurityInfo(broker pipe owner)",
+            code: status.0,
+        });
+    }
+    if owner.0.is_null() {
+        return Err(WinError {
+            context: "broker pipe has no owner",
+            code: 0,
+        });
+    }
+    // SAFETY: `owner` points into `descriptor`, alive until the guard drops.
+    unsafe { sid_to_string(owner) }
+}
+
+/// The Win32 code behind a windows-rs error, which arrives as an HRESULT.
+fn win32_code(err: &windows::core::Error) -> u32 {
+    let hr = err.code().0 as u32;
+    if hr & 0xFFFF_0000 == 0x8007_0000 {
+        hr & 0xFFFF
+    } else {
+        hr
+    }
+}
+
+fn process_image_path(process: HANDLE) -> Result<std::path::PathBuf, WinError> {
+    // Long-path aware: 32 767 UTF-16 units is the Win32 maximum.
+    let mut buffer = vec![0u16; 32_768];
+    let mut size = buffer.len() as u32;
+    // SAFETY: `buffer` holds `size` units; the call writes at most that many
+    // and updates `size` to the length written, excluding the terminator.
+    unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        )
+    }
+    .map_err(|e| WinError {
+        context: "QueryFullProcessImageNameW",
+        code: win32_code(&e),
+    })?;
+    let len = (size as usize).min(buffer.len());
+    Ok(std::path::PathBuf::from(String::from_utf16_lossy(
+        &buffer[..len],
+    )))
+}
+
+fn token_is_elevated(token: HANDLE) -> Result<bool, WinError> {
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    // SAFETY: the out-buffer is a TOKEN_ELEVATION on the stack, sized exactly.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(std::ptr::addr_of_mut!(elevation).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    }
+    .map_err(|e| WinError {
+        context: "GetTokenInformation(TokenElevation)",
+        code: win32_code(&e),
+    })?;
+    Ok(elevation.TokenIsElevated != 0)
 }
 
 // ── Overlapped Read/Write adapter (both ends) ─────────────────────────────────
@@ -701,6 +854,54 @@ mod tests {
         // Drop closes it; creating proves the SDDL converts + CreateNamedPipeW
         // accepts the descriptor.
         drop(pipe);
+    }
+
+    /// The launcher-side identity read over a real pipe: the server here is this
+    /// test process, so the image is our own and elevation is whatever we run at.
+    #[test]
+    fn pipe_server_facts_names_the_process_serving_the_pipe() {
+        let sid = current_process_user_sid().expect("own sid");
+        let name = format!(
+            r"\\.\pipe\NetRuleRouter\broker-facts-{}",
+            std::process::id()
+        );
+        let pipe = create_owner_restricted_pipe(&name, &sid, true).expect("create pipe");
+        let client = connect_pipe(&name, Duration::from_secs(5)).expect("client connect");
+
+        let facts = pipe_server_facts(client.raw()).expect("server facts");
+        assert_eq!(facts.pid, std::process::id());
+        let own = std::fs::canonicalize(std::env::current_exe().expect("current exe"))
+            .expect("canonical exe");
+        let image = std::fs::canonicalize(facts.image.expect("image")).expect("canonical image");
+        assert_eq!(image, own);
+        assert!(facts.elevated.is_ok(), "own token is readable");
+        let owner = facts.pipe_owner.expect("pipe owner");
+        assert!(owner.starts_with("S-1-"), "got {owner}");
+        drop(pipe);
+    }
+
+    #[test]
+    fn a_pipe_that_refuses_us_is_served_and_an_invented_one_is_not() {
+        // `lsass` exists everywhere and is not ours to open.
+        assert!(pipe_name_served(r"\\.\pipe\lsass"));
+        let invented = format!(
+            r"\\.\pipe\NetRuleRouter\broker-absent-{}",
+            std::process::id()
+        );
+        assert!(!pipe_name_served(&invented));
+    }
+
+    #[test]
+    fn a_pipe_we_serve_reads_as_served_until_it_closes() {
+        let sid = current_process_user_sid().expect("own sid");
+        let name = format!(
+            r"\\.\pipe\NetRuleRouter\broker-served-{}",
+            std::process::id()
+        );
+        let pipe = create_owner_restricted_pipe(&name, &sid, true).expect("create pipe");
+        assert!(pipe_name_served(&name));
+        drop(pipe);
+        assert!(!pipe_name_served(&name));
     }
 
     /// End-to-end over a REAL named pipe (no elevation, no service): proves

@@ -30,7 +30,7 @@ use nrr_platform_api::conn_observe::egress::{resolve_egress, EgressInterface, Eg
 use nrr_platform_api::conn_observe::{
     ConnectionObservation, ConnectionProgress, ConnectionVerdict, TransportProtocol,
 };
-use nrr_platform_api::fake_ip::stale_flows::StaleFlowReset;
+use nrr_platform_api::fake_ip::stale_flows::{EstablishedFlow, StaleFlowReset};
 use nrr_platform_api::route_table::RouteTablePort;
 
 use crate::app_observation_lookup::AppObservationStore;
@@ -206,6 +206,12 @@ impl ConnectionTraceRing {
     /// Record that the observation source is running and feeding this ring.
     pub fn mark_observer_active(&self) {
         self.observer_active.store(true, Ordering::Relaxed);
+    }
+
+    /// Record that the task feeding this ring stopped (it waits for a restart);
+    /// [`Self::mark_observer_active`] is the way back.
+    pub fn mark_observer_down(&self) {
+        self.observer_active.store(false, Ordering::Relaxed);
     }
 
     /// Whether an observation source is feeding this ring.
@@ -447,6 +453,8 @@ pub struct ConnectionObservationConsumer {
     primary_stall_evidence: Mutex<stall_evidence::ConnectionStallTracker>,
     /// The application measure's sink — see [`AppMainLinkFn`].
     app_main_link: Option<AppMainLinkFn>,
+    /// Programs seen leaving over the additional link — see [`AppAdditionalLinkFn`].
+    app_additional_link: Option<AppAdditionalLinkFn>,
     /// Which program opened each recent main-link connection (see
     /// `remember_program`).
     connection_programs: Mutex<std::collections::HashMap<(SocketAddr, SocketAddr), (String, u64)>>,
@@ -623,6 +631,9 @@ pub type CompanionPrimaryHealthFn = Arc<dyn Fn(&str, bool) + Send + Sync>;
 /// an orderly close), and whether the address has a name.
 pub type AppMainLinkFn = Arc<dyn Fn(&str, std::net::IpAddr, bool, bool) + Send + Sync>;
 
+/// Reports a program one of whose connections left over the additional link.
+pub type AppAdditionalLinkFn = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Reports one outbound connection attempt to the navigation measurement:
 /// the initiating image path, the destination's name when it has one, and
 /// when the connection happened. Purely observational — see
@@ -638,7 +649,8 @@ pub type PlaceholderConfirmedFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// only decides WHICH drops qualify and what `BlockAttempt` to build.
 /// The owning principal comes first: mutes are personal, so the sink must know
 /// whose block this was. An empty SID means the owner could not be determined.
-pub type BlockNoticeSinkFn = Arc<dyn Fn(&str, BlockAttempt) + Send + Sync>;
+/// The last argument is when the drop was seen (wall-clock Unix ms), when known.
+pub type BlockNoticeSinkFn = Arc<dyn Fn(&str, BlockAttempt, Option<u64>) + Send + Sync>;
 
 impl ConnectionObservationConsumer {}
 

@@ -6,10 +6,8 @@
 //! emits a **connect** event for *every* outbound TCP connection from *every*
 //! process unconditionally — no filter, no engine option. So this backend is
 //! the safety net when the WFP backend can't see permitted flows on a given
-//! host. It is a near-copy of the proven [`super::super::dns_observe::etw`]
-//! session scaffold (StartTraceW / EnableTraceEx2 / OpenTraceW / ProcessTrace +
-//! an `EVENT_RECORD` C callback); only the provider GUID, the event id, and the
-//! payload parse differ.
+//! host. The session itself is [`crate::etw_session`]; only the provider, the
+//! event ids and the payload parse live here.
 //!
 //! It yields PID + 5-tuple (no process image path, no SID, no allow/block
 //! verdict — those are WFP's). The local (source) address in the connect event
@@ -26,19 +24,11 @@
 #![allow(unsafe_code)]
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 
-use windows::core::{GUID, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, GetLastError, FALSE, WIN32_ERROR};
-use windows::Win32::System::Diagnostics::Etw::{
-    CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
-    CONTROLTRACE_HANDLE, ENABLE_TRACE_PARAMETERS, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD,
-    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
-    EVENT_TRACE_REAL_TIME_MODE, PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
-};
+use windows::core::{GUID, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, FALSE};
+use windows::Win32::System::Diagnostics::Etw::{EVENT_RECORD, TRACE_LEVEL_INFORMATION};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -48,6 +38,9 @@ use super::{
     TransportProtocol,
 };
 use crate::error::PlatformError;
+use crate::etw_session::{
+    callback_context, user_data, ProviderEnable, RealtimeSession, SessionClock, SessionConfig,
+};
 
 /// `Microsoft-Windows-Kernel-Network` provider GUID.
 const KERNEL_NETWORK_PROVIDER: GUID = GUID::from_u128(0x7dd42a49_5329_4832_8dfd_43d979153a88);
@@ -85,18 +78,8 @@ type Buffer = Arc<Mutex<Vec<ConnectionObservation>>>;
 /// A running real-time ETW consumer for kernel TCP/IP connect events.
 pub struct EtwKernelNetworkObserver {
     buffer: Buffer,
-    session_name: Vec<u16>,
-    control_handle: CONTROLTRACE_HANDLE,
-    process_handle: PROCESSTRACE_HANDLE,
-    stop_flag: Arc<AtomicBool>,
-    worker: Mutex<Option<JoinHandle<()>>>,
-    /// One stop, whoever asks first — the teardown step or `Drop`.
-    stopped: AtomicBool,
+    session: RealtimeSession,
 }
-
-// Handles owned solely by this struct; the callback only touches the buffer.
-unsafe impl Send for EtwKernelNetworkObserver {}
-unsafe impl Sync for EtwKernelNetworkObserver {}
 
 impl ConnectionObservationSource for EtwKernelNetworkObserver {
     fn drain(&self) -> Vec<ConnectionObservation> {
@@ -107,203 +90,41 @@ impl ConnectionObservationSource for EtwKernelNetworkObserver {
     }
 }
 
-/// Allocate + initialize an `EVENT_TRACE_PROPERTIES` buffer for the real-time
-/// session `session_name`, reserving room for the struct, the logger name, AND
-/// a log-file-name region so the kernel's Query/Stop writeback cannot overrun
-/// it. Same defect class + fix as the DNS observer: never reuse one buffer
-/// across `ControlTraceW(STOP)` and `StartTraceW`.
-fn alloc_trace_props(session_name: &[u16]) -> Vec<u8> {
-    const LOGFILE_PAD_CHARS: usize = 1024;
-    let name_bytes = std::mem::size_of_val(session_name);
-    let pad_bytes = LOGFILE_PAD_CHARS * std::mem::size_of::<u16>();
-    let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + name_bytes + pad_bytes;
-    let mut buf: Vec<u8> = vec![0u8; props_size];
-    // SAFETY: `buf` is `props_size` bytes, ≥ size_of::<EVENT_TRACE_PROPERTIES>().
-    let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-    unsafe {
-        (*props).Wnode.BufferSize = props_size as u32;
-        (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        (*props).Wnode.ClientContext = 1; // QPC clock
-        (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-        (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-    }
-    buf
-}
-
 impl EtwKernelNetworkObserver {
     /// Start a real-time ETW session, enable the Kernel-Network provider for
-    /// IPv4, and spawn the `ProcessTrace` worker. Returns an error (and starts
-    /// nothing) on any setup failure — the caller degrades to no observation.
+    /// IPv4 + IPv6, and spawn the pump. Returns an error (and starts nothing)
+    /// on any setup failure — the caller degrades to no observation.
     pub fn start() -> Result<Self, PlatformError> {
         let buffer: Buffer = Arc::new(Mutex::new(Vec::new()));
-        let session_name = wide("NrrConnObserve");
-
-        // TWO independent buffers so the STOP writeback cannot corrupt the
-        // pristine StartTraceW buffer (same defect + fix as the DNS observer).
-        // Both sized by `alloc_trace_props`.
-        let mut stop_buf = alloc_trace_props(&session_name);
-        let mut props_buf = alloc_trace_props(&session_name);
-        let props = props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-
-        let mut control_handle = CONTROLTRACE_HANDLE::default();
-        // SAFETY: stop any stale same-named session, then start fresh; the
-        // buffers and `session_name` outlive both calls.
-        unsafe {
-            let _ = ControlTraceW(
-                CONTROLTRACE_HANDLE::default(),
-                PCWSTR(session_name.as_ptr()),
-                stop_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
-                EVENT_TRACE_CONTROL_STOP,
-            );
-            let start = StartTraceW(&mut control_handle, PCWSTR(session_name.as_ptr()), props);
-            if start != WIN32_ERROR(0) {
-                return Err(PlatformError::Win32 {
-                    operation: "StartTraceW(NrrConnObserve)",
-                    code: start.0,
-                    message: "failed to start conn-observe ETW session".into(),
-                });
-            }
-        }
-
-        let enable_params = ENABLE_TRACE_PARAMETERS {
-            Version: 2, // ENABLE_TRACE_PARAMETERS_VERSION_2
-            ..Default::default()
-        };
-        // SAFETY: `control_handle` is the just-started session; provider GUID is
-        // static; keyword limits to IPv4; `enable_params` outlives the call.
-        let enable = unsafe {
-            EnableTraceEx2(
-                control_handle,
-                &KERNEL_NETWORK_PROVIDER,
-                EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
-                TRACE_LEVEL_INFORMATION as u8,
-                KEYWORD_IPV4 | KEYWORD_IPV6,
-                0,
-                0,
-                Some(&enable_params),
-            )
-        };
-        if enable != WIN32_ERROR(0) {
-            // SAFETY: tear the session down on enable failure.
-            unsafe {
-                let _ = ControlTraceW(
-                    control_handle,
-                    PCWSTR(session_name.as_ptr()),
-                    props,
-                    EVENT_TRACE_CONTROL_STOP,
-                );
-            }
-            return Err(PlatformError::Win32 {
-                operation: "EnableTraceEx2(Kernel-Network)",
-                code: enable.0,
-                message: "failed to enable Kernel-Network ETW provider".into(),
-            });
-        }
-
-        let mut logfile = EVENT_TRACE_LOGFILEW {
-            LoggerName: PWSTR(session_name.as_ptr() as *mut u16),
-            ..Default::default()
-        };
-        logfile.Anonymous1.ProcessTraceMode =
-            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-        logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
-        // Hand the callback a stable raw pointer to the buffer; reclaimed on drop.
-        let ctx = Arc::into_raw(Arc::clone(&buffer)) as *mut std::ffi::c_void;
-        logfile.Context = ctx;
-
-        // SAFETY: `logfile` is fully initialised; the callback is a static fn.
-        let process_handle = unsafe { OpenTraceW(&mut logfile) };
-        if process_handle.Value == u64::MAX {
-            let err = unsafe { GetLastError() };
-            // SAFETY: reclaim the leaked Arc ref and stop the session.
-            unsafe {
-                drop(Arc::from_raw(
-                    ctx as *const Mutex<Vec<ConnectionObservation>>,
-                ));
-                let _ = ControlTraceW(
-                    control_handle,
-                    PCWSTR(session_name.as_ptr()),
-                    props,
-                    EVENT_TRACE_CONTROL_STOP,
-                );
-            }
-            return Err(PlatformError::Win32 {
-                operation: "OpenTraceW(NrrConnObserve)",
-                code: err.0,
-                message: "failed to open conn-observe ETW trace".into(),
-            });
-        }
-
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let worker = {
-            let handle = process_handle;
-            std::thread::Builder::new()
-                .name("nrr-conn-etw".into())
-                .spawn(move || {
-                    // SAFETY: `handle` is a valid real-time trace handle until
-                    // `CloseTrace` in `Drop` makes `ProcessTrace` return.
-                    let _ = unsafe { ProcessTrace(&[handle], None, None) };
-                })
-                .map_err(|e| PlatformError::Win32 {
-                    operation: "spawn(nrr-conn-etw)",
-                    code: 0,
-                    message: e.to_string(),
-                })?
-        };
-
+        let session = RealtimeSession::start(
+            &SessionConfig {
+                name: "NrrConnObserve",
+                thread_name: "nrr-conn-etw",
+                clock: SessionClock::PerformanceCounter,
+                flush_timer_secs: 0,
+            },
+            &ProviderEnable {
+                guid: KERNEL_NETWORK_PROVIDER,
+                level: TRACE_LEVEL_INFORMATION as u8,
+                keywords: KEYWORD_IPV4 | KEYWORD_IPV6,
+                enable_property: 0,
+            },
+            event_record_callback,
+            Arc::clone(&buffer),
+        )?;
         tracing::info!(
             target: "nrr::conn-observe",
+            msg_key = "win-etw-conn-observer-started",
             "Kernel-Network ETW connection observer started",
         );
-        Ok(Self {
-            buffer,
-            session_name,
-            control_handle,
-            process_handle,
-            stop_flag,
-            worker: Mutex::new(Some(worker)),
-            stopped: AtomicBool::new(false),
-        })
+        Ok(Self { buffer, session })
     }
-}
 
-impl EtwKernelNetworkObserver {
-    /// Stop the trace session and join the pump, without waiting for `Drop`.
-    ///
-    /// An ETW session is a KERNEL object registered by name: a process that
-    /// exits without stopping it leaves `NrrConnObserve` running, and the next
-    /// start finds the name taken. `Drop` cannot be relied on for that — the
-    /// consumer threads hold their own `Arc` to this source, and one that is
-    /// still referenced at exit is never dropped.
+    /// Stop the trace session and join the pump, without waiting for `Drop`:
+    /// the consumer threads hold their own `Arc` to this source, and one still
+    /// referenced at exit is never dropped (see [`RealtimeSession::stop`]).
     pub fn shutdown(&self) {
-        if self.stopped.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.stop_flag.store(true, Ordering::SeqCst);
-        let mut props_buf = alloc_trace_props(&self.session_name);
-        let props = props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-        // SAFETY: stop the session + close the trace → ProcessTrace returns and
-        // the worker exits; mirrors the DNS observer's teardown. `props_buf` is
-        // adequately sized for the kernel's Stop writeback (alloc_trace_props).
-        unsafe {
-            let _ = ControlTraceW(
-                self.control_handle,
-                PCWSTR(self.session_name.as_ptr()),
-                props,
-                EVENT_TRACE_CONTROL_STOP,
-            );
-            let _ = CloseTrace(self.process_handle);
-        }
-        let worker = self.worker.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(w) = worker {
-            let _ = w.join();
-        }
-    }
-}
-
-impl Drop for EtwKernelNetworkObserver {
-    fn drop(&mut self) {
-        self.shutdown();
+        self.session.stop();
     }
 }
 
@@ -332,18 +153,12 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
     let Some((is_v6, progress)) = classify_event(event_id) else {
         return;
     };
-    let ctx = rec.UserContext as *const Mutex<Vec<ConnectionObservation>>;
-    if ctx.is_null() {
+    let Some(buffer) = callback_context::<Mutex<Vec<ConnectionObservation>>>(rec) else {
         return;
-    }
-    let buffer = &*ctx;
-
-    let data = rec.UserData as *const u8;
-    let len = rec.UserDataLength as usize;
-    if data.is_null() {
+    };
+    let Some(bytes) = user_data(rec) else {
         return;
-    }
-    let bytes = std::slice::from_raw_parts(data, len);
+    };
     let parsed = if is_v6 {
         parse_tcp_connect_v6(bytes).map(|(pid, l, r)| (pid, SocketAddr::V6(l), SocketAddr::V6(r)))
     } else {
@@ -466,11 +281,6 @@ fn parse_tcp_connect_v6(d: &[u8]) -> Option<(u32, SocketAddrV6, SocketAddrV6)> {
     let local = SocketAddrV6::new(saddr, sport, 0, 0);
     let remote = SocketAddrV6::new(daddr, dport, 0, 0);
     Some((pid, local, remote))
-}
-
-/// NUL-terminated UTF-16 from a `&str`.
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(test)]

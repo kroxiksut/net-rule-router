@@ -88,6 +88,7 @@ impl DiagnosticsExportArchiveHandler {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::diagnostics",
+                    msg_key = "diagarchive-decision-ids-lookup-failed",
                     error = %e,
                     "diagnostics.export-archive: recent_decision_ids: recent_log_entries failed",
                 );
@@ -135,6 +136,7 @@ impl DiagnosticsExportArchiveHandler {
                     Err(e) => {
                         tracing::warn!(
                             target: "nrr::diagnostics",
+                            msg_key = "diagarchive-explain-sample-skipped",
                             decision_id = %decision_id,
                             error = %e,
                             "diagnostics.export-archive: skipping explain sample (facade error)",
@@ -392,6 +394,7 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
             if let Err(e) = self.file_handoff.grant_read(&result.path, caller) {
                 tracing::warn!(
                     target: "nrr::diagnostics",
+                    msg_key = "diagarchive-handoff-failed",
                     error = %e,
                     "diagnostics.export-archive: could not hand the archive to its requester",
                 );
@@ -449,11 +452,13 @@ pub(super) fn prune_old_archives(dir: &std::path::Path, keep: usize) {
         match std::fs::remove_file(&path) {
             Ok(()) => tracing::info!(
                 target: "nrr::diagnostics",
+                msg_key = "diagarchive-pruned",
                 path = %path.display(),
                 "archive retention: pruned old diagnostic archive",
             ),
             Err(e) => tracing::warn!(
                 target: "nrr::diagnostics",
+                msg_key = "diagarchive-prune-failed",
                 path = %path.display(),
                 error = %e,
                 "archive retention: failed to prune old archive",

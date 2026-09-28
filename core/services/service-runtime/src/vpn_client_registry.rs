@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::SystemTime;
 
+use nrr_shared::glob::glob_match;
+
 /// Maximum distinct client paths held at once. Oldest entry is evicted to
 /// make room once the cap is reached. Mirrors the storage-layer cap so the
 /// in-memory view and the persisted set stay congruent.
@@ -244,31 +246,12 @@ impl ConfirmedVpnClients {
             .values()
             .flatten()
             .filter(|entry| {
-                glob_matches(&needle, &entry.basename_lower)
-                    || glob_matches(&needle, &entry.full_lower)
+                glob_match(&needle, &entry.basename_lower) || glob_match(&needle, &entry.full_lower)
             })
             .filter(|entry| seen.insert(entry.full_lower.clone()))
             .map(|entry| entry.full.clone())
             .collect()
     }
-}
-
-/// Glob match where `*` matches zero or more characters. Both sides must
-/// already be lowercase. Mirrors `nrr_domain::decision_rules_matching`'s
-/// matcher — duplicated rather than depended on because that one is private to
-/// the rule engine and this crate must not widen the engine's public surface
-/// for a two-line helper.
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    fn walk(pat: &[u8], txt: &[u8]) -> bool {
-        match pat.first() {
-            None => txt.is_empty(),
-            Some(b'*') => (0..=txt.len()).any(|i| walk(&pat[1..], &txt[i..])),
-            Some(&pc) => txt
-                .first()
-                .is_some_and(|&tc| tc == pc && walk(&pat[1..], &txt[1..])),
-        }
-    }
-    walk(pattern.as_bytes(), text.as_bytes())
 }
 
 /// Process-wide [`ConfirmedVpnClients`].

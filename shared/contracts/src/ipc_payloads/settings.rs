@@ -121,16 +121,15 @@ pub type LogRetentionConfigSetResponse = LogRetentionConfigDto;
 /// Slug values recognised by the service: `"all-or-nothing"`,
 /// `"best-effort"`, `"pre-flight-then-all-or-nothing"`. The GUI MUST
 /// echo back one of these — the service rejects unknown slugs.
+///
+/// The writer's SID stays in storage, off the wire: the policy is machine-wide,
+/// so every user reads it, and who last set it is none of their business.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ApplyFailurePolicyDto {
     pub policy: String,
     /// Epoch seconds of the last write.
     pub updated_at: u64,
-    /// SID of the principal who last set the policy. `None` for the
-    /// default row materialised on first read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub set_by_sid: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

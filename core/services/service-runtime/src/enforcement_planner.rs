@@ -160,6 +160,7 @@ pub fn plan_route_rules(
     let families = input.ipv6.families();
     let mut flows = Vec::new();
     let mut report = PlanReport::default();
+    let shapes = crate::wfp_codegen::current_rule_shape_support();
     // The same arbiter the Windows codegens read. Without it this path pins an
     // app rule's observed destinations over an address rule the user wrote for
     // that very host, and the kill-switch then blocks the address for every
@@ -202,6 +203,16 @@ pub fn plan_route_rules(
             if !rule.enabled {
                 continue;
             }
+            // The same shape gate as `wfp_codegen`: skipped whole, never
+            // narrowed to the destination half.
+            if let nrr_domain::rule_shape::ShapeVerdict::Unsupported { reason } =
+                nrr_domain::rule_shape::rule_verdict(rule, shapes)
+            {
+                report
+                    .unsupported_shapes
+                    .push((rule.id.as_str().to_string(), reason));
+                continue;
+            }
             let (verdict, class, coverage) = match rule.action {
                 RuleAction::Route => (
                     Verdict::Permit,
@@ -236,14 +247,16 @@ pub fn plan_route_rules(
                 let targets = resolve_targets(addr_match, cache_for_role, families);
                 note_address_resolution(&mut report, rule, addr_match, &targets, cache_for_role);
                 for (fanout_idx, ip) in targets {
-                    // A Block rule steers nothing, so the arbiter has no say
-                    // over it. Otherwise: an address the main link's own rules
-                    // name is not this link's to take, however specific this
-                    // rule is about the HOST — the flow acts on the ADDRESS,
-                    // and it carries the main link's hosts too.
-                    if !matches!(rule.action, RuleAction::Block)
-                        && !ownership.address_rule_may_steer(ip, link)
-                    {
+                    // A Block yields an address a narrower rule names. A route:
+                    // an address the main link's own rules name is not this
+                    // link's to take, however specific this rule is about the
+                    // HOST — the flow acts on the ADDRESS, and it carries the
+                    // main link's hosts too.
+                    let keep = match rule.action {
+                        RuleAction::Block => !ownership.block_yields(ip, addr_match),
+                        RuleAction::Route => ownership.address_rule_may_steer(ip, link),
+                    };
+                    if !keep {
                         continue;
                     }
                     flows.push(host_flow(fanout_idx, ip));

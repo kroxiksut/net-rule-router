@@ -219,6 +219,9 @@ pub struct BlockNotice {
     pub reason: BlockReason,
     pub first_attempt_ms: u64,
     pub attempts: u32,
+    /// Image names of the processes that started `app`, nearest parent first.
+    /// The ledger never knows it; the caller fills it in once per episode.
+    pub launched_by: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +305,7 @@ impl BlockNoticeLedger {
             reason: attempt.reason,
             first_attempt_ms: now_ms,
             attempts: 1,
+            launched_by: Vec::new(),
         })
     }
 

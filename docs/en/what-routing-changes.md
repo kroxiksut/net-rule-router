@@ -59,7 +59,10 @@ protection has less to work with.
 This is a real trade-off, not a detail: encrypted DNS in the browser and
 name-based routing want the same information. Settings → Routing has a
 **Block browser DoH/DoT** switch for this, off by default; by default it is in
-force only while leak protection is on. If you leave
+force only while leak protection is on. It closes the known encrypted-DNS
+services over both IPv4 and IPv6. The built-in list of those services grows
+with new versions of the app, and an update adds the new entries without
+bringing back any you removed yourself. If you leave
 encrypted DNS on in your browser, expect routing for browser traffic to be
 less reliable than for everything else.
 

@@ -1,6 +1,7 @@
 //! Rule matching implementation.
 //!
-//! Five-tier matching algorithm:
+//! Five-tier matching algorithm, after one veto: an `ExactIp` Block on the
+//! observed address wins outright.
 //! 1. ExactFqdn — exact hostname (always before SuffixDomain for the same hostname)
 //! 2. SuffixDomain — longest suffix domain (`*.label`); covers the apex `label`
 //!    itself and every subdomain of it — see [`match_suffix_domain`]
@@ -19,8 +20,9 @@
 //! # Determinism
 //!
 //! Tie-breaking within a tier is deterministic: highest [`SpecificityScore`]
-//! wins; among equal scores, the lexicographically smallest `rule_id` wins.
-//! A [`ConflictMarker::Detected`] is attached when two candidates have equal
+//! wins; among equal scores a Block beats a route, then the main route beats
+//! the additional one, then the smallest `rule_id`. A
+//! [`ConflictMarker::Detected`] is attached when two candidates have equal
 //! specificity but belong to different route roles.
 
 use std::net::IpAddr;
@@ -56,6 +58,20 @@ pub fn match_rules(
     behavior_mode: RouteBehaviorMode,
 ) -> RequestedRouteDecision {
     let avail = &input.match_class_availability;
+
+    // A literal-IP Block is an absolute veto: it names the address itself, and
+    // enforcement drops that address whatever name rule a tenant of it has.
+    if avail.exact_ip.is_none() {
+        if let Some(ip) = observed_ip(input) {
+            let vetoes: Vec<_> = collect_exact_ip(rule_book, ip, &input.app_identity)
+                .into_iter()
+                .filter(|c| c.action == RuleAction::Block)
+                .collect();
+            if let Some(winner) = select_winner(vetoes) {
+                return RequestedRouteDecision::MatchedRoute { candidate: winner };
+            }
+        }
+    }
 
     // Tier 1: ExactFqdn
     if avail.exact_fqdn.is_none() {
@@ -302,16 +318,12 @@ fn collect_application(
 /// Ineligible candidates (`AppFilterResult::NotMatched`) are discarded first.
 /// Among eligible candidates the highest [`SpecificityScore`] wins.
 ///
-/// A tie between the two route sets is broken by ROLE — the main route wins —
-/// because that is what the enforcement layer does with the same tie: its
-/// primary weight band sits above the secondary one, so a filter for the main
-/// route is the one that fires. Breaking it by `rule_id` here made this
-/// matcher answer "additional route" for a case the service would route down
-/// the main one, purely because a name sorted first; an explain probe that
-/// disagrees with enforcement is worse than no probe. The tie is still marked
-/// [`ConflictMarker::Detected`] — the user named the same traffic twice, and
-/// only they can say which they meant. `rule_id` remains the last resort so
-/// the answer stays deterministic.
+/// Ties follow enforcement. A Block beats a route of the same specificity:
+/// its filters sit in a band above every route and the address arbiter keeps
+/// a block on a tie. Between two routes the main one wins, because its weight
+/// band sits above the secondary one. The tie is still marked
+/// [`ConflictMarker::Detected`] when the two sets disagree — only the user can
+/// say which they meant. `rule_id` is the last resort, for determinism.
 fn select_winner(mut candidates: Vec<RuleMatchCandidate>) -> Option<RuleMatchCandidate> {
     candidates.retain(|c| c.app_filter_result.is_eligible());
     if candidates.is_empty() {
@@ -320,6 +332,7 @@ fn select_winner(mut candidates: Vec<RuleMatchCandidate>) -> Option<RuleMatchCan
     candidates.sort_by(|a, b| {
         b.specificity
             .cmp(&a.specificity)
+            .then_with(|| action_rank(a.action).cmp(&action_rank(b.action)))
             .then_with(|| role_rank(a.route_role).cmp(&role_rank(b.route_role)))
             .then_with(|| a.rule_id.as_str().cmp(b.rule_id.as_str()))
     });
@@ -348,6 +361,22 @@ fn role_rank(role: RouteRole) -> u8 {
     }
 }
 
+/// Tie-break order between actions: a Block first, see [`select_winner`].
+fn action_rank(action: RuleAction) -> u8 {
+    match action {
+        RuleAction::Block => 0,
+        RuleAction::Route => 1,
+    }
+}
+
+fn observed_ip(input: &NormalizedDecisionInput) -> Option<IpAddr> {
+    match input.ip {
+        NormalizedIp::ValidIpv4(v4) => Some(IpAddr::V4(v4)),
+        NormalizedIp::ValidIpv6(v6) => Some(IpAddr::V6(v6)),
+        NormalizedIp::Unavailable => None,
+    }
+}
+
 /// The IPv4 addresses an `ExactIp` rule may be matched against: the resolved
 /// one, the observed one, or both when they disagree.
 ///
@@ -370,12 +399,7 @@ fn effective_ips_for_matching(
             out.push(selected.addr);
         }
     }
-    let observed = match input.ip {
-        NormalizedIp::ValidIpv4(v4) => Some(IpAddr::V4(v4)),
-        NormalizedIp::ValidIpv6(v6) => Some(IpAddr::V6(v6)),
-        NormalizedIp::Unavailable => None,
-    };
-    if let Some(ip) = observed {
+    if let Some(ip) = observed_ip(input) {
         if !out.contains(&ip) {
             out.push(ip);
         }
@@ -425,31 +449,16 @@ fn eval_app_filter(
 /// Does `pattern` name the observed process?
 ///
 /// Both sides go through the one match key, so the `.exe` spelling — appended
-/// to the observed name on every OS, appended to an exact rule but never to a
-/// glob — cannot decide the answer: `*torrent` names `qbittorrent.exe`, and an
-/// exact rule matches a Linux process that has no suffix at all.
+/// to the observed name on every OS, to a Windows exact rule, never to a glob —
+/// cannot decide the answer: `*torrent` names `qbittorrent.exe`, and a rule
+/// stored as `firefox.exe` still matches a Linux process with no suffix.
 fn app_pattern_matches(pattern: &CanonicalAppPattern, process_name: &str) -> bool {
     let observed = nrr_shared::app_identity::app_match_key(process_name);
     match pattern {
         CanonicalAppPattern::Exact(p) => nrr_shared::app_identity::app_match_key(p) == observed,
         CanonicalAppPattern::Glob(p) => {
-            glob_matches(&nrr_shared::app_identity::app_match_key(p), &observed)
+            nrr_shared::glob::glob_match(&nrr_shared::app_identity::app_match_key(p), &observed)
         }
-    }
-}
-
-/// Glob match where `*` matches zero or more characters (lowercase inputs only).
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    glob_bytes(pattern.as_bytes(), text.as_bytes())
-}
-
-fn glob_bytes(pat: &[u8], txt: &[u8]) -> bool {
-    match pat.first() {
-        None => txt.is_empty(),
-        Some(b'*') => (0..=txt.len()).any(|i| glob_bytes(&pat[1..], &txt[i..])),
-        Some(&pc) => txt
-            .first()
-            .is_some_and(|&tc| tc == pc && glob_bytes(&pat[1..], &txt[1..])),
     }
 }
 

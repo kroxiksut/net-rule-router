@@ -1,7 +1,7 @@
 ﻿Nama: ID Indonesia Default Split
 Negara: ID
 Use case: Trafik lokal Indonesia melalui primary, layanan asing melalui secondary
-Author: NetRuleRouter contributors (AI draft)
+Author: NetRuleRouter contributors
 Status uji: BELUM TERVERIFIKASI
 
 PENTING:

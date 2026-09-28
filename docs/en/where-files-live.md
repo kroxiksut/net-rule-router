@@ -34,11 +34,13 @@ Three ways, none of which require you to open the folder:
 
 - **In the app** — *Settings, Diagnostics and logs*, "Export diagnostic archive". You get the archive in your own folder.
 - **`nrr-cli diag export`** — the same archive from a terminal. No administrator rights needed: the service builds it and hands it to whoever asked.
-- **`nrr-cli diag logs --tail N`** — the tail of the operational log, printed verbatim. This one reads the file directly, so it needs an administrator console; it is the option that still works when the service is not running.
+- **`nrr-cli diag logs --tail N`** — the tail of the operational log, printed verbatim. It asks the service, so it needs no administrator rights and shows your own records plus the machine's. When the service is not running it reads the files directly instead, which takes an administrator console.
 
 See [the `nrr-cli` console](cli.md) for the full command set.
 
 The two `.db` files above are meant to be managed by the application itself, through its own settings, import, and export flows. Opening and editing them directly with a generic SQLite tool or any other third-party program is not supported: it can leave the app unable to start, make it apply the wrong routing policy, or lose your settings and rules. There are legitimate reasons to touch a database file outside the app — restoring it from a backup, moving it to another machine — so this is not forbidden, but if you do it, the consequences are yours to deal with.
+
+If the service ever finds that the key it uses to check this database is gone while rules are already stored — a restore that left it behind, for example — your rules are kept: Diagnostics shows a security alert, and rule changes wait until you acknowledge it.
 
 ## Your own settings: `%APPDATA%\NetRuleRouter\`
 
@@ -77,7 +79,7 @@ The layout follows the XDG conventions your other applications use, so nothing l
 | `%LOCALAPPDATA%\NetRuleRouter\` | `~/.cache/netrulerouter/` | Caches that are rebuilt when missing |
 | `%TEMP%\NetRuleRouter\` | `/run/user/<your id>/netrulerouter/` and `~/.local/state/netrulerouter/` | Coordination files for the current session, and the launcher logs |
 
-For a clean start there is the same script with a shell spelling: `./scripts/purge-data.sh`, dry-run until you add `--yes`, and the audit trail stays unless you add `--purge-audit`.
+For a clean start there is the same script with a shell spelling: `./scripts/purge-data.sh`, dry-run until you add `--yes`, and the audit trail stays unless you add `--purge-audit`. It gives the network back first — the packet filters and the DNS redirect the service set up — and deletes nothing if that fails.
 
 ## What survives a reinstall
 
@@ -95,7 +97,7 @@ From a repository checkout, one command does all of it:
 powershell -ExecutionPolicy Bypass -File .\scripts\purge-data.ps1
 ```
 
-It prints every place it would remove and removes nothing until you add `-Yes`. The security audit trail stays behind unless you also add `-PurgeAudit`, because it is the record of what changed your routing. Your rules files are never touched, wherever you keep them.
+It prints every place it would remove and removes nothing until you add `-Yes`, which needs an administrator console. It also takes out the tray icon's start-at-sign-in entry. If the service cannot be removed yet — Windows sometimes holds it until the next reboot — the script deletes nothing and says what to do first, because a service left registered would recreate its data at the next start. The security audit trail stays behind unless you also add `-PurgeAudit`, because it is the record of what changed your routing. Your rules files are never touched, wherever you keep them.
 
 By hand, if you would rather see each step:
 

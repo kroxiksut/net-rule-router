@@ -67,8 +67,14 @@ QString NrrNativeBridge::rpcAppGroupsDiscover() {
                           QJsonObject());
 }
 
-QString NrrNativeBridge::rpcVmInventoryList() {
-    return emitRpcRequest(QStringLiteral("local.vm-inventory.list"), QJsonObject());
+QString NrrNativeBridge::rpcVmInventoryList(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("local.vm-inventory.list"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
+QString NrrNativeBridge::rpcVmNatBind(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("local.vm-nat.bind"),
+                          QJsonObject::fromVariantMap(payload));
 }
 
 QString NrrNativeBridge::rpcSeedFromBrowserHistory() {

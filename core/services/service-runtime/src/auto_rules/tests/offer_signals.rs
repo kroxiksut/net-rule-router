@@ -110,6 +110,34 @@ fn a_host_that_keeps_failing_on_the_main_link_is_offered_the_other_route() {
     assert_eq!(c.primary_behavior, AUTO_RULE_PRIMARY_BEHAVIOR_STALLS);
 }
 
+/// `*.wikidesk` would be a rule for a whole top-level label: a bare name is
+/// offered only as the full name our resolver completed it to.
+#[test]
+fn a_short_name_is_offered_only_under_its_completed_name() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    let completions = crate::short_name_completions::global_short_name_completions();
+
+    assert!(!f.engine.note_main_link_blocked_host(
+        SID,
+        "timesheetdesk",
+        HostCounts::default(),
+        wall_clock()
+    ));
+    assert!(f.engine.candidates(SID).is_empty());
+
+    completions.record("wikidesk", "wikidesk.corp.example");
+    assert!(f.engine.note_main_link_blocked_host(
+        SID,
+        "wikidesk",
+        HostCounts::default(),
+        wall_clock()
+    ));
+    let candidates = f.engine.candidates(SID);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].proposed_match, "wikidesk.corp.example");
+}
+
 /// A program the main link carries none of is offered whole, as an application
 /// rule on the additional route; once one of its connections completes there
 /// the offer goes.

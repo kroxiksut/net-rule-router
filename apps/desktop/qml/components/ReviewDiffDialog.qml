@@ -1,29 +1,7 @@
-// Review dialog for rules-update dry-run.
-//
-// Renders the wire `ReviewSummaryResponse` produced by
-// `ProductionMutationExecutor::preview`:
-// risk badge (Low/Medium/High/Critical), full list of structured
-// `RiskSignalDto` entries with kind-specific localised messages,
-// and three side-by-side columns (Added / Removed / Modified +
-// Retargeted) for the rule-level diff. Per-rule arrays are not
-// yet carried on the wire — they're populated to placeholders
-// from `changedFields` until a B.7+ follow-up extends
-// `ReviewSummaryResponse`.
-//
-// Contract:
-// - `summary` (object) — the wire response. Properties accessed via
-//   kebab-case keys (`risk-level`, `risk-signals`, `changed-fields`,
-//   `diff-summary`, `requires-review`).
-// - `signal approved()` — fired when the user clicks "Apply changes".
-//   The caller executes the activation directly; the former separate
-//   ConfirmActivateDialog confirmation step was merged in. A Critical-risk
-//   acknowledgement checkbox now
-//   lives in this dialog and gates the Apply button.
-// - `signal cancelled()` — fired on Cancel / window close.
-//
-// Width target: 900px (side-by-side 3 columns). Height adapts to
-// content; risk-badge + signals are sticky at the top of the dialog
-// content so they stay visible while the columns scroll.
+// Review of a rules dry run: risk badge, risk signals, rules written into
+// both routes, and the Added / Removed / Modified columns of the wire
+// `ReviewSummaryResponse` (kebab-case keys). `approved()` applies directly;
+// a Critical risk first needs the acknowledgement box.
 
 import QtQuick 2.15
 import QtQuick.Controls 2.15
@@ -161,6 +139,12 @@ Dialog {
             text = text.replace("{removed-pct}", String(signal["removed-pct"]))
         }
         if (signal.apex !== undefined) text = text.replace("{apex}", String(signal.apex))
+        if (signal.executables !== undefined) {
+            // QVariantList from the bridge: no `join`, index it.
+            var names = []
+            for (var i = 0; i < signal.executables.length; i += 1) names.push(String(signal.executables[i]))
+            text = text.replace("{executables}", names.join(", "))
+        }
         return text
     }
 
@@ -176,13 +160,12 @@ Dialog {
         return summary["risk-signals"]
     }
 
+    function _count(key) {
+        var list = summary && summary[key]
+        return list && typeof list.length === "number" ? list.length : 0
+    }
+
     function diffSummaryText() {
-        // The server-side `diff_summary` field is a hardcoded English
-        // `"N SID(s); +A / -R filters; W pre-flight warning(s)"`
-        // string (production_mutation_executor.rs). Parse it to
-        // recover the counters and re-render through the locale tree
-        // so the line localises into RU. Fall back to the raw text
-        // when the format ever drifts.
         var raw = summary && summary["diff-summary"] ? String(summary["diff-summary"]) : ""
         if (raw === "") {
             return tr("dialog.review-diff.summary-empty",
@@ -196,14 +179,21 @@ Dialog {
                 "Discard {count} custom rule(s) and restore the baseline rules.")
                 .replace("{count}", rm[1])
         }
-        var m = raw.match(/^(\d+)\s+SID\(s\);\s*\+(\d+)\s*\/\s*-(\d+)\s+filters;\s*(\d+)\s+pre-flight\s+warning\(s\)$/)
-        if (!m) return raw
-        return tr("dialog.review-diff.summary-counts",
-                "{sids} SID(s); +{added} / -{removed} filters; {warnings} pre-flight warning(s)")
-            .replace("{sids}", m[1])
-            .replace("{added}", m[2])
-            .replace("{removed}", m[3])
-            .replace("{warnings}", m[4])
+        // The service's apply-plan counters (users, filters) are its own
+        // bookkeeping; the user reviews rules, so the line counts rules.
+        if (!/^\d+\s+SID\(s\);/.test(raw)) return raw
+        var added = _count("rules-added")
+        var removed = _count("rules-removed")
+        var changed = _count("rules-modified") + _count("rules-retargeted")
+        if (added + removed + changed === 0) {
+            return tr("dialog.review-diff.summary-rules-unchanged",
+                "The rule list does not change; routing is rebuilt from it.")
+        }
+        return tr("dialog.review-diff.summary-rule-counts",
+                "Added: {added} · Removed: {removed} · Changed: {changed}")
+            .replace("{added}", String(added))
+            .replace("{removed}", String(removed))
+            .replace("{changed}", String(changed))
     }
 
     onRejected: cancelled()
@@ -415,6 +405,8 @@ Dialog {
         }
 
         // ── Three columns ────────────────────────────────────────
+        // Equal preferred widths: otherwise the layout sizes each column by
+        // its content and a long rule name takes the whole row.
         RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -423,6 +415,7 @@ Dialog {
             ReviewDiffColumn {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                Layout.preferredWidth: 1
                 ownerRoot: root.ownerRoot
                 title: root.tr("dialog.review-diff.column-added", "Added")
                 items: (root.summary && root.summary["rules-added"]) || []
@@ -431,6 +424,7 @@ Dialog {
             ReviewDiffColumn {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                Layout.preferredWidth: 1
                 ownerRoot: root.ownerRoot
                 title: root.tr("dialog.review-diff.column-removed", "Removed")
                 items: (root.summary && root.summary["rules-removed"]) || []
@@ -439,6 +433,7 @@ Dialog {
             ReviewDiffColumn {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                Layout.preferredWidth: 1
                 ownerRoot: root.ownerRoot
                 title: root.tr("dialog.review-diff.column-modified", "Modified or retargeted")
                 items: {

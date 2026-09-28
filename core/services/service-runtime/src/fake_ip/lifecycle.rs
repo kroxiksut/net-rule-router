@@ -239,6 +239,7 @@ impl FakeIpAssembly {
         } else {
             tracing::info!(
                 target: "nrr::fake_ip",
+                msg_key = "fakeip-stale-flow-swept",
                 found = sweep.found,
                 torn_down = sweep.torn_down,
                 "stale-flow sweep tore down sockets a previous run left pointing at dead fake addresses",
@@ -428,6 +429,7 @@ impl FakeIpController {
             // The watchdog tick retries the start once the zombie is reaped.
             tracing::info!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-start-deferred-zombies",
                 zombies = inner.zombies.len(),
                 "fake-IP start deferred — a detached stack thread has not exited yet",
             );
@@ -436,6 +438,7 @@ impl FakeIpController {
         let Some(factory) = inner.factory.clone() else {
             tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-start-no-factory",
                 "fake-IP start requested but no stack factory is wired; feature stays off",
             );
             return;
@@ -445,6 +448,7 @@ impl FakeIpController {
             // open failed); this line records that a start was attempted.
             tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-start-build-failed",
                 "fake-IP start requested but the stack could not be built; feature stays off (fail-open)",
             );
             return;
@@ -459,6 +463,7 @@ impl FakeIpController {
             if let Err(e) = stack.run(&thread_stop) {
                 tracing::warn!(
                     target: "nrr::fake-ip",
+                    msg_key = "fakeip-run-loop-exited",
                     error = ?e,
                     "fake-IP stack run loop exited on a device error — relay is DOWN until restarted",
                 );
@@ -472,6 +477,7 @@ impl FakeIpController {
         inner.restart_pending = false;
         tracing::info!(
             target: "nrr::fake-ip",
+            msg_key = "fakeip-stack-started",
             "fake-IP stack started — virtual addresses are live",
         );
     }
@@ -495,6 +501,7 @@ impl FakeIpController {
             // in the join.
             tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-shutdown-signal-failed",
                 error = ?e,
                 "fake-IP stack shutdown signal failed — the reader may not wake promptly",
             );
@@ -507,11 +514,13 @@ impl FakeIpController {
             let _ = running.join.join();
             tracing::info!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-stack-stopped",
                 "fake-IP stack stopped — names resolve to real addresses again",
             );
         } else {
             tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-stop-grace-exceeded",
                 grace_ms = STOP_JOIN_GRACE.as_millis() as u64,
                 "fake-IP stack thread ignored the stop grace — detached; the next start waits for it to exit (wedged datapath keeps the old adapter open until then)",
             );
@@ -573,6 +582,7 @@ impl FakeIpController {
                 inner.down_flush_pending = true;
                 tracing::warn!(
                     target: "nrr::fake-ip",
+                    msg_key = "fakeip-thread-self-exited",
                     "fake-IP stack thread had self-exited and was reaped — the relay was not running",
                 );
             }
@@ -584,6 +594,7 @@ impl FakeIpController {
                 let _ = zombie.join.join();
                 tracing::info!(
                     target: "nrr::fake-ip",
+                    msg_key = "fakeip-zombie-reaped",
                     "a detached fake-IP stack thread finally exited and was reaped — a rebuild can proceed",
                 );
             } else {
@@ -641,6 +652,7 @@ impl FakeIpController {
         if tcp_flows_delta > 0 || udp_flows_delta > 0 || udp_unreachable_delta > 0 {
             tracing::info!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-relay-dial-activity",
                 tcp_flows_opened = tcp_flows_delta,
                 tcp_dial_ok = tcp_ok_delta,
                 tcp_dial_refused = tcp_refused_delta,
@@ -715,6 +727,7 @@ impl FakeIpController {
                         inner.watchdog.last_outage_warn = Some(std::time::Instant::now());
                         tracing::warn!(
                             target: "nrr::fake-ip",
+                            msg_key = "fakeip-datapath-not-running",
                             zombies = inner.zombies.len(),
                             "fake-IP is enabled but the datapath is NOT running — relay, RST and telemetry are all inactive until it restarts",
                         );
@@ -745,12 +758,14 @@ impl FakeIpController {
         {
             tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-wedge-cooldown",
                 "fake-IP datapath still wedged (answers without ingress) but a rebuild just ran — waiting out the cooldown",
             );
             return false;
         }
         tracing::warn!(
             target: "nrr::fake-ip",
+            msg_key = "fakeip-datapath-wedged-rebuild",
             answers_delta,
             "fake-IP datapath wedged: virtual addresses are being answered but NO packets arrive — rebuilding the TUN stack",
         );

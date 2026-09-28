@@ -18,7 +18,7 @@ use nrr_platform_api::dns::DnsResolverPort;
 use nrr_shared::RouteRole;
 use nrr_storage::repository::CacheRepository;
 
-use crate::dns_observation_consumer::rule_set_matches;
+use crate::dns_observation_consumer::rule_covers;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::per_sid_orchestrator::RulesProvider;
 
@@ -192,6 +192,7 @@ impl FlowActivityObserver {
         if let Err(error) = spawned {
             tracing::warn!(
                 target: "nrr::fake-ip",
+                msg_key = "fakeip-flow-worker-start-failed",
                 %error,
                 "could not start the flow-activity worker — companion discovery will not see relayed flows",
             );
@@ -223,6 +224,7 @@ impl super::stack::FlowObserver for FlowActivityObserver {
             if n == 1 || n.is_multiple_of(512) {
                 tracing::warn!(
                     target: "nrr::fake-ip",
+                    msg_key = "fakeip-flow-notices-dropped",
                     dropped = n,
                     "flow-activity notices are being dropped — companion discovery is behind",
                 );
@@ -258,9 +260,9 @@ impl super::stack::FlowObserver for CompositeFlowObserver {
 ///
 /// A hostname that matches an enabled **secondary** rule for the routing-active
 /// principal leaves over the secondary link; everything else takes the primary.
-/// This is the same `rule_set_matches` gate the DNS oracle and the observer use
-/// (single source of truth), so fake-IP steers a host to the same link every
-/// other surface would.
+/// Hosts are matched by the same `rule_covers` the DNS oracle and the observer
+/// use, so fake-IP steers a host to the link the filters do — which is also why
+/// a rule enforcement skips for its shape is left out.
 pub struct RuleBookRouteSelector {
     rules_provider: Arc<dyn RulesProvider>,
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
@@ -281,9 +283,16 @@ impl RuleBookRouteSelector {
 
 impl RouteSelector for RuleBookRouteSelector {
     fn route_for(&self, hostname: &str) -> RouteRole {
+        // A rule enforcement skips for its shape steers nothing here either.
         let is_secondary = (self.active_sid)()
             .and_then(|sid| self.rules_provider.active_rules_for(&sid))
-            .is_some_and(|snapshot| rule_set_matches(hostname, &snapshot.rule_book.secondary));
+            .is_some_and(|snapshot| {
+                snapshot.rule_book.secondary.rules().iter().any(|r| {
+                    r.enabled
+                        && crate::wfp_codegen::rule_shape_enforced(r)
+                        && rule_covers(r, hostname)
+                })
+            });
         if is_secondary {
             RouteRole::Secondary
         } else {

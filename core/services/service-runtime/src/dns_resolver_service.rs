@@ -76,6 +76,9 @@ pub type NamespaceRecheck = Arc<AtomicBool>;
 /// what qualifies; this module only carries the answer to the port.
 pub type DnsNamespaceExemptionsFn = Arc<dyn Fn() -> Vec<DnsNamespaceExemption> + Send + Sync>;
 
+/// Suffixes the user named for completing short names, asked afresh each tick.
+pub type ShortNameSuffixesFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 pub struct DnsResolverService {
     listener: DnsInterceptListener,
     redirect: Arc<dyn SystemDnsRedirectPort>,
@@ -85,6 +88,7 @@ pub struct DnsResolverService {
     /// `None` claims every name, which is what the product did before it
     /// learned to step aside.
     exemptions: Option<DnsNamespaceExemptionsFn>,
+    short_name_suffixes: Option<ShortNameSuffixesFn>,
 }
 
 impl DnsResolverService {
@@ -100,6 +104,40 @@ impl DnsResolverService {
             guard_interval: REDIRECT_GUARD_INTERVAL,
             recheck: None,
             exemptions: None,
+            short_name_suffixes: None,
+        }
+    }
+
+    /// Wire the user's own short-name suffixes. The machine's suffixes are the
+    /// port's to know; these are added to them.
+    #[must_use]
+    pub fn with_short_name_suffixes(mut self, source: ShortNameSuffixesFn) -> Self {
+        self.short_name_suffixes = Some(source);
+        self
+    }
+
+    /// Ask the port to keep short names resolvable. Every tick: the machine's
+    /// suffixes change with its connections, and the port writes only on
+    /// change. A failure is logged once until it changes or clears.
+    fn keep_short_names(
+        redirect: &Arc<dyn SystemDnsRedirectPort>,
+        source: Option<&ShortNameSuffixesFn>,
+        last_error: &mut Option<String>,
+    ) {
+        let extra = source.map(|s| s()).unwrap_or_default();
+        match redirect.keep_short_names(&extra) {
+            Ok(()) => *last_error = None,
+            Err(error) => {
+                let text = error.to_string();
+                if last_error.as_deref() != Some(text.as_str()) {
+                    tracing::warn!(
+                        target: "nrr::dns-resolver",
+                        msg_key = "dns-resolver-short-names-failed",
+                        "Mode B: could not keep short names resolvable ({text});                          single-label names may not resolve",
+                    );
+                    *last_error = Some(text);
+                }
+            }
         }
     }
 
@@ -146,6 +184,7 @@ impl DnsResolverService {
                 let names: Vec<&str> = current.iter().map(|e| e.suffix.as_str()).collect();
                 tracing::info!(
                     target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-namespaces-exempted",
                     namespaces = %names.join(", "),
                     "Mode B: these namespaces are answered by the connections that claim them",
                 );
@@ -155,6 +194,7 @@ impl DnsResolverService {
             // retries instead of believing the failed write took effect.
             Err(error) => tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-exempt-namespaces-failed",
                 "Mode B: could not step out of the claimed namespaces ({error}); names inside them keep resolving through us",
             ),
         }
@@ -168,6 +208,7 @@ impl DnsResolverService {
 
     /// Re-installs the redirect whenever `inspect` finds it missing or the
     /// table damaged, until `stop`. Runs beside the serve loop.
+    #[allow(clippy::too_many_arguments)]
     fn guard(
         redirect: Arc<dyn SystemDnsRedirectPort>,
         handle: RedirectHandle,
@@ -176,7 +217,9 @@ impl DnsResolverService {
         exemptions: Option<DnsNamespaceExemptionsFn>,
         mut applied: Vec<DnsNamespaceExemption>,
         recheck: Option<NamespaceRecheck>,
+        short_name_suffixes: Option<ShortNameSuffixesFn>,
     ) {
+        let mut short_name_error = None;
         let slice = Duration::from_millis(50).min(interval);
         loop {
             let mut waited = Duration::ZERO;
@@ -201,11 +244,17 @@ impl DnsResolverService {
             // without the exemptions beside it would capture those names for a
             // whole interval.
             Self::apply_exemptions(&redirect, exemptions.as_ref(), &mut applied);
+            Self::keep_short_names(
+                &redirect,
+                short_name_suffixes.as_ref(),
+                &mut short_name_error,
+            );
             match redirect.inspect(&handle) {
                 Ok(RedirectState::Active) => {}
                 Ok(RedirectState::Inactive) => {
                     tracing::warn!(
                         target: "nrr::dns-resolver",
+                        msg_key = "dns-resolver-redirect-missing",
                         "Mode B: the system-DNS redirect is no longer configured as written — \
                          re-installing it",
                     );
@@ -219,11 +268,13 @@ impl DnsResolverService {
                             let _ = redirect.flush_cache();
                             tracing::info!(
                                 target: "nrr::dns-resolver",
+                                msg_key = "dns-resolver-redirect-reinstalled",
                                 "Mode B: system-DNS redirect re-installed",
                             );
                         }
                         Err(error) => tracing::warn!(
                             target: "nrr::dns-resolver",
+                            msg_key = "dns-resolver-reinstall-failed",
                             "Mode B: re-installing the system-DNS redirect failed ({error}); \
                              names resolve past the resolver until the next check",
                         ),
@@ -254,6 +305,7 @@ impl DnsResolverService {
             Err(error) => {
                 tracing::warn!(
                     target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-bind-failed",
                     addr = %self.listen_addr,
                     "Mode B: could not bind the DNS listener ({error}); resolver disabled, \
                      system DNS untouched",
@@ -274,6 +326,7 @@ impl DnsResolverService {
         if stop.load(Ordering::SeqCst) {
             tracing::info!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-arm-cancelled",
                 "Mode B: arm cancelled during bind (mode switched back before redirect); \
                  system DNS untouched",
             );
@@ -285,6 +338,7 @@ impl DnsResolverService {
             Err(error) => {
                 tracing::warn!(
                     target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-redirect-failed",
                     addr = %self.listen_addr,
                     "Mode B: system-DNS redirect failed ({error}); resolver disabled, \
                      system DNS untouched",
@@ -297,17 +351,20 @@ impl DnsResolverService {
         // back through the table we just wrote.
         let mut applied: Vec<DnsNamespaceExemption> = Vec::new();
         Self::apply_exemptions(&self.redirect, self.exemptions.as_ref(), &mut applied);
+        Self::keep_short_names(&self.redirect, self.short_name_suffixes.as_ref(), &mut None);
         // A warm OS cache would otherwise bypass us on first contact.
         // Best-effort: a flush failure is logged, not fatal.
         if let Err(error) = self.redirect.flush_cache() {
             tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-cache-flush-failed",
                 "Mode B: DNS cache flush on activation failed ({error}); warm entries may \
                  bypass the resolver until they expire",
             );
         }
         tracing::info!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-active",
             addr = %self.listen_addr,
             "Mode B: DNS resolver active — system DNS redirected to the loopback listener",
         );
@@ -325,9 +382,17 @@ impl DnsResolverService {
                 // unchanged machine writes nothing on its first tick.
                 let applied = applied.clone();
                 let recheck = self.recheck.clone();
+                let short_name_suffixes = self.short_name_suffixes.clone();
                 move || {
                     Self::guard(
-                        redirect, handle, interval, stop, exemptions, applied, recheck,
+                        redirect,
+                        handle,
+                        interval,
+                        stop,
+                        exemptions,
+                        applied,
+                        recheck,
+                        short_name_suffixes,
                     )
                 }
             })
@@ -346,6 +411,7 @@ impl DnsResolverService {
         if let Err(error) = self.redirect.restore(&handle) {
             tracing::error!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-restore-failed",
                 "Mode B: FAILED to restore system DNS ({error}); if name resolution is \
                  broken, remove the NetRuleRouter NRPT rule manually \
                  (Get-DnsClientNrptRule / Remove-DnsClientNrptRule)",
@@ -354,12 +420,14 @@ impl DnsResolverService {
             let _ = self.redirect.flush_cache();
             tracing::info!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-stopped-restored",
                 "Mode B: DNS resolver stopped — system DNS restored",
             );
         }
         if let Err(error) = serve_result {
             tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-serve-loop-error",
                 "Mode B: DNS serve loop ended with an error ({error})",
             );
         }
@@ -543,6 +611,7 @@ impl DnsResolverController {
         }
         tracing::warn!(
             target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-watchdog-rearm",
             "Mode B: resolver is enabled but its serve thread has exited — re-arming (watchdog)",
         );
         inner.restart_cooldown = RESOLVER_RESTART_BACKOFF_TICKS;
@@ -562,6 +631,7 @@ impl DnsResolverController {
         let Some(factory) = inner.factory.clone() else {
             tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-no-factory",
                 "Mode B: start requested but no resolver factory is wired; staying reactive",
             );
             return;
@@ -571,6 +641,7 @@ impl DnsResolverController {
         let Some(service) = factory() else {
             tracing::warn!(
                 target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-arm-failed",
                 "Mode B: resolver could not be armed (no upstream / deps); staying reactive",
             );
             return;
@@ -585,6 +656,7 @@ impl DnsResolverController {
             Ok(join) => {
                 tracing::info!(
                     target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-thread-started",
                     "Mode B: DNS resolver thread started",
                 );
                 inner.running = Some((stop, join));
@@ -592,6 +664,7 @@ impl DnsResolverController {
             Err(e) => {
                 tracing::error!(
                     target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-spawn-failed",
                     "Mode B: failed to spawn DNS resolver thread ({e}); staying reactive",
                 );
             }
@@ -630,11 +703,13 @@ impl DnsResolverController {
             if join.join().is_err() {
                 tracing::warn!(
                     target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-thread-panicked",
                     "Mode B: DNS resolver thread panicked during stop",
                 );
             } else {
                 tracing::info!(
                     target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-stopped-restored",
                     "Mode B: DNS resolver stopped (system DNS restored)",
                 );
             }
@@ -704,6 +779,8 @@ mod tests {
         /// Set once the guard has re-installed the redirect at least once, so
         /// a test can stop the serve loop at that moment.
         reinstalled: Option<Arc<AtomicBool>>,
+        /// Every suffix set the port was asked to keep short names with.
+        short_names: Mutex<Vec<Vec<String>>>,
     }
     impl SystemDnsRedirectPort for RecordingRedirect {
         fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
@@ -753,6 +830,11 @@ mod tests {
                 .unwrap()
                 .push(exemptions.iter().map(|e| e.suffix.clone()).collect());
             Ok(exemptions.len())
+        }
+        fn keep_short_names(&self, extra: &[String]) -> Result<(), PlatformError> {
+            self.calls.lock().unwrap().push("short_names");
+            self.short_names.lock().unwrap().push(extra.to_vec());
+            Ok(())
         }
     }
 
@@ -837,6 +919,42 @@ mod tests {
         );
     }
 
+    /// The OS completes a short name before any resolver sees it, so the
+    /// suffixes must be in place before the flush sends names back through.
+    /// Asked even with no suffix of the user's: the machine's own are the
+    /// port's to restore.
+    #[test]
+    fn short_names_are_kept_before_the_cache_is_flushed() {
+        for (user, expected) in [
+            (Some("lab.example"), vec!["lab.example".to_string()]),
+            (None, Vec::new()),
+        ] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let redirect = Arc::new(RecordingRedirect {
+                flip_stop: Some(Arc::clone(&stop)),
+                ..Default::default()
+            });
+            let service = DnsResolverService::new(
+                listener(),
+                redirect.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .with_short_name_suffixes(Arc::new(move || {
+                user.map(str::to_string).into_iter().collect()
+            }));
+            assert_eq!(service.run(&stop), DnsResolverRunOutcome::ServedAndRestored);
+
+            let calls = redirect.calls.lock().unwrap().clone();
+            let kept_at = calls
+                .iter()
+                .position(|c| *c == "short_names")
+                .expect("asked");
+            let flush_at = calls.iter().position(|c| *c == "flush").expect("flushed");
+            assert!(kept_at < flush_at, "{calls:?}");
+            assert_eq!(redirect.short_names.lock().unwrap()[0], expected);
+        }
+    }
+
     /// One source feeds both: the namespaces we step out of are the ones a
     /// short name is completed with. Wired separately, the listener's half was
     /// never wired at all.
@@ -893,6 +1011,7 @@ mod tests {
                     Some(source),
                     std::mem::take(&mut applied),
                     Some(recheck),
+                    None,
                 );
             }
         });

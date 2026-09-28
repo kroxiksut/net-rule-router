@@ -73,8 +73,10 @@ impl ConnectionObservationConsumer {
         let mut dest_scope_sample: Option<DropSample> = None;
         // Destinations whose pin caught a socket on the wrong link this batch.
         // Deduped (a stalled flow is re-observed every tick) and capped.
-        let mut stale_flow_victims: std::collections::BTreeSet<std::net::Ipv4Addr> =
-            std::collections::BTreeSet::new();
+        let mut stale_flow_victims: std::collections::BTreeMap<
+            std::net::Ipv4Addr,
+            drop_reporter::PinDropVictims,
+        > = std::collections::BTreeMap::new();
 
         for obs in batch {
             // Asked of EVERY observation, before the filter below keeps only
@@ -174,8 +176,13 @@ impl ConnectionObservationConsumer {
                         // Routed through the tunnel, yet this socket is on the
                         // other link — a teardown candidate.
                         if let IpAddr::V4(rip) = rec.remote.ip() {
-                            if stale_flow_victims.len() < MAX_STALE_FLOW_RESETS_PER_BATCH {
-                                stale_flow_victims.insert(rip);
+                            if stale_flow_victims.len() < MAX_STALE_FLOW_RESETS_PER_BATCH
+                                || stale_flow_victims.contains_key(&rip)
+                            {
+                                stale_flow_victims
+                                    .entry(rip)
+                                    .or_default()
+                                    .note(rec.local, rec.user_sid.as_deref());
                             }
                         }
                         if dest_scope_sample.is_none() {
@@ -216,6 +223,7 @@ impl ConnectionObservationConsumer {
                             summary.vpn_endpoints_learned += 1;
                             tracing::info!(
                                 target: "nrr::vpn-learn",
+                                msg_key = "connobs-vpn-endpoint-learned",
                                 server = %rip,
                                 process = rec.process_path.as_deref().unwrap_or("?"),
                                 "learned VPN bootstrap endpoint from a role-verified kill-switch drop — exempting so the tunnel can reconnect",
@@ -312,6 +320,7 @@ impl ConnectionObservationConsumer {
                             }
                             tracing::info!(
                                 target: "nrr::conn-trace",
+                                msg_key = "connobs-app-pin-withdrawn",
                                 owner = %owner,
                                 intruder = %this_app,
                                 destination = %rip,
@@ -338,6 +347,7 @@ impl ConnectionObservationConsumer {
                     .last_secondary_at
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+                self.note_app_additional_link(&rec);
             }
             if rec.egress.role == EgressRole::Primary {
                 self.note_companion_in_use(rec.remote.ip());
@@ -363,6 +373,7 @@ impl ConnectionObservationConsumer {
             if self.log_ndjson {
                 tracing::info!(
                     target: "nrr::conn-trace",
+                    msg_key = "connobs-outbound-connection-observed",
                     process = rec.process_path.as_deref().unwrap_or("?"),
                     sid = rec.user_sid.as_deref().unwrap_or("?"),
                     proto = proto_str(rec.protocol),
@@ -404,11 +415,12 @@ impl ConnectionObservationConsumer {
             // teardown and needs a re-query, not a reset. Which one it is shows
             // in whether we already tore this destination down.
             let repeat = stale_flow_victims
-                .iter()
+                .keys()
                 .any(|ip| self.was_torn_down_before(*ip));
             if repeat {
                 tracing::warn!(
                     target: "nrr::conn-trace",
+                    msg_key = "connobs-stale-pin-repeat-drop",
                     count = dest_scope,
                     filter_id = sample.filter_id,
                     spec_id = sample.spec_id,
@@ -419,6 +431,7 @@ impl ConnectionObservationConsumer {
             } else {
                 tracing::warn!(
                     target: "nrr::conn-trace",
+                    msg_key = "connobs-stale-pin-live-secondary-drop",
                     count = dest_scope,
                     app_scoped = summary.killswitch_drops_live_secondary_app_scope,
                     filter_id = sample.filter_id,
@@ -431,15 +444,26 @@ impl ConnectionObservationConsumer {
         }
         // The socket predates the pin and can never reach the tunnel; tearing it
         // down is what makes the application reconnect onto the route.
-        if let Some(reset) = self.stale_flow_reset.as_ref() {
-            let mut torn_down = 0usize;
-            for ip in &stale_flow_victims {
-                torn_down = torn_down.saturating_add(reset.reset_flows_to(*ip, 32).torn_down);
-                self.note_torn_down(*ip);
+        // Only the dropped sockets and their owners' siblings: the pin is one
+        // user's, and another user's connection to the address is not behind it.
+        if let Some(reset) = self
+            .stale_flow_reset
+            .as_ref()
+            .filter(|_| !stale_flow_victims.is_empty())
+        {
+            let addresses: Vec<std::net::Ipv4Addr> = stale_flow_victims.keys().copied().collect();
+            let flows = drop_reporter::stale_flows_behind_drops(
+                reset.established_flows_to(&addresses),
+                &stale_flow_victims,
+            );
+            let torn_down = reset.reset_established(&flows);
+            for ip in addresses {
+                self.note_torn_down(ip);
             }
             if torn_down > 0 {
                 tracing::info!(
                     target: "nrr::conn-trace",
+                    msg_key = "connobs-stale-flows-torn-down",
                     torn_down,
                     destinations = stale_flow_victims.len(),
                     "tore down connections a destination pin caught on the wrong link — the application reconnects over the additional route",
@@ -449,6 +473,7 @@ impl ConnectionObservationConsumer {
         if summary.killswitch_drops_live_secondary_app_scope > 0 {
             tracing::info!(
                 target: "nrr::conn-trace",
+                msg_key = "connobs-app-pin-first-contact-drop",
                 count = summary.killswitch_drops_live_secondary_app_scope,
                 "app-pinned processes hit the kill-switch on destinations that are not routed through the additional link yet — expected first contact: the drop is what teaches the destination, and the route plus its own pin follow on the next reconcile",
             );

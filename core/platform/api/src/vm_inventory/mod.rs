@@ -9,11 +9,13 @@
 //! onto the host's loopback. The alias differs per adapter, so it is derived from
 //! each machine's configuration and never assumed.
 //!
-//! Neutral here: the model, the advice, and the reader of VirtualBox's settings
-//! format, which is the same XML on every OS. Where those files live and which
-//! adapters the host carries is the per-OS mechanism behind [`VmInventoryPort`].
+//! Neutral here: the model, the advice, and the readers of VirtualBox's and
+//! VMware's settings formats, which are the same on every OS. Where those files
+//! live and which adapters the host carries is the per-OS mechanism behind
+//! [`VmInventoryPort`].
 
 pub mod virtualbox;
+pub mod vmware;
 
 use std::net::Ipv4Addr;
 
@@ -24,6 +26,8 @@ use serde::Serialize;
 pub enum Hypervisor {
     #[serde(rename = "virtualbox")]
     VirtualBox,
+    #[serde(rename = "vmware")]
+    VMware,
 }
 
 /// One hypervisor's view of this machine.
@@ -35,7 +39,8 @@ pub struct HypervisorInventory {
     pub host_network_seen: bool,
     /// File names of the processes whose sockets carry NAT guests' traffic —
     /// what an application rule has to name. Every machine of the hypervisor
-    /// runs as one of these, so no rule can tell two machines apart.
+    /// runs as one of these, so no rule can tell two machines apart. Empty when
+    /// no application rule can route the guests.
     pub traffic_processes: Vec<String>,
     pub machines: Vec<VirtualMachine>,
 }
@@ -81,6 +86,9 @@ pub enum VmAttachment {
     Internal,
     /// A shared NAT service with its own engine, not read yet.
     NatNetwork,
+    /// The hypervisor's NAT runs as a system service: no application rule
+    /// routes it, and no guest DNS advice is known to reach our resolver.
+    ServiceNat,
     /// Not attached, or a kind this edition does not interpret.
     Other,
 }
@@ -95,6 +103,80 @@ pub struct NatAdapter {
     /// Whether the guest reaching `host_address` lands on the host's loopback.
     pub host_loopback_reachable: bool,
     pub guest_dns: GuestDnsAdvice,
+    /// The host address the NAT sends the guest's traffic from, when the
+    /// machine is pinned to one.
+    pub bound_address: Option<Ipv4Addr>,
+    /// What that pin means on this host right now; see [`classify_bindings`].
+    pub binding: NatBinding,
+}
+
+/// Where a NAT adapter's traffic leaves the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NatBinding {
+    /// No pin: the host's rules decide, like for any program.
+    Unbound,
+    /// Pinned to the additional adapter's current address: all of the
+    /// machine's traffic takes the additional route.
+    AdditionalRoute,
+    /// Pinned to an address the host no longer has, typically a tunnel that
+    /// reconnected with a new one. The machine has no network until re-pinned.
+    Missing,
+    /// Pinned to another address the host has.
+    OtherAddress,
+}
+
+/// Why pinning an adapter did not happen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VmControlError {
+    /// This OS or hypervisor has no way to do it here.
+    Unsupported,
+    /// The hypervisor's command-line tool was not found.
+    ToolMissing,
+    /// The machine id or adapter slot is not one the hypervisor could name.
+    InvalidTarget,
+    /// The hypervisor refuses to change the machine in its current state:
+    /// running, or saved. Either way the cure is powering it off.
+    MachineNotMutable,
+    /// The tool ran and failed; its own words.
+    Failed(String),
+}
+
+impl VmControlError {
+    /// Stable slug for the GUI.
+    #[must_use]
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::ToolMissing => "tool-missing",
+            Self::InvalidTarget => "invalid-target",
+            Self::MachineNotMutable => "machine-not-mutable",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
+/// Settles every NAT adapter's [`NatBinding`] against the addresses the host
+/// has now and the additional adapter's address.
+pub fn classify_bindings(
+    inventory: &mut [HypervisorInventory],
+    host_addresses: &[Ipv4Addr],
+    additional: Option<Ipv4Addr>,
+) {
+    let adapters = inventory
+        .iter_mut()
+        .flat_map(|hypervisor| hypervisor.machines.iter_mut())
+        .flat_map(|machine| machine.adapters.iter_mut());
+    for adapter in adapters {
+        if let VmAttachment::Nat(nat) = &mut adapter.attachment {
+            nat.binding = match nat.bound_address {
+                None => NatBinding::Unbound,
+                Some(bound) if Some(bound) == additional => NatBinding::AdditionalRoute,
+                Some(bound) if host_addresses.contains(&bound) => NatBinding::OtherAddress,
+                Some(_) => NatBinding::Missing,
+            };
+        }
+    }
 }
 
 impl NatAdapter {
@@ -115,7 +197,15 @@ impl NatAdapter {
             host_address,
             host_loopback_reachable,
             guest_dns,
+            bound_address: None,
+            binding: NatBinding::Unbound,
         }
+    }
+
+    #[must_use]
+    pub fn with_bound_address(mut self, bound_address: Option<Ipv4Addr>) -> Self {
+        self.bound_address = bound_address;
+        self
     }
 }
 
@@ -139,6 +229,20 @@ pub enum GuestDnsAdvice {
 /// machines they are.
 pub trait VmInventoryPort: Send + Sync {
     fn inventory(&self) -> Vec<HypervisorInventory>;
+
+    /// Pins a machine's NAT adapter to `address` as the source of its traffic,
+    /// or removes the pin with `None`. Hypervisors refuse this unless the
+    /// machine is powered off.
+    fn bind_nat(
+        &self,
+        hypervisor: Hypervisor,
+        machine_id: &str,
+        slot: u32,
+        address: Option<Ipv4Addr>,
+    ) -> Result<(), VmControlError> {
+        let _ = (hypervisor, machine_id, slot, address);
+        Err(VmControlError::Unsupported)
+    }
 }
 
 /// Off-platform default: nothing found.
@@ -251,7 +355,9 @@ mod tests {
                                     "kind": "enable-host-loopback-first",
                                     "address": "10.0.3.2",
                                     "command": null
-                                }
+                                },
+                                "boundAddress": null,
+                                "binding": "unbound"
                             }
                         },
                         { "slot": 2, "attachment": { "mode": "bridged" } }
@@ -263,6 +369,7 @@ mod tests {
             (VmAttachment::HostOnly, "host-only"),
             (VmAttachment::Internal, "internal"),
             (VmAttachment::NatNetwork, "nat-network"),
+            (VmAttachment::ServiceNat, "service-nat"),
             (VmAttachment::Other, "other"),
         ] {
             assert_eq!(
@@ -270,6 +377,10 @@ mod tests {
                 json!({ "mode": mode.1 })
             );
         }
+        assert_eq!(
+            serde_json::to_value(Hypervisor::VMware).unwrap_or_default(),
+            json!("vmware")
+        );
         assert_eq!(
             serde_json::to_value(GuestDnsAdvice::UseHostAddress {
                 address: Ipv4Addr::new(10, 0, 2, 2)
@@ -311,6 +422,61 @@ mod tests {
         assert_eq!(
             MockVmInventory::new(inventory.clone()).inventory(),
             inventory
+        );
+    }
+
+    #[test]
+    fn a_pin_is_read_against_the_host_as_it_is_now() {
+        let pinned = |address: Option<Ipv4Addr>| VmAdapter {
+            slot: 0,
+            attachment: VmAttachment::Nat(
+                NatAdapter::new("10.0.2.0/24".to_string(), Ipv4Addr::new(10, 0, 2, 2), true)
+                    .with_bound_address(address),
+            ),
+        };
+        let additional = Ipv4Addr::new(192, 0, 2, 10);
+        let other = Ipv4Addr::new(198, 51, 100, 7);
+        let gone = Ipv4Addr::new(203, 0, 113, 5);
+        let mut inventory = vec![HypervisorInventory {
+            hypervisor: Hypervisor::VirtualBox,
+            host_network_seen: true,
+            traffic_processes: Vec::new(),
+            machines: vec![VirtualMachine {
+                id: "a".to_string(),
+                name: "A".to_string(),
+                adapters: vec![
+                    pinned(None),
+                    pinned(Some(additional)),
+                    pinned(Some(other)),
+                    pinned(Some(gone)),
+                ],
+            }],
+        }];
+        classify_bindings(&mut inventory, &[additional, other], Some(additional));
+        let bindings: Vec<NatBinding> = inventory[0].machines[0]
+            .adapters
+            .iter()
+            .filter_map(|adapter| match &adapter.attachment {
+                VmAttachment::Nat(nat) => Some(nat.binding),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bindings,
+            vec![
+                NatBinding::Unbound,
+                NatBinding::AdditionalRoute,
+                NatBinding::OtherAddress,
+                NatBinding::Missing
+            ]
+        );
+    }
+
+    #[test]
+    fn a_port_without_the_mechanism_says_so() {
+        assert_eq!(
+            NoopVmInventory.bind_nat(Hypervisor::VirtualBox, "a", 0, None),
+            Err(VmControlError::Unsupported)
         );
     }
 }

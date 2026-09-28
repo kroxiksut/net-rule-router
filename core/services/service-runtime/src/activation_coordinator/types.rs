@@ -117,6 +117,9 @@ pub struct SidActionPlanSummary {
 pub struct PreFlightWarning {
     pub sid: String,
     pub category: PreFlightCategory,
+    /// What the finding names for the user (the executables nothing matched);
+    /// `message` is the English log form of the same fact.
+    pub subjects: Vec<String>,
     pub message: String,
 }
 
@@ -226,6 +229,23 @@ pub enum PolicyError {
         revision_id: RevisionId,
         reason: RevisionRejectReason,
     },
+    /// A submitted revision holds a rule whose shape enforcement cannot carry
+    /// out (see `nrr_domain::rule_shape`). Refused at submission so it never
+    /// becomes a stored candidate.
+    UnsupportedRuleShape {
+        rule_id: String,
+        reason: nrr_domain::rule_shape::UnsupportedShapeReason,
+    },
+    /// A submitted rule's text carries a line break or other control
+    /// character, which the rules file would read back as a rule of its own.
+    /// Refused at submission, like an unsupported shape.
+    ControlCharacterInRule {
+        rule_id: String,
+        /// `address-match`, `app-match`, `comment` or `origin`.
+        field: &'static str,
+    },
+    /// Another activation held the machine-wide gate for the whole wait.
+    ActivationBusy,
 }
 
 /// Why [`ActivationCoordinator`] refused to treat a row as trustworthy.

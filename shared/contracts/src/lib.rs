@@ -49,6 +49,7 @@ pub mod app_identity;
 pub mod auto_rule;
 pub mod diagnostics_dto;
 pub mod eula;
+pub mod glob;
 pub mod ipc;
 pub mod ipc_dto;
 pub mod ipc_flow;

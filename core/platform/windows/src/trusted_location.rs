@@ -157,8 +157,15 @@ pub fn lock_down_service_tree(root: &Path) -> Result<(), LockdownError> {
     Ok(())
 }
 
+/// Whether `path` is owned by SYSTEM, Administrators or TrustedInstaller.
+pub fn owner_is_trusted(path: &Path) -> Result<bool, String> {
+    let descriptor = SecurityDescriptor::of_file(path)?;
+    let (owner, _) = descriptor.owner_and_dacl()?;
+    Ok(is_trusted(&sid_string(owner)?))
+}
+
 /// The first path at or below `root` that is a reparse point, if any.
-fn first_reparse_point(root: &Path) -> Result<Option<PathBuf>, String> {
+pub fn first_reparse_point(root: &Path) -> Result<Option<PathBuf>, String> {
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
         let meta = std::fs::symlink_metadata(&path)
@@ -364,6 +371,15 @@ mod tests {
             Err(LockdownError::Link(link.clone()))
         );
         let _ = std::fs::remove_dir(&link);
+    }
+
+    #[test]
+    fn a_system_directory_has_a_trusted_owner_and_a_user_directory_does_not() {
+        let system32 = crate::system_shell::system32_exe("cmd.exe");
+        let system32 = system32.parent().expect("System32");
+        assert_eq!(owner_is_trusted(system32), Ok(true));
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(owner_is_trusted(dir.path()), Ok(false));
     }
 
     #[test]

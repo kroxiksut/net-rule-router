@@ -1,7 +1,7 @@
 ﻿# NetRuleRouter preset - version 1
 # name: Oman Default Split - Primary Route
 # description: Local services routed to primary
-# author: NetRuleRouter contributors (AI draft)
+# author: NetRuleRouter contributors
 # preset_version: 1
 
 --- Zones

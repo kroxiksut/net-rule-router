@@ -4,6 +4,8 @@
 //!
 //! ## Decode path
 //!
+//! 0. A revision mid-activation (`applying_revision_overlay`) wins
+//!    over the stored row for its principal.
 //! 1. `RevisionsRepository::get_active` → returns the row whose
 //!    `status='active'` (at most one — partial unique index on
 //!    `revisions.status` enforces the invariant at the SQL layer).
@@ -39,6 +41,7 @@ use nrr_storage::revisions::{RevisionRecord, RevisionsRepository};
 use nrr_storage::BASELINE_PRINCIPAL;
 use rusqlite::Connection;
 
+use crate::applying_revision_overlay;
 use crate::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider};
 
 /// Production [`RulesProvider`] backed by `nrr_service_state.db`.
@@ -78,6 +81,7 @@ pub fn decode_rules_snapshot(rules_json: &str, origin: &str) -> Option<ActiveRul
         Err(e) => {
             tracing::warn!(
                 target: "nrr::rules-provider",
+                msg_key = "prod-rules-json-parse-failed",
                 error = %e,
                 origin = %origin,
                 "canonical rules-json parse failed; treating as no active rules",
@@ -88,18 +92,20 @@ pub fn decode_rules_snapshot(rules_json: &str, origin: &str) -> Option<ActiveRul
     // Domain decode: schema_version check, IPv4 parse, "≥1 match"
     // invariant. Failures here are typically caused by a bumped
     // schema version on a downgrade path — log and degrade.
-    let content = match rules_json_codec::decode(dto) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                target: "nrr::rules-provider",
-                error = %e,
-                origin = %origin,
-                "rules-json codec decode failed; treating as no active rules",
-            );
-            return None;
-        }
-    };
+    let content =
+        match rules_json_codec::decode(dto, nrr_domain::rules_file::HostPlatform::compiled()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "nrr::rules-provider",
+                    msg_key = "prod-rules-codec-decode-failed",
+                    error = %e,
+                    origin = %origin,
+                    "rules-json codec decode failed; treating as no active rules",
+                );
+                return None;
+            }
+        };
     Some(ActiveRulesSnapshot {
         rule_book: content.rule_book,
         // placeholder: the per-SID `PerSidBehaviorMode` wins inside
@@ -131,6 +137,7 @@ impl RulesProvider for ProductionRulesProvider {
             Err(_) => {
                 tracing::warn!(
                     target: "nrr::rules-provider",
+                    msg_key = "prod-rules-state-db-mutex-poisoned",
                     "state DB mutex poisoned; treating as no active rules",
                 );
                 return None;
@@ -142,6 +149,7 @@ impl RulesProvider for ProductionRulesProvider {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::rules-provider",
+                    msg_key = "prod-rules-get-active-failed",
                     error = %e,
                     principal = %p,
                     "revisions.get_active_for failed; treating as no active rules",
@@ -149,17 +157,26 @@ impl RulesProvider for ProductionRulesProvider {
                 Err(())
             }
         };
-        let record = match lookup(principal) {
-            Ok(Some(r)) => r,
+        // A revision mid-activation wins over the stored pointer, which still
+        // names the previous one until phase 3a commits.
+        let resolve = |p: &str| match applying_revision_overlay::applying_for(&guard, p) {
+            Some(rules_json) => Ok(Some(decode_rules_snapshot(
+                &rules_json,
+                "applying-revision",
+            ))),
+            None => lookup(p).map(|found| found.map(|r| Self::snapshot_from_record(&r))),
+        };
+        let decoded = match resolve(principal) {
+            Ok(Some(s)) => s,
             // No own revision → read through to the baseline principal.
-            Ok(None) if principal != BASELINE_PRINCIPAL => match lookup(BASELINE_PRINCIPAL) {
-                Ok(Some(r)) => r,
+            Ok(None) if principal != BASELINE_PRINCIPAL => match resolve(BASELINE_PRINCIPAL) {
+                Ok(Some(s)) => s,
                 _ => return None,
             },
             Ok(None) => return None,
             Err(()) => return None,
         };
-        let mut snapshot = Self::snapshot_from_record(&record)?;
+        let mut snapshot = decoded?;
         // Subdomain coverage (ON by default) is applied HERE, at the
         // enforcement-read layer feeding the WFP codegen, the route codegen and
         // the DNS-observation seeder — NEVER to the stored/hashed rule book,
@@ -458,5 +475,62 @@ mod tests {
             .active_rules_for("S-1-5-21-OTHER")
             .expect("read-through");
         assert_eq!(other.rule_book.primary.rules().len(), 1);
+    }
+
+    /// The overlay is keyed by database path, so these need a real file.
+    fn make_file_state_conn(dir: &tempfile::TempDir) -> Arc<Mutex<Connection>> {
+        let conn = Connection::open(dir.path().join("state.db")).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        Arc::new(Mutex::new(runner.into_connection()))
+    }
+
+    fn names(snap: &ActiveRulesSnapshot, addr: &str) -> bool {
+        format!("{:?}", snap.rule_book.primary.rules()).contains(addr)
+    }
+
+    #[test]
+    fn a_revision_mid_activation_wins_over_the_stored_one_until_withdrawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = make_file_state_conn(&dir);
+        let user = "S-1-5-21-APPLYING";
+        insert_active_revision_for(&conn, user, &single_rule_json("203.0.113.5"));
+        let provider = ProductionRulesProvider::new(Arc::clone(&conn));
+
+        let guard = {
+            let g = conn.lock().unwrap();
+            applying_revision_overlay::publish(&g, user, &single_rule_json("198.51.100.9"))
+        };
+        let during = provider.active_rules_for(user).expect("rules");
+        assert!(
+            names(&during, "198.51.100.9"),
+            "the applying revision is served"
+        );
+        drop(guard);
+        let after = provider.active_rules_for(user).expect("rules");
+        assert!(names(&after, "203.0.113.5"), "the stored revision is back");
+    }
+
+    #[test]
+    fn a_baseline_mid_activation_reaches_inheriting_users_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = make_file_state_conn(&dir);
+        insert_active_revision(&conn, &single_rule_json("203.0.113.5"));
+        let diverged = "S-1-5-21-DIVERGED";
+        insert_active_revision_for(&conn, diverged, &single_rule_json("192.0.2.7"));
+        let provider = ProductionRulesProvider::new(Arc::clone(&conn));
+
+        let _guard = {
+            let g = conn.lock().unwrap();
+            applying_revision_overlay::publish(
+                &g,
+                BASELINE_PRINCIPAL,
+                &single_rule_json("198.51.100.9"),
+            )
+        };
+        let inheriting = provider.active_rules_for("S-1-5-21-NEW").expect("rules");
+        assert!(names(&inheriting, "198.51.100.9"));
+        let own = provider.active_rules_for(diverged).expect("rules");
+        assert!(names(&own, "192.0.2.7"));
     }
 }

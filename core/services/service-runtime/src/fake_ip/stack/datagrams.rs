@@ -50,6 +50,7 @@ impl FakeIpStack {
                 local: local_addr,
                 target,
                 clients: HashMap::new(),
+                pending: HashMap::new(),
             },
         );
     }
@@ -63,9 +64,10 @@ impl FakeIpStack {
             let Some(&UdpBind { handle, local, .. }) = self.udp_binds.get(&key) else {
                 continue;
             };
+            self.collect_udp_dials(&key, now_ms);
 
             // Client -> upstream. Copy each datagram out (releasing the socket
-            // borrow) before dialing, since dialing mutates the bind map.
+            // borrow) before forwarding, since forwarding mutates the bind map.
             let mut inbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
             {
                 let socket = self.sockets.get_mut::<udp::Socket>(handle);
@@ -79,7 +81,7 @@ impl FakeIpStack {
                 }
             }
             for (client, payload) in inbound {
-                self.udp_forward_upstream(&key, client, &payload, now_ms);
+                self.udp_forward_upstream(&key, client, payload, now_ms);
             }
 
             // Upstream -> client. Drain each client's reply queue, then emit.
@@ -106,91 +108,197 @@ impl FakeIpStack {
         }
     }
 
-    /// Send one client datagram upstream, dialing (and starting the reader) the
-    /// first time that client is seen on this bind.
+    /// Route one client datagram: straight upstream for a live flow, into the
+    /// hold queue while that client's dial runs, or start the dial.
     fn udp_forward_upstream(
         &mut self,
         key: &(std::net::IpAddr, u16),
         client: SocketAddr,
-        payload: &[u8],
+        payload: Vec<u8>,
         now_ms: u64,
     ) {
-        let known = self
-            .udp_binds
-            .get(key)
-            .is_some_and(|bind| bind.clients.contains_key(&client));
-        if !known {
-            let Some(target) = self.udp_binds.get(key).map(|bind| bind.target.clone()) else {
+        let Some(bind) = self.udp_binds.get_mut(key) else {
+            return;
+        };
+        if let Some(pending) = bind.pending.get_mut(&client) {
+            // Past the bound the datagram is dropped: the client retransmits.
+            if pending.queued.len() < UDP_PENDING_DIAL_QUEUE {
+                pending.queued.push_back(payload);
+            }
+            return;
+        }
+        if bind.clients.contains_key(&client) {
+            self.udp_send_upstream(key, client, &payload, now_ms);
+        } else {
+            self.start_udp_dial(key, client, payload);
+        }
+    }
+
+    /// Hand a first-seen client's dial to a worker, holding its datagram.
+    ///
+    /// Never inline: a dial may resolve the name through the whole resolver
+    /// chain first, and this thread carries every other flow on the machine.
+    /// UDP dials are never held either — `fake_ip_instant_rst` is TCP-only, so
+    /// a source-policy refusal is refused at once like any other failure.
+    fn start_udp_dial(
+        &mut self,
+        key: &(std::net::IpAddr, u16),
+        client: SocketAddr,
+        payload: Vec<u8>,
+    ) {
+        let in_flight: usize = self.udp_binds.values().map(|bind| bind.pending.len()).sum();
+        if in_flight >= MAX_PENDING_UDP_DIALS {
+            return;
+        }
+        let Some(target) = self.udp_binds.get(key).map(|bind| bind.target.clone()) else {
+            return;
+        };
+        self.health.record_udp_relay_flow_opened();
+        let outcome = Arc::new(Mutex::new(None));
+        let spawned = spawn_udp_dial_worker(
+            Arc::clone(&self.dialer),
+            target,
+            Arc::clone(&outcome),
+            Arc::clone(&self.waker),
+        );
+        if spawned.is_err() {
+            self.health.record_udp_dial_failed();
+            self.send_port_unreachable(*key, client, payload.len());
+            return;
+        }
+        if let Some(bind) = self.udp_binds.get_mut(key) {
+            bind.pending.insert(
+                client,
+                PendingUdpDial {
+                    outcome,
+                    first_payload_len: payload.len(),
+                    queued: VecDeque::from([payload]),
+                    started_at: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// Adopt every dial on this bind that has landed: open the flow and flush
+    /// its held datagrams, or tell the client the port is unreachable.
+    fn collect_udp_dials(&mut self, key: &(std::net::IpAddr, u16), now_ms: u64) {
+        let landed: Vec<(SocketAddr, PendingUdpDial, UdpDialOutcome)> = {
+            let Some(bind) = self.udp_binds.get_mut(key) else {
                 return;
             };
-            // UDP dials run inline on the poll thread (no per-flow worker
-            // thread exists for the send/first-dial path — see the module
-            // doc), so they are NEVER held: a 10 s hold here would freeze
-            // every other flow the stack carries. `fake_ip_instant_rst` is a
-            // TCP-only setting; UDP always instant-refuses a source-policy
-            // refusal, same as every other dial failure.
-            self.health.record_udp_relay_flow_opened();
-            let dial_started = std::time::Instant::now();
-            let datagram = match self.dialer.connect_udp(&target) {
+            if bind.pending.is_empty() {
+                return;
+            }
+            let ready: Vec<(SocketAddr, UdpDialOutcome)> = bind
+                .pending
+                .iter()
+                .filter_map(|(client, pending)| {
+                    guard(&pending.outcome)
+                        .take()
+                        .map(|outcome| (*client, outcome))
+                })
+                .collect();
+            ready
+                .into_iter()
+                .filter_map(|(client, outcome)| {
+                    bind.pending
+                        .remove(&client)
+                        .map(|pending| (client, pending, outcome))
+                })
+                .collect()
+        };
+        for (client, pending, outcome) in landed {
+            let datagram = match outcome {
                 Ok(datagram) => {
                     self.health.record_udp_dial_ok();
                     datagram
                 }
                 Err(error) => {
-                    let elapsed_ms = dial_started.elapsed().as_millis();
-                    if matches!(error, RelayError::SourcePolicyRefused { .. }) {
-                        self.health.record_udp_dial_refused();
-                        tracing::warn!(
-                            target: "nrr::fake-ip",
-                            hostname = %target.hostname,
-                            route = ?target.route,
-                            elapsed_ms = %elapsed_ms,
-                            mode = "instant",
-                            attempts = 1u32,
-                            error = %error,
-                            "fake-IP UDP dial refused by source policy — no relay for this client (UDP dials are never held)",
-                        );
-                    } else {
-                        self.health.record_udp_dial_failed();
-                    }
-                    // Fail CLOSED but not SILENT: the datagram is never relayed,
-                    // and the client is told the port is unreachable so it stops
-                    // waiting on a protocol timeout and falls back at once. A
-                    // refused TCP flow already gets its reset this way.
-                    self.send_port_unreachable(*key, client, payload.len());
-                    return;
+                    self.record_udp_dial_failure(key, &error, pending.started_at);
+                    // Fail CLOSED but not SILENT: the client learns the port is
+                    // unreachable and falls back at once instead of waiting out
+                    // a protocol timeout — the UDP twin of a refused flow's RST.
+                    self.send_port_unreachable(*key, client, pending.first_payload_len);
+                    continue;
                 }
             };
             let upstream: Arc<dyn RelayDatagram> = Arc::from(datagram);
             let replies = UdpReplies::new(Arc::clone(&self.waker));
             let worker = spawn_udp_reader(Arc::clone(&upstream), Arc::clone(&replies));
-            if let Some(bind) = self.udp_binds.get_mut(key) {
-                bind.clients.insert(
-                    client,
-                    UdpClientFlow {
-                        upstream,
-                        replies,
-                        worker,
-                        last_seen_at: now_ms,
-                    },
-                );
+            let Some(bind) = self.udp_binds.get_mut(key) else {
+                return;
+            };
+            bind.clients.insert(
+                client,
+                UdpClientFlow {
+                    upstream,
+                    replies,
+                    worker,
+                    last_seen_at: now_ms,
+                },
+            );
+            for datagram in pending.queued {
+                if !self.udp_send_upstream(key, client, &datagram, now_ms) {
+                    break;
+                }
             }
         }
+    }
+
+    fn record_udp_dial_failure(
+        &self,
+        key: &(std::net::IpAddr, u16),
+        error: &RelayError,
+        started_at: std::time::Instant,
+    ) {
+        if !matches!(error, RelayError::SourcePolicyRefused { .. }) {
+            self.health.record_udp_dial_failed();
+            return;
+        }
+        self.health.record_udp_dial_refused();
+        let Some(target) = self.udp_binds.get(key).map(|bind| &bind.target) else {
+            return;
+        };
+        tracing::warn!(
+            target: "nrr::fake-ip",
+            msg_key = "fakeip-udp-dial-policy-refused",
+            hostname = %target.hostname,
+            route = ?target.route,
+            elapsed_ms = %started_at.elapsed().as_millis(),
+            mode = "instant",
+            attempts = 1u32,
+            error = %error,
+            "fake-IP UDP dial refused by source policy — no relay for this client (UDP dials are never held)",
+        );
+    }
+
+    /// Send one datagram on a live client flow. Returns whether the flow is
+    /// still usable; a dead one has been retired and the client told.
+    fn udp_send_upstream(
+        &mut self,
+        key: &(std::net::IpAddr, u16),
+        client: SocketAddr,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> bool {
         let Some(flow) = self
             .udp_binds
             .get_mut(key)
             .and_then(|bind| bind.clients.get_mut(&client))
         else {
-            return;
+            return false;
         };
         // Its reader is gone, so nothing would ever carry a reply back.
         if flow.replies.is_dead() {
             self.retire_udp_client(key, client);
             self.send_port_unreachable(*key, client, payload.len());
-            return;
+            return false;
         }
         match flow.upstream.send(payload) {
-            Ok(_) => flow.last_seen_at = now_ms,
+            Ok(_) => {
+                flow.last_seen_at = now_ms;
+                true
+            }
             // The upstream socket is gone (route torn down under the flow, peer
             // hard-refusing). Retiring the client here means the next datagram
             // re-dials rather than being swallowed until the idle reap, and the
@@ -198,6 +306,7 @@ impl FakeIpStack {
             Err(_) => {
                 self.retire_udp_client(key, client);
                 self.send_port_unreachable(*key, client, payload.len());
+                false
             }
         }
     }
@@ -257,7 +366,13 @@ impl FakeIpStack {
                     reaped_workers.push(flow.worker);
                 }
             }
-            bind.clients.is_empty()
+            // A dial is bounded by its own timeouts; this only guards against
+            // a dialer that never returns pinning the bind forever.
+            bind.pending.retain(|_, pending| {
+                pending.started_at.elapsed()
+                    < std::time::Duration::from_millis(DEFAULT_SESSION_IDLE_MS)
+            });
+            bind.clients.is_empty() && bind.pending.is_empty()
         } else {
             false
         };

@@ -114,8 +114,8 @@ pub struct PrincipalPurgeSummary {
 
 /// Deletes every row belonging to `principal` across [`PURGED_TABLES`], in
 /// one transaction. Idempotent; never touches another principal's rows.
-/// Refuses the baseline sentinel — none of these tables ever hold baseline
-/// rows, so a caller asking for it is a bug, not a legitimate case.
+/// Refuses the baseline sentinel — its only rows here are machine markers
+/// (the resolver seed version), so a caller asking for it is a bug.
 pub fn purge_principal_data(
     conn: &mut Connection,
     principal: &str,

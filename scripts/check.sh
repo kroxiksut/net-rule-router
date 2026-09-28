@@ -30,68 +30,47 @@ cyan() { printf '\033[36m%s\033[0m\n' "$1"; }
 green() { printf '\033[32m%s\033[0m\n' "$1"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$1" >&2; }
 
-# Source comments must not carry task tracking. The repository is public, and
-# block/phase/ticket numbers and dates are meaningless to anyone reading it.
-# Only comment text is scanned — the same words inside string literals, test
-# data or schema version facts are legitimate.
-check_comment_hygiene() {
-  local roots=()
-  local d
-  for d in apps core shared scripts; do
-    [ -d "$repo_root/$d" ] && roots+=("$repo_root/$d")
-  done
-  [ "${#roots[@]}" -eq 0 ] && return 0
+# Source must not carry task tracking: the repository is public, and block,
+# phase and ticket numbers or dates mean nothing to its readers. What counts as
+# a marker lives in lib/comment-hygiene.rules, shared with check.ps1; the
+# scanner runs over what git would publish (tracked plus unignored files).
+hygiene_rules="$script_dir/lib/comment-hygiene.rules"
+hygiene_fixture="$script_dir/tests/comment-hygiene"
 
-  # The sub-block form is fenced on both sides so dotted-quad addresses in
-  # comments (10.0.0.0/8, 172.16.0.0/12) are not read as block numbers.
-  local markers exempt
-  markers='Block\s+\d|блок\s+\d|(?<![\d.])1\d\.\d+\.[0-9A-Z](?!\.?\d)|NRR-\d+|TODO\(block|Phase\s+[A-Z]\b|20\d\d-[01]\d-[0-3]\d'
-  # A date used as arithmetic in a worked example is documentation, not a
-  # tracking stamp.
-  exempt='UTC|epoch|RFC|ISO\s?8601|≈|\d_\d{3}_'
+# Paths on stdin (NUL-separated, relative to $1); prints `path:line<TAB>text`.
+scan_hygiene() {
+  perl "$script_dir/lib/comment-hygiene.pl" "$hygiene_rules" "$1"
+}
 
-  local offences=() total=0
-  local file rest line_no content prefix before after
-
-  while IFS= read -r hit; do
-    file="${hit%%:*}"
-    rest="${hit#*:}"
-    line_no="${rest%%:*}"
-    content="${rest#*:}"
-
-    case "$file" in
-      *.sh|*.ps1) prefix='#' ;;
-      *) prefix='//' ;;
-    esac
-
-    before="${content%%"$prefix"*}"
-    [ "$before" = "$content" ] && continue
-    after="${content#*"$prefix"}"
-
-    grep -qP "$markers" <<<"$after" || continue
-    grep -qP "$exempt" <<<"$content" && continue
-
-    total=$((total + 1))
-    if [ "$total" -le 20 ]; then
-      offences+=("$file:$line_no: $content")
-    fi
-  done < <(grep -RnP \
-    --include='*.rs' --include='*.qml' --include='*.cpp' --include='*.h' \
-    --include='*.js' --include='*.ps1' --include='*.sh' \
-    -e "$markers" "${roots[@]}" 2>/dev/null | grep -v '/target/')
-
-  if [ "$total" -gt 0 ]; then
-    local o
-    for o in "${offences[@]}"; do
-      yellow "  $o"
-    done
-    if [ "$total" -gt 20 ]; then
-      yellow "  ... and $((total - 20)) more"
-    fi
-    echo "comment hygiene failed: $total comment(s) carry task references or dates." >&2
+# The gate first proves it still sees what it is meant to see: a pattern edit
+# that blinds it fails here instead of passing the whole tree silently.
+check_comment_hygiene_self_test() {
+  local got expected
+  got="$(cd "$hygiene_fixture" && find . -type f ! -name expected.txt -printf '%P\0' |
+    scan_hygiene "$hygiene_fixture" | cut -f1 | LC_ALL=C sort)"
+  expected="$(tr -d '\r' <"$hygiene_fixture/expected.txt" | LC_ALL=C sort)"
+  if [ "$got" != "$expected" ]; then
+    diff <(printf '%s\n' "$expected") <(printf '%s\n' "$got") >&2 || true
+    echo "comment hygiene self-test failed: the scanner no longer matches $hygiene_fixture/expected.txt." >&2
     return 1
   fi
-  return 0
+}
+
+check_comment_hygiene() {
+  check_comment_hygiene_self_test
+  local report total o
+  report="$(git -C "$repo_root" ls-files -z --cached --others --exclude-standard |
+    scan_hygiene "$repo_root")"
+  [ -z "$report" ] && return 0
+  total="$(printf '%s\n' "$report" | wc -l)"
+  while IFS= read -r o; do
+    yellow "  ${o/$'\t'/: }"
+  done < <(printf '%s\n' "$report" | head -n 20)
+  if [ "$total" -gt 20 ]; then
+    yellow "  ... and $((total - 20)) more"
+  fi
+  echo "comment hygiene failed: $total line(s) or file name(s) carry task references or dates." >&2
+  return 1
 }
 
 cyan "[check] NetRuleRouter workspace quality baseline"

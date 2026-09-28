@@ -63,6 +63,7 @@ fn report_cleanup(what: &str, result: nrr_diagnostics::CleanupResult) {
     if !result.errors.is_empty() {
         tracing::warn!(
             target: "nrr::retention",
+            msg_key = "svctask-retention-delete-failed",
             kind = what,
             deleted = result.files_deleted,
             errors = ?result.errors,
@@ -72,6 +73,7 @@ fn report_cleanup(what: &str, result: nrr_diagnostics::CleanupResult) {
     if result.files_deleted > 0 {
         tracing::info!(
             target: "nrr::retention",
+            msg_key = "svctask-retention-swept",
             kind = what,
             deleted = result.files_deleted,
             bytes_freed = result.bytes_freed,
@@ -110,6 +112,7 @@ pub fn build_revisions_retention_task(conn: Arc<Mutex<rusqlite::Connection>>) ->
                 Err(e) => {
                     tracing::warn!(
                         target: "nrr::retention",
+                        msg_key = "svctask-retention-settings-read-failed",
                         error = %e,
                         "retention settings read failed; skipping prune",
                     );
@@ -126,6 +129,7 @@ pub fn build_revisions_retention_task(conn: Arc<Mutex<rusqlite::Connection>>) ->
                     {
                         tracing::info!(
                             target: "nrr::retention",
+                            msg_key = "svctask-revisions-pruned",
                             superseded = summary.superseded_dropped,
                             rejected = summary.rejected_dropped,
                             rolled_back = summary.rolledback_dropped,
@@ -136,6 +140,7 @@ pub fn build_revisions_retention_task(conn: Arc<Mutex<rusqlite::Connection>>) ->
                 Err(e) => {
                     tracing::warn!(
                         target: "nrr::retention",
+                        msg_key = "svctask-revisions-prune-failed",
                         error = %e,
                         "revisions retention prune failed",
                     );
@@ -144,6 +149,7 @@ pub fn build_revisions_retention_task(conn: Arc<Mutex<rusqlite::Connection>>) ->
             if let Err(e) = retention_repo.touch_last_cleanup(now) {
                 tracing::warn!(
                     target: "nrr::retention",
+                    msg_key = "svctask-revisions-touch-failed",
                     error = %e,
                     "touch_last_cleanup failed",
                 );

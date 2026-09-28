@@ -21,6 +21,7 @@ impl SecondaryRouteCoordinator {
             Some(t) if self.liveness.is_dead(t.interface_index, Instant::now()) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-secondary-liveness-dead",
                     sid = %sid,
                     ifindex = t.interface_index,
                     next_hop = %t.gateway,
@@ -208,6 +209,7 @@ impl SecondaryRouteCoordinator {
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
+                    msg_key = "route-first-contact-install-failed",
                     sid = %sid,
                     error = ?e,
                     "first-contact routes did not install — the next recompute adds them",

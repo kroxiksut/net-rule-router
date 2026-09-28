@@ -42,6 +42,7 @@ pub fn collect_interfaces_rows(
         Ok(_) => {
             tracing::warn!(
                 target: "nrr::interface-rows",
+                msg_key = "linux-interfaces-empty",
                 "/sys/class/net listed no interfaces — answering with the placeholder set",
             );
             return (InterfacesDataSource::FallbackMock, fallback_rows());
@@ -49,6 +50,7 @@ pub fn collect_interfaces_rows(
         Err(error) => {
             tracing::warn!(
                 target: "nrr::interface-rows",
+                msg_key = "linux-interfaces-enumeration-failed",
                 %error,
                 "the link enumeration failed — answering with the placeholder set",
             );
@@ -214,6 +216,7 @@ fn forwarding_capable_indexes() -> Option<HashSet<u32>> {
         Err(error) => {
             tracing::warn!(
                 target: "nrr::interface-rows",
+                msg_key = "linux-route-table-unreadable",
                 %error,
                 "route table unreadable — forwarding capability stays unevaluated for every link",
             );

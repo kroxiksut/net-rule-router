@@ -75,6 +75,10 @@ QtObject {
         }
     }
 
+    /// The service could not re-open the page the suggestion came from, so the
+    /// user has to reload it for the new route to show.
+    property bool autoRuleReloadHint: false
+
     function acceptAutoRuleCandidates(ids) {
         if (!ids || ids.length === 0 || !root.bridgeAvailable) return
         var corr = root.rpc.rpcAutoRuleCandidatesAccept({ "ids": ids })
@@ -83,6 +87,7 @@ QtObject {
                 console.log("auto-rule accept failed:", code, msg)
                 return
             }
+            autoRuleSuggestionsController.autoRuleReloadHint = !!(p && p["anchor-skipped"] === true)
             autoRuleSuggestionsController._noteAutoRulePending(p)
         })
     }

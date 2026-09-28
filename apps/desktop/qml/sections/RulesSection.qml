@@ -1556,11 +1556,6 @@ ColumnLayout {
         root.openRulesDialog(importFileDialog)
     }
 
-    // `_applyBuiltinDemo()` removed. Its
-    // empty-table-only "Apply built-in demo rules" button was consolidated
-    // into the single "Load demo rules…" button, whose `root.loadDemoRules`
-    // now reads the same bundled `builtin-demo/*.txt` and merges it.
-
     function _openExportFor(route) {
         exportFileDialog.pendingSourceRoute = route
         root.openRulesDialog(exportFileDialog)

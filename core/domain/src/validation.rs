@@ -35,8 +35,10 @@ use crate::{
         CanonicalAddressMatch, CanonicalAppMatch, CanonicalAppPattern, CanonicalProfile,
         CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
     },
+    rules_file::HostPlatform,
     ActiveConfiguration, AddressMatch, AppMatch, AppMatchPattern, Rule, RuleId,
 };
+use nrr_shared::app_identity::ExecutableNaming;
 
 // ── Public error types ────────────────────────────────────────────────────────
 
@@ -214,8 +216,8 @@ pub enum ValidationWarning {
         normalized: String,
     },
 
-    /// A process name was missing the `.exe` suffix required for reliable
-    /// Windows process matching. The suffix was appended automatically.
+    /// A Windows process name was missing its `.exe` suffix, which was
+    /// appended. Never raised for Linux or macOS names, which carry none.
     ProcessNameMissingExeSuffix {
         rule_id: RuleId,
         original: String,
@@ -420,7 +422,7 @@ impl ValidationOutcome {
 /// 2. For each rule in primary and secondary rule sets:
 ///    a. Validate that the rule has at least one match condition.
 ///    b. Normalize `address_match` (domain case/dot/IDN; IP version check).
-///    c. Normalize `app_match` (path strip, `.exe` suffix, lowercase).
+///    c. Normalize `app_match` (path strip, lowercase, `.exe` on Windows).
 /// 3. Deduplicate within each rule set; detect cross-set duplicates.
 /// 4. Build [`CanonicalProfile`] with [`CanonicalRuleSet`]s in canonical order.
 /// 5. Check for behavior-mode / binding incompatibilities (warnings only).
@@ -430,7 +432,14 @@ impl ValidationOutcome {
 /// Returns [`ValidationOutcome::Rejected`] if any blocking error is found.
 /// Returns [`ValidationOutcome::AcceptedWithWarnings`] if warnings accumulated.
 /// Returns [`ValidationOutcome::Accepted`] only when the profile is fully clean.
-pub fn validate_and_canonicalize(config: &ActiveConfiguration) -> ValidationOutcome {
+///
+/// `platform` is the platform whose application section the rules came from:
+/// it alone decides how an application name is spelled.
+pub fn validate_and_canonicalize(
+    config: &ActiveConfiguration,
+    platform: HostPlatform,
+) -> ValidationOutcome {
+    let naming = platform.executable_naming();
     let mut errors: Vec<ValidationError> = Vec::new();
     let mut warnings: Vec<ValidationWarning> = Vec::new();
 
@@ -458,12 +467,14 @@ pub fn validate_and_canonicalize(config: &ActiveConfiguration) -> ValidationOutc
     let primary_rules = normalize_rule_set(
         &config.rule_book.primary.rules,
         RouteRole::Primary,
+        naming,
         &mut errors,
         &mut warnings,
     );
     let secondary_rules = normalize_rule_set(
         &config.rule_book.secondary.rules,
         RouteRole::Secondary,
+        naming,
         &mut errors,
         &mut warnings,
     );
@@ -542,12 +553,13 @@ fn collect_rule_errors_only(config: &ActiveConfiguration, errors: &mut Vec<Valid
 fn normalize_rule_set(
     rules: &[Rule],
     _role: RouteRole,
+    naming: ExecutableNaming,
     errors: &mut Vec<ValidationError>,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Vec<CanonicalRule> {
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
-        if let Some(canonical) = normalize_rule(rule, errors, warnings) {
+        if let Some(canonical) = normalize_rule(rule, naming, errors, warnings) {
             out.push(canonical);
         }
     }
@@ -558,6 +570,7 @@ fn normalize_rule_set(
 /// the rule should be excluded from the canonical output.
 fn normalize_rule(
     rule: &Rule,
+    naming: ExecutableNaming,
     errors: &mut Vec<ValidationError>,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Option<CanonicalRule> {
@@ -638,7 +651,7 @@ fn normalize_rule(
     // Normalize app_match.
     let app_match = match rule.app_match.as_ref() {
         None => None,
-        Some(a) => match normalize_app_match(a, &rule.id, warnings) {
+        Some(a) => match normalize_app_match(a, naming, &rule.id, warnings) {
             Ok(canonical) => Some(canonical),
             Err(e) => {
                 errors.push(e);
@@ -806,17 +819,20 @@ fn canonicalize_ip_addr(
 
 /// Normalizes an [`AppMatch`]:
 ///
-/// - `Exact`: strips any directory path separator, lowercases, appends `.exe` if absent.
+/// - `Exact`: strips any directory path separator, lowercases, and appends
+///   `.exe` if absent — on Windows only; Linux and macOS names carry no suffix.
 /// - `Glob`: lowercases only; path-stripping and `.exe` appending are not applied
 ///   because the user controls the full pattern. Bare `*` is rejected as too broad.
 fn normalize_app_match(
     app: &AppMatch,
+    naming: ExecutableNaming,
     rule_id: &RuleId,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Result<CanonicalAppMatch, ValidationError> {
     let canonical_pattern = match &app.pattern {
         AppMatchPattern::Exact(raw) => {
-            let (process_name, changes) = crate::app_identity::canonical_exact_process_name(raw);
+            let (process_name, changes) =
+                crate::app_identity::canonical_exact_process_name(raw, naming);
             if let Some(original) = changes.stripped_path_from {
                 warnings.push(ValidationWarning::ProcessNameContainedPath {
                     rule_id: rule_id.clone(),

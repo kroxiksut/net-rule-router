@@ -171,9 +171,17 @@ impl Drop for NetlinkWatcher {
     }
 }
 
-/// `AF_NETLINK` socket bound to the link / IPv4-address / IPv4-route groups.
-/// IPv6 is deliberately absent: the product routes IPv4, and a v6 address
-/// churn would only re-drive the same decision.
+/// The multicast groups the watcher joins. Both families: a tunnel can gain or
+/// lose only its v6 address or default route, and our own v6 routes need the
+/// same prompt restore after someone else deletes them.
+#[cfg(target_os = "linux")]
+const SUBSCRIBED_GROUPS: u32 = (libc::RTMGRP_LINK
+    | libc::RTMGRP_IPV4_IFADDR
+    | libc::RTMGRP_IPV4_ROUTE
+    | libc::RTMGRP_IPV6_IFADDR
+    | libc::RTMGRP_IPV6_ROUTE) as u32;
+
+/// `AF_NETLINK` socket bound to [`SUBSCRIBED_GROUPS`].
 #[cfg(target_os = "linux")]
 fn open_netlink_socket() -> Result<libc::c_int, PlatformError> {
     // SAFETY: three integers in, a descriptor out.
@@ -193,8 +201,7 @@ fn open_netlink_socket() -> Result<libc::c_int, PlatformError> {
     // SAFETY: `sockaddr_nl` is plain data; zeroed is a valid starting value.
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    addr.nl_groups =
-        (libc::RTMGRP_LINK | libc::RTMGRP_IPV4_IFADDR | libc::RTMGRP_IPV4_ROUTE) as u32;
+    addr.nl_groups = SUBSCRIBED_GROUPS;
     // SAFETY: the address is live for the call and its declared length matches
     // the struct actually passed.
     let rc = unsafe {
@@ -292,6 +299,7 @@ fn read_until_woken(
             }
             tracing::warn!(
                 target: "nrr::adapters",
+                msg_key = "linux-rtnetlink-poll-failed",
                 error = %error,
                 "rtnetlink poll failed; the reader is retiring",
             );
@@ -328,6 +336,7 @@ fn read_until_woken(
             if error.raw_os_error() == Some(libc::ENOBUFS) {
                 tracing::warn!(
                     target: "nrr::adapters",
+                    msg_key = "linux-rtnetlink-overflowed",
                     "rtnetlink overflowed; some change messages were lost — re-reading state",
                 );
                 on_change();
@@ -335,6 +344,7 @@ fn read_until_woken(
             }
             tracing::warn!(
                 target: "nrr::adapters",
+                msg_key = "linux-rtnetlink-reader-stopped",
                 error = %error,
                 "rtnetlink reader stopped; only the timer tick remains",
             );
@@ -425,6 +435,22 @@ mod tests {
         let mut overrun = message(RTM_NEWLINK, b"x");
         overrun[0..4].copy_from_slice(&9999u32.to_ne_bytes());
         assert!(!carries_topology_change(&overrun));
+    }
+
+    /// A tunnel that changes only its v6 address or default route must wake
+    /// the event-driven pass too, not wait for the timer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn both_families_addresses_and_routes_are_subscribed() {
+        for group in [
+            libc::RTMGRP_LINK,
+            libc::RTMGRP_IPV4_IFADDR,
+            libc::RTMGRP_IPV4_ROUTE,
+            libc::RTMGRP_IPV6_IFADDR,
+            libc::RTMGRP_IPV6_ROUTE,
+        ] {
+            assert_ne!(SUBSCRIBED_GROUPS & group as u32, 0, "group {group:#x}");
+        }
     }
 
     /// The live half: subscribing must succeed on any Linux host (the groups

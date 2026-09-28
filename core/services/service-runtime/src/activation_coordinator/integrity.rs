@@ -138,6 +138,21 @@ impl ActivationCoordinator {
 
     // ── active-revision integrity gate ──────────────────────────────────────
 
+    /// The startup sweep, gated on what the tamper bootstrap found. After a
+    /// key reset no row can verify against a key that never signed it, so
+    /// the sweep would clear every principal's rules; the key-reset alert
+    /// already reports that state, and acknowledging it re-signs the rows.
+    pub fn enforce_active_integrity_at_boot(
+        &self,
+        bootstrap: &crate::tamper_bootstrap::TamperBootstrapOutcome,
+        correlation_id: &str,
+    ) -> Result<Vec<(String, ActiveIntegrityOutcome)>, PolicyError> {
+        if bootstrap.key_reset_unacknowledged {
+            return Ok(Vec::new());
+        }
+        self.enforce_active_integrity_all(correlation_id)
+    }
+
     /// Verifies every principal's active revision (HMAC + Free rule cap)
     /// and rolls each failing one back to the newest trusted prior
     /// revision. Run once at service startup, before any SID install, so

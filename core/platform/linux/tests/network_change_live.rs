@@ -2,7 +2,8 @@
 //! subscriber, because that is the event a tunnel coming up produces and the
 //! whole point of the observer is not waiting out the timer for it.
 //!
-//! Needs root (`ip link add`) — without it, a loud SKIP rather than a pass.
+//! Ignored by default: `ip link add` needs root. Run it with `--ignored`; it
+//! then fails, rather than passes, without root.
 
 #![cfg(target_os = "linux")]
 
@@ -26,16 +27,24 @@ fn ip(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-#[test]
-fn a_link_appearing_reaches_the_subscriber() {
-    if !nix_is_root() {
-        eprintln!(
-            "SKIPPED: not root — `ip link add` needs it. Run as root to exercise the netlink \
-             observer against the kernel."
-        );
-        return;
+/// Deletes the test link on every exit, a failed assert included.
+struct LinkGuard;
+
+impl Drop for LinkGuard {
+    fn drop(&mut self) {
+        let _ = ip(&["link", "del", LINK]);
     }
+}
+
+#[test]
+#[ignore = "needs root for `ip link add`; run with --ignored"]
+fn a_link_appearing_reaches_the_subscriber() {
+    assert!(
+        nix_is_root(),
+        "not root — `ip link add` needs it to exercise the netlink observer"
+    );
     let _ = ip(&["link", "del", LINK]);
+    let _guard = LinkGuard;
 
     let seen = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&seen);

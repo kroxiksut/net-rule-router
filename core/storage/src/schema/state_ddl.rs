@@ -1410,3 +1410,19 @@ FROM service_stability_config",
     "DROP TABLE service_stability_config",
     "ALTER TABLE service_stability_config_v63 RENAME TO service_stability_config",
 ];
+
+/// Short-name completion for a connection that announces no domain: the
+/// user's opt-in and the domain they named. Per-SID like the other
+/// suggestion settings. DEV schema; wiped freely.
+pub const STATE_DB_V64_DDL: &[&str] = &[
+    "ALTER TABLE secondary_block_policy ADD COLUMN short_name_completion INTEGER NOT NULL \
+     DEFAULT 0 CHECK(short_name_completion IN (0, 1))",
+    "ALTER TABLE secondary_block_policy ADD COLUMN short_name_suffix TEXT NOT NULL \
+     DEFAULT '' CHECK(length(short_name_suffix) <= 253)",
+];
+
+/// Who started the blocked program, as image names, newline-separated — a
+/// notice raised with no surface up carries the same answer the live one does.
+/// DEV schema; wiped freely.
+pub const STATE_DB_V65_DDL: &[&str] = &["ALTER TABLE block_notice_journal ADD COLUMN launched_by \
+     TEXT NOT NULL DEFAULT '' CHECK(length(launched_by) <= 2048)"];

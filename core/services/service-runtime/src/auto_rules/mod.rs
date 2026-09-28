@@ -72,7 +72,8 @@ use crate::ipc_handlers::event_bus::EventBus;
 use crate::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider};
 
 pub use authoring::{
-    AuthorError, AuthoredMatchKind, AuthoredRule, AutoRuleAuthor, ProductionAutoRuleAuthor,
+    AuthorError, AuthoredMatchKind, AuthoredOutcome, AuthoredRule, AutoRuleAuthor,
+    ProductionAutoRuleAuthor,
 };
 pub use store::{
     DismissalStore, EvidenceStore, InMemoryDismissalStore, InMemoryEvidenceStore,
@@ -325,6 +326,9 @@ pub struct ActionSummary {
     pub applied: u32,
     pub unknown: u32,
     pub pending: usize,
+    /// Accept only: the page the rules were offered next to has to be
+    /// reloaded by hand.
+    pub anchor_skipped: bool,
 }
 
 // ── Exclusions ───────────────────────────────────────────────────────────────
@@ -426,8 +430,14 @@ impl LedgerBatch<'_> {
     /// allocation is the hostname copy the ledger makes the first time it sees a
     /// name, and the ledger's own caps bound how many of those can exist.
     pub fn observe(&mut self, at_ms: u64, hostname: &str, kind: CoActivityKind) {
+        // A bare label would surface as an offer for a whole top-level label.
+        let Some(hostname) =
+            crate::short_name_completions::global_short_name_completions().qualify(hostname)
+        else {
+            return;
+        };
         if let Some(entry) = self.ledgers.get_mut(self.sid) {
-            entry.ledger.observe(at_ms, hostname, kind);
+            entry.ledger.observe(at_ms, &hostname, kind);
         }
     }
 
@@ -830,6 +840,7 @@ fn sort_and_cap(entry: &mut Vec<PendingCandidate>, sid: &str) {
         // exactly the kind of thing that looks like a bug from outside.
         tracing::info!(
             target: "nrr::auto-rules",
+            msg_key = "autorules-pending-cap-dropped",
             sid = %sid,
             dropped,
             kept = MAX_PENDING_PER_PRINCIPAL,

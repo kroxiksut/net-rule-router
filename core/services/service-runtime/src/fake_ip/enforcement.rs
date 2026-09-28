@@ -85,7 +85,11 @@ pub fn plan_fake_ip_enforcement(
     let mut seen: HashSet<Ipv4Addr> = HashSet::new();
     let mut scope_ips: Vec<Ipv4Addr> = Vec::new();
 
-    for rule in secondary.rules().iter().filter(|r| r.enabled) {
+    for rule in secondary
+        .rules()
+        .iter()
+        .filter(|r| r.enabled && crate::wfp_codegen::rule_shape_enforced(r))
+    {
         let Some(addr) = &rule.address_match else {
             continue;
         };

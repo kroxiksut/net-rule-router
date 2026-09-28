@@ -16,9 +16,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nrr_domain::block_notice::{BlockAttempt, BlockNoticeLedger, Mute};
+use nrr_platform_api::process_lineage::ProcessLineagePort;
 use nrr_shared::ipc_payloads::StatusUpdateEvent;
 
 use crate::block_notice_journal_store::BlockNoticeJournalStore;
@@ -41,6 +42,9 @@ pub struct BlockNoticeCenter {
     mute_loader: Option<MuteLoaderFn>,
     events: Option<Arc<EventBus>>,
     journal: Option<Arc<dyn BlockNoticeJournalStore>>,
+    /// Attached once the process recorder is up, which is after this center
+    /// is built; empty until then and on platforms without one.
+    lineage: Mutex<Option<Arc<dyn ProcessLineagePort>>>,
 }
 
 impl Default for BlockNoticeCenter {
@@ -57,6 +61,7 @@ impl BlockNoticeCenter {
             mute_loader: None,
             events: None,
             journal: None,
+            lineage: Mutex::new(None),
         }
     }
 
@@ -87,14 +92,28 @@ impl BlockNoticeCenter {
         self
     }
 
+    /// Name who started the blocked program on each new notice. Asked once
+    /// per episode, never per retried packet.
+    pub fn attach_process_lineage(&self, lineage: Arc<dyn ProcessLineagePort>) {
+        *self.lineage.lock().unwrap_or_else(|p| p.into_inner()) = Some(lineage);
+    }
+
     /// Record one blocked attempt for `sid` and log the notice, if any.
+    pub fn record(&self, sid: &str, attempt: &BlockAttempt) {
+        self.record_observed(sid, attempt, None);
+    }
+
+    /// [`Self::record`] for an attempt seen at `observed_ms` (wall-clock Unix
+    /// ms). The time anchors only the ancestry lookup: the notice names the
+    /// run that was live when the drop happened, not a later one of the same
+    /// program.
     ///
     /// Wall-clock is read here rather than threaded through the caller — this
     /// is the one place the ledger's clock dependency is resolved for the live
     /// service. An attempt whose owner is unknown is attributed to the empty
     /// principal: it still deserves a notice, and lumping it in with a real
     /// user would let that user's mutes silence it.
-    pub fn record(&self, sid: &str, attempt: &BlockAttempt) {
+    pub fn record_observed(&self, sid: &str, attempt: &BlockAttempt, observed_ms: Option<u64>) {
         let now_ms = now_ms();
         let notice = {
             let mut guard = self.ledgers.lock().unwrap_or_else(|p| p.into_inner());
@@ -108,13 +127,17 @@ impl BlockNoticeCenter {
             }
             guard.get_mut(sid).and_then(|l| l.record(now_ms, attempt))
         };
-        if let Some(notice) = notice {
+        if let Some(mut notice) = notice {
+            // Outside the ledger lock: the lookup may read the process table.
+            notice.launched_by = self.launched_by(sid, &notice.app, observed_ms.unwrap_or(now_ms));
             tracing::info!(
                 target: "nrr::block-notice",
+                msg_key = "blocknotice-episode-opened",
                 destination = %notice.destination,
                 app = %notice.app,
                 reason = notice.reason.slug(),
                 attempts = notice.attempts,
+                launched_by = %notice.launched_by.join(" < "),
                 "blocked connection — new episode",
             );
             // Journalled before publishing, and unconditionally: whether a
@@ -134,10 +157,27 @@ impl BlockNoticeCenter {
                         app: notice.app,
                         reason: notice.reason.slug().to_string(),
                         attempts: u64::from(notice.attempts),
+                        launched_by: notice.launched_by,
                     },
                 );
             }
         }
+    }
+
+    fn launched_by(&self, sid: &str, app: &str, at_ms: u64) -> Vec<String> {
+        if app.is_empty() {
+            return Vec::new();
+        }
+        let lineage = self
+            .lineage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(lineage) = lineage else {
+            return Vec::new();
+        };
+        let owner = (!sid.is_empty()).then_some(sid);
+        lineage.ancestry_of(app, owner, UNIX_EPOCH + Duration::from_millis(at_ms))
     }
 
     /// Close every episode `sid` has about `destination` — the user acted on
@@ -294,7 +334,9 @@ mod tests {
                 app,
                 reason,
                 attempts,
+                launched_by,
             } => {
+                assert!(launched_by.is_empty(), "no recorder attached");
                 assert_eq!(sid, ALICE);
                 assert_eq!(destination, "cdn.example");
                 assert_eq!(app, "chrome.exe");
@@ -342,6 +384,113 @@ mod tests {
         center.record(ALICE, &attempt());
 
         assert!(journal.list_pending(ALICE, i64::MAX).is_empty());
+    }
+
+    /// Counts lookups; answers a fixed ancestry.
+    struct CountingLineage {
+        calls: Mutex<Vec<(String, Option<String>, u64)>>,
+    }
+
+    impl ProcessLineagePort for CountingLineage {
+        fn coverage(&self) -> nrr_platform_api::process_lineage::LineageCoverage {
+            nrr_platform_api::process_lineage::LineageCoverage::History
+        }
+
+        fn ancestry_of(&self, image_path: &str, sid: Option<&str>, at: SystemTime) -> Vec<String> {
+            self.calls.lock().unwrap_or_else(|p| p.into_inner()).push((
+                image_path.to_owned(),
+                sid.map(str::to_owned),
+                nrr_platform_api::process_lineage::unix_ms(at),
+            ));
+            vec!["pwsh.exe".into(), "explorer.exe".into()]
+        }
+    }
+
+    fn counting() -> Arc<CountingLineage> {
+        Arc::new(CountingLineage {
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[test]
+    fn ancestry_is_asked_once_per_episode_and_rides_on_the_notice() {
+        let bus = Arc::new(EventBus::new());
+        let sub = bus.subscribe_as("test-client".to_string(), Some(ALICE.to_string()), None);
+        let journal =
+            Arc::new(crate::block_notice_journal_store::InMemoryBlockNoticeJournalStore::new());
+        let center = BlockNoticeCenter::new()
+            .with_event_bus(Arc::clone(&bus))
+            .with_journal(journal.clone());
+        let lineage = counting();
+        center.attach_process_lineage(lineage.clone());
+
+        center.record_observed(ALICE, &attempt(), Some(1_234));
+        center.record_observed(ALICE, &attempt(), Some(1_300));
+        center.record_observed(ALICE, &attempt(), Some(1_400));
+
+        let calls = lineage
+            .calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(
+            calls,
+            vec![("chrome.exe".to_string(), Some(ALICE.to_string()), 1_234)],
+            "one lookup for the episode, anchored at the drop that opened it"
+        );
+        let pending = bus.peek_pending_for(&sub.subscription_id, 10);
+        match &pending[0].event {
+            StatusUpdateEvent::BlockNoticeRaised { launched_by, .. } => {
+                assert_eq!(
+                    launched_by,
+                    &vec!["pwsh.exe".to_string(), "explorer.exe".to_string()]
+                );
+            }
+            other => panic!("expected BlockNoticeRaised, got {other:?}"),
+        }
+        let journalled = journal.list_pending(ALICE, i64::MAX);
+        assert_eq!(journalled[0].notice.launched_by.len(), 2);
+    }
+
+    #[test]
+    fn an_unnamed_program_or_a_muted_episode_is_never_looked_up() {
+        let muted = BlockNoticeCenter::new()
+            .with_mute_loader(Arc::new(|_sid: &str| vec![Mute::forever(MuteScope::All)]));
+        let lineage = counting();
+        muted.attach_process_lineage(lineage.clone());
+        muted.record(ALICE, &attempt());
+
+        let unnamed = BlockNoticeCenter::new();
+        unnamed.attach_process_lineage(lineage.clone());
+        unnamed.record(
+            ALICE,
+            &BlockAttempt {
+                app: None,
+                ..attempt()
+            },
+        );
+
+        assert!(lineage
+            .calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty());
+    }
+
+    #[test]
+    fn an_unknown_owner_is_looked_up_without_a_user() {
+        let center = BlockNoticeCenter::new();
+        let lineage = counting();
+        center.attach_process_lineage(lineage.clone());
+        center.record("", &attempt());
+
+        let calls = lineage
+            .calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, None);
     }
 
     #[test]
