@@ -1,9 +1,5 @@
 //! `SecurityAlertsList` handler.
 //!
-//! Reads alerts directly from `Arc<dyn SecurityAlertsRepository>`
-//! (the SQLite-backed `security_alerts` table) and honours
-//! `state_filter`:
-//!
 //! | `state_filter`      | Returned set                               |
 //! |---------------------|--------------------------------------------|
 //! | `None` / `"open"`   | Active + Acknowledged, newest first        |
@@ -13,14 +9,14 @@
 //! | `"superseded"`      | Superseded only, oldest first              |
 //! | `"all"`             | All states, oldest first across categories |
 //!
-//! When `IpcHandlerDeps::alerts_repo` is `None` (early bring-up), the
-//! handler returns an empty list rather than `Internal` — alerts are a
-//! soft surface and the rest of the GUI keeps painting.
+//! Read through the diagnostics facade, scoped to the audience the service
+//! derives from the connection: an alert about another user's rules reaches a
+//! non-elevated caller only as one entry that names nobody.
 
 use std::sync::Arc;
 
-use nrr_diagnostics::audit::alert::{SecurityAlert, SecurityAlertState, SecurityAlertsRepository};
-use nrr_diagnostics::facade::dto::SecurityAlertDto;
+use nrr_diagnostics::audit::alert::SecurityAlertState;
+use nrr_diagnostics::facade::service::{AlertListFilter, DiagnosticsFacade};
 
 use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
@@ -28,20 +24,17 @@ use crate::ipc::{
 use crate::ipc_handlers::payloads::{SecurityAlertsRequest, SecurityAlertsResponse};
 
 pub struct SecurityAlertsHandler {
-    /// `None` ⇒ handler returns an empty list (early bring-up / no
-    /// state DB available). All four `IpcHandlerDeps` constructions
-    /// must wire this in production.
-    repo: Option<Arc<dyn SecurityAlertsRepository>>,
+    diagnostics: Arc<dyn DiagnosticsFacade>,
 }
 
 impl SecurityAlertsHandler {
-    pub fn new(repo: Option<Arc<dyn SecurityAlertsRepository>>) -> Self {
-        Self { repo }
+    pub fn new(diagnostics: Arc<dyn DiagnosticsFacade>) -> Self {
+        Self { diagnostics }
     }
 }
 
 impl IpcHandler for SecurityAlertsHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let req: SecurityAlertsRequest = if request.payload.is_null() {
             SecurityAlertsRequest::default()
         } else {
@@ -52,23 +45,13 @@ impl IpcHandler for SecurityAlertsHandler {
             })?
         };
 
-        let Some(repo) = self.repo.as_ref() else {
-            return serde_json::to_value(SecurityAlertsResponse { alerts: Vec::new() }).map_err(
-                |e| IpcError {
-                    code: IpcErrorCode::Internal,
-                    message: format!("security.alerts.list serialise failed: {e}"),
-                    diagnostics_id: None,
-                },
-            );
-        };
-
-        let alerts = match req.state_filter.as_deref() {
-            None | Some("") | Some("open") => repo.list_open(),
-            Some("active") => repo.list_by_state(SecurityAlertState::Active),
-            Some("acknowledged") => repo.list_by_state(SecurityAlertState::Acknowledged),
-            Some("resolved") => repo.list_by_state(SecurityAlertState::Resolved),
-            Some("superseded") => repo.list_by_state(SecurityAlertState::Superseded),
-            Some("all") => list_all(repo.as_ref()),
+        let filter = match req.state_filter.as_deref() {
+            None | Some("") | Some("open") => AlertListFilter::Open,
+            Some("active") => AlertListFilter::In(SecurityAlertState::Active),
+            Some("acknowledged") => AlertListFilter::In(SecurityAlertState::Acknowledged),
+            Some("resolved") => AlertListFilter::In(SecurityAlertState::Resolved),
+            Some("superseded") => AlertListFilter::In(SecurityAlertState::Superseded),
+            Some("all") => AlertListFilter::All,
             Some(other) => {
                 return Err(IpcError {
                     code: IpcErrorCode::MalformedRequest,
@@ -76,15 +59,17 @@ impl IpcHandler for SecurityAlertsHandler {
                     diagnostics_id: None,
                 });
             }
-        }
-        .map_err(|e| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("alerts repo query failed: {e}"),
-            diagnostics_id: None,
-        })?;
+        };
+        let alerts = self
+            .diagnostics
+            .list_alerts(filter, &ctx.diagnostics_audience())
+            .map_err(|e| IpcError {
+                code: IpcErrorCode::Internal,
+                message: format!("alerts repo query failed: {e}"),
+                diagnostics_id: None,
+            })?;
 
-        let dto: Vec<SecurityAlertDto> = alerts.into_iter().map(alert_to_dto).collect();
-        serde_json::to_value(SecurityAlertsResponse { alerts: dto }).map_err(|e| IpcError {
+        serde_json::to_value(SecurityAlertsResponse { alerts }).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
             message: format!("security.alerts.list response serialisation failed: {e}"),
             diagnostics_id: None,
@@ -92,41 +77,18 @@ impl IpcHandler for SecurityAlertsHandler {
     }
 }
 
-fn list_all(
-    repo: &dyn SecurityAlertsRepository,
-) -> nrr_diagnostics::error::DiagnosticsResult<Vec<SecurityAlert>> {
-    let mut out = Vec::new();
-    for state in [
-        SecurityAlertState::Active,
-        SecurityAlertState::Acknowledged,
-        SecurityAlertState::Resolved,
-        SecurityAlertState::Superseded,
-    ] {
-        out.extend(repo.list_by_state(state)?);
-    }
-    Ok(out)
-}
-
-fn alert_to_dto(a: SecurityAlert) -> SecurityAlertDto {
-    let requires_action = a.requires_action();
-    SecurityAlertDto {
-        alert_id: a.alert_id,
-        kind: a.kind,
-        state: a.state.as_str().to_string(),
-        created_at: a.created_at,
-        updated_at: a.updated_at,
-        reason_code: a.reason_code,
-        raised_file: a.raised_file,
-        requires_action,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ipc::{IpcOperationClass, IPC_PROTOCOL_VERSION};
-    use nrr_diagnostics::audit::alert::InMemorySecurityAlertsRepository;
+    use crate::production_diagnostics::ProductionDiagnosticsFacade;
+    use nrr_diagnostics::audit::alert::{
+        InMemorySecurityAlertsRepository, SecurityAlert, SecurityAlertsRepository,
+    };
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
+
+    const ALICE: &str = "S-1-5-21-1000-1000-1000-1001";
+    const BOB: &str = "S-1-5-21-1000-1000-1000-1002";
 
     fn sample(id: &str, state: SecurityAlertState) -> SecurityAlert {
         SecurityAlert {
@@ -145,49 +107,83 @@ mod tests {
         }
     }
 
+    fn pointer_alert(principal: &str) -> SecurityAlert {
+        SecurityAlert {
+            kind: "db_tamper_detected".into(),
+            reason_code: "integrity.db_row_hmac_mismatch".into(),
+            ..sample(
+                &format!("alt-dbtamper-pointer:{principal}@abc"),
+                SecurityAlertState::Active,
+            )
+        }
+    }
+
+    fn handler(alerts: &[SecurityAlert]) -> SecurityAlertsHandler {
+        let repo = Arc::new(InMemorySecurityAlertsRepository::new());
+        for alert in alerts {
+            repo.insert(alert).unwrap();
+        }
+        let dir = std::env::temp_dir();
+        SecurityAlertsHandler::new(Arc::new(ProductionDiagnosticsFacade::new(
+            &dir,
+            &dir,
+            None,
+            repo as Arc<dyn SecurityAlertsRepository>,
+            None,
+        )))
+    }
+
+    fn envelope(payload: serde_json::Value) -> IpcRequestEnvelope {
+        IpcRequestEnvelope {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: "r-sa".into(),
+            correlation_id: None,
+            operation: IpcOperationName::SecurityAlertsList,
+            operation_class: IpcOperationClass::ReadSnapshot,
+            confirmation_token: None,
+            payload,
+        }
+    }
+
+    fn caller(principal: Option<&str>, elevated: bool) -> IpcRequestContext {
+        IpcRequestContext {
+            client_profile: IpcClientProfile::GuiInteractive,
+            caller_is_elevated: elevated,
+            caller_principal: principal
+                .and_then(|sid| crate::UserPrincipal::from_windows_sid(sid).ok()),
+            caller_pid: None,
+        }
+    }
+
+    fn dispatch_as(
+        handler: &SecurityAlertsHandler,
+        payload: serde_json::Value,
+        ctx: &IpcRequestContext,
+    ) -> SecurityAlertsResponse {
+        let resp = handler.handle(&envelope(payload), ctx).expect("handler ok");
+        serde_json::from_value(resp).expect("parse response")
+    }
+
     fn dispatch(
         handler: &SecurityAlertsHandler,
         payload: serde_json::Value,
     ) -> SecurityAlertsResponse {
-        let resp = handler
-            .handle(
-                &IpcRequestEnvelope {
-                    protocol_version: IPC_PROTOCOL_VERSION,
-                    request_id: "r-sa".into(),
-                    correlation_id: None,
-                    operation: IpcOperationName::SecurityAlertsList,
-                    operation_class: IpcOperationClass::ReadSnapshot,
-                    confirmation_token: None,
-                    payload,
-                },
-                &IpcRequestContext {
-                    client_profile: IpcClientProfile::GuiInteractive,
-                    caller_is_elevated: false,
-                    caller_principal: None,
-                    caller_pid: None,
-                },
-            )
-            .expect("handler ok");
-        serde_json::from_value(resp).expect("parse response")
+        dispatch_as(handler, payload, &caller(None, false))
     }
 
     #[test]
-    fn no_repo_wired_returns_empty_list() {
-        let h = SecurityAlertsHandler::new(None);
-        let resp = dispatch(&h, serde_json::json!({}));
+    fn an_empty_store_lists_nothing() {
+        let resp = dispatch(&handler(&[]), serde_json::json!({}));
         assert!(resp.alerts.is_empty());
     }
 
     #[test]
     fn open_filter_returns_active_and_acknowledged() {
-        let repo = Arc::new(InMemorySecurityAlertsRepository::new());
-        repo.insert(&sample("a-active", SecurityAlertState::Active))
-            .unwrap();
-        repo.insert(&sample("a-ack", SecurityAlertState::Acknowledged))
-            .unwrap();
-        repo.insert(&sample("a-resolved", SecurityAlertState::Resolved))
-            .unwrap();
-        let h = SecurityAlertsHandler::new(Some(repo as Arc<dyn SecurityAlertsRepository>));
+        let h = handler(&[
+            sample("a-active", SecurityAlertState::Active),
+            sample("a-ack", SecurityAlertState::Acknowledged),
+            sample("a-resolved", SecurityAlertState::Resolved),
+        ]);
         let resp = dispatch(&h, serde_json::json!({}));
         assert_eq!(resp.alerts.len(), 2);
         assert!(resp
@@ -198,12 +194,10 @@ mod tests {
 
     #[test]
     fn state_filter_active_returns_only_active() {
-        let repo = Arc::new(InMemorySecurityAlertsRepository::new());
-        repo.insert(&sample("a-1", SecurityAlertState::Active))
-            .unwrap();
-        repo.insert(&sample("a-2", SecurityAlertState::Acknowledged))
-            .unwrap();
-        let h = SecurityAlertsHandler::new(Some(repo as Arc<dyn SecurityAlertsRepository>));
+        let h = handler(&[
+            sample("a-1", SecurityAlertState::Active),
+            sample("a-2", SecurityAlertState::Acknowledged),
+        ]);
         let resp = dispatch(&h, serde_json::json!({"state-filter": "active"}));
         assert_eq!(resp.alerts.len(), 1);
         assert_eq!(resp.alerts[0].alert_id, "a-1");
@@ -211,43 +205,61 @@ mod tests {
 
     #[test]
     fn state_filter_all_returns_every_state() {
-        let repo = Arc::new(InMemorySecurityAlertsRepository::new());
-        repo.insert(&sample("a-1", SecurityAlertState::Active))
-            .unwrap();
-        repo.insert(&sample("a-2", SecurityAlertState::Acknowledged))
-            .unwrap();
-        repo.insert(&sample("a-3", SecurityAlertState::Resolved))
-            .unwrap();
-        repo.insert(&sample("a-4", SecurityAlertState::Superseded))
-            .unwrap();
-        let h = SecurityAlertsHandler::new(Some(repo as Arc<dyn SecurityAlertsRepository>));
+        let h = handler(&[
+            sample("a-1", SecurityAlertState::Active),
+            sample("a-2", SecurityAlertState::Acknowledged),
+            sample("a-3", SecurityAlertState::Resolved),
+            sample("a-4", SecurityAlertState::Superseded),
+        ]);
         let resp = dispatch(&h, serde_json::json!({"state-filter": "all"}));
         assert_eq!(resp.alerts.len(), 4);
     }
 
     #[test]
     fn unknown_state_filter_returns_malformed_request() {
-        let repo = Arc::new(InMemorySecurityAlertsRepository::new());
-        let h = SecurityAlertsHandler::new(Some(repo as Arc<dyn SecurityAlertsRepository>));
-        let err = h
+        let err = handler(&[])
             .handle(
-                &IpcRequestEnvelope {
-                    protocol_version: IPC_PROTOCOL_VERSION,
-                    request_id: "r-sa".into(),
-                    correlation_id: None,
-                    operation: IpcOperationName::SecurityAlertsList,
-                    operation_class: IpcOperationClass::ReadSnapshot,
-                    confirmation_token: None,
-                    payload: serde_json::json!({"state-filter": "bogus"}),
-                },
-                &IpcRequestContext {
-                    client_profile: IpcClientProfile::GuiInteractive,
-                    caller_is_elevated: false,
-                    caller_principal: None,
-                    caller_pid: None,
-                },
+                &envelope(serde_json::json!({"state-filter": "bogus"})),
+                &caller(None, false),
             )
             .unwrap_err();
         assert_eq!(err.code, IpcErrorCode::MalformedRequest);
+    }
+
+    /// The audience comes from the connection: an ordinary user sees their own
+    /// row's alert and the machine's, and another user's only as an entry that
+    /// names nobody; an administrator sees every alert as stored.
+    #[test]
+    fn another_users_alert_reaches_a_user_without_their_sid() {
+        let h = handler(&[
+            sample("alt-audit-1", SecurityAlertState::Active),
+            pointer_alert(ALICE),
+            pointer_alert(BOB),
+        ]);
+        for state_filter in ["open", "active", "all"] {
+            let payload = serde_json::json!({ "state-filter": state_filter });
+            let alice = dispatch_as(&h, payload.clone(), &caller(Some(ALICE), false));
+            let mut ids: Vec<&str> = alice.alerts.iter().map(|a| a.alert_id.as_str()).collect();
+            ids.sort_unstable();
+            let own = format!("alt-dbtamper-pointer:{ALICE}@abc");
+            assert_eq!(
+                ids,
+                [
+                    "alt-audit-1",
+                    own.as_str(),
+                    crate::alert_audience::OTHER_PRINCIPAL_ALERT_ID,
+                ],
+                "{state_filter}"
+            );
+            let wire = serde_json::to_string(&alice).unwrap();
+            assert!(!wire.contains(BOB), "{state_filter}: {wire}");
+
+            let admin = dispatch_as(&h, payload, &caller(Some(ALICE), true));
+            assert_eq!(admin.alerts.len(), 3, "{state_filter}");
+            assert!(
+                admin.alerts.iter().any(|a| a.alert_id.contains(BOB)),
+                "{state_filter}"
+            );
+        }
     }
 }

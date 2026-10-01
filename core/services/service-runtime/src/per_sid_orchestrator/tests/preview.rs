@@ -26,7 +26,7 @@ fn a_preview_publishes_nothing_about_the_live_policy() {
     .with_shared_ip_exemption_status(shared_status.clone())
     // Secondary unresolved → the compute would arm fail-closed, latch the
     // posture and ask for a re-resolve. A preview must do none of it.
-    .with_kill_switch_resolver(Arc::new(|_| None))
+    .with_kill_switch_resolver(Arc::new(|_, _| None))
     .with_rebind_requests(Arc::clone(&requests));
     source.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
     let candidate = rules_with_one_app("nowhere.exe");

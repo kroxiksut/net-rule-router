@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use nrr_platform_api::service_control::{
     ServiceControlError, ServiceControlPort, ServiceInstallSpec, ServiceStartMode,
-    ServiceStatusReport, ServiceUninstallSpec,
+    ServiceStatusReport, ServiceUninstallReport, ServiceUninstallSpec,
 };
 use nrr_shared::product_identity::{BinaryRole, PRODUCT_NAME};
 
@@ -37,6 +37,7 @@ use parse::Command;
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() -> ExitCode {
+    platform::restrict_dll_search();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // An elevated copy of ourselves, running the real command on behalf of the
@@ -178,18 +179,7 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                         }
                     );
                     println!("  your rule files:   kept");
-                    // Removal is when a wedged install gets removed, so say out
-                    // loud whether the machine was handed back clean: a leftover
-                    // filter set or DNS redirect means no traffic and no product
-                    // left to fix it.
-                    match report.machine_state_cleared {
-                        Some(true) => println!("  network state:     restored"),
-                        Some(false) => println!(
-                            "  network state:     NOT fully restored — run `{exe} \
-reset-network` elevated, or reboot"
-                        ),
-                        None => {}
-                    }
+                    print_network_state(&report, exe);
                     exit::SUCCESS
                 }
                 Err(err) => report_failure(
@@ -240,9 +230,22 @@ reset-network` elevated, or reboot"
             };
             let previous = port.query().ok().flatten();
             let start_mode = previous.as_ref().and_then(|report| report.start_mode);
-            if previous.is_some() {
-                if let Err(err) = port.uninstall(&ServiceUninstallSpec::keep_data()) {
-                    return report_failure("reinstall", &err, ctx, "reinstall");
+            let removed_old_registration = previous.is_some();
+            if removed_old_registration {
+                match port.uninstall(&ServiceUninstallSpec::keep_data()) {
+                    Ok(removed) => {
+                        println!("Removed the old {PRODUCT_NAME} registration.");
+                        print_network_state(&removed, exe);
+                        // The manager deletes a registration only once its process
+                        // has exited; installing now would race `MARKED_FOR_DELETE`,
+                        // so stop here rather than hand back a confusing install
+                        // failure.
+                        if removed.machine_state_cleared == Some(false) {
+                            eprintln!("{}", unfinished_removal_install_hint(exe));
+                            return exit::FAILED;
+                        }
+                    }
+                    Err(err) => return report_failure("reinstall", &err, ctx, "reinstall"),
                 }
             }
             let mut spec = ServiceInstallSpec::production_defaults(binary_path);
@@ -252,10 +255,7 @@ reset-network` elevated, or reboot"
                 spec.start_mode = mode;
             }
             if let Err(err) = port.install(&spec) {
-                eprintln!(
-                    "The old registration was removed but the new one failed — \
-                     the service is NOT registered right now."
-                );
+                eprintln!("{}", install_failure_hint(removed_old_registration));
                 return report_failure("reinstall", &err, ctx, "reinstall");
             }
             println!("Re-registered the {PRODUCT_NAME} service.");
@@ -276,6 +276,47 @@ reset-network` elevated, or reboot"
                 Err(err) => report_failure("reinstall", &err, ctx, "start"),
             }
         }),
+    }
+}
+
+/// Removal is when a wedged install gets removed, so say out loud whether the
+/// machine was handed back clean: a leftover filter set or DNS redirect means
+/// no traffic and no product left to fix it.
+fn print_network_state(report: &ServiceUninstallReport, exe: &str) {
+    if let Some(line) = network_state_line(report, exe) {
+        println!("{line}");
+    }
+}
+
+fn network_state_line(report: &ServiceUninstallReport, exe: &str) -> Option<String> {
+    match report.machine_state_cleared {
+        Some(true) => Some("  network state:     restored".to_string()),
+        Some(false) => Some(format!(
+            "  network state:     NOT fully restored — run `{exe} reset-network` elevated, or reboot"
+        )),
+        None => None,
+    }
+}
+
+/// `reinstall` points here instead of attempting `install`: the manager has
+/// not freed the old registration yet, and trying now only trades a clear
+/// message for a confusing `MARKED_FOR_DELETE` failure.
+fn unfinished_removal_install_hint(exe: &str) -> String {
+    format!(
+        "The old service had not finished stopping. Once it has, or after a \
+         reboot, run: {exe} install"
+    )
+}
+
+/// What to tell the operator when `install` fails inside `reinstall` —
+/// wording depends on whether there was an old registration to blame for
+/// the machine's current unregistered state.
+fn install_failure_hint(removed_old_registration: bool) -> &'static str {
+    if removed_old_registration {
+        "The old registration was removed but the new one failed — \
+         the service is NOT registered right now."
+    } else {
+        "Registration failed — the service is NOT registered."
     }
 }
 
@@ -476,10 +517,9 @@ fn read_reset_run(run: &std::io::Result<Option<i32>>) -> ResetRun {
         Ok(Some(code)) if *code == i32::from(exit::NEEDS_PRIVILEGE) => ResetRun::NeedsPrivilege,
         Ok(Some(code)) => ResetRun::Unfinished(format!("exit code {code}")),
         Ok(None) => ResetRun::Unfinished("terminated by a signal".to_string()),
-        // Windows refuses to start a binary that demands elevation
-        // (`ERROR_ELEVATION_REQUIRED`) rather than letting it fail, so the
-        // refusal can arrive here instead of as an exit code.
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => ResetRun::NeedsPrivilege,
+        // A binary whose manifest demands elevation is refused before it runs,
+        // so the refusal arrives here instead of as an exit code.
+        Err(err) if platform::is_elevation_refusal(err) => ResetRun::NeedsPrivilege,
         Err(err) => ResetRun::NotStarted(err.to_string()),
     }
 }
@@ -570,8 +610,6 @@ mod tests {
     fn a_refused_reset_becomes_the_consoles_privilege_code() {
         let refused = Ok(Some(i32::from(exit::NEEDS_PRIVILEGE)));
         assert_eq!(read_reset_run(&refused), ResetRun::NeedsPrivilege);
-        let unstartable = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        assert_eq!(read_reset_run(&unstartable), ResetRun::NeedsPrivilege);
         // The exit code `main` retries on and a script reads.
         assert_eq!(
             needs_elevation(
@@ -580,6 +618,23 @@ mod tests {
                 "reset-network --confirm"
             ),
             exit::NEEDS_PRIVILEGE
+        );
+    }
+
+    /// The OS refusing to start an image that demands elevation is a question
+    /// of privilege; a file this user cannot run at all is a broken install,
+    /// and elevating would only hide it.
+    #[test]
+    fn only_an_elevation_refusal_to_start_is_a_privilege_question() {
+        let not_runnable = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(matches!(
+            read_reset_run(&not_runnable),
+            ResetRun::NotStarted(_)
+        ));
+        #[cfg(windows)]
+        assert_eq!(
+            read_reset_run(&Err(std::io::Error::from_raw_os_error(740))),
+            ResetRun::NeedsPrivilege
         );
     }
 
@@ -595,6 +650,41 @@ mod tests {
             read_reset_run(&Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
             ResetRun::NotStarted(_)
         ));
+    }
+
+    /// `uninstall` and `reinstall` share this line: a removal that could not
+    /// stop the service must point at the reset rather than stay silent.
+    #[test]
+    fn an_unfinished_removal_names_the_reset() {
+        let report = |cleared| ServiceUninstallReport {
+            data_removed: false,
+            machine_state_cleared: cleared,
+        };
+        let unfinished = network_state_line(&report(Some(false)), "nrr-cli").unwrap_or_default();
+        assert!(unfinished.contains("nrr-cli reset-network"), "{unfinished}");
+        assert_eq!(
+            network_state_line(&report(Some(true)), "nrr-cli").as_deref(),
+            Some("  network state:     restored")
+        );
+        assert_eq!(network_state_line(&report(None), "nrr-cli"), None);
+    }
+
+    /// `reinstall` reads this text, not `install`'s failure branch, once the
+    /// old registration is still mid-removal — it must never send the
+    /// operator to install while the manager would still refuse it.
+    #[test]
+    fn unfinished_removal_hint_names_install_not_reinstall() {
+        let hint = unfinished_removal_install_hint("nrr-cli");
+        assert!(hint.contains("nrr-cli install"), "{hint}");
+        assert!(!hint.contains("reinstall"), "{hint}");
+    }
+
+    /// `reinstall` must never claim a removal happened when there was
+    /// nothing registered to remove.
+    #[test]
+    fn install_failure_hint_only_blames_a_removal_that_happened() {
+        assert!(install_failure_hint(true).contains("removed"));
+        assert!(!install_failure_hint(false).contains("removed"));
     }
 
     #[test]

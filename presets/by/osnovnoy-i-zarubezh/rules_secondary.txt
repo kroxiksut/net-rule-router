@@ -57,7 +57,6 @@ redd.it  # Discord and community platforms
 *.sc-cdn.net  # Professional and streaming social platforms
 *.bsky.app  # Professional and streaming social platforms
 *.medium.com  # Publishing platform
-*.meduza.io  # Independent news outlet
 
 *.telegram.org  # Foreign messengers and communication tools
 *.t.me  # Foreign messengers and communication tools
@@ -124,9 +123,6 @@ api.jetbrains.ai  # JetBrains ecosystem
 *.jetbrains.space  # JetBrains ecosystem
 *.toolbox.app  # JetBrains ecosystem
 
-*.rutracker.org  # Torrent trackers
-*.rutracker.cc  # Torrent trackers
-
 *.coursera.org  # Developer and IT services measured as unreachable from this country
 *.gitlab.com  # Developer and IT services measured as unreachable from this country
 *.intel.com  # Developer and IT services measured as unreachable from this country
@@ -145,16 +141,16 @@ WhatsAp*.exe  # Messaging and social apps
 discord.exe  # Messaging and social apps
 signal.exe  # Messaging and social apps
 viber.exe  # Messaging and social apps
-line.exe  # Messaging and social apps
+# line.exe    # LINE: имя процесса слишком общее, проверьте у себя
 skype.exe  # Messaging and social apps
 zoom.exe  # Messaging and social apps
 slack.exe  # Messaging and social apps
-teams.exe  # Messaging and social apps
+# teams.exe    # Microsoft Teams: имя процесса слишком общее, проверьте у себя
 wechat.exe  # Messaging and social apps
 
 chatgpt.exe  # AI desktop wrappers and launchers (common names)
 claude.exe  # AI desktop wrappers and launchers (common names)
-poe.exe  # AI desktop wrappers and launchers (common names)
+# poe.exe    # Poe: имя процесса слишком общее, проверьте у себя
 codex.exe  # AI desktop wrappers and launchers (common names)
 codex*.exe  # AI desktop wrappers and launchers (common names)
 Cursor.exe  # AI desktop wrappers and launchers (common names)
@@ -183,8 +179,8 @@ dataspell.exe  # JetBrains IDE and tooling apps
 dataspell64.exe  # JetBrains IDE and tooling apps
 aqua.exe  # JetBrains IDE and tooling apps
 aqua64.exe  # JetBrains IDE and tooling apps
-gateway.exe  # JetBrains IDE and tooling apps
-gateway64.exe  # JetBrains IDE and tooling apps
+# gateway.exe    # JetBrains Gateway: имя процесса слишком общее, проверьте у себя
+# gateway64.exe    # JetBrains Gateway: имя процесса слишком общее, проверьте у себя
 fleet.exe  # JetBrains IDE and tooling apps
 mps.exe  # JetBrains IDE and tooling apps
 MaintenanceTool.exe  # Qt installer and updater (Qt account and downloads are refused from this country)

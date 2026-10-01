@@ -9,9 +9,9 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use rusqlite::{Connection, ErrorCode};
+use rusqlite::Connection;
 
 use crate::error::{SidecarError, SidecarResult};
 use crate::migration::{self, MigrationSummary};
@@ -182,39 +182,17 @@ fn restrict_db_to_owner(path: &Path) {
 /// the value is read back to guard against silent filesystem-level
 /// downgrades.
 fn configure_pragmas(conn: &Connection, path: &Path) -> SidecarResult<()> {
-    conn.busy_timeout(BUSY_TIMEOUT)?;
-    let mode = enable_wal(conn)?;
-    if mode != "wal" {
-        return Err(SidecarError::Environment {
-            reason: format!(
-                "WAL mode not supported at {} (returned journal_mode = {mode:?})",
-                path.display()
-            ),
-        });
-    }
-    // Same as the service store, so the schema's foreign keys mean the same
-    // thing in both databases.
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    Ok(())
-}
-
-/// Switch to WAL, retrying on `SQLITE_BUSY` within [`BUSY_TIMEOUT`].
-///
-/// Converting a fresh file needs an exclusive lock and SQLite answers BUSY
-/// without consulting the busy handler — so when the GUI and the tray open a
-/// new sidecar in the same instant, the loser failed outright.
-fn enable_wal(conn: &Connection) -> SidecarResult<String> {
-    let deadline = Instant::now() + BUSY_TIMEOUT;
-    loop {
-        match conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)) {
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == ErrorCode::DatabaseBusy && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(10));
+    nrr_sqlite_support::configure_connection(conn, BUSY_TIMEOUT).map_err(|e| match e {
+        nrr_sqlite_support::ConnectionError::Sqlite(e) => SidecarError::Sqlite(e),
+        nrr_sqlite_support::ConnectionError::WalUnsupported { journal_mode } => {
+            SidecarError::Environment {
+                reason: format!(
+                    "WAL mode not supported at {} (returned journal_mode = {journal_mode:?})",
+                    path.display()
+                ),
             }
-            other => return Ok(other?),
         }
-    }
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

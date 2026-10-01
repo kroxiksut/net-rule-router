@@ -57,7 +57,7 @@ Rectangle {
             ThemedButton {
                 theme: root.uiTheme
                 flat: true
-                text: root.uiRevision >= 0 ? root.tr("notifications.dismiss", "Dismiss") : ""
+                text: root.uiRevision >= 0 ? root.tr("action.dismiss", "Dismiss") : ""
                 onClicked: banner.dismissed()
                 Accessible.name: text
             }

@@ -222,7 +222,7 @@ fn empty_sid_load_returns_default_record() {
     assert_eq!(r.mode, BehaviorMode::PreferPrimary);
     assert!(
         r.block_secondary_when_unavailable,
-        "leak-guard must default ON (block 16.HW-0702) so an un-configured \
+        "leak-guard must default ON so an un-configured \
              SID never leaks secondary-bound traffic to the primary link"
     );
     assert!(
@@ -231,7 +231,7 @@ fn empty_sid_load_returns_default_record() {
     );
     assert!(
         r.allow_dns_over_primary,
-        "DNS-over-primary must default ON (block 16.HW-0716 P1b) — a \
+        "DNS-over-primary must default ON — a \
              DNS-cut block-all is a total blackout and the FQDN cache never fills"
     );
     assert_eq!(r.binding_source, BindingSource::UserAssigned);
@@ -246,6 +246,29 @@ fn update_then_load_round_trips_full_record() {
         .expect("update");
     let loaded = repo.load_for_sid("S-1-5-21-A").expect("load");
     assert_eq!(loaded, rec);
+}
+
+/// The column admits `0` ("every box unticked") and `64` ("Other" alone):
+/// both read as on while blocking nothing, so they are read back as every
+/// protocol. A real selection is kept.
+#[test]
+fn a_stored_protocol_mask_that_selects_nothing_reads_as_every_protocol() {
+    let (_dir, conn) = fresh_db();
+    let repo = RouteBindingsRepository::new(&conn);
+    for (stored, read) in [
+        (0u16, KILL_SWITCH_PROTOCOLS_ALL),
+        (0x40, KILL_SWITCH_PROTOCOLS_ALL),
+        (0x05, 0x05),
+    ] {
+        let rec = RoutePolicyRecord {
+            kill_switch_protocols: stored,
+            ..sample_record(BindingSource::UserAssigned)
+        };
+        repo.update_for_sid("S-1-5-21-A", &rec, 1_700_000_000)
+            .expect("update");
+        let loaded = repo.load_for_sid("S-1-5-21-A").expect("load");
+        assert_eq!(loaded.kill_switch_protocols, read, "{stored:#x}");
+    }
 }
 
 /// A setting the user turned on has to survive the service restart that
@@ -412,7 +435,7 @@ fn heal_binding_identity_unions_old_and_new_ids() {
     let mut rec = sample_record(BindingSource::UserAssigned);
     rec.secondary = Some(secondary_binding(
         "win-adapter:{guid-a}",
-        "swiftvpn VPN OpenVPN Adapter",
+        "examplevpn VPN OpenVPN Adapter",
     ));
     repo.update_for_sid("S", &rec, 1).unwrap();
 
@@ -421,14 +444,14 @@ fn heal_binding_identity_unions_old_and_new_ids() {
         "S",
         "secondary",
         "win-adapter:{guid-b}",
-        "SwiftVPN 3.0 OpenVPN Adapter",
+        "ExampleVPN 3.0 OpenVPN Adapter",
         2,
     )
     .unwrap();
 
     let s = repo.load_for_sid("S").unwrap().secondary.unwrap();
     assert_eq!(s.stable_id, "win-adapter:{guid-b}");
-    assert_eq!(s.display_name, "SwiftVPN 3.0 OpenVPN Adapter");
+    assert_eq!(s.display_name, "ExampleVPN 3.0 OpenVPN Adapter");
     assert!(s
         .known_stable_ids
         .contains(&"win-adapter:{guid-a}".to_string()));

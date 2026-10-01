@@ -33,6 +33,10 @@ use nrr_storage::{
     SqliteTrafficStore, StorageResult, TrafficCursorRow, TrafficDayRow, TrafficTotalRow,
 };
 
+/// How stale an adapter's persisted `last_seen` may grow while its name holds.
+/// Far inside the history-merge handover window, far above the 2 s tick.
+const IDENTITY_REFRESH_MS: i64 = 60_000;
+
 /// Per-adapter session accumulator (since the additional adapter's current
 /// session began).
 #[derive(Clone, Debug)]
@@ -68,6 +72,11 @@ pub struct TrafficSampler {
     /// means the session rows are a frozen snapshot of the last session (or
     /// empty when none happened yet).
     session_active: bool,
+    /// What each adapter's identity row holds: name and when it was written.
+    identity_written: HashMap<String, (String, i64)>,
+    /// What each adapter's cursor row holds; an idle adapter's cursor is not
+    /// rewritten.
+    cursors_written: HashMap<String, (u64, u64)>,
 }
 
 impl TrafficSampler {
@@ -79,8 +88,10 @@ impl TrafficSampler {
         store: SqliteTrafficStore,
     ) -> StorageResult<Self> {
         let mut accountant = TrafficAccountant::new();
+        let mut cursors_written = HashMap::new();
         for c in store.all_cursors()? {
             accountant.prime(&c.adapter_key, c.last_in, c.last_out);
+            cursors_written.insert(c.adapter_key, (c.last_in, c.last_out));
         }
         Ok(Self {
             source,
@@ -88,6 +99,8 @@ impl TrafficSampler {
             accountant,
             session: HashMap::new(),
             session_active: false,
+            identity_written: HashMap::new(),
+            cursors_written,
         })
     }
 
@@ -140,8 +153,7 @@ impl TrafficSampler {
             let Some(category) = categorize(facts, roles, toggles) else {
                 continue;
             };
-            self.store
-                .upsert_identity(&c.stable_name, &c.display_name, now_ms)?;
+            self.refresh_identity(&c.stable_name, &c.display_name, now_ms)?;
             named_samples.push((
                 c.display_name.clone(),
                 TrafficSample {
@@ -214,20 +226,50 @@ impl TrafficSampler {
             }
         }
 
-        // Persist resume-safe cursors for the adapters sampled this tick.
+        // Persist resume-safe cursors for the adapters sampled this tick. Only
+        // the ones that moved: a restart primes from the row either way.
         let cursors: Vec<TrafficCursorRow> = samples
             .iter()
             .filter_map(|s| {
-                self.accountant
-                    .cursor(&s.stable_name)
-                    .map(|(last_in, last_out)| TrafficCursorRow {
+                let cursor = self.accountant.cursor(&s.stable_name)?;
+                (self.cursors_written.get(&s.stable_name) != Some(&cursor)).then(|| {
+                    TrafficCursorRow {
                         adapter_key: s.stable_name.clone(),
-                        last_in,
-                        last_out,
-                    })
+                        last_in: cursor.0,
+                        last_out: cursor.1,
+                    }
+                })
             })
             .collect();
         self.store.set_cursors(&cursors, now_ms)?;
+        for c in cursors {
+            self.cursors_written
+                .insert(c.adapter_key, (c.last_in, c.last_out));
+        }
+        Ok(())
+    }
+
+    /// Upsert the identity row when the name changed or `last_seen` has aged
+    /// past [`IDENTITY_REFRESH_MS`], not on every tick.
+    fn refresh_identity(
+        &mut self,
+        adapter_key: &str,
+        display_name: &str,
+        now_ms: i64,
+    ) -> StorageResult<()> {
+        let current = self
+            .identity_written
+            .get(adapter_key)
+            .is_some_and(|(name, at)| {
+                name == display_name && now_ms.saturating_sub(*at) < IDENTITY_REFRESH_MS
+            });
+        if current {
+            return Ok(());
+        }
+        self.store
+            .upsert_identity(adapter_key, display_name, now_ms)?;
+        self.identity_written
+            .insert(adapter_key.to_string(), (display_name.to_string(), now_ms));
         Ok(())
     }
 
@@ -347,6 +389,8 @@ impl TrafficSampler {
     pub fn clear(&mut self) -> StorageResult<()> {
         self.session.clear();
         self.accountant = TrafficAccountant::new();
+        self.identity_written.clear();
+        self.cursors_written.clear();
         self.store.clear()
     }
 }
@@ -710,6 +754,71 @@ mod tests {
         let rows = sampler.today_totals(1).expect("totals");
         assert_eq!(rows.len(), 1, "only the primary is counted");
         assert_eq!(rows[0].role, "primary");
+    }
+
+    /// `(last_seen, sampled_at)` as the database holds them, read over a
+    /// second connection.
+    fn persisted_stamps(dir: &tempfile::TempDir, key: &str) -> (i64, i64) {
+        let conn = open_connection(&dir.path().join("nrr_traffic_stats.db")).expect("reopen");
+        let last_seen = conn
+            .query_row(
+                "SELECT last_seen FROM interface_identity WHERE adapter_key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .expect("identity row");
+        let sampled_at = conn
+            .query_row(
+                "SELECT sampled_at FROM interface_counter_cursor WHERE adapter_key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .expect("cursor row");
+        (last_seen, sampled_at)
+    }
+
+    /// An idle adapter on a 2 s tick must not be rewritten each time: the
+    /// identity row only when its name changes or `last_seen` ages out, the
+    /// cursor only when the counters move.
+    #[test]
+    fn an_idle_adapter_is_not_rewritten_every_tick() {
+        let dir = tempfile::tempdir().expect("dir");
+        let src = Arc::new(MockInterfaceCounterSource::new());
+        let mut sampler = TrafficSampler::new(
+            Arc::clone(&src) as Arc<dyn InterfaceCounterSource>,
+            open_store(&dir),
+        )
+        .expect("new");
+        let eth = |in_o, out_o| counters("Ethernet", InterfaceType::Ethernet, false, in_o, out_o);
+        let tick = |sampler: &mut TrafficSampler, now_ms| {
+            sampler
+                .tick(Some("Ethernet"), None, all_on(), 5, now_ms)
+                .expect("tick");
+        };
+
+        src.set(vec![eth(1000, 500)]);
+        tick(&mut sampler, 1_000);
+        tick(&mut sampler, 3_000);
+        assert_eq!(persisted_stamps(&dir, "Ethernet"), (1_000, 1_000));
+
+        // Positive controls: moving counters rewrite the cursor, an aged
+        // `last_seen` is refreshed, and a rename lands at once.
+        src.set(vec![eth(1500, 700)]);
+        tick(&mut sampler, 5_000);
+        assert_eq!(persisted_stamps(&dir, "Ethernet"), (1_000, 5_000));
+        tick(&mut sampler, 1_000 + IDENTITY_REFRESH_MS);
+        assert_eq!(
+            persisted_stamps(&dir, "Ethernet"),
+            (1_000 + IDENTITY_REFRESH_MS, 5_000)
+        );
+        src.set(vec![InterfaceCounters {
+            display_name: "Ethernet 2".to_string(),
+            ..eth(1500, 700)
+        }]);
+        tick(&mut sampler, 3_000 + IDENTITY_REFRESH_MS);
+        let sightings = sampler.key_sightings().expect("sightings");
+        assert_eq!(sightings[0].display_name, "Ethernet 2");
+        assert_eq!(sightings[0].last_seen_ms, 3_000 + IDENTITY_REFRESH_MS);
     }
 
     #[test]

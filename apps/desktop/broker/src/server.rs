@@ -16,7 +16,7 @@
 
 #![cfg(target_os = "windows")]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,13 +31,13 @@ use nrr_platform_windows::trusted_location::{first_reparse_point, owner_is_trust
 
 use crate::log_location::{log_dir_refusal, PathFact};
 use crate::protocol::{
-    relay_timeout, BrokerRequest, BrokerResponse, BrokerServerArgs, BROKER_PING,
-    BROKER_SERVICE_CONTROL, BROKER_SHUTDOWN, SERVICE_CONTROL_BUDGET,
+    relay_timeout, BrokerRequest, BrokerResponse, BrokerServerArgs, ANSWER_MARGIN, BROKER_PING,
+    BROKER_SERVICE_CONTROL, BROKER_SHUTDOWN, MAX_FORWARD_TIMEOUT, SERVICE_CONTROL_BUDGET,
 };
 use crate::spawn::read_and_delete_token_file;
 use crate::windows_sys::{
     accept_with_parent_watch, client_process_id, create_owner_restricted_pipe,
-    disconnect_and_close, open_parent_process, pipe_client_user_sid, AcceptResult, PipeIo,
+    disconnect_and_close, open_parent_process, pipe_client_user_sid, AcceptResult, NoFlush, PipeIo,
 };
 
 /// How long to wait at startup for the privileged service client to reach
@@ -46,6 +46,12 @@ use crate::windows_sys::{
 /// service is up; this just lets our own client finish its handshake so the
 /// first forwarded mutation finds a live connection.
 const SERVICE_CONNECT_WAIT: Duration = Duration::from_secs(3);
+
+/// How long one connection may spend reading its request, and separately
+/// taking its answer. The broker serves on one thread: a client that goes
+/// quiet would otherwise hold it, and a revoke queued behind it, for good.
+const CONNECTION_IO_BUDGET: Duration =
+    Duration::from_secs(MAX_FORWARD_TIMEOUT.as_secs() + ANSWER_MARGIN.as_secs());
 
 enum Served {
     Continue,
@@ -573,11 +579,24 @@ fn serve_connection(
             return Served::Continue;
         }
     };
+    exchange(&mut io, nonce, CONNECTION_IO_BUDGET, |request| {
+        dispatch(request, service, started)
+    })
+}
 
-    let request: BrokerRequest = match read_frame(&mut io) {
+/// One request, one answer, each I/O phase bounded by `budget`. The work in
+/// between is not: `handle` carries its own bound.
+fn exchange(
+    io: &mut PipeIo,
+    nonce: &str,
+    budget: Duration,
+    handle: impl FnOnce(&BrokerRequest) -> (BrokerResponse, Served),
+) -> Served {
+    io.set_deadline(Instant::now() + budget);
+    let request: BrokerRequest = match read_frame(io) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[nrr-broker] reject: malformed request frame: {e}");
+            eprintln!("[nrr-broker] reject: no request frame: {e}");
             return Served::Continue;
         }
     };
@@ -585,20 +604,42 @@ fn serve_connection(
     // Owner check #3 — the session nonce. A mismatch is the signal that a
     // same-user process tried to drive the standing elevated channel
     // without the secret only the spawning launcher holds.
-    if request.nonce != nonce {
+    let (response, outcome) = if request.nonce == nonce {
+        handle(&request)
+    } else {
         eprintln!("[nrr-broker] reject: nonce mismatch");
-        let _ = write_frame(
-            &mut io,
-            &BrokerResponse::err("unauthorized", "bad session token"),
-        );
-        return Served::Continue;
-    }
+        (
+            BrokerResponse::err("unauthorized", "bad session token"),
+            Served::Continue,
+        )
+    };
 
-    let (response, outcome) = dispatch(&request, service, started);
-    if let Err(e) = write_frame(&mut io, &response) {
-        eprintln!("[nrr-broker] response write failed: {e}");
-    }
+    io.set_deadline(Instant::now() + budget);
+    deliver(io, &response);
     outcome
+}
+
+/// Writes the answer and waits for the client to hang up. Hanging up proves
+/// the answer was read before the instance is disconnected (which discards
+/// unread bytes), and unlike `FlushFileBuffers` the wait has a deadline.
+fn deliver(io: &mut PipeIo, response: &BrokerResponse) {
+    if let Err(e) = write_frame(&mut NoFlush(io), response) {
+        eprintln!("[nrr-broker] response write failed: {e}");
+        return;
+    }
+    let mut scratch = [0u8; 64];
+    loop {
+        match io.read(&mut scratch) {
+            Ok(0) => return,
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                eprintln!("[nrr-broker] client kept the connection open after its answer");
+                return;
+            }
+            // Broken pipe: the client has closed its end.
+            Err(_) => return,
+        }
+    }
 }
 
 fn dispatch(
@@ -868,6 +909,175 @@ install failed: no PROGRAMDATA
             refused.is_err(),
             "a directory an ordinary account owns must not take elevated writes"
         );
+    }
+
+    mod connection_budget {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use nrr_ipc_client::wire::{read_frame, write_frame};
+
+        use super::super::{exchange, Served};
+        use crate::protocol::{BrokerRequest, BrokerResponse, BROKER_PING, BROKER_SHUTDOWN};
+        use crate::windows_sys::{
+            accept_with_parent_watch, connect_pipe, create_owner_restricted_pipe,
+            current_process_user_sid, disconnect_and_close, open_parent_process, AcceptResult,
+            NoFlush, OwnedHandle, PipeIo,
+        };
+
+        const NONCE: &str = "budget-nonce";
+
+        /// Serves `connections` in turn the way the broker's accept loop does,
+        /// reporting whether each retired the broker and how long it held the
+        /// thread.
+        fn serve(
+            name: &str,
+            budget: Duration,
+            work: Duration,
+            connections: usize,
+        ) -> (thread::JoinHandle<()>, mpsc::Receiver<(bool, Duration)>) {
+            let sid = current_process_user_sid().expect("own sid");
+            let name = name.to_string();
+            let (tx, rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let parent = open_parent_process(std::process::id()).expect("parent self");
+                let mut pending = create_owner_restricted_pipe(&name, &sid, true).expect("pipe");
+                for _ in 0..connections {
+                    assert!(matches!(
+                        accept_with_parent_watch(pending.raw(), parent.raw()),
+                        AcceptResult::Connected
+                    ));
+                    let next = create_owner_restricted_pipe(&name, &sid, false).expect("next");
+                    let mut io = PipeIo::new(pending.raw()).expect("server io");
+                    let started = Instant::now();
+                    let outcome = exchange(&mut io, NONCE, budget, |request| {
+                        thread::sleep(work);
+                        let served = if request.operation == BROKER_SHUTDOWN {
+                            Served::Shutdown
+                        } else {
+                            Served::Continue
+                        };
+                        (
+                            BrokerResponse::ok(serde_json::json!(request.operation)),
+                            served,
+                        )
+                    });
+                    drop(io);
+                    disconnect_and_close(pending.into_raw());
+                    pending = next;
+                    let _ = tx.send((matches!(outcome, Served::Shutdown), started.elapsed()));
+                }
+            });
+            (server, rx)
+        }
+
+        fn pipe_name(tag: &str) -> String {
+            format!(
+                r"\\.\pipe\NetRuleRouter\broker-{tag}-{}",
+                std::process::id()
+            )
+        }
+
+        fn send(handle: &OwnedHandle, operation: &str) -> PipeIo {
+            let mut io = PipeIo::new(handle.raw()).expect("client io");
+            io.set_timeout(Duration::from_secs(10));
+            let request = BrokerRequest {
+                nonce: NONCE.to_string(),
+                operation: operation.to_string(),
+                payload: serde_json::json!({}),
+                timeout_ms: 0,
+            };
+            write_frame(&mut NoFlush(&mut io), &request).expect("write request");
+            io
+        }
+
+        #[test]
+        fn a_silent_client_is_dropped_and_the_revoke_behind_it_is_served() {
+            let name = pipe_name("silent");
+            let budget = Duration::from_millis(500);
+            let (server, outcomes) = serve(&name, budget, Duration::ZERO, 2);
+
+            let silent = connect_pipe(&name, Duration::from_secs(5)).expect("silent connect");
+            let revoke = connect_pipe(&name, Duration::from_secs(5)).expect("revoke connect");
+            let asked = Instant::now();
+            let mut io = send(&revoke, BROKER_SHUTDOWN);
+            let answer: BrokerResponse = read_frame(&mut io).expect("revoke answered");
+            assert!(answer.ok);
+            assert!(
+                asked.elapsed() < Duration::from_secs(5),
+                "the revoke waited {:?} behind a client that said nothing",
+                asked.elapsed()
+            );
+            drop(io);
+            drop(revoke);
+
+            let (retired, held) = outcomes.recv().expect("silent outcome");
+            assert!(!retired);
+            assert!(held < budget + Duration::from_secs(2), "held {held:?}");
+            let (retired, _) = outcomes.recv().expect("revoke outcome");
+            assert!(retired, "the revoke must retire the broker");
+            drop(silent);
+            server.join().expect("server thread");
+        }
+
+        /// A launcher that stopped waiting for the answer has still delivered
+        /// its revoke.
+        #[test]
+        fn a_request_left_by_a_client_that_hung_up_is_still_honoured() {
+            let name = pipe_name("hungup");
+            let (server, outcomes) = serve(&name, Duration::from_secs(2), Duration::ZERO, 1);
+
+            let handle = connect_pipe(&name, Duration::from_secs(5)).expect("connect");
+            drop(send(&handle, BROKER_SHUTDOWN));
+            drop(handle);
+
+            let (retired, _) = outcomes.recv().expect("outcome");
+            assert!(retired);
+            server.join().expect("server thread");
+        }
+
+        #[test]
+        fn a_late_request_and_work_longer_than_the_io_budget_are_answered() {
+            let name = pipe_name("slow");
+            let budget = Duration::from_millis(800);
+            let work = Duration::from_millis(1200);
+            let (server, outcomes) = serve(&name, budget, work, 1);
+
+            let handle = connect_pipe(&name, Duration::from_secs(5)).expect("connect");
+            thread::sleep(Duration::from_millis(300));
+            let mut io = send(&handle, BROKER_PING);
+            let answer: BrokerResponse = read_frame(&mut io).expect("answered");
+            assert_eq!(answer.payload, Some(serde_json::json!(BROKER_PING)));
+            drop(io);
+            drop(handle);
+
+            let (retired, held) = outcomes.recv().expect("outcome");
+            assert!(!retired);
+            assert!(
+                held < budget + work,
+                "a client that hung up was waited for: {held:?}"
+            );
+            server.join().expect("server thread");
+        }
+
+        #[test]
+        fn a_client_that_keeps_the_line_after_its_answer_is_let_go() {
+            let name = pipe_name("linger");
+            let budget = Duration::from_millis(500);
+            let (server, outcomes) = serve(&name, budget, Duration::ZERO, 1);
+
+            let handle = connect_pipe(&name, Duration::from_secs(5)).expect("connect");
+            let mut io = send(&handle, BROKER_PING);
+            let answer: BrokerResponse = read_frame(&mut io).expect("answered");
+            assert!(answer.ok);
+
+            let (_, held) = outcomes.recv().expect("outcome");
+            assert!(held < budget + Duration::from_secs(2), "held {held:?}");
+            drop(io);
+            drop(handle);
+            server.join().expect("server thread");
+        }
     }
 
     #[cfg(windows)]

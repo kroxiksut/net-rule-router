@@ -46,8 +46,14 @@ pub(crate) const DOH_CANARY_DOMAIN: &str = "use-application-dns.net";
 
 /// `true` when `hostname` is the Firefox DoH canary apex or a subdomain of it.
 pub(crate) fn is_doh_canary(hostname: &str) -> bool {
-    let h = hostname.trim_end_matches('.').to_ascii_lowercase();
-    h == DOH_CANARY_DOMAIN || h.ends_with(&format!(".{DOH_CANARY_DOMAIN}"))
+    // Asked on every query: no allocation.
+    let h = hostname.trim_end_matches('.').as_bytes();
+    let Some(split) = h.len().checked_sub(DOH_CANARY_DOMAIN.len()) else {
+        return false;
+    };
+    let (head, tail) = h.split_at(split);
+    tail.eq_ignore_ascii_case(DOH_CANARY_DOMAIN.as_bytes())
+        && (head.is_empty() || head.ends_with(b"."))
 }
 
 /// Is a queried hostname a SECONDARY rule host for the active principal? The

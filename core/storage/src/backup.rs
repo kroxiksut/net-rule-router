@@ -5,21 +5,6 @@ use rusqlite::Connection;
 
 use crate::error::{StorageError, StorageResult};
 
-/// Whether a database backup is mandatory or optional before a migration.
-///
-/// | Database | Policy |
-/// |----------|--------|
-/// | `nrr_service_state.db` | `Required` — contains non-rebuildable revision pointers |
-/// | `nrr_fqdn_ip_cache.db` | `Optional` — fully rebuildable from the source of truth |
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BackupPolicy {
-    /// Backup is mandatory.  Migration runner must abort if the backup fails.
-    Required,
-    /// Backup is optional.  If it fails, migration may proceed; a warning is
-    /// emitted but the operation is not aborted.
-    Optional,
-}
-
 /// Why a backup was requested.  Encoded into the backup filename for traceability.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackupReason {
@@ -97,6 +82,9 @@ pub fn backup_database(
     let conn = Connection::open(source).map_err(|e| {
         StorageError::Internal(format!("backup: cannot open {}: {e}", source.display()))
     })?;
+    // Without it a writer holding the lock fails the snapshot at once.
+    conn.busy_timeout(crate::migration::BUSY_TIMEOUT)
+        .map_err(|e| StorageError::Internal(format!("backup: busy timeout: {e}")))?;
     conn.execute("VACUUM INTO ?1", [dest_sql]).map_err(|e| {
         StorageError::Internal(format!(
             "failed to snapshot {} → {}: {e}",
@@ -342,10 +330,5 @@ mod tests {
             made.last().expect("last backup").exists(),
             "the newest snapshot must be one of the survivors",
         );
-    }
-
-    #[test]
-    fn backup_policy_values_are_distinct() {
-        assert_ne!(BackupPolicy::Required, BackupPolicy::Optional);
     }
 }

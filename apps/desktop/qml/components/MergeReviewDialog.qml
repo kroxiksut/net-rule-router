@@ -85,7 +85,7 @@ Dialog {
 
     function _routeLabel(role) {
         return String(role) === "secondary"
-            ? tr("dialog.drift.row-secondary", "Secondary")
+            ? tr("dialog.drift.row-secondary", "Additional")
             : tr("dialog.drift.row-primary", "Primary")
     }
 
@@ -484,7 +484,7 @@ Dialog {
             spacing: 8
             ThemedButton {
                 theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.merge.cancel", "Cancel")
+                text: dialog.tr("action.cancel", "Cancel")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 onClicked: { dialog.cancelled(); dialog.close() }

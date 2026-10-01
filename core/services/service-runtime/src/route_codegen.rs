@@ -61,12 +61,13 @@ pub const HOST_PREFIX_V6: u8 = 128;
 
 /// Whether `prefix_length` is a shape THIS codegen emits.
 ///
-/// Startup orphan adoption identifies our leftovers by metric plus shape.
-/// Derived from the overlay constants rather than kept as a separate list: a
-/// hardcoded list goes stale the moment a mode grows a shape it does not
-/// know, leaving a crashed-and-recovered pair unadopted so every packet keeps
-/// steering into a tunnel that is no longer there. Pinned by a test that
-/// generates every mode and asserts each emitted shape is recognised here.
+/// Startup orphan adoption and the uninstall sweep identify our leftovers by
+/// metric plus shape. Besides host routes, IPv4 carries the overlay: its
+/// lengths follow the tunnel's own catch-alls ([`counter_overlay_for`]), so
+/// the range is every length that function can return rather than a list of
+/// the ones seen so far — an unrecognised half survives a crash and keeps
+/// steering traffic after the service is gone. Pinned by tests that generate
+/// every mode, with and without a tunnel redirect set.
 ///
 /// The FAMILY is part of the shape. `/32` in IPv6 is a prefix, not a host
 /// route, so a family-blind answer adopts a stranger and hands the reconciler
@@ -75,15 +76,14 @@ pub const HOST_PREFIX_V6: u8 = 128;
 #[must_use]
 pub fn is_owned_shape(destination: IpAddr, prefix_length: u8) -> bool {
     match destination {
-        IpAddr::V4(_) => {
-            prefix_length == HOST_PREFIX
-                || prefix_length == OVERLAY_LOW.1
-                || prefix_length == OVERLAY_HIGH.1
-                || COUNTER_OVERLAY.iter().any(|(_, p)| *p == prefix_length)
-        }
+        IpAddr::V4(_) => prefix_length == HOST_PREFIX || OVERLAY_PREFIXES.contains(&prefix_length),
         IpAddr::V6(_) => prefix_length == HOST_PREFIX_V6,
     }
 }
+
+/// Every length an overlay half can have: the `/1` split-default pair up to
+/// one bit longer than the narrowest tunnel catch-all we answer.
+const OVERLAY_PREFIXES: std::ops::RangeInclusive<u8> = 1..=TUNNEL_CATCH_ALL_MAX_PREFIX + 1;
 
 /// Metric for our secondary routes. Low = preferred over the default
 /// route, but we never touch the system default itself (`is_ours = true`
@@ -126,11 +126,11 @@ pub const COUNTER_OVERLAY: [(Ipv4Addr, u8); 4] = [
 /// The counter-overlay that actually out-specifics THIS tunnel.
 ///
 /// The fixed `/2` set assumes the VPN redirects with a `/1` pair. A Wintun
-/// client (swiftvpn over WireGuard) instead covers the internet with a
+/// client (examplevpn over WireGuard) instead covers the internet with a
 /// redirect SET — `0.0.0.0/5`, `8.0.0.0/7`, `16.0.0.0/4`, …, `128.0.0.0/2`,
 /// `192.0.0.0/9` — and against that the `/2`s lose: same length at a better
 /// metric, or shorter outright. Every non-rule connection then rode the
-/// tunnel, `.ru` sites included, and a Russian shop that refuses foreign
+/// tunnel, regional-zone sites included, and a shop that refuses foreign
 /// addresses stopped opening.
 ///
 /// So the counter-overlay is derived from the tunnel's own catch-all
@@ -141,10 +141,12 @@ pub const COUNTER_OVERLAY: [(Ipv4Addr, u8); 4] = [
 /// (the tunnel's catch-alls are not visible, or were stripped) falls back to
 /// them as well. Rule `/32`s stay longer than anything here, so they keep
 /// riding the tunnel. Deduplicated and sorted for a stable reconcile.
+/// Prefixes narrower than [`TUNNEL_CATCH_ALL_MAX_PREFIX`] are not answered, so
+/// every half stays a length [`is_owned_shape`] recognises.
 pub fn counter_overlay_for(tunnel_catch_alls: &[(Ipv4Addr, u8)]) -> Vec<(Ipv4Addr, u8)> {
     let mut halves: Vec<(Ipv4Addr, u8)> = tunnel_catch_alls
         .iter()
-        .filter(|(_, n)| *n < 31)
+        .filter(|(_, n)| *n <= TUNNEL_CATCH_ALL_MAX_PREFIX)
         .flat_map(|&(dest, n)| {
             let base = u32::from(dest) & prefix_mask(n);
             let half = 1u32 << (31 - u32::from(n));
@@ -197,7 +199,7 @@ pub fn tunnel_catch_all_prefixes(routes: &[RouteEntry], ifindex: u32) -> Vec<(Ip
 }
 
 /// Longest prefix that still reads as "steer a chunk of the internet" rather
-/// than "reach one network": swiftvpn's set bottoms out at `/9`, a corporate
+/// than "reach one network": examplevpn's set bottoms out at `/9`, a corporate
 /// split tunnel names `/16`s and narrower, which are its business, not ours.
 const TUNNEL_CATCH_ALL_MAX_PREFIX: u8 = 12;
 

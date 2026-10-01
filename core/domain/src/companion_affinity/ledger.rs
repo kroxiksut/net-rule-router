@@ -755,8 +755,8 @@ impl CompanionAffinityLedger {
         // that the anchor is the page doing the fetching. When most of the hits
         // this anchor claims happened while somebody else's page was loading,
         // the assumption is false — this is how a rule host in one tab collects
-        // another site's CDN (`ypncdn.com` under `www.search.test`,
-        // `cdninsta.test` under `cdn.openai.com`). Brand relation above is
+        // another site's CDN (`tubecdn.test` under `www.search.test`,
+        // `cdninsta.test` under `cdn.assistant.example`). Brand relation above is
         // exempt: a shared name states ownership regardless of timing.
         let mostly_someone_elses =
             pair.foreign_parent_hits > 0 && pair.foreign_parent_hits * 2 > pair.nearest_hits.max(1);
@@ -940,9 +940,9 @@ impl CompanionAffinityLedger {
                 // onto the route.
                 //
                 // The evidence has to hold for the APEX, though, not just for
-                // the one subdomain that was seen. `cdn.auth0.com` is a delivery
+                // the one subdomain that was seen. `cdn.accounts.test` is a delivery
                 // name under a service's own domain: generalizing it moved all
-                // of `auth0.com` — sign-in included — onto the additional link
+                // of `accounts.test` — sign-in included — onto the additional link
                 // on the strength of one asset host. A dedicated delivery apex
                 // (`cdninsta.test`, `videocdn.test`, `cdn.example`) carries
                 // the mask itself, and that is the shape worth generalizing.

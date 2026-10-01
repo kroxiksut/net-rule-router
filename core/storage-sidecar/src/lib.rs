@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! GUI-side sidecar SQLite database — block 16.QoL+0.
+//! GUI-side sidecar SQLite database.
 //!
 //! `nrr-storage-sidecar` persists data that lives strictly on the user's
 //! machine and never crosses the IPC boundary to the service:
@@ -16,12 +16,11 @@
 //!   `Export to file…` round-trip is byte-identical for the foreign-OS
 //!   blocks.
 //!
-//! * `pending_apply` — last `_buildRulesJson()` snapshot from the GUI
-//!   plus a precomputed `{added, modified, removed}` summary. Written
-//!   when the user chooses "Work without service" in the
-//!   `ServiceNotRunningDialog`; read on the next successful connect to
-//!   prompt "Apply pending changes?". TTL is 7 days from the last
-//!   modification — stale state is treated as absent.
+//! * `pending_apply` — a one-row marker: the content hash of the parked
+//!   rules plus a precomputed `{added, modified, removed}` summary, never
+//!   the rules themselves. Written when the user chooses "Work without
+//!   service"; read on the next successful connect to offer "Apply pending
+//!   changes?". TTL is 7 days from the last modification.
 //!
 //! * `external_ip_cache` — last-known external (reflexive) IPv4
 //!   address per adapter, written on every live snapshot that resolves
@@ -33,24 +32,23 @@
 //! `nrr-storage-sidecar` is GUI-only. **Forbidden** deps: `nrr-storage`
 //! (service-owned), `nrr-shared` (wire schemas — sidecar has nothing to
 //! do with the wire), `nrr-service-runtime`, `nrr-platform-windows`,
-//! and any UI crate. The only allowed deps are `rusqlite` (bundled) and
-//! `thiserror`.
+//! and any UI crate. Allowed: `rusqlite` (bundled), `thiserror` and the
+//! leaf `nrr-sqlite-support`.
 //!
 //! # Threading model
 //!
 //! Synchronous `rusqlite` blocking API — same convention as
 //! `nrr-storage`. WAL journal mode is enforced on open with
-//! `busy_timeout = 5000 ms`. Callers in async contexts (the GUI's
-//! launcher subprocess) wrap calls in `tokio::task::spawn_blocking` if
-//! they hold an async runtime; the Q_INVOKABLE bridge is called from
-//! the Qt event loop and treats the calls as fast synchronous ops
-//! (single-row reads/writes, all sub-millisecond on local SSDs).
+//! `busy_timeout = 5000 ms`. Two processes hold the file: the GUI launcher
+//! and the tray launcher, one connection each, both serving `sidecar.*`
+//! RPCs on their worker threads, never on the Qt event loop.
 //!
 //! # Storage location
 //!
-//! Default: `%APPDATA%\NetRuleRouter\gui_metadata.db` (Windows) — per
-//! user, so Alice and Bob get separate sidecars on a shared machine.
-//! The path is resolved by [`profile::resolve_default_path`]; tests and
+//! Default: `%LOCALAPPDATA%\NetRuleRouter\gui_metadata.db` on Windows,
+//! `$XDG_DATA_HOME/NetRuleRouter/gui_metadata.db` elsewhere — per user, and
+//! local rather than roaming because a WAL database must not travel.
+//! The path is resolved by [`profile::resolve_path`]; tests and
 //! headless drivers can override via the `NRR_SIDECAR_PATH` env var.
 //!
 //! # On corruption

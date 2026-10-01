@@ -175,7 +175,7 @@ Dialog {
 
             // Secondary row
             Label {
-                text: dialog.tr("dialog.drift.row-secondary", "Secondary")
+                text: dialog.tr("dialog.drift.row-secondary", "Additional")
                 color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
             }
             Label {
@@ -220,7 +220,7 @@ Dialog {
                 Layout.fillWidth: true
                 visible: dialog.secondaryDetails.mismatch !== "none"
                 text: dialog.tr("dialog.drift.summary-secondary",
-                    "Secondary route: {kind}")
+                    "Additional route: {kind}")
                     .replace("{kind}",
                         dialog._mismatchLabel(dialog.secondaryDetails.mismatch))
                 wrapMode: Text.Wrap

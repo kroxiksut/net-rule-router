@@ -113,18 +113,69 @@ fn get_status_reports_individual_cards_with_no_storage_attached() {
     std::fs::create_dir_all(&audit_dir).unwrap();
     std::fs::create_dir_all(&logs_dir).unwrap();
     let facade = make_facade(&audit_dir, &logs_dir);
-    let status = facade.get_status();
+    let status = facade.get_status(&DiagnosticsAudience::Machine);
     assert!(status.security_status.audit_chain_ok);
     assert!(status.security_status.audit_write_healthy);
     assert!(status.log_health.dir_writable);
     assert_eq!(status.security_status.active_alert_count, 0);
     assert_eq!(status.service_health.state, "running");
-    assert!(!status.diagnostic_mode.active);
     // With no cache connection, the card reports unhealthy.
     assert!(!status.cache_health.healthy);
     assert_eq!(status.cache_health.entry_count, 0);
     // Aggregate flips to false because of the cache_health gate.
     assert!(!status.overall_healthy);
+    assert!(status.security_status.alerts_readable);
+}
+
+/// An alert store that cannot be read must not look like one with nothing in
+/// it: "No active alerts" is a claim the service did not make.
+#[test]
+fn an_unreadable_alert_store_is_reported_not_read_as_empty() {
+    struct Unreadable;
+    impl SecurityAlertsRepository for Unreadable {
+        fn insert(&self, _: &SecurityAlert) -> DiagnosticsResult<()> {
+            Ok(())
+        }
+        fn update_state(
+            &self,
+            _: &str,
+            _: SecurityAlertState,
+            _: u64,
+            _: &str,
+            _: i64,
+        ) -> DiagnosticsResult<()> {
+            Ok(())
+        }
+        fn list_by_state(&self, _: SecurityAlertState) -> DiagnosticsResult<Vec<SecurityAlert>> {
+            Err(unreadable())
+        }
+        fn list_open(&self) -> DiagnosticsResult<Vec<SecurityAlert>> {
+            Err(unreadable())
+        }
+        fn find_by_id(&self, _: &str) -> DiagnosticsResult<Option<SecurityAlert>> {
+            Err(unreadable())
+        }
+    }
+    fn unreadable() -> DiagnosticsError {
+        DiagnosticsError::LogStorageUnavailable {
+            reason: "security_alerts unreadable".into(),
+        }
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let audit_dir = dir.path().join("audit");
+    let logs_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&audit_dir).unwrap();
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    let facade =
+        ProductionDiagnosticsFacade::new(&logs_dir, &audit_dir, None, Arc::new(Unreadable), None);
+    let status = facade.get_status(&DiagnosticsAudience::Machine);
+    assert!(!status.security_status.alerts_readable);
+    assert!(status.active_alerts.is_empty());
+    assert!(!status.overall_healthy);
+    // The wire carries the difference, so a client can tell it from an empty list.
+    let wire = serde_json::to_value(&status).expect("serialise");
+    assert_eq!(wire["security_status"]["alerts_readable"], false);
 }
 
 /// One user must not read another user's audit entries. The trail is a
@@ -286,6 +337,220 @@ fn list_log_entries_returns_empty_on_no_files() {
         .unwrap();
     assert!(r.items.is_empty());
     assert!(r.next_cursor.is_none());
+}
+
+/// Writes one event per `(level, category, kind)`, `evt-0001` onwards, with
+/// strictly increasing `created_at` (`1_745_000_000_000 + i * 1000`).
+fn write_shaped_log_events(
+    dir: &Path,
+    shapes: &[(
+        nrr_diagnostics::taxonomy::EventLevel,
+        nrr_diagnostics::taxonomy::EventCategory,
+        &str,
+    )],
+) {
+    use nrr_diagnostics::event::LogEvent;
+    use nrr_diagnostics::reason::service::STARTED;
+    use std::io::Write;
+    let date = nrr_diagnostics::audit::writer::local_date_string(std::time::SystemTime::now());
+    let path = dir.join(format!("nrr_service_{date}-1.ndjson"));
+    let mut file = std::fs::File::create(&path).expect("create log file");
+    for (i, (level, category, kind)) in shapes.iter().enumerate() {
+        let n = i as i64 + 1;
+        let mut event = LogEvent::new(
+            format!("evt-{n:04}"),
+            1_745_000_000_000 + n * 1000,
+            *level,
+            STARTED,
+        );
+        event.category = *category;
+        event.kind = (*kind).to_string();
+        writeln!(file, "{}", event.to_ndjson().expect("serialize")).expect("write");
+    }
+}
+
+/// Every page of a filtered listing, walked to the end.
+fn all_pages(
+    facade: &ProductionDiagnosticsFacade,
+    filter: &LogEntryFilter,
+    page_size: u32,
+) -> Vec<Vec<LogEntryDto>> {
+    let mut pages = Vec::new();
+    let mut cursor = None;
+    for _ in 0..100 {
+        let page = facade
+            .list_log_entries(
+                filter,
+                &PaginationParams {
+                    cursor: cursor.clone(),
+                    page_size,
+                },
+                &DiagnosticsAudience::Machine,
+            )
+            .expect("list");
+        pages.push(page.items);
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => return pages,
+        }
+    }
+    panic!("paging did not terminate");
+}
+
+/// The Logs view used to fetch unfiltered pages and hide rows itself, so
+/// "warnings and errors" could show a page of nothing with more behind it.
+/// Filtered on the service, every page is full of matches and paging reaches
+/// all of them.
+#[test]
+fn a_level_filter_pages_through_every_match_and_nothing_else() {
+    use nrr_diagnostics::taxonomy::{EventCategory, EventLevel};
+    let dir = TempDir::new().expect("tempdir");
+    let audit_dir = dir.path().join("audit");
+    let logs_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&audit_dir).unwrap();
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    let levels = [EventLevel::Warn, EventLevel::Info, EventLevel::Error];
+    let shapes: Vec<_> = (0..12)
+        .map(|i| (levels[i % 3], EventCategory::Service, "service.started"))
+        .collect();
+    write_shaped_log_events(&logs_dir, &shapes);
+    let facade = make_facade(&audit_dir, &logs_dir);
+
+    let filter = LogEntryFilter {
+        level_min: Some("warn".into()),
+        ..LogEntryFilter::default()
+    };
+    let pages = all_pages(&facade, &filter, 3);
+    let (last, full) = pages.split_last().expect("at least one page");
+    assert!(
+        full.iter().all(|page| page.len() == 3),
+        "every page but the last must be full"
+    );
+    assert!(!last.is_empty());
+    let ids: Vec<String> = pages.iter().flatten().map(|e| e.event_id.clone()).collect();
+    // evt-n has level levels[(n - 1) % 3]; Info is every third from evt-0002.
+    let expected: Vec<String> = (1..=12)
+        .rev()
+        .filter(|n| (n - 1) % 3 != 1)
+        .map(|n| format!("evt-{n:04}"))
+        .collect();
+    assert_eq!(ids, expected);
+
+    let errors_since = LogEntryFilter {
+        level_min: Some("error".into()),
+        from_ms: Some(1_745_000_000_000 + 6 * 1000),
+        ..LogEntryFilter::default()
+    };
+    let ids: Vec<String> = all_pages(&facade, &errors_since, 1)
+        .into_iter()
+        .flatten()
+        .map(|e| e.event_id)
+        .collect();
+    assert_eq!(ids, vec!["evt-0012", "evt-0009", "evt-0006"]);
+}
+
+#[test]
+fn category_is_exact_and_kind_is_a_substring() {
+    use nrr_diagnostics::taxonomy::{EventCategory, EventLevel};
+    let dir = TempDir::new().expect("tempdir");
+    let audit_dir = dir.path().join("audit");
+    let logs_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&audit_dir).unwrap();
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    let shapes: Vec<_> = (0..9)
+        .map(|i| {
+            let category = if i % 2 == 0 {
+                EventCategory::Apply
+            } else {
+                EventCategory::Service
+            };
+            let kind = if i % 3 == 0 {
+                "apply.rollback_done"
+            } else {
+                "service.started"
+            };
+            (EventLevel::Info, category, kind)
+        })
+        .collect();
+    write_shaped_log_events(&logs_dir, &shapes);
+    let facade = make_facade(&audit_dir, &logs_dir);
+    let ids = |filter: LogEntryFilter| -> Vec<String> {
+        all_pages(&facade, &filter, 2)
+            .into_iter()
+            .flatten()
+            .map(|e| e.event_id)
+            .collect()
+    };
+
+    // Written index i is evt-(i + 1): Apply at even i, rollback at i % 3 == 0.
+    assert_eq!(
+        ids(LogEntryFilter {
+            category: Some("apply".into()),
+            ..LogEntryFilter::default()
+        }),
+        vec!["evt-0009", "evt-0007", "evt-0005", "evt-0003", "evt-0001"]
+    );
+    assert_eq!(
+        ids(LogEntryFilter {
+            kind: Some("rollback".into()),
+            ..LogEntryFilter::default()
+        }),
+        vec!["evt-0007", "evt-0004", "evt-0001"]
+    );
+    assert_eq!(
+        ids(LogEntryFilter {
+            category: Some("service".into()),
+            kind: Some("rollback".into()),
+            ..LogEntryFilter::default()
+        }),
+        vec!["evt-0004"]
+    );
+    assert_eq!(
+        ids(LogEntryFilter {
+            kind: Some("Rollback".into()),
+            ..LogEntryFilter::default()
+        }),
+        vec!["evt-0007", "evt-0004", "evt-0001"],
+        "the kind match is case-insensitive"
+    );
+}
+
+/// A misspelt filter used to be dropped and the whole log came back — the
+/// opposite of what the person asked for.
+#[test]
+fn an_unknown_level_or_category_matches_nothing() {
+    use nrr_diagnostics::taxonomy::{EventCategory, EventLevel};
+    let dir = TempDir::new().expect("tempdir");
+    let audit_dir = dir.path().join("audit");
+    let logs_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&audit_dir).unwrap();
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    write_shaped_log_events(
+        &logs_dir,
+        &[(EventLevel::Error, EventCategory::Service, "service.started")],
+    );
+    let facade = make_facade(&audit_dir, &logs_dir);
+    for filter in [
+        LogEntryFilter {
+            category: Some("Service".into()),
+            ..LogEntryFilter::default()
+        },
+        LogEntryFilter {
+            category: Some(String::new()),
+            ..LogEntryFilter::default()
+        },
+        LogEntryFilter {
+            level_min: Some("fatal".into()),
+            ..LogEntryFilter::default()
+        },
+    ] {
+        let pages = all_pages(&facade, &filter, 50);
+        assert!(pages.iter().all(Vec::is_empty), "{filter:?}");
+        let recent = facade
+            .recent_log_entries(&filter, 50, &DiagnosticsAudience::Machine)
+            .expect("recent");
+        assert!(recent.is_empty(), "{filter:?}");
+    }
 }
 
 /// Writes `n` operational log events `evt-0001..evt-000n` with strictly
@@ -455,10 +720,113 @@ fn list_active_alerts_proxies_repo() {
     };
     repo.insert(&alert).expect("insert");
     let facade = ProductionDiagnosticsFacade::new(&logs_dir, &audit_dir, None, repo, None);
-    let alerts = facade.list_active_alerts().expect("list");
+    let alerts = facade
+        .list_alerts(AlertListFilter::Open, &DiagnosticsAudience::Machine)
+        .expect("list");
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].alert_id, "alt-test");
     assert!(alerts[0].requires_action);
+}
+
+/// An alert about one user's stored rules reaches that user and an
+/// administrator; another user learns only that an alert holds the edits, with
+/// no SID and no revision of the owner's. Status and list agree.
+#[test]
+fn alerts_about_a_users_rules_are_scoped_to_that_user() {
+    use nrr_diagnostics::audit::alert::SecurityAlertState::Active;
+    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+    use nrr_storage::repository::MigrationRunner;
+    const ALICE: &str = "S-1-5-21-1000-1000-1000-1001";
+    const BOB: &str = "S-1-5-21-1000-1000-1000-1002";
+
+    let dir = TempDir::new().expect("tmp");
+    let conn = open_connection(&dir.path().join("state.db")).expect("open");
+    let runner = SqliteMigrationRunner::for_state_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+    for (principal, revision_id) in [(ALICE, "rev-alice-1"), (BOB, "rev-bob-1")] {
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO revisions (
+                    principal, revision_id, content_hash, rules_json, status, source,
+                    correlation_id, created_at, activated_at
+                 ) VALUES (?1, ?2, ?2, '{}', 'active', 'gui-rules-edit', 'c', 1, 1)",
+                rusqlite::params![principal, revision_id],
+            )
+            .expect("seed revision");
+    }
+    let repo: Arc<dyn SecurityAlertsRepository> = Arc::new(InMemorySecurityAlertsRepository::new());
+    let alert = |id: String, kind: &str, at: i64| SecurityAlert {
+        alert_id: id,
+        kind: kind.into(),
+        state: Active,
+        raised_event_seq: 0,
+        raised_file: "bootstrap".into(),
+        ack_event_seq: None,
+        ack_file: None,
+        resolved_event_seq: None,
+        resolved_file: None,
+        created_at: at,
+        updated_at: at,
+        reason_code: "integrity.db_row_hmac_mismatch".into(),
+    };
+    for a in [
+        alert("alt-keyreset-1".into(), "key_reset_with_existing_data", 1),
+        alert(
+            format!("alt-dbtamper-pointer:{BOB}@f1"),
+            "db_tamper_detected",
+            2,
+        ),
+        alert("alt-dbtamper-rev-bob-1@f2".into(), "db_tamper_detected", 3),
+        alert(
+            "alt-dbtamper-rev-alice-1@f3".into(),
+            "db_tamper_detected",
+            4,
+        ),
+    ] {
+        repo.insert(&a).expect("insert");
+    }
+    let facade = ProductionDiagnosticsFacade::new(
+        dir.path(),
+        dir.path(),
+        None,
+        repo,
+        Some(Arc::clone(&conn)),
+    );
+
+    let alice = DiagnosticsAudience::Principal(ALICE.into());
+    let listed = facade
+        .list_alerts(AlertListFilter::All, &alice)
+        .expect("list");
+    let mut ids: Vec<&str> = listed.iter().map(|a| a.alert_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [
+            "alt-dbtamper-rev-alice-1@f3",
+            "alt-keyreset-1",
+            crate::alert_audience::OTHER_PRINCIPAL_ALERT_ID,
+        ]
+    );
+    let status = facade.get_status(&alice);
+    assert_eq!(status.security_status.active_alert_count, 3);
+    let wire = serde_json::to_string(&(listed, status)).expect("json");
+    assert!(!wire.contains(BOB) && !wire.contains("rev-bob"), "{wire}");
+
+    let everything = facade.get_status(&DiagnosticsAudience::Machine);
+    assert_eq!(everything.active_alerts.len(), 4);
+    let bob = facade
+        .list_alerts(
+            AlertListFilter::Open,
+            &DiagnosticsAudience::Principal(BOB.into()),
+        )
+        .expect("list");
+    assert_eq!(
+        bob.len(),
+        4,
+        "Bob's two, the machine's, and one for Alice's"
+    );
 }
 
 #[test]
@@ -489,44 +857,6 @@ fn acknowledge_alert_directs_caller_to_mutation_queue() {
         reason: None,
     });
     assert!(r.is_err(), "direct ack must be rejected");
-}
-
-#[test]
-fn set_diagnostic_mode_enable_then_disable() {
-    let dir = TempDir::new().expect("tempdir");
-    let audit_dir = dir.path().join("audit");
-    let logs_dir = dir.path().join("logs");
-    std::fs::create_dir_all(&audit_dir).unwrap();
-    std::fs::create_dir_all(&logs_dir).unwrap();
-    let facade = make_facade(&audit_dir, &logs_dir);
-    // Initial state inactive.
-    assert!(!facade.get_status().diagnostic_mode.active);
-    // Enable.
-    facade
-        .set_diagnostic_mode(&SetDiagnosticModeRequest {
-            enabled: true,
-            duration_ms: Some(60_000),
-            scope: Some("decision_and_cache".into()),
-            until_restart: false,
-        })
-        .unwrap();
-    let status = facade.get_status();
-    assert!(status.diagnostic_mode.active);
-    assert!(status.diagnostic_mode.remaining_ms.unwrap_or(0) > 0);
-    assert_eq!(
-        status.diagnostic_mode.scope_key.as_deref(),
-        Some("decision_and_cache")
-    );
-    // Disable.
-    facade
-        .set_diagnostic_mode(&SetDiagnosticModeRequest {
-            enabled: false,
-            duration_ms: None,
-            scope: None,
-            until_restart: false,
-        })
-        .unwrap();
-    assert!(!facade.get_status().diagnostic_mode.active);
 }
 
 #[test]
@@ -673,26 +1003,6 @@ fn paginate_handles_empty_input() {
     assert!(r.items.is_empty());
     assert!(r.next_cursor.is_none());
     assert_eq!(r.total_count, Some(0));
-}
-
-#[test]
-fn diagnostic_session_handle_redaction_mode_inactive_returns_default() {
-    let h = DiagnosticSessionHandle::new();
-    assert_eq!(h.redaction_mode(0), RedactionMode::Default);
-}
-
-#[test]
-fn diagnostic_session_handle_redaction_mode_active_returns_diagnostics() {
-    let h = DiagnosticSessionHandle::new();
-    let s = DiagnosticSession::new(
-        1_000,
-        60_000,
-        "test-user",
-        DiagnosticSessionScope::All,
-        None,
-    );
-    h.store(Some(s));
-    assert_eq!(h.redaction_mode(2_000), RedactionMode::Diagnostics);
 }
 
 fn log_entry(created_at: i64, event_id: &str) -> LogEntryDto {
@@ -991,5 +1301,108 @@ fn a_winner_enforcement_cannot_carry_out_is_not_reported_as_enforced() {
     assert_eq!(
         plain.reason_key,
         "diag.explain.reason.rule-matched-exact-fqdn"
+    );
+}
+
+/// The writer opens a new file on every start, so checking only the newest
+/// file shrank the window to "since the last boot": an edit in the middle of
+/// yesterday's file went unnoticed. The whole chain in retention is checked.
+#[test]
+fn an_edit_in_an_older_audit_file_is_caught() {
+    let dir = TempDir::new().expect("tempdir");
+    let audit_dir = dir.path().join("audit");
+    let logs_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    for suffix in ["1", "2", "3"] {
+        write_audit_event(&audit_dir, suffix);
+    }
+    let facade = make_facade(&audit_dir, &logs_dir);
+    assert!(
+        facade
+            .get_status(&DiagnosticsAudience::Machine)
+            .security_status
+            .audit_chain_ok,
+        "positive control: an untouched trail verifies"
+    );
+
+    let files = AuditReader::new(&audit_dir).list_files();
+    assert_eq!(files.len(), 3);
+    let middle = std::fs::read_to_string(&files[1]).expect("read");
+    let written_at = std::fs::metadata(&files[1])
+        .and_then(|m| m.modified())
+        .expect("mtime");
+    std::fs::write(&files[1], middle.replace("rev-1", "rev-9")).expect("tamper");
+    // Same length, and the time put back: nothing but the bytes tells the
+    // edit from the file already verified.
+    std::fs::File::options()
+        .write(true)
+        .open(&files[1])
+        .and_then(|f| f.set_modified(written_at))
+        .expect("put the time back");
+
+    assert!(
+        !facade
+            .get_status(&DiagnosticsAudience::Machine)
+            .security_status
+            .audit_chain_ok,
+        "an edited older file must fail verification"
+    );
+}
+
+/// The revision line of the status card is the caller's own: a user sees
+/// their active revision (or the baseline they read through to) and their own
+/// candidates, never another user's; the machine audience sees everything.
+#[test]
+fn the_status_revision_summary_follows_the_audience() {
+    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+    use nrr_storage::repository::MigrationRunner;
+    const ALICE: &str = "S-1-5-21-1000-1000-1000-1001";
+    const BOB: &str = "S-1-5-21-1000-1000-1000-1002";
+    const CAROL: &str = "S-1-5-21-1000-1000-1000-1003";
+
+    let dir = TempDir::new().expect("tmp");
+    let conn = open_connection(&dir.path().join("state.db")).expect("open");
+    let runner = SqliteMigrationRunner::for_state_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+    for (principal, revision_id, status, at) in [
+        (nrr_storage::BASELINE_PRINCIPAL, "rev-base", "active", 1),
+        (ALICE, "rev-alice", "active", 2),
+        (BOB, "rev-bob", "active", 3),
+        (ALICE, "cand-alice", "candidate", 4),
+        (BOB, "cand-bob-1", "candidate", 5),
+        (BOB, "cand-bob-2", "candidate", 6),
+    ] {
+        conn.lock()
+            .expect("lock")
+            .execute(
+                "INSERT INTO revisions (
+                    principal, revision_id, content_hash, rules_json, status, source,
+                    correlation_id, created_at, activated_at
+                 ) VALUES (?1, ?2, ?2, '{}', ?3, 'gui-rules-edit', 'c', ?4, ?4)",
+                rusqlite::params![principal, revision_id, status, at],
+            )
+            .expect("seed revision");
+    }
+    let alerts: Arc<dyn SecurityAlertsRepository> =
+        Arc::new(InMemorySecurityAlertsRepository::new());
+    let facade = ProductionDiagnosticsFacade::new(dir.path(), dir.path(), None, alerts, Some(conn));
+    let summary = |audience: DiagnosticsAudience| {
+        let health = facade.get_status(&audience).service_health;
+        (health.active_revision_id, health.pending_changes)
+    };
+
+    assert_eq!(
+        summary(DiagnosticsAudience::Principal(ALICE.into())),
+        (Some("rev-alice".into()), 1)
+    );
+    assert_eq!(
+        summary(DiagnosticsAudience::Principal(CAROL.into())),
+        (Some("rev-base".into()), 0),
+        "an undiverged user runs the baseline"
+    );
+    assert_eq!(
+        summary(DiagnosticsAudience::Machine),
+        (Some("rev-bob".into()), 3)
     );
 }

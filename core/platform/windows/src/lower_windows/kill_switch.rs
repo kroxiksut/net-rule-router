@@ -176,9 +176,8 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
             ));
         }
     }
-    // The ALE fail-closed set carries at most one protocol narrow (the codegen
-    // collapses TCP/UDP into a single `ale_protocol`), so the plain `+ idx`
-    // weight — the codegen's exact formula — cannot collide across groups.
+    // The plain `+ idx` weight is the codegen's formula and repeats across
+    // protocol groups; the id stays unique because it digests the protocol.
     for (proto, ips) in &fc_ale.groups {
         for (idx, chunk) in pack_both(ips.iter().copied()).iter().enumerate() {
             out.push(ale_set_filter(
@@ -282,7 +281,17 @@ pub(super) fn ale_set_filter(
         remote_ip_set_v6: members_v6,
         remote_port: None,
         weight,
-        id: derive_set_id(user_sid.as_deref(), layer, action, &chunk.id_seg(), weight),
+        id: derive_set_id(
+            user_sid.as_deref(),
+            SetFilterKey {
+                layer,
+                action,
+                seg: &chunk.id_seg(),
+                proto,
+                egress_luid,
+                weight,
+            },
+        ),
         user_sid,
         app_pattern: None,
         local_interface_luid: egress_luid,
@@ -311,7 +320,17 @@ pub(super) fn packet_set_filter(
         remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
-        id: derive_set_id(None, layer, action, &chunk.id_seg(), weight),
+        id: derive_set_id(
+            None,
+            SetFilterKey {
+                layer,
+                action,
+                seg: &chunk.id_seg(),
+                proto,
+                egress_luid,
+                weight,
+            },
+        ),
         user_sid: None,
         app_pattern: None,
         local_interface_luid: egress_luid,

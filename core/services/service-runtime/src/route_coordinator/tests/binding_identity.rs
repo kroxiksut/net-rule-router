@@ -20,7 +20,7 @@ fn named_adapter(friendly: &str, description: &str) -> nrr_platform_api::Adapter
 #[test]
 fn a_replacement_for_the_additional_route_leads_with_the_tunnels() {
     let infos = vec![
-        named_adapter("Ethernet", "Intel(R) Ethernet Connection"),
+        named_adapter("Ethernet", "Ethernet Connection"),
         named_adapter("my-tunnel", "WireGuard Tunnel"),
     ];
     let offered = replacement_candidates(&infos, "secondary");
@@ -72,7 +72,7 @@ fn a_physical_adapter_anchors_on_its_mac_and_is_found_by_it_after_a_guid_change(
         None,
     );
     nic.mac = Some([0x00, 0x11, 0x22, 0x33, 0x44, 0xAA]);
-    nic.description = "Realtek(R) PCI(e) Ethernet Controller".into();
+    nic.description = "Vendor PCI(e) Ethernet Controller".into();
     let anchor = mac_anchor_id(&nic).expect("a burned-in MAC is an anchor");
     assert_eq!(anchor, "win-mac:00-11-22-33-44-AA");
 
@@ -211,7 +211,7 @@ fn two_live_adapters_answering_to_the_saved_name_ask_the_user_instead_of_guessin
 }
 
 /// The vendor replaced its adapter outright: the bound GUID is gone and NO
-/// live name answers for it. The field case is swiftvpn switching from its
+/// live name answers for it. The field case is examplevpn switching from its
 /// OpenVPN adapter to a WireGuard tunnel — a different device with a different
 /// name, while the old one stays behind as a driver that will not start.
 ///
@@ -227,7 +227,7 @@ fn a_bound_adapter_that_no_longer_exists_asks_the_user_instead_of_going_quiet() 
     // What is left after the swap: the machine NIC and the new tunnel. Neither
     // shares a name with the binding.
     let mut nic = adapter("nic", 19, true, true, Some([192, 168, 0, 2]));
-    nic.description = "Realtek Gaming GbE".into();
+    nic.description = "Ethernet Controller".into();
     nic.friendly_name = "Ethernet".into();
     // The hard case: the replacement carries NOTHING of the vendor's name,
     // so no amount of token matching can tie it to the binding. A vendor
@@ -309,7 +309,7 @@ fn a_bound_adapter_whose_driver_will_not_start_is_reported_as_broken_not_gone() 
     let statuses = |port: Option<Arc<dyn NetworkDeviceStatusPort>>| -> Vec<String> {
         let api = Arc::new(MockWindowsApi::new());
         let mut nic = adapter("nic", 19, true, true, Some([192, 168, 0, 2]));
-        nic.description = "Realtek Gaming GbE".into();
+        nic.description = "Ethernet Controller".into();
         nic.friendly_name = "Ethernet".into();
         api.set_adapter_infos(vec![nic]);
         let policy = Arc::new(FakePolicy::new());
@@ -378,7 +378,7 @@ fn a_vendor_that_keeps_its_brand_across_a_transport_change_heals_without_asking(
 
     let api = Arc::new(MockWindowsApi::new());
     let mut nic = adapter("nic", 19, true, true, Some([192, 168, 0, 2]));
-    nic.description = "Realtek Gaming GbE".into();
+    nic.description = "Ethernet Controller".into();
     nic.friendly_name = "Ethernet".into();
     // OpenVPN adapter replaced by a WireGuard tunnel; only the brand survived.
     let mut tun = adapter("wg", 64, true, true, Some([10, 88, 0, 191]));
@@ -483,15 +483,15 @@ fn found_but_down_bound_adapter_heals_to_available_same_name_sibling() {
     // `down` = the bound (present-but-down) instance; `sibling` = a live
     // same-family adapter whose version token differs.
     let mut down = adapter("oldtap", 1, false, false, None);
-    down.description = "swiftvpn vpn 3.0 adapter".into();
+    down.description = "examplevpn vpn 3.0 adapter".into();
     down.friendly_name = down.description.clone();
     let mut sibling = adapter("newtap", 2, true, true, Some([10, 0, 0, 1]));
-    sibling.description = "swiftvpn vpn adapter".into();
+    sibling.description = "examplevpn vpn adapter".into();
     sibling.friendly_name = sibling.description.clone();
     api.set_adapter_infos(vec![down, sibling]);
 
     let policy = Arc::new(FakePolicy::new());
-    policy.bind_secondary_named("S-DOWN", "win-adapter:oldtap", "swiftvpn vpn 3.0 adapter");
+    policy.bind_secondary_named("S-DOWN", "win-adapter:oldtap", "examplevpn vpn 3.0 adapter");
 
     let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let cap = Arc::clone(&captured);
@@ -515,7 +515,7 @@ fn found_but_down_bound_adapter_heals_to_available_same_name_sibling() {
     assert_eq!(c.len(), 1, "the healed sibling id is persisted once");
     assert_eq!(
         c[0],
-        "S-DOWN|secondary|win-adapter:newtap|swiftvpn vpn adapter"
+        "S-DOWN|secondary|win-adapter:newtap|examplevpn vpn adapter"
     );
 }
 

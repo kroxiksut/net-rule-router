@@ -88,7 +88,7 @@ const HELP_MENU_ITEMS: [MenuItem; 4] = [
     },
     MenuItem {
         action: AppAction::CheckForUpdates,
-        availability: MenuAvailability::Preview,
+        availability: MenuAvailability::Enabled,
     },
 ];
 
@@ -202,7 +202,6 @@ const INFORMATION_ARCHITECTURE: InformationArchitecture = InformationArchitectur
 };
 
 const TRAY_MENU: TrayMenuModel = TrayMenuModel {
-    status_line: "Preview mode: policy changes are not applied in block 2 shell.",
     primary_actions: &TRAY_PRIMARY_ACTIONS,
     quick_actions: &TRAY_QUICK_ACTIONS,
 };
@@ -424,9 +423,6 @@ const SETTINGS_CONTRACT: SettingsContract = SettingsContract {
 };
 
 const ABOUT_CONTRACT: AboutContract = AboutContract {
-    product_name: crate::product_identity::PRODUCT_NAME,
-    edition: "",
-    license: "MPL-2.0",
     project_url: "https://github.com/kroxiksut/net-rule-router",
     build_channel: "development",
     author: "Fyodor Malkov (kroxiksut)",
@@ -692,65 +688,10 @@ const UI_SURFACE_CONTRACT: UiSurfaceContract = UiSurfaceContract {
     surfaces: &UI_SURFACE_SPECS,
 };
 
-const FIRST_RUN_STEPS: [FirstRunStepSpec; 6] = [
-    FirstRunStepSpec {
-        id: FirstRunStepId::Welcome,
-        required: true,
-    },
-    FirstRunStepSpec {
-        id: FirstRunStepId::BasicScenarioSelection,
-        required: true,
-    },
-    FirstRunStepSpec {
-        id: FirstRunStepId::RoutesSetup,
-        required: true,
-    },
-    FirstRunStepSpec {
-        id: FirstRunStepId::RulesSetup,
-        required: true,
-    },
-    FirstRunStepSpec {
-        id: FirstRunStepId::DiagnosticsPreview,
-        required: true,
-    },
-    FirstRunStepSpec {
-        id: FirstRunStepId::Finish,
-        required: true,
-    },
-];
-
-const FIRST_RUN_SCENARIOS: [FirstRunScenarioId; 2] = [
-    FirstRunScenarioId::QuickStart,
-    FirstRunScenarioId::GuidedDefault,
-];
-
 const QUICK_START_PATH: [AppSection; 3] = [
     AppSection::InterfacesAndRoutes,
     AppSection::Rules,
     AppSection::Diagnostics,
-];
-
-const STARTUP_STATES: [SectionStartupState; 4] = [
-    SectionStartupState {
-        section: AppSection::InterfacesAndRoutes,
-        state: StartupDataState::SemiEmpty,
-        note: "Interfaces are visible; primary/secondary candidates are not selected yet.",
-    },
-    SectionStartupState {
-        section: AppSection::Rules,
-        state: StartupDataState::Empty,
-        note: "Rules list starts empty before first import or manual creation.",
-    },
-    SectionStartupState {
-        section: AppSection::Diagnostics,
-        state: StartupDataState::SemiEmpty,
-        note: "Diagnostics starts with minimal placeholders until user runs checks.",
-    },
-    SectionStartupState {
-        section: AppSection::Logs,
-        state: StartupDataState::Empty,
-        note: "Logs table can be empty on first launch before events are generated.",
-    },
 ];
 
 const FIRST_RUN_ACTION_GATES: [SetupActionGate; 9] = [
@@ -793,14 +734,8 @@ const FIRST_RUN_ACTION_GATES: [SetupActionGate; 9] = [
 ];
 
 const FIRST_RUN_CONTRACT: FirstRunContract = FirstRunContract {
-    steps: &FIRST_RUN_STEPS,
-    scenarios: &FIRST_RUN_SCENARIOS,
-    default_scenario: FirstRunScenarioId::QuickStart,
     quick_start_path_sections: &QUICK_START_PATH,
-    startup_states: &STARTUP_STATES,
     action_gates_before_completion: &FIRST_RUN_ACTION_GATES,
-    list_editing_preview_notice:
-        "Opening or editing a list in first-run is preview/setup only and does not mean service policy was applied.",
     completion_notice:
         "First-run completion opens interfaces/routes first; rule and diagnostics screens stay immediately available from sidebar.",
 };

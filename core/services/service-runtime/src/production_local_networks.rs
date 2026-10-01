@@ -233,7 +233,8 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
                         msg_key = "prod-networks-store-decision-failed",
                         sid = %sid,
                         cidr = %rule.cidr,
-                        "could not store the local-network decision: {e}",
+                        error = %e,
+                        "could not store the local-network decision",
                     );
                     continue;
                 }
@@ -247,7 +248,8 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
                         msg_key = "prod-networks-prune-superseded-failed",
                         sid = %sid,
                         adapter = %rule.adapter,
-                        "could not prune superseded local-network answers: {e}",
+                        error = %e,
+                        "could not prune superseded local-network answers",
                     );
                 }
             }
@@ -309,7 +311,8 @@ impl crate::ipc_handlers::providers::RefusingAnchorsWriter for ProductionRefusin
                 target: "nrr::auto-rules",
                 msg_key = "prod-networks-refusing-anchor-store-failed",
                 sid = %sid,
-                "could not record that a site refuses main-link addresses: {e}",
+                error = %e,
+                "could not record that a site refuses main-link addresses",
             );
         }
         nrr_shared::ipc_payloads::RefusingAnchorSetResponse {
@@ -453,7 +456,7 @@ mod tests {
                 "{good}"
             );
         }
-        for bad in ["203.0.113.0/24", "8.8.8.0/24", "172.32.0.0/16"] {
+        for bad in ["203.0.113.0/24", "198.51.100.0/24", "172.32.0.0/16"] {
             assert!(
                 !is_private(Ipv4Network::parse(bad).expect("parse")),
                 "{bad}"

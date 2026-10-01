@@ -1,275 +1,69 @@
-//! Schema migration runner for the sidecar database.
-//!
-//! Mirrors the convention of `nrr-storage::migration`:
-//!
-//! * `schema_migrations` stores one row per applied migration with name,
-//!   checksum and the `app_version` of the binary that ran it.
-//! * The version read, the history check and every pending migration run in
-//!   ONE immediate transaction. The GUI and the tray open this file from two
-//!   processes, often in the same second on a fresh install; a version read
-//!   outside the write lock let both see 0 and the loser re-ran the DDL.
-//! * Stored checksums are re-validated on every open; drift is fatal.
-//! * Downgrades are refused — a version above [`LATEST_SCHEMA_VERSION`]
-//!   means a newer build wrote the file.
+//! Schema migrations of the sidecar database, run by the shared runner in
+//! `nrr-sqlite-support` (one immediate transaction, checksums re-validated on
+//! every open, downgrades refused).
 //!
 //! The contents are rebuildable, yet corruption is treated strictly: silently
 //! truncating user-typed comments is worse than refusing to open.
 
-use std::time::SystemTime;
-
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use nrr_sqlite_support::{Migration, MigrationError};
+use rusqlite::Connection;
 
 use crate::error::{SidecarError, SidecarResult};
 use crate::schema::{SIDECAR_DB_V1_DDL, SIDECAR_DB_V2_DDL, SIDECAR_DB_V3_DDL};
 
-/// Latest schema version this binary knows how to produce or open.
-///
-/// Incrementing this constant **must** be paired with adding a new
-/// entry at the tail of [`MIGRATIONS`] — the runner refuses to start
-/// if the on-disk version exceeds the highest registered migration.
+/// Latest schema version this binary knows how to produce or open: the last
+/// entry of [`MIGRATIONS`].
 pub const LATEST_SCHEMA_VERSION: u32 = 3;
 
-/// Bootstrap DDL for the `schema_migrations` bookkeeping table.
-/// Idempotent so the runner can call it on every open without
-/// guarding for "already created".
-const CREATE_SCHEMA_MIGRATIONS: &str = "
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version     INTEGER PRIMARY KEY,
-    name        TEXT    NOT NULL,
-    applied_at  INTEGER NOT NULL,
-    checksum    TEXT    NOT NULL,
-    app_version TEXT    NOT NULL
-)";
-
-/// A single versioned migration step.
-#[derive(Clone, Copy)]
-struct MigrationDef {
-    version: u32,
-    name: &'static str,
-    /// Individual SQL statements executed in order inside the same
-    /// transaction as the `schema_migrations` INSERT. The checksum
-    /// is computed over this slice; reordering statements without
-    /// bumping the version is a corruption signal at next open.
-    stmts: &'static [&'static str],
-}
-
-/// Ordered catalogue of every migration this binary can apply.
-/// Adding a new entry: append at the tail, bump
-/// [`LATEST_SCHEMA_VERSION`], never mutate existing entries.
-const MIGRATIONS: &[MigrationDef] = &[
-    MigrationDef {
+/// Append only; never edit an entry that has shipped.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
         version: 1,
         name: "initial_sidecar_schema",
         stmts: SIDECAR_DB_V1_DDL,
     },
-    MigrationDef {
+    Migration {
         version: 2,
         name: "external_ip_cache",
         stmts: SIDECAR_DB_V2_DDL,
     },
-    MigrationDef {
+    Migration {
         version: 3,
         name: "pending_apply_without_rules_snapshot",
         stmts: SIDECAR_DB_V3_DDL,
     },
 ];
 
-/// Outcome of [`migrate`] — surfaced for diagnostics and tests; not
-/// consumed by the GUI runtime, which only cares about success.
+/// Outcome of [`migrate`] — for diagnostics and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationSummary {
-    /// Schema version recorded in the database **before** the run.
-    /// Zero on a freshly created sidecar (no migrations applied yet).
+    /// Zero on a freshly created sidecar.
     pub from_version: u32,
-    /// Schema version recorded in the database **after** the run.
-    /// Always ≥ `from_version`; equal when no pending migrations
-    /// existed.
     pub to_version: u32,
-    /// Names of migrations applied during this call, in order.
-    /// Empty when the database was already up to date.
+    /// Names of the migrations this call applied, in order.
     pub migrations_applied: Vec<String>,
 }
 
-/// Apply any pending schema migrations on `conn`.
-///
-/// Inside one `BEGIN IMMEDIATE` transaction:
-///
-/// 1. Ensure the `schema_migrations` table exists.
-/// 2. Read the current version (`MAX(version)`); zero when empty.
-/// 3. Refuse a version above [`LATEST_SCHEMA_VERSION`]
-///    ([`SidecarError::SchemaTooNew`]) — before the history is judged, so a
-///    database from a newer build is named as such.
-/// 4. Re-validate the applied history: a changed checksum OR a missing row
-///    below the maximum is [`SidecarError::MigrationCorrupted`].
-/// 5. Apply each pending migration and its bookkeeping row, then commit.
-///
-/// A second opener blocks on the write lock (the caller's `busy_timeout`) and
-/// then reads the version the first one committed.
+/// Apply any pending schema migrations on `conn`. The GUI and the tray open
+/// this file from two processes, often in the same second on a fresh install;
+/// the second one waits on the write lock and then finds nothing to do.
 pub fn migrate(conn: &mut Connection) -> SidecarResult<MigrationSummary> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    ensure_migrations_table(&tx)?;
-    let from_version = current_version(&tx)?;
-
-    // Before the history is validated. A database written by a NEWER build
-    // carries migrations this one has never heard of, and "you are running an
-    // older binary" is the diagnosis the caller can act on.
-    if from_version > LATEST_SCHEMA_VERSION {
-        return Err(SidecarError::SchemaTooNew {
-            found: from_version,
-            supported: LATEST_SCHEMA_VERSION,
-        });
-    }
-
-    validate_applied_checksums(&tx, from_version)?;
-
-    let pending: Vec<&MigrationDef> = MIGRATIONS
-        .iter()
-        .filter(|m| m.version > from_version)
-        .collect();
-
-    let mut applied = Vec::with_capacity(pending.len());
-    for migration in &pending {
-        apply_migration(&tx, migration)?;
-        applied.push(migration.name.to_string());
-    }
-    tx.commit()?;
-
-    let to_version = pending.last().map(|m| m.version).unwrap_or(from_version);
-
+    let outcome = nrr_sqlite_support::migrate(conn, MIGRATIONS).map_err(|e| match e {
+        MigrationError::Sqlite(e) | MigrationError::StepFailed { source: e, .. } => {
+            SidecarError::Sqlite(e)
+        }
+        MigrationError::SchemaTooNew { found, supported } => {
+            SidecarError::SchemaTooNew { found, supported }
+        }
+        other => SidecarError::MigrationCorrupted {
+            detail: other.to_string(),
+        },
+    })?;
     Ok(MigrationSummary {
-        from_version,
-        to_version,
-        migrations_applied: applied,
+        from_version: outcome.from_version,
+        to_version: outcome.to_version,
+        migrations_applied: outcome.applied.into_iter().map(str::to_owned).collect(),
     })
-}
-
-/// Idempotent bootstrap for the bookkeeping table itself.
-fn ensure_migrations_table(conn: &Connection) -> SidecarResult<()> {
-    conn.execute_batch(CREATE_SCHEMA_MIGRATIONS)?;
-    Ok(())
-}
-
-/// Read the highest applied version from `schema_migrations`.
-///
-/// Returns zero when the table does not exist (freshly created
-/// database) or contains no rows (extremely rare race between
-/// `ensure_migrations_table` and the first migration commit).
-fn current_version(conn: &Connection) -> SidecarResult<u32> {
-    let table_exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-             WHERE type = 'table' AND name = 'schema_migrations'",
-        [],
-        |r| r.get(0),
-    )?;
-    if table_exists == 0 {
-        return Ok(0);
-    }
-    let max_version: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
-        |r| r.get(0),
-    )?;
-    // Not `unwrap_or(0)`. A version this build cannot make sense of used to
-    // read as "fresh database", so the v1 DDL ran again and the caller got
-    // `table already exists` from SQLite instead of a typed answer about the
-    // schema — the one thing the version column is for.
-    u32::try_from(max_version).map_err(|_| SidecarError::MigrationCorrupted {
-        detail: format!("schema_migrations holds an impossible version {max_version}"),
-    })
-}
-
-/// Re-compute checksums for migrations already applied and compare
-/// against the stored values. A mismatch indicates somebody (or
-/// somebody's editor + git merge) altered a migration's SQL after
-/// the database had already applied it, and proceeding without
-/// alerting the user would corrupt schema invariants on the next
-/// run.
-fn validate_applied_checksums(conn: &Connection, applied_up_to: u32) -> SidecarResult<()> {
-    for migration in MIGRATIONS.iter().filter(|m| m.version <= applied_up_to) {
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT checksum FROM schema_migrations WHERE version = ?1",
-                params![i64::from(migration.version)],
-                |r| r.get(0),
-            )
-            .optional()?;
-        // A row missing BELOW the maximum means an earlier migration never ran:
-        // the version counter is `MAX(version)` and the runner only applies what
-        // is above it, so nothing would ever apply it and the schema is short
-        // whatever it created. Tolerating the `None` here made an interrupted
-        // upgrade look like a clean one.
-        let Some(stored) = stored else {
-            return Err(SidecarError::MigrationCorrupted {
-                detail: format!(
-                    "migration v{} ({}) is missing from the applied history while \
-                     v{applied_up_to} is recorded as applied",
-                    migration.version, migration.name,
-                ),
-            });
-        };
-        let computed = checksum_of(migration.stmts);
-        if stored != computed {
-            return Err(SidecarError::MigrationCorrupted {
-                detail: format!(
-                    "checksum mismatch for v{} ({}): stored={stored}, computed={computed}",
-                    migration.version, migration.name,
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Execute one migration step inside the caller's immediate transaction.
-fn apply_migration(conn: &Connection, migration: &MigrationDef) -> SidecarResult<()> {
-    for stmt in migration.stmts {
-        conn.execute_batch(stmt)?;
-    }
-    // IGNORE, not REPLACE: REPLACE overwrote the stored checksum of an
-    // already-applied migration — the guard defeated by the code it guards.
-    conn.execute(
-        "INSERT OR IGNORE INTO schema_migrations
-            (version, name, applied_at, checksum, app_version)
-            VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            i64::from(migration.version),
-            migration.name,
-            system_time_to_ms(SystemTime::now()),
-            checksum_of(migration.stmts),
-            env!("CARGO_PKG_VERSION"),
-        ],
-    )?;
-    Ok(())
-}
-
-/// FNV-1a 64-bit checksum over all statements, NUL-separated. The
-/// constant matches `nrr-storage::migration::checksum_of` so a future
-/// shared helper crate can absorb both without changing on-disk
-/// checksums.
-fn checksum_of(stmts: &[&str]) -> String {
-    const OFFSET: u64 = 14_695_981_039_346_656_037;
-    const PRIME: u64 = 1_099_511_628_211;
-    let mut h = OFFSET;
-    for stmt in stmts {
-        for b in stmt.bytes() {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(PRIME);
-        }
-        h ^= 0x00;
-        h = h.wrapping_mul(PRIME);
-    }
-    format!("{h:016x}")
-}
-
-/// Convert a `SystemTime` to milliseconds since UNIX epoch. A clock
-/// before the epoch (e.g. system clock reset to 1970) yields zero
-/// rather than panicking — the value is informational, not
-/// load-bearing.
-fn system_time_to_ms(t: SystemTime) -> i64 {
-    t.duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -277,6 +71,7 @@ fn system_time_to_ms(t: SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     fn open_in_memory() -> SidecarResult<Connection> {
         let conn = Connection::open_in_memory()?;
@@ -373,9 +168,7 @@ mod tests {
 
     /// A gap below the maximum is an interrupted upgrade: nothing will ever
     /// apply the missing migration, because the runner only looks above
-    /// `MAX(version)`. Same invariant as the service store's
-    /// `missing_migration_row_below_the_maximum_is_rejected`; the two runners
-    /// are copies by necessity, so each keeps its own test of the shared rule.
+    /// `MAX(version)`.
     #[test]
     fn a_gap_in_the_applied_history_is_rejected() -> SidecarResult<()> {
         let mut conn = open_in_memory()?;
@@ -458,5 +251,32 @@ mod tests {
         )?;
         assert_eq!(v, 1);
         Ok(())
+    }
+
+    #[test]
+    fn the_latest_version_is_the_last_migration() {
+        assert_eq!(
+            MIGRATIONS.last().map(|m| m.version),
+            Some(LATEST_SCHEMA_VERSION)
+        );
+    }
+
+    /// Existing sidecars store these; a changed value is a database that no
+    /// longer opens.
+    #[test]
+    fn shipped_migration_checksums_are_unchanged() {
+        let got: Vec<(u32, String)> = MIGRATIONS
+            .iter()
+            .map(|m| (m.version, nrr_sqlite_support::checksum(m.stmts)))
+            .collect();
+        let want = [
+            (1, "d80a0f4a3f2b0718"),
+            (2, "6c866594fe9fdcb4"),
+            (3, "7905dfe410d06a0e"),
+        ];
+        assert_eq!(got.len(), want.len());
+        for ((v, c), (wv, wc)) in got.iter().zip(want) {
+            assert_eq!((*v, c.as_str()), (wv, wc));
+        }
     }
 }

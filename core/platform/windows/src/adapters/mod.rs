@@ -49,7 +49,7 @@ mod tests {
         api.set_adapter_infos(vec![AdapterInfo {
             index: 5,
             adapter_name: "{5}".to_string(),
-            description: "Intel Ethernet".to_string(),
+            description: "Ethernet Controller".to_string(),
             friendly_name: "Ethernet".to_string(),
             mac: Some([0xAA, 0xBB, 0xCC, 0, 0, 5]),
             interface_type: InterfaceType::Ethernet,

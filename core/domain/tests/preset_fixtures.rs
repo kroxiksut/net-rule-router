@@ -10,10 +10,10 @@
 //! so the tests require no file-system access at runtime.
 
 use nrr_domain::{
-    preset_canonicalize::{canonicalize_preset_rules, PresetRulesCanonicalizeOutcome},
+    preset_canonicalize::canonicalize_preset_rules,
     preset_validation::{validate_preset_bytes, PresetFileValidationOutcome, PresetImportWarning},
     rules_file::HostPlatform,
-    validation::{ValidationError, ValidationWarning},
+    validation::ValidationWarning,
 };
 use nrr_shared::RouteRole;
 
@@ -104,9 +104,11 @@ fn disabled_rules_only_is_accepted_with_no_active_rules() {
     );
 }
 
-/// A bare `*` glob in the Windows section is a blocking semantic error.
+/// A bare `*` glob in the Windows section is dropped with a warning — the
+/// same policy as an address that is never a destination — and the rest of
+/// the file still imports.
 #[test]
-fn bare_glob_in_windows_section_is_rejected_at_canonicalize() {
+fn bare_glob_in_windows_section_is_dropped_and_the_rest_imports() {
     let outcome = validate_preset_bytes(NEG_BARE_GLOB);
     // Validation layer accepts it (no byte-level problem).
     assert!(
@@ -122,18 +124,19 @@ fn bare_glob_in_windows_section_is_rejected_at_canonicalize() {
         false,
     );
     assert!(
-        !canon.is_accepted(),
-        "bare `*` glob must be rejected at canonicalization"
+        canon.is_accepted(),
+        "the rest of the file must still import: {canon:?}"
     );
-
-    if let PresetRulesCanonicalizeOutcome::Rejected { errors } = &canon {
-        assert!(
-            errors
-                .iter()
-                .any(|e| matches!(e, ValidationError::AppGlobTooWide { .. })),
-            "expected AppGlobTooWide error, got: {errors:?}"
-        );
-    }
+    let rule_set = canon.rule_set().expect("accepted");
+    assert_eq!(rule_set.len(), 1, "only the domain rule survives");
+    assert!(
+        canon
+            .warnings()
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::AppPatternRefusedDropped { value, .. } if value == "*")),
+        "expected AppPatternRefusedDropped warning, got: {:?}",
+        canon.warnings()
+    );
 }
 
 /// An IPv6 address in the IP section is an exact-address rule like any other.

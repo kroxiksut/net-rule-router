@@ -1,28 +1,13 @@
-//! Interfaces & routes *preview* layer.
+//! Interfaces & routes snapshot for the desktop.
 //!
-//! The adapter rich-row enrichment SSOT (the [`InterfaceRouteRow`] type,
-//! its sub-structs/enums, and the `build_*`/`collect_*`/`fallback_rows`
-//! builders) lives in [`nrr_platform_api::interface_rows`] so the Windows
-//! service can build identical rows without depending on this preview
-//! crate. It is re-exported below so every existing call site
-//! (`ui_surface.rs`, the `nrr-application` backend facade, this module's
-//! own preview logic, and the tests) keeps compiling unchanged.
-//!
-//! What stays here is the *preview-only* layer: route-role selection,
-//! the advisory recommendation scoring engine, and the per-adapter
-//! diagnostics checks — all driven by a [`RouteSelectionRequest`] and
-//! never run by the service path.
+//! The row type, its enrichment, the recommendation and the binding resolver
+//! live in [`nrr_platform_api::interface_rows`] (re-exported here), shared
+//! with the service so a row reads alike whichever side produced it. What
+//! stays here is the desktop's half: applying the user's role bindings.
 
 pub use nrr_platform_api::interface_rows::*;
 
-use nrr_shared::{
-    AdapterCheckActionId, AdapterCheckResultStatus, ConnectivityState, DerivedLikelihood,
-    ExternalIpStatus, RecommendationClass, RecommendationConfidence, RouteBehaviorMode, RouteRole,
-    RouteSelectionState,
-};
-
-pub const INTERFACES_ROLE_EXPLANATION: &str =
-    "Primary route is the default preferred interface; secondary route is the fallback route.";
+use nrr_shared::{RouteBehaviorMode, RouteRole, RouteSelectionState};
 
 const SUPPORTED_ROUTE_BEHAVIOR_MODES: [RouteBehaviorMode; 3] = [
     RouteBehaviorMode::PreferPrimary,
@@ -30,6 +15,7 @@ const SUPPORTED_ROUTE_BEHAVIOR_MODES: [RouteBehaviorMode; 3] = [
     RouteBehaviorMode::StrictSecondaryFailClosed,
 ];
 
+/// The user's saved role bindings. A binding counts only once confirmed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteSelectionRequest {
     pub primary_candidate_id: Option<String>,
@@ -38,7 +24,6 @@ pub struct RouteSelectionRequest {
     pub secondary_candidate_id: Option<String>,
     pub secondary_candidate_name: Option<String>,
     pub secondary_candidate_confirmed: bool,
-    pub include_bluetooth_adapters: bool,
     pub behavior_mode: RouteBehaviorMode,
 }
 
@@ -51,7 +36,6 @@ impl Default for RouteSelectionRequest {
             secondary_candidate_id: None,
             secondary_candidate_name: None,
             secondary_candidate_confirmed: false,
-            include_bluetooth_adapters: false,
             behavior_mode: RouteBehaviorMode::default_when_secondary_unbound(),
         }
     }
@@ -60,225 +44,113 @@ impl Default for RouteSelectionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfacesRoutesPreviewSnapshot {
     pub data_source: InterfacesDataSource,
-    pub role_explanation: &'static str,
     pub supported_behavior_modes: &'static [RouteBehaviorMode],
     pub selected_behavior_mode: RouteBehaviorMode,
-    pub role_assignment_advisory: RoleAssignmentAdvisory,
     pub rows: Vec<InterfaceRouteRow>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AdapterCheckResult {
-    pub action: AdapterCheckActionId,
-    pub status: AdapterCheckResultStatus,
-    pub explanation: String,
-    pub read_only: bool,
-    pub requires_service_mediation: bool,
+/// This host's adapter enumeration: the one place the desktop side picks it.
+pub fn local_interface_rows() -> &'static dyn InterfaceRowsPort {
+    #[cfg(windows)]
+    {
+        &nrr_platform_windows::WindowsInterfaceRows
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &nrr_platform_linux::interface_rows::LinuxInterfaceRows
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        &PlaceholderInterfaceRows
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InterfaceDiagnosticsChecksRow {
-    pub persistent_id: String,
-    pub windows_name: String,
-    pub checks: Vec<AdapterCheckResult>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InterfaceDiagnosticsChecksSnapshot {
-    pub data_source: InterfacesDataSource,
-    pub rows: Vec<InterfaceDiagnosticsChecksRow>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoleAssignmentAdvisory {
-    pub manual_confirmation_required: bool,
-    pub user_choice_priority_note: String,
-    pub conflict_warning: Option<String>,
-    pub warnings: Vec<String>,
-}
-
+/// This host's adapters, scored and bound. Never probes the external address.
 pub fn interfaces_routes_preview_snapshot(
     request: RouteSelectionRequest,
 ) -> InterfacesRoutesPreviewSnapshot {
-    // Preview path never runs an external-IP probe. The live enumeration is
-    // Windows-only (`nrr-platform-windows`); off Windows the preview uses the
-    // neutral deterministic fallback dataset.
-    #[cfg(windows)]
-    let (data_source, rows) = nrr_platform_windows::collect_interfaces_rows(false);
-    #[cfg(not(windows))]
-    let (data_source, rows) = (InterfacesDataSource::FallbackMock, fallback_rows());
-    build_preview_snapshot(data_source, rows, &request)
+    interfaces_snapshot_from(local_interface_rows(), &request)
 }
 
-/// Decorate externally-supplied rows (e.g. a snapshot pulled from the
-/// service over IPC) with the preview engine's advisory recommendations and
-/// the request's explicit role assignment, exactly as
-/// [`interfaces_routes_preview_snapshot`] does for locally-enumerated rows.
-/// This lets the IPC facade treat the service as the single source of truth
-/// for the adapter list while still rendering a fully-decorated snapshot.
-///
-/// `data_source` is the provenance the SUPPLIER reported. It is a parameter
-/// and not a constant because the service answers with a deterministic
-/// placeholder dataset whenever its own live enumeration came back empty;
-/// stamping every incoming row `WindowsLive` turned that placeholder into
-/// four invented adapters the user could bind a route to.
-pub fn decorate_interface_rows(
-    rows: Vec<InterfaceRouteRow>,
+/// [`interfaces_routes_preview_snapshot`] over any enumeration.
+pub fn interfaces_snapshot_from(
+    port: &dyn InterfaceRowsPort,
     request: &RouteSelectionRequest,
-    data_source: InterfacesDataSource,
 ) -> InterfacesRoutesPreviewSnapshot {
-    build_preview_snapshot(data_source, rows, request)
+    let (data_source, rows) = port.collect_rows(false);
+    decorate_interface_rows(rows, request, data_source)
 }
 
-fn build_preview_snapshot(
-    data_source: InterfacesDataSource,
+/// Score `rows` and apply the request's bindings, exactly as for a local
+/// enumeration. `data_source` is the provenance the supplier reported: a
+/// service whose enumeration came back empty answers with the placeholder
+/// set, and only it knows which happened.
+pub fn decorate_interface_rows(
     mut rows: Vec<InterfaceRouteRow>,
     request: &RouteSelectionRequest,
+    data_source: InterfacesDataSource,
 ) -> InterfacesRoutesPreviewSnapshot {
-    if !request.include_bluetooth_adapters {
-        // A row the user CONFIRMED for a role survives the filter whatever the
-        // toggle says. `is_bluetooth_like` is a substring guess ("pan" matches
-        // more than Bluetooth PAN), and dropping the confirmed adapter on a
-        // false positive made it vanish from the screen under "Confirmed
-        // primary adapter is currently unavailable in this snapshot" — a
-        // message about an adapter that is present and working. It also made
-        // the "confirmed primary uses Bluetooth" warning unreachable: the row
-        // it warns about had already been removed.
-        rows.retain(|row| !row.is_bluetooth_like || is_confirmed_for_a_role(row, request));
-    }
-    assign_recommendations(&mut rows, request);
-    let role_assignment_advisory = assign_preview_roles(&mut rows, request);
-
+    assign_recommendations(&mut rows);
+    apply_role_bindings(&mut rows, request);
     InterfacesRoutesPreviewSnapshot {
         data_source,
-        role_explanation: INTERFACES_ROLE_EXPLANATION,
         supported_behavior_modes: &SUPPORTED_ROUTE_BEHAVIOR_MODES,
         selected_behavior_mode: request.behavior_mode,
-        role_assignment_advisory,
         rows,
     }
 }
 
-pub fn interface_diagnostics_checks_snapshot(
-    request: RouteSelectionRequest,
-) -> InterfaceDiagnosticsChecksSnapshot {
-    interface_diagnostics_checks_from(&interfaces_routes_preview_snapshot(request))
-}
-
-/// Derives the per-adapter checks from an ALREADY-TAKEN interfaces snapshot.
-///
-/// Every check reads only the row it is given, so a caller that already holds a
-/// snapshot must not enumerate the adapters again: on Windows one snapshot is
-/// two `GetAdaptersAddresses` plus `GetIpForwardTable` plus `GetAdaptersInfo`,
-/// and taking a second one also means the rows and the checks describe two
-/// DIFFERENT moments — a tunnel that came up in between showed as present in
-/// one list and absent in the other.
-pub fn interface_diagnostics_checks_from(
-    snapshot: &InterfacesRoutesPreviewSnapshot,
-) -> InterfaceDiagnosticsChecksSnapshot {
-    interface_diagnostics_checks_from_rows(snapshot.data_source, &snapshot.rows)
-}
-
-/// Same derivation over an explicit row set, for a caller that has to narrow
-/// the rows first (the desktop hides Bluetooth-like adapters unless asked).
-pub fn interface_diagnostics_checks_from_rows(
-    data_source: InterfacesDataSource,
-    rows: &[InterfaceRouteRow],
-) -> InterfaceDiagnosticsChecksSnapshot {
-    let rows = rows
-        .iter()
-        .map(|row| InterfaceDiagnosticsChecksRow {
-            persistent_id: row.persistent_id.clone(),
-            windows_name: row.windows_name.clone(),
-            checks: evaluate_adapter_checks(row),
-        })
-        .collect::<Vec<_>>();
-
-    InterfaceDiagnosticsChecksSnapshot { data_source, rows }
-}
-
-/// Did the user confirm this row for either role?
-///
-/// Matched the way the resolvers match — id first, then name — so "the user
-/// picked this one" means the same thing here as where the role is assigned.
-fn is_confirmed_for_a_role(row: &InterfaceRouteRow, request: &RouteSelectionRequest) -> bool {
-    let named = |confirmed: bool, id: Option<&str>, name: Option<&str>| {
-        confirmed
-            && (id.map(str::trim).is_some_and(|value| {
-                !value.is_empty() && row.persistent_id.eq_ignore_ascii_case(value)
-            }) || name.map(str::trim).is_some_and(|value| {
-                !value.is_empty() && row.windows_name.eq_ignore_ascii_case(value)
-            }))
-    };
-    named(
-        request.primary_candidate_confirmed,
-        request.primary_candidate_id.as_deref(),
-        request.primary_candidate_name.as_deref(),
-    ) || named(
-        request.secondary_candidate_confirmed,
-        request.secondary_candidate_id.as_deref(),
-        request.secondary_candidate_name.as_deref(),
-    )
-}
-
-/// Would the router actually route through this adapter?
-///
-/// `has_forwarding_path` is the platform layer's own answer, computed for
-/// exactly the case a visible default route misses: OpenVPN / WireGuard TUN
-/// links install split-defaults pointing at the tunnel PEER and report no
-/// gateway at all, so judging them by `has_default_route` alone called a
-/// perfectly healthy tunnel degraded — the one thing
-/// `nrr_platform_api::interface_rows` promises the GUI will never do. `None`
-/// means the layer could not tell, and then the visible default route is the
-/// best evidence there is.
-fn carries_traffic(row: &InterfaceRouteRow) -> bool {
-    row.has_forwarding_path.unwrap_or(row.has_default_route)
-}
-
-/// A link that routes without advertising a gateway — the shape that made the
-/// old check wrong, kept separate so the reason reaches the user.
-fn routes_without_a_gateway(row: &InterfaceRouteRow) -> bool {
-    carries_traffic(row) && !(row.has_default_route && row.gateway != "-")
-}
-
-fn assign_preview_roles(
-    rows: &mut [InterfaceRouteRow],
-    request: &RouteSelectionRequest,
-) -> RoleAssignmentAdvisory {
+/// Mark the rows the user's confirmed bindings resolve to. Heuristics never
+/// assign a role.
+fn apply_role_bindings(rows: &mut [InterfaceRouteRow], request: &RouteSelectionRequest) {
     for row in rows.iter_mut() {
         row.selected_role = None;
         row.route_state = baseline_route_state(row);
     }
 
-    let primary_index = resolve_explicit_primary_index(rows, request);
+    let primary_index = request
+        .primary_candidate_confirmed
+        .then(|| {
+            find_adapter_index(
+                rows,
+                request.primary_candidate_id.as_deref(),
+                request.primary_candidate_name.as_deref(),
+                None,
+            )
+        })
+        .flatten();
     if let Some(index) = primary_index {
         rows[index].selected_role = Some(RouteRole::Primary);
-        if matches!(rows[index].route_state, RouteSelectionState::NotSelected) {
+        if rows[index].route_state == RouteSelectionState::NotSelected {
             rows[index].route_state = RouteSelectionState::Selected;
         }
     }
 
-    let secondary_index = resolve_explicit_secondary_index(rows, request, primary_index);
+    let secondary_index = request
+        .secondary_candidate_confirmed
+        .then(|| {
+            find_adapter_index(
+                rows,
+                request.secondary_candidate_id.as_deref(),
+                request.secondary_candidate_name.as_deref(),
+                primary_index,
+            )
+        })
+        .flatten();
     if let Some(index) = secondary_index {
         rows[index].selected_role = Some(RouteRole::Secondary);
         rows[index].route_state = secondary_state_for_row(&rows[index], request.behavior_mode);
     }
-
-    // Heuristics remain advisory-only; no implicit assignment here.
-    build_role_assignment_advisory(rows, request, primary_index, secondary_index)
 }
 
 fn baseline_route_state(row: &InterfaceRouteRow) -> RouteSelectionState {
     match row.availability_status {
         BasicAvailabilityStatus::Unavailable => RouteSelectionState::Unavailable,
         BasicAvailabilityStatus::RequiresCheck => RouteSelectionState::RequiresVerification,
-        BasicAvailabilityStatus::Available => {
-            if row.local_ip == "-" {
-                RouteSelectionState::RequiresVerification
-            } else {
-                RouteSelectionState::NotSelected
-            }
+        BasicAvailabilityStatus::Available if row.local_ip == "-" => {
+            RouteSelectionState::RequiresVerification
         }
+        BasicAvailabilityStatus::Available => RouteSelectionState::NotSelected,
     }
 }
 
@@ -287,689 +159,17 @@ fn secondary_state_for_row(
     behavior_mode: RouteBehaviorMode,
 ) -> RouteSelectionState {
     match row.availability_status {
-        BasicAvailabilityStatus::Unavailable => {
-            if matches!(behavior_mode, RouteBehaviorMode::StrictSecondaryFailClosed) {
-                RouteSelectionState::FailClosedConflict
-            } else {
-                RouteSelectionState::Unavailable
-            }
-        }
-        BasicAvailabilityStatus::RequiresCheck => RouteSelectionState::RequiresVerification,
-        BasicAvailabilityStatus::Available => {
-            if row.local_ip == "-" {
-                RouteSelectionState::RequiresVerification
-            } else {
-                RouteSelectionState::Selected
-            }
-        }
-    }
-}
-
-fn resolve_explicit_primary_index(
-    rows: &[InterfaceRouteRow],
-    request: &RouteSelectionRequest,
-) -> Option<usize> {
-    if !request.primary_candidate_confirmed {
-        return None;
-    }
-
-    if let Some(index) = resolve_id_index(rows, request.primary_candidate_id.as_deref(), None) {
-        return Some(index);
-    }
-
-    resolve_named_index(rows, request.primary_candidate_name.as_deref(), None)
-}
-
-fn resolve_explicit_secondary_index(
-    rows: &[InterfaceRouteRow],
-    request: &RouteSelectionRequest,
-    primary_index: Option<usize>,
-) -> Option<usize> {
-    if !request.secondary_candidate_confirmed {
-        return None;
-    }
-
-    if let Some(index) = resolve_id_index(
-        rows,
-        request.secondary_candidate_id.as_deref(),
-        primary_index,
-    ) {
-        return Some(index);
-    }
-
-    if let Some(index) = resolve_named_index(
-        rows,
-        request.secondary_candidate_name.as_deref(),
-        primary_index,
-    ) {
-        return Some(index);
-    }
-
-    None
-}
-
-fn resolve_id_index(
-    rows: &[InterfaceRouteRow],
-    persistent_id: Option<&str>,
-    excluded_index: Option<usize>,
-) -> Option<usize> {
-    let target = persistent_id?.trim();
-    if target.is_empty() {
-        return None;
-    }
-
-    rows.iter().enumerate().find_map(|(index, row)| {
-        if Some(index) == excluded_index {
-            return None;
-        }
-        if row.persistent_id.eq_ignore_ascii_case(target) {
-            Some(index)
-        } else {
-            None
-        }
-    })
-}
-
-fn resolve_named_index(
-    rows: &[InterfaceRouteRow],
-    name: Option<&str>,
-    excluded_index: Option<usize>,
-) -> Option<usize> {
-    let target = name?.trim();
-    if target.is_empty() {
-        return None;
-    }
-
-    rows.iter().enumerate().find_map(|(index, row)| {
-        if Some(index) == excluded_index {
-            return None;
-        }
-        if row.windows_name.eq_ignore_ascii_case(target) {
-            Some(index)
-        } else {
-            None
-        }
-    })
-}
-
-fn build_role_assignment_advisory(
-    rows: &[InterfaceRouteRow],
-    request: &RouteSelectionRequest,
-    primary_index: Option<usize>,
-    secondary_index: Option<usize>,
-) -> RoleAssignmentAdvisory {
-    let conflict_warning = if requested_same_adapter_for_both_roles(request) {
-        Some(
-            "Primary and secondary cannot be confirmed as the same adapter in default mode."
-                .to_string(),
-        )
-    } else {
-        None
-    };
-
-    let mut warnings = Vec::new();
-    if request.primary_candidate_confirmed && primary_index.is_none() {
-        warnings.push(
-            "Confirmed primary adapter is currently unavailable in this snapshot; selection is preserved until user changes it."
-                .to_string(),
-        );
-    }
-    if request.secondary_candidate_confirmed && secondary_index.is_none() {
-        warnings.push(
-            "Confirmed secondary adapter is currently unavailable (or conflicts with confirmed primary); selection is preserved until user changes it."
-                .to_string(),
-        );
-    }
-
-    if !request.secondary_candidate_confirmed
-        && !rows.iter().any(|row| {
-            row.recommendation.class == RecommendationClass::PreferredSecondary
-                && row.recommendation.confidence != RecommendationConfidence::Unknown
-        })
-    {
-        warnings.push(
-            "No suitable secondary candidate was found; manual confirmation is needed.".to_string(),
-        );
-    }
-
-    if let Some(index) = secondary_index {
-        let secondary = &rows[index];
-        if secondary.local_ip == "-" {
-            warnings.push(
-                "Confirmed secondary currently has no IP address; selection is preserved and marked for verification."
-                    .to_string(),
-            );
-        }
-        if secondary.recommendation.class == RecommendationClass::NotRecommended
-            || matches!(
-                secondary.observed_facts.connectivity_state,
-                ConnectivityState::Unavailable
-                    | ConnectivityState::Unknown
-                    | ConnectivityState::Timeout
-            )
+        BasicAvailabilityStatus::Unavailable
+            if behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed =>
         {
-            warnings.push(
-                "Confirmed secondary looks unstable or not recommended; selection is preserved, keep fallback expectations conservative."
-                    .to_string(),
-            );
+            RouteSelectionState::FailClosedConflict
         }
-        if secondary.is_bluetooth_like {
-            warnings.push(
-                "Confirmed secondary uses Bluetooth; this profile is allowed but not recommended for stable fallback routing."
-                    .to_string(),
-            );
+        BasicAvailabilityStatus::Unavailable => RouteSelectionState::Unavailable,
+        BasicAvailabilityStatus::RequiresCheck => RouteSelectionState::RequiresVerification,
+        BasicAvailabilityStatus::Available if row.local_ip == "-" => {
+            RouteSelectionState::RequiresVerification
         }
-    }
-
-    if let Some(index) = primary_index {
-        if rows[index].is_bluetooth_like {
-            warnings.push(
-                "Confirmed primary uses Bluetooth; this profile is allowed but not recommended for default routing."
-                    .to_string(),
-            );
-        }
-    }
-
-    RoleAssignmentAdvisory {
-        manual_confirmation_required: true,
-        user_choice_priority_note:
-            "User-confirmed role assignment has priority; recommendation is advisory-only."
-                .to_string(),
-        conflict_warning,
-        warnings,
-    }
-}
-
-/// Re-derivations of what the row already says — no packet is sent from here.
-///
-/// The wording matters because these strings reach the user verbatim: they used
-/// to claim a check had been performed ("connectivity check indicates…",
-/// `Timeout` for a timeout that never happened), so an adapter plugged into a
-/// switch with a dead uplink collected a green tick. Each explanation now says
-/// what it is actually based on — the interface's reported state — and the
-/// statuses no longer invent an outcome the code did not observe.
-fn evaluate_adapter_checks(row: &InterfaceRouteRow) -> Vec<AdapterCheckResult> {
-    vec![
-        evaluate_check_route(row),
-        evaluate_show_external_ip(row),
-        evaluate_check_internet_availability(row),
-    ]
-}
-
-fn evaluate_check_route(row: &InterfaceRouteRow) -> AdapterCheckResult {
-    let (status, explanation) = if row.availability_status == BasicAvailabilityStatus::Unavailable {
-        (
-            AdapterCheckResultStatus::Unavailable,
-            "Adapter is unavailable; route check cannot be completed.",
-        )
-    } else if matches!(
-        row.observed_facts.connectivity_state,
-        ConnectivityState::Timeout
-    ) {
-        (
-            AdapterCheckResultStatus::Timeout,
-            "The adapter reports a connectivity timeout, so its route cannot be judged.",
-        )
-    } else if row.has_default_route && row.gateway != "-" {
-        (
-            AdapterCheckResultStatus::Success,
-            "The adapter reports a default route and a gateway.",
-        )
-    } else if routes_without_a_gateway(row) {
-        (
-            AdapterCheckResultStatus::Success,
-            "The adapter advertises no gateway, but a usable forwarding path was found for it \
-             — the shape a VPN tunnel normally has.",
-        )
-    } else {
-        (
-            AdapterCheckResultStatus::Degraded,
-            "The adapter reports no default route, no gateway, and no usable forwarding path.",
-        )
-    };
-
-    AdapterCheckResult {
-        action: AdapterCheckActionId::CheckRoute,
-        status,
-        explanation: explanation.to_string(),
-        read_only: true,
-        requires_service_mediation: false,
-    }
-}
-
-fn evaluate_show_external_ip(row: &InterfaceRouteRow) -> AdapterCheckResult {
-    let (status, explanation) = match row.observed_facts.external_ip_status {
-        // `Resolved` with no address is not a success — it is a row that says
-        // one thing and carries another. It used to print "resolved: unknown".
-        ExternalIpStatus::Resolved => match row.observed_facts.external_ip.as_deref() {
-            Some(ip) => (
-                AdapterCheckResultStatus::Success,
-                format!("The adapter reports an external address: {ip}."),
-            ),
-            None => (
-                AdapterCheckResultStatus::Degraded,
-                "The adapter reports a resolved external address but carries none.".to_string(),
-            ),
-        },
-        ExternalIpStatus::NotChecked => (
-            AdapterCheckResultStatus::Degraded,
-            "No external address has been looked up for this adapter.".to_string(),
-        ),
-        ExternalIpStatus::CheckFailed | ExternalIpStatus::RateLimited => (
-            AdapterCheckResultStatus::Degraded,
-            "The last external-address lookup did not finish.".to_string(),
-        ),
-        ExternalIpStatus::Blocked => (
-            AdapterCheckResultStatus::Unavailable,
-            "External-address lookups are blocked in this environment.".to_string(),
-        ),
-    };
-
-    AdapterCheckResult {
-        action: AdapterCheckActionId::ShowExternalIp,
-        status,
-        explanation,
-        read_only: true,
-        requires_service_mediation: false,
-    }
-}
-
-fn evaluate_check_internet_availability(row: &InterfaceRouteRow) -> AdapterCheckResult {
-    let (status, explanation) = match row.observed_facts.connectivity_state {
-        ConnectivityState::Available => (
-            AdapterCheckResultStatus::Success,
-            "The adapter reports a usable connection.".to_string(),
-        ),
-        ConnectivityState::Degraded | ConnectivityState::Unknown => (
-            AdapterCheckResultStatus::Degraded,
-            "The adapter reports an uncertain connection; confirm it yourself.".to_string(),
-        ),
-        ConnectivityState::Unavailable => (
-            AdapterCheckResultStatus::Unavailable,
-            "The adapter reports no usable connection.".to_string(),
-        ),
-        ConnectivityState::Timeout => (
-            AdapterCheckResultStatus::Timeout,
-            "The adapter reports a connectivity timeout.".to_string(),
-        ),
-    };
-
-    AdapterCheckResult {
-        action: AdapterCheckActionId::CheckInternetAvailability,
-        status,
-        explanation,
-        read_only: true,
-        requires_service_mediation: false,
-    }
-}
-
-fn requested_same_adapter_for_both_roles(request: &RouteSelectionRequest) -> bool {
-    if request.primary_candidate_confirmed && request.secondary_candidate_confirmed {
-        if let (Some(primary_id), Some(secondary_id)) = (
-            request.primary_candidate_id.as_deref(),
-            request.secondary_candidate_id.as_deref(),
-        ) {
-            let primary_id = primary_id.trim();
-            let secondary_id = secondary_id.trim();
-            if !primary_id.is_empty() && primary_id.eq_ignore_ascii_case(secondary_id) {
-                return true;
-            }
-        }
-        if let (Some(primary_name), Some(secondary_name)) = (
-            request.primary_candidate_name.as_deref(),
-            request.secondary_candidate_name.as_deref(),
-        ) {
-            let primary_name = primary_name.trim();
-            let secondary_name = secondary_name.trim();
-            if !primary_name.is_empty() && primary_name.eq_ignore_ascii_case(secondary_name) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-#[derive(Clone, Debug)]
-struct RecommendationScore {
-    primary_score: i32,
-    secondary_score: i32,
-    blocked: bool,
-    confidence: RecommendationConfidence,
-    key_signals: Vec<String>,
-}
-
-fn assign_recommendations(rows: &mut [InterfaceRouteRow], request: &RouteSelectionRequest) {
-    // The SAME resolution the role assignment uses, so the pin that scores and
-    // the pin that gets the role can never be two different adapters. Matching
-    // "id or name" here instead let a stale name out of a renamed adapter hand
-    // the +5 and the tie-break to a row that holds no role.
-    let explicit = ExplicitChoices::resolve(rows, request);
-
-    let scores = rows
-        .iter()
-        .enumerate()
-        .map(|(index, row)| (index, evaluate_recommendation_score(row, index, explicit)))
-        .collect::<Vec<_>>();
-
-    let best_primary_index = scores
-        .iter()
-        .filter(|(_, score)| !score.blocked)
-        .max_by_key(|(index, score)| {
-            (
-                score.primary_score,
-                primary_tie_break_weight(&rows[*index], *index, explicit),
-            )
-        })
-        .map(|(index, _)| *index);
-
-    let best_secondary_index = scores
-        .iter()
-        .filter(|(index, score)| !score.blocked && Some(*index) != best_primary_index)
-        .max_by_key(|(index, score)| {
-            (
-                score.secondary_score,
-                secondary_tie_break_weight(&rows[*index], *index, explicit),
-            )
-        })
-        .map(|(index, _)| *index);
-
-    for (index, score) in scores {
-        let class = if score.blocked {
-            RecommendationClass::NotRecommended
-        } else if rows[index].is_bluetooth_like {
-            RecommendationClass::AllowedButNotRecommended
-        } else if Some(index) == best_primary_index && score.primary_score >= 6 {
-            RecommendationClass::PreferredPrimary
-        } else if Some(index) == best_secondary_index && score.secondary_score >= 5 {
-            RecommendationClass::PreferredSecondary
-        } else {
-            RecommendationClass::AllowedButNotRecommended
-        };
-
-        let mut excluded_alternatives = Vec::new();
-        if class != RecommendationClass::PreferredPrimary {
-            if let Some(best_index) = best_primary_index {
-                if best_index != index {
-                    excluded_alternatives.push(format!(
-                        "better-primary-candidate={}",
-                        rows[best_index].windows_name
-                    ));
-                }
-            }
-        }
-        if class != RecommendationClass::PreferredSecondary {
-            if let Some(best_index) = best_secondary_index {
-                if best_index != index {
-                    excluded_alternatives.push(format!(
-                        "better-secondary-candidate={}",
-                        rows[best_index].windows_name
-                    ));
-                }
-            }
-        }
-
-        rows[index].recommendation = RouteRoleRecommendation {
-            class,
-            confidence: score.confidence,
-            advisory_only: true,
-            summary: recommendation_summary_for_class(class),
-            key_signals: score.key_signals,
-            excluded_alternatives,
-        };
-    }
-}
-
-fn evaluate_recommendation_score(
-    row: &InterfaceRouteRow,
-    index: usize,
-    explicit: ExplicitChoices,
-) -> RecommendationScore {
-    let mut primary_score = 0;
-    let mut secondary_score = 0;
-    let mut key_signals = Vec::new();
-
-    let mut blocked = false;
-    if row.availability_status == BasicAvailabilityStatus::Unavailable {
-        blocked = true;
-        key_signals.push("blocked-unavailable-interface".to_string());
-    }
-    if row.runtime_data_unavailable {
-        // Every row reads "-" because the query failed. Blocking here would
-        // report "no usable adapter" for a machine whose link is fine.
-        key_signals.push("adapter-data-unreadable".to_string());
-    } else if row.local_ip == "-" {
-        blocked = true;
-        key_signals.push("blocked-missing-local-ip".to_string());
-    }
-    // Two of the three signals behind the service-interface verdict are "no
-    // gateway, no IP" and "connectivity unknown" — exactly what an unreadable
-    // query looks like — so it cannot block when the data never arrived.
-    if row.derived_assessment.service_interface_likelihood == DerivedLikelihood::Likely
-        && !row.runtime_data_unavailable
-    {
-        blocked = true;
-        key_signals.push("blocked-service-interface-likely".to_string());
-    }
-
-    match row.observed_facts.connectivity_state {
-        ConnectivityState::Available => {
-            primary_score += 4;
-            secondary_score += 2;
-            key_signals.push("connectivity-available".to_string());
-        }
-        ConnectivityState::Degraded => {
-            primary_score += 2;
-            secondary_score += 2;
-            key_signals.push("connectivity-degraded".to_string());
-        }
-        ConnectivityState::Timeout => {
-            primary_score -= 1;
-            secondary_score -= 1;
-            key_signals.push("connectivity-timeout".to_string());
-        }
-        ConnectivityState::Unknown => {
-            primary_score -= 1;
-            secondary_score -= 1;
-            key_signals.push("connectivity-unknown".to_string());
-        }
-        ConnectivityState::Unavailable => {
-            primary_score -= 4;
-            secondary_score -= 3;
-            key_signals.push("connectivity-unavailable".to_string());
-        }
-    }
-
-    if row.has_default_route {
-        primary_score += 3;
-        key_signals.push("has-default-route".to_string());
-    } else if carries_traffic(row) {
-        // A gateway-less tunnel routes as well as anything; it just says so
-        // differently. Scoring it as "no default route" pushed a healthy
-        // WireGuard link down by 2 and handed the +1 to whatever else was
-        // around.
-        primary_score += 3;
-        key_signals.push("forwarding-path-without-gateway".to_string());
-    } else if row.has_forwarding_path == Some(false)
-        && row.derived_assessment.vpn_tunnel_likelihood != DerivedLikelihood::Likely
-    {
-        // The platform layer looked and found no way out through this adapter,
-        // and it does not look like a tunnel either — a host-only virtual
-        // switch, an adapter with no usable next hop. Preferring THAT as the
-        // secondary is the worst outcome available: rules would be routed into
-        // a link that reaches nothing.
-        //
-        // A VPN-shaped adapter is deliberately exempt: at the moment the user
-        // is choosing their secondary the tunnel is usually still down, which
-        // is the same `Some(false)`. Penalising it there would stop the app
-        // recommending the very adapter the user came to bind.
-        primary_score -= 2;
-        secondary_score -= 3;
-        key_signals.push("no-forwarding-path".to_string());
-    } else {
-        primary_score -= 2;
-        secondary_score += 1;
-        key_signals.push("no-default-route".to_string());
-    }
-
-    match row.observed_facts.external_ip_status {
-        ExternalIpStatus::Resolved => {
-            primary_score += 2;
-            secondary_score += 1;
-            key_signals.push("external-ip-resolved".to_string());
-        }
-        ExternalIpStatus::NotChecked => {
-            key_signals.push("external-ip-not-checked".to_string());
-        }
-        ExternalIpStatus::CheckFailed
-        | ExternalIpStatus::RateLimited
-        | ExternalIpStatus::Blocked => {
-            primary_score -= 1;
-            key_signals.push("external-ip-check-not-successful".to_string());
-        }
-    }
-
-    match row.derived_assessment.vpn_tunnel_likelihood {
-        DerivedLikelihood::Likely => {
-            primary_score -= 4;
-            secondary_score += 4;
-            key_signals.push("vpn-tunnel-likely".to_string());
-        }
-        DerivedLikelihood::Possible => {
-            primary_score -= 1;
-            secondary_score += 2;
-            key_signals.push("vpn-tunnel-possible".to_string());
-        }
-        DerivedLikelihood::Unlikely => {
-            primary_score += 1;
-        }
-        DerivedLikelihood::Unknown => {}
-    }
-
-    if row.derived_assessment.virtual_interface_likelihood == DerivedLikelihood::Likely {
-        primary_score -= 3;
-        secondary_score -= 2;
-        key_signals.push("virtual-interface-likely".to_string());
-    }
-    if row.is_bluetooth_like {
-        primary_score -= 4;
-        secondary_score -= 2;
-        key_signals.push("bluetooth-adapter-nondefault-routing-profile".to_string());
-    }
-
-    if explicit.is_primary(index) {
-        primary_score += 5;
-        key_signals.push("manual-primary-pin".to_string());
-    }
-    if explicit.is_secondary(index) {
-        secondary_score += 5;
-        key_signals.push("manual-secondary-pin".to_string());
-    }
-
-    if !row.persistent_id.trim().is_empty() {
-        primary_score += 1;
-        secondary_score += 1;
-        key_signals.push("stable-identity-present".to_string());
-    }
-
-    let confidence = if blocked {
-        RecommendationConfidence::High
-    } else {
-        let top_score = primary_score.max(secondary_score);
-        if top_score >= 9 {
-            RecommendationConfidence::High
-        } else if top_score >= 6 {
-            RecommendationConfidence::Medium
-        } else if top_score >= 3 {
-            RecommendationConfidence::Low
-        } else {
-            RecommendationConfidence::Unknown
-        }
-    };
-
-    RecommendationScore {
-        primary_score,
-        secondary_score,
-        blocked,
-        confidence,
-        key_signals,
-    }
-}
-
-fn primary_tie_break_weight(
-    row: &InterfaceRouteRow,
-    index: usize,
-    explicit: ExplicitChoices,
-) -> i32 {
-    let mut weight = 0;
-    if explicit.is_primary(index) {
-        weight += 100;
-    }
-    if !row.persistent_id.trim().is_empty() {
-        weight += 10;
-    }
-    if carries_traffic(row) {
-        weight += 5;
-    }
-    weight
-}
-
-fn secondary_tie_break_weight(
-    row: &InterfaceRouteRow,
-    index: usize,
-    explicit: ExplicitChoices,
-) -> i32 {
-    let mut weight = 0;
-    if explicit.is_secondary(index) {
-        weight += 100;
-    }
-    if !row.persistent_id.trim().is_empty() {
-        weight += 10;
-    }
-    if row.derived_assessment.vpn_tunnel_likelihood == DerivedLikelihood::Likely {
-        weight += 8;
-    }
-    weight
-}
-
-/// The rows the user's confirmed pins resolve to, resolved once per pass.
-#[derive(Clone, Copy, Debug, Default)]
-struct ExplicitChoices {
-    primary: Option<usize>,
-    secondary: Option<usize>,
-}
-
-impl ExplicitChoices {
-    fn resolve(rows: &[InterfaceRouteRow], request: &RouteSelectionRequest) -> Self {
-        let primary = resolve_explicit_primary_index(rows, request);
-        Self {
-            primary,
-            secondary: resolve_explicit_secondary_index(rows, request, primary),
-        }
-    }
-
-    fn is_primary(self, index: usize) -> bool {
-        self.primary == Some(index)
-    }
-
-    fn is_secondary(self, index: usize) -> bool {
-        self.secondary == Some(index)
-    }
-}
-
-fn recommendation_summary_for_class(class: RecommendationClass) -> String {
-    match class {
-        RecommendationClass::PreferredPrimary => {
-            "Looks like primary internet interface".to_string()
-        }
-        RecommendationClass::PreferredSecondary => {
-            "Looks like fallback/VPN secondary interface".to_string()
-        }
-        RecommendationClass::AllowedButNotRecommended => {
-            "Usable, but not a top recommendation".to_string()
-        }
-        RecommendationClass::NotRecommended => {
-            "Not recommended for routing role assignment".to_string()
-        }
+        BasicAvailabilityStatus::Available => RouteSelectionState::Selected,
     }
 }
 

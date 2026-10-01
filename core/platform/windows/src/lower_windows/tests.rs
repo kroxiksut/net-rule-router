@@ -75,8 +75,8 @@ fn lowers_exact_ip_permit_with_expected_fields() {
 #[test]
 fn primary_outranks_secondary_and_ids_are_deterministic() {
     let p = plan(vec![
-        route_flow(RouteRole::Primary, 0, Ipv4Addr::new(1, 1, 1, 1)),
-        route_flow(RouteRole::Secondary, 0, Ipv4Addr::new(2, 2, 2, 2)),
+        route_flow(RouteRole::Primary, 0, Ipv4Addr::new(198, 51, 100, 1)),
+        route_flow(RouteRole::Secondary, 0, Ipv4Addr::new(198, 51, 100, 2)),
     ]);
     let a = lower_route_rules(&p);
     let b = lower_route_rules(&p);
@@ -126,8 +126,43 @@ fn catch_all_ids_separate_filters_that_differ_only_in_their_conditions() {
             disc,
         )
     };
-    assert_ne!(base("1.1.1.1|53"), base("8.8.8.8|53"));
-    assert_ne!(base("1.1.1.1|53"), base("1.1.1.1|443"));
+    assert_ne!(base("198.51.100.1|53"), base("198.51.100.8|53"));
+    assert_ne!(base("198.51.100.1|53"), base("198.51.100.1|443"));
     // Same inputs still give the same id — the whole point of deriving it.
-    assert_eq!(base("1.1.1.1|53"), base("1.1.1.1|53"));
+    assert_eq!(base("198.51.100.1|53"), base("198.51.100.1|53"));
+}
+
+/// Fail-closed ALE groups for two protocols over the same addresses share a
+/// weight by the codegen's formula; only the id keeps the second group from
+/// being swallowed as `FWP_E_ALREADY_EXISTS`.
+#[test]
+fn fail_closed_ale_groups_per_protocol_get_distinct_ids() {
+    use nrr_platform_api::enforcement::L4Proto;
+    let fail_closed = |ordinal: u32, protocol: L4Proto| FlowRule {
+        verdict: Verdict::Block,
+        precedence: Precedence {
+            class: PrecedenceClass::KillSwitchBlock,
+            ordinal,
+        },
+        flow: FlowMatch {
+            dst: DstMatch::HostV4(Ipv4Addr::new(203, 0, 113, 7)),
+            dst_port: None,
+            protocol: Some(protocol),
+        },
+        principal: PrincipalScope(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
+        app: AppScope::Any,
+        egress: EgressConstraint::Any,
+        coverage: Coverage::ConnectOnly,
+    };
+    let out = lower_kill_switch(
+        &plan(vec![
+            fail_closed(0, L4Proto::Tcp),
+            fail_closed(1, L4Proto::Udp),
+        ]),
+        7,
+    );
+    assert_eq!(out.len(), 2, "one ALE block per protocol group");
+    assert_eq!(out[0].weight, out[1].weight);
+    assert_ne!(out[0].ip_protocol, out[1].ip_protocol);
+    assert_ne!(out[0].id, out[1].id);
 }

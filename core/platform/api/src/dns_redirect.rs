@@ -101,15 +101,22 @@ pub trait SystemDnsRedirectPort: Send + Sync {
     }
 
     /// Keep single-label names resolvable behind the redirect: the OS
-    /// completes them with the machine's own suffixes, plus `extra` — suffixes
-    /// the user named for their networks.
+    /// completes them with the suffixes of `claimed` — the same set just
+    /// handed to [`Self::exempt_namespaces`] — plus `extra`, the suffixes the
+    /// user named for their networks.
     ///
-    /// Called on every guard tick with the current set; an implementation
-    /// writes only on change and takes it all back in `restore`. Default:
-    /// nothing, for platforms whose resolver still completes short names with
-    /// the redirect in place.
-    fn keep_short_names(&self, extra: &[String]) -> Result<(), PlatformError> {
-        let _ = extra;
+    /// Called whenever the claims are read again, and retried while it
+    /// fails; an implementation writes only on change and takes it all back
+    /// in `restore`. `extra` costs a settings read, so
+    /// it is asked only by an implementation that uses it. Default: nothing,
+    /// for platforms whose resolver still completes short names with the
+    /// redirect in place.
+    fn keep_short_names(
+        &self,
+        claimed: &[DnsNamespaceExemption],
+        extra: &dyn Fn() -> Vec<String>,
+    ) -> Result<(), PlatformError> {
+        let _ = (claimed, extra);
         Ok(())
     }
 }

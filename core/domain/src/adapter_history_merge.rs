@@ -8,8 +8,8 @@
 //! Merging them automatically is not available, and a setting is worse than
 //! either. A setting has to be turned on BEFORE the event, by someone who knows
 //! it is coming; left on, it would eventually join two connections that have
-//! nothing to do with each other — "swiftvpn v2 became v3" and "I replaced
-//! swiftvpn with amnezia" look identical from inside the ledger. So this
+//! nothing to do with each other — "examplevpn v2 became v3" and "I replaced
+//! examplevpn with another client" look identical from inside the ledger. So this
 //! module produces a QUESTION, once, at the moment there is evidence for it,
 //! and nothing is joined until the user answers.
 //!
@@ -250,14 +250,14 @@ mod tests {
     fn a_version_bump_of_the_same_client_is_offered() {
         let now = 10 * HOUR;
         let keys = vec![
-            sighting("old", "swiftvpn v2", 0, 5 * HOUR),
-            sighting("new", "swiftvpn v3", 5 * HOUR + 1000, now),
+            sighting("old", "examplevpn v2", 0, 5 * HOUR),
+            sighting("new", "examplevpn v3", 5 * HOUR + 1000, now),
         ];
         let proposal = propose_merge(&keys, &[], now, MergeTiming::default())
             .expect("a handover between two names sharing a word must be offered");
         assert_eq!(proposal.old_key, "old");
         assert_eq!(proposal.new_key, "new");
-        assert_eq!(proposal.shared_token, "swiftvpn");
+        assert_eq!(proposal.shared_token, "examplevpn");
     }
 
     /// The other half of the same sentence: a different product is not the same
@@ -266,8 +266,8 @@ mod tests {
     fn a_replacement_by_a_different_product_is_never_offered() {
         let now = 10 * HOUR;
         let keys = vec![
-            sighting("old", "swiftvpn", 0, 5 * HOUR),
-            sighting("new", "amnezia", 5 * HOUR + 1000, now),
+            sighting("old", "examplevpn", 0, 5 * HOUR),
+            sighting("new", "othervpn", 5 * HOUR + 1000, now),
         ];
         assert_eq!(propose_merge(&keys, &[], now, MergeTiming::default()), None);
     }
@@ -289,8 +289,8 @@ mod tests {
         // Both seen up to now: they coexist, nothing was handed over.
         let now = 10 * HOUR;
         let keys = vec![
-            sighting("old", "swiftvpn v2", 0, now),
-            sighting("new", "swiftvpn v3", 5 * HOUR, now),
+            sighting("old", "examplevpn v2", 0, now),
+            sighting("new", "examplevpn v3", 5 * HOUR, now),
         ];
         assert_eq!(propose_merge(&keys, &[], now, MergeTiming::default()), None);
     }
@@ -301,8 +301,8 @@ mod tests {
         // not one being replaced.
         let now = 10 * HOUR;
         let keys = vec![
-            sighting("old", "swiftvpn v2", 0, now - 10 * 60 * 1000),
-            sighting("new", "swiftvpn v3", now - 9 * 60 * 1000, now),
+            sighting("old", "examplevpn v2", 0, now - 10 * 60 * 1000),
+            sighting("new", "examplevpn v3", now - 9 * 60 * 1000, now),
         ];
         assert_eq!(propose_merge(&keys, &[], now, MergeTiming::default()), None);
     }
@@ -311,8 +311,8 @@ mod tests {
     fn an_appearance_long_after_the_disappearance_is_not_a_handover() {
         let now = 10 * HOUR;
         let keys = vec![
-            sighting("old", "swiftvpn v2", 0, HOUR),
-            sighting("new", "swiftvpn v3", 5 * HOUR, now),
+            sighting("old", "examplevpn v2", 0, HOUR),
+            sighting("new", "examplevpn v3", 5 * HOUR, now),
         ];
         assert_eq!(propose_merge(&keys, &[], now, MergeTiming::default()), None);
     }
@@ -321,8 +321,8 @@ mod tests {
     fn a_pair_already_answered_never_comes_back() {
         let now = 10 * HOUR;
         let keys = vec![
-            sighting("old", "swiftvpn v2", 0, 5 * HOUR),
-            sighting("new", "swiftvpn v3", 5 * HOUR + 1000, now),
+            sighting("old", "examplevpn v2", 0, 5 * HOUR),
+            sighting("new", "examplevpn v3", 5 * HOUR + 1000, now),
         ];
         let decided = vec![("new".to_string(), "old".to_string())];
         assert_eq!(
@@ -339,12 +339,12 @@ mod tests {
             // Closer in time, but the shared word is short.
             sighting("near", "acme link", 0, 5 * HOUR),
             // Further away, but unmistakably the same product.
-            sighting("far", "swiftvpn v2", 0, 5 * HOUR - 60_000),
-            sighting("new", "swiftvpn v3 acme", 5 * HOUR + 1000, now),
+            sighting("far", "examplevpn v2", 0, 5 * HOUR - 60_000),
+            sighting("new", "examplevpn v3 acme", 5 * HOUR + 1000, now),
         ];
         let proposal = propose_merge(&keys, &[], now, MergeTiming::default()).expect("a proposal");
         assert_eq!(proposal.old_key, "far");
-        assert_eq!(proposal.shared_token, "swiftvpn");
+        assert_eq!(proposal.shared_token, "examplevpn");
     }
 
     #[test]

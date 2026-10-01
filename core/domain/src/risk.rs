@@ -7,7 +7,7 @@
 //!
 //! `compute_diff(prev, candidate)` → `StructuralDiff`
 //! → `score_candidate(diff, source)` → `RiskAssessment`
-//! → stored in `PolicyRevision::risk_level`
+//! → stored with the revision (`risk_level`)
 //! → used to decide: mandatory review, persistent alert, block silent activation.
 //!
 //! # Signal catalogue and thresholds
@@ -290,7 +290,7 @@ pub fn score_candidate(diff: &StructuralDiff, source: &RevisionSource) -> RiskAs
     let mut signals: Vec<RiskSignal> = Vec::new();
 
     collect_content_signals(diff, &mut signals);
-    collect_block_16_12_signals(diff, &mut signals);
+    collect_structural_severity_signals(diff, &mut signals);
     collect_source_signals(source, &mut signals);
 
     let level = signals
@@ -311,7 +311,7 @@ pub fn score_candidate(diff: &StructuralDiff, source: &RevisionSource) -> RiskAs
 /// They are emitted in this order: `FailClosedActivation`,
 /// `RuleSetEmptied`, `HighRemovalRatio`, `OverlappingRules` — matching
 /// severity-then-specificity for the review UI's rendering.
-fn collect_block_16_12_signals(diff: &StructuralDiff, signals: &mut Vec<RiskSignal>) {
+fn collect_structural_severity_signals(diff: &StructuralDiff, signals: &mut Vec<RiskSignal>) {
     // Fail-closed activation: next mode is StrictSecondaryFailClosed
     // AND prev mode wasn't (or there was no prev — first revision
     // activating fail-closed is still High risk).
@@ -423,7 +423,7 @@ fn collect_source_signals(source: &RevisionSource, _signals: &mut Vec<RiskSignal
     // With current strongly-typed RevisionSource all variants have known
     // provenance. UnknownSource is reserved for future use.
     match source {
-        RevisionSource::DirectEdit | RevisionSource::FileSync | RevisionSource::Import(_) => {}
+        RevisionSource::DirectEdit | RevisionSource::FileSync => {}
     }
 }
 
@@ -436,7 +436,6 @@ mod tests {
     use crate::{
         canonical::{CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet},
         review::compute_diff,
-        revision::{ContentHash, ImportChannel, ImportedArtifact, RevisionSource, UnixTimestamp},
         AdapterIdentity, BindingSource, RouteBinding, RuleId,
     };
 
@@ -493,21 +492,12 @@ mod tests {
         }
     }
 
-    fn import_source() -> RevisionSource {
-        RevisionSource::Import(ImportedArtifact {
-            source_path: "/rules.txt".to_string(),
-            file_hash: ContentHash::from_bytes([0xAA; 32]),
-            imported_at: UnixTimestamp::from_secs(1_700_000_000),
-            channel: ImportChannel::Snapshot,
-        })
-    }
-
     #[test]
     fn low_risk_for_small_exact_fqdn_addition() {
         let prev = make_profile(vec![], vec![]);
         let next = make_profile(vec![fqdn_rule("r-1", "corp.example.com")], vec![]);
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert_eq!(assessment.level, RiskLevel::Low);
         assert!(assessment.signals.is_empty());
         assert!(assessment.is_low_risk());
@@ -518,7 +508,7 @@ mod tests {
         let prev = make_profile(vec![], vec![]);
         let next = make_profile(vec![suffix_rule("r-1", "com")], vec![]);
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert_eq!(assessment.level, RiskLevel::High);
         assert!(assessment.requires_mandatory_review());
         assert!(assessment
@@ -532,7 +522,7 @@ mod tests {
         let prev = make_profile(vec![], vec![]);
         let next = make_profile(vec![suffix_rule("r-1", "ru")], vec![]);
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(assessment
             .signals
             .iter()
@@ -544,7 +534,7 @@ mod tests {
         let prev = make_profile(vec![], vec![]);
         let next = make_profile(vec![suffix_rule("r-1", "example.com")], vec![]);
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert_eq!(assessment.level, RiskLevel::Medium);
         assert!(assessment
             .signals
@@ -557,7 +547,7 @@ mod tests {
         let prev = make_profile(vec![], vec![]);
         let next = make_profile(vec![suffix_rule("r-1", "api.example.com")], vec![]);
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(assessment.is_low_risk());
     }
 
@@ -567,7 +557,7 @@ mod tests {
         let mut next = make_profile(vec![], vec![]);
         next.behavior_mode = crate::RouteBehaviorMode::PreferPrimary;
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert_eq!(assessment.level, RiskLevel::Medium);
         assert!(assessment
             .signals
@@ -583,7 +573,7 @@ mod tests {
         let next = make_profile(rules, vec![]);
         let diff = compute_diff(Some(&prev), &next);
         assert_eq!(diff.rule_changes.len(), 20);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert_eq!(assessment.level, RiskLevel::High);
         assert!(assessment
             .signals
@@ -599,7 +589,7 @@ mod tests {
             .collect();
         let next = make_profile(rules, vec![]);
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(!assessment
             .signals
             .iter()
@@ -611,7 +601,7 @@ mod tests {
         let prev = make_profile(vec![fqdn_rule("r-1", "corp.net")], vec![]);
         let next = make_profile(vec![], vec![fqdn_rule("r-1", "corp.net")]); // retargeted to secondary
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(assessment
             .signals
             .iter()
@@ -624,7 +614,7 @@ mod tests {
         let mut next = make_profile(vec![], vec![]);
         next.primary.adapter.stable_id = "adapter-different".to_string();
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert_eq!(assessment.level, RiskLevel::High);
         assert!(assessment
             .signals
@@ -640,7 +630,7 @@ mod tests {
             vec![suffix_rule("r-1", "example.com")], // secondary + 2nd-level suffix
         );
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         // ModerateSuffix (medium) + SecondaryReroute (medium) → Medium
         assert_eq!(assessment.level, RiskLevel::Medium);
         assert!(assessment.signals.len() >= 2);
@@ -663,7 +653,7 @@ mod tests {
         let profile = make_profile(vec![fqdn_rule("r-1", "corp.example.com")], vec![]);
         // Import same content → no diff changes, no risk signals
         let diff = compute_diff(Some(&profile), &profile);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(assessment.is_low_risk());
     }
 
@@ -732,7 +722,7 @@ mod tests {
         );
         let next = make_profile(vec![], vec![]);
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(assessment
             .signals
             .iter()
@@ -745,7 +735,7 @@ mod tests {
         let prev = make_profile(vec![], vec![]);
         let next = make_profile(vec![], vec![]);
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(!assessment
             .signals
             .iter()
@@ -772,7 +762,7 @@ mod tests {
             vec![],
         );
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(assessment.signals.iter().any(
             |s| matches!(s, RiskSignal::HighRemovalRatio { removed_pct } if *removed_pct == 50)
         ));
@@ -800,7 +790,7 @@ mod tests {
             vec![],
         );
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(!assessment
             .signals
             .iter()
@@ -819,7 +809,7 @@ mod tests {
         );
         let diff = compute_diff(Some(&prev), &next);
         assert_eq!(diff.overlapping_apexes, vec!["example.com".to_string()]);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(assessment
             .signals
             .iter()
@@ -838,7 +828,7 @@ mod tests {
         );
         let diff = compute_diff(Some(&prev), &next);
         assert!(diff.overlapping_apexes.is_empty());
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(!assessment
             .signals
             .iter()
@@ -882,7 +872,7 @@ mod tests {
         );
         let diff = compute_diff(Some(&prev), &next);
         assert!(diff.overlapping_apexes.is_empty());
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(!assessment
             .signals
             .iter()
@@ -910,7 +900,7 @@ mod tests {
         let mut next = make_profile(vec![], vec![]);
         next.behavior_mode = crate::RouteBehaviorMode::StrictSecondaryFailClosed;
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(assessment
             .signals
             .iter()
@@ -927,7 +917,7 @@ mod tests {
         let mut next = make_profile(vec![], vec![]);
         next.behavior_mode = crate::RouteBehaviorMode::StrictSecondaryFailClosed;
         let diff = compute_diff(Some(&prev), &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(!assessment
             .signals
             .iter()
@@ -942,7 +932,7 @@ mod tests {
         // helper test path already covers this. Confirm the signal
         // fires when prev is None.
         let diff = compute_diff(None, &next);
-        let assessment = score_candidate(&diff, &import_source());
+        let assessment = score_candidate(&diff, &RevisionSource::DirectEdit);
         assert!(assessment
             .signals
             .iter()

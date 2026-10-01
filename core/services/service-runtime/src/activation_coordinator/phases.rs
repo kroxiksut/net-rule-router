@@ -112,15 +112,7 @@ impl ActivationCoordinator {
             match self.dispatcher.pre_flight_for_sid(sid, rules_json) {
                 Ok(per_sid) => {
                     for w in per_sid {
-                        // Pre-flight warnings of certain categories
-                        // upgrade to blocking failures.
-                        if matches!(
-                            w.category,
-                            PreFlightCategory::FilterIdCollision
-                                | PreFlightCategory::BatchOverflow
-                                | PreFlightCategory::RoutingConflict
-                                | PreFlightCategory::InvalidRulesContent
-                        ) {
+                        if w.category.blocks_activation() {
                             failures.push((w.sid.clone(), w.message.clone()));
                         }
                         warnings.push(w);
@@ -253,9 +245,16 @@ impl ActivationCoordinator {
                 message: e.to_string(),
             })?;
         }
-        self.marker_store
-            .clear()
-            .map_err(PolicyError::MarkerWriteFailed)?;
+        // Past the commit an error would tell the caller "not applied" about
+        // rules that are active, and send it to revert them. A marker left
+        // behind names an attempt that did finish; boot recovery settles it.
+        if let Err(e) = self.marker_store.clear() {
+            tracing::warn!(
+                target: "nrr::activation",
+                revision_id = %revision_id,
+                "activation committed but its apply marker could not be cleared: {e}",
+            );
+        }
 
         let succeeded_sids: Vec<String> = phase1
             .sids
@@ -313,45 +312,8 @@ impl ActivationCoordinator {
         now: i64,
     ) -> Result<ActivationOutcome, PolicyError> {
         let _ = target_rules_json; // explicitly unused — caller passes it for symmetry
-                                   // Revert successful SIDs to previous rules (or empty rules if no
-                                   // previous revision).
-        let previous_rules_json = phase1
-            .previous_revision
-            .as_ref()
-            .map(|r| r.rules_json.clone())
-            .unwrap_or_else(|| "{}".to_string());
-        let mut reverted: Vec<String> = Vec::new();
-        let mut revert_failures: Vec<(String, String)> = Vec::new();
-        // Every SID Phase 2 TOUCHED, not just the ones it finished. A SID whose
-        // apply failed may have installed part of its set before failing (the
-        // batch-overflow warning says so in as many words), so leaving it out
-        // of the revert left that partial policy live under a revision the
-        // service has just rejected.
-        let touched = phase2
-            .succeeded
-            .iter()
-            .cloned()
-            .chain(phase2.failed.iter().map(|(sid, _)| sid.clone()));
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for sid in touched.filter(|sid| seen.insert(sid.clone())) {
-            match self.dispatcher.revert_for_sid(&sid, &previous_rules_json) {
-                Ok(()) => reverted.push(sid),
-                // A failed revert is the state that matters most and used to be
-                // discarded by an `is_ok()`: the SID keeps rules from a
-                // rejected revision and nothing anywhere says so.
-                Err(failure) => {
-                    tracing::error!(
-                        target: "nrr::activation",
-                        msg_key = "activation-revert-failed",
-                        sid = %failure.sid,
-                        revision_id = %revision_id,
-                        "revert after a failed activation did not succeed; this SID may still                          be enforcing rules from a rejected revision: {}",
-                        failure.message,
-                    );
-                    revert_failures.push((failure.sid, failure.message));
-                }
-            }
-        }
+        let (reverted, revert_failures) =
+            self.revert_to_previous(revision_id, phase1, &phase2.touched());
 
         let mut reason = format!(
             "{} SID(s) failed Phase 2: {}",
@@ -363,19 +325,9 @@ impl ActivationCoordinator {
                 .collect::<Vec<_>>()
                 .join("; ")
         );
-        if !revert_failures.is_empty() {
-            // Recorded on the revision itself: whoever reads why it was
-            // rejected also needs to know the machine was not fully put back.
-            reason.push_str(&format!(
-                "; revert failed for {} SID(s): {}",
-                revert_failures.len(),
-                revert_failures
-                    .iter()
-                    .map(|(s, m)| format!("{s}={m}"))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ));
-        }
+        // Recorded on the revision itself: whoever reads why it was rejected
+        // also needs to know the machine was not fully put back.
+        push_revert_failures(&mut reason, &revert_failures);
         {
             let conn = self.conn.lock().expect("connection mutex poisoned");
             let repo = self.revisions_repo(&conn);
@@ -407,6 +359,102 @@ impl ActivationCoordinator {
             reverted_sids: reverted,
             reason,
         })
+    }
+
+    /// Phase 3a could not commit: the pointer never moved, yet phase 2 has
+    /// already put the new rules into the kernel. Revert what it touched,
+    /// close the attempt so nothing reads it as still in flight, and fail
+    /// loudly. The confirmation token stays consumed — a retry goes through a
+    /// fresh review, never through a token that already authorised once.
+    pub(super) fn phase3a_unrecorded(
+        &self,
+        principal: &str,
+        revision_id: &RevisionId,
+        phase1: &Phase1Outcome,
+        touched: &[String],
+        error: PolicyError,
+        now: i64,
+    ) -> Result<ActivationOutcome, PolicyError> {
+        tracing::error!(
+            target: "nrr::activation",
+            msg_key = "activation-commit-failed",
+            revision_id = %revision_id,
+            error = %error,
+            "the activation could not be recorded; reverting the rules it applied",
+        );
+        let (_reverted, revert_failures) = self.revert_to_previous(revision_id, phase1, touched);
+        let mut reason = format!("activation could not be recorded: {error}");
+        push_revert_failures(&mut reason, &revert_failures);
+        // Best-effort: the store may be what failed. A row left a candidate
+        // can still only be activated with a newly issued token.
+        {
+            let conn = self.conn.lock().expect("connection mutex poisoned");
+            if let Err(e) = self.revisions_repo(&conn).mark_apply_failed_for(
+                principal,
+                revision_id.as_str(),
+                &reason,
+                now,
+            ) {
+                tracing::warn!(
+                    target: "nrr::activation",
+                    revision_id = %revision_id,
+                    "could not mark the unrecorded activation rejected; it stays a candidate: {e}",
+                );
+            }
+        }
+        if let Err(e) = self.marker_store.clear() {
+            tracing::warn!(
+                target: "nrr::activation",
+                revision_id = %revision_id,
+                "could not clear the apply marker of an unrecorded activation; boot recovery will: {e}",
+            );
+        }
+        self.audit.emit(ActivationAuditEvent::RevisionRejected {
+            principal: principal.to_string(),
+            revision_id: revision_id.as_str().to_string(),
+            reason: reason.clone(),
+            sid_failures: revert_failures,
+        });
+        Err(PolicyError::ActivationNotRecorded {
+            revision_id: revision_id.clone(),
+            detail: reason,
+        })
+    }
+
+    /// Put `sids` back on the previous revision's rules (none if there was
+    /// none). Returns the SIDs reverted and the ones whose revert failed.
+    fn revert_to_previous(
+        &self,
+        revision_id: &RevisionId,
+        phase1: &Phase1Outcome,
+        sids: &[String],
+    ) -> (Vec<String>, Vec<(String, String)>) {
+        let previous_rules_json = phase1
+            .previous_revision
+            .as_ref()
+            .map(|r| r.rules_json.clone())
+            .unwrap_or_else(|| "{}".to_string());
+        let mut reverted: Vec<String> = Vec::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+        for sid in sids {
+            match self.dispatcher.revert_for_sid(sid, &previous_rules_json) {
+                Ok(()) => reverted.push(sid.clone()),
+                // The SID keeps rules from a revision that is not in force,
+                // and nothing else would say so.
+                Err(failure) => {
+                    tracing::error!(
+                        target: "nrr::activation",
+                        msg_key = "activation-revert-failed",
+                        sid = %failure.sid,
+                        revision_id = %revision_id,
+                        error = %failure.message,
+                        "revert after a failed activation did not succeed; this SID may still be enforcing rules from a rejected revision",
+                    );
+                    failures.push((failure.sid, failure.message));
+                }
+            }
+        }
+        (reverted, failures)
     }
 
     // `pub(super)` because the impl is split across files and the parent is
@@ -444,4 +492,19 @@ impl ActivationCoordinator {
             sid_failures,
         })
     }
+}
+
+fn push_revert_failures(reason: &mut String, failures: &[(String, String)]) {
+    if failures.is_empty() {
+        return;
+    }
+    reason.push_str(&format!(
+        "; revert failed for {} SID(s): {}",
+        failures.len(),
+        failures
+            .iter()
+            .map(|(s, m)| format!("{s}={m}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    ));
 }

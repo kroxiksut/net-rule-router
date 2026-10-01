@@ -379,8 +379,8 @@ impl SecondaryRouteReconciler {
 
     /// Diff `desired` against the owned set and apply the difference. On
     /// success the owned set becomes exactly `desired`. On any platform
-    /// error the partial changes are rolled back and the owned set is left
-    /// unchanged.
+    /// error the partial changes are rolled back and the owned set follows
+    /// what the rollback actually restored.
     pub fn reconcile(&self, desired: &[RouteEntry]) -> Result<RouteReconcileDelta, PlatformError> {
         let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
         self.reconcile_owned(desired, owned)
@@ -460,17 +460,22 @@ impl SecondaryRouteReconciler {
                 Ok(RouteReconcileDelta { added, removed })
             }
             Err(e) => {
-                // Best-effort undo of the actions that landed before the
-                // failure. What the table holds afterwards is not knowable from
-                // here - the rollback is best-effort too - so we stop claiming
-                // anything: the next reconcile re-derives the full desired set
-                // and re-adds it (an add of a route that is already there is
-                // idempotent). Keeping the old claim was worse: a route the
-                // rollback did delete stayed listed as ours, the next diff saw
-                // no work to do, and the rule silently stopped working until a
-                // restart.
-                let _ = tx.rollback();
-                owned.clear();
+                // The claim follows what the table holds after the undo. Clearing
+                // it orphaned the restored routes (to a gateway that may be dead)
+                // until restart; keeping it whole claimed routes the undo failed
+                // to put back, so the next diff never re-added them.
+                let residue = tx.rollback_with_residue();
+                owned.retain(|o| {
+                    !residue
+                        .still_removed
+                        .iter()
+                        .any(|r| route_key(r) == route_key(o))
+                });
+                for r in residue.still_added {
+                    if !owned.iter().any(|o| route_key(o) == route_key(&r)) {
+                        owned.push(r);
+                    }
+                }
                 Err(e)
             }
         }
@@ -502,7 +507,7 @@ impl SecondaryRouteReconciler {
         }
         let mut tx = RoutingTransaction::new(Arc::clone(&self.api));
         if let Err(e) = tx.execute(&actions) {
-            let _ = tx.rollback();
+            owned.extend(tx.rollback_with_residue().still_added);
             return Err(e);
         }
         let landed = tx.added_routes();
@@ -645,15 +650,15 @@ mod tests {
     /// client we were careful not to touch.
     #[test]
     fn a_route_we_did_not_add_is_never_claimed_as_ours() {
-        let taken = Ipv4Addr::new(1, 1, 1, 1);
+        let taken = Ipv4Addr::new(198, 51, 100, 1);
         let api = Arc::new(ForeignRouteApi {
             inner: MockWindowsApi::new(),
             taken,
         });
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let desired = vec![
-            route([1, 1, 1, 1], [10, 0, 0, 1], 7),
-            route([2, 2, 2, 2], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 1], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 2], [10, 0, 0, 1], 7),
         ];
         rec.reconcile(&desired).expect("conflict is not a failure");
         assert_eq!(
@@ -672,18 +677,18 @@ mod tests {
     /// already holds stays theirs.
     #[test]
     fn an_additional_route_is_claimed_and_the_full_pass_finds_it_in_place() {
-        let taken = Ipv4Addr::new(1, 1, 1, 1);
+        let taken = Ipv4Addr::new(198, 51, 100, 1);
         let api = Arc::new(ForeignRouteApi {
             inner: MockWindowsApi::new(),
             taken,
         });
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
-        rec.reconcile(&[route([3, 3, 3, 3], [10, 0, 0, 1], 7)])
+        rec.reconcile(&[route([198, 51, 100, 3], [10, 0, 0, 1], 7)])
             .expect("first pass");
 
         let extra = vec![
-            route([2, 2, 2, 2], [10, 0, 0, 1], 7),
-            route([1, 1, 1, 1], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 2], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 1], [10, 0, 0, 1], 7),
         ];
         assert_eq!(rec.install_additional(&extra).expect("install"), 1);
         assert_eq!(
@@ -694,8 +699,8 @@ mod tests {
 
         let delta = rec
             .reconcile(&[
-                route([3, 3, 3, 3], [10, 0, 0, 1], 7),
-                route([2, 2, 2, 2], [10, 0, 0, 1], 7),
+                route([198, 51, 100, 3], [10, 0, 0, 1], 7),
+                route([198, 51, 100, 2], [10, 0, 0, 1], 7),
             ])
             .expect("full pass");
         assert!(delta.is_noop(), "{delta:?}");
@@ -715,12 +720,12 @@ mod tests {
         };
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>)
             .with_teardown_gate(gate);
-        rec.reconcile(&[route([1, 1, 1, 1], [10, 0, 0, 1], 7)])
+        rec.reconcile(&[route([198, 51, 100, 1], [10, 0, 0, 1], 7)])
             .expect("first pass");
 
         stopping.store(true, std::sync::atomic::Ordering::SeqCst);
         let delta = rec
-            .reconcile(&[route([2, 2, 2, 2], [10, 0, 0, 1], 7)])
+            .reconcile(&[route([198, 51, 100, 2], [10, 0, 0, 1], 7)])
             .expect("teardown pass");
         assert_eq!(
             delta,
@@ -734,11 +739,132 @@ mod tests {
             "the new route never reached the table",
         );
         assert_eq!(
-            rec.install_additional(&[route([3, 3, 3, 3], [10, 0, 0, 1], 7)])
+            rec.install_additional(&[route([198, 51, 100, 3], [10, 0, 0, 1], 7)])
                 .expect("additional"),
             0
         );
         assert!(table_dests(&api).is_empty());
+    }
+
+    type AddFailure = Box<dyn Fn(&RouteEntry) -> bool + Send>;
+
+    /// A route table whose adds fail on demand, for driving a reconcile into
+    /// its rollback.
+    struct FlakyAddApi {
+        inner: MockWindowsApi,
+        fail_add: Mutex<AddFailure>,
+    }
+
+    impl FlakyAddApi {
+        fn new() -> Self {
+            Self {
+                inner: MockWindowsApi::new(),
+                fail_add: Mutex::new(Box::new(|_| false)),
+            }
+        }
+        fn fail_adds_when(&self, pred: impl Fn(&RouteEntry) -> bool + Send + 'static) {
+            *self.fail_add.lock().unwrap() = Box::new(pred);
+        }
+    }
+
+    impl RouteTablePort for FlakyAddApi {
+        fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError> {
+            self.inner.get_ip_forward_table()
+        }
+        fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+            if (self.fail_add.lock().unwrap())(entry) {
+                return Err(PlatformError::Win32 {
+                    operation: "CreateIpForwardEntry2",
+                    code: 0x5,
+                    message: "simulated fatal".into(),
+                });
+            }
+            self.inner.create_ip_forward_entry(entry)
+        }
+        fn delete_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+            self.inner.delete_ip_forward_entry(entry)
+        }
+        fn get_adapter_infos(&self) -> Result<Vec<nrr_platform_api::AdapterInfo>, PlatformError> {
+            self.inner.get_adapter_infos()
+        }
+        fn interface_luid_for_index(&self, index: u32) -> Result<u64, PlatformError> {
+            self.inner.interface_luid_for_index(index)
+        }
+    }
+
+    fn table_gateways(api: &FlakyAddApi) -> HashSet<IpAddr> {
+        api.get_ip_forward_table()
+            .unwrap()
+            .iter()
+            .map(|r| r.next_hop)
+            .collect()
+    }
+
+    /// The gateway moves, the switch fails half-way and the rollback puts the
+    /// old routes back. They are still ours: when the secondary then goes away
+    /// they must go with it, not stay pointing at a dead gateway.
+    #[test]
+    fn routes_restored_by_a_rollback_stay_owned_and_are_removed_later() {
+        let api = Arc::new(FlakyAddApi::new());
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let old_gw = [10, 0, 0, 1];
+        let new_gw = [192, 168, 0, 1];
+        rec.reconcile(&[
+            route([198, 51, 100, 1], old_gw, 7),
+            route([198, 51, 100, 2], old_gw, 7),
+        ])
+        .expect("first pass");
+
+        let failing = route([198, 51, 100, 2], new_gw, 9);
+        api.fail_adds_when(move |r| r == &failing);
+        rec.reconcile(&[
+            route([198, 51, 100, 1], new_gw, 9),
+            route([198, 51, 100, 2], new_gw, 9),
+        ])
+        .expect_err("the second add fails");
+        assert_eq!(
+            table_gateways(&api),
+            HashSet::from([IpAddr::V4(Ipv4Addr::from(old_gw))]),
+            "the rollback restored the old routes",
+        );
+        assert_eq!(rec.owned_count(), 2);
+
+        api.fail_adds_when(|_| false);
+        rec.reconcile(&[]).expect("secondary gone");
+        assert!(
+            table_dests_of(&api).is_empty(),
+            "no route to the old gateway survives",
+        );
+    }
+
+    /// Positive control for the other direction: a route the rollback failed to
+    /// put back is not claimed, so the next pass that wants it re-adds it.
+    #[test]
+    fn a_route_the_rollback_could_not_restore_is_re_added_next_pass() {
+        let api = Arc::new(FlakyAddApi::new());
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let old = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
+        rec.reconcile(std::slice::from_ref(&old))
+            .expect("first pass");
+
+        api.fail_adds_when(|_| true);
+        rec.reconcile(&[route([198, 51, 100, 1], [192, 168, 0, 1], 9)])
+            .expect_err("the add and its undo both fail");
+        assert!(table_dests_of(&api).is_empty());
+        assert_eq!(rec.owned_count(), 0, "a route that is gone is not ours");
+
+        api.fail_adds_when(|_| false);
+        let delta = rec.reconcile(std::slice::from_ref(&old)).expect("retry");
+        assert_eq!(delta.added, 1);
+        assert_eq!(table_dests_of(&api).len(), 1);
+    }
+
+    fn table_dests_of(api: &FlakyAddApi) -> HashSet<IpAddr> {
+        api.get_ip_forward_table()
+            .unwrap()
+            .iter()
+            .map(|r| r.destination)
+            .collect()
     }
 
     #[test]
@@ -746,8 +872,8 @@ mod tests {
         let api = Arc::new(MockWindowsApi::new());
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let desired = vec![
-            route([1, 1, 1, 1], [10, 0, 0, 1], 7),
-            route([2, 2, 2, 2], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 1], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 2], [10, 0, 0, 1], 7),
         ];
         let delta = rec.reconcile(&desired).unwrap();
         assert_eq!(
@@ -760,7 +886,10 @@ mod tests {
         assert_eq!(rec.owned_count(), 2);
         assert_eq!(
             table_dests(&api),
-            HashSet::from([Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(2, 2, 2, 2)])
+            HashSet::from([
+                Ipv4Addr::new(198, 51, 100, 1),
+                Ipv4Addr::new(198, 51, 100, 2)
+            ])
         );
     }
 
@@ -768,7 +897,7 @@ mod tests {
     fn reconcile_is_idempotent_when_desired_unchanged() {
         let api = Arc::new(MockWindowsApi::new());
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
-        let desired = vec![route([1, 1, 1, 1], [10, 0, 0, 1], 7)];
+        let desired = vec![route([198, 51, 100, 1], [10, 0, 0, 1], 7)];
         rec.reconcile(&desired).unwrap();
         let delta = rec.reconcile(&desired).unwrap();
         assert!(delta.is_noop());
@@ -780,15 +909,15 @@ mod tests {
         let api = Arc::new(MockWindowsApi::new());
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         rec.reconcile(&[
-            route([1, 1, 1, 1], [10, 0, 0, 1], 7),
-            route([2, 2, 2, 2], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 1], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 2], [10, 0, 0, 1], 7),
         ])
         .unwrap();
         // New desired: drop .2, keep .1, add .3.
         let delta = rec
             .reconcile(&[
-                route([1, 1, 1, 1], [10, 0, 0, 1], 7),
-                route([3, 3, 3, 3], [10, 0, 0, 1], 7),
+                route([198, 51, 100, 1], [10, 0, 0, 1], 7),
+                route([198, 51, 100, 3], [10, 0, 0, 1], 7),
             ])
             .unwrap();
         assert_eq!(
@@ -800,7 +929,10 @@ mod tests {
         );
         assert_eq!(
             table_dests(&api),
-            HashSet::from([Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(3, 3, 3, 3)])
+            HashSet::from([
+                Ipv4Addr::new(198, 51, 100, 1),
+                Ipv4Addr::new(198, 51, 100, 3)
+            ])
         );
     }
 
@@ -809,10 +941,10 @@ mod tests {
         // Same destination, different gateway/ifindex → delete old + add new.
         let api = Arc::new(MockWindowsApi::new());
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
-        rec.reconcile(&[route([1, 1, 1, 1], [10, 0, 0, 1], 7)])
+        rec.reconcile(&[route([198, 51, 100, 1], [10, 0, 0, 1], 7)])
             .unwrap();
         let delta = rec
-            .reconcile(&[route([1, 1, 1, 1], [192, 168, 0, 1], 9)])
+            .reconcile(&[route([198, 51, 100, 1], [192, 168, 0, 1], 9)])
             .unwrap();
         assert_eq!(
             delta,
@@ -824,7 +956,7 @@ mod tests {
         let table = api.get_ip_forward_table().unwrap();
         let r = table
             .iter()
-            .find(|r| r.destination == Ipv4Addr::new(1, 1, 1, 1))
+            .find(|r| r.destination == Ipv4Addr::new(198, 51, 100, 1))
             .unwrap();
         assert_eq!(r.next_hop, Ipv4Addr::new(192, 168, 0, 1));
         assert_eq!(r.interface_index, 9);
@@ -835,8 +967,8 @@ mod tests {
         let api = Arc::new(MockWindowsApi::new());
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         rec.reconcile(&[
-            route([1, 1, 1, 1], [10, 0, 0, 1], 7),
-            route([2, 2, 2, 2], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 1], [10, 0, 0, 1], 7),
+            route([198, 51, 100, 2], [10, 0, 0, 1], 7),
         ])
         .unwrap();
         let delta = rec.clear().unwrap();
@@ -856,8 +988,8 @@ mod tests {
         // Simulate a crash: routes exist in the table + we adopt them as
         // owned; a fresh desired set then drops one.
         let api = Arc::new(MockWindowsApi::new());
-        let orphan_a = route([1, 1, 1, 1], [10, 0, 0, 1], 7);
-        let orphan_b = route([2, 2, 2, 2], [10, 0, 0, 1], 7);
+        let orphan_a = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
+        let orphan_b = route([198, 51, 100, 2], [10, 0, 0, 1], 7);
         api.set_route_table(vec![orphan_a.clone(), orphan_b.clone()]);
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         rec.adopt_owned(vec![orphan_a.clone(), orphan_b]);
@@ -872,7 +1004,7 @@ mod tests {
         );
         assert_eq!(
             table_dests(&api),
-            HashSet::from([Ipv4Addr::new(1, 1, 1, 1)])
+            HashSet::from([Ipv4Addr::new(198, 51, 100, 1)])
         );
     }
 
@@ -932,7 +1064,7 @@ mod tests {
             raw_route([198, 51, 100, 9], 32, pg, 12, false), // VPN server #2 (bootstrap)
             raw_route([203, 0, 113, 7], 32, pg, 12, false), // dup → deduped
             raw_route([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, false), // VPN redirect half (not a server)
-            raw_route([23, 10, 20, 138], 32, [10, 91, 192, 1], 78, true), // our /32 (is_ours)
+            raw_route([203, 0, 113, 138], 32, [10, 91, 192, 1], 78, true), // our /32 (is_ours)
         ];
         let got = bootstrap_server_ips(&routes, 78, Some(Ipv4Addr::from(pg)));
         assert_eq!(
@@ -1128,8 +1260,8 @@ mod tests {
         // default.
         let api = Arc::new(MockWindowsApi::new());
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
-        let host_a = route([8, 8, 8, 8], [10, 0, 0, 1], 14);
-        let host_b = route([1, 1, 1, 1], [10, 0, 0, 1], 14);
+        let host_a = route([198, 51, 100, 8], [10, 0, 0, 1], 14);
+        let host_b = route([198, 51, 100, 1], [10, 0, 0, 1], 14);
         let counter_overlay = raw_route([64, 0, 0, 0], 2, [192, 168, 0, 1], 16, true);
         let split_default = raw_route([0, 0, 0, 0], 1, [10, 0, 0, 1], 14, true);
         rec.reconcile(&[host_a, host_b, counter_overlay, split_default])
@@ -1144,8 +1276,8 @@ mod tests {
         assert_eq!(delta.added, 0);
         assert_eq!(rec.owned_count(), 2, "only the two /32 host routes remain");
         let dests = table_dests(&api);
-        assert!(dests.contains(&Ipv4Addr::new(8, 8, 8, 8)));
-        assert!(dests.contains(&Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(dests.contains(&Ipv4Addr::new(198, 51, 100, 8)));
+        assert!(dests.contains(&Ipv4Addr::new(198, 51, 100, 1)));
         assert!(
             !dests.contains(&Ipv4Addr::new(64, 0, 0, 0)),
             "counter-overlay gone"

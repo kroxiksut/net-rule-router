@@ -326,7 +326,7 @@ fn explain_rejects_both_fields_set() {
     let h = ExplainGetHandler::new(facade());
     let payload = serde_json::json!({
         "decision-id": "d-1",
-        "input-sample": { "hostname": "x.com" }
+        "input-sample": { "hostname": "short.example" }
     });
     let r = h.handle(&envelope(payload), &ctx());
     assert!(r.is_err());
@@ -456,7 +456,7 @@ fn seeded_cache() -> Arc<Mutex<dyn CacheRepository + Send>> {
         .expect("seed");
     store
         .upsert_resolution(ResolutionEntry {
-            canonical_hostname: "api.other.net".into(),
+            canonical_hostname: "api.other.example.net".into(),
             raw_hostname_sample: None,
             resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))],
             ttl_seconds: Some(300),
@@ -481,8 +481,11 @@ fn cache_entries_local_viewer_shows_real_hostname_and_ip() {
     assert_eq!(v["page"]["total_count"], 2, "live cache total");
     let items = v["page"]["items"].as_array().expect("items array");
     assert_eq!(items.len(), 2);
-    // Ordered by canonical_host: api.other.net before sub.example.com.
-    assert_eq!(items[0]["hostname"], "api.other.net", "full hostname");
+    // Ordered by canonical_host: api.other.example.net before sub.example.com.
+    assert_eq!(
+        items[0]["hostname"], "api.other.example.net",
+        "full hostname"
+    );
     assert_eq!(items[0]["source"], "observed_from_traffic");
     assert_eq!(items[0]["ip"], "198.51.100.9", "real IP");
     assert_eq!(items[1]["hostname"], "sub.example.com", "full hostname");
@@ -538,7 +541,7 @@ fn cache_entries_carry_expected_route_when_expectation_wired() {
                 rule_book: CanonicalRuleBook {
                     primary: CanonicalRuleSet::from_rules(vec![rule(
                         "p1",
-                        CanonicalAddressMatch::SuffixDomain("other.net".into()),
+                        CanonicalAddressMatch::SuffixDomain("other.example.net".into()),
                     )]),
                     secondary: CanonicalRuleSet::from_rules(vec![rule(
                         "s1",
@@ -559,7 +562,7 @@ fn cache_entries_carry_expected_route_when_expectation_wired() {
         .handle(&envelope(serde_json::json!({})), &ctx())
         .expect("ok");
     let items = v["page"]["items"].as_array().expect("items");
-    assert_eq!(items[0]["hostname"], "api.other.net");
+    assert_eq!(items[0]["hostname"], "api.other.example.net");
     assert_eq!(items[0]["expected_route"], "primary");
     assert_eq!(items[1]["hostname"], "sub.example.com");
     assert_eq!(items[1]["expected_route"], "secondary");
@@ -872,7 +875,7 @@ fn health_json_carries_enrichment_from_providers() {
             adapter_name: "eth0".into(),
             ipv6_if_index: 1,
             physical_address: None,
-            windows_name: "Ethernet".into(),
+            name: "Ethernet".into(),
             interface_description: "Test NIC".into(),
             interface_type: "ethernet".into(),
             oper_status: "up".into(),

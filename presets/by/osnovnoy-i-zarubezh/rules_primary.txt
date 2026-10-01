@@ -19,7 +19,7 @@ ru              # Российская Федерация (.ru)
 *.vkuseraudio.net  # Regional services commonly used in Belarus
 
 *.my.com
-*.icq.com
+# *.icq.com    # сервис закрыт, включать незачем
 *.ok.com
 
 *.yandex.com  # Yandex and related infrastructure on global TLDs
@@ -43,7 +43,7 @@ ru              # Российская Федерация (.ru)
 --- Windows
 YandexDis*.exe  # Direct route preferred for local/regional desktop apps
 DiskO*.exe  # Direct route preferred for local/regional desktop apps
-Cloud.exe  # Direct route preferred for local/regional desktop apps
+# Cloud.exe    # Mail.ru Cloud: имя процесса слишком общее, проверьте у себя
 mail.ru_cloud*.exe  # Direct route preferred for local/regional desktop apps
 
 vk.exe
@@ -51,7 +51,7 @@ vkteams.exe
 vkplay.exe
 gamecenter.exe
 
-icq.exe
+# icq.exe    # сервис закрыт, включать незачем
 tamtam.exe
 2gis.exe
 

@@ -304,7 +304,7 @@ Dialog {
             ThemedButton {
                 id: cancelButton
                 theme: guard.ownerRoot ? guard.ownerRoot.uiTheme : null
-                text: guard.tr("unsaved-changes.action.cancel", "Cancel")
+                text: guard.tr("action.cancel", "Cancel")
                 Accessible.role: Accessible.Button
                 Accessible.name: guard.tr(
                     "unsaved-changes.accessible.cancel",

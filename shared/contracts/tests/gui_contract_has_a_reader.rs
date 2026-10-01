@@ -92,6 +92,22 @@ fn every_main_window_shell_field_is_read_by_the_context_emitter() {
     }
 }
 
+/// The About window reads product name, version and licence from the build
+/// itself (`AboutWindowInfo`); this contract keeps only what the build cannot
+/// know, and each of it must reach the window.
+#[test]
+fn every_about_field_is_read_by_the_context_emitter() {
+    let reader = repo_file(READER);
+    let fields = declared_fields("AboutContract");
+    assert!(!fields.is_empty(), "the contract declares nothing at all");
+    for field in fields {
+        assert!(
+            reader.contains(&format!("shell.about.{field}")),
+            "AboutContract::{field} has no reader in {READER}"
+        );
+    }
+}
+
 /// The contracts that described the rules table and the interfaces screen were
 /// removed for having no reader. Re-adding one is a decision, not an accident:
 /// this fails until the reader exists on the other side.

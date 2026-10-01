@@ -2,7 +2,7 @@
 # name: ID Indonesia Default Split - Primary Route
 # description: Indonesia/local services routed to primary
 # author: NetRuleRouter contributors
-# preset_version: 1
+# preset_version: 2
 
 --- Zones
 id              # Republic of Indonesia (.id)
@@ -12,7 +12,8 @@ id              # Republic of Indonesia (.id)
 *.indosatooredoo.com  # Indonesia telecom and public ecosystem
 *.xl.co.id  # Indonesia telecom and public ecosystem
 *.smartfren.com  # Indonesia telecom and public ecosystem
-*.kominfo.go.id  # Indonesia telecom and public ecosystem
+*.komdigi.go.id  # Indonesia telecom and public ecosystem (Komdigi, the communications ministry)
+*.kominfo.go.id  # The ministry's former name; kept while the old domain still answers
 
 *.go-jek.com  # Local digital ecosystem
 *.gojek.com  # Local digital ecosystem
@@ -20,7 +21,7 @@ id              # Republic of Indonesia (.id)
 *.bukalapak.com  # Local digital ecosystem
 *.blibli.com  # Local digital ecosystem
 
-*.google.com  # Google services stay on the main route; the AI hosts are routed separately
+*.google.com  # Google services stay on the main route
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets

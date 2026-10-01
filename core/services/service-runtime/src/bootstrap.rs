@@ -547,12 +547,9 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
         );
     }
 
-    // Phase 4 — integrity verify. Walks the policy-load state machine:
-    // read active pointer → verify content hashes → optionally fall back
-    // to LKG through an audited recovery flow. `DiagnosticsRecoveryAuditEmitter`
-    // (over the early-opened `AuditWriter`) ensures any LKG fallback /
-    // integrity failure lands in `audit/*.ndjson` durably before the
-    // active pointer is mutated.
+    // Phase 4 — integrity verify. The keyless loader reports what it finds
+    // (durably, through the early-opened `AuditWriter`) and changes nothing;
+    // the keyed per-principal sweep recovers once the signing key is loaded.
     //
     // `audit_writer` is guaranteed to be `Some` here: it was opened in
     // phase 2.5 before this branch can even run (a missing audit writer
@@ -573,9 +570,9 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
                 BootstrapStepStatus::Ok,
                 format!("active revision loaded: {}", s.revision_id),
             ),
-            PolicyLoadResult::LkgFallbackApplied(s) => (
+            PolicyLoadResult::IntegrityFailureReported(details) => (
                 BootstrapStepStatus::Warning,
-                format!("active recovered from LKG: {}", s.revision_id),
+                format!("integrity failure reported: {details}"),
             ),
             PolicyLoadResult::NoActiveRevision => (
                 BootstrapStepStatus::Ok,
@@ -637,13 +634,13 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
         &mut report,
         phases::IPC_START,
         BootstrapStepStatus::Skipped,
-        "deferred to block 14.5",
+        "not yet implemented",
     );
     push(
         &mut report,
         phases::RUNTIME_LOOP_START,
         BootstrapStepStatus::Skipped,
-        "deferred to block 14.7",
+        "not yet implemented",
     );
 
     BootstrapArtifacts {
@@ -960,7 +957,7 @@ mod tests {
             .expect("STORAGE_STATE recorded");
         assert!(
             audit_idx < state_idx,
-            "audit must be opened before state DB (block 16.5 invariant)"
+            "audit must be opened before state DB"
         );
     }
 

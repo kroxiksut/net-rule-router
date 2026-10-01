@@ -140,7 +140,7 @@ impl PerSidApplyOrchestrator {
             fqdn_cache,
             policy.shared_ip_policy,
         );
-        // Block D (fake-IP, slice 5) — fold fake-IP into the plan. Computed
+        // Fake-IP: fold fake-IP into the plan. Computed
         // against the ORIGINAL denylist (which doubles as the shared-IP census),
         // BEFORE its suppress-set is merged in: the /32 permits of shared real
         // addresses are suppressed via the denylist, and the pool permit is
@@ -182,10 +182,21 @@ impl PerSidApplyOrchestrator {
                 .publish(sid, &policy.link_provider_exe_paths);
         }
         timings.mark("fake-ip");
+        // One reading of the machine for the whole pass, and each resolver asked
+        // at most once: every one of them used to enumerate the adapters and
+        // the route table for itself, a dozen OS reads per compute.
+        let machine = (self.machine_reader)();
+        let kill_switch_cell = std::cell::OnceCell::new();
+        let kill_switch =
+            || kill_switch_cell.get_or_init(|| (self.kill_switch_resolver)(sid, &machine));
+        let fail_closed_cell = std::cell::OnceCell::new();
+        let fail_closed_base = || {
+            fail_closed_cell.get_or_init(|| (self.fail_closed_exemptions_resolver)(sid, &machine))
+        };
         // What the machine's links can carry decides whether policy names IPv6
         // at all. Resolved per pass, not per session: a tunnel that comes up
         // with a v6 address changes the answer.
-        let ipv6 = (self.ipv6_guard_resolver)(sid);
+        let ipv6 = (self.ipv6_guard_resolver)(sid, &machine);
         if intent.publishes() {
             crate::ipv6_disposition::global_ipv6_dispositions().set(sid, ipv6);
         }
@@ -344,7 +355,7 @@ impl PerSidApplyOrchestrator {
                     sid = %sid,
                     count = claimed_by_main.len(),
                     conflicts = %shown.join(", "),
-                    "an application rule is talking to addresses your main-link rules name: those                      stay on the main link. The app keeps the additional link for everything else",
+                    "an application rule is talking to addresses your main-link rules name: those stay on the main link. The app keeps the additional link for everything else",
                 );
             }
             if !over_capped.is_empty() {
@@ -428,14 +439,14 @@ impl PerSidApplyOrchestrator {
             // routed domain's UN-SEEDED edge IP is handled when the secondary is
             // unresolved (VPN down). `FailClosedUnknown` escalates the fail-closed
             // block to the catch-all so that un-seeded IP is BLOCKED rather than
-            // leaked to the primary (the  chatgpt-over-primary leak while
+            // leaked to the primary (the  assistant-over-primary leak while
             // the VPN was closed). This only escalates in PreferPrimary (Mode A) —
             // the other modes already catch-all — and only in the `None`
             // (secondary-unresolved) branch below; while the secondary is UP the
             // per-IP pin is correct and a catch-all would wrongly cut the primary.
             // `ZoneWidening` is not yet implemented (needs suffix/zone routing) and
             // falls back to per-IP with a one-line notice; `FailClosedUnknown` is
-            // the default since HW-0714.
+            // the product default.
             use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
             let mode_a_fail_closed_unknown = behavior_mode == RouteBehaviorMode::PreferPrimary
                 && policy.mode_a_coverage_strategy == ModeACoverageStrategy::FailClosedUnknown;
@@ -532,9 +543,9 @@ impl PerSidApplyOrchestrator {
             // handling (the default). An IP the shared-IP census has ALSO seen
             // on a direct (non-rule) hostname is removed from the kill-switch
             // pin/block set: IP-level blocking cannot separate co-tenants, and
-            // the 0719 HW run showed strict pinning of Google front-end IPs
-            // (shared by gemini/video-site secondary rules and www.search.example)
-            // killing search.example in every browser — plus the VPN client's own
+            // strict pinning of CDN front-end IPs
+            // (shared by ai-site/video-site secondary rules and www.search.example)
+            // was seen killing search.example in every browser — plus the VPN client's own
             // bootstrap. The trade-off is explicit: while excluded, those IPs
             // are not leak-protected (secondary-rule traffic to them can egress
             // the primary when the secondary is down). `strict` restores the
@@ -564,8 +575,9 @@ impl PerSidApplyOrchestrator {
             // 10.x network is a legitimate destination. The distinction is
             // whether the address sits in a subnet the PRIMARY link is
             // connected to.
-            let local_subnets = (self.kill_switch_resolver)(sid)
-                .map(|r| r.local_subnets)
+            let local_subnets = kill_switch()
+                .as_ref()
+                .map(|r| r.local_subnets.clone())
                 .unwrap_or_default();
             // An address only an APPLICATION rule brought in is not pinned
             // per-destination: the app's own egress-conditional pair (or its
@@ -611,16 +623,25 @@ impl PerSidApplyOrchestrator {
                     std::net::IpAddr::V6(_) => true,
                 })
                 .collect();
-            if protectable.len() != codegen_out.secondary_dest_ips.len() {
-                tracing::info!(
-                    target: "nrr::per_sid_orchestrator",
-                    msg_key = "persid-plan-pin-set-trimmed",
-                    sid,
-                    kept = protectable.len(),
-                    dropped = codegen_out.secondary_dest_ips.len() - protectable.len(),
-                    app_covered = app_covered.len(),
-                    "kill-switch pin set trimmed: main-route-claimed addresses (blocking one kills a destination the user routed the other way) and app-observed destinations (their app's own pair is the guard)",
-                );
+            let trim = (protectable.len() != codegen_out.secondary_dest_ips.len()).then(|| {
+                (
+                    protectable.len(),
+                    codegen_out.secondary_dest_ips.len() - protectable.len(),
+                    app_covered.len(),
+                )
+            });
+            if self.pin_trim_changed(sid, trim) {
+                if let Some((kept, dropped, app_covered)) = trim {
+                    tracing::info!(
+                        target: "nrr::per_sid_orchestrator",
+                        msg_key = "persid-plan-pin-set-trimmed",
+                        sid,
+                        kept,
+                        dropped,
+                        app_covered,
+                        "kill-switch pin set trimmed: main-route-claimed addresses (blocking one kills a destination the user routed the other way) and app-observed destinations (their app's own pair is the guard)",
+                    );
+                }
             }
             // The shared-address census is IPv4: it counts direct hosts seen
             // on an address, and nothing observes v6 co-tenancy yet. A v6
@@ -692,7 +713,7 @@ impl PerSidApplyOrchestrator {
             //   then the ONLY enforcement, and an exempted shared IP is a real
             //   leak, not a side channel: 39 connections to assistant.example
             //   front-ends (rule host fail-closed) once egressed the primary in
-            //   ~10 minutes through exactly this hole, because chatgpt's IPs are
+            //   ~10 minutes through exactly this hole, because assistant's IPs are
             //   census-shared with direct hosts.
             //
             //   One carve-out: an address whose direct tenant a MAIN-route rule
@@ -707,7 +728,7 @@ impl PerSidApplyOrchestrator {
             //   opposite trade.
             //
             // The smart PIN partition above stays smart in BOTH modes —
-            // re-pinning shared IPs is what killed search.example in the 0719 run;
+            // re-pinning shared IPs is what killed search.example;
             // only the exemption subtraction tightens. A fake-IP transition
             // triggers an immediate replan (the settings write hook on
             // toggle/mode flips, the datapath watchdog on health flips), so
@@ -749,7 +770,7 @@ impl PerSidApplyOrchestrator {
             // differently: the codegen lists what it managed to emit a permit
             // for (subject to its own fan-out caps), the arbiter lists what the
             // user's rules actually name. Two answers to one question is how
-            // the address-ownership bugs of 23.08 happened; this is the same
+            // address-ownership bugs happen; this is the same
             // arbiter the route, filter and kill-switch codegens read.
             // Sorted so the emitted exemption set is stable across recomputes.
             let known_primary_dest_ips: Vec<std::net::Ipv4Addr> = {
@@ -799,7 +820,7 @@ impl PerSidApplyOrchestrator {
                         secondary_luid: 0,
                     }
                 };
-            match (self.kill_switch_resolver)(sid) {
+            match kill_switch().clone() {
                 Some(resolution) => {
                     // Mode A (PreferPrimary) protects only the selected secondary
                     // destinations; mode B arms the catch-all (all off-tunnel).
@@ -985,7 +1006,7 @@ impl PerSidApplyOrchestrator {
                         // off-tunnel flow while the tunnel is UP, and that
                         // includes the VPN client's own primary-side control
                         // traffic (server handshake, connectivity checks
-                        // against ROTATING provider IPs — the swiftvpn 72 s
+                        // against ROTATING provider IPs — the examplevpn 72 s
                         // hang-per-drop class). The client's egress IS the
                         // tunnel's transport, so the app exemption set is
                         // emitted here too — proactively, at arming — not only
@@ -1009,7 +1030,7 @@ impl PerSidApplyOrchestrator {
                     // the main link. The wait is visible — `secondary-down`
                     // reaches the window and the tray.
                     if fail_closed {
-                        let mut exemptions = (self.fail_closed_exemptions_resolver)(sid);
+                        let mut exemptions = fail_closed_base().clone();
                         // opt-in: keep name resolution working over
                         // the primary link while the block-all is engaged (adds a
                         // port-scoped UDP/TCP-53 permit). Strict default = blocks DNS too.
@@ -1186,7 +1207,10 @@ impl PerSidApplyOrchestrator {
         if app_block_emitted
             || (leak_guard_armed && behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed)
         {
-            let floor = self.destination_less_block_floor(sid, &filters);
+            let floor =
+                self.destination_less_block_floor(sid, &filters, kill_switch().as_ref(), &|| {
+                    fail_closed_base().clone()
+                });
             filters.extend(floor);
         }
         timings.mark("kill-switch");
@@ -1196,7 +1220,7 @@ impl PerSidApplyOrchestrator {
             // Strict still emits its default block (that is the mode, not the
             // guard), so it still needs the exemptions the guard used to carry.
             if behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed {
-                if let Some(resolution) = (self.kill_switch_resolver)(sid) {
+                if let Some(resolution) = kill_switch().clone() {
                     let exemptions = FailClosedExemptions {
                         bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
                         bootstrap_server_ips_v6: resolution.bootstrap_server_ips_v6.clone(),
@@ -1216,7 +1240,7 @@ impl PerSidApplyOrchestrator {
                 }
             }
             let _ = self.posture_changed_for(intent, sid, "off");
-            // П0-A — nothing is pinned while disarmed, so no shared-IP
+            // Nothing is pinned while disarmed, so no shared-IP
             // exclusions either; clear the GUI warning.
             if let Some(status) = self
                 .shared_ip_exemption_status
@@ -1374,14 +1398,16 @@ impl PerSidApplyOrchestrator {
         &self,
         sid: &str,
         emitted: &[WfpFilterSpec],
+        kill_switch: Option<&KillSwitchResolution>,
+        fail_closed: &dyn Fn() -> FailClosedExemptions,
     ) -> Vec<WfpFilterSpec> {
-        let exemptions = match (self.kill_switch_resolver)(sid) {
+        let exemptions = match kill_switch {
             Some(resolution) => FailClosedExemptions {
-                bootstrap_server_ips: resolution.bootstrap_server_ips,
-                local_subnets: resolution.local_subnets,
+                bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                local_subnets: resolution.local_subnets.clone(),
                 ..FailClosedExemptions::default()
             },
-            None => (self.fail_closed_exemptions_resolver)(sid),
+            None => fail_closed(),
         };
         let present: std::collections::HashSet<nrr_platform_api::types::WfpFilterId> =
             emitted.iter().map(|f| f.id).collect();

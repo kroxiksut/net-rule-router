@@ -36,8 +36,8 @@ pub struct InterfaceCounters {
     /// `true` for known virtual-adapter software (Hyper-V / WSL / Docker / …),
     /// computed by the backend via [`crate::adapters::is_virtual_adapter`].
     pub is_virtual: bool,
-    /// `true` for a VPN/tunnel adapter (block T — feeds the tunnel-overlap
-    /// double-counting fix in `nrr_domain::traffic_accountant`). Computed by
+    /// `true` for a VPN/tunnel adapter — feeds the tunnel-overlap
+    /// double-counting fix in `nrr_domain::traffic_accountant`. Computed by
     /// the backend from the raw interface type OR a name/description keyword
     /// match — see [`crate::adapters::text_indicates_vpn_tunnel`]; the raw
     /// type alone under-detects (TAP-Windows presents as Ethernet, wintun as

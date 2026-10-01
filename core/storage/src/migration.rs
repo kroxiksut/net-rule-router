@@ -1,4 +1,5 @@
-//! Migration runner and connection factory.
+//! Migration catalogues of the three service databases and the connection
+//! factory.
 //!
 //! # Connection lifecycle
 //!
@@ -10,27 +11,21 @@
 //! runner.into_connection()            → Connection  (hand to repository)
 //! ```
 //!
-//! # Migration model
+//! The runner itself — one immediate transaction per run, checksums
+//! re-validated on every open, the `schema_migrations` bookkeeping — is
+//! `nrr-sqlite-support`, shared with the GUI sidecar.
 //!
-//! Each database carries a `schema_migrations` table (created by the runner
-//! before the first migration runs, as bootstrap infrastructure).  Each
-//! migration executes its SQL statements plus the `schema_migrations` INSERT
-//! atomically in a single transaction: either both commit or both roll back.
-//!
-//! # WAL baseline
-//!
-//! WAL journal mode is mandatory.  [`open_connection`] verifies that the DB
-//! actually accepted `PRAGMA journal_mode = WAL` — some network filesystems
-//! silently fall back to DELETE mode.  The service always runs on a local NTFS
-//! volume so this check should never fire in production.
+//! WAL is mandatory and verified on open: some network filesystems silently
+//! fall back to DELETE mode.
 
 use std::cell::RefCell;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use rusqlite::{Connection, OptionalExtension};
+use nrr_sqlite_support::{ConnectionError, MigrationError};
+use rusqlite::Connection;
 
-use crate::backup::{backup_database, BackupPolicy, BackupReason};
+use crate::backup::{backup_database, BackupReason};
 use crate::dto::{MigrationSummary, SchemaVerification};
 use crate::error::{StorageError, StorageResult};
 use crate::repository::MigrationRunner;
@@ -48,32 +43,12 @@ use crate::schema::{
     STATE_DB_V52_DDL, STATE_DB_V53_DDL, STATE_DB_V54_DDL, STATE_DB_V55_DDL, STATE_DB_V56_DDL,
     STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V59_DDL, STATE_DB_V5_DDL, STATE_DB_V60_DDL,
     STATE_DB_V61_DDL, STATE_DB_V62_DDL, STATE_DB_V63_DDL, STATE_DB_V64_DDL, STATE_DB_V65_DDL,
-    STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL, STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL,
-    TRAFFIC_DB_V2_DDL,
+    STATE_DB_V66_DDL, STATE_DB_V67_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL,
+    STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL, TRAFFIC_DB_V2_DDL,
 };
 
-// ── schema_migrations bootstrap DDL ──────────────────────────────────────────
-
-const CREATE_SCHEMA_MIGRATIONS: &str = "
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version      INTEGER PRIMARY KEY,
-    name         TEXT    NOT NULL,
-    applied_at   INTEGER NOT NULL,
-    checksum     TEXT    NOT NULL,
-    app_version  TEXT    NOT NULL
-)";
-
-// ── MigrationDef ─────────────────────────────────────────────────────────────
-
-/// A single versioned migration: an ordered list of SQL statements applied
-/// atomically within one transaction.
-#[derive(Clone, Copy)]
-pub(crate) struct MigrationDef {
-    pub version: u32,
-    pub name: &'static str,
-    /// Individual SQL statements executed in order inside a single transaction.
-    pub stmts: &'static [&'static str],
-}
+/// One versioned step; the catalogues below append, never edit.
+pub(crate) type MigrationDef = nrr_sqlite_support::Migration;
 
 // ── Migration catalogs ────────────────────────────────────────────────────────
 
@@ -629,6 +604,16 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_block_notice_launched_by",
         stmts: STATE_DB_V65_DDL,
     },
+    MigrationDef {
+        version: 66,
+        name: "drop_integrity_log_and_apply_snapshots",
+        stmts: STATE_DB_V66_DDL,
+    },
+    MigrationDef {
+        version: 67,
+        name: "verbose_logging_deadline",
+        stmts: STATE_DB_V67_DDL,
+    },
 ];
 
 // ── Required schema elements — used by verify_schema ─────────────────────────
@@ -677,8 +662,6 @@ const TRAFFIC_REQUIRED_INDEXES: &[&str] = &[];
 
 const STATE_REQUIRED_TABLES: &[&str] = &[
     "schema_migrations",
-    "integrity_log",
-    "apply_snapshots",
     "route_bindings",
     "behavior_mode",
     "secondary_block_policy",
@@ -723,8 +706,6 @@ const STATE_REQUIRED_TABLES: &[&str] = &[
 ];
 
 const STATE_REQUIRED_INDEXES: &[&str] = &[
-    "idx_integrity_log_checked",
-    "idx_apply_snapshots_created",
     "idx_route_bindings_sid",
     "idx_revisions_status",
     "idx_revisions_created",
@@ -748,30 +729,25 @@ const STATE_REQUIRED_INDEXES: &[&str] = &[
 
 // ── Connection factory ────────────────────────────────────────────────────────
 
-/// Opens a file-based SQLite connection with mandatory baseline PRAGMAs.
-///
-/// Sets WAL journal mode (verified, not assumed), enables foreign key
-/// enforcement, and configures a 5-second busy timeout.
+/// How long any connection to a local database waits out another's lock.
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+/// Opens a file-based SQLite connection with the baseline both local
+/// databases share: [`BUSY_TIMEOUT`], WAL (verified), foreign keys.
 pub fn open_connection(path: &Path) -> StorageResult<Connection> {
     let conn = Connection::open(path)
         .map_err(|e| StorageError::StorageUnavailable(format!("open {}: {e}", path.display())))?;
 
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
-        .map_err(|e| StorageError::Internal(format!("WAL pragma: {e}")))?;
-    if mode != "wal" {
-        return Err(StorageError::StorageUnavailable(format!(
-            "WAL mode not supported at {} (filesystem returned {mode:?}); \
-             database must reside on a local NTFS volume",
-            path.display()
-        )));
-    }
-
-    conn.execute_batch("PRAGMA foreign_keys = ON;")
-        .map_err(|e| StorageError::Internal(format!("foreign_keys pragma: {e}")))?;
-
-    conn.busy_timeout(std::time::Duration::from_millis(5_000))
-        .map_err(|e| StorageError::Internal(format!("busy_timeout: {e}")))?;
+    nrr_sqlite_support::configure_connection(&conn, BUSY_TIMEOUT).map_err(|e| match e {
+        ConnectionError::WalUnsupported { journal_mode } => {
+            StorageError::StorageUnavailable(format!(
+                "WAL mode not supported at {} (filesystem returned {journal_mode:?}); \
+                     database must reside on a local volume",
+                path.display()
+            ))
+        }
+        ConnectionError::Sqlite(e) => StorageError::Internal(format!("connection pragmas: {e}")),
+    })?;
 
     // Fold the journal back into the database file and shrink it. WAL's
     // automatic checkpoint copies pages across but never truncates the file, so
@@ -904,10 +880,10 @@ pub struct SqliteMigrationRunner {
     migrations: &'static [MigrationDef],
     required_tables: &'static [&'static str],
     required_indexes: &'static [&'static str],
-    /// Whether an upgrade of THIS database is snapshotted first, and what a
-    /// failed snapshot means. `None` for the databases that are rebuildable by
-    /// definition: losing them costs a rebuild, not data.
-    backup_policy: Option<BackupPolicy>,
+    /// Whether an upgrade of THIS database is snapshotted first; a failed
+    /// snapshot then refuses the upgrade. Off for the databases that are
+    /// rebuildable by definition: losing them costs a rebuild, not data.
+    snapshot_first: bool,
 }
 
 impl SqliteMigrationRunner {
@@ -917,7 +893,7 @@ impl SqliteMigrationRunner {
             migrations: CACHE_MIGRATIONS,
             required_tables: CACHE_REQUIRED_TABLES,
             required_indexes: CACHE_REQUIRED_INDEXES,
-            backup_policy: None,
+            snapshot_first: false,
         }
     }
 
@@ -928,18 +904,18 @@ impl SqliteMigrationRunner {
             required_tables: STATE_REQUIRED_TABLES,
             required_indexes: STATE_REQUIRED_INDEXES,
             // The only database here that cannot be rebuilt from anything.
-            backup_policy: Some(BackupPolicy::Required),
+            snapshot_first: true,
         }
     }
 
-    /// Migration runner for the Block T traffic-stats DB (`nrr_traffic_stats.db`).
+    /// Migration runner for the traffic-stats DB (`nrr_traffic_stats.db`).
     pub fn for_traffic_db(conn: Connection) -> Self {
         Self {
             conn: RefCell::new(conn),
             migrations: TRAFFIC_MIGRATIONS,
             required_tables: TRAFFIC_REQUIRED_TABLES,
             required_indexes: TRAFFIC_REQUIRED_INDEXES,
-            backup_policy: None,
+            snapshot_first: false,
         }
     }
 
@@ -1002,80 +978,37 @@ impl SqliteMigrationRunner {
 
 impl MigrationRunner for SqliteMigrationRunner {
     fn current_schema_version(&self) -> StorageResult<u32> {
-        let conn = self.conn.borrow();
-        current_version(&conn)
+        read_schema_version(&self.conn.borrow())
     }
 
     fn run_pending_migrations(&self) -> StorageResult<MigrationSummary> {
-        let from_version = {
-            let conn = self.conn.borrow();
-            ensure_migrations_table(&conn)?;
-            current_version(&conn)?
-        };
-
-        let max_available = self.migrations.iter().map(|m| m.version).max().unwrap_or(0);
-
-        // Before the history is validated: a database written by a newer build
-        // carries migrations this one has never heard of, and "you are running
-        // an older binary" is the diagnosis the caller can act on.
-        if from_version > max_available {
-            return Err(StorageError::UnsupportedSchemaVersion {
-                found: from_version,
-                max_supported: max_available,
-            });
-        }
-
-        {
-            let conn = self.conn.borrow();
-            validate_applied_checksums(&conn, self.migrations, from_version)?;
-        }
-
-        let pending: Vec<&MigrationDef> = self
-            .migrations
-            .iter()
-            .filter(|m| m.version > from_version)
-            .collect();
-
-        // The promise in `MigrationRunner`'s doc — a copy before any structural
-        // change — was only ever a promise: nothing called the backup. Taken
-        // here, once, before the first migration runs, because a snapshot per
-        // migration would copy the same database N times for one upgrade.
-        if let Some(policy) = self.backup_policy.clone() {
-            if let Some(to_version) = pending.iter().map(|m| m.version).max() {
-                if let Err(e) = self.snapshot_before_migrating(from_version, to_version) {
-                    match policy {
-                        // Refusing to migrate is the point: this database cannot
-                        // be rebuilt, so an upgrade we could not undo must not
-                        // start.
-                        BackupPolicy::Required => return Err(e),
-                        BackupPolicy::Optional => {}
-                    }
+        // Taken before the migrating transaction and outside its write lock:
+        // the snapshot is a second connection reading the same file. The
+        // runner re-reads the version under the lock, so this read only
+        // decides whether a snapshot is due.
+        if self.snapshot_first {
+            let from_version = read_schema_version(&self.conn.borrow())?;
+            if let Some(to_version) = self.migrations.last().map(|m| m.version) {
+                if from_version < to_version {
+                    // An upgrade we could not undo must not start.
+                    self.snapshot_before_migrating(from_version, to_version)?;
                 }
             }
         }
 
-        let mut applied_names: Vec<String> = Vec::with_capacity(pending.len());
-        for migration in &pending {
-            {
-                let mut conn = self.conn.borrow_mut();
-                apply_migration(&mut conn, migration)?;
-            }
-            applied_names.push(migration.name.to_string());
-        }
-
-        let to_version = pending.last().map(|m| m.version).unwrap_or(from_version);
-
+        let outcome = nrr_sqlite_support::migrate(&mut self.conn.borrow_mut(), self.migrations)
+            .map_err(storage_error)?;
         Ok(MigrationSummary {
-            from_version,
-            to_version,
-            migrations_applied: applied_names,
+            from_version: outcome.from_version,
+            to_version: outcome.to_version,
+            migrations_applied: outcome.applied.into_iter().map(str::to_owned).collect(),
             completed_at: SystemTime::now(),
         })
     }
 
     fn verify_schema(&self) -> StorageResult<SchemaVerification> {
         let conn = self.conn.borrow();
-        let version = current_version(&conn)?;
+        let version = read_schema_version(&conn)?;
 
         let required_tables_present = self
             .required_tables
@@ -1103,149 +1036,33 @@ impl MigrationRunner for SqliteMigrationRunner {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-fn ensure_migrations_table(conn: &Connection) -> StorageResult<()> {
-    conn.execute_batch(CREATE_SCHEMA_MIGRATIONS)
-        .map_err(|e| StorageError::Internal(format!("create schema_migrations: {e}")))
-}
-
-/// Reads the current `schema_migrations` version from an already-open
-/// connection **without** taking ownership of it.
-///
-/// [`SqliteMigrationRunner::current_schema_version`] requires owning the
-/// `Connection` (it holds one in a `RefCell`), which doesn't fit callers
-/// that only have a shared `Arc<Mutex<Connection>>` opened elsewhere (e.g.
-/// the diagnostic archive builder, which reads the version for
-/// `health.json` enrichment without disturbing the connection's real
-/// owner). Returns `0` when the `schema_migrations` table itself doesn't
-/// exist yet (fresh/un-migrated database) — same convention as
-/// [`current_version`] internally.
-///
-/// [`SqliteMigrationRunner::current_schema_version`]: crate::repository::MigrationRunner::current_schema_version
-pub fn read_schema_version(conn: &Connection) -> StorageResult<u32> {
-    current_version(conn)
-}
-
-fn current_version(conn: &Connection) -> StorageResult<u32> {
-    let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE type='table' AND name='schema_migrations'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|n| n > 0)
-        .map_err(|e| StorageError::Internal(format!("check schema_migrations: {e}")))?;
-
-    if !exists {
-        return Ok(0);
-    }
-
-    conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
-        |r| r.get::<_, i64>(0),
-    )
-    .map(|v| v as u32)
-    .map_err(|e| StorageError::Internal(format!("read schema version: {e}")))
-}
-
-fn apply_migration(conn: &mut Connection, migration: &MigrationDef) -> StorageResult<()> {
-    let from = migration.version.saturating_sub(1);
-    let mk_err = |reason: String| StorageError::MigrationFailed {
-        from_version: from,
-        to_version: migration.version,
-        reason,
-    };
-
-    // IMMEDIATE, not the default DEFERRED: a deferred transaction takes its read
-    // snapshot first and asks for the write lock at the first DDL statement, and
-    // a concurrent writer then answers SQLITE_BUSY_SNAPSHOT — which `busy_timeout`
-    // does not retry. Taking the write lock up front puts the wait back under
-    // the timeout.
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| mk_err(format!("begin transaction: {e}")))?;
-
-    for stmt in migration.stmts {
-        tx.execute_batch(stmt)
-            .map_err(|e| mk_err(format!("DDL failed: {e}")))?;
-    }
-
-    tx.execute(
-        "INSERT OR IGNORE INTO schema_migrations
-         (version, name, applied_at, checksum, app_version)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![
-            migration.version as i64,
-            migration.name,
-            system_time_to_ms(SystemTime::now()),
-            checksum_of(migration.stmts),
-            env!("CARGO_PKG_VERSION"),
-        ],
-    )
-    .map_err(|e| mk_err(format!("record migration: {e}")))?;
-
-    tx.commit().map_err(|e| mk_err(format!("commit: {e}")))?;
-
-    Ok(())
-}
-
-/// Validates that checksums stored in `schema_migrations` for already-applied
-/// migrations match the checksums computed from the current embedded SQL.
-///
-/// A mismatch means either the migration SQL was edited after being applied
-/// (schema drift) or the database was tampered with.  Either case is fatal —
-/// the runner cannot safely determine which migrations to apply next.
-fn validate_applied_checksums(
-    conn: &Connection,
-    migrations: &[MigrationDef],
-    applied_up_to: u32,
-) -> StorageResult<()> {
-    for migration in migrations.iter().filter(|m| m.version <= applied_up_to) {
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT checksum FROM schema_migrations WHERE version = ?1",
-                rusqlite::params![migration.version as i64],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| {
-                StorageError::Internal(format!("read checksum v{}: {e}", migration.version))
-            })?;
-
-        // The version counter is MAX(version), so a row missing below the
-        // maximum means an earlier migration never ran (an interrupted upgrade,
-        // a database restored from a copy). Nothing would ever apply it — the
-        // runner only looks at versions ABOVE the maximum — and the schema is
-        // short exactly whatever that migration created.
-        let Some(stored_checksum) = stored else {
-            return Err(StorageError::MigrationFailed {
-                from_version: migration.version.saturating_sub(1),
-                to_version: migration.version,
-                reason: format!(
-                    "migration '{}' (v{}) is missing from the applied history \
-                     while v{applied_up_to} is recorded as applied — the upgrade \
-                     was interrupted and the schema is incomplete",
-                    migration.name, migration.version,
-                ),
-            });
-        };
-
-        let computed = checksum_of(migration.stmts);
-        if stored_checksum != computed {
-            return Err(StorageError::MigrationFailed {
-                from_version: migration.version.saturating_sub(1),
-                to_version: migration.version,
-                reason: format!(
-                    "checksum mismatch for migration '{}' (v{}): \
-                     stored={stored_checksum}, computed={computed} — \
-                     migration SQL may have changed after it was applied",
-                    migration.name, migration.version,
-                ),
-            });
+fn storage_error(e: MigrationError) -> StorageError {
+    match e {
+        MigrationError::SchemaTooNew { found, supported } => {
+            StorageError::UnsupportedSchemaVersion {
+                found,
+                max_supported: supported,
+            }
+        }
+        MigrationError::Sqlite(e) => StorageError::Internal(format!("schema_migrations: {e}")),
+        other => {
+            let to_version = other.step_version().unwrap_or(0);
+            StorageError::MigrationFailed {
+                from_version: to_version.saturating_sub(1),
+                to_version,
+                reason: other.to_string(),
+            }
         }
     }
-    Ok(())
+}
+
+/// The recorded schema version of an open connection, `0` when the database
+/// was never migrated. Read-only: it does not create the bookkeeping table.
+pub fn read_schema_version(conn: &Connection) -> StorageResult<u32> {
+    if !relation_exists(conn, "table", "schema_migrations") {
+        return Ok(0);
+    }
+    nrr_sqlite_support::schema_version(conn).map_err(storage_error)
 }
 
 fn relation_exists(conn: &Connection, kind: &str, name: &str) -> bool {
@@ -1256,28 +1073,6 @@ fn relation_exists(conn: &Connection, kind: &str, name: &str) -> bool {
     )
     .map(|n| n > 0)
     .unwrap_or(false)
-}
-
-fn system_time_to_ms(t: SystemTime) -> i64 {
-    t.duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
-/// FNV-1a 64-bit checksum over all SQL statements, separated by a null byte.
-fn checksum_of(stmts: &[&str]) -> String {
-    const OFFSET: u64 = 14_695_981_039_346_656_037;
-    const PRIME: u64 = 1_099_511_628_211;
-    let mut h = OFFSET;
-    for stmt in stmts {
-        for b in stmt.bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(PRIME);
-        }
-        h ^= 0x00;
-        h = h.wrapping_mul(PRIME);
-    }
-    format!("{h:016x}")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

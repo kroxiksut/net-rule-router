@@ -368,6 +368,10 @@ pub struct AutoRuleCandidatesListRequest {}
 #[serde(rename_all = "kebab-case")]
 pub struct AutoRuleCandidatesListResponse {
     pub candidates: Vec<AutoRuleCandidateDto>,
+    /// How many of `candidates` the inbox shows by default — the service's one
+    /// definition, so a badge never counts rows the list hides.
+    #[serde(default)]
+    pub pending_count: u64,
     /// Companions the last pass declined to offer because the site pulling them
     /// already travels the route they would be sent to. Lets the screen explain
     /// an empty list instead of looking broken.
@@ -398,7 +402,7 @@ pub struct AutoRuleCandidatesActionResponse {
     pub applied: u32,
     /// How many ids were not found in the caller's pending set.
     pub unknown: u32,
-    /// Pending suggestions left for this caller after the action.
+    /// Suggestions left for this caller that the inbox shows by default.
     pub pending: u64,
     /// Accept only: the page the suggestions were offered next to was left
     /// running on its old connections, so it needs a reload to pick them up.

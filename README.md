@@ -68,7 +68,7 @@ yourself — it doesn't create or hide them.
 > **One-time step after installation.** The service routes exactly what the
 > rules say and nothing else. Sites that used to open for you over the VPN
 > will keep going out over the main connection until they appear in the rules
-> of the additional (secondary) route — a preset cannot know your personal
+> of the additional route — a preset cannot know your personal
 > list. Go through the sites you care about and add them yourself: in the
 > **Rules** section of the app, or straight into `rules_secondary.txt` in your
 > rule-set folder. Then press **Apply**. You do this once — from then on the
@@ -79,10 +79,10 @@ The full walkthrough, including what to do if you lose network access, is in
 
 ## Highlights
 
-- **Two-route model** — a `primary` and a `secondary` route, one active config at a time.
+- **Two-route model** — a `primary` and an additional route, one active config at a time.
 - **Four ways to match traffic** — by domain (label + all subdomains), by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), by exact IPv4, or by application (the process name).
 - **Per-name routing** — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
-- **Fail-Closed** — if `secondary` goes down, matching traffic is held rather than silently leaking to `primary`.
+- **Leak protection** — if the additional route goes down, matching traffic is held rather than silently leaking to `primary`.
 - **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
 - **Overlaps** — when rules of the two routes cover the same sites (a zone on one route, a site inside it on the other), the narrower rule wins, and the app lists every such pair with the route its sites actually take. Confirm each one, or send those sites over the other route in one click. The same screen points out applied rules that work
   differently from how they read — for example an address block that also
@@ -122,7 +122,7 @@ Notes:
 - The decision engine is pure and deterministic: identical inputs always produce identical, fully-traceable outputs.
 
 > A destination that matches no rule takes the default route — so a site
-> belongs in the rules of the additional (secondary) route if that is where
+> belongs in the rules of the additional route if that is where
 > you want it to go; see the one-time step in [Quick start](#quick-start).
 > **After adding or removing rules, always press Apply: rules take effect only
 > once applied.**
@@ -236,7 +236,7 @@ it is a way to keep one machine healthy, not an automation API. See
 - No mandatory login for core local routing.
 - Telemetry is **off by default**; no hidden background network actions.
 - Privileged policy changes go over a local, DACL-protected named-pipe IPC boundary — there is no localhost HTTP control plane for privileged mutations.
-- Update checks are user-initiated, use only official sources, and can never silently install, apply, or change routing behavior.
+- Every N days (14 by default, adjustable in Settings) the app asks the project's official release page whether a newer version is out and, if so, shows a notice. It never downloads, installs or changes routing, and you can turn the check off in Settings. Help → Check for updates asks the same question on demand, even with the automatic check off.
 
 See [`SECURITY.md`](SECURITY.md) for the full trust model.
 
@@ -244,7 +244,7 @@ See [`SECURITY.md`](SECURITY.md) for the full trust model.
 
 **Current:** two-route model, one active config per Windows user over a shared
 administrator baseline, domain / zone / exact-IP / app rules, per-name routing,
-presets, explain mode, Fail-Closed, suggested addresses, diagnostics archive,
+presets, explain mode, leak protection, suggested addresses, diagnostics archive,
 administrative console, RU/EN.
 
 **In progress:** Linux support (the platform-specific pieces sit behind one
@@ -260,10 +260,10 @@ the internal ranges a corporate VPN serves, with one rule instead of one rule
 per address. Very wide ranges are refused, so one rule cannot swallow a large
 share of the internet.
 
-**Explored for the future:** multiple saved profiles and scenario libraries,
-2+N adapters, richer rule types (ports, protocols), per-site / per-app
-routing across 3+ routes, and automated switching. The desktop UI stays a
-native Qt app throughout.
+**Right after that:** traffic history per connection, with a warning when the
+additional connection nears your data plan's limit.
+
+The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 
 ## Documentation
 

@@ -1,0 +1,13 @@
+# Terms that must not appear in public documentation (README*, ROADMAP*, docs/, every AGENTS.md,
+# CONTRIBUTING/SECURITY/STRUCTURE). Shared by check.ps1 and check.sh; matched case-insensitively.
+# Format: <regex><TAB><sample the regex must match>. The sample is the gate's self-test:
+# an edit that blinds a pattern fails the gate instead of passing the tree silently.
+# Code is not scanned: the slugs are legal there.
+
+\bfcrdns	the FCrDNS check
+\bcensus\b	the shared-address census
+\bcollateral-	slug collateral-fake-ip
+\bTZ_	TZ_Windows_Network_Policy_Manager
+\bspecifikaciya	specifikaciya_modeli_pravil
+\bPro-only\b	a Pro-only zone
+\bTASKS_RU\b	see TASKS_RU.md

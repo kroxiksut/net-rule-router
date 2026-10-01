@@ -42,6 +42,9 @@ enum Resolvconf {
 
 struct State {
     nm_running: bool,
+    /// `false` is `dns=none`: NetworkManager takes a drop-in and never
+    /// writes the file.
+    nm_writes_file: bool,
     resolvconf: Resolvconf,
     devices: Vec<(String, Vec<Ipv4Addr>, Vec<String>)>,
 }
@@ -52,6 +55,12 @@ struct State {
 struct FakeMachine {
     files: DnsFiles,
     state: Arc<Mutex<State>>,
+    /// The next `nmcli general reload` refuses, then later calls succeed —
+    /// simulating the reload that commits a written drop-in failing once.
+    fail_next_nm_reload: Arc<Mutex<bool>>,
+    /// `resolvconf -a` writes the record (a refused call can still have
+    /// written it) but reports failure, as `resolvconf`'s own contract allows.
+    fail_resolvconf_add: Arc<Mutex<bool>>,
 }
 
 fn reply(success: bool, stdout: &str) -> Result<CommandReply, PlatformError> {
@@ -68,6 +77,7 @@ impl FakeMachine {
             files: files.clone(),
             state: Arc::new(Mutex::new(State {
                 nm_running: false,
+                nm_writes_file: true,
                 resolvconf: Resolvconf::Absent,
                 devices: vec![
                     (
@@ -82,7 +92,17 @@ impl FakeMachine {
                     ),
                 ],
             })),
+            fail_next_nm_reload: Arc::new(Mutex::new(false)),
+            fail_resolvconf_add: Arc::new(Mutex::new(false)),
         }
+    }
+
+    fn fail_next_nm_reload(&self) {
+        *self.fail_next_nm_reload.lock().expect("lock") = true;
+    }
+
+    fn fail_resolvconf_add(&self) {
+        *self.fail_resolvconf_add.lock().expect("lock") = true;
     }
 
     fn with_network_manager(self) -> Self {
@@ -198,7 +218,14 @@ impl FakeMachine {
             (_, ["-a", name]) => {
                 std::fs::write(dir.join(name), input.unwrap_or_default()).expect("record");
                 self.resolvconf_write();
-                reply(true, "")
+                if *self.fail_resolvconf_add.lock().expect("lock") {
+                    // Real `resolvconf` can write the record and still report
+                    // failure; the redirect must roll back rather than trust
+                    // the write it cannot confirm.
+                    reply(false, "resolvconf: refused (simulated)")
+                } else {
+                    reply(true, "")
+                }
             }
             (Resolvconf::Openresolv, ["-f", "-d", name]) | (_, ["-d", name]) => {
                 let _ = std::fs::remove_file(dir.join(name));
@@ -227,7 +254,15 @@ impl DnsCommands for FakeMachine {
                 reply(true, if running { "running\n" } else { "stopped\n" })
             }
             ("nmcli", ["general", "reload"]) => {
-                self.nm_write();
+                let mut fail_next = self.fail_next_nm_reload.lock().expect("lock");
+                if *fail_next {
+                    *fail_next = false;
+                    return reply(false, "NetworkManager: reload refused (simulated)");
+                }
+                drop(fail_next);
+                if self.state.lock().expect("lock").nm_writes_file {
+                    self.nm_write();
+                }
                 reply(true, "")
             }
             ("nmcli", ["-t", "-f", "GENERAL.DEVICE,IP4.DNS,IP4.DOMAIN", "device", "show"]) => {
@@ -321,6 +356,67 @@ fn a_file_networkmanager_once_wrote_is_not_its_while_it_is_stopped() {
     );
 }
 
+/// resolved not answering yet, but the file sends programs to its stub: that
+/// is resolved's machine, and taking the file over would forward to ourselves.
+#[test]
+fn a_file_naming_resolveds_stub_means_resolved_while_it_is_silent() {
+    let files = scratch("choice-stub-file");
+    std::fs::write(&files.resolv_conf, "nameserver 127.0.0.53\noptions edns0\n").expect("stub");
+    assert_eq!(
+        detect_capture_method(&FakeMachine::new(&files), &files),
+        Some(DnsCaptureMethod::Resolved)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_to_resolveds_stub_means_resolved_while_it_is_silent() {
+    let files = scratch("choice-stub-link");
+    let stub = &files.resolved_stub;
+    std::fs::create_dir_all(stub.parent().expect("dir")).expect("dir");
+    std::fs::write(stub, "nameserver 127.0.0.53\n").expect("stub");
+    std::os::unix::fs::symlink(stub, &files.resolv_conf).expect("link");
+    assert_eq!(
+        detect_capture_method(&FakeMachine::new(&files), &files),
+        Some(DnsCaptureMethod::Resolved)
+    );
+}
+
+#[test]
+fn a_rearm_picks_the_mechanism_the_machine_has_now() {
+    let files = scratch("choice-redetect");
+    plain_file(&files);
+    let machine = FakeMachine::new(&files);
+    let selector = DnsCaptureSelector::new(
+        DnsCaptureMethod::ResolvConfFile,
+        machine.clone(),
+        files.clone(),
+    );
+    assert_eq!(
+        selector.redetect(),
+        (DnsCaptureMethod::ResolvConfFile, false)
+    );
+
+    // NetworkManager came up after the service did.
+    let machine = machine.with_network_manager();
+    assert_eq!(
+        selector.redetect(),
+        (DnsCaptureMethod::NetworkManager, true)
+    );
+    assert_eq!(
+        selector.parts(DnsCaptureMethod::NetworkManager).listener,
+        LOOPBACK_LISTENER_ADDR
+    );
+
+    // A moment with nothing to detect keeps what worked.
+    machine.state.lock().expect("lock").nm_running = false;
+    std::fs::remove_file(&files.resolv_conf).expect("remove");
+    assert_eq!(
+        selector.redetect(),
+        (DnsCaptureMethod::NetworkManager, false)
+    );
+}
+
 #[test]
 fn every_mechanism_but_resolved_listens_on_loopback() {
     assert_eq!(DnsCaptureMethod::Resolved.listener(), LISTENER_ADDR);
@@ -363,6 +459,40 @@ fn the_file_names_only_the_listener_and_keeps_the_search_list() {
     redirect.restore(&handle).expect("restores");
     assert_eq!(read(&files.resolv_conf), original);
     assert!(!files.system_copy().exists());
+}
+
+/// dnsmasq or unbound on `127.0.0.1` forwards to whatever the file names —
+/// us, once it is redirected. Forwarding to it would loop every query.
+#[test]
+fn a_local_cache_on_loopback_is_never_an_upstream() {
+    let files = scratch("file-loopback-cache");
+    std::fs::write(&files.resolv_conf, "nameserver 127.0.0.1\n").expect("resolv.conf");
+    let servers = ResolvConfFileServers {
+        files: files.clone(),
+    };
+    assert!(upstreams(&servers).is_empty());
+
+    let redirect = ResolvConfFileRedirect::new(files.clone());
+    let handle = redirect
+        .redirect_to(LOOPBACK_LISTENER_ADDR)
+        .expect("redirects");
+    // Read from the copy now, which still names the cache.
+    assert!(upstreams(&servers).is_empty());
+    redirect.restore(&handle).expect("restores");
+
+    // What the warning is raised on.
+    assert_eq!(
+        resolv_conf::without_loopback(vec![Ipv4Addr::LOCALHOST, DHCP_SERVER]),
+        (vec![DHCP_SERVER], 1)
+    );
+
+    let files = scratch("records-loopback-cache");
+    std::fs::write(
+        files.resolvconf_record_dirs[0].join("lo.dnsmasq"),
+        "nameserver 127.0.0.1\n",
+    )
+    .expect("record");
+    assert!(upstreams(&ResolvconfDnsServers { files }).is_empty());
 }
 
 #[cfg(unix)]
@@ -439,6 +569,27 @@ fn a_crashed_runs_file_is_put_back_by_the_cleanup() {
     assert!(!files.system_copy().exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_write_failure_rolls_back_to_the_original_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let files = scratch("file-write-fails");
+    let original = plain_file(&files);
+    let redirect = ResolvConfFileRedirect::new(files.clone());
+    let etc_dir = files.resolv_conf.parent().expect("etc dir").to_path_buf();
+    // Denies the temp-file create inside write_atomically for the FINAL
+    // redirect write, after the system copy (a different directory) already
+    // succeeded — the step this rollback exists for.
+    std::fs::set_permissions(&etc_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    let result = redirect.redirect_to(LOOPBACK_LISTENER_ADDR);
+    std::fs::set_permissions(&etc_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+
+    assert!(result.is_err());
+    assert_eq!(read(&files.resolv_conf), original);
+    assert!(!files.system_copy().exists());
+}
+
 #[test]
 fn a_listener_resolv_conf_cannot_name_is_refused_before_anything_changes() {
     let files = scratch("file-refused");
@@ -490,6 +641,105 @@ fn networkmanager_writes_the_listener_and_the_devices_search_domains() {
     );
 }
 
+/// `dns=none` or a reload that rejected the drop-in leaves the drop-in in
+/// place while the file names the devices' servers again.
+#[test]
+fn networkmanager_no_longer_writing_the_listener_is_noticed() {
+    let files = scratch("nm-bypassed");
+    let machine = FakeMachine::new(&files).with_network_manager();
+    let redirect = NetworkManagerDnsRedirect::new(machine.clone(), files.clone());
+    let handle = redirect
+        .redirect_to(LOOPBACK_LISTENER_ADDR)
+        .expect("redirects");
+    // Positive control: as written, the check passes.
+    assert_eq!(
+        redirect.inspect(&handle).expect("inspect"),
+        RedirectState::Active
+    );
+
+    std::fs::write(
+        &files.resolv_conf,
+        format!("# Generated by NetworkManager\nnameserver {DHCP_SERVER}\n"),
+    )
+    .expect("resolv.conf");
+    assert!(files.nm_drop_in().exists());
+    assert_eq!(
+        redirect.inspect(&handle).expect("inspect"),
+        RedirectState::Inactive
+    );
+
+    // `dns=dnsmasq`: NetworkManager's own cache in front of us.
+    std::fs::write(
+        &files.resolv_conf,
+        "# Generated by NetworkManager\nnameserver 127.0.0.1\n",
+    )
+    .expect("resolv.conf");
+    assert_eq!(
+        redirect.inspect(&handle).expect("inspect"),
+        RedirectState::Active
+    );
+    redirect.restore(&handle).expect("restores");
+}
+
+/// `dns=none`: re-writing a drop-in NetworkManager ignores changes nothing,
+/// so the redirect moves to the next mechanism once and stays there.
+#[test]
+fn networkmanager_ignoring_its_drop_in_hands_over_to_the_file() {
+    let files = scratch("nm-dns-none");
+    let machine = FakeMachine::new(&files).with_network_manager();
+    let parts = dns_capture_parts(
+        DnsCaptureMethod::NetworkManager,
+        machine.clone(),
+        files.clone(),
+    );
+    // Positive control: a NetworkManager that writes the file keeps the job.
+    let handle = parts
+        .redirect
+        .redirect_to(LOOPBACK_LISTENER_ADDR)
+        .expect("redirects");
+    assert!(files.nm_drop_in().exists());
+    assert!(!resolv_conf::is_ours(&read(&files.resolv_conf)));
+    parts.redirect.restore(&handle).expect("restores");
+
+    machine.state.lock().expect("lock").nm_writes_file = false;
+    let original = read(&files.resolv_conf);
+    let handle = parts
+        .redirect
+        .redirect_to(LOOPBACK_LISTENER_ADDR)
+        .expect("hands over");
+    assert!(
+        !files.nm_drop_in().exists(),
+        "the ignored drop-in is taken back"
+    );
+    assert!(resolv_conf::is_ours(&read(&files.resolv_conf)));
+    assert_eq!(servers_in(&files.resolv_conf), vec![LOOPBACK_LISTENER_V4]);
+    assert_eq!(
+        parts.redirect.inspect(&handle).expect("inspect"),
+        RedirectState::Active
+    );
+    assert_eq!(
+        upstreams(parts.servers.as_ref()),
+        vec![DHCP_SERVER, VPN_SERVER],
+        "the servers follow the file, not the devices"
+    );
+
+    // The guard's re-install and a later arm go straight to the file.
+    parts
+        .redirect
+        .redirect_to(LOOPBACK_LISTENER_ADDR)
+        .expect("re-installs");
+    assert!(!files.nm_drop_in().exists());
+    parts.redirect.restore(&handle).expect("restores");
+    assert_eq!(read(&files.resolv_conf), original);
+    parts
+        .redirect
+        .redirect_to(LOOPBACK_LISTENER_ADDR)
+        .expect("re-arms");
+    assert!(!files.nm_drop_in().exists());
+    parts.redirect.restore(&handle).expect("restores");
+    assert_eq!(read(&files.resolv_conf), original);
+}
+
 #[test]
 fn a_crashed_runs_networkmanager_drop_in_is_removed_by_the_cleanup() {
     let files = scratch("nm-orphan");
@@ -499,6 +749,25 @@ fn a_crashed_runs_networkmanager_drop_in_is_removed_by_the_cleanup() {
         .expect("redirects");
 
     clear_every_redirect(machine, &files).expect("clears");
+    assert!(!files.nm_drop_in().exists());
+    assert_eq!(
+        servers_in(&files.resolv_conf),
+        vec![DHCP_SERVER, VPN_SERVER]
+    );
+}
+
+#[test]
+fn a_reload_failure_removes_the_drop_in_and_restores_the_file() {
+    let files = scratch("nm-reload-fails");
+    let machine = FakeMachine::new(&files).with_network_manager();
+    machine.fail_next_nm_reload();
+
+    let redirect = NetworkManagerDnsRedirect::new(machine.clone(), files.clone());
+    assert!(redirect.redirect_to(LOOPBACK_LISTENER_ADDR).is_err());
+
+    // The refused reload never took the drop-in NetworkManager has not
+    // applied would be reapplied by its next reload or restart — the rollback
+    // removes it rather than leaving it in place.
     assert!(!files.nm_drop_in().exists());
     assert_eq!(
         servers_in(&files.resolv_conf),
@@ -602,6 +871,25 @@ fn a_crashed_runs_resolvconf_record_is_deleted_by_the_cleanup() {
     assert!(!files.resolvconf_record_dirs[0]
         .join(resolvconf_record())
         .exists());
+}
+
+#[test]
+fn an_add_failure_leaves_no_record_behind() {
+    let files = scratch("resolvconf-add-fails");
+    let machine = FakeMachine::new(&files).with_resolvconf(Resolvconf::Debian);
+    machine.fail_resolvconf_add();
+
+    let redirect = ResolvconfDnsRedirect::new(machine.clone(), files.clone());
+    // A refused call can still have written the record before failing; the
+    // rollback must delete it rather than trust the write it cannot confirm.
+    assert!(redirect.redirect_to(LOOPBACK_LISTENER_ADDR).is_err());
+    assert!(!files.resolvconf_record_dirs[0]
+        .join(resolvconf_record())
+        .exists());
+    assert_eq!(
+        servers_in(&files.resolv_conf),
+        vec![VPN_SERVER, DHCP_SERVER]
+    );
 }
 
 #[test]

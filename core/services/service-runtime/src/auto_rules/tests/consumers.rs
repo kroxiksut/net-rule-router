@@ -399,12 +399,11 @@ fn a_suggestion_muted_by_the_quiet_gap_is_announced_by_a_later_tick() {
 }
 
 /// A host that already completes connections on the main route needs no
-/// tunnel, so it earns no popup — but it must stay in the tray's count: that
-/// number promises "everything waiting for an answer", not "everything worth
-/// waking you up for". And once every offer in the set has settled that way,
-/// there is nothing left worth a popup at all.
+/// tunnel, so it earns no popup and no place in the count: the inbox hides it
+/// by default, and a number promising rows the list hides reads as a broken
+/// list. It stays parked — the list still carries it behind its toggle.
 #[test]
-fn a_settled_offer_is_counted_but_only_an_unsettled_one_earns_a_popup() {
+fn a_settled_offer_stays_listed_but_only_an_unsettled_one_is_counted_and_pops() {
     let f = fixture(AutoRulesMode::Suggest);
     let bus = subscribed_bus();
     let engine = AutoRulesEngine::new(
@@ -422,16 +421,30 @@ fn a_settled_offer_is_counted_but_only_an_unsettled_one_earns_a_popup() {
 
     // assets.example is still unsettled, so the set as a whole is worth surfacing.
     let mixed = engine.tick(SID, later());
-    assert_eq!(mixed.pending, 2, "both offers stay parked, settled or not");
+    assert_eq!(
+        mixed.pending, 1,
+        "only the offer the list shows by default counts"
+    );
     assert!(mixed.published, "the still-open offer earns a popup");
+    let listed = engine.candidates(SID);
+    assert_eq!(
+        listed.len(),
+        2,
+        "both offers stay on the list, settled or not"
+    );
+    assert_eq!(
+        shown_by_default_count(&listed),
+        mixed.pending,
+        "the list reply and the tick count through one definition"
+    );
 
     let published = bus.peek_pending_for(&sub.subscription_id, 10);
     assert_eq!(published.len(), 1, "exactly one event went out so far");
     match &published[0].event {
         StatusUpdateEvent::AutoRuleCandidatesChanged { pending_count, .. } => {
             assert_eq!(
-                *pending_count, 2,
-                "the tray's number covers everything waiting, not just what popped"
+                *pending_count, 1,
+                "the tray's number is what the list shows by default"
             );
         }
         other => panic!("unexpected event: {other:?}"),
@@ -441,7 +454,8 @@ fn a_settled_offer_is_counted_but_only_an_unsettled_one_earns_a_popup() {
     // is left worth a popup, so this tick must stay silent on its own terms.
     engine.note_primary_health(SID, "assets.example", PrimaryHealthEvent::Completed);
     let settled = engine.tick(SID, SystemTime::UNIX_EPOCH + Duration::from_millis(400_000));
-    assert_eq!(settled.pending, 2, "still both parked");
+    assert_eq!(settled.pending, 0, "nothing is shown by default any more");
+    assert_eq!(engine.candidates(SID).len(), 2, "yet both are still parked");
     assert!(
         !settled.published,
         "everything answers on primary, so no popup"
@@ -449,6 +463,90 @@ fn a_settled_offer_is_counted_but_only_an_unsettled_one_earns_a_popup() {
 
     let after = bus.peek_pending_for(&sub.subscription_id, 10);
     assert_eq!(after.len(), 1, "no second event was published");
+}
+
+/// A batch the inbox would only list behind its toggle is not news: no push
+/// goes out, so the tray never opens a popup it has nothing to show in.
+#[test]
+fn a_batch_of_only_hidden_offers_raises_no_popup() {
+    let f = fixture(AutoRulesMode::Suggest);
+    let bus = subscribed_bus();
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
+        mode_fn(AutoRulesMode::Suggest),
+        Arc::clone(&f.dismissals) as Arc<dyn DismissalStore>,
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_event_bus(Arc::clone(&bus));
+    let sub = bus.subscribe_as("client".into(), Some(SID.to_string()), None);
+
+    two_visits(&engine, &["cdn.example"]);
+    engine.note_primary_health(SID, "cdn.example", PrimaryHealthEvent::Completed);
+    let hidden = engine.tick(SID, later());
+    assert!(hidden.parked > 0, "the offer is parked");
+    assert_eq!(hidden.pending, 0);
+    let listed = engine.candidates(SID);
+    assert_eq!(listed.len(), 1, "listed behind the toggle");
+    assert!(listed[0].served_by_main_link);
+    assert!(!hidden.published, "a hidden-only batch must not announce");
+    assert!(bus.peek_pending_for(&sub.subscription_id, 10).is_empty());
+
+    // Positive control: a row the list shows does announce, and the push counts
+    // only it.
+    for at in [151_000_u64, 168_000] {
+        let Some(mut batch) = engine.begin_batch(SID) else {
+            unreachable!("suggest mode collects")
+        };
+        page_load(
+            batch_ledger(&mut batch),
+            at,
+            "site.example",
+            RouteRole::Secondary,
+            &["other.example"],
+        );
+    }
+    let shown = engine.tick(SID, SystemTime::UNIX_EPOCH + Duration::from_millis(169_000));
+    assert!(shown.published, "an offer the list shows is announced");
+    let events = bus.peek_pending_for(&sub.subscription_id, 10);
+    assert_eq!(events.len(), 1);
+    match &events[0].event {
+        StatusUpdateEvent::AutoRuleCandidatesChanged { pending_count, .. } => {
+            assert_eq!(*pending_count, 1, "the hidden row is not counted");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+/// An answer's reply carries the same count, so the tray menu and the sidebar
+/// drop to zero while a settled row stays listed behind its toggle.
+#[test]
+fn an_answer_reports_only_what_the_list_still_shows_by_default() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example", "assets.example"]);
+    f.engine
+        .note_primary_health(SID, "cdn.example", PrimaryHealthEvent::Completed);
+    f.engine.tick(SID, later());
+    let open: Vec<String> = f
+        .engine
+        .candidates(SID)
+        .into_iter()
+        .filter(|c| !c.served_by_main_link)
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(open.len(), 1, "one offer is still a question");
+
+    let outcome = f.engine.dismiss(SID, &open, later());
+    assert_eq!(outcome.applied, 1);
+    assert_eq!(
+        outcome.pending, 0,
+        "nothing the list shows by default is left"
+    );
+    assert_eq!(
+        f.engine.candidates(SID).len(),
+        1,
+        "the settled row is still listed"
+    );
 }
 
 /// A site the user marked as refusing main-link addresses is the one case where
@@ -480,6 +578,12 @@ fn a_site_marked_as_refusing_keeps_its_companions_on_offer() {
         "the anchor refuses main-link addresses, so its companions are still worth asking about"
     );
     assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
+    // The popup, the count and the inbox agree: a row that popped and is
+    // counted must not hide behind the "main route handles it" toggle.
+    let listed = engine.candidates(SID);
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].anchor_refuses_main_link);
+    assert!(!listed[0].served_by_main_link);
 }
 
 /// While the additional route is down, everything already travels the main
@@ -560,7 +664,7 @@ fn an_address_of_the_site_itself_still_pops_even_when_the_main_route_answers() {
 #[test]
 fn a_delivery_named_host_is_not_suggested_from_one_visit_by_default() {
     let f = fixture(AutoRulesMode::Suggest);
-    one_visit(&f.engine, &["assets.edgefarm.net"]);
+    one_visit(&f.engine, &["assets.edgefarm.example"]);
 
     let summary = f.engine.tick(SID, later());
     assert_eq!(summary.parked, 0);
@@ -572,7 +676,7 @@ fn a_delivery_named_host_is_not_suggested_from_one_visit_by_default() {
 #[test]
 fn the_eager_opt_in_reaches_the_learner_and_offers_from_the_first_visit() {
     let f = fixture_with_eager_delivery(Arc::new(AtomicBool::new(true)));
-    one_visit(&f.engine, &["assets.edgefarm.net"]);
+    one_visit(&f.engine, &["assets.edgefarm.example"]);
 
     let summary = f.engine.tick(SID, later());
     assert_eq!(summary.parked, 1);
@@ -580,7 +684,7 @@ fn the_eager_opt_in_reaches_the_learner_and_offers_from_the_first_visit() {
     assert_eq!(candidates.len(), 1);
     // A delivery name generalizes to its domain, so what the user is offered
     // covers the whole CDN rather than the one host seen so far.
-    assert_eq!(candidates[0].proposed_match, "edgefarm.net");
+    assert_eq!(candidates[0].proposed_match, "edgefarm.example");
     assert_eq!(candidates[0].match_kind, AUTO_RULE_MATCH_KIND_SUFFIX);
     assert_eq!(candidates[0].signal, AUTO_RULE_SIGNAL_DELIVERY_NAME);
 }
@@ -614,12 +718,12 @@ fn a_parked_offer_covers_the_subdomains_of_what_it_proposes() {
 fn flipping_the_opt_in_reconfigures_the_live_ledger() {
     let opted_in = Arc::new(AtomicBool::new(false));
     let f = fixture_with_eager_delivery(Arc::clone(&opted_in));
-    one_visit(&f.engine, &["assets.edgefarm.net"]);
+    one_visit(&f.engine, &["assets.edgefarm.example"]);
     assert_eq!(f.engine.tick(SID, later()).parked, 0, "gated while off");
 
     opted_in.store(true, Ordering::Relaxed);
     f.engine.expire_settings_memo();
-    one_visit(&f.engine, &["assets.edgefarm.net"]);
+    one_visit(&f.engine, &["assets.edgefarm.example"]);
 
     let summary = f.engine.tick(SID, later());
     assert_eq!(summary.parked, 1, "the new setting reached the ledger");

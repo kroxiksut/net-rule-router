@@ -11,22 +11,27 @@
 //!
 //! Each event carries:
 //! - `seq` — monotonic sequence number within the file (resets to 1 per file).
-//! - `prev_hash` — the `event_hash` of the previous event (or genesis constant
-//!   for the first event in a file).
+//! - `prev_hash` — the `event_hash` of the previous event, across files and
+//!   restarts (omitted only for the very first event of a trail).
 //! - `event_hash` — `SHA-256(prev_hash || canonical_payload_json)`.
 //!
-//! On startup the [`crate::audit::reader::AuditReader`] verifies the chain for
-//! the most recent file and raises `integrity.audit_chain_mismatch` on failure.
+//! [`crate::audit::reader::AuditChainVerifier`] checks the whole chain.
+//!
+//! # One writer per chain
+//!
+//! A writer takes an OS lock on [`CHAIN_LOCK_FILE_NAME`] before its first
+//! append and resumes from the tail on disk at that moment; a second writer
+//! on the same directory fails its appends instead of forking the chain.
 //!
 //! # Append-only invariant
 //!
-//! The public API has no update or delete methods.  Files are only written in
-//! append mode.  Acknowledgement / resolution events are new NDJSON lines —
-//! never overwrites of earlier lines.
+//! The public API has no update or delete methods. Acknowledgement /
+//! resolution events are new NDJSON lines — never overwrites of earlier lines.
+//! The one truncation is taking back a line whose write failed.
 
 use super::anchor::{check_tail, AuditChainAnchor, AuditChainAnchorStore, AuditTailIntegrity};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -34,6 +39,10 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::audit::kind::{ActorKind, AuditEventKind, AuditEventResult};
+use crate::audit::reader::{AuditChainVerification, AuditChainVerifier, AuditReader};
+use crate::audit::restart::{
+    seal_event, AuditChainRestartError, AuditChainRestartRequest, AuditRestartKey,
+};
 use crate::error::{DiagnosticsError, DiagnosticsResult};
 use crate::event::{AuditEvent, AUDIT_EVENT_SCHEMA_VERSION};
 use crate::reason::ReasonCode;
@@ -47,6 +56,14 @@ pub const AUDIT_CHAIN_GENESIS: &str =
 
 /// Default maximum file size before rotation (10 MiB).
 pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The file whose OS lock makes one writer the owner of the chain. Not an
+/// `nrr_audit_*.ndjson` name, so no reader or retention pass ever lists it.
+pub const CHAIN_LOCK_FILE_NAME: &str = "nrr_audit.lock";
+
+/// How long a writer waits for the chain on its first append: long enough for
+/// a restart to outlast the previous instance's slow stop.
+pub const DEFAULT_CHAIN_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 // ── AuditEventInput ───────────────────────────────────────────────────────────
 
@@ -76,6 +93,13 @@ pub struct AuditEventInput {
     pub payload_summary_json: Option<String>,
 }
 
+/// Where a committed event sits: the file it went to and its `seq` there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditEventLocation {
+    pub file_name: String,
+    pub seq: u64,
+}
+
 // ── AuditWriterConfig ─────────────────────────────────────────────────────────
 
 /// Configuration for an [`AuditWriter`].
@@ -85,6 +109,9 @@ pub struct AuditWriterConfig {
     pub audit_dir: PathBuf,
     /// Rotate to a new file when the current exceeds this size (bytes).
     pub max_file_size_bytes: u64,
+    /// How long the first append waits for another writer to release the
+    /// chain; later appends try once.
+    pub chain_lock_wait: Duration,
 }
 
 impl AuditWriterConfig {
@@ -92,6 +119,7 @@ impl AuditWriterConfig {
         Self {
             audit_dir: audit_dir.into(),
             max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
+            chain_lock_wait: DEFAULT_CHAIN_LOCK_WAIT,
         }
     }
 }
@@ -110,6 +138,12 @@ struct AuditWriterInner {
     next_seq: u64,
     /// Out-of-band record of the last committed event, when configured.
     anchor: Option<std::sync::Arc<dyn AuditChainAnchorStore>>,
+    /// Held for the writer's lifetime once taken. Exclusive file creation
+    /// guards a FILE, not the chain: two writers each opened their own next
+    /// file on the same `prev_hash` and forked it.
+    chain_lock: Option<File>,
+    /// Whether the first append's wait for the lock has been spent.
+    lock_wait_spent: bool,
 }
 
 // `expect()`s here are invariants (file open right after `ensure_open`) and
@@ -124,7 +158,32 @@ impl AuditWriterInner {
             prev_hash: AUDIT_CHAIN_GENESIS.to_string(),
             next_seq: 1,
             anchor: None,
+            chain_lock: None,
+            lock_wait_spent: false,
         }
+    }
+
+    /// Takes the chain lock if this writer does not hold it yet, then resumes
+    /// the chain from what is on disk NOW: another writer may have appended
+    /// since this one opened.
+    fn ensure_chain_owned(&mut self) -> DiagnosticsResult<()> {
+        if self.chain_lock.is_some() {
+            return Ok(());
+        }
+        let wait = if self.lock_wait_spent {
+            Duration::ZERO
+        } else {
+            self.config.chain_lock_wait
+        };
+        self.lock_wait_spent = true;
+        let lock = acquire_chain_lock(&self.config.audit_dir, wait)?;
+        let (prev_hash, next_seq) = resume_anchored(&self.config.audit_dir, self.anchor.as_deref());
+        self.prev_hash = prev_hash;
+        self.next_seq = next_seq;
+        // A file opened before the lock may sit behind another writer's.
+        self.current = None;
+        self.chain_lock = Some(lock);
+        Ok(())
     }
 
     /// Ensures a writable file is open, rotating if needed.
@@ -162,50 +221,117 @@ impl AuditWriterInner {
         Ok(())
     }
 
-    fn append_inner(&mut self, input: AuditEventInput) -> DiagnosticsResult<()> {
+    fn append_inner(&mut self, input: AuditEventInput) -> DiagnosticsResult<AuditEventLocation> {
+        self.ensure_chain_owned()?;
         self.ensure_open()?;
+        let (_canonical, event) = build_event(&input, self.next_seq, &self.prev_hash)?;
+        self.commit_event(event)
+    }
 
-        let seq = self.next_seq;
-        let (_canonical, event) = build_event(&input, seq, &self.prev_hash)?;
+    /// Appends a restart over exactly the breaks the administrator was shown.
+    ///
+    /// Verified under the writer's lock, so the restart links onto the event
+    /// the verification last saw rather than one appended in between.
+    fn restart_inner(
+        &mut self,
+        key: &AuditRestartKey,
+        shown_digest: &str,
+        request: AuditChainRestartRequest,
+    ) -> Result<AuditChainVerification, AuditChainRestartError> {
+        self.ensure_chain_owned()
+            .map_err(AuditChainRestartError::Write)?;
+        let anchor = self.anchor.as_ref().and_then(|a| a.load());
+        let verdict = AuditChainVerifier::with_restart_key(key.clone())
+            .verify(&AuditReader::new(&self.config.audit_dir), anchor.as_ref());
+        match verdict.breaks_digest.as_deref() {
+            None => return Err(AuditChainRestartError::Intact),
+            Some(digest) if digest != shown_digest => {
+                return Err(AuditChainRestartError::ChangedSinceShown)
+            }
+            Some(_) => {}
+        }
+        // Onto the event on disk, not the anchored one a cut tail resumed
+        // from: the restart accepts what is there.
+        let (head, _) = resume_chain_state(&self.config.audit_dir);
+        self.prev_hash = head.clone();
+        self.ensure_open().map_err(AuditChainRestartError::Write)?;
+
+        let first = verdict.breaks.first().map(|b| {
+            serde_json::json!({
+                "kind": b.kind.slug(),
+                "file": b.file_name,
+                "line": b.line,
+                "seq": b.seq,
+            })
+        });
+        let input = AuditEventInput {
+            event_id: request.event_id,
+            kind: AuditEventKind::AuditChainRestarted,
+            created_at: request.created_at,
+            actor_kind: ActorKind::User,
+            actor_id_hash: request.actor_id_hash,
+            revision_id: None,
+            risk_level: None,
+            result: AuditEventResult::Success,
+            reason_code: crate::reason::integrity::AUDIT_CHAIN_RESTARTED,
+            payload_summary_json: Some(
+                serde_json::json!({
+                    "breaks": verdict.break_count,
+                    "first_break": first,
+                    "breaks_digest": shown_digest,
+                    "head": head,
+                })
+                .to_string(),
+            ),
+        };
+        let event = build_sealed_event(&input, self.next_seq, &self.prev_hash, key)
+            .map_err(AuditChainRestartError::Write)?;
+        self.commit_event(event)
+            .map_err(AuditChainRestartError::Write)?;
+        Ok(verdict)
+    }
+
+    fn commit_event(&mut self, event: AuditEvent) -> DiagnosticsResult<AuditEventLocation> {
+        let seq = event.seq;
         let event_hash = event.event_hash.clone();
 
-        let line = event
+        let mut line = event
             .to_ndjson()
             .map_err(|e| DiagnosticsError::AuditWriteFailed {
                 reason: format!("serialize audit event: {e}"),
             })?;
-        let line_with_newline = format!("{line}\n");
+        line.push('\n');
 
+        let start = self.current_size;
         let (file, _path) = self.current.as_mut().expect("file open after ensure_open");
-        file.write_all(line_with_newline.as_bytes()).map_err(|e| {
-            DiagnosticsError::AuditWriteFailed {
+        if let Err(e) = commit_line(file, start, line.as_bytes()) {
+            // Whether or not the rollback held, the next event starts a fresh
+            // file rather than landing after a fragment.
+            self.current = None;
+            return Err(DiagnosticsError::AuditWriteFailed {
                 reason: format!("write audit line: {e}"),
-            }
-        })?;
-        file.flush()
-            .map_err(|e| DiagnosticsError::AuditWriteFailed {
-                reason: format!("flush audit file: {e}"),
-            })?;
+            });
+        }
 
-        self.current_size += line_with_newline.len() as u64;
+        self.current_size += line.len() as u64;
         self.prev_hash = event_hash.clone();
         self.next_seq += 1;
 
+        let file_name = self
+            .current
+            .as_ref()
+            .and_then(|(_, p)| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
         if let Some(anchor) = &self.anchor {
-            let file_name = self
-                .current
-                .as_ref()
-                .and_then(|(_, p)| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_string();
             anchor.save(&AuditChainAnchor {
-                file_name,
+                file_name: file_name.clone(),
                 seq,
                 event_hash,
             });
         }
-        Ok(())
+        Ok(AuditEventLocation { file_name, seq })
     }
 }
 
@@ -218,6 +344,9 @@ impl AuditWriterInner {
 pub struct AuditWriter {
     inner: Mutex<AuditWriterInner>,
     tail_integrity: AuditTailIntegrity,
+    /// Read without the writer's lock, for verification.
+    audit_dir: PathBuf,
+    anchor: Option<std::sync::Arc<dyn AuditChainAnchorStore>>,
 }
 
 impl AuditWriter {
@@ -246,23 +375,60 @@ impl AuditWriter {
     ) -> Self {
         let stored = anchor.as_ref().and_then(|a| a.load());
         let integrity = check_tail(&config.audit_dir, stored.as_ref());
-        let (mut prev_hash, next_seq) = resume_chain_state(&config.audit_dir);
-        if let (AuditTailIntegrity::Truncated { .. }, Some(stored)) = (&integrity, &stored) {
-            prev_hash = stored.event_hash.clone();
-        }
+        // Where the chain resumes is read when the lock is taken, not here:
+        // another writer may still be appending.
+        let audit_dir = config.audit_dir.clone();
         let mut inner = AuditWriterInner::new(config);
-        inner.prev_hash = prev_hash;
-        inner.next_seq = next_seq;
-        inner.anchor = anchor;
+        inner.anchor = anchor.clone();
         Self {
             inner: Mutex::new(inner),
             tail_integrity: integrity,
+            audit_dir,
+            anchor,
         }
+    }
+
+    /// [`AuditSink::append`], also saying where the event landed, so a record
+    /// that refers to it can point at the line.
+    #[allow(clippy::expect_used)] // lock poisoning propagates a prior panic
+    pub fn append_located(&self, input: AuditEventInput) -> DiagnosticsResult<AuditEventLocation> {
+        self.inner
+            .lock()
+            .expect("AuditWriter mutex")
+            .append_inner(input)
     }
 
     /// What the anchor said about the tail when this writer opened.
     pub fn tail_integrity(&self) -> &AuditTailIntegrity {
         &self.tail_integrity
+    }
+
+    /// The chain as it stands, honouring restarts sealed with `key`.
+    pub fn verify_chain(&self, key: Option<&AuditRestartKey>) -> AuditChainVerification {
+        let mut verifier = match key {
+            Some(key) => AuditChainVerifier::with_restart_key(key.clone()),
+            None => AuditChainVerifier::new(),
+        };
+        let anchor = self.anchor.as_ref().and_then(|a| a.load());
+        verifier.verify(&AuditReader::new(&self.audit_dir), anchor.as_ref())
+    }
+
+    /// Restarts the chain over the breaks whose digest the administrator was
+    /// shown, and returns the verification it papered over. Refused when the
+    /// chain is intact or the breaks have changed since.
+    ///
+    /// Only a holder of `key` can write a restart the verifier honours.
+    #[allow(clippy::expect_used)] // lock poisoning propagates a prior panic
+    pub fn restart_chain(
+        &self,
+        key: &AuditRestartKey,
+        shown_digest: &str,
+        request: AuditChainRestartRequest,
+    ) -> Result<AuditChainVerification, AuditChainRestartError> {
+        self.inner
+            .lock()
+            .expect("AuditWriter mutex")
+            .restart_inner(key, shown_digest, request)
     }
 }
 
@@ -272,10 +438,7 @@ impl AuditSink for AuditWriter {
     type Event = AuditEventInput;
 
     fn append(&self, input: AuditEventInput) -> Result<(), DiagnosticsError> {
-        self.inner
-            .lock()
-            .expect("AuditWriter mutex")
-            .append_inner(input)
+        self.append_located(input).map(|_| ())
     }
 }
 
@@ -301,6 +464,7 @@ fn build_event(
         result: input.result.as_str().to_string(),
         reason_code: input.reason_code.as_str().to_string(),
         payload_summary_json: input.payload_summary_json.clone(),
+        seal: None,
         prev_hash: if prev_hash == AUDIT_CHAIN_GENESIS {
             None
         } else {
@@ -314,6 +478,7 @@ fn build_event(
     // This is a live struct, so ADDING A FIELD to `AuditEvent` changes the
     // canonical bytes and makes every previously written event unverifiable —
     // silently, since the hashes still recompute consistently going forward.
+    // Only an optional field omitted when absent (`seal`) leaves them alone.
     // `schema_version` is part of the hashed payload but nothing compares it on
     // read. The golden test below pins the exact bytes so such a change fails
     // loudly with an explanation instead of rewriting history's verdict.
@@ -328,6 +493,25 @@ fn build_event(
     Ok((canonical, event))
 }
 
+/// [`build_event`], sealed with the service's key before it is hashed, so the
+/// chain covers the seal too.
+fn build_sealed_event(
+    input: &AuditEventInput,
+    seq: u64,
+    prev_hash: &str,
+    key: &AuditRestartKey,
+) -> DiagnosticsResult<AuditEvent> {
+    let (_, mut event) = build_event(input, seq, prev_hash)?;
+    event.event_hash = String::new();
+    seal_event(&mut event, key)?;
+    let canonical =
+        serde_json::to_string(&event).map_err(|e| DiagnosticsError::AuditWriteFailed {
+            reason: format!("canonical serialization failed: {e}"),
+        })?;
+    event.event_hash = compute_chain_hash(prev_hash, &canonical);
+    Ok(event)
+}
+
 /// Computes the rolling chain hash: `SHA-256(prev_hash || canonical_json)`.
 pub fn compute_chain_hash(prev_hash: &str, canonical_json: &str) -> String {
     let mut hasher = Sha256::new();
@@ -337,7 +521,85 @@ pub fn compute_chain_hash(prev_hash: &str, canonical_json: &str) -> String {
     result.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// ── Chain ownership and commit ───────────────────────────────────────────────
+
+/// Takes the chain's exclusive OS lock, retrying for up to `wait`.
+fn acquire_chain_lock(audit_dir: &Path, wait: Duration) -> DiagnosticsResult<File> {
+    let fail = |reason: String| DiagnosticsError::AuditWriteFailed { reason };
+    std::fs::create_dir_all(audit_dir)
+        .map_err(|e| fail(format!("cannot create audit dir: {e}")))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(audit_dir.join(CHAIN_LOCK_FILE_NAME))
+        .map_err(|e| fail(format!("cannot open audit chain lock: {e}")))?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(fail("audit chain is held by another writer".to_string()));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(fail(format!("cannot lock audit chain: {e}")));
+            }
+        }
+    }
+}
+
+/// What the writer needs from the file it appends to; a trait so a failing
+/// disk can be simulated.
+trait AuditFile: Write + Seek {
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<()>;
+    fn make_durable(&mut self) -> std::io::Result<()>;
+}
+
+impl AuditFile for File {
+    fn truncate_to(&mut self, len: u64) -> std::io::Result<()> {
+        self.set_len(len)
+    }
+
+    fn make_durable(&mut self) -> std::io::Result<()> {
+        self.sync_data()
+    }
+}
+
+/// Appends one whole line, durable before it counts, or leaves the file as it
+/// was.
+///
+/// Durable first because the anchor written next is fsynced: an anchor that
+/// outlives its event after a power loss reads as a truncated trail. Rolled
+/// back on failure because a half line reads as a corrupt one. Both are the
+/// tamper alarm nobody caused.
+fn commit_line<F: AuditFile>(file: &mut F, start: u64, line: &[u8]) -> std::io::Result<()> {
+    let result = file.write_all(line).and_then(|()| file.make_durable());
+    if result.is_err() {
+        let _ = file
+            .truncate_to(start)
+            .and_then(|()| file.seek(SeekFrom::Start(start)));
+    }
+    result
+}
+
 // ── Chain resume ─────────────────────────────────────────────────────────────
+
+/// [`resume_chain_state`], except that a tail shorter than the anchor resumes
+/// from the ANCHORED hash, so the gap fails verification at the seam instead
+/// of quietly becoming the new truth.
+fn resume_anchored(audit_dir: &Path, anchor: Option<&dyn AuditChainAnchorStore>) -> (String, u64) {
+    let (prev_hash, next_seq) = resume_chain_state(audit_dir);
+    let Some(stored) = anchor.and_then(|a| a.load()) else {
+        return (prev_hash, next_seq);
+    };
+    if check_tail(audit_dir, Some(&stored)).is_truncated() {
+        return (stored.event_hash, next_seq);
+    }
+    (prev_hash, next_seq)
+}
 
 /// Reads the last `event_hash` from the tail of the most recent audit file
 /// and returns `(prev_hash, next_seq)` so a new writer session continues
@@ -514,13 +776,9 @@ mod tests {
         let writer = AuditWriter::open(config);
         writer.append(sample_input("adt-001")).expect("append");
 
-        let files: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read dir")
-            .filter_map(|e| e.ok())
-            .collect();
+        let files: Vec<_> = sorted_audit_files(dir.path());
         assert_eq!(files.len(), 1, "one audit file created");
-        let name = files[0].file_name();
-        let name = name.to_string_lossy();
+        let name = files[0].file_name().expect("name").to_string_lossy();
         assert!(
             name.starts_with("nrr_audit_"),
             "file name has correct prefix: {name}"
@@ -539,13 +797,10 @@ mod tests {
         writer.append(sample_input("adt-002")).expect("2");
         writer.append(sample_input("adt-003")).expect("3");
 
-        let files: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read dir")
-            .filter_map(|e| e.ok())
-            .collect();
+        let files: Vec<_> = sorted_audit_files(dir.path());
         assert_eq!(files.len(), 1, "still one file (no rotation needed)");
 
-        let content = std::fs::read_to_string(files[0].path()).expect("read");
+        let content = std::fs::read_to_string(files[0].clone()).expect("read");
         let lines: Vec<_> = content.lines().collect();
         assert_eq!(lines.len(), 3, "three NDJSON lines");
     }
@@ -560,15 +815,8 @@ mod tests {
                 .expect("append");
         }
 
-        let content = std::fs::read_to_string(
-            std::fs::read_dir(dir.path())
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-        )
-        .expect("read");
+        let content =
+            std::fs::read_to_string(sorted_audit_files(dir.path())[0].clone()).expect("read");
 
         let events: Vec<AuditEvent> = content
             .lines()
@@ -588,15 +836,8 @@ mod tests {
         writer.append(sample_input("adt-002")).expect("2");
         writer.append(sample_input("adt-003")).expect("3");
 
-        let content = std::fs::read_to_string(
-            std::fs::read_dir(dir.path())
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-        )
-        .expect("read");
+        let content =
+            std::fs::read_to_string(sorted_audit_files(dir.path())[0].clone()).expect("read");
 
         let events: Vec<AuditEvent> = content
             .lines()
@@ -626,15 +867,8 @@ mod tests {
         let writer = AuditWriter::open(AuditWriterConfig::new(dir.path()));
         writer.append(sample_input("adt-001")).expect("append");
 
-        let content = std::fs::read_to_string(
-            std::fs::read_dir(dir.path())
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-        )
-        .expect("read");
+        let content =
+            std::fs::read_to_string(sorted_audit_files(dir.path())[0].clone()).expect("read");
         let event: AuditEvent = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert!(
             event.prev_hash.is_none(),
@@ -653,11 +887,7 @@ mod tests {
         writer.append(sample_input("adt-002")).expect("2");
         writer.append(sample_input("adt-003")).expect("3");
 
-        let mut files: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read dir")
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect();
+        let mut files: Vec<_> = sorted_audit_files(dir.path());
         files.sort();
         assert_eq!(files.len(), 3, "one file per event due to tiny max_size");
     }
@@ -668,15 +898,8 @@ mod tests {
         let writer = AuditWriter::open(AuditWriterConfig::new(dir.path()));
         writer.append(sample_input("adt-001")).expect("append");
 
-        let content = std::fs::read_to_string(
-            std::fs::read_dir(dir.path())
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-        )
-        .expect("read");
+        let content =
+            std::fs::read_to_string(sorted_audit_files(dir.path())[0].clone()).expect("read");
         for line in content.lines() {
             let _v: serde_json::Value = serde_json::from_str(line).expect("valid JSON per line");
         }
@@ -700,15 +923,8 @@ mod tests {
             writer.append(sample_input("adt-003")).expect("s1-3");
 
             // Read the last hash from the written file.
-            let content = std::fs::read_to_string(
-                std::fs::read_dir(dir.path())
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .expect("read");
+            let content =
+                std::fs::read_to_string(sorted_audit_files(dir.path())[0].clone()).expect("read");
             let last_event: crate::event::AuditEvent =
                 serde_json::from_str(content.lines().last().unwrap()).expect("parse");
             last_event.event_hash.clone()
@@ -720,11 +936,7 @@ mod tests {
 
         // Session 2's first event must have prev_hash = session 1's last event_hash.
         let files: Vec<_> = {
-            let mut v: Vec<_> = std::fs::read_dir(dir.path())
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .collect();
+            let mut v: Vec<_> = sorted_audit_files(dir.path());
             v.sort();
             v
         };
@@ -749,15 +961,8 @@ mod tests {
         let writer = AuditWriter::open(AuditWriterConfig::new(dir.path()));
         writer.append(sample_input("adt-001")).expect("write");
 
-        let content = std::fs::read_to_string(
-            std::fs::read_dir(dir.path())
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-        )
-        .expect("read");
+        let content =
+            std::fs::read_to_string(sorted_audit_files(dir.path())[0].clone()).expect("read");
         let event: crate::event::AuditEvent =
             serde_json::from_str(content.lines().next().unwrap()).expect("parse");
 
@@ -829,5 +1034,152 @@ mod tests {
                 r#""reason_code":"review.approved","event_hash":""}"#
             )
         );
+    }
+
+    fn no_wait(dir: &Path) -> AuditWriterConfig {
+        let mut config = AuditWriterConfig::new(dir);
+        config.chain_lock_wait = Duration::ZERO;
+        config
+    }
+
+    fn events_in_order(dir: &Path) -> Vec<AuditEvent> {
+        sorted_audit_files(dir)
+            .iter()
+            .flat_map(|p| {
+                std::fs::read_to_string(p)
+                    .expect("read")
+                    .lines()
+                    .map(|l| serde_json::from_str::<AuditEvent>(l).expect("parse"))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Two live writers on one directory — the service and a console run, or a
+    /// restart that caught up with a slow stop — used to open files N and N+1
+    /// on the same `prev_hash`. The second now cannot append while the first
+    /// holds the chain, and once it can, it continues from what the first
+    /// wrote, not from what it saw when it opened.
+    #[test]
+    fn a_second_writer_cannot_fork_the_chain() {
+        let dir = tempfile::tempdir().expect("temp");
+        let first = AuditWriter::open(no_wait(dir.path()));
+        let second = AuditWriter::open(no_wait(dir.path()));
+        first.append(sample_input("a1")).expect("a1");
+        first.append(sample_input("a2")).expect("a2");
+
+        assert!(
+            second.append(sample_input("b1")).is_err(),
+            "the chain has one writer"
+        );
+
+        drop(first);
+        second
+            .append(sample_input("b1"))
+            .expect("the chain is free");
+        let events = events_in_order(dir.path());
+        let ids: Vec<_> = events.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, ["a1", "a2", "b1"]);
+        assert_eq!(
+            events[2].prev_hash.as_deref(),
+            Some(events[1].event_hash.as_str()),
+            "b1 chains onto a2"
+        );
+    }
+
+    /// Positive control: one writer after another, the usual restart, keeps
+    /// working without any wait.
+    #[test]
+    fn writers_in_turn_share_the_chain() {
+        let dir = tempfile::tempdir().expect("temp");
+        AuditWriter::open(no_wait(dir.path()))
+            .append(sample_input("a1"))
+            .expect("a1");
+        AuditWriter::open(no_wait(dir.path()))
+            .append(sample_input("b1"))
+            .expect("b1");
+        let events = events_in_order(dir.path());
+        assert_eq!(
+            events[1].prev_hash.as_deref(),
+            Some(events[0].event_hash.as_str())
+        );
+    }
+
+    /// A file that accepts `room` bytes and then fails, or fails at fsync.
+    struct FlakyFile {
+        bytes: std::io::Cursor<Vec<u8>>,
+        room: usize,
+        fail_sync: bool,
+    }
+
+    impl Write for FlakyFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.room == 0 {
+                return Err(std::io::Error::other("disk full"));
+            }
+            let n = buf.len().min(self.room);
+            self.room -= n;
+            self.bytes.write(&buf[..n])
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for FlakyFile {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.bytes.seek(pos)
+        }
+    }
+
+    impl AuditFile for FlakyFile {
+        fn truncate_to(&mut self, len: u64) -> std::io::Result<()> {
+            self.bytes.get_mut().truncate(len as usize);
+            Ok(())
+        }
+
+        fn make_durable(&mut self) -> std::io::Result<()> {
+            if self.fail_sync {
+                Err(std::io::Error::other("sync failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn flaky(room: usize, fail_sync: bool) -> FlakyFile {
+        FlakyFile {
+            bytes: std::io::Cursor::new(Vec::new()),
+            room,
+            fail_sync,
+        }
+    }
+
+    /// A write that fails halfway leaves no half line behind, and the next
+    /// line lands right after the last whole one.
+    #[test]
+    fn a_failed_write_leaves_no_fragment() {
+        let mut file = flaky(12, false);
+        commit_line(&mut file, 0, b"first\n").expect("fits");
+        assert!(commit_line(&mut file, 6, b"second line\n").is_err());
+        assert_eq!(file.bytes.get_ref().as_slice(), b"first\n");
+
+        file.room = usize::MAX;
+        commit_line(&mut file, 6, b"third\n").expect("fits");
+        assert_eq!(file.bytes.get_ref().as_slice(), b"first\nthird\n");
+    }
+
+    /// A line that is not durable does not count: the caller must not anchor
+    /// it, so the commit fails and the line is taken back.
+    #[test]
+    fn a_line_that_cannot_be_made_durable_is_not_committed() {
+        let mut file = flaky(usize::MAX, true);
+        assert!(commit_line(&mut file, 0, b"line\n").is_err());
+        assert!(file.bytes.get_ref().is_empty());
+
+        file.fail_sync = false;
+        commit_line(&mut file, 0, b"line\n").expect("positive control");
+        assert_eq!(file.bytes.get_ref().as_slice(), b"line\n");
     }
 }

@@ -375,8 +375,8 @@ mod tests {
 
     #[test]
     fn multiset_is_order_independent_but_count_sensitive() {
-        let f1 = permit(ip(1, 1, 1, 1), 10, 1);
-        let f2 = permit(ip(2, 2, 2, 2), 20, 2);
+        let f1 = permit(ip(198, 51, 100, 1), 10, 1);
+        let f2 = permit(ip(198, 51, 100, 2), 20, 2);
         // Same two filters, emitted in the opposite order → still equivalent.
         assert!(behaviorally_equivalent(
             &[f1.clone(), f2.clone()],
@@ -391,8 +391,8 @@ mod tests {
 
     #[test]
     fn arbitration_ignores_absolute_weights_but_catches_reorder() {
-        let lo = permit(ip(1, 1, 1, 1), 10, 1);
-        let hi = permit(ip(2, 2, 2, 2), 20, 2);
+        let lo = permit(ip(198, 51, 100, 1), 10, 1);
+        let hi = permit(ip(198, 51, 100, 2), 20, 2);
         // Same relative order, different absolute weights → preserved.
         let mut lo2 = lo.clone();
         lo2.weight = 0x0010_0000;

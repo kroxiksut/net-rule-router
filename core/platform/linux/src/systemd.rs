@@ -120,7 +120,7 @@ pub const DAEMON_CLEANUP_VERB: &str = "cleanup";
 /// The `RuntimeDirectory=` / `StateDirectory=` leaf. Kept next to the paths in
 /// the IPC address (`/run/netrulerouter/…`) and the secrets store
 /// (`/var/lib/netrulerouter/…`) so all three agree on one directory name.
-const RUNTIME_STATE_DIR: &str = "netrulerouter";
+const RUNTIME_STATE_DIR: &str = nrr_shared::product_identity::PRODUCT_NAME_UNIX;
 
 /// Render the full `netrulerouter.service` unit text.
 ///
@@ -153,15 +153,12 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
     // READY=1 (see `notify_ready`), matching the Windows "report Running only
     // after bootstrap" contract.
     s.push_str("Type=notify\n");
-    s.push_str(&format!(
-        "ExecStart={} {DAEMON_RUN_VERB}\n",
-        cfg.binary_path.display()
-    ));
+    let executable = exec_word(&cfg.binary_path);
+    s.push_str(&format!("ExecStart={executable} {DAEMON_RUN_VERB}\n"));
     // Runs after every exit, a crash included, so a dead daemon never leaves
     // the machine's DNS pointed at its listener.
     s.push_str(&format!(
-        "ExecStopPost={} {DAEMON_RESTORE_DNS_VERB}\n",
-        cfg.binary_path.display()
+        "ExecStopPost={executable} {DAEMON_RESTORE_DNS_VERB}\n"
     ));
     s.push_str("Restart=on-failure\n");
     s.push_str(&format!("RestartSec={}\n", cfg.restart_sec));
@@ -190,15 +187,52 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
     // logrotate backstop drop-in (see `logrotate.rs`) governs only this path.
     s.push_str(&format!("LogsDirectory={RUNTIME_STATE_DIR}\n"));
     s.push_str("LogsDirectoryMode=0700\n");
-    // Minimal hardening that does not interfere with net-admin duties.
-    s.push_str("NoNewPrivileges=yes\n");
-    s.push_str("ProtectHome=yes\n");
+    for directive in HARDENING {
+        s.push_str(directive);
+        s.push('\n');
+    }
     s.push('\n');
 
     s.push_str("[Install]\n");
     s.push_str("WantedBy=multi-user.target\n");
     s
 }
+
+/// Sandboxing of the root daemon, each line held to what the code does, so a
+/// bug in the socket-facing parser is not the whole of root.
+///
+/// Deliberately absent: `PrivateDevices`/`DevicePolicy` (the fake-IP relay
+/// opens `/dev/net/tun`), `ProtectProc` (the socket-to-process walk reads other
+/// users' `/proc/<pid>`), `MemoryDenyWriteExecute` (never checked against the
+/// helpers the daemon runs).
+const HARDENING: &[&str] = &[
+    "NoNewPrivileges=yes",
+    "ProtectHome=yes",
+    // Read-only everywhere but the unit's own directories and these two: the
+    // bare-file DNS redirect writes `resolv.conf` by temp file + rename in
+    // /etc, as openresolv run from here does; the NetworkManager drop-in and
+    // resolvconf's records live under /run.
+    "ProtectSystem=strict",
+    "ReadWritePaths=/etc /run",
+    "PrivateTmp=yes",
+    // Nothing writes sysctls or loads modules; nftables and TUN modules are
+    // loaded by the kernel on demand, which this does not stop.
+    "ProtectKernelTunables=yes",
+    "ProtectKernelModules=yes",
+    // NET_ADMIN: nftables, rtnetlink, the TUN device and the DNS link.
+    // NET_RAW: the ICMP probes. NET_BIND_SERVICE: the listener on :53.
+    // SYS_PTRACE + DAC_READ_SEARCH: `/proc/<pid>/fd` and `/exe` of other
+    // users' processes (connection owners, the IPC peer's program).
+    // CHOWN: a diagnostics archive handed to its requester.
+    // DAC_OVERRIDE: files the helpers it runs touch under their own modes.
+    "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE \
+     CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN",
+    // Unix for the IPC socket, D-Bus and sd_notify; netlink for nftables,
+    // routes and links; inet for DNS, probes and the relay.
+    "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+    "SystemCallArchitectures=native",
+    "LockPersonality=yes",
+];
 
 /// Directory trees the unit written above cannot execute from.
 ///
@@ -209,16 +243,54 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
 /// that could never start.
 const HIDDEN_BY_PROTECT_HOME: [&str; 3] = ["/home/", "/root/", "/run/user/"];
 
+/// Why the unit this module renders could not execute a binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitExecRefusal {
+    /// The path lies in a tree `ProtectHome=yes` hides from the service.
+    HiddenByProtectHome,
+    /// Not UTF-8, or holds a control character or `$`: no quoting in a unit
+    /// line carries it through to `execve` unchanged.
+    Unrepresentable,
+}
+
 /// Whether the unit this module renders can execute `binary_path`.
 ///
 /// The question is asked before the unit is written, because afterwards the
 /// evidence is a bare exec failure in the journal and the unit file looks fine.
-#[must_use]
-pub fn unit_can_execute(binary_path: &Path) -> bool {
-    let path = binary_path.to_string_lossy();
-    !HIDDEN_BY_PROTECT_HOME
+pub fn unit_can_execute(binary_path: &Path) -> Result<(), UnitExecRefusal> {
+    let Some(path) = binary_path.to_str() else {
+        return Err(UnitExecRefusal::Unrepresentable);
+    };
+    // `$` would need `$$` in argv but is taken literally in the exec path, so
+    // one spelling cannot serve both.
+    if path.chars().any(|c| c.is_control() || c == '$') {
+        return Err(UnitExecRefusal::Unrepresentable);
+    }
+    if HIDDEN_BY_PROTECT_HOME
         .iter()
         .any(|hidden| path.starts_with(hidden))
+    {
+        return Err(UnitExecRefusal::HiddenByProtectHome);
+    }
+    Ok(())
+}
+
+/// `path` as one quoted word of an `Exec*=` line (systemd.syntax + specifiers):
+/// unquoted, a space splits it and a `%` is read as a specifier.
+fn exec_word(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut word = String::with_capacity(raw.len() + 2);
+    word.push('"');
+    for c in raw.chars() {
+        match c {
+            '%' => word.push_str("%%"),
+            '\\' => word.push_str("\\\\"),
+            '"' => word.push_str("\\\""),
+            _ => word.push(c),
+        }
+    }
+    word.push('"');
+    word
 }
 
 // ── install / uninstall plan ─────────────────────────────────────────────────
@@ -645,15 +717,46 @@ mod tests {
         let cfg = SystemdServiceConfig::for_binary(PathBuf::from(SAMPLE_BINARY));
         assert!(render_service_unit(&cfg).contains("ProtectHome=yes"));
 
-        assert!(!unit_can_execute(Path::new(
-            "/home/user/nrr/target/debug/nrr-serviced"
-        )));
-        assert!(!unit_can_execute(Path::new("/root/nrr-serviced")));
-        assert!(!unit_can_execute(Path::new("/run/user/1000/nrr-serviced")));
-        assert!(unit_can_execute(Path::new(SAMPLE_BINARY)));
-        assert!(unit_can_execute(Path::new(
-            "/opt/netrulerouter/nrr-serviced"
-        )));
+        let hidden = Err(UnitExecRefusal::HiddenByProtectHome);
+        assert_eq!(
+            unit_can_execute(Path::new("/home/user/nrr/target/debug/nrr-serviced")),
+            hidden
+        );
+        assert_eq!(unit_can_execute(Path::new("/root/nrr-serviced")), hidden);
+        assert_eq!(
+            unit_can_execute(Path::new("/run/user/1000/nrr-serviced")),
+            hidden
+        );
+        assert_eq!(unit_can_execute(Path::new(SAMPLE_BINARY)), Ok(()));
+        assert_eq!(
+            unit_can_execute(Path::new("/opt/netrulerouter/nrr-serviced")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_path_with_a_space_or_percent_stays_one_literal_word() {
+        // Unquoted, systemd would exec `/opt/Net` and expand `%h` as a specifier.
+        let path = r#"/opt/Net Rule %h\x"q/nrr-serviced"#;
+        assert_eq!(unit_can_execute(Path::new(path)), Ok(()));
+        let unit = render_service_unit(&SystemdServiceConfig::for_binary(PathBuf::from(path)));
+        let word = r#""/opt/Net Rule %%h\\x\"q/nrr-serviced""#;
+        assert!(unit.contains(&format!("ExecStart={word} run\n")), "{unit}");
+        assert!(
+            unit.contains(&format!("ExecStopPost={word} restore-dns\n")),
+            "{unit}"
+        );
+    }
+
+    #[test]
+    fn a_path_no_unit_line_can_carry_is_refused() {
+        for path in ["/opt/a$b/nrr-serviced", "/opt/a\nb/nrr-serviced"] {
+            assert_eq!(
+                unit_can_execute(Path::new(path)),
+                Err(UnitExecRefusal::Unrepresentable),
+                "{path:?}"
+            );
+        }
     }
 
     fn sample_config() -> SystemdServiceConfig {
@@ -665,7 +768,7 @@ mod tests {
         let unit = render_service_unit(&sample_config());
         assert!(unit.contains("Type=notify"), "{unit}");
         assert!(
-            unit.contains("ExecStart=/usr/lib/netrulerouter/nrr-serviced run"),
+            unit.contains(r#"ExecStart="/usr/lib/netrulerouter/nrr-serviced" run"#),
             "{unit}"
         );
         assert!(unit.contains("Description=NetRuleRouter"), "{unit}");
@@ -695,7 +798,7 @@ mod tests {
         });
         assert!(unit.contains("Restart=on-failure"), "{unit}");
         assert!(
-            unit.contains("ExecStopPost=/usr/lib/netrulerouter/nrr-serviced restore-dns"),
+            unit.contains(r#"ExecStopPost="/usr/lib/netrulerouter/nrr-serviced" restore-dns"#),
             "{unit}"
         );
         assert!(unit.contains("RestartSec=7"), "{unit}");
@@ -765,6 +868,63 @@ mod tests {
         let unit = render_service_unit(&sample_config());
         assert!(unit.contains("LogsDirectory=netrulerouter"), "{unit}");
         assert!(unit.contains("LogsDirectoryMode=0700"), "{unit}");
+    }
+
+    /// Each directive is held to a code path: the ones that would break a
+    /// mechanism stay out, the capabilities those mechanisms need stay in.
+    #[test]
+    fn the_unit_sandboxes_the_daemon_without_breaking_its_mechanisms() {
+        let unit = render_service_unit(&sample_config());
+        for directive in [
+            "NoNewPrivileges=yes\n",
+            "ProtectSystem=strict\n",
+            "ReadWritePaths=/etc /run\n",
+            "PrivateTmp=yes\n",
+            "ProtectKernelTunables=yes\n",
+            "ProtectKernelModules=yes\n",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n",
+            "SystemCallArchitectures=native\n",
+            "LockPersonality=yes\n",
+        ] {
+            assert!(unit.contains(directive), "{directive}{unit}");
+        }
+        let caps = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("CapabilityBoundingSet="))
+            .expect("capability bounding set");
+        for cap in [
+            "CAP_NET_ADMIN",
+            "CAP_NET_RAW",
+            "CAP_NET_BIND_SERVICE",
+            "CAP_SYS_PTRACE",
+            "CAP_DAC_READ_SEARCH",
+            "CAP_CHOWN",
+        ] {
+            assert!(caps.split_whitespace().any(|c| c == cap), "{cap}: {caps}");
+        }
+        assert!(!caps.contains("CAP_SYS_ADMIN"), "{caps}");
+        // The fake-IP relay opens the TUN clone device.
+        for absent in ["PrivateDevices", "DevicePolicy", "ProtectProc"] {
+            assert!(!unit.contains(absent), "{absent}{unit}");
+        }
+        // Everything the DNS mechanisms write stays writable.
+        let writable: Vec<&str> = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("ReadWritePaths="))
+            .expect("writable paths")
+            .split_whitespace()
+            .collect();
+        let files = crate::dns_redirect::DnsFiles::system(Path::new("/var/lib/netrulerouter"));
+        for path in [files.resolv_conf.as_path(), files.nm_conf_dir.as_path()]
+            .into_iter()
+            .chain(files.resolvconf_record_dirs.iter().map(PathBuf::as_path))
+        {
+            assert!(
+                writable.iter().any(|w| path.starts_with(w)),
+                "{} is written but read-only under the unit",
+                path.display()
+            );
+        }
     }
 
     #[test]
@@ -918,7 +1078,7 @@ mod tests {
         let unit = render_service_unit(&cfg);
         let alias = alias_link(&cfg.binary_path).expect("alias");
         assert!(
-            unit.contains(&format!("ExecStart={} run", alias.target.display())),
+            unit.contains(&format!("ExecStart=\"{}\" run", alias.target.display())),
             "{unit}"
         );
     }

@@ -12,26 +12,18 @@ GroupBox {
     title: root.tr("diag.section.title", "Diagnostics and Logs")
     Layout.fillWidth: true
 
-    readonly property var diagCtx: root.context.diagnosticsSettings || {}
-    readonly property var retentionCtx: diagCtx.retention || {}
-    readonly property var storageHealth: diagCtx.storageHealth || {}
-    readonly property var auditChain: diagCtx.auditChain || {}
+    // The window's snapshot, re-read on service events and on opening this
+    // page; the launch context would hold these numbers until a restart.
+    readonly property var storageView: Pure.diagnosticsStorageView(root.diagnosticsSnapshot)
+    readonly property var storageHealth: storageView.storageHealth
+    readonly property var auditChain: storageView.auditChain
     readonly property int defaultLogsMaxAgeDays: 90
     readonly property int defaultLogsMaxSizeMb: 50
     readonly property int defaultAuditMaxAgeDays: 365
     readonly property int defaultAuditMaxSizeMb: 50
 
-    // Diagnostic-archive privacy tier forwarded as the 4th arg to
-    // rpcDiagnosticsExportArchive: "standard" (default, redacted) or
-    // "diagnostics" (extra cache/storage/decision detail, less redacted).
-    // The value lives on `root` (shared with the Diagnostics-section export
-    // surface) so both radios present ONE choice, and is persisted through the
-    // preferences store so it survives a restart. The companion
-    // `root.diagnosticsArchiveSessionOnly` (default ON) trims the archive to
-    // the session's calendar day by sending `root.appSessionDayStartMs` as the
-    // logs cutoff, so yesterday's rotated segments stay out of a routine
-    // support archive while an app/service restart mid-test keeps the whole
-    // day's history. Unchecked → full history.
+    // The archive privacy tier and the session-only scope live on `root`, shared
+    // with the Diagnostics page's export, so both surfaces present one choice.
 
     function formatBytes(value) {
         var n = Number(value || 0)
@@ -42,10 +34,8 @@ GroupBox {
         return (n / 1073741824).toFixed(2) + " GB"
     }
 
-    // Real "Clear logs" wiring (the dialog Apply was a
-    // no-op stub). Mirrors LogsSection._performLogsClear; reuses the already-
-    // shipped `rpcLogsClear` op. Audit trail is never touched (service-side
-    // invariant). All status keys already exist in both locales.
+    // Mirrors LogsSection._performLogsClear; the service never touches the
+    // audit trail here.
     property bool _clearing: false
     function _performLogsClear() {
         if (!root.bridgeAvailable
@@ -66,6 +56,8 @@ GroupBox {
                         : String(errorCode || "unknown"))
                 return
             }
+            // The storage card would otherwise show the deleted files' size.
+            root.refreshDiagnosticsSnapshot()
             var files = Number((payload && payload["files-deleted"]) || 0)
             var bytes = Number((payload && payload["bytes-freed"]) || 0)
             root.statusLine = root.tr("status.logs-cleared",
@@ -75,10 +67,8 @@ GroupBox {
         })
     }
 
-    // Real log/audit retention Apply (was a "preview
-    // applied" no-op). Reads the SpinBoxes + unit combos, converts sizes to
-    // bytes, and persists via the settings.log-retention.set op. A fetch on
-    // open populates the controls from the authoritative persisted config.
+    // Retention is read from the service on open and written through
+    // settings.log-retention.set; sizes travel in bytes.
     property bool _logRetentionApplying: false
     // Dirty-tracking baseline — last-loaded/last-applied values, captured in
     // raw units (days / bytes) so a unit-combo change that leaves the number
@@ -184,9 +174,12 @@ GroupBox {
     property int  _stabilityDraftMaxRestarts: 20
     property int  _stabilityDraftBackoffBaseMs: 100
     property int  _stabilityDraftBackoffCapSec: 5
-    // Verbose service logging is apply-on-change (LIVE) and its value is the
-    // shared `root.serviceVerboseLogging` (also surfaced in the Logs view),
-    // so it is NOT drafted here.
+    // Verbose service logging is apply-on-change (LIVE) and reported by the
+    // service (`root.serviceVerboseLoggingMode`), so it is NOT drafted here.
+    // A request parked while the service is down, shown until delivered.
+    property string _verboseParkedChange: ""
+    // Wall clock for the remaining-time text; ticks only while a window runs.
+    property real _verboseNowMs: Date.now()
     // The enforcement-mode + liveness-window carry-forward props
     // are GONE: `_saveStabilityConfig` now goes through the merge-on-Get
     // `root.applyServiceStabilityPatch`, which preserves every field this panel
@@ -253,17 +246,12 @@ GroupBox {
         // itself. The mirror below still records what the service said.
         var parked = (typeof root._readPendingOffline === "function")
             ? (root._readPendingOffline()["stability"] || {}) : {}
-        // The wire response carries BOTH the policy and the
-        // verbose-logging flag at the root of the DTO. Older payloads
-        // (S1/S2 era) lack the flag — default to false to preserve
-        // pre-S3 behaviour.
         var policy = payload["ipc-accept-policy"]
             || payload.ipc_accept_policy
             || payload
-        var verbose = payload["verbose-logging"]
-        if (verbose === undefined) verbose = payload.verbose_logging
-        if (!parked.hasOwnProperty("verbose-logging"))
-            root.serviceVerboseLogging = !!verbose
+        root.adoptVerboseLogging(payload)
+        _verboseParkedChange = parked.hasOwnProperty("verbose-logging-change")
+            ? String(parked["verbose-logging-change"]) : ""
 
         // Additive flags; older payloads lack
         // them and default to false (= trace off).
@@ -318,8 +306,8 @@ GroupBox {
     /// display mirror on every successful read so a service-stopped launch shows
     /// the user's real values rather than the QML literal drafts.
     readonly property var _mirroredStabilityKeys: [
-        "ipc-accept-policy", "verbose-logging", "conn-trace-ndjson",
-        "conn-trace-gui", "cache-refresh-interval-secs"
+        "ipc-accept-policy", "conn-trace-ndjson", "conn-trace-gui",
+        "cache-refresh-interval-secs"
     ]
 
     function _rememberStabilityFromPayload(payload) {
@@ -343,14 +331,15 @@ GroupBox {
         var mirror = (typeof root._readServiceMirror === "function")
             ? (root._readServiceMirror()["stability"] || {}) : {}
         var source = null
+        _verboseParkedChange = parked.hasOwnProperty("verbose-logging-change")
+            ? String(parked["verbose-logging-change"]) : ""
         for (var i = 0; i < group._mirroredStabilityKeys.length; i += 1) {
             var key = group._mirroredStabilityKeys[i]
             source = parked.hasOwnProperty(key)
                 ? parked : (mirror.hasOwnProperty(key) ? mirror : null)
             if (source === null) continue
             var value = Pure.stabilityEffective(source, key)
-            if (key === "verbose-logging") root.serviceVerboseLogging = value
-            else if (key === "conn-trace-ndjson") _stabilityDraftConnTraceNdjson = value
+            if (key === "conn-trace-ndjson") _stabilityDraftConnTraceNdjson = value
             else if (key === "conn-trace-gui") _stabilityDraftConnTraceGui = value
             else if (key === "cache-refresh-interval-secs") _stabilityDraftCacheRefreshSecs = value
             else if (key === "ipc-accept-policy") {
@@ -395,11 +384,6 @@ GroupBox {
                         group._seedStabilityFromOfflineSources()
                         return
                     }
-                    // ServiceStabilityConfigGetResponse is a type alias to
-                    // ServiceStabilityConfigDto — both `ipc-accept-policy`
-                    // and the S3 `verbose-logging` flag sit at the payload
-                    // root. Pass the whole payload so the applier can read
-                    // both in one place.
                     group._applyStabilityFromPayload(payload || {})
                 })
         } catch (e) {
@@ -410,14 +394,17 @@ GroupBox {
         }
     }
 
+    // Wording lives on `root` (`verboseLoggingChangeLabel` /
+    // `verboseLoggingStateText`) so the Logs tab banner reads the exact same
+    // formatter instead of a second copy.
+    function _verboseStateText() { return root.verboseLoggingStateText(_verboseNowMs) }
+
     function _resetStabilityToDefaults() {
         _stabilityDraftIsCritical = false
         _stabilityDraftMaxRestarts = 20
         _stabilityDraftBackoffBaseMs = 100
         _stabilityDraftBackoffCapSec = 5
-        // Verbose logging is now apply-on-change (LIVE) and no longer
-        // part of the draft/Save flow, so Reset-to-defaults deliberately does
-        // NOT silently flip the live verbose state.
+        // Verbose logging is live, not drafted: Reset leaves the window alone.
         _stabilityDraftConnTraceNdjson = false
         _stabilityDraftConnTraceGui = false
         _markStabilityDirty()
@@ -478,9 +465,6 @@ GroupBox {
         // fields; the merge-on-Get preserves the Routing-owned fields
         // (enforcement-mode, liveness-window, stop-policy, rule-scope), so the
         // old carry-forward hacks (_stabilityLoaded*) are gone.
-        // Verbose-logging is NOT sent here anymore: it applies
-        // on-change through `_applyVerboseLogging`. Leaving it in this Save
-        // patch is what silently carried verbose=false when Save was skipped.
         try {
             root.applyServiceStabilityPatch({
                 "ipc-accept-policy": policy,
@@ -551,7 +535,9 @@ GroupBox {
         }
     }
 
+    onVisibleChanged: if (visible) root.refreshDiagnosticsOnPageOpen()
     Component.onCompleted: {
+        root.refreshDiagnosticsOnPageOpen()
         _fetchStabilityConfig()
         // Register a Save-and-continue callback so UnsavedChangesGuard
         // can offer the third button. The closure captures `group`
@@ -713,8 +699,12 @@ GroupBox {
                 Label {
                     Layout.fillWidth: true
                     visible: storageHealth.lastCleanup !== undefined && storageHealth.lastCleanup !== ""
+                    // Unix milliseconds, shown in the OS regional date/time format.
                     text: root.tr("diag.storage-health.last-cleanup", "Last cleanup: {time}")
-                        .replace("{time}", String(storageHealth.lastCleanup || "-"))
+                        .replace("{time}", Number(storageHealth.lastCleanup) > 0
+                            ? Qt.formatDateTime(new Date(Number(storageHealth.lastCleanup)),
+                                                Qt.locale().dateTimeFormat(Locale.ShortFormat))
+                            : "-")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }
@@ -758,8 +748,7 @@ GroupBox {
                     Layout.minimumWidth: 140
                     from: 1
                     to: 3650
-                    value: Number(retentionCtx.logsMaxAgeDays !== undefined
-                        ? retentionCtx.logsMaxAgeDays : defaultLogsMaxAgeDays)
+                    value: group.defaultLogsMaxAgeDays
                     editable: true
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
@@ -785,8 +774,7 @@ GroupBox {
                     // GB is no longer offered as a unit, so the upper bound
                     // collapses to a sensible storage budget at all times.
                     to: logsSizeUnitCombo.currentIndex === 0 ? 1048576 : 1024
-                    value: Number(retentionCtx.logsMaxSizeMb !== undefined
-                        ? retentionCtx.logsMaxSizeMb : defaultLogsMaxSizeMb)
+                    value: group.defaultLogsMaxSizeMb
                     editable: true
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
@@ -818,8 +806,7 @@ GroupBox {
                     Layout.minimumWidth: 140
                     from: 1
                     to: 3650
-                    value: Number(retentionCtx.auditMaxAgeDays !== undefined
-                        ? retentionCtx.auditMaxAgeDays : defaultAuditMaxAgeDays)
+                    value: group.defaultAuditMaxAgeDays
                     editable: true
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
@@ -844,8 +831,7 @@ GroupBox {
                     // Cap depends on the unit, exactly as the log budget above:
                     // one cap for a number whose unit varies bounds nothing.
                     to: auditSizeUnitCombo.currentIndex === 0 ? 1048576 : 1024
-                    value: Number(retentionCtx.auditMaxSizeMb !== undefined
-                        ? retentionCtx.auditMaxSizeMb : defaultAuditMaxSizeMb)
+                    value: group.defaultAuditMaxSizeMb
                     editable: true
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
@@ -1116,52 +1102,80 @@ GroupBox {
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }
+                ServiceIntentDivergenceNote {
+                    root: group.root
+                    keys: ["ipc-accept-policy", "conn-trace-ndjson", "conn-trace-gui",
+                        "cache-refresh-interval-secs"]
+                }
 
-                // Verbose service logging toggle. Placed first in the group:
-                // it is the most commonly used control here, and it lives
-                // outside the recoverable-only grid because it applies to
-                // both policy modes (debug events flow regardless of which
-                // IPC accept policy is active). Applies LIVE, no restart:
-                // the service reload-wraps its `EnvFilter` (`reload::Layer`)
-                // and `ProductionServiceStability::set` drives it through
-                // the `VerbosityControl` seam on every Save.
+                // Verbose service logging: a window that ends by itself, chosen
+                // here and nowhere else. Applied live (no restart) outside the
+                // draft/Save flow; the closed box shows what the service runs.
                 ColumnLayout {
                     Layout.fillWidth: true
                     Layout.topMargin: root.uiTheme.spacingXs
                     spacing: root.uiTheme.spacingXxs
-                    CheckBox {
-                        id: verboseLoggingCheck
-                        text: root.tr(
-                            "settings.diagnostics.service-stability.verbose.label",
-                            "Verbose service logging")
-                        // Apply-on-change (LIVE), NOT the draft/Save flow: an
-                        // un-pressed Save used to silently discard this toggle.
-                        // The service reloads verbosity without a restart. The
-                        // shared `root.serviceVerboseLogging` is the source of
-                        // truth (the same flag is surfaced in the Logs view); a
-                        // Binding re-asserts `checked` from it so a change on the
-                        // twin surface — or a failed apply — is reflected here.
-                        onToggled: root.applyVerboseLogging(checked, "user:verbose-toggle")
-                        Binding {
-                            target: verboseLoggingCheck
-                            property: "checked"
-                            value: root.serviceVerboseLogging
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: root.uiTheme.spacingSm
+                        Label {
+                            text: root.tr("settings.diagnostics.service-stability.verbose.label",
+                                "Verbose service logging")
+                            color: root.textColor
+                            Layout.alignment: Qt.AlignVCenter
                         }
-                        ToolTip.visible: hovered
-                        ToolTip.delay: 400
-                        ToolTip.text: root.tr(
-                            "settings.diagnostics.service-stability.verbose.tooltip",
-                            "When enabled, the service writes tracing::debug events to operational NDJSON. Applies immediately, no restart required.")
+                        VerboseLoggingDurationCombo {
+                            id: verboseLoggingCombo
+                            root: group.root
+                            theme: group.root.uiTheme
+                            Layout.fillWidth: true
+                            Layout.maximumWidth: 420
+                            currentIndex: {
+                                if (group._verboseParkedChange !== "")
+                                    return Pure.VERBOSE_LOGGING_CHANGES.indexOf(group._verboseParkedChange)
+                                if (group.root.serviceVerboseLoggingMode === "until-restart") return 3
+                                return group.root.serviceVerboseLoggingMode === "off" ? 0 : -1
+                            }
+                            displayText: group.root.uiRevision >= 0 ? group._verboseStateText() : ""
+                            onActivated: function(index) {
+                                var change = options[index]
+                                if (!group.root._routingBackendConnected())
+                                    group._verboseParkedChange = change
+                                group.root.applyVerboseLogging(change, "user:verbose-logging")
+                            }
+                            Accessible.name: group.root.tr(
+                                "settings.diagnostics.service-stability.verbose.label",
+                                "Verbose service logging") + ": " + displayText
+                            ToolTip.visible: hovered
+                            ToolTip.delay: 400
+                            ToolTip.text: group.root.tr(
+                                "settings.diagnostics.service-stability.verbose.tooltip",
+                                "Adds debug events to the service log. Switches itself off when the chosen time runs out or the service restarts. Applies immediately.")
+                        }
                     }
                     Label {
                         Layout.fillWidth: true
-                        Layout.leftMargin: root.uiTheme.spacingLg
+                        Layout.preferredWidth: 0
                         text: root.tr(
                             "settings.diagnostics.service-stability.verbose.help",
-                            "Useful for diagnosing rare IPC or mutation issues. Leave off in normal operation — log volume grows substantially.")
+                            "Useful for diagnosing rare problems. The log grows substantially while it is on, which is why it switches itself off.")
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                    }
+                    Timer {
+                        interval: 20000
+                        repeat: true
+                        running: group.visible && root.serviceVerboseLoggingMode === "timed"
+                        triggeredOnStart: true
+                        onTriggered: {
+                            group._verboseNowMs = Date.now()
+                            // The service ends the window at this same moment.
+                            if (group._verboseNowMs >= root.serviceVerboseLoggingUntilMs) {
+                                root.serviceVerboseLoggingMode = "off"
+                                root.serviceVerboseLoggingUntilMs = 0
+                            }
+                        }
                     }
                 }
 
@@ -1402,8 +1416,7 @@ GroupBox {
                 // Connection-egress trace.
                 // Two independent toggles: write the per-connection trace to
                 // the service NDJSON, and/or surface it in GUI diagnostics.
-                // Both require a service restart (the observer starts at
-                // bootstrap). Off by default — privacy-sensitive.
+                // Both apply on save. Off by default — privacy-sensitive.
                 ColumnLayout {
                     Layout.fillWidth: true
                     Layout.topMargin: root.uiTheme.spacingSm
@@ -1427,6 +1440,8 @@ GroupBox {
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
                     }
                     CheckBox {
+                        // Hidden where the service has no disk sink for the trace.
+                        visible: root.supports("connTraceLog")
                         text: root.tr(
                             "settings.diagnostics.conn-trace.ndjson.label",
                             "Write connection trace to service log (NDJSON)")
@@ -1441,7 +1456,7 @@ GroupBox {
                         ToolTip.delay: 400
                         ToolTip.text: root.tr(
                             "settings.diagnostics.conn-trace.ndjson.tooltip",
-                            "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary/provider or secondary/additional adapter). Applies at the next service start.")
+                            "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary or additional adapter). Takes effect immediately, no service restart.")
                     }
                     CheckBox {
                         text: root.tr(

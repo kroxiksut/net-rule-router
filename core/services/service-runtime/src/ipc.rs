@@ -28,28 +28,28 @@
 //!   `SettingsExportFull` responses.
 //! - Connect timeout: 5 seconds. Read/write timeout: 30 seconds.
 //!
-//! ## ACL baseline
+//! ## Who may connect, and who decides
 //!
-//! On install, the pipe is ACL'd to:
-//! - `NT AUTHORITY\LocalSystem` — full (the service runs here)
-//! - The service account — full
-//! - `BUILTIN\Administrators` — Read+Write (for the GUI/tray launched by
-//!   an admin user)
-//! - Standard users — none
+//! The pipe ACL admits SYSTEM, Administrators and Authenticated Users (read
+//! and write, but not the right to add pipe instances), so an ordinary user
+//! connects. The connection itself is therefore not a privilege boundary:
 //!
-//! Privileged operation classes (`MutationRequest`,
-//! `ReviewConfirmation`, `RecoveryAction`, `SafeDisable`) additionally
-//! require the connecting client's token to be elevated; see the
-//! `caller_is_elevated` field on `IpcRequestContext`. The transport
-//! layer fills it in from `GetTokenInformation(TokenElevation)` —
-//! validation lives in this module so the rule is one place.
+//! - The caller's exe basename maps to an `IpcClientProfile`. That is a
+//!   coarse, advisory filter (a process can carry any name); it narrows what
+//!   an honest client can ask for, it does not authenticate anyone.
+//! - The operation class decides elevation: classes with
+//!   `requires_elevation()` need an elevated token (`caller_is_elevated`),
+//!   or an authorization from the platform authority. Per-user classes do
+//!   not. Machine-wide values written through a per-user class are compared
+//!   by value in the handler, and only a real change demands rights.
+//! - Log and audit reads are scoped by `DiagnosticsAudience`, derived from
+//!   the connection, never from the request.
 //!
-//! ## No raw storage paths
+//! ## Paths
 //!
-//! Response payloads are JSON DTOs only. They never carry absolute
-//! file paths to service-owned databases or log directories. The GUI
-//! receives logical handles (`archive_handle`, `revision_id`, …) and
-//! re-opens whatever it needs through dedicated IPC operations.
+//! Most responses are JSON DTOs with logical handles. The diagnostics archive
+//! export is the exception: it returns the absolute `archive_path` of the file
+//! the service wrote.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -496,7 +496,7 @@ impl IpcRouter {
                 "not authorized for {action}: an administrator may grant it"
             )),
             AuthorizationDecision::NeedsInteraction => AuthorizationOutcome::Refused(format!(
-                "{action} needs confirmation, and no authentication agent is available in this                  session"
+                "{action} needs confirmation, and no authentication agent is available in this session"
             )),
             AuthorizationDecision::Unavailable => AuthorizationOutcome::Refused(format!(
                 "{action} could not be checked: no authorization service answered"
@@ -808,15 +808,18 @@ mod tests {
         }
     }
 
-    /// A privileged request: rollback is a `RecoveryAction`, which needs
-    /// elevation and therefore reaches the authority.
-    fn recovery_request() -> IpcRequestEnvelope {
-        req(
-            IpcOperationName::RollbackRequest,
-            IpcOperationClass::RecoveryAction,
-            IPC_PROTOCOL_VERSION,
-            Some("token-from-dry-run"),
-        )
+    /// A privileged request: rolling back the shared baseline is an edit of
+    /// it, which needs elevation and therefore reaches the authority.
+    fn baseline_rollback_request() -> IpcRequestEnvelope {
+        IpcRequestEnvelope {
+            payload: serde_json::json!({ "admin-baseline": true }),
+            ..req(
+                IpcOperationName::RollbackRequest,
+                IpcOperationClass::MutationRequest,
+                IPC_PROTOCOL_VERSION,
+                Some("token-from-dry-run"),
+            )
+        }
     }
 
     struct EchoHandler;
@@ -1088,7 +1091,6 @@ mod tests {
         }
         for class in [
             IpcOperationClass::MutationRequest,
-            IpcOperationClass::RecoveryAction,
             IpcOperationClass::SafeDisable,
         ] {
             assert!(class.is_mutating());
@@ -1167,7 +1169,7 @@ mod tests {
                 caller_principal: Some(UserPrincipal::from_linux_uid(1000)),
                 caller_pid: Some(4321),
             };
-            router.dispatch(recovery_request(), ctx)
+            router.dispatch(baseline_rollback_request(), ctx)
         };
 
         assert!(
@@ -1208,7 +1210,7 @@ mod tests {
             caller_pid: Some(4321),
         };
 
-        let response = router.dispatch(recovery_request(), ctx);
+        let response = router.dispatch(baseline_rollback_request(), ctx);
 
         let error = response.error.expect("a refusal carries an error");
         assert_eq!(error.code, IpcErrorCode::Forbidden);

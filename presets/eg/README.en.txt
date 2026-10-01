@@ -11,6 +11,4 @@ Expected structure:
 - eg/<pack-name>/rules_secondary.txt
 
 Author: repository contributors
-
-Note:
-- Initial pack content may be unverified.
+Checked: September 2026 (secondary route list, against public reports)

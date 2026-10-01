@@ -13,7 +13,7 @@ anywhere=(?<![A-Za-z])(?i:blocks?)[\s_-]*\d|[бБ]лок[а-яё]*\s*\d|TODO\((?
 # Markers judged only inside comment text: string literals and test data carry
 # the same shapes legitimately (timestamps, dotted versions). The sub-block form
 # is fenced on both sides so dotted-quad addresses are not read as block numbers.
-comment=(?<![\d.])1\d\.\d+\.[0-9A-Za-z](?!\.?\d)|(?<![A-Za-z])Block\s+[A-Z]\b|Phase\s+[A-Z]\b|20\d\d-[01]\d-[0-3]\d|\bTASKS_RU\b|(?<!\p{L})П\d
+comment=(?<![\d.])1\d\.\d+\.[0-9A-Za-z](?!\.?\d)|(?<![A-Za-z])(?i:block)\s+[A-Z]\b|Phase\s+[A-Z]\b|20\d\d-[01]\d-[0-3]\d|\bTASKS_RU\b|(?<!\p{L})П\d
 
 # A comment-tier hit is forgiven when the comment is about time arithmetic.
 exempt=UTC|epoch|RFC|ISO\s?8601|≈|\d_\d{3}_
@@ -30,3 +30,16 @@ hashnames=CMakeLists.txt
 # Path prefixes skipped entirely: vendored code, and the fixture that holds the
 # offences on purpose.
 exclude=third_party/ scripts/tests/comment-hygiene/
+
+# A lost `\` line-continuation inside a plain (non-raw) .rs string literal,
+# collapsed onto one line: a 10+ space run with real text on both sides. Raw
+# strings are never scanned for it (source formatting on purpose). Excluded so
+# legitimate space-padding in this tree is not misread as the same defect:
+# a `label:` column (CLI/log rows), a run whose far side is not a lowercase
+# letter (SQL `NOT NULL`/`INTEGER`, a `{placeholder}`, table-drawing `|`,
+# digits, `=`), and a run right after a `\n`/`\t` escape (an embedded
+# multi-line fixture, not a broken sentence). A continuation line of a
+# genuinely multi-line literal (SQL text throughout this crate) starts its own
+# span at column 0 in the lexer below, so its leading indentation has no
+# "real text before" to satisfy the first lookbehind either.
+string_gap=(?<=[^\s:])(?<!\\n)(?<!\\t) {10,}[a-z]

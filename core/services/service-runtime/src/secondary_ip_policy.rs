@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn non_shared_ip_is_never_denied() {
         let inner = MockFqdnCacheLookup::new();
-        let solo = Ipv4Addr::new(1, 2, 3, 4);
+        let solo = Ipv4Addr::new(192, 0, 2, 4);
         inner.set_ips("example.com", vec![solo]);
         // No direct hosts recorded → direct_on_ip == 0 → committed.
         let cache = CensusMock {

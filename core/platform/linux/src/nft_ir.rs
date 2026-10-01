@@ -78,6 +78,12 @@ pub struct NftRule {
     pub comment: String,
 }
 
+/// Priority of our output chain: `filter - 10`, ahead of ufw and Docker
+/// (iptables, `filter`) and firewalld (`filter + 10`); at an equal priority the
+/// order is undefined. Still after `dstnat` (-100), so the destination matched
+/// is the one NAT already rewrote.
+pub const NRR_CHAIN_PRIORITY: i32 = -10;
+
 /// The full ruleset for one principal: one table, one chain, rules in order.
 ///
 /// The chain's `policy` is deliberately `accept`: this product routes traffic,
@@ -98,8 +104,8 @@ impl NftRuleset {
     pub fn to_nft_script(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "table {} {} {{\n  chain {} {{\n    type filter hook output priority filter; policy accept;\n",
-            self.family, self.table, self.chain
+            "table {} {} {{\n  chain {} {{\n    type filter hook output priority {}; policy accept;\n",
+            self.family, self.table, self.chain, NRR_CHAIN_PRIORITY
         ));
         for rule in &self.rules {
             out.push_str("    ");
@@ -148,10 +154,10 @@ mod tests {
     #[test]
     fn a_host_match_renders_without_a_redundant_prefix() {
         let m = NftMatch::DstV4 {
-            net: Ipv4Addr::new(23, 10, 20, 138),
+            net: Ipv4Addr::new(203, 0, 113, 138),
             prefix: 32,
         };
-        assert_eq!(render_match(&m), "ip daddr 23.10.20.138");
+        assert_eq!(render_match(&m), "ip daddr 203.0.113.138");
     }
 
     #[test]
@@ -188,7 +194,7 @@ mod tests {
                 matches: vec![
                     NftMatch::SkUid(1000),
                     NftMatch::DstV4 {
-                        net: Ipv4Addr::new(1, 2, 3, 4),
+                        net: Ipv4Addr::new(192, 0, 2, 4),
                         prefix: 32,
                     },
                     NftMatch::OutInterface("tun0".into()),
@@ -200,7 +206,7 @@ mod tests {
         let script = ruleset.to_nft_script();
         assert!(
             script.contains(
-                "meta skuid 1000 ip daddr 1.2.3.4 oifname \"tun0\" accept comment \"route-rule/secondary#0\""
+                "meta skuid 1000 ip daddr 192.0.2.4 oifname \"tun0\" accept comment \"route-rule/secondary#0\""
             ),
             "{script}"
         );

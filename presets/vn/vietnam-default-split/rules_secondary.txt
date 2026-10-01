@@ -1,91 +1,33 @@
 ﻿# NetRuleRouter preset - version 1
 # name: Vietnam Default Split - Secondary Route
-# description: Foreign social, messaging, developer, and AI services routed to secondary
+# description: Medium, Reddit and Telegram, blocked or restricted by Vietnamese ISPs, routed to secondary
 # author: NetRuleRouter contributors
-# preset_version: 1
+# preset_version: 2
 
 --- Zones
 # Keep empty to avoid over-broad routing by TLD
 
 --- Domains
-*.facebook.com
-*.instagram.com
-*.threads.com
-*.x.com
-*.twitter.com
-*.youtube.com
-*.googlevideo.com
-*.tiktok.com
-*.discord.com
-*.reddit.com
-*.linkedin.com
-*.telegram.org
-*.t.me
-*.whatsapp.com
-*.signal.org
-*.openai.com
-*.chatgpt.com
-*.anthropic.com
-*.claude.ai
-*.claude.com
-*.perplexity.ai
-*.mistral.ai
-api.mistral.ai
-*.cohere.com
-*.cursor.com
-*.openrouter.ai
-*.midjourney.com
-*.jetbrains.com
-plugins.jetbrains.com
+*.medium.com  # Medium: blocked by the major ISPs since 2020
+
+*.reddit.com  # Reddit: blocked on part of the networks of a major ISP
+*.redd.it  # Reddit: blocked on part of the networks of a major ISP
+*.redditstatic.com  # Reddit: blocked on part of the networks of a major ISP
+*.redditmedia.com  # Reddit: blocked on part of the networks of a major ISP
+
+*.telegram.org  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
+*.t.me  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
+*.telegram.me  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
+*.telesco.pe  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 
 --- Windows
-telegram.exe
-WhatsAp*.exe
-discord.exe
-signal.exe
-viber.exe
-line.exe
-skype.exe
-zoom.exe
-slack.exe
-chatgpt.exe
-claude.exe
-poe.exe
-codex.exe
-codex*.exe
-Cursor.exe
-Windsurf.exe
-jetbrains-toolbox.exe
-idea64.exe
-pycharm64.exe
-webstorm64.exe
-clion64.exe
-rider64.exe
-goland64.exe
-fleet.exe
+telegram.exe  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
 
 --- Linux
-clion
-codex
-codex*
-cursor
-discord
-goland
-idea
-jetbrains-toolbox
-pycharm
-rider
-signal-desktop
-slack
-telegram
-telegram-desktop
-viber
-webstorm
-windsurf
-zoom
+telegram-desktop  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
 
 --- MacOS
 # (reserved - not applied on Windows)

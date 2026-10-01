@@ -26,7 +26,7 @@ while (my $l = <$rf>) {
   $rule{$key} = $value;
 }
 close $rf;
-for my $key (qw(anywhere comment exempt filename slash hash hashnames exclude)) {
+for my $key (qw(anywhere comment exempt filename slash hash hashnames exclude string_gap)) {
   die "rule '$key' missing from $rules_path\n" unless exists $rule{$key};
 }
 
@@ -39,10 +39,83 @@ my %hash      = map { $_ => 1 } split ' ', $rule{hash};
 my %hashnames = map { $_ => 1 } split ' ', $rule{hashnames};
 my @exclude   = split ' ', $rule{exclude};
 my $opener    = qr/^\s*(?:\/[\/*]+!?|\*+|<#|#+)?\s*/;
+my $string_gap = qr/$rule{string_gap}/;
 
 sub is_offence {
   my ($text) = @_;
   return $text =~ $anywhere || ($text =~ $comment && $text !~ $exempt);
+}
+
+# Tiny same-shaped lexer (mirrored in check.ps1) that tracks enough Rust syntax
+# to tell plain-string content from code, comments, char literals and raw
+# strings (`r"`/`r#"`, whose content is never collected — they keep source
+# formatting on purpose). For each line it appends every plain-string span
+# THAT LINE contributes to @$spans, one entry per contiguous run: a
+# continuation line's span starts at column 0 with no code before it, which is
+# what keeps a multi-line literal's own leading indentation out of the
+# flanked-both-sides check above. Limits: no nested block comments; an
+# escaped `\'` right after `r` (never valid Rust) is not specially handled —
+# neither shape occurs in this tree.
+sub scan_rs_line {
+  my ($line, $mode, $spans) = @_;
+  my $len = length($line);
+  my $i = 0;
+  my $span_start = ($mode eq 'string') ? 0 : undef;
+  while ($i < $len) {
+    if ($mode eq 'code') {
+      my $c = substr($line, $i, 1);
+      if ($c eq '/' && $i + 1 < $len && substr($line, $i + 1, 1) eq '/') {
+        last;
+      } elsif ($c eq '/' && $i + 1 < $len && substr($line, $i + 1, 1) eq '*') {
+        my $close = index($line, '*/', $i + 2);
+        if ($close >= 0) { $i = $close + 2 } else { $mode = 'block'; last }
+      } elsif ($c eq "'") {
+        if (substr($line, $i + 1, 1) eq '\\') {
+          if (substr($line, $i + 2, 2) eq 'u{') {
+            my $brace = index($line, '}', $i + 4);
+            $i = ($brace >= 0 && substr($line, $brace + 1, 1) eq "'") ? $brace + 2 : $i + 1;
+          } else {
+            $i = (substr($line, $i + 3, 1) eq "'") ? $i + 4 : $i + 1;
+          }
+        } elsif (substr($line, $i + 2, 1) eq "'") {
+          $i += 3;
+        } else {
+          $i += 1; # a lifetime, not a char literal
+        }
+      } elsif ($c eq '"') {
+        $mode = 'string';
+        $i += 1;
+        $span_start = $i;
+      } elsif ($c eq 'r' && ($i == 0 || substr($line, $i - 1, 1) !~ /[A-Za-z0-9_]/)) {
+        my $j = $i + 1;
+        my $hashes = 0;
+        while (substr($line, $j, 1) eq '#') { $hashes++; $j++ }
+        if (substr($line, $j, 1) eq '"') { $mode = "raw:$hashes"; $i = $j + 1 } else { $i += 1 }
+      } else {
+        $i += 1;
+      }
+    } elsif ($mode eq 'string') {
+      my $c = substr($line, $i, 1);
+      if ($c eq '\\') { $i += ($i + 1 < $len) ? 2 : 1 }
+      elsif ($c eq '"') {
+        push @$spans, substr($line, $span_start, $i - $span_start);
+        $mode = 'code';
+        $i += 1;
+        $span_start = undef;
+      } else {
+        $i += 1;
+      }
+    } elsif ($mode =~ /^raw:(\d+)\z/) {
+      my $closer = '"' . ('#' x $1);
+      if (substr($line, $i, length($closer)) eq $closer) { $mode = 'code'; $i += length($closer) }
+      else { $i += 1 }
+    } elsif ($mode eq 'block') {
+      my $close = index($line, '*/', $i);
+      if ($close >= 0) { $mode = 'code'; $i = $close + 2 } else { last }
+    }
+  }
+  push @$spans, substr($line, $span_start) if $mode eq 'string' && defined $span_start;
+  return $mode;
 }
 
 my @found;
@@ -63,8 +136,10 @@ PATH: for my $raw_path (sort grep { length } split /\0/, $input) {
     : undef;
   next unless defined $style;
 
+  my $is_rs = defined($ext) && $ext eq 'rs';
   open my $fh, '<:raw', "$root/$raw_path" or next;
   my ($line_no, $in_block, $prev) = (0, 0, undef);
+  my $str_mode = 'code';
   while (my $raw = <$fh>) {
     $line_no += 1;
     my $line = decode('UTF-8', $raw);
@@ -97,6 +172,14 @@ PATH: for my $raw_path (sort grep { length } split /\0/, $input) {
     }
     push @found, [$path, $line_no, $trimmed] if $hit;
     $prev = $text;
+
+    if ($is_rs) {
+      my @spans;
+      $str_mode = scan_rs_line($line, $str_mode, \@spans);
+      if (grep { $_ =~ $string_gap } @spans) {
+        push @found, [$path, $line_no, $trimmed];
+      }
+    }
   }
   close $fh;
 }

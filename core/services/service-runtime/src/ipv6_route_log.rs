@@ -46,7 +46,7 @@ impl Ipv6RouteTableLog {
                 tracing::debug!(
                     target: "nrr::routes-v6",
                     reason,
-                    error = ?err,
+                    error = %err,
                     "IPv6 route table unavailable on this platform",
                 );
                 return false;

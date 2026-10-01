@@ -16,7 +16,8 @@
 //! not demand elevation, so the Set handler checks the VALUE (see
 //! `crate::machine_scoped`): an unelevated save passes only when it leaves the
 //! row as stored. An unelevated GUI gets `Forbidden` and the launcher retries
-//! through the elevation broker.
+//! through the elevation broker, unless the request is a connect-time replay
+//! no user started: that one stays refused.
 
 use std::sync::Arc;
 
@@ -125,6 +126,11 @@ impl ServiceStabilityConfigSetHandler {
         if requested.allow_user_rule_edits.is_none() {
             want.remove(RULES_LOCK_WIRE_KEY);
         }
+        // Reported state the writer ignores: an echo taken before a window
+        // ended differs from the row without asking for anything.
+        for key in REPORTED_ONLY_WIRE_KEYS {
+            want.remove(*key);
+        }
         want.into_iter()
             .filter(|(key, value)| have.get(key) != Some(value))
             .map(|(key, _)| key)
@@ -133,6 +139,7 @@ impl ServiceStabilityConfigSetHandler {
 }
 
 const RULES_LOCK_WIRE_KEY: &str = "allow-user-rule-edits";
+const REPORTED_ONLY_WIRE_KEYS: &[&str] = &["verbose-logging-mode", "verbose-logging-until-ms"];
 
 impl IpcHandler for ServiceStabilityConfigSetHandler {
     fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
@@ -184,7 +191,7 @@ impl IpcHandler for ServiceStabilityConfigSetHandler {
             msg_key = "svcstability-set-requested",
             origin = req.origin.as_deref().unwrap_or("unspecified"),
             requested_enforcement_mode = %req.config.enforcement_mode,
-            requested_verbose = req.config.verbose_logging,
+            requested_verbose = ?req.config.verbose_logging_change,
             "service-stability set requested",
         );
         // Measure the write end-to-end. `elapsed_ms` here says whether the

@@ -32,7 +32,7 @@ fn every_ipc_variant_is_service_backed() {
 #[test]
 fn ipc_fallback_to_mock_reports_not_service_backed() {
     use nrr_application::backend_facade::MockBackendFacade;
-    let facade = MockBackendFacade;
+    let facade = MockBackendFacade::default();
     let backend: &dyn BackendFacade = &facade;
     assert!(!backend_provider_is_service_backed(backend.provider_kind()));
 }

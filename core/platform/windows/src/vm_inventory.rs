@@ -11,7 +11,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use nrr_platform_api::vm_inventory::virtualbox::{
-    self, COMMAND_LINE_TOOL_STEM, GLOBAL_SETTINGS_FILE, TRAFFIC_PROCESS_STEMS,
+    self, COMMAND_LINE_TOOL_BUDGET, COMMAND_LINE_TOOL_STEM, GLOBAL_SETTINGS_FILE,
+    TRAFFIC_PROCESS_STEMS,
 };
 use std::net::Ipv4Addr;
 
@@ -47,6 +48,8 @@ impl WindowsVmInventory {
 
 impl VmInventoryPort for WindowsVmInventory {
     fn inventory(&self) -> Vec<HypervisorInventory> {
+        let adapters = adapter_descriptions();
+        let host_has = |marker: &str| adapters.iter().any(|d| d.contains(marker));
         let mut machines = virtualbox_home()
             .map(|home| machines_in(&home))
             .unwrap_or_default();
@@ -55,14 +58,14 @@ impl VmInventoryPort for WindowsVmInventory {
         }
         let virtualbox = HypervisorInventory {
             hypervisor: Hypervisor::VirtualBox,
-            host_network_seen: host_has_virtualbox_adapter(),
+            host_network_seen: host_has(ADAPTER_DESCRIPTION_MARKER),
             traffic_processes: TRAFFIC_PROCESS_STEMS
                 .iter()
                 .map(|stem| format!("{stem}.exe"))
                 .collect(),
             machines,
         };
-        let vmware = vmware_inventory();
+        let vmware = vmware_inventory(host_has(VMWARE_ADAPTER_DESCRIPTION_MARKER));
         [virtualbox, vmware]
             .into_iter()
             .filter(HypervisorInventory::is_present)
@@ -90,13 +93,18 @@ impl VmInventoryPort for WindowsVmInventory {
 const MAX_TOOL_MESSAGE_CHARS: usize = 300;
 
 fn run_tool(tool: &Path, arguments: &[String]) -> Result<(), VmControlError> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let output = std::process::Command::new(tool)
-        .args(arguments)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| VmControlError::Failed(error.to_string()))?;
+    let output = crate::bounded_command::output_within(
+        std::process::Command::new(tool).args(arguments),
+        COMMAND_LINE_TOOL_BUDGET,
+    )
+    .map_err(|error| {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => VmControlError::ToolMissing,
+            // The generic "could not be changed": the tool said nothing.
+            std::io::ErrorKind::TimedOut => VmControlError::Failed(String::new()),
+            _ => VmControlError::Failed(error.to_string()),
+        }
+    })?;
     if output.status.success() {
         return Ok(());
     }
@@ -142,21 +150,21 @@ fn machines_in(home: &Path) -> Vec<VirtualMachine> {
             } else {
                 home.join(path)
             };
-            virtualbox::machine(&read_settings(&path)?)
+            virtualbox::machine(&read_machine_file(&path)?)
         })
         .collect()
 }
 
 /// No traffic processes: VMware's NAT runs as a system service that no
 /// application rule binds.
-fn vmware_inventory() -> HypervisorInventory {
+fn vmware_inventory(host_network_seen: bool) -> HypervisorInventory {
     let networks = vmware_host_networks();
     let machines = crate::system_shell::roaming_app_data_directory()
         .map(|appdata| vmware_machines_in(&appdata.join("VMware"), &networks))
         .unwrap_or_default();
     HypervisorInventory {
         hypervisor: Hypervisor::VMware,
-        host_network_seen: host_has_adapter(VMWARE_ADAPTER_DESCRIPTION_MARKER),
+        host_network_seen,
         traffic_processes: Vec::new(),
         machines,
     }
@@ -196,7 +204,7 @@ fn vmware_machines_in(settings: &Path, networks: &HostNetworks) -> Vec<VirtualMa
                 return None;
             }
             vmware::machine(
-                &read_lossy(path)?,
+                &read_machine_file(path)?,
                 &entry.config,
                 entry.display_name.as_deref(),
                 networks,
@@ -205,8 +213,45 @@ fn vmware_machines_in(settings: &Path, networks: &HostNetworks) -> Vec<VirtualMa
         .collect()
 }
 
-/// A `.vmx` from an older release may not be UTF-8; its names still show.
-fn read_lossy(path: &Path) -> Option<String> {
+/// A machine the inventory lists is read only from a drive that answers at
+/// once: on a share or an unplugged drive the open can stall for the
+/// redirector's timeout, per machine, inside a synchronous request.
+fn read_machine_file(path: &Path) -> Option<String> {
+    on_local_drive(path).then(|| read_settings(path)).flatten()
+}
+
+fn on_local_drive(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => drive_is_local(letter),
+            // A share by name, or a device path.
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+#[allow(unsafe_code)]
+fn drive_is_local(letter: u8) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    // WinBase.h; a mapped share is DRIVE_REMOTE, a vanished drive DRIVE_NO_ROOT_DIR.
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    const DRIVE_RAMDISK: u32 = 6;
+    let root: Vec<u16> = format!("{}:\\", char::from(letter))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call.
+    let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+    matches!(kind, DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_RAMDISK)
+}
+
+/// Bounded, and lossy: a `.vmx` from an older release may not be UTF-8, and
+/// its names should still show.
+fn read_settings(path: &Path) -> Option<String> {
     let mut bytes = Vec::new();
     File::open(path)
         .ok()?
@@ -216,28 +261,16 @@ fn read_lossy(path: &Path) -> Option<String> {
     (bytes.len() as u64 <= MAX_SETTINGS_BYTES).then(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn read_settings(path: &Path) -> Option<String> {
-    let mut text = String::new();
-    File::open(path)
-        .ok()?
-        .take(MAX_SETTINGS_BYTES + 1)
-        .read_to_string(&mut text)
-        .ok()?;
-    (text.len() as u64 <= MAX_SETTINGS_BYTES).then_some(text)
-}
-
-fn host_has_virtualbox_adapter() -> bool {
-    host_has_adapter(ADAPTER_DESCRIPTION_MARKER)
-}
-
-fn host_has_adapter(marker: &str) -> bool {
+/// Every adapter's description, lower-cased, from one enumeration.
+fn adapter_descriptions() -> Vec<String> {
     ipconfig::get_adapters()
         .map(|adapters| {
             adapters
                 .iter()
-                .any(|adapter| adapter.description().to_lowercase().contains(marker))
+                .map(|adapter| adapter.description().to_lowercase())
+                .collect()
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -299,6 +332,29 @@ mod tests {
             machines[0].adapters[0].attachment,
             VmAttachment::Nat(_)
         ));
+    }
+
+    #[test]
+    fn a_machine_on_a_share_is_not_opened() {
+        // Positive control: the drive a temp directory lives on is local.
+        let local = tempfile::tempdir().expect("dir");
+        assert!(on_local_drive(local.path()));
+        for remote in [
+            r"\\fileserver.example\vms\One\One.vmx",
+            r"\\?\UNC\fileserver.example\vms\One\One.vmx",
+            r"\\.\PhysicalDrive0",
+            r"One\One.vmx",
+        ] {
+            assert!(!on_local_drive(Path::new(remote)), "{remote}");
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_machine_file_still_reads() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("old.vmx");
+        std::fs::write(&path, b"displayName = \"Caf\xe9\"\n").expect("write");
+        assert!(read_machine_file(&path).is_some_and(|text| text.starts_with("displayName")));
     }
 
     #[test]

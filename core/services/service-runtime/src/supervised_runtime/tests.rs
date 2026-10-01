@@ -1,7 +1,6 @@
 use super::*;
 use crate::bootstrap::{bootstrap, BootstrapConfig};
 use crate::managers::{AcceptOutcome, IpcAcceptor, IpcBindError, IpcServer};
-use crate::state::ServiceShutdownReason;
 use nrr_platform_api::MockAdapterEventSource;
 use nrr_storage::StorageProfile;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -96,7 +95,7 @@ fn fresh_deps() -> SupervisedRuntimeDeps {
         conn_observation_source: None,
         conn_observation_consumer: None,
         dns_resolver_controller: None,
-        dns_resolver_boot_mode: nrr_domain::enforcement_mode::EnforcementMode::default(),
+        dns_resolver_mode: Arc::new(nrr_domain::enforcement_mode::EnforcementMode::default),
         sign_in_gate: None,
         fake_ip_shutdown: None,
         conn_observer_shutdown: None,
@@ -131,9 +130,8 @@ fn happy_path_emits_full_state_sequence() {
     let cfg = BootstrapConfig::new(StorageProfile::TestTemp(dir.path().to_path_buf()));
     let artifacts = bootstrap(&cfg);
     let deps = fresh_deps();
-    let reason = run_supervised_runtime(&controller, &stop, artifacts, deps);
+    run_supervised_runtime(&controller, &stop, artifacts, deps);
     join.join().unwrap();
-    assert_eq!(reason, ServiceShutdownReason::ScmStop);
     let states = controller.states();
     // Healthy bootstrap → expect Running. If the temp profile
     // ever produces Blocking we'd see RecoveryRequired instead;
@@ -197,6 +195,10 @@ impl IpcAcceptor for SharedScriptedAcceptor {
     fn join_workers(&self) {}
 }
 
+/// How long a probe waits for the event it stops on. Reached only when the
+/// event never comes; a passing run stops as soon as it does.
+const PROBE_BACKSTOP: Duration = Duration::from_secs(60);
+
 fn deps_with_server(server: Arc<dyn IpcServer>) -> SupervisedRuntimeDeps {
     let mut d = fresh_deps();
     d.ipc_server = server;
@@ -239,12 +241,16 @@ fn ipc_accept_recoverable_max_restarts_exhausted_marks_ipc_blocking() {
     let controller = RecordingController::default();
     let stop = StopToken::new();
     let stop_clone = stop.clone();
-    // Stop once the restart budget is exhausted, with a deadline as the
-    // backstop — same reason as the sibling tests: a fixed sleep starts
-    // before `bootstrap` and measures the machine, not the supervisor.
+    // Storage init first, outside the probe's window: see the adapter-monitor
+    // test for what it cost when the deadline covered it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = BootstrapConfig::new(StorageProfile::TestTemp(dir.path().to_path_buf()));
+    let artifacts = bootstrap(&cfg);
+    // Stop once the restart budget is exhausted; the deadline only bounds a
+    // regression.
     let binds_probe = Arc::clone(&server);
     let join = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + PROBE_BACKSTOP;
         while binds_probe.binds.load(Ordering::SeqCst) <= max_restarts as usize
             && std::time::Instant::now() < deadline
         {
@@ -253,10 +259,7 @@ fn ipc_accept_recoverable_max_restarts_exhausted_marks_ipc_blocking() {
         stop_clone.request_stop();
     });
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let cfg = BootstrapConfig::new(StorageProfile::TestTemp(dir.path().to_path_buf()));
-    let artifacts = bootstrap(&cfg);
-    let _ = run_supervised_runtime(&controller, &stop, artifacts, deps);
+    run_supervised_runtime(&controller, &stop, artifacts, deps);
     join.join().unwrap();
 
     // The supervisor must have asked for at least max_restarts + 1
@@ -291,23 +294,21 @@ fn ipc_accept_critical_retires_on_first_failure_without_rebind() {
     let controller = RecordingController::default();
     let stop = StopToken::new();
     let stop_clone = stop.clone();
-    // Stop once the runtime has actually done the thing under test, with a
-    // deadline as the backstop. A fixed sleep measured the machine instead:
-    // under a loaded `--workspace` run the accept task had not reached its
-    // first tick yet and the count read 1.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = BootstrapConfig::new(StorageProfile::TestTemp(dir.path().to_path_buf()));
+    let artifacts = bootstrap(&cfg);
+    // Stop once the runtime has done the thing under test; the deadline only
+    // bounds a regression.
     let binds_probe = Arc::clone(&server);
     let join = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + PROBE_BACKSTOP;
         while binds_probe.binds.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         stop_clone.request_stop();
     });
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let cfg = BootstrapConfig::new(StorageProfile::TestTemp(dir.path().to_path_buf()));
-    let artifacts = bootstrap(&cfg);
-    let _ = run_supervised_runtime(&controller, &stop, artifacts, deps);
+    run_supervised_runtime(&controller, &stop, artifacts, deps);
     join.join().unwrap();
 
     // Critical: 1 initial bind + 1 rebind from the Err handling
@@ -369,14 +370,14 @@ fn adapter_monitor_task_ticks_during_run() {
     // inside the window is starting the runtime and two 500 ms ticks.
     let calls_probe = Arc::clone(&counting);
     let join = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + PROBE_BACKSTOP;
         while calls_probe.calls.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         stop_clone.request_stop();
     });
 
-    let _ = run_supervised_runtime(&controller, &stop, artifacts, deps);
+    run_supervised_runtime(&controller, &stop, artifacts, deps);
     join.join().unwrap();
 
     let calls = counting.calls.load(Ordering::SeqCst);
@@ -531,5 +532,67 @@ fn one_task_recovering_does_not_clear_another_that_is_still_down() {
             .expect("component recorded")
             .severity,
         ServiceHealthSeverity::Ok
+    );
+}
+
+fn migrated_state_db() -> (tempfile::TempDir, Arc<Mutex<rusqlite::Connection>>) {
+    use nrr_storage::{open_connection, repository::MigrationRunner, SqliteMigrationRunner};
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let conn = open_connection(&dir.path().join("nrr_service_state.db")).expect("open");
+    let runner = SqliteMigrationRunner::for_state_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    (dir, Arc::new(Mutex::new(runner.into_connection())))
+}
+
+/// Boot in `boot`, switch to `switched` the way the GUI does, then sign in
+/// twice (an RDP reconnect after the first logon). Returns what the resolver
+/// was left asked for.
+fn mode_after_signing_in(
+    boot: nrr_domain::enforcement_mode::EnforcementMode,
+    switched: nrr_domain::enforcement_mode::EnforcementMode,
+) -> nrr_domain::enforcement_mode::EnforcementMode {
+    use crate::ipc_handlers::providers::{
+        ServiceStabilityConfigProvider, ServiceStabilityConfigWriter,
+    };
+    let (_dir, conn) = migrated_state_db();
+    let controller = Arc::new(crate::dns_resolver_service::DnsResolverController::new());
+    let settings = crate::production_settings::ProductionServiceStability::new(Arc::clone(&conn))
+        .with_resolver_controller(Arc::clone(&controller));
+    let write = |mode: nrr_domain::enforcement_mode::EnforcementMode| {
+        let mut dto = settings.get();
+        dto.enforcement_mode = mode.as_slug().to_string();
+        settings.set(&dto, Some("S-1-5-21-test")).expect("set");
+    };
+    write(boot);
+    let source = crate::dns_stack::persisted_enforcement_mode(Some(Arc::clone(&conn)));
+    controller.apply(source());
+    write(switched);
+    assert_eq!(controller.desired_mode(), switched);
+
+    let signed_in = on_signed_in(Some(Arc::clone(&controller)), source, None);
+    signed_in();
+    signed_in();
+    controller.desired_mode()
+}
+
+#[test]
+fn a_sign_in_applies_the_mode_saved_since_boot_not_the_boot_one() {
+    use nrr_domain::enforcement_mode::EnforcementMode::{Reactive, Resolver};
+    assert_eq!(mode_after_signing_in(Reactive, Resolver), Resolver);
+    assert_eq!(mode_after_signing_in(Resolver, Reactive), Reactive);
+}
+
+#[test]
+fn a_sign_in_without_a_state_database_applies_the_default() {
+    let controller = Arc::new(crate::dns_resolver_service::DnsResolverController::new());
+    controller.apply(nrr_domain::enforcement_mode::EnforcementMode::Reactive);
+    on_signed_in(
+        Some(Arc::clone(&controller)),
+        crate::dns_stack::persisted_enforcement_mode(None),
+        None,
+    )();
+    assert_eq!(
+        controller.desired_mode(),
+        nrr_domain::enforcement_mode::EnforcementMode::default()
     );
 }

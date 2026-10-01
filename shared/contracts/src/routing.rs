@@ -27,13 +27,6 @@ impl RouteRole {
             Self::Secondary => "secondary",
         }
     }
-
-    pub const fn user_label(self) -> &'static str {
-        match self {
-            Self::Primary => "Primary route",
-            Self::Secondary => "Secondary route",
-        }
-    }
 }
 
 impl fmt::Display for RouteRole {
@@ -152,14 +145,6 @@ impl RouteBehaviorMode {
             Self::PreferPrimary => "prefer-primary",
             Self::PreferSecondaryWhenAvailable => "prefer-secondary-when-available",
             Self::StrictSecondaryFailClosed => "strict-secondary-fail-closed",
-        }
-    }
-
-    pub const fn user_label(self) -> &'static str {
-        match self {
-            Self::PreferPrimary => "Primary (direct)",
-            Self::PreferSecondaryWhenAvailable => "Prefer secondary when available",
-            Self::StrictSecondaryFailClosed => "Strict secondary (Fail-Closed)",
         }
     }
 

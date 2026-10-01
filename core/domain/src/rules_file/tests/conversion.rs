@@ -146,9 +146,9 @@ fn the_gui_writes_the_current_preset_format_version() {
         .parse()
         .expect("the declared version is a number");
     assert_eq!(
-        declared, CURRENT_PRESET_FORMAT_VERSION,
+        declared, CURRENT_RULES_FILE_FORMAT_VERSION,
         "rules.js declares preset format version {declared}, this build writes \
-             {CURRENT_PRESET_FORMAT_VERSION}"
+             {CURRENT_RULES_FILE_FORMAT_VERSION}"
     );
 
     // The header the GUI emits must also be the one the parser reads back.
@@ -156,7 +156,7 @@ fn the_gui_writes_the_current_preset_format_version() {
         format!("# NetRuleRouter preset \u{2014} version {declared}\n--- Domains\nexample.com\n");
     assert_eq!(
         parse_rules_file(&header).file_format_version,
-        Some(CURRENT_PRESET_FORMAT_VERSION)
+        Some(CURRENT_RULES_FILE_FORMAT_VERSION)
     );
 }
 

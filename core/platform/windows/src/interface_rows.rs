@@ -1,54 +1,43 @@
-//! The neutral adapter rich-row types + enrichment live
-//! in `nrr_platform_api::interface_rows` (re-exported below for source
-//! compatibility, so `crate::interface_rows::*` and the crate-root re-exports
-//! in `lib.rs` keep resolving unchanged). What remains here is the Windows-only
-//! live enumeration: [`collect_interfaces_rows`] merges the stable identity
-//! snapshot (`crate::interface_manager::adapters_snapshot`) with per-adapter
-//! runtime IP/gateway/DNS data via the `ipconfig` crate. Off Windows the
-//! callers use the neutral `fallback_rows` instead.
+//! The Windows live enumeration behind [`InterfaceRowsPort`]: the stable
+//! identity snapshot (`crate::interface_manager::adapters_snapshot`) merged
+//! with per-adapter runtime IP/gateway/DNS data from the `ipconfig` crate. The
+//! row type and every judgement about a row are the neutral ones re-exported
+//! below.
 
 pub use nrr_platform_api::interface_rows::*;
 
-// Only the live Windows enumeration builds rows; off Windows this module is
-// the neutral re-export plus the fallback dataset.
 #[cfg(windows)]
 use nrr_shared::RouteSelectionState;
 
-/// Enumerate adapters live and enrich each into an [`InterfaceRouteRow`].
-///
-/// On Windows this merges the stable identity snapshot
-/// ([`crate::interface_manager::adapters_snapshot`]) with per-adapter
-/// runtime IP/gateway/DNS data; off Windows (or when the live
-/// enumeration is empty) it returns the deterministic fallback dataset.
-///
-/// `probe_external_ip` decides whether each adapter is additionally asked for
-/// the address the outside world sees behind it. It is opt-in because the
-/// probe sends a datagram to a third-party server: only a path where the user
-/// explicitly asked for the check may pass `true`. Every routine or background
-/// enumeration passes `false` and stays network-silent, so a plain refresh can
-/// never block on the network.
-pub fn collect_interfaces_rows(
-    probe_external_ip: bool,
-) -> (InterfacesDataSource, Vec<InterfaceRouteRow>) {
-    let snapshot = crate::interface_manager::adapters_snapshot();
-    #[cfg(windows)]
-    if matches!(
-        snapshot.data_source,
-        nrr_shared::AdapterSnapshotDataSource::WindowsLive
-    ) {
-        let rows = collect_windows_rows_from_snapshot(snapshot.adapters, probe_external_ip);
-        if !rows.is_empty() {
-            return (InterfacesDataSource::WindowsLive, rows);
+/// This host's adapters, enumerated live.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WindowsInterfaceRows;
+
+impl InterfaceRowsPort for WindowsInterfaceRows {
+    /// Off Windows, or when the live enumeration is empty, the placeholder set.
+    fn collect_rows(
+        &self,
+        probe_external_ip: bool,
+    ) -> (InterfacesDataSource, Vec<InterfaceRouteRow>) {
+        let snapshot = crate::interface_manager::adapters_snapshot();
+        #[cfg(windows)]
+        if matches!(
+            snapshot.data_source,
+            nrr_shared::AdapterSnapshotDataSource::WindowsLive
+        ) {
+            let rows = collect_windows_rows_from_snapshot(snapshot.adapters, probe_external_ip);
+            if !rows.is_empty() {
+                return (InterfacesDataSource::WindowsLive, rows);
+            }
         }
+
+        // The placeholder set is offline by contract: there is no real adapter
+        // behind it to probe.
+        #[cfg(not(windows))]
+        let _ = (probe_external_ip, snapshot);
+
+        (InterfacesDataSource::FallbackMock, fallback_rows())
     }
-
-    // The fallback dataset is deterministic and offline by contract: there is
-    // no real adapter behind those rows to probe, and nothing off Windows reads
-    // the snapshot the live path merges.
-    #[cfg(not(windows))]
-    let _ = (probe_external_ip, snapshot);
-
-    (InterfacesDataSource::FallbackMock, fallback_rows())
 }
 
 #[cfg(windows)]
@@ -122,7 +111,7 @@ fn collect_windows_rows_from_snapshot(
                 .unwrap_or_else(|| ("-".to_string(), "-".to_string(), "-".to_string(), false));
             let observed_facts = build_observed_facts(availability_status, &local_ip, &gateway);
             let derived_assessment = build_derived_assessment(
-                &adapter.windows_name,
+                &adapter.name,
                 &adapter.interface_type,
                 &adapter.interface_description,
                 &adapter.identity.adapter_name,
@@ -132,7 +121,7 @@ fn collect_windows_rows_from_snapshot(
                 observed_facts.connectivity_state,
             );
             let is_bluetooth_like = is_bluetooth_like_interface(
-                &adapter.windows_name,
+                &adapter.name,
                 &adapter.interface_description,
                 &adapter.identity.adapter_name,
             );
@@ -140,7 +129,7 @@ fn collect_windows_rows_from_snapshot(
             InterfaceRouteRow {
                 persistent_id: adapter.identity.persistent_id,
                 adapter_name: adapter.identity.adapter_name,
-                windows_name: adapter.windows_name,
+                name: adapter.name,
                 interface_description: adapter.interface_description,
                 interface_type: adapter.interface_type,
                 is_bluetooth_like,
@@ -163,9 +152,9 @@ fn collect_windows_rows_from_snapshot(
         .collect::<Vec<_>>();
 
     rows.sort_by(|left, right| {
-        left.windows_name
+        left.name
             .to_ascii_lowercase()
-            .cmp(&right.windows_name.to_ascii_lowercase())
+            .cmp(&right.name.to_ascii_lowercase())
     });
 
     if probe_external_ip {
@@ -246,8 +235,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collect_interfaces_rows_never_empty() {
-        let (_source, rows) = collect_interfaces_rows(false);
+    fn collected_rows_are_never_empty() {
+        let (_source, rows) = WindowsInterfaceRows.collect_rows(false);
         assert!(!rows.is_empty());
     }
 }

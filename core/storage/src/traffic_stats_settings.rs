@@ -1,4 +1,4 @@
-//! Block T (traffic counter) — service-global traffic-statistics settings
+//! Service-global traffic-statistics settings
 //! singleton (`traffic_stats_settings`).
 //!
 //! Lives in the **service-critical** state DB, deliberately NOT in the

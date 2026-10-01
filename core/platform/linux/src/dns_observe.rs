@@ -29,6 +29,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::Ipv4Addr;
 use std::process::{Child, Command, Stdio};
@@ -39,7 +40,11 @@ use nrr_platform_api::dns_observe::{DnsObservation, DnsObservationSource};
 /// Resource-record type for an IPv4 address; anything else in the answer is not
 /// a destination this product can route to.
 const TYPE_A: u64 = 1;
+const TYPE_CNAME: u64 = 5;
 const CLASS_IN: u64 = 1;
+/// A resolver follows at most a handful of aliases; a longer chain in one
+/// answer is a loop or garbage.
+const MAX_ALIAS_HOPS: usize = 16;
 
 /// The reader is a `resolvectl` child; keeping the handle lets the observer stop
 /// it when it is dropped, rather than leaving a process attached to the monitor
@@ -55,12 +60,15 @@ impl ResolvedDnsObserver {
     /// observer that never produces anything must not be mistaken for a quiet
     /// network.
     pub fn start() -> Option<Self> {
-        let mut child = Command::new("resolvectl")
-            .args(["monitor", "--json=short"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .spawn()
+        let mut child = crate::command::system_tool("resolvectl")
+            .and_then(|exe| {
+                Command::new(exe)
+                    .args(["monitor", "--json=short"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .stdin(Stdio::null())
+                    .spawn()
+            })
             .map_err(|e| {
                 tracing::info!(
                     target: "nrr::dns",
@@ -79,10 +87,11 @@ impl ResolvedDnsObserver {
             .name("nrr-dns-monitor".to_owned())
             .spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    if let Some(observation) = parse_monitor_line(&line) {
+                    let mut observations = parse_monitor_line(&line).peekable();
+                    if observations.peek().is_some() {
                         sink.lock()
                             .unwrap_or_else(|p| p.into_inner())
-                            .push(observation);
+                            .extend(observations);
                     }
                 }
                 // The stream ending means resolved stopped or the monitor was
@@ -141,77 +150,132 @@ pub fn probe_resolver_mode() -> Option<bool> {
     Some(resolutions_pass_through_resolved(&text))
 }
 
-/// Turn one `--json=short` line into an observation.
+/// Turn one `--json=short` line into observations: the answer under the name
+/// that was asked for and, when an alias chain led elsewhere, under the name
+/// the addresses belong to as well.
 ///
-/// `None` for anything that is not a successful A-record answer: a failed
+/// Empty for anything that is not a successful A-record answer: a failed
 /// lookup, an AAAA-only answer, a line this build does not understand. Pure, so
 /// it is tested against real captured output on any host.
-#[must_use]
-pub fn parse_monitor_line(line: &str) -> Option<DnsObservation> {
+pub fn parse_monitor_line(line: &str) -> impl Iterator<Item = DnsObservation> {
+    let (queried, answered) = match parse_answer(line) {
+        Some((queried, answered)) => (Some(queried), answered),
+        None => (None, None),
+    };
+    [queried, answered].into_iter().flatten()
+}
+
+/// The queried-name observation, plus the final-name one when the names differ.
+fn parse_answer(line: &str) -> Option<(DnsObservation, Option<DnsObservation>)> {
     let event: serde_json::Value = serde_json::from_str(line).ok()?;
     if event.get("state").and_then(|s| s.as_str()) != Some("success") {
         return None;
     }
 
-    let mut hostname: Option<String> = None;
-    let mut ipv4s: Vec<Ipv4Addr> = Vec::new();
+    let mut records: Vec<(String, Ipv4Addr)> = Vec::new();
+    // Alias target -> alias owner, to walk a chain back towards the question.
+    let mut aliased_from: HashMap<String, String> = HashMap::new();
     for answer in event.get("answer")?.as_array()? {
         let rr = answer.get("rr")?;
         let key = rr.get("key")?;
-        if key.get("type").and_then(serde_json::Value::as_u64) != Some(TYPE_A)
-            || key.get("class").and_then(serde_json::Value::as_u64) != Some(CLASS_IN)
-        {
+        if key.get("class").and_then(serde_json::Value::as_u64) != Some(CLASS_IN) {
             continue;
         }
-        // The name comes from the RECORD, not the question: a query for an alias
-        // is answered by the records of its target, and the address belongs to
-        // the name that carries it.
-        let name = key.get("name")?.as_str()?;
-        let octets = rr.get("address")?.as_array()?;
-        if octets.len() != 4 {
-            continue;
+        let owner = canonical(key.get("name")?.as_str()?);
+        match key.get("type").and_then(serde_json::Value::as_u64) {
+            Some(TYPE_A) => {
+                let octets = rr.get("address")?.as_array()?;
+                if octets.len() != 4 {
+                    continue;
+                }
+                let mut address = [0u8; 4];
+                for (slot, value) in address.iter_mut().zip(octets) {
+                    *slot = u8::try_from(value.as_u64()?).ok()?;
+                }
+                records.push((owner, Ipv4Addr::from(address)));
+            }
+            Some(TYPE_CNAME) => {
+                if let Some(target) = rr.get("name").and_then(serde_json::Value::as_str) {
+                    aliased_from.insert(canonical(target), owner);
+                }
+            }
+            _ => {}
         }
-        let mut address = [0u8; 4];
-        for (slot, value) in address.iter_mut().zip(octets) {
-            *slot = u8::try_from(value.as_u64()?).ok()?;
-        }
-        let canonical = name.trim_end_matches('.').to_ascii_lowercase();
-        // One observation carries one name. An answer naming two (an alias chain)
-        // is reported for the first; the rest arrive as their own records.
-        if hostname.get_or_insert(canonical.clone()) != &canonical {
-            continue;
-        }
-        ipv4s.push(Ipv4Addr::from(address));
     }
 
-    if ipv4s.is_empty() {
-        return None;
+    // A rule may name what was asked for (what the Windows source reports) or
+    // the CDN suffix the chain ends on, so both names learn the addresses. One
+    // chain per answer; another chain arrives as its own record.
+    let (final_name, _) = records.first()?;
+    let final_name = final_name.clone();
+    let queried = alias_origin(final_name.clone(), &aliased_from);
+    let mut queried_ipv4s = Vec::new();
+    let mut final_ipv4s = Vec::new();
+    for (owner, address) in records {
+        if owner == final_name {
+            final_ipv4s.push(address);
+        }
+        if alias_origin(owner, &aliased_from) == queried {
+            queried_ipv4s.push(address);
+        }
     }
-    Some(DnsObservation {
-        hostname: hostname?,
-        ipv4s,
-    })
+
+    let answered = (final_name != queried).then_some(DnsObservation {
+        hostname: final_name,
+        ipv4s: final_ipv4s,
+    });
+    Some((
+        DnsObservation {
+            hostname: queried,
+            ipv4s: queried_ipv4s,
+        },
+        answered,
+    ))
+}
+
+/// Follow CNAMEs from the record's owner back to the name that started the
+/// chain. Bounded, so a looping answer ends the walk instead of the thread.
+fn alias_origin(mut name: String, aliased_from: &HashMap<String, String>) -> String {
+    for _ in 0..MAX_ALIAS_HOPS {
+        match aliased_from.get(&name) {
+            Some(owner) if *owner != name => name.clone_from(owner),
+            _ => break,
+        }
+    }
+    name
+}
+
+fn canonical(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Captured verbatim from `resolvectl monitor --json=short` on a live
-    /// machine (systemd 255), so the parser is tested against the real shape
-    /// rather than one imagined from documentation.
-    const LIVE_LINE: &str = r#"{"state":"success","question":[{"class":1,"type":1,"name":"example.com"},{"class":1,"type":28,"name":"example.com"}],"answer":[{"rr":{"key":{"class":1,"type":1,"name":"example.com"},"address":[23,10,20,160]},"raw":"B2V4YW1wbGU=","ifindex":2},{"rr":{"key":{"class":1,"type":1,"name":"example.com"},"address":[23,10,20,143]},"raw":"B2V4YW1wbGU=","ifindex":2},{"rr":{"key":{"class":1,"type":28,"name":"example.com"},"address":[42,6,152,193,49,35,128,0,0,0,0,0,0,0,0,0]},"raw":"B2V4YW1wbGU=","ifindex":2}]}"#;
+    /// The shape of a `resolvectl monitor --json=short` line (systemd 255) with
+    /// documentation addresses, so the parser meets the real structure.
+    const LIVE_LINE: &str = r#"{"state":"success","question":[{"class":1,"type":1,"name":"example.com"},{"class":1,"type":28,"name":"example.com"}],"answer":[{"rr":{"key":{"class":1,"type":1,"name":"example.com"},"address":[203,0,113,160]},"raw":"B2V4YW1wbGU=","ifindex":2},{"rr":{"key":{"class":1,"type":1,"name":"example.com"},"address":[203,0,113,143]},"raw":"B2V4YW1wbGU=","ifindex":2},{"rr":{"key":{"class":1,"type":28,"name":"example.com"},"address":[32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1]},"raw":"B2V4YW1wbGU=","ifindex":2}]}"#;
 
+    fn parsed(line: &str) -> Vec<DnsObservation> {
+        parse_monitor_line(line).collect()
+    }
+
+    fn hostnames(observations: &[DnsObservation]) -> Vec<&str> {
+        observations.iter().map(|o| o.hostname.as_str()).collect()
+    }
+
+    /// Without an alias the asked name and the owner coincide: one observation.
     #[test]
     fn a_successful_answer_yields_the_name_and_its_v4_addresses() {
-        let observation = parse_monitor_line(LIVE_LINE).expect("a success line must parse");
+        let observations = parsed(LIVE_LINE);
 
-        assert_eq!(observation.hostname, "example.com");
+        assert_eq!(hostnames(&observations), vec!["example.com"]);
         assert_eq!(
-            observation.ipv4s,
+            observations[0].ipv4s,
             vec![
-                Ipv4Addr::new(23, 10, 20, 160),
-                Ipv4Addr::new(23, 10, 20, 143)
+                Ipv4Addr::new(203, 0, 113, 160),
+                Ipv4Addr::new(203, 0, 113, 143)
             ],
         );
     }
@@ -221,23 +285,52 @@ mod tests {
     /// empty answer in the cache.
     #[test]
     fn an_answer_without_v4_addresses_is_not_an_observation() {
-        let v6_only = r#"{"state":"success","question":[{"class":1,"type":28,"name":"ipv6.example"}],"answer":[{"rr":{"key":{"class":1,"type":28,"name":"ipv6.example"},"address":[42,6,152,193,49,35,128,0,0,0,0,0,0,0,0,0]},"ifindex":2}]}"#;
+        let v6_only = r#"{"state":"success","question":[{"class":1,"type":28,"name":"ipv6.example"}],"answer":[{"rr":{"key":{"class":1,"type":28,"name":"ipv6.example"},"address":[32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1]},"ifindex":2}]}"#;
 
-        assert!(parse_monitor_line(v6_only).is_none());
+        assert!(parsed(v6_only).is_empty());
+    }
+
+    /// A rule may name what was asked for or the CDN suffix the alias chain
+    /// lands on; both learn the same addresses.
+    #[test]
+    fn an_alias_chain_is_reported_under_the_queried_and_the_final_name() {
+        let aliased = r#"{"state":"success","question":[{"class":1,"type":1,"name":"www.example.com"}],"answer":[{"rr":{"key":{"class":1,"type":5,"name":"www.example.com"},"name":"www.example.com.cdn.example"},"ifindex":2},{"rr":{"key":{"class":1,"type":5,"name":"www.example.com.cdn.example"},"name":"edge.cdn.example"},"ifindex":2},{"rr":{"key":{"class":1,"type":1,"name":"edge.cdn.example"},"address":[192,0,2,10]},"ifindex":2},{"rr":{"key":{"class":1,"type":1,"name":"edge.cdn.example"},"address":[192,0,2,11]},"ifindex":2}]}"#;
+
+        let observations = parsed(aliased);
+
+        assert_eq!(
+            hostnames(&observations),
+            vec!["www.example.com", "edge.cdn.example"]
+        );
+        let addresses = vec![Ipv4Addr::new(192, 0, 2, 10), Ipv4Addr::new(192, 0, 2, 11)];
+        assert!(observations.iter().all(|o| o.ipv4s == addresses));
+    }
+
+    #[test]
+    fn a_looping_alias_chain_ends_instead_of_spinning() {
+        let looping = r#"{"state":"success","answer":[{"rr":{"key":{"class":1,"type":5,"name":"a.example"},"name":"b.example."},"ifindex":2},{"rr":{"key":{"class":1,"type":5,"name":"B.example"},"name":"a.example"},"ifindex":2},{"rr":{"key":{"class":1,"type":1,"name":"b.example"},"address":[192,0,2,20]},"ifindex":2}]}"#;
+
+        let observations = parsed(looping);
+
+        assert!(!observations.is_empty() && observations.len() <= 2);
+        for observation in &observations {
+            assert!(["a.example", "b.example"].contains(&observation.hostname.as_str()));
+            assert_eq!(observation.ipv4s, vec![Ipv4Addr::new(192, 0, 2, 20)]);
+        }
     }
 
     #[test]
     fn a_failed_lookup_is_not_an_observation() {
         let failed = r#"{"state":"errno","question":[{"class":1,"type":1,"name":"nope.invalid"}]}"#;
 
-        assert!(parse_monitor_line(failed).is_none());
+        assert!(parsed(failed).is_empty());
     }
 
     #[test]
     fn a_line_this_build_does_not_understand_is_skipped_rather_than_guessed() {
-        assert!(parse_monitor_line("not json at all").is_none());
-        assert!(parse_monitor_line(r#"{"state":"success"}"#).is_none());
-        assert!(parse_monitor_line(r#"{"state":"success","answer":[]}"#).is_none());
+        assert!(parsed("not json at all").is_empty());
+        assert!(parsed(r#"{"state":"success"}"#).is_empty());
+        assert!(parsed(r#"{"state":"success","answer":[]}"#).is_empty());
     }
 
     /// The machine where the monitor is connected and permanently silent. The

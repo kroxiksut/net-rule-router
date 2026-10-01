@@ -3,7 +3,7 @@
 //! For each accepted pipe connection we determine:
 //!
 //! 1. the client's process id (`GetNamedPipeClientProcessId`)
-//! 2. the client's exe path (`QueryFullProcessImageNameW`)
+//! 2. the client's exe path (`QueryFullProcessImageNameW`, any length)
 //! 3. whether the process token is at low integrity (rejected)
 //!
 //! The exe path's basename is compared (case-insensitive) against a small
@@ -26,7 +26,7 @@
 #![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, LocalFree, BOOL, HANDLE, HLOCAL};
@@ -37,8 +37,7 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use nrr_shared::ipc::IpcClientProfile;
@@ -146,12 +145,11 @@ pub fn classify_pipe_client(pipe: HANDLE) -> Result<ClientIdentity, ClientReject
     };
     let process_guard = HandleGuard(process);
 
-    let exe_path = query_image_name(process_guard.0)?;
-    let basename = exe_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_string();
+    let exe_path = nrr_platform_windows::win32_ffi::process::image_path_of(process_guard.0)
+        .map_err(|e| ClientRejectReason::QueryImageNameFailed {
+            code: e.code().0 as u32,
+        })?;
+    let basename = exe_basename(&exe_path);
 
     let profile =
         classify_exe_basename(&basename).ok_or_else(|| ClientRejectReason::UnknownProcess {
@@ -190,27 +188,13 @@ fn client_process_id(pipe: HANDLE) -> Result<u32, ClientRejectReason> {
     Ok(pid)
 }
 
-fn query_image_name(process: HANDLE) -> Result<PathBuf, ClientRejectReason> {
-    let mut buf = vec![0u16; 1024];
-    let mut len = buf.len() as u32;
-    // SAFETY: buf points at a valid u16 slice, len holds capacity. On
-    // success, len receives the actual character count (no null).
-    let result = unsafe {
-        QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_FORMAT(0),
-            PWSTR(buf.as_mut_ptr()),
-            &mut len as *mut u32,
-        )
-    };
-    if result.is_err() {
-        return Err(ClientRejectReason::QueryImageNameFailed {
-            code: unsafe { windows::Win32::Foundation::GetLastError().0 },
-        });
-    }
-    buf.truncate(len as usize);
-    let s = String::from_utf16_lossy(&buf);
-    Ok(PathBuf::from(s))
+/// The file name the whitelist is keyed on; empty when the path has none.
+fn exe_basename(image_path: &str) -> String {
+    Path::new(image_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn open_process_token(process: HANDLE) -> Result<HANDLE, ClientRejectReason> {
@@ -446,6 +430,34 @@ mod tests {
         assert_eq!(
             classify_exe_basename("NetRuleRouterTray.exe"),
             Some(IpcClientProfile::TrayLightweight)
+        );
+    }
+
+    /// A client installed under a path past the old fixed buffer is still
+    /// classified by its file name.
+    #[test]
+    fn a_long_install_path_keeps_its_basename() {
+        let deep = format!(r"C:\{}\NetRuleRouter.exe", "d".repeat(1_500));
+        assert_eq!(exe_basename(&deep), "NetRuleRouter.exe");
+        assert_eq!(
+            classify_exe_basename(&exe_basename(&deep)),
+            Some(IpcClientProfile::GuiInteractive)
+        );
+    }
+
+    /// The same read the pipe check runs, on this test process.
+    #[test]
+    fn the_image_of_an_open_process_names_its_executable() {
+        // SAFETY: the pseudo-handle of this process needs no closing.
+        let own = unsafe { windows::Win32::System::Threading::GetCurrentProcess() };
+        let path = nrr_platform_windows::win32_ffi::process::image_path_of(own).expect("image");
+        let exe = std::env::current_exe().expect("exe");
+        assert_eq!(
+            exe_basename(&path).to_ascii_lowercase(),
+            exe.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
         );
     }
 

@@ -1,91 +1,72 @@
 ﻿# NetRuleRouter preset - version 1
 # name: Turkey Default Split - Secondary Route
-# description: Foreign social, messaging, developer, and AI services routed to secondary
+# description: Platforms blocked nationwide in Turkey, and social and messaging services throttled during nationwide events
 # author: NetRuleRouter contributors
-# preset_version: 1
+# preset_version: 2
 
 --- Zones
 # Keep empty to avoid over-broad routing by TLD
 
 --- Domains
-*.facebook.com
-*.instagram.com
-*.threads.com
-*.x.com
-*.twitter.com
-*.youtube.com
-*.googlevideo.com
-*.tiktok.com
-*.discord.com
-*.reddit.com
-*.linkedin.com
-*.telegram.org
-*.t.me
-*.whatsapp.com
-*.signal.org
-*.openai.com
-*.chatgpt.com
-*.anthropic.com
-*.claude.ai
-*.claude.com
-*.perplexity.ai
-*.mistral.ai
-api.mistral.ai
-*.cohere.com
-*.cursor.com
-*.openrouter.ai
-*.midjourney.com
-*.jetbrains.com
-plugins.jetbrains.com
+# Checked: September 2026. AI, developer and payment services are not listed: they serve Turkey directly.
+
+*.discord.com  # Discord: blocked nationwide since October 2024
+discord.gg  # Discord: blocked nationwide since October 2024
+*.discordapp.com  # Discord: blocked nationwide since October 2024
+*.discordapp.net  # Discord: blocked nationwide since October 2024
+*.discord.media  # Discord: blocked nationwide since October 2024
+
+*.wattpad.com  # Wattpad: blocked nationwide since July 2024
+
+*.x.com  # X: throttled nationwide in March and September 2025
+*.twitter.com  # X: throttled nationwide in March and September 2025
+*.t.co  # X: throttled nationwide in March and September 2025
+*.twimg.com  # X: throttled nationwide in March and September 2025
+
+*.facebook.com  # Meta: throttled nationwide in March and September 2025
+*.fb.com  # Meta: throttled nationwide in March and September 2025
+*.messenger.com  # Meta: throttled nationwide in March and September 2025
+*.fbcdn.net  # Meta: throttled nationwide in March and September 2025
+*.facebook.net  # Meta: throttled nationwide in March and September 2025
+*.fbsbx.com  # Meta: throttled nationwide in March and September 2025
+*.instagram.com  # Instagram: blocked in August 2024, throttled in March and September 2025
+*.cdninstagram.com  # Instagram: blocked in August 2024, throttled in March and September 2025
+
+*.youtube.com  # YouTube: throttled nationwide in March and September 2025
+youtu.be  # YouTube: throttled nationwide in March and September 2025
+*.googlevideo.com  # YouTube: throttled nationwide in March and September 2025
+*.ytimg.com  # YouTube: throttled nationwide in March and September 2025
+
+*.tiktok.com  # TikTok: throttled nationwide in March and September 2025
+*.tiktokv.com  # TikTok: throttled nationwide in March and September 2025
+*.tiktokcdn.com  # TikTok: throttled nationwide in March and September 2025
+*.byteoversea.com  # TikTok: throttled nationwide in March and September 2025
+*.ibyteimg.com  # TikTok: throttled nationwide in March and September 2025
+
+*.whatsapp.com  # WhatsApp: throttled nationwide in March and September 2025
+*.whatsapp.net  # WhatsApp: throttled nationwide in March and September 2025
+wa.me  # WhatsApp: throttled nationwide in March and September 2025
+*.telegram.org  # Telegram: web client blocked and service throttled in 2025
+*.t.me  # Telegram: web client blocked and service throttled in 2025
+*.telegram.me  # Telegram: web client blocked and service throttled in 2025
+*.telesco.pe  # Telegram: web client blocked and service throttled in 2025
+*.signal.org  # Signal: throttled nationwide in March and September 2025
+*.signal.me  # Signal: throttled nationwide in March and September 2025
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 
 --- Windows
-telegram.exe
-WhatsAp*.exe
-discord.exe
-signal.exe
-viber.exe
-line.exe
-skype.exe
-zoom.exe
-slack.exe
-chatgpt.exe
-claude.exe
-poe.exe
-codex.exe
-codex*.exe
-Cursor.exe
-Windsurf.exe
-jetbrains-toolbox.exe
-idea64.exe
-pycharm64.exe
-webstorm64.exe
-clion64.exe
-rider64.exe
-goland64.exe
-fleet.exe
+discord.exe  # Discord: blocked nationwide since October 2024
+WhatsAp*.exe  # WhatsApp: throttled nationwide in March and September 2025
+telegram.exe  # Telegram: web client blocked and service throttled in 2025
+signal.exe  # Signal: throttled nationwide in March and September 2025
 
 --- Linux
-clion
-codex
-codex*
-cursor
-discord
-goland
-idea
-jetbrains-toolbox
-pycharm
-rider
-signal-desktop
-slack
-telegram
-telegram-desktop
-viber
-webstorm
-windsurf
-zoom
+discord  # Discord: blocked nationwide since October 2024
+telegram  # Telegram: web client blocked and service throttled in 2025
+telegram-desktop  # Telegram: web client blocked and service throttled in 2025
+signal-desktop  # Signal: throttled nationwide in March and September 2025
 
 --- MacOS
 # (reserved - not applied on Windows)

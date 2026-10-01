@@ -46,8 +46,8 @@ fn doh_lockdown_emits_blocks_when_enabled_and_in_scope() {
         snap.doh_lockdown_scope = scope;
         snap.kill_switch_enabled = kill_switch;
         snap.doh_resolver_ips = vec![
-            Ipv4Addr::new(8, 8, 8, 8).into(),
-            Ipv4Addr::new(1, 1, 1, 1).into(),
+            Ipv4Addr::new(198, 51, 100, 8).into(),
+            Ipv4Addr::new(198, 51, 100, 1).into(),
             "2001:db8::53".parse().expect("v6"),
         ];
         source.set("S-1-5-21-DOH", snap);
@@ -97,7 +97,7 @@ fn doh_lockdown_blocks_are_published_in_their_own_band() {
     snap.doh_lockdown_enabled = true;
     snap.doh_lockdown_scope = DohLockdownScope::Always;
     snap.doh_resolver_ips = vec![
-        Ipv4Addr::new(8, 8, 4, 4).into(),
+        Ipv4Addr::new(198, 51, 100, 4).into(),
         "2001:db8::53".parse().expect("v6"),
     ];
     source.set("S-1-5-21-DOHBAND", snap);
@@ -113,7 +113,7 @@ fn doh_lockdown_blocks_are_published_in_their_own_band() {
         cache,
         Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
     )
-    .with_kill_switch_resolver(Arc::new(|_| Some(full_ks_resolution())))
+    .with_kill_switch_resolver(Arc::new(|_, _| Some(full_ks_resolution())))
     .with_killswitch_drop_registry(Arc::clone(&registry));
 
     let set = orch
@@ -232,7 +232,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &std::collections::HashSet::new(),
             &live,
         ),
-        "computing the filters already compared this input — the periodic pass          must not pay for it twice"
+        "computing the filters already compared this input — the periodic pass must not pay for it twice"
     );
 
     let sid = "S-1-5-21-NEUTRAL";
@@ -536,7 +536,7 @@ fn the_additional_link_coming_up_sweeps_every_pinned_destination() {
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| {
+        .with_kill_switch_resolver(Arc::new(move |_, _| {
             resolver_state
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())

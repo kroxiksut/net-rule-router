@@ -4,7 +4,7 @@
 //! ## The `.exe` a name may still carry
 //!
 //! A Linux rule is stored as the process is named, but one stored before
-//! `.exe` became Windows-only, or typed with it, still reads `telegram.exe`.
+//! `.exe` became Windows-only, or typed with it, still reads `messenger.exe`.
 //! This backend strips the suffix before looking, so both spellings find the
 //! same file — and a genuinely `.exe`-named Wine program is tried as written.
 //!

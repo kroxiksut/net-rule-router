@@ -52,9 +52,10 @@ pub(super) struct IpcSurfaceInputs<'a> {
 
 /// What the assembly hands back.
 pub(super) struct IpcSurface {
-    /// Whether the on-disk connection-trace NDJSON sink is enabled. The ring
-    /// below is always built; only the persisted sink is opt-in.
-    pub conn_trace_persisted_ndjson: bool,
+    /// The on-disk connection-trace NDJSON switch, shared by the settings
+    /// writer (flips it on save) and the observer (reads it per batch). The
+    /// ring below is always built; only the disk sink is opt-in.
+    pub conn_trace_ndjson: Arc<std::sync::atomic::AtomicBool>,
     pub conn_trace_ring:
         Option<Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>>,
     /// Filled while the handlers are wired (the probe runner is built there)
@@ -105,18 +106,18 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
     // (`NoopMutationExecutor`, etc.) when their dependency chain (WFP
     // session, settings DB) could not be built at boot.
     //
-    // Connection-trace ring: shared between the observer (writer, built
-    // later in `build_conn_trace_pair`) and the `conn-trace.entries.list` IPC
-    // handler (reader, wired below). Always created — a cheap ~1000-entry
-    // in-memory bounded buffer, never persisted — so "Show connections"
-    // works without a service restart; the on-disk NDJSON sink stays opt-in
-    // (`conn_trace_ndjson`), the privacy-sensitive output. Declared at
-    // function scope so it reaches both the handler registration and the
-    // observer construction below. `_conn_trace_gui` is retained in the row
-    // but does not gate the ring; the NDJSON sink is gated by
-    // `conn_trace_persisted_ndjson` below.
+    // Connection-trace ring: written by the observer (built later in
+    // `build_conn_trace_pair`), read by `conn-trace.entries.list`. Always
+    // created — a bounded in-memory buffer, never persisted. The on-disk NDJSON
+    // sink is the privacy-sensitive output and stays opt-in; its switch is
+    // shared with the settings writer so a save applies without a restart.
+    // The dev sentinel forces it on for the life of the process.
     let (conn_trace_persisted_ndjson, _conn_trace_gui) =
         read_conn_trace_flags(settings_conn.as_ref());
+    let conn_trace_forced = conn_trace_requested();
+    let conn_trace_ndjson = Arc::new(std::sync::atomic::AtomicBool::new(
+        conn_trace_persisted_ndjson || conn_trace_forced,
+    ));
     let conn_trace_ring: Option<
         Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>,
     > = Some(Arc::new(
@@ -208,6 +209,12 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 Some(Arc::clone(conn)),
             )
             .with_log_writer(artifacts.log_writer.clone())
+            // Restarts the service sealed are honoured; any other is an event.
+            .with_chain_restart_key(
+                activation_coordinator
+                    .as_ref()
+                    .and_then(|c| c.audit_restart_key()),
+            )
             // "Did the service slow my boot" is the standing suspicion of every
             // background service. The card answers it with the two moments
             // measured — the host log's sign-in phase, and this process's own
@@ -244,6 +251,8 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         // failed to open — the probe still runs, it just does not persist.
         let mut adapters_snapshot_provider = MonitoredAdaptersSnapshotProvider::new(
             Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+            Arc::new(nrr_platform_windows::WindowsInterfaceRows)
+                as Arc<dyn nrr_platform_api::InterfaceRowsPort>,
         );
         if let Some(sampler) = traffic_sampler.as_ref() {
             adapters_snapshot_provider = adapters_snapshot_provider.with_address_recorder(
@@ -254,6 +263,132 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 ) as Arc<dyn nrr_service_runtime::AdapterAddressRecorder>,
             );
         }
+
+        // One instance reads and writes the stability config: the running
+        // verbose-logging window ("until restart" is never stored) lives in
+        // it, and a Get from a second instance would not see it.
+        let service_stability = Arc::new({
+            let mut writer = ProductionServiceStability::new(Arc::clone(conn))
+                // The writer drives the live liveness
+                // window: a `set` applies it to the tracker without a restart.
+                .with_liveness_tracker(Arc::clone(&liveness_tracker))
+                // The writer also starts/stops
+                // the local DNS resolver on an `enforcement_mode` change,
+                // without a restart (Mode B live re-arm). Same shared
+                // controller the boot path arms.
+                .with_resolver_controller(Arc::clone(&dns_resolver_controller))
+                // A fake-IP toggle (or a mode
+                // flip) reconciles the TUN/relay stack live, no restart. The
+                // apply is offloaded to a thread: bringing the driver up can
+                // take seconds and must never stall the IPC reply (the
+                // writer's live-apply contract). The controller serialises
+                // concurrent applies internally, so racing toggles are safe.
+                // The replan after `apply` recompiles the active SIDs'
+                // WFP sets so the pool permit / real-IP suppression track
+                // the stack transition immediately (the codegen reads the
+                // fake-IP context live, but needs a compute to happen).
+                .with_fake_ip_apply({
+                    let controller = Arc::clone(&fake_ip_controller);
+                    let replan = Arc::clone(&fake_ip_replan);
+                    Arc::new(move |req: FakeIpApplyRequest| {
+                        let controller = Arc::clone(&controller);
+                        let replan = Arc::clone(&replan);
+                        std::thread::spawn(move || {
+                            use nrr_platform_api::DnsCacheControlPort;
+                            controller.apply(req.desired);
+                            replan();
+                            // Either direction of a REAL transition leaves
+                            // the OS resolver cache full of answers from
+                            // the previous world (real addresses when
+                            // enabling, pool addresses when disabling —
+                            // the latter are unreachable once the TUN
+                            // route is gone). Flush so clients re-query
+                            // instead of riding stale answers until their
+                            // TTL expires — but ONLY when the writer
+                            // reports a resolve-affecting change: a save
+                            // that merely re-applies the current config
+                            // must not trigger a machine-wide re-resolve
+                            // wave (every CDN name re-queried at once).
+                            if req.dns_flush_reasons.is_empty() {
+                                return;
+                            }
+                            let reason = req.dns_flush_reasons.join(",");
+                            match nrr_platform_windows::WindowsDnsCacheControl::new()
+                                .flush_resolver_cache()
+                            {
+                                Ok(()) => tracing::info!(
+                                    target: "nrr::fake-ip",
+                                    msg_key = "svc-ipc-fakeip-dns-flush-ok",
+                                    enabled = req.desired,
+                                    reason = %reason,
+                                    "flushed OS DNS resolver cache after fake-IP transition",
+                                ),
+                                Err(e) => tracing::warn!(
+                                    target: "nrr::fake-ip",
+                                    msg_key = "svc-ipc-fakeip-dns-flush-failed",
+                                    error = %e,
+                                    enabled = req.desired,
+                                    reason = %reason,
+                                    "OS DNS resolver cache flush after fake-IP transition failed — stale answers persist until TTL",
+                                ),
+                            }
+                        });
+                    })
+                })
+                // DNS-over-secondary — a toggle stores into the shared
+                // process flag the query sockets and the route coordinator
+                // both read, so it takes effect on the next query and the
+                // next reconcile, with no restart.
+                .with_dns_via_secondary_flag(
+                    nrr_service_runtime::dns_egress::global_dns_via_secondary(),
+                )
+                // Fast DNS answers — same live-flag contract: the Mode-B
+                // resolver reads it per query.
+                .with_dns_fast_answers_flag(
+                    nrr_service_runtime::dns_resolver::global_dns_fast_answers(),
+                )
+                // Fake-IP UDP relay — unlike the flag-only toggles above,
+                // this changes the emitted `ks-fakeip-pool` WFP filters, so
+                // the hook both stores the new value into the shared live
+                // flag the per-SID codegen reads AND replans the active
+                // SIDs, reusing the same `fake_ip_replan` closure the
+                // fake-IP toggle drives above. Offloaded to a thread so
+                // the (possibly multi-SID) WFP recompute never stalls this
+                // IPC reply.
+                .with_udp_relay_apply({
+                    let replan = Arc::clone(&fake_ip_replan);
+                    Arc::new(move |desired: bool| {
+                        nrr_service_runtime::fake_ip::global_udp_relay_enabled()
+                            .store(desired, std::sync::atomic::Ordering::Relaxed);
+                        let replan = Arc::clone(&replan);
+                        std::thread::spawn(move || replan());
+                    })
+                })
+                // Fake-IP instant reset — the dial path reads this flag
+                // fresh per dial and it never feeds WFP filter
+                // generation, so (unlike UDP relay above) storing the new
+                // value IS the whole live apply: no replan thread needed.
+                .with_instant_rst_flag(
+                    nrr_service_runtime::fake_ip::global_instant_rst_enabled(),
+                )
+                .with_conn_trace_ndjson_apply({
+                    let flag = Arc::clone(&conn_trace_ndjson);
+                    Arc::new(move |on: bool| {
+                        flag.store(
+                            on || conn_trace_forced,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    })
+                });
+            // The live tracing filter: a verbose-logging request applies at
+            // once and a window ends on time. `None` on a boot without a log
+            // writer.
+            if let Some(handle) = verbosity_handle {
+                writer =
+                    writer.with_verbosity_control(Arc::new(handle) as Arc<dyn VerbosityControl>);
+            }
+            writer
+        });
 
         let mut deps = IpcHandlerDeps::new(
             Arc::new(NoopIpcAuditEmitter) as Arc<dyn nrr_service_runtime::IpcAuditEmitter>,
@@ -268,8 +403,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                     .with_app_observations(
                         nrr_service_runtime::app_observation_lookup::global_app_observations(),
                     ),
-            )
-                as Arc<dyn RulesSnapshotProvider>,
+            ) as Arc<dyn RulesSnapshotProvider>,
             diagnostics,
             // ProductionMutationExecutor handles RulesUpdate
             // end-to-end via the coordinator. Other MutationKind variants
@@ -284,6 +418,9 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                         exec = exec.with_recovery_audit_sink(Arc::clone(sink));
                     }
                     exec = exec.with_alerts_repo(Arc::clone(&alerts_repo));
+                    if let Some(writer) = artifacts.audit_writer.as_ref() {
+                        exec = exec.with_audit_writer(Arc::clone(writer));
+                    }
                     // Thread the state DB connection
                     // through so the dry-run path runs real
                     // `score_candidate` instead of the count-based
@@ -314,9 +451,9 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                     // Administrative rules lock, enforced where mutations
                     // land — the IPC handler refuses the same submission
                     // earlier, this is the backstop.
-                    exec = exec.with_stability_provider(Arc::new(
-                        ProductionServiceStability::new(Arc::clone(conn)),
-                    )
+                    exec = exec.with_stability_provider(Arc::new(ProductionServiceStability::new(
+                        Arc::clone(conn),
+                    ))
                         as Arc<dyn ServiceStabilityConfigProvider>);
                     Arc::new(exec) as Arc<dyn MutationExecutor>
                 }
@@ -389,134 +526,17 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 nrr_storage::revisions::RevisionsRepository::new(&guard)
                     .distinct_principals()
                     .map(|principals| {
-                        principals.iter().any(|p| {
-                            p != caller && p != nrr_storage::BASELINE_PRINCIPAL
-                        })
+                        principals
+                            .iter()
+                            .any(|p| p != caller && p != nrr_storage::BASELINE_PRINCIPAL)
                     })
                     // Unreadable is not consent to speak for others.
                     .unwrap_or(true)
             })
         })
-        // Service stability config. One ProductionServiceStability impl
-        // satisfies both provider and writer traits; share via
-        // Arc<Mutex<Connection>> with the rest of the settings providers.
         .with_service_stability(
-            Arc::new(ProductionServiceStability::new(Arc::clone(conn)))
-                as Arc<dyn ServiceStabilityConfigProvider>,
-            Arc::new({
-                let mut writer = ProductionServiceStability::new(Arc::clone(conn))
-                    // The writer drives the live liveness
-                    // window: a `set` applies it to the tracker without a restart.
-                    .with_liveness_tracker(Arc::clone(&liveness_tracker))
-                    // The writer also starts/stops
-                    // the local DNS resolver on an `enforcement_mode` change,
-                    // without a restart (Mode B live re-arm). Same shared
-                    // controller the boot path arms.
-                    .with_resolver_controller(Arc::clone(&dns_resolver_controller))
-                    // A fake-IP toggle (or a mode
-                    // flip) reconciles the TUN/relay stack live, no restart. The
-                    // apply is offloaded to a thread: bringing the driver up can
-                    // take seconds and must never stall the IPC reply (the
-                    // writer's live-apply contract). The controller serialises
-                    // concurrent applies internally, so racing toggles are safe.
-                    // The replan after `apply` recompiles the active SIDs'
-                    // WFP sets so the pool permit / real-IP suppression track
-                    // the stack transition immediately (the codegen reads the
-                    // fake-IP context live, but needs a compute to happen).
-                    .with_fake_ip_apply({
-                        let controller = Arc::clone(&fake_ip_controller);
-                        let replan = Arc::clone(&fake_ip_replan);
-                        Arc::new(move |req: FakeIpApplyRequest| {
-                            let controller = Arc::clone(&controller);
-                            let replan = Arc::clone(&replan);
-                            std::thread::spawn(move || {
-                                use nrr_platform_api::DnsCacheControlPort;
-                                controller.apply(req.desired);
-                                replan();
-                                // Either direction of a REAL transition leaves
-                                // the OS resolver cache full of answers from
-                                // the previous world (real addresses when
-                                // enabling, pool addresses when disabling —
-                                // the latter are unreachable once the TUN
-                                // route is gone). Flush so clients re-query
-                                // instead of riding stale answers until their
-                                // TTL expires — but ONLY when the writer
-                                // reports a resolve-affecting change: a save
-                                // that merely re-applies the current config
-                                // must not trigger a machine-wide re-resolve
-                                // wave (every CDN name re-queried at once).
-                                if req.dns_flush_reasons.is_empty() {
-                                    return;
-                                }
-                                let reason = req.dns_flush_reasons.join(",");
-                                match nrr_platform_windows::WindowsDnsCacheControl::new()
-                                    .flush_resolver_cache()
-                                {
-                                    Ok(()) => tracing::info!(
-                                        target: "nrr::fake-ip",
-                                        msg_key = "svc-ipc-fakeip-dns-flush-ok",
-                                        enabled = req.desired,
-                                        reason = %reason,
-                                        "flushed OS DNS resolver cache after fake-IP transition",
-                                    ),
-                                    Err(e) => tracing::warn!(
-                                        target: "nrr::fake-ip",
-                                        msg_key = "svc-ipc-fakeip-dns-flush-failed",
-                                        error = ?e,
-                                        enabled = req.desired,
-                                        reason = %reason,
-                                        "OS DNS resolver cache flush after fake-IP transition failed — stale answers persist until TTL",
-                                    ),
-                                }
-                            });
-                        })
-                    })
-                    // DNS-over-secondary — a toggle stores into the shared
-                    // process flag the query sockets and the route coordinator
-                    // both read, so it takes effect on the next query and the
-                    // next reconcile, with no restart.
-                    .with_dns_via_secondary_flag(
-                        nrr_service_runtime::dns_egress::global_dns_via_secondary(),
-                    )
-                    // Fast DNS answers — same live-flag contract: the Mode-B
-                    // resolver reads it per query.
-                    .with_dns_fast_answers_flag(
-                        nrr_service_runtime::dns_resolver::global_dns_fast_answers(),
-                    )
-                    // Fake-IP UDP relay — unlike the flag-only toggles above,
-                    // this changes the emitted `ks-fakeip-pool` WFP filters, so
-                    // the hook both stores the new value into the shared live
-                    // flag the per-SID codegen reads AND replans the active
-                    // SIDs, reusing the same `fake_ip_replan` closure the
-                    // fake-IP toggle drives above. Offloaded to a thread so
-                    // the (possibly multi-SID) WFP recompute never stalls this
-                    // IPC reply.
-                    .with_udp_relay_apply({
-                        let replan = Arc::clone(&fake_ip_replan);
-                        Arc::new(move |desired: bool| {
-                            nrr_service_runtime::fake_ip::global_udp_relay_enabled()
-                                .store(desired, std::sync::atomic::Ordering::Relaxed);
-                            let replan = Arc::clone(&replan);
-                            std::thread::spawn(move || replan());
-                        })
-                    })
-                    // Fake-IP instant reset — the dial path reads this flag
-                    // fresh per dial and it never feeds WFP filter
-                    // generation, so (unlike UDP relay above) storing the new
-                    // value IS the whole live apply: no replan thread needed.
-                    .with_instant_rst_flag(
-                        nrr_service_runtime::fake_ip::global_instant_rst_enabled(),
-                    );
-                // The writer also flips the LIVE tracing filter on
-                // a `verbose_logging` change, without a restart. `None` on a
-                // degraded boot (no log writer at startup) — the value still
-                // persists and takes effect next restart, same as before.
-                if let Some(handle) = verbosity_handle {
-                    writer = writer
-                        .with_verbosity_control(Arc::new(handle) as Arc<dyn VerbosityControl>);
-                }
-                writer
-            }) as Arc<dyn ServiceStabilityConfigWriter>,
+            Arc::clone(&service_stability) as Arc<dyn ServiceStabilityConfigProvider>,
+            service_stability as Arc<dyn ServiceStabilityConfigWriter>,
         )
         // Archive directory + app version for the
         // diagnostics export handler. Archives directory is a
@@ -916,7 +936,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
     // `Running` because bootstrap was Blocking.
 
     IpcSurface {
-        conn_trace_persisted_ndjson,
+        conn_trace_ndjson,
         conn_trace_ring,
         auto_probe_wiring,
         registry,

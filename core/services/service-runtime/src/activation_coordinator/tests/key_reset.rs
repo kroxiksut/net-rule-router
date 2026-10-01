@@ -114,7 +114,8 @@ fn key_reset_alert(alert_id: &str, state: SecurityAlertState) -> SecurityAlert {
     }
 }
 
-/// Acknowledges through the real IPC executor path.
+/// Acknowledges through the real IPC executor path, echoing back the rows the
+/// dry-run listed, as the dialog does.
 fn acknowledge(
     coord: &Arc<ActivationCoordinator>,
     alerts: &Arc<dyn SecurityAlertsRepository>,
@@ -122,10 +123,18 @@ fn acknowledge(
 ) {
     let exec =
         ProductionMutationExecutor::new(Arc::clone(coord)).with_alerts_repo(Arc::clone(alerts));
+    let shown: Vec<_> = exec
+        .unverified_rows(
+            MutationKind::SecurityAlertAck,
+            &serde_json::json!({ "alert-id": alert_id }),
+        )
+        .into_iter()
+        .map(|r| r.row)
+        .collect();
     let outcome = exec.execute(
         StoredMutation {
             kind: MutationKind::SecurityAlertAck,
-            payload: serde_json::json!({ "alert-id": alert_id }),
+            payload: serde_json::json!({ "alert-id": alert_id, "adopt-rows": shown }),
             correlation_id: None,
             issuer_sid: String::new(),
             caller_is_elevated: false,
@@ -329,6 +338,53 @@ fn a_legacy_fixed_id_key_reset_alert_is_still_acknowledged_by_kind() {
     assert!(!marker_present(&key_store));
 }
 
+/// A client that sends no row list adopts nothing, and a key reset must then
+/// stay pending: clearing the marker with every row still unsigned would let
+/// the next sweep clear everybody's rules.
+#[test]
+fn acknowledging_a_reset_without_the_shown_rows_keeps_the_marker_and_the_rules() {
+    let (fx, expected) = seeded();
+    let key_store = Arc::new(InMemKeyStore::new());
+    let alerts = empty_alerts();
+    let reset = boot(&fx, &key_store, &alerts, BOOT_MS);
+    let coord = rekeyed(&fx, &reset, &key_store);
+    let alert_id = key_reset_alerts(&alerts, SecurityAlertState::Active)[0]
+        .alert_id
+        .clone();
+
+    let exec =
+        ProductionMutationExecutor::new(Arc::clone(&coord)).with_alerts_repo(Arc::clone(&alerts));
+    let outcome = exec.execute(
+        StoredMutation {
+            kind: MutationKind::SecurityAlertAck,
+            payload: serde_json::json!({ "alert-id": alert_id }),
+            correlation_id: None,
+            issuer_sid: String::new(),
+            caller_is_elevated: false,
+        },
+        nrr_storage::BASELINE_PRINCIPAL,
+    );
+    assert!(
+        matches!(outcome, MutationOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+    assert!(marker_present(&key_store), "nothing was adopted");
+
+    let restart = boot(&fx, &key_store, &alerts, BOOT_MS + 1_000);
+    assert!(restart.key_reset_unacknowledged);
+    let swept = coord
+        .enforce_active_integrity_at_boot(&restart, "corr-boot-2")
+        .expect("boot sweep");
+    assert!(swept.is_empty(), "nothing may be rolled back: {swept:?}");
+    assert_eq!(active_ids(&coord), expected);
+    let reraised = key_reset_alerts(&alerts, SecurityAlertState::Active);
+    assert_eq!(reraised.len(), 1, "the reset is asked about again");
+
+    // Positive control: the same reset acknowledged with its rows clears.
+    acknowledge(&coord, &alerts, &reraised[0].alert_id);
+    assert!(!marker_present(&key_store));
+}
+
 #[test]
 fn acknowledging_without_a_signing_key_keeps_the_marker() {
     let (fx, _) = seeded();
@@ -391,4 +447,112 @@ fn a_tampered_revision_under_an_intact_key_is_still_rolled_back() {
         }
         other => panic!("expected RolledBack, got {other:?}"),
     }
+}
+
+/// Every alert write fails; reads answer "nothing there".
+struct UnwritableAlerts;
+
+impl SecurityAlertsRepository for UnwritableAlerts {
+    fn insert(&self, _alert: &SecurityAlert) -> nrr_diagnostics::DiagnosticsResult<()> {
+        Err(nrr_diagnostics::DiagnosticsError::AuditWriteFailed {
+            reason: "alerts table unwritable".into(),
+        })
+    }
+    fn update_state(
+        &self,
+        _alert_id: &str,
+        _new_state: SecurityAlertState,
+        _event_seq: u64,
+        _event_file: &str,
+        _updated_at: i64,
+    ) -> nrr_diagnostics::DiagnosticsResult<()> {
+        Err(nrr_diagnostics::DiagnosticsError::AuditWriteFailed {
+            reason: "alerts table unwritable".into(),
+        })
+    }
+    fn list_by_state(
+        &self,
+        _state: SecurityAlertState,
+    ) -> nrr_diagnostics::DiagnosticsResult<Vec<SecurityAlert>> {
+        Ok(Vec::new())
+    }
+    fn list_open(&self) -> nrr_diagnostics::DiagnosticsResult<Vec<SecurityAlert>> {
+        Ok(Vec::new())
+    }
+    fn find_by_id(
+        &self,
+        _alert_id: &str,
+    ) -> nrr_diagnostics::DiagnosticsResult<Option<SecurityAlert>> {
+        Ok(None)
+    }
+}
+
+/// A failed alert write must not cost the verdict: the bootstrap still hands
+/// back the key, so the boot sweep rolls the tampered revision back instead of
+/// an unsigned coordinator enforcing it as is.
+#[test]
+fn a_tamper_verdict_survives_an_alert_that_cannot_be_written() {
+    let key = vec![0x34u8; 32];
+    let fx = build_signed_fixture(ApplyFailurePolicy::AllOrNothing, key.clone());
+    let trusted = activate_for(&fx, nrr_storage::BASELINE_PRINCIPAL, "h-1");
+    let tampered = activate_for(&fx, nrr_storage::BASELINE_PRINCIPAL, "h-2");
+    tamper_rules_json(&fx, tampered.as_str());
+
+    let alerts: Arc<dyn SecurityAlertsRepository> = Arc::new(UnwritableAlerts);
+    let key_store = Arc::new(InMemKeyStore::with_key(key.clone()));
+    let boot_out = boot(&fx, &key_store, &alerts, BOOT_MS);
+    assert_eq!(
+        boot_out.signing_key, key,
+        "the key must survive the failure"
+    );
+    assert!(boot_out.raised_blocking_alert);
+    assert!(boot_out
+        .tampered_revision_ids
+        .contains(&tampered.as_str().to_string()));
+
+    let swept = fx
+        .coordinator
+        .enforce_active_integrity_at_boot(&boot_out, "corr-boot")
+        .expect("boot sweep");
+    match swept
+        .iter()
+        .find(|(p, _)| p == nrr_storage::BASELINE_PRINCIPAL)
+        .map(|(_, o)| o)
+    {
+        Some(ActiveIntegrityOutcome::RolledBack {
+            rejected_revision_id,
+            trusted_source_revision_id,
+            ..
+        }) => {
+            assert_eq!(rejected_revision_id, tampered.as_str());
+            assert_eq!(trusted_source_revision_id, trusted.as_str());
+        }
+        other => panic!("expected RolledBack, got {other:?}"),
+    }
+    let active = fx
+        .coordinator
+        .current_active_for(nrr_storage::BASELINE_PRINCIPAL)
+        .expect("current active")
+        .map(|r| r.revision_id);
+    assert_ne!(active.as_deref(), Some(tampered.as_str()));
+}
+
+/// Same for a key reset: the marker is saved before the alert, so a failed
+/// alert write still returns the new key and holds the sweep off.
+#[test]
+fn a_key_reset_survives_an_alert_that_cannot_be_written() {
+    let (fx, expected) = seeded();
+    let key_store = Arc::new(InMemKeyStore::new());
+    let alerts: Arc<dyn SecurityAlertsRepository> = Arc::new(UnwritableAlerts);
+    let boot_out = boot(&fx, &key_store, &alerts, BOOT_MS);
+    assert!(boot_out.key_was_reset);
+    assert!(boot_out.key_reset_unacknowledged);
+    assert!(marker_present(&key_store));
+
+    let coord = rekeyed(&fx, &boot_out, &key_store);
+    let swept = coord
+        .enforce_active_integrity_at_boot(&boot_out, "corr-boot")
+        .expect("boot sweep");
+    assert!(swept.is_empty(), "nothing may be rolled back: {swept:?}");
+    assert_eq!(active_ids(&coord), expected);
 }

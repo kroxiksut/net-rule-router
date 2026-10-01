@@ -90,11 +90,17 @@ check the status.
 From console — the same operations via scripts:
 
 ```powershell
-.\scripts\install-service.ps1 -Profile release   # install and start
+.\scripts\install-service.ps1 -Profile release   # stage, install and start (one UAC prompt)
 .\scripts\service-status.ps1                     # check status
 .\scripts\uninstall-service.ps1                  # remove
 .\scripts\purge-data.ps1                          # show every trace a clean re-test would remove
 ```
+
+The service is never registered from `target\`: that folder is writable by
+whoever built it, and the service runs as SYSTEM. `install-service.ps1` copies the binaries into
+`%ProgramW6432%\NetRuleRouter-dev` (writable by administrators only) and
+registers the service from there. Re-run it after every rebuild: it stops the
+service, replaces the files and starts it again.
 
 `purge-data.ps1` is what a clean re-test starts from: it removes the service
 plus every place the product writes to, so the next install behaves like a

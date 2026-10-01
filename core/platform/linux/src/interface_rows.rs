@@ -1,14 +1,10 @@
-//! The Linux live enumeration behind the "Interfaces & routes" screen.
+//! The Linux live enumeration behind [`InterfaceRowsPort`].
 //!
 //! Mirror of `nrr_platform_windows::interface_rows`, and deliberately as thin:
 //! the row type and every judgement about a row live in
 //! [`nrr_platform_api::interface_rows`]. What is here is only where this OS
 //! keeps the facts — links from `/sys/class/net` (via [`crate::adapters`]), the
 //! route table from rtnetlink, per-link resolvers from `resolvectl`.
-//!
-//! Until this existed the service answered every interfaces request with the
-//! deterministic placeholder set, so a Linux user picked their routes from a
-//! list of adapters their machine does not have.
 
 #![cfg(target_os = "linux")]
 
@@ -20,54 +16,55 @@ use nrr_platform_api::interface_rows::{
     apply_external_ip_probes, build_derived_assessment, build_observed_facts,
     derive_forwarding_next_hop, fallback_rows, is_bluetooth_like_interface,
     preferred_display_address, unknown_recommendation, BasicAvailabilityStatus, InterfaceRouteRow,
-    InterfacesDataSource,
+    InterfaceRowsPort, InterfacesDataSource,
 };
 use nrr_shared::RouteSelectionState;
 
-/// Enumerate the machine's links and enrich each into an [`InterfaceRouteRow`].
+/// This host's links, enumerated live.
 ///
-/// `probe_external_ip` decides whether each adapter is additionally asked for
-/// the address the outside world sees behind it — opt-in, because the probe
-/// sends a datagram to a third party. Every background refresh passes `false`
-/// and stays network-silent.
-///
-/// An empty or unreadable enumeration answers with the deterministic
-/// placeholder set, tagged as such: rows the GUI presents as this machine's
-/// adapters must be this machine's adapters.
-pub fn collect_interfaces_rows(
-    probe_external_ip: bool,
-) -> (InterfacesDataSource, Vec<InterfaceRouteRow>) {
-    let adapters = match crate::adapters::collect_adapter_infos() {
-        Ok(adapters) if !adapters.is_empty() => adapters,
-        Ok(_) => {
-            tracing::warn!(
-                target: "nrr::interface-rows",
-                msg_key = "linux-interfaces-empty",
-                "/sys/class/net listed no interfaces — answering with the placeholder set",
-            );
-            return (InterfacesDataSource::FallbackMock, fallback_rows());
-        }
-        Err(error) => {
-            tracing::warn!(
-                target: "nrr::interface-rows",
-                msg_key = "linux-interfaces-enumeration-failed",
-                %error,
-                "the link enumeration failed — answering with the placeholder set",
-            );
-            return (InterfacesDataSource::FallbackMock, fallback_rows());
-        }
-    };
+/// An empty or unreadable enumeration answers with the placeholder set, tagged
+/// as such: rows the GUI presents as this machine's adapters must be this
+/// machine's adapters.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LinuxInterfaceRows;
 
-    let mut rows = build_rows(&adapters, &link_dns_servers(), forwarding_capable_indexes());
-    rows.sort_by(|left, right| {
-        left.adapter_name
-            .to_ascii_lowercase()
-            .cmp(&right.adapter_name.to_ascii_lowercase())
-    });
-    if probe_external_ip {
-        apply_external_ip_probes(&mut rows);
+impl InterfaceRowsPort for LinuxInterfaceRows {
+    fn collect_rows(
+        &self,
+        probe_external_ip: bool,
+    ) -> (InterfacesDataSource, Vec<InterfaceRouteRow>) {
+        let adapters = match crate::adapters::collect_adapter_infos() {
+            Ok(adapters) if !adapters.is_empty() => adapters,
+            Ok(_) => {
+                tracing::warn!(
+                    target: "nrr::interface-rows",
+                    msg_key = "linux-interfaces-empty",
+                    "/sys/class/net listed no interfaces — answering with the placeholder set",
+                );
+                return (InterfacesDataSource::FallbackMock, fallback_rows());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "nrr::interface-rows",
+                    msg_key = "linux-interfaces-enumeration-failed",
+                    %error,
+                    "the link enumeration failed — answering with the placeholder set",
+                );
+                return (InterfacesDataSource::FallbackMock, fallback_rows());
+            }
+        };
+
+        let mut rows = build_rows(&adapters, &link_dns_servers(), forwarding_capable_indexes());
+        rows.sort_by(|left, right| {
+            left.adapter_name
+                .to_ascii_lowercase()
+                .cmp(&right.adapter_name.to_ascii_lowercase())
+        });
+        if probe_external_ip {
+            apply_external_ip_probes(&mut rows);
+        }
+        (InterfacesDataSource::LinuxLive, rows)
     }
-    (InterfacesDataSource::LinuxLive, rows)
 }
 
 /// The pure half: links plus the two lookups in, rows out. Free of the OS so
@@ -134,7 +131,7 @@ fn row_for(
         adapter_name: name.to_string(),
         // The field is named for the OS it was born on. Here the link name is
         // both the stable name and the one the user sees, so it fills both.
-        windows_name: name.to_string(),
+        name: name.to_string(),
         interface_description: adapter.description.clone(),
         interface_type: interface_type.to_string(),
         is_bluetooth_like: is_bluetooth_like_interface(name, &adapter.description, name),

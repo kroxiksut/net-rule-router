@@ -296,7 +296,6 @@ pub struct SingleInstancePolicy {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TrayMenuModel {
-    pub status_line: &'static str,
     pub primary_actions: &'static [MenuItem],
     pub quick_actions: &'static [MenuItem],
 }
@@ -535,9 +534,6 @@ pub struct SettingsContract {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AboutContract {
-    pub product_name: &'static str,
-    pub edition: &'static str,
-    pub license: &'static str,
     pub project_url: &'static str,
     pub build_channel: &'static str,
     /// Rights holder named by the licence agreement, spelled as the English

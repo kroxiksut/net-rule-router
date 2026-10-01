@@ -255,8 +255,8 @@ pub struct RouteLinkProviderSetResponse {
 pub struct DohResolverEntryDto {
     /// `ip` or `host` (matches `nrr_storage::doh_lockdown::DohTarget::kind_str`).
     pub target_kind: String,
-    /// An address literal of either family (`8.8.8.8`, `2001:4860:4860::8888`)
-    /// or a hostname (`dns.google`).
+    /// An address literal of either family (`198.51.100.8`, `2001:db8::8888`)
+    /// or a hostname (`dns.example`).
     pub target: String,
     /// Free-text note (provider/country).
     #[serde(default)]
@@ -310,10 +310,28 @@ fn kill_switch_fail_closed_default() -> bool {
     true
 }
 
-/// Wire default for `kill_switch_protocols`: `127` (all protocols). An
-/// omitting peer must never silently narrow what the emergency block cuts.
+/// Every protocol bit the emergency block knows (TCP=1 … Other=64), and the
+/// wire default: an omitting peer must never silently narrow what it cuts.
+pub const KILL_SWITCH_PROTOCOLS_ALL: u16 = 0x7F;
+
 fn kill_switch_protocols_default() -> u16 {
-    0x7F
+    KILL_SWITCH_PROTOCOLS_ALL
+}
+
+/// The protocol bits that make the emergency block cut something: TCP/UDP at
+/// the connection layer, ICMP/IGMP/GRE/ESP at the packet layer. "Other" (64)
+/// is kept on the wire but blocks nothing.
+pub const KILL_SWITCH_PROTOCOLS_ENFORCED: u16 = 0x3F;
+
+/// Whether `bits` is a protocol selection the service stores and every mirror
+/// keeps. The one answer for all sides. A mask that blocks nothing (`0`, or
+/// "Other" alone) is not one: switching leak protection off is the master
+/// toggle's job, and such a mask is protection that reads as on while
+/// blocking nothing. A bit outside the mask is damage, and masking it away
+/// would invent a selection.
+#[must_use]
+pub const fn is_valid_kill_switch_protocols(bits: u16) -> bool {
+    bits & KILL_SWITCH_PROTOCOLS_ENFORCED != 0 && bits & !KILL_SWITCH_PROTOCOLS_ALL == 0
 }
 
 /// Wire default for `mode_a_coverage_strategy`: `per-ip` — the permissive

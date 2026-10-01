@@ -349,6 +349,23 @@ impl WfpFilterSpec {
     /// `FWP_E_CONDITION_NOT_FOUND` at apply time — catching it here turns a
     /// silent per-filter skip in production (and a false green in tests,
     /// where the mock engine accepts anything) into a structured error.
+    /// Whether any destination condition is present, in either family.
+    pub fn names_a_destination(&self) -> bool {
+        self.remote_ip.is_some()
+            || !self.remote_ip_set.is_empty()
+            || !self.remote_ip_set_v6.is_empty()
+            || self.remote_subnet.is_some()
+            || self.remote_subnet_v6.is_some()
+    }
+
+    /// Whether leaving this filter out lets through traffic it exists to stop:
+    /// any block but one scoped to an application alone, which covers no
+    /// destination when its executable is absent.
+    pub fn guards_traffic(&self) -> bool {
+        self.action == WfpAction::Block
+            && (self.app_pattern.is_none() || self.names_a_destination())
+    }
+
     /// Whether this filter's v4 destination conditions cover `ip` — the
     /// single-address form or the packed set.
     pub fn covers_v4(&self, ip: Ipv4Addr) -> bool {

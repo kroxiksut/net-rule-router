@@ -129,7 +129,7 @@ mod tests {
         // The whole point: nothing is running, nothing was ever persisted, and
         // the exe is not on a searched path — only the user's confirmation.
         let dir = tempfile::tempdir().expect("temp dir");
-        let exe = touch(&dir, "SwiftVPN 3.0.exe");
+        let exe = touch(&dir, "ExampleVPN 3.0.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[exe.to_string_lossy().into_owned()]);
         let resolver = ConfirmedClientAppPathResolver::new(
@@ -138,7 +138,7 @@ mod tests {
         );
 
         // The user's own app rule, spelled exactly as in the rule book…
-        assert_eq!(resolver.resolve("SwiftVPN 3.0.exe"), vec![exe.clone()],);
+        assert_eq!(resolver.resolve("ExampleVPN 3.0.exe"), vec![exe.clone()],);
         // …and the built-in kill-switch exemption glob.
         assert_eq!(resolver.resolve("*vpn*"), vec![exe]);
     }
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn an_unconfirmed_pattern_still_resolves_to_nothing() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let _exe = touch(&dir, "SwiftVPN 3.0.exe");
+        let _exe = touch(&dir, "ExampleVPN 3.0.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[_exe.to_string_lossy().into_owned()]);
         let resolver =

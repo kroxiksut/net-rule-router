@@ -28,7 +28,7 @@ mod resolvconf;
 
 pub use capture::{
     clear_every_redirect, detect_capture_method, dns_capture_parts, DnsCaptureMethod,
-    DnsCaptureParts,
+    DnsCaptureParts, DnsCaptureSelector,
 };
 pub use network_manager::{
     network_manager_writes, parse_nmcli_devices, NetworkManagerDnsRedirect,

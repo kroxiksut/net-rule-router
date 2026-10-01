@@ -831,8 +831,6 @@ dependencies = [
  "nrr-domain",
  "nrr-mock-backend",
  "nrr-shared",
- "nrr-ui-support",
- "serde",
 ]
 
 [[package]]
@@ -880,7 +878,6 @@ dependencies = [
 name = "nrr-desktop-tray"
 version = "0.1.0-prealpha"
 dependencies = [
- "nrr-application",
  "nrr-platform-api",
  "nrr-shared",
  "nrr-ui-support",
@@ -893,6 +890,7 @@ name = "nrr-diagnostics"
 version = "0.1.0-prealpha"
 dependencies = [
  "chrono",
+ "hmac",
  "nrr-domain",
  "nrr-shared",
  "nrr-storage",
@@ -917,7 +915,6 @@ dependencies = [
 name = "nrr-ipc-client"
 version = "0.1.0-prealpha"
 dependencies = [
- "nrr-application",
  "nrr-service-runtime",
  "nrr-shared",
  "serde",
@@ -959,7 +956,6 @@ name = "nrr-linux-service"
 version = "0.1.0-prealpha"
 dependencies = [
  "nrr-diagnostics",
- "nrr-domain",
  "nrr-platform-api",
  "nrr-platform-linux",
  "nrr-service-runtime",
@@ -977,6 +973,7 @@ dependencies = [
  "nrr-diagnostics",
  "nrr-domain",
  "nrr-platform-api",
+ "nrr-platform-linux",
  "nrr-platform-windows",
  "nrr-shared",
 ]
@@ -1069,6 +1066,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrr-sqlite-support"
+version = "0.1.0-prealpha"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "nrr-storage"
 version = "0.1.0-prealpha"
 dependencies = [
@@ -1076,16 +1081,19 @@ dependencies = [
  "hmac",
  "nrr-domain",
  "nrr-platform-api",
+ "nrr-sqlite-support",
  "rusqlite",
  "serde_json",
  "sha2",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
 name = "nrr-storage-sidecar"
 version = "0.1.0-prealpha"
 dependencies = [
+ "nrr-sqlite-support",
  "rusqlite",
  "tempfile",
  "thiserror 1.0.69",

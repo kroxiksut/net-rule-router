@@ -122,7 +122,7 @@ fn snap_full(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
         shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
         kill_switch_strict_shared_ips: true,
         // Pinned to the per-IP path these fixtures were written for. This is
-        // once again the product default (HW-0718 flip); the FailClosedUnknown
+        // once again the product default; the FailClosedUnknown
         // escalation has its own dedicated tests.
         mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp,
         link_provider_exe_paths: Vec::new(),
@@ -157,7 +157,7 @@ fn snap_primary_only(primary: &str) -> PerSidPolicySnapshot {
         allow_dns_over_primary: false,
         shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
         kill_switch_strict_shared_ips: true,
-        // Pinned per-IP for the same reason as `snap_full` above (HW-0714).
+        // Pinned per-IP for the same reason as `snap_full` above.
         mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp,
         link_provider_exe_paths: Vec::new(),
         doh_lockdown_enabled: false,
@@ -192,8 +192,7 @@ impl PerSidApplyAudit for CollectAudit {
 /// Shared fixture: orchestrator wired with the scripted
 /// policy/rules sources and an empty FQDN cache. By default the
 /// rules snapshot is seeded with **two** ExactIp rules so
-/// `install_for_sid` produces 2 filters per SID — matching the
-/// pre-16.12.A.3 placeholder count and letting most lifecycle
+/// `install_for_sid` produces 2 filters per SID — letting most lifecycle
 /// tests keep their `len() == 2` assertions. Tests that need a
 /// different filter count call `rules.set(rules_with_n_primary_ips(n))`
 /// themselves.
@@ -297,7 +296,7 @@ fn fixture_with_resolution(
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| resolution.clone())),
+        .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone())),
     );
     (api, orch, source, rules)
 }
@@ -335,9 +334,9 @@ fn fixture_with_ipv6(
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| resolution.clone()))
+        .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
         // The tunnel carries IPv6: policy may name and steer the family.
-        .with_ipv6_guard_resolver(Arc::new(|_| {
+        .with_ipv6_guard_resolver(Arc::new(|_, _| {
             crate::enforcement_planner::Ipv6Guard::FiltersAndRoutes
         })),
     );
@@ -366,7 +365,7 @@ fn rules_with_secondary_host(host: &str) -> ActiveRulesSnapshot {
 
 /// One secondary ExactIp rule → exactly one secondary destination
 /// for the kill-switch to protect.
-/// A primary-route ExactIp rule (16.HW-0716 P1b test helper).
+/// A primary-route ExactIp rule (test helper).
 fn primary_ip_rule(id: &str, ip: Ipv4Addr) -> CanonicalRule {
     CanonicalRule {
         id: RuleId(id.into()),
@@ -476,6 +475,7 @@ mod audit;
 mod blocking_scope;
 mod cleanup;
 mod kill_switch;
+mod machine_reading;
 mod preview;
 mod route_before_block;
 mod vpn_exempt;

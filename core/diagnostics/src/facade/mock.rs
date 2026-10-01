@@ -14,16 +14,16 @@
 //! | `ServiceDegraded`   | Service running in degraded mode                 |
 //! | `EmptyLogs`         | No log files exist yet                           |
 
+use crate::audit::alert::SecurityAlertState;
 use crate::error::{DiagnosticsError, DiagnosticsResult};
 use crate::explain::{ExplainDataAvailability, ExplainQuery, ExplainResponse};
 use crate::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsAudience, DiagnosticsDataOrigin,
-    DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto,
-    SecurityStatusCard, ServiceHealthCard, SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticsAudience, DiagnosticsDataOrigin, DiagnosticsStatusDto, LogEntryDto,
+    LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard, ServiceHealthCard,
 };
 use crate::facade::pagination::{PageResult, PaginationParams};
-use crate::facade::service::DiagnosticsFacade;
+use crate::facade::service::{AlertListFilter, DiagnosticsFacade};
 use crate::redaction::ExplainDetailLevel;
 
 // ── MockScenario ──────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ impl MockDiagnosticsFacade {
 }
 
 impl DiagnosticsFacade for MockDiagnosticsFacade {
-    fn get_status(&self) -> DiagnosticsStatusDto {
+    fn get_status(&self, _audience: &DiagnosticsAudience) -> DiagnosticsStatusDto {
         match self.scenario {
             MockScenario::Healthy => healthy_status(),
             MockScenario::ActiveTamperAlert => tamper_alert_status(),
@@ -93,12 +93,17 @@ impl DiagnosticsFacade for MockDiagnosticsFacade {
         Ok(PageResult::single_page(entries))
     }
 
-    fn list_active_alerts(&self) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
-        if self.scenario == MockScenario::ActiveTamperAlert {
-            Ok(vec![mock_tamper_alert()])
-        } else {
-            Ok(Vec::new())
+    fn list_alerts(
+        &self,
+        filter: AlertListFilter,
+        _audience: &DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
+        if self.scenario != MockScenario::ActiveTamperAlert {
+            return Ok(Vec::new());
         }
+        Ok(std::iter::once(mock_tamper_alert())
+            .filter(|a| SecurityAlertState::from_str(&a.state).is_some_and(|s| filter.admits(s)))
+            .collect())
     }
 
     fn acknowledge_alert(&self, req: &AcknowledgeAlertRequest) -> DiagnosticsResult<()> {
@@ -107,10 +112,6 @@ impl DiagnosticsFacade for MockDiagnosticsFacade {
                 reason: "alert_id must not be empty".into(),
             });
         }
-        Ok(()) // mock: always succeeds
-    }
-
-    fn set_diagnostic_mode(&self, _req: &SetDiagnosticModeRequest) -> DiagnosticsResult<()> {
         Ok(()) // mock: always succeeds
     }
 
@@ -165,6 +166,7 @@ fn healthy_status() -> DiagnosticsStatusDto {
             audit_chain_ok: true,
             active_alert_count: 0,
             audit_write_healthy: true,
+            alerts_readable: true,
         },
         active_alerts: Vec::new(),
         cache_health: CacheHealthCard {
@@ -179,7 +181,6 @@ fn healthy_status() -> DiagnosticsStatusDto {
             dropped_count: 0,
             last_cleanup_at: None,
         },
-        diagnostic_mode: DiagnosticModeStateDto::inactive(),
         stale: false,
         // Canned content: never let it read as a verdict about this machine.
         origin: DiagnosticsDataOrigin::Preview,
@@ -314,7 +315,7 @@ mod tests {
     #[test]
     fn mock_healthy_is_healthy() {
         let facade = MockDiagnosticsFacade::healthy();
-        let status = facade.get_status();
+        let status = facade.get_status(&DiagnosticsAudience::Machine);
         assert!(status.overall_healthy);
         assert!(status.active_alerts.is_empty());
         assert!(!status.stale);
@@ -323,7 +324,7 @@ mod tests {
     #[test]
     fn mock_tamper_alert_has_active_alert() {
         let facade = MockDiagnosticsFacade::new(MockScenario::ActiveTamperAlert);
-        let status = facade.get_status();
+        let status = facade.get_status(&DiagnosticsAudience::Machine);
         assert!(!status.overall_healthy);
         assert_eq!(status.active_alerts.len(), 1);
         assert!(status.active_alerts[0].requires_action);
@@ -378,21 +379,11 @@ mod tests {
     }
 
     #[test]
-    fn mock_set_diagnostic_mode_succeeds() {
-        let facade = MockDiagnosticsFacade::healthy();
-        let req = SetDiagnosticModeRequest {
-            enabled: true,
-            duration_ms: Some(3_600_000),
-            scope: None,
-            until_restart: false,
-        };
-        assert!(facade.set_diagnostic_mode(&req).is_ok());
-    }
-
-    #[test]
     fn mock_list_active_alerts_healthy_is_empty() {
         let facade = MockDiagnosticsFacade::healthy();
-        let alerts = facade.list_active_alerts().expect("ok");
+        let alerts = facade
+            .list_alerts(AlertListFilter::Open, &DiagnosticsAudience::Machine)
+            .expect("ok");
         assert!(alerts.is_empty());
     }
 
@@ -422,7 +413,7 @@ mod tests {
             MockScenario::EmptyLogs,
         ] {
             let facade = MockDiagnosticsFacade::new(scenario);
-            let _ = facade.get_status();
+            let _ = facade.get_status(&DiagnosticsAudience::Machine);
         }
     }
 }

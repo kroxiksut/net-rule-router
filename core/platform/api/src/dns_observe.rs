@@ -81,8 +81,8 @@ mod tests {
     #[test]
     fn mock_buffers_and_drains_once() {
         let src = MockDnsObservationSource::new();
-        src.push("a.example.com", vec![Ipv4Addr::new(1, 2, 3, 4)]);
-        src.push("b.example.com", vec![Ipv4Addr::new(5, 6, 7, 8)]);
+        src.push("a.example.com", vec![Ipv4Addr::new(192, 0, 2, 4)]);
+        src.push("b.example.com", vec![Ipv4Addr::new(192, 0, 2, 8)]);
         let first = src.drain();
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].hostname, "a.example.com");

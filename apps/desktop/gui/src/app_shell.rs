@@ -1,4 +1,4 @@
-use nrr_shared::{ActivationSource, AppSection, FirstRunScenarioId};
+use nrr_shared::{ActivationSource, AppSection};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -20,7 +20,6 @@ pub struct LaunchRequest {
     pub open_about: bool,
     pub open_license: bool,
     pub first_run_completed_override: Option<bool>,
-    pub first_run_scenario_override: Option<FirstRunScenarioId>,
     /// Secondary launchers can carry an opaque "action" slug that the
     /// primary GUI consumes via the `gui-activation.json` hand-off.
     /// Currently the only known slug is `"safe-disable"` (tray
@@ -135,7 +134,6 @@ where
         open_about: false,
         open_license: false,
         first_run_completed_override: None,
-        first_run_scenario_override: None,
         action: None,
         reason: None,
         focus: None,
@@ -223,48 +221,16 @@ where
             continue;
         }
 
-        if let Some(value) = argument.strip_prefix("--scenario=") {
-            request.first_run_scenario_override = parse_first_run_scenario(value);
-            if request.first_run_scenario_override.is_none() {
-                eprintln!(
-                    "Unknown --scenario value '{}'. Use quick-start|guided-default.",
-                    value
-                );
-            }
-            continue;
-        }
-
         eprintln!("Unknown GUI launch argument '{}'.", argument);
     }
 
     request
 }
 
-pub fn parse_first_run_scenario(value: &str) -> Option<FirstRunScenarioId> {
-    match value {
-        "quick-start" | "quick" => Some(FirstRunScenarioId::QuickStart),
-        "guided-default" | "guided" => Some(FirstRunScenarioId::GuidedDefault),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_first_run_scenario, parse_launch_request_arguments, FocusContext};
-    use nrr_shared::{ActivationSource, AppSection, FirstRunScenarioId};
-
-    #[test]
-    fn first_run_scenario_parser_accepts_supported_aliases() {
-        assert_eq!(
-            parse_first_run_scenario("quick-start"),
-            Some(FirstRunScenarioId::QuickStart)
-        );
-        assert_eq!(
-            parse_first_run_scenario("guided-default"),
-            Some(FirstRunScenarioId::GuidedDefault)
-        );
-        assert_eq!(parse_first_run_scenario("unknown"), None);
-    }
+    use super::{parse_launch_request_arguments, FocusContext};
+    use nrr_shared::{ActivationSource, AppSection};
 
     #[test]
     fn launch_request_parser_maps_common_arguments() {
@@ -273,7 +239,6 @@ mod tests {
             "--section=rules".to_string(),
             "--about".to_string(),
             "--first-run=required".to_string(),
-            "--scenario=quick-start".to_string(),
         ]);
 
         assert_eq!(request.source, ActivationSource::Tray);
@@ -281,10 +246,6 @@ mod tests {
         assert!(request.open_about);
         assert!(!request.open_license);
         assert_eq!(request.first_run_completed_override, Some(false));
-        assert_eq!(
-            request.first_run_scenario_override,
-            Some(FirstRunScenarioId::QuickStart)
-        );
     }
 
     #[test]

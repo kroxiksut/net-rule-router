@@ -51,7 +51,7 @@ Dialog {
             Item { Layout.fillWidth: true }
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("dialog.service-update.cancel", "Cancel")
+                text: root.tr("action.cancel", "Cancel")
                 onClicked: root.close()
             }
             ThemedButton {

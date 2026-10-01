@@ -110,9 +110,11 @@ mod tests {
     fn unmarking_removes_it_and_says_whether_there_was_anything_to_remove() {
         let c = conn();
         let repo = RefusingAnchorsRepository::new(&c);
-        repo.set("S", "reddit.com", true, 1).expect("mark");
-        assert!(repo.set("S", "REDDIT.com", false, 2).expect("unmark"));
-        assert!(!repo.set("S", "reddit.com", false, 3).expect("unmark again"));
+        repo.set("S", "site.example", true, 1).expect("mark");
+        assert!(repo.set("S", "SITE.example", false, 2).expect("unmark"));
+        assert!(!repo
+            .set("S", "site.example", false, 3)
+            .expect("unmark again"));
         assert!(repo.list_for_sid("S").expect("read").is_empty());
     }
 

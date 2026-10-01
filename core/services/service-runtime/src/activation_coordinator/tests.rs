@@ -542,8 +542,139 @@ fn a_failed_pointer_write_leaves_no_half_activated_revision() {
     let rec = fx.coordinator.load_record(&id).expect("load");
     assert_eq!(
         rec.status,
+        RevisionStatus::Rejected,
+        "the status change rolled back with the failed pointer write; the attempt is then settled as rejected, never active",
+    );
+    assert!(fx.coordinator.current_active().expect("active").is_none());
+}
+
+const REFUSE_POINTER: &str =
+    "CREATE TRIGGER no_pointer_write BEFORE UPDATE ON active_revision_pointer
+     BEGIN SELECT RAISE(ABORT, 'pointer write refused'); END;
+     CREATE TRIGGER no_pointer_insert BEFORE INSERT ON active_revision_pointer
+     BEGIN SELECT RAISE(ABORT, 'pointer write refused'); END;";
+const ALLOW_POINTER: &str = "DROP TRIGGER no_pointer_write; DROP TRIGGER no_pointer_insert;";
+
+fn exec(fx: &Fixture, sql: &str) {
+    fx.conn
+        .lock()
+        .expect("lock")
+        .execute_batch(sql)
+        .expect("sql");
+}
+
+/// A commit that fails after phase 2 must not leave the new rules live under
+/// a pointer that still names the old revision, nor an attempt that reads as
+/// still in flight.
+#[test]
+fn a_commit_that_fails_reverts_and_closes_the_attempt() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    fx.registry
+        .on_connect("S-1-A", IpcClientProfile::TrayLightweight);
+    let id = submit(&fx, "h-unrecorded");
+    let token = issue_token(&fx, &id);
+    exec(&fx, REFUSE_POINTER);
+
+    let err = fx
+        .coordinator
+        .activate(&id, &token, "c")
+        .expect_err("the activation cannot report success");
+
+    assert!(
+        matches!(&err, PolicyError::ActivationNotRecorded { revision_id, .. } if *revision_id == id),
+        "a distinct failure the GUI can name, got {err:?}",
+    );
+    assert_eq!(
+        fx.dispatcher.revert_log(),
+        vec![("S-1-A".to_string(), "{}".to_string())],
+        "the SID phase 2 touched goes back to the previous rules",
+    );
+    assert!(fx.marker.read().is_none(), "the attempt is closed");
+    assert_eq!(
+        fx.coordinator.load_record(&id).expect("load").status,
+        RevisionStatus::Rejected,
+    );
+    assert!(fx.audit.snapshot().iter().any(|e| matches!(
+        e,
+        ActivationAuditEvent::RevisionRejected { revision_id, .. } if revision_id == id.as_str()
+    )));
+}
+
+/// The token authorised one attempt and is spent by it. When even the
+/// rejection cannot be written the revision stays a candidate, and only a
+/// newly issued token — a new review — activates it.
+#[test]
+fn an_unrecorded_activation_spends_its_token_and_a_new_review_retries() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    fx.registry
+        .on_connect("S-1-A", IpcClientProfile::TrayLightweight);
+    let id = submit(&fx, "h-retry");
+    let token = issue_token(&fx, &id);
+    exec(&fx, REFUSE_POINTER);
+    exec(
+        &fx,
+        "CREATE TRIGGER no_reject BEFORE UPDATE ON revisions WHEN NEW.status = 'rejected'
+         BEGIN SELECT RAISE(ABORT, 'reject refused'); END;",
+    );
+
+    fx.coordinator
+        .activate(&id, &token, "c")
+        .expect_err("not recorded");
+    assert_eq!(
+        fx.coordinator.load_record(&id).expect("load").status,
         RevisionStatus::Candidate,
-        "the status change must have rolled back with the failed pointer write",
+    );
+    assert!(fx.marker.read().is_none());
+
+    exec(&fx, ALLOW_POINTER);
+    exec(&fx, "DROP TRIGGER no_reject;");
+    assert!(matches!(
+        fx.coordinator.activate(&id, &token, "c"),
+        Err(PolicyError::ConfirmationTokenAlreadyUsed)
+    ));
+    let fresh = issue_token(&fx, &id);
+    let outcome = fx.coordinator.activate(&id, &fresh, "c").expect("retry");
+    assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+}
+
+/// Past the commit, a marker that will not clear must not turn an active
+/// revision into a reported failure — the caller would revert live rules.
+#[test]
+fn a_marker_that_will_not_clear_after_the_commit_is_not_a_failure() {
+    struct StuckMarker(InMemoryMarkerStore);
+    impl ApplyMarkerStore for StuckMarker {
+        fn read(&self) -> Option<ApplyAttemptMarker> {
+            self.0.read()
+        }
+        fn write(&self, marker: &ApplyAttemptMarker) -> Result<(), String> {
+            self.0.write(marker)
+        }
+        fn clear(&self) -> Result<(), String> {
+            Err("disk full".into())
+        }
+    }
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    fx.registry
+        .on_connect("S-1-A", IpcClientProfile::TrayLightweight);
+    let coordinator = ActivationCoordinator::new(
+        fx.conn.clone(),
+        fx.registry.clone(),
+        fx.dispatcher.clone() as Arc<dyn RulesApplyDispatcher>,
+        Arc::new(StuckMarker(InMemoryMarkerStore::new())) as Arc<dyn ApplyMarkerStore>,
+        fx.audit.clone() as Arc<dyn ActivationAuditEmitter>,
+        fx.clock.clone() as Arc<dyn Clock>,
+        Arc::new(CounterIds::new()),
+        ApplyFailurePolicy::AllOrNothing,
+    );
+    let id = submit(&fx, "h-stuck-marker");
+    let token = issue_token(&fx, &id);
+
+    let outcome = coordinator.activate(&id, &token, "c").expect("activate");
+    assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+    assert!(fx.dispatcher.revert_log().is_empty());
+    assert_eq!(
+        coordinator.load_record(&id).expect("load").status,
+        RevisionStatus::Active,
     );
 }
 
@@ -796,14 +927,70 @@ fn activate_pre_flight_failure_does_not_apply() {
     assert_eq!(rec.status, RevisionStatus::Rejected);
 }
 
+/// Signs the user out the moment Phase 1 records its marker, i.e. between the
+/// snapshot of target SIDs and the pre-flight re-check.
+struct SignOutOnMarker {
+    registry: Arc<ActiveSidRegistry>,
+    sid: &'static str,
+    inner: InMemoryMarkerStore,
+}
+
+impl ApplyMarkerStore for SignOutOnMarker {
+    fn read(&self) -> Option<ApplyAttemptMarker> {
+        self.inner.read()
+    }
+
+    fn write(&self, marker: &ApplyAttemptMarker) -> Result<(), String> {
+        self.registry
+            .on_disconnect(self.sid, IpcClientProfile::TrayLightweight);
+        self.inner.write(marker)
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        self.inner.clear()
+    }
+}
+
+#[test]
+fn activate_pre_flight_refuses_a_sid_that_signed_out_after_phase1() {
+    let fx = build_fixture(ApplyFailurePolicy::PreFlightThenAllOrNothing);
+    fx.registry
+        .on_connect("S-A", IpcClientProfile::TrayLightweight);
+    let coordinator = ActivationCoordinator::new(
+        fx.conn.clone(),
+        fx.registry.clone(),
+        fx.dispatcher.clone() as Arc<dyn RulesApplyDispatcher>,
+        Arc::new(SignOutOnMarker {
+            registry: fx.registry.clone(),
+            sid: "S-A",
+            inner: InMemoryMarkerStore::new(),
+        }) as Arc<dyn ApplyMarkerStore>,
+        fx.audit.clone() as Arc<dyn ActivationAuditEmitter>,
+        fx.clock.clone() as Arc<dyn Clock>,
+        Arc::new(CounterIds::new()),
+        ApplyFailurePolicy::PreFlightThenAllOrNothing,
+    );
+
+    let id = submit(&fx, "h-gone");
+    let token = coordinator
+        .issue_confirmation_token(&id, 300)
+        .expect("issue token");
+    match coordinator.activate(&id, &token, "c").expect("activate") {
+        ActivationOutcome::PreFlightFailed { sid_failures, .. } => {
+            assert_eq!(sid_failures.len(), 1);
+            assert_eq!(sid_failures[0].0, "S-A");
+        }
+        other => panic!("expected PreFlightFailed, got {other:?}"),
+    }
+    assert!(fx.dispatcher.apply_log().is_empty());
+}
+
 #[test]
 fn activate_pre_flight_passed_but_apply_failed_audit_recorded() {
     let fx = build_fixture(ApplyFailurePolicy::PreFlightThenAllOrNothing);
     fx.registry
         .on_connect("S-A", IpcClientProfile::TrayLightweight);
-    // Pre-flight returns a non-blocking warning (`SidLeftRegistry`
-    // is not in our failure-upgrade set, but we use no warnings here
-    // to keep the test focused).
+    // Pre-flight passes clean; only the apply fails.
     fx.dispatcher.queue_apply(
         "S-A",
         Err(DispatchFailure {
@@ -1225,6 +1412,53 @@ fn issue_token_rejects_row_exceeding_free_rule_cap() {
     ));
 }
 
+/// The app-rule budget is a write-side cap: a stored, signed revision past it
+/// still activates rather than being refused after the fact.
+#[test]
+fn a_stored_revision_past_the_app_rule_budget_still_activates() {
+    use nrr_shared::rules_json::{
+        AddressMatchDto, CanonicalRulesJsonV1, RuleDto, RuleOriginDto, RULES_JSON_SCHEMA_VERSION,
+    };
+    let key = vec![0x25u8; 32];
+    let fx = build_signed_fixture(ApplyFailurePolicy::AllOrNothing, key.clone());
+    let auto: Vec<RuleDto> = (0..=nrr_domain::auto_rule_budget::MAX_AUTO_RULES)
+        .map(|i| RuleDto {
+            id: format!("auto-{i}"),
+            enabled: true,
+            address_match: Some(AddressMatchDto::ExactFqdn {
+                value: format!("cdn{i}.example.net"),
+            }),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: Some(RuleOriginDto::auto(
+                nrr_shared::AutoRuleReason::SiteCompanion,
+                "example.com",
+                "2026-07-31",
+            )),
+        })
+        .collect();
+    let rules_json = nrr_shared::rules_json::to_canonical_string(&CanonicalRulesJsonV1 {
+        schema_version: RULES_JSON_SCHEMA_VERSION,
+        primary: vec![],
+        secondary: auto,
+    })
+    .expect("serialise");
+    {
+        let conn = fx.conn.lock().expect("conn");
+        RevisionsRepository::with_signing_key(&conn, key)
+            .insert_candidate(&outside_app_record("rev-auto-over", rules_json))
+            .expect("insert");
+    }
+    let id = RevisionId::from_prefixed_string("rev-auto-over".to_string()).expect("id");
+    let token = issue_token(&fx, &id);
+    let outcome = fx.coordinator.activate(&id, &token, "c").expect("activate");
+    assert!(
+        matches!(outcome, ActivationOutcome::Activated { .. }),
+        "{outcome:?}"
+    );
+}
+
 #[test]
 fn valid_signed_candidate_activates_normally() {
     // Regression: the gate must not disturb the ordinary path.
@@ -1555,6 +1789,8 @@ fn the_revert_after_a_failed_apply_reads_the_stored_revision() {
     );
 }
 
+mod integrity_ack;
+mod integrity_sweep;
 mod key_reset;
 
 fn app_and_address_rules_json() -> String {
@@ -1618,6 +1854,65 @@ fn submit_candidate_refuses_an_unsupported_shape_even_when_it_would_dedup() {
     );
 }
 
+/// A combined rule already in force (here the baseline a user reads through
+/// to) does not block the user's next edit; changing that rule does.
+#[test]
+fn submit_candidate_spares_an_unsupported_rule_carried_over_unchanged() {
+    use nrr_shared::rules_json::{AddressMatchDto, RuleDto};
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let legacy = app_and_address_rules_json();
+    {
+        let conn = fx.conn.lock().expect("conn");
+        let repo = RevisionsRepository::new(&conn);
+        repo.insert_candidate(&outside_app_record("rev-legacy", legacy.clone()))
+            .expect("insert");
+        repo.mark_apply_succeeded("rev-legacy", None, 1_700_000_001)
+            .expect("activate");
+    }
+    let user = "S-1-5-21-1000";
+    assert!(
+        fx.coordinator.rules_json_in_force_for(user).is_some(),
+        "the user reads through to the baseline"
+    );
+    let with = |edit: &dyn Fn(&mut nrr_shared::rules_json::CanonicalRulesJsonV1)| {
+        let mut dto = nrr_shared::rules_json::from_canonical_string(&legacy).expect("parse");
+        edit(&mut dto);
+        nrr_shared::rules_json::to_canonical_string(&dto).expect("serialise")
+    };
+    let submit = |rules_json: String, hash: &str| {
+        fx.coordinator.submit_candidate(CandidateSubmission {
+            principal: user.to_string(),
+            rules_json,
+            content_hash: hash.to_string(),
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "corr".to_string(),
+            risk_level: None,
+            review_summary_json: None,
+        })
+    };
+
+    let added = with(&|dto| {
+        dto.primary.push(RuleDto {
+            id: "R-0008".into(),
+            enabled: true,
+            address_match: Some(AddressMatchDto::ExactFqdn {
+                value: "example.com".into(),
+            }),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        });
+    });
+    submit(added, "h-added").expect("the carried rule does not block an unrelated edit");
+
+    let edited = with(&|dto| dto.primary[0].enabled = false);
+    assert!(matches!(
+        submit(edited, "h-edited"),
+        Err(PolicyError::UnsupportedRuleShape { .. })
+    ));
+}
+
 /// A note carrying `\n--- IP\n…` is an IP rule once the book is exported, so
 /// it never becomes a stored candidate — whichever producer submits it.
 #[test]
@@ -1658,6 +1953,181 @@ fn submit_candidate_refuses_a_line_break_in_a_comment() {
             field: "comment",
         }
     );
+}
+
+fn host_rules_json(rules: &[(&str, &str, &str)]) -> String {
+    use nrr_shared::rules_json::{AddressMatchDto, CanonicalRulesJsonV1, RuleDto};
+    let dto = CanonicalRulesJsonV1 {
+        schema_version: nrr_shared::rules_json::RULES_JSON_SCHEMA_VERSION,
+        primary: rules
+            .iter()
+            .map(|(id, kind, value)| RuleDto {
+                id: (*id).into(),
+                enabled: true,
+                address_match: Some(match *kind {
+                    "zone" => AddressMatchDto::Zone {
+                        name: (*value).into(),
+                    },
+                    _ => AddressMatchDto::ExactFqdn {
+                        value: (*value).into(),
+                    },
+                }),
+                app_match: None,
+                comment: String::new(),
+                action: nrr_shared::rules_json::RuleAction::Route,
+                origin: None,
+            })
+            .collect(),
+        secondary: vec![],
+    };
+    nrr_shared::rules_json::to_canonical_string(&dto).expect("serialise")
+}
+
+/// A rule the rules table marks red never becomes a stored candidate, and the
+/// refusal names every such rule.
+#[test]
+fn submit_candidate_refuses_rules_the_table_marks_as_errors() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let err = fx
+        .coordinator
+        .submit_candidate(CandidateSubmission {
+            principal: nrr_storage::BASELINE_PRINCIPAL.to_string(),
+            rules_json: host_rules_json(&[
+                ("R-0001", "domain", "192.168.1.1"),
+                ("R-0002", "domain", "example.com"),
+                ("R-0003", "zone", "123"),
+            ]),
+            content_hash: "h-invalid".to_string(),
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "corr".to_string(),
+            risk_level: None,
+            review_summary_json: None,
+        })
+        .expect_err("refused");
+    assert_eq!(
+        err,
+        PolicyError::InvalidRuleValue {
+            rules: vec![refused("R-0001", "192.168.1.1"), refused("R-0003", "123")],
+        }
+    );
+}
+
+/// A book stored before the check (here the baseline a user reads through to)
+/// keeps its refused row in force: an edit carrying it along is accepted and
+/// activates, a refused value added anew is not.
+#[test]
+fn submit_candidate_spares_a_refused_value_already_in_force() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let legacy = host_rules_json(&[
+        ("R-0001", "domain", "192.168.1.1"),
+        ("R-0002", "domain", "example.com"),
+    ]);
+    {
+        let conn = fx.conn.lock().expect("conn");
+        let repo = RevisionsRepository::new(&conn);
+        repo.insert_candidate(&outside_app_record("rev-legacy", legacy))
+            .expect("a stored row keeps inserting");
+        repo.mark_apply_succeeded("rev-legacy", None, 1_700_000_001)
+            .expect("activate");
+    }
+    let user = "S-1-5-21-1000";
+    let submit = |rules_json: String, hash: &str| {
+        fx.coordinator.submit_candidate(CandidateSubmission {
+            principal: user.to_string(),
+            rules_json,
+            content_hash: hash.to_string(),
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "corr".to_string(),
+            risk_level: None,
+            review_summary_json: None,
+        })
+    };
+
+    let edited = submit(
+        host_rules_json(&[
+            ("R-0001", "domain", "192.168.1.1"),
+            ("R-0002", "domain", "example.com"),
+            ("R-0003", "domain", "example.org"),
+        ]),
+        "h-edit",
+    )
+    .expect("the carried value does not block an unrelated edit");
+    fx.registry
+        .on_connect(user, IpcClientProfile::TrayLightweight);
+    let token = issue_token(&fx, &edited);
+    fx.coordinator
+        .activate(&edited, &token, "c-edit")
+        .expect("the edit activates");
+
+    assert_eq!(
+        submit(
+            host_rules_json(&[
+                ("R-0001", "domain", "192.168.1.1"),
+                ("R-0004", "zone", "123"),
+            ]),
+            "h-added",
+        ),
+        Err(PolicyError::InvalidRuleValue {
+            rules: vec![refused("R-0004", "123")],
+        })
+    );
+}
+
+/// A stored book drops such an application row on read, but a new submission
+/// carrying one is refused by name rather than silently losing the row.
+#[test]
+fn submit_candidate_refuses_an_application_value_the_pipeline_refuses() {
+    use nrr_shared::rules_json::{AppMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleDto};
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let long = format!("{}.exe", "a".repeat(300));
+    let app = |id: &str, value: &str| RuleDto {
+        id: id.into(),
+        enabled: true,
+        address_match: None,
+        app_match: Some(AppMatchDto {
+            pattern: AppPatternDto::Exact {
+                value: value.into(),
+            },
+            include_child_processes: false,
+        }),
+        comment: String::new(),
+        action: nrr_shared::rules_json::RuleAction::Route,
+        origin: None,
+    };
+    let dto = CanonicalRulesJsonV1 {
+        schema_version: nrr_shared::rules_json::RULES_JSON_SCHEMA_VERSION,
+        primary: vec![
+            app("R-0001", "chrome.exe"),
+            app("R-0002", &long),
+            app("R-0003", "*"),
+        ],
+        secondary: vec![],
+    };
+    let err = fx
+        .coordinator
+        .submit_candidate(CandidateSubmission {
+            principal: nrr_storage::BASELINE_PRINCIPAL.to_string(),
+            rules_json: nrr_shared::rules_json::to_canonical_string(&dto).expect("serialise"),
+            content_hash: "h-app".to_string(),
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "corr".to_string(),
+            risk_level: None,
+            review_summary_json: None,
+        })
+        .expect_err("refused");
+    assert_eq!(
+        err,
+        PolicyError::InvalidRuleValue {
+            rules: vec![refused("R-0002", &long), refused("R-0003", "*")],
+        }
+    );
+}
+
+fn refused(rule_id: &str, value: &str) -> nrr_domain::rule_value_validation::RefusedRuleValue {
+    nrr_domain::rule_value_validation::RefusedRuleValue {
+        rule_id: rule_id.into(),
+        value: value.into(),
+    }
 }
 
 /// Rollback re-activates history on purpose and does not pass the submission

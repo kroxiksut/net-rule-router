@@ -1,4 +1,4 @@
-# Locale Source Policy (Block 3.6)
+# Locale Source Policy
 
 This document defines how bundled and user-provided locale files are discovered and merged.
 

@@ -157,6 +157,112 @@ fn no_country_preset_has_duplicate_sections() {
     }
 }
 
+/// Every `rules_*.txt` anywhere under `presets/`, at any depth.
+fn every_shipped_rules_file() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+            let path = entry.expect("read dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rules_") && n.ends_with(".txt"))
+            {
+                out.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../presets");
+    let mut out = Vec::new();
+    walk(&root, &mut out);
+    out.sort();
+    out
+}
+
+/// Well-known sites of the categories a shipped pack may not carry: news
+/// outlets and torrent trackers. A sample, not a blocklist — it catches the
+/// removed lines coming back: a shipped pack routes, it does not curate.
+const DOMAINS_A_PACK_MAY_NOT_SHIP: &[&str] = &[
+    // News outlets.
+    "meduza.io",
+    "tvrain.tv",
+    "svoboda.org",
+    // Torrent trackers.
+    "rutracker.org",
+    "rutracker.cc",
+    "rutor.info",
+    "nnmclub.to",
+    "kinozal.tv",
+    "thepiratebay.org",
+    "1337x.to",
+];
+
+/// The listed site a line names, in any spelling: bare, `*.`-wildcarded,
+/// as a subdomain, in a comment.
+fn site_a_pack_may_not_ship(line: &str) -> Option<&'static str> {
+    let lower = line.to_ascii_lowercase();
+    lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+        .map(|token| token.trim_matches('.'))
+        .find_map(|name| {
+            DOMAINS_A_PACK_MAY_NOT_SHIP.iter().copied().find(|banned| {
+                name == *banned
+                    || name
+                        .strip_suffix(banned)
+                        .is_some_and(|head| head.ends_with('.'))
+            })
+        })
+}
+
+#[test]
+fn no_shipped_pack_names_a_news_outlet_or_a_torrent_tracker() {
+    let files = every_shipped_rules_file();
+    assert!(
+        files.len() > 2,
+        "positive control: the walk must reach the country packs"
+    );
+    // Disabled and commented-out lines count too: a name lying in the pack is
+    // the suggestion, whether or not it is switched on.
+    let mut hits = Vec::new();
+    for path in &files {
+        let text =
+            fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        for (number, line) in text.lines().enumerate() {
+            if let Some(site) = site_a_pack_may_not_ship(line) {
+                hits.push(format!("{}:{}: {site}", path.display(), number + 1));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "a shipped pack names a site of a category packs do not carry:
+  {}",
+        hits.join(
+            "
+  "
+        )
+    );
+}
+
+#[test]
+fn the_pack_topic_guard_recognises_a_listed_site_in_every_spelling() {
+    assert_eq!(
+        site_a_pack_may_not_ship("*.meduza.io  # outlet"),
+        Some("meduza.io")
+    );
+    assert_eq!(
+        site_a_pack_may_not_ship("# rutracker.org"),
+        Some("rutracker.org")
+    );
+    assert_eq!(
+        site_a_pack_may_not_ship("WWW.RuTracker.CC"),
+        Some("rutracker.cc")
+    );
+    assert_eq!(site_a_pack_may_not_ship("notmeduza.io"), None);
+    assert_eq!(site_a_pack_may_not_ship("meduza.io.example"), None);
+}
+
 #[test]
 fn ru_primary_preserves_idn_zone_round_trip_intent() {
     // The RU primary preset is the canonical test for our Unicode↔
@@ -213,7 +319,7 @@ fn ru_primary_preserves_idn_zone_round_trip_intent() {
     assert!(
         !rf_rule.comment.is_empty(),
         "`рф` zone should carry an inline Punycode comment per \
-         block 16.QoL+0 RU-preset enrichment",
+         RU-preset enrichment",
     );
 }
 

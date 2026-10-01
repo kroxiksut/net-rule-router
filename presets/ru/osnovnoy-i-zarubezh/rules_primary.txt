@@ -1,3 +1,9 @@
+# NetRuleRouter preset - version 1
+# name: RU Osnovnoy I Zarubezh - Primary Route
+# description: Russian zones and domestic services on global domains routed to primary
+# author: NetRuleRouter contributors
+# preset_version: 1
+
 --- Zones
 ru  # Российская Федерация (.ru)
 su  # Историческая зона СССР (.su)
@@ -8,14 +14,14 @@ su  # Историческая зона СССР (.su)
 *.avito.com
 *.drweb.com
 *.google.com
-*.icq.com
+# *.icq.com    # сервис закрыт, включать незачем
 *.ivi.com
 *.kaspersky.com
 *.litres.com
 *.my.com
 *.ok.com
 *.ozon.com
-*.qiwi.com
+# *.qiwi.com    # лицензия отозвана, сервис не работает
 *.sberbank.com
 *.userapi.com
 *.vk.cc
@@ -32,13 +38,13 @@ su  # Историческая зона СССР (.su)
 
 --- Windows
 2gis.exe
-Cloud.exe
+# Cloud.exe    # Mail.ru Cloud: имя процесса слишком общее, проверьте у себя
 DiskO*.exe
 YandexDis*.exe
 avp.exe
 gamecenter.exe
 # Процесс вашего ВПН-клиента задаётся в мастере первого запуска
-icq.exe
+# icq.exe    # сервис закрыт, включать незачем
 kavfs.exe
 mail.ru_cloud*.exe
 tamtam.exe

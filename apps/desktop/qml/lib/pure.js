@@ -88,6 +88,23 @@ function normalizedFontScalePercent(value) {
     return Math.max(80, Math.min(300, Math.round(numeric / 5) * 5))
 }
 
+// Fill `{name}` from `args` and `{0}`, `{1}`… from `positional` in ONE pass:
+// a value is never re-scanned, so a `{host}` or `$&` inside it stays literal.
+// A translation left with a hole reads worse than the English line, which
+// still carries the cause — so any unfilled placeholder shows `source` instead.
+function formatLogLine(translated, source, args, positional) {
+    var named = args || {}
+    var indexed = positional || []
+    var missing = false
+    var filled = String(translated).replace(/\{(\w+)\}/g, function(whole, name) {
+        if (Object.prototype.hasOwnProperty.call(named, name)) return String(named[name])
+        if (/^\d+$/.test(name) && Number(name) < indexed.length) return String(indexed[Number(name)])
+        missing = true
+        return whole
+    })
+    return missing ? String(source) : filled
+}
+
 function formatStorageBytes(bytes) {
     var n = Number(bytes || 0)
     if (n < 1024) return n + " B"
@@ -279,7 +296,8 @@ function pendingOfflineCount(obj) {
 
 // Wire key -> value used when the config does not carry the key.
 var STABILITY_FIELD_DEFAULTS = {
-    "verbose-logging": false,
+    "verbose-logging-mode": "off",
+    "verbose-logging-until-ms": 0,
     "conn-trace-ndjson": false,
     "conn-trace-gui": true,
     "rule-scope-service-driven": true,
@@ -298,9 +316,14 @@ var STABILITY_FIELD_DEFAULTS = {
 // above but are still part of the config the writer round-trips.
 var STABILITY_STRUCTURED_KEYS = ["ipc-accept-policy"]
 
-// Machine-wide administrator policy: never one user's recorded intent, so the
-// carry-forward below must not resurrect it out of a user's preferences.
+// The administrator's rules lock: never recorded as a user's intent, never
+// replayed and never carried forward out of one user's preferences.
 var STABILITY_INTENT_EXCLUDED_KEYS = ["allow-user-rule-edits"]
+
+// Row fields whose value belongs to the calling user. Empty: the service keeps
+// ONE stability row per machine and refuses an unelevated change of any field
+// (`service_stability_handlers.rs`), so every other key is machine-wide.
+var STABILITY_PER_USER_KEYS = []
 
 // Service-side clamps for the numeric fields. `non-positive` is the value a
 // zero-or-negative input resolves to (0 = "disabled" for the liveness window,
@@ -312,6 +335,7 @@ var STABILITY_FIELD_CLAMPS = {
 
 // Legal values of the slug fields; anything else resolves to the default.
 var STABILITY_FIELD_CHOICES = {
+    "verbose-logging-mode": ["off", "timed", "until-restart"],
     "enforcement-mode": ["resolver", "reactive"],
     "routing-stop-policy": ["teardown", "persist"]
 }
@@ -320,6 +344,103 @@ var STABILITY_FIELD_CHOICES = {
 function stabilityKeyIsKnown(key) {
     return STABILITY_FIELD_DEFAULTS[key] !== undefined
         || STABILITY_STRUCTURED_KEYS.indexOf(key) >= 0
+}
+
+// True when a recorded intent for `key` may be kept at all. A one-shot request
+// such as `verbose-logging-change` never is: replayed on the next connect it
+// would re-open a window that had ended. Neither is the rules lock, nor a key
+// this build no longer has.
+function stabilityIntentIsRecordable(key) {
+    return stabilityKeyIsKnown(key) && STABILITY_INTENT_EXCLUDED_KEYS.indexOf(key) < 0
+}
+
+function stabilityKeyIsMachineWide(key) {
+    return STABILITY_PER_USER_KEYS.indexOf(key) < 0
+}
+
+// What a full-row write may carry forward out of the recorded intent without
+// the user naming it. Never a machine-wide value, not even from an elevated
+// GUI: it would overwrite what another administrator chose.
+function stabilityIntentMayReplay(key) {
+    return stabilityIntentIsRecordable(key) && !stabilityKeyIsMachineWide(key)
+}
+
+function _stabilitySame(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b)
+}
+
+// The part of the recorded intent a full-row write may carry forward.
+function stabilityReplayableIntent(intent) {
+    var out = {}
+    for (var key in (intent || {})) {
+        if (stabilityIntentMayReplay(key)) out[key] = intent[key]
+    }
+    return out
+}
+
+// Recorded intents the live row holds otherwise, as key -> { mine, service },
+// for the settings panels to show: a connect writes nothing back. Parked keys
+// belong to the pending-changes flow.
+function stabilityIntentDivergence(intent, live, parked) {
+    var out = {}
+    for (var key in (intent || {})) {
+        if (!stabilityIntentIsRecordable(key)) continue
+        if (parked && parked.hasOwnProperty(key)) continue
+        var service = stabilityEffective(live, key)
+        if (_stabilitySame(stabilityEffective(intent, key), service)) continue
+        out[key] = { "mine": intent[key], "service": service }
+    }
+    return out
+}
+
+// The recorded intent without `key`: the user chose to keep the service's
+// value. Returns null when there was nothing recorded for it.
+function stabilityIntentWithout(intent, key) {
+    if (!intent || !intent.hasOwnProperty(key)) return null
+    var out = {}
+    for (var k in intent) {
+        if (k !== key) out[k] = intent[k]
+    }
+    return out
+}
+
+// The recorded intent after a user's write the service CONFIRMED. `before` is
+// the row the write was merged onto. A machine-wide key is recorded only when
+// the write was carried out elevated: the GUI itself is, or the value really
+// changed, which the service accepts from nobody else. Any other key the write
+// named loses its old record, since the service now holds the user's latest
+// choice. Returns null when nothing changes.
+function stabilityIntentAfterWrite(intent, partial, before, appElevated) {
+    var out = {}
+    var key
+    for (key in (intent || {})) out[key] = intent[key]
+    var changed = false
+    for (key in (partial || {})) {
+        var value = partial[key]
+        if (value === undefined || !stabilityIntentIsRecordable(key)) continue
+        var elevatedWrite = appElevated === true || !stabilityKeyIsMachineWide(key)
+            || !_stabilitySame(stabilityEffective(partial, key), stabilityEffective(before, key))
+        if (elevatedWrite) {
+            if (_stabilitySame(out[key], value)) continue
+            out[key] = value
+            changed = true
+        } else if (out.hasOwnProperty(key)) {
+            delete out[key]
+            changed = true
+        }
+    }
+    return changed ? out : null
+}
+
+// The requests the verbose-logging control offers, in display order.
+var VERBOSE_LOGGING_CHANGES = ["off", "one-hour", "four-hours", "until-restart"]
+
+// Whole hours and minutes left until `untilMs`, rounded up to the minute so
+// the last minute never reads as zero.
+function remainingHoursMinutes(untilMs, nowMs) {
+    var left = Math.max(0, Number(untilMs || 0) - Number(nowMs || 0))
+    var minutes = Math.ceil(left / 60000)
+    return { "hours": Math.floor(minutes / 60), "minutes": minutes % 60 }
 }
 
 // Normalise ONE scalar stability value to the shape the wire expects, using the
@@ -529,7 +650,7 @@ function mapWireInterfaceRow(w) {
     var rec = w["recommendation"] || {}
     return {
         persistentId: String(w["persistent-id"] || ""),
-        name: String(w["windows-name"] || ""),
+        name: String(w["name"] || ""),
         description: String(w["interface-description"] || ""),
         type: String(w["interface-type"] || ""),
         ip: String(w["local-ip"] || "-"),
@@ -549,9 +670,7 @@ function mapWireInterfaceRow(w) {
         observedFacts: {
             connectivityState: String(of["connectivity-state"] || ""),
             externalIpStatus: String(of["external-ip-status"] || ""),
-            externalIp: (of["external-ip"] === undefined ? null : of["external-ip"]),
-            externalProbeAttempted: !!of["external-probe-attempted"],
-            externalProbeNote: String(of["external-probe-note"] || "")
+            externalIp: (of["external-ip"] === undefined ? null : of["external-ip"])
         },
         derivedAssessment: {
             vpnTunnelLikelihood: String(da["vpn-tunnel-likelihood"] || ""),
@@ -566,7 +685,6 @@ function mapWireInterfaceRow(w) {
             "class": String(rec["class"] || ""),
             confidence: String(rec["confidence"] || ""),
             advisoryOnly: !!rec["advisory-only"],
-            summary: String(rec["summary"] || ""),
             keySignals: rec["key-signals"] || [],
             excludedAlternatives: rec["excluded-alternatives"] || []
         }
@@ -724,6 +842,203 @@ function interfaceCannotCarryTrafficOut(row) {
 
 // ---- pending-apply / review summary counting ----
 
+// The values a rules preview names as refused by the service, joined for the
+// `{rules}` placeholder; "" when it refuses none.
+function refusedRuleValuesText(summary) {
+    var signals = summary && summary["risk-signals"]
+    if (!signals || typeof signals.length !== "number") return ""
+    for (var i = 0; i < signals.length; i += 1) {
+        var signal = signals[i]
+        if (!signal || signal.kind !== "invalid-rule-value" || !signal.rules) continue
+        var values = []
+        for (var j = 0; j < signal.rules.length; j += 1) values.push(String(signal.rules[j]))
+        return values.join(", ")
+    }
+    return ""
+}
+
+// The service's refusal of a previewed change as `{ code, values }`, or null
+// when it would accept the change. A refused preview carries no rule changes,
+// so every reader of a preview asks this before calling it empty: refused is
+// not "nothing to apply". `values` is "" unless the refusal names rule values.
+function previewRefusal(summary) {
+    var signals = summary && summary["risk-signals"]
+    if (!signals || typeof signals.length !== "number") return null
+    for (var i = 0; i < signals.length; i += 1) {
+        var signal = signals[i]
+        if (!signal) continue
+        if (signal.kind === "invalid-rule-value") {
+            return { code: "invalid-rule-value", values: refusedRuleValuesText(summary) }
+        }
+        if (signal.kind === "change-refused") {
+            return { code: String(signal.code || "unknown"), values: "" }
+        }
+    }
+    return null
+}
+
+// Whether the "new version" notice shows for `offer` ({latestVersion, url} or
+// null). A dismissed release stays hidden; the offer is always the newest one
+// the release page names, so any other version is a newer release.
+function updateOfferShown(offer, dismissedVersion) {
+    if (!offer || !offer.latestVersion) return false
+    return String(offer.latestVersion) !== String(dismissedVersion || "")
+}
+
+// The verdict of an `operation.status.get` answer: "" when the operation
+// completed, its error code when it failed, null when the answer says neither
+// (the record is not readable here, or not finished).
+function operationOutcome(ok, status) {
+    if (!ok || !status) return null
+    var state = String(status.state || "")
+    if (state === "completed") return ""
+    if (state === "failed") return String((status.error && status.error.code) || "unknown")
+    return null
+}
+
+// Whether a `snapshot.diagnostics.get` status is the service saying it could
+// not read its alert store (as opposed to no answer at all).
+function securityAlertsUnreadable(status) {
+    if (!status || status.stale === true) return false
+    var security = status.security_status
+    return !security || security.alerts_readable !== true
+}
+
+// The alert list of a `snapshot.diagnostics.get` status, in the shape the
+// launch context carries it. null when the status is no answer from the
+// service, or the service could not read its alerts: an empty list from a
+// failed read must not clear the alerts shown.
+function securityAlertItemsFromStatus(status) {
+    if (!status || status.stale === true) return null
+    if (securityAlertsUnreadable(status)) return null
+    var alerts = status.active_alerts
+    if (!alerts || typeof alerts.length !== "number") return null
+    var items = []
+    for (var i = 0; i < alerts.length; i++) {
+        var a = alerts[i]
+        if (!a) continue
+        items.push({
+            alertId: String(a.alert_id || ""),
+            kind: String(a.kind || ""),
+            state: String(a.state || ""),
+            createdAt: Number(a.created_at || 0),
+            updatedAt: Number(a.updated_at || 0),
+            reasonCode: String(a.reason_code || ""),
+            raisedFile: String(a.raised_file || ""),
+            requiresAction: a.requires_action === true
+        })
+    }
+    return items
+}
+
+// Verdict on an alert acknowledgement from a `snapshot.diagnostics.get`
+// answer: "" once the service no longer lists `alertId` as active, "unknown"
+// while it still does, `failureCode` (or "unknown") when the answer carries
+// no readable list — an empty list from an unreadable store proves nothing.
+function alertAckOutcome(status, alertId, failureCode) {
+    var alerts = securityAlertItemsFromStatus(status)
+    if (alerts === null) return String(failureCode || "unknown")
+    for (var i = 0; i < alerts.length; i++) {
+        if (alerts[i].alertId === String(alertId) && alerts[i].state === "active")
+            return "unknown"
+    }
+    return ""
+}
+
+// Whether a diagnostics snapshot in the launch-context shape is the service's
+// own answer, as opposed to a placeholder or preview content.
+function diagnosticsSnapshotIsLive(snapshot) {
+    return !!snapshot && snapshot.origin === "service" && snapshot.stale !== true
+}
+
+// What to do with a request to re-read the diagnostics snapshot: "read",
+// "queue" it behind the read in flight, or "skip" it. Only a page-open request
+// (`forced` false) is throttled, and only by the last LIVE answer: a failed
+// read leaves the next opening free to try again.
+function diagnosticsReadDecision(inFlight, forced, lastLiveAtMs, nowMs, throttleMs) {
+    if (inFlight) return "queue"
+    if (forced) return "read"
+    var last = Number(lastLiveAtMs) || 0
+    // A clock set back must not hold the page on old data until it catches up.
+    if (last > 0 && nowMs >= last && nowMs - last < throttleMs) return "skip"
+    return "read"
+}
+
+function _nullIfAbsent(value) {
+    return value === undefined ? null : value
+}
+
+// `current` (launch-context shape) with its cards replaced from a
+// `snapshot.diagnostics.get` status; null when the status is no live answer,
+// so a failed or stale read never wipes what is shown. The alert fields are
+// kept: the alert list is the window's own state, merged separately.
+function diagnosticsSnapshotMerged(current, status) {
+    if (!status || status.stale === true || status.origin === "unavailable") return null
+    var health = status.service_health || {}
+    var security = status.security_status || {}
+    var cache = status.cache_health || {}
+    var logs = status.log_health || {}
+    var next = {}
+    var base = current || {}
+    for (var key in base) next[key] = base[key]
+    next.overallHealthy = status.overall_healthy === true
+    next.stale = false
+    next.origin = String(status.origin || "service")
+    next.serviceHealth = {
+        state: String(health.state || ""),
+        activeRevisionId: _nullIfAbsent(health.active_revision_id),
+        pendingChanges: Number(health.pending_changes || 0),
+        startRelativeToSignIn: String(health.start_relative_to_sign_in || "unknown"),
+        startSignInGapMs: _nullIfAbsent(health.start_sign_in_gap_ms)
+    }
+    next.securityStatus = {
+        auditChainOk: security.audit_chain_ok === true,
+        activeAlertCount: Number(security.active_alert_count || 0),
+        auditWriteHealthy: security.audit_write_healthy === true
+    }
+    next.cacheHealth = {
+        entryCount: Number(cache.entry_count || 0),
+        healthy: cache.healthy === true
+    }
+    next.logHealth = {
+        dirWritable: logs.dir_writable === true,
+        totalSizeBytes: Number(logs.total_size_bytes || 0),
+        auditSizeBytes: Number(logs.audit_size_bytes || 0),
+        fileCount: Number(logs.file_count || 0),
+        droppedCount: Number(logs.dropped_count || 0),
+        lastCleanupAt: _nullIfAbsent(logs.last_cleanup_at)
+    }
+    return next
+}
+
+// Storage and audit-chain view of Settings -> Diagnostics and logs, read from
+// the window's diagnostics snapshot. A card the snapshot lacks yields an empty
+// object, which the page draws exactly as it drew a missing launch-context key.
+function diagnosticsStorageView(snapshot) {
+    var logs = snapshot ? snapshot.logHealth : null
+    var security = snapshot ? snapshot.securityStatus : null
+    return {
+        storageHealth: logs ? {
+            logsSizeBytes: logs.totalSizeBytes,
+            auditSizeBytes: logs.auditSizeBytes,
+            logFileCount: logs.fileCount,
+            droppedEvents: logs.droppedCount,
+            lastCleanup: logs.lastCleanupAt,
+            dirWritable: logs.dirWritable
+        } : {},
+        auditChain: security ? { verified: security.auditChainOk } : {}
+    }
+}
+
+// The verdict of re-previewing a confirmed change: "" when it took effect
+// (`unchanged(summary)` holds), the refusal code when the service refuses it,
+// "unknown" otherwise.
+function previewOutcome(summary, unchanged) {
+    var refusal = previewRefusal(summary)
+    if (refusal) return refusal.code
+    return unchanged(summary) ? "" : "unknown"
+}
+
 // True when a dry-run review summary carries no rule changes and no
 // changed-fields. `summary` arrives from the C++ bridge as a QVariantMap whose
 // nested arrays surface as QVariantList (NOT a JS Array), so `Array.isArray()`
@@ -823,7 +1138,15 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
 var ROUTE_POLICY_SNAPSHOT_ONLY_KEYS = ["secondary-link-provider-apps"]
 
 // Bit masks for the numeric wire fields (the protocol bitmask is the only one).
-var ROUTE_POLICY_FIELD_MASKS = { "kill-switch-protocols": 0x7F }
+// A masked value is a selection only when it sets a bit that blocks something
+// and nothing outside its mask, the rule of
+// `nrr_shared::ipc_payloads::is_valid_kill_switch_protocols`; anything else
+// reads as the default rather than being masked into meaning.
+// `enforced` are the bits that block something: "Other" (64) blocks nothing.
+var KILL_SWITCH_PROTOCOLS_ENFORCED = 0x3F
+var ROUTE_POLICY_FIELD_MASKS = {
+    "kill-switch-protocols": { all: 0x7F, enforced: KILL_SWITCH_PROTOCOLS_ENFORCED }
+}
 
 // Normalise ONE route-policy value to the shape the wire expects, using the
 // declared default to pick the coercion. Absent / null / empty reads as the
@@ -837,9 +1160,25 @@ function routePolicyCoerce(key, raw) {
     if (typeof def === "number") {
         var mask = ROUTE_POLICY_FIELD_MASKS[key]
         var n = raw | 0
-        return (mask === undefined) ? n : (n & mask)
+        if (mask === undefined) return n
+        return ((n & mask.enforced) === 0 || (n & ~mask.all) !== 0) ? def : n
     }
     return String(raw)
+}
+
+// Whether the protocol box `bit` must stay ticked: it is the last one that
+// blocks something (the stored "other" bit has no box and blocks nothing), and
+// the service refuses a selection that blocks nothing. Leak protection is switched off by its own toggle, not
+// by unticking every protocol.
+function killSwitchProtocolLocked(mask, bit) {
+    var m = routePolicyCoerce("kill-switch-protocols", mask) & KILL_SWITCH_PROTOCOLS_ENFORCED
+    return (m & bit) !== 0 && (m & ~bit) === 0
+}
+
+// Whether one blocking protocol is left, i.e. its box is locked.
+function killSwitchProtocolsAtLastOne(mask) {
+    var m = routePolicyCoerce("kill-switch-protocols", mask) & KILL_SWITCH_PROTOCOLS_ENFORCED
+    return m !== 0 && (m & (m - 1)) === 0
 }
 
 // Effective CURRENT value of one route-policy key from a snapshot (or from any
@@ -1108,13 +1447,31 @@ function autoRuleRowThirdParty(row) {
 // A rule of "domain + *.domain" acts on the whole group, so selection and
 // bulk actions key on the DOMAIN, not on individual candidate ids -- callers
 // don't need an id->group lookup, just `group.pendingIds` / `.dismissedIds`.
-/// Split the merged suggestion groups by status.
+/// Does the suggestions list show this offer without being asked to show more?
 ///
-/// The inbox is a list of things to answer; an address already answered with
-/// "don't suggest again" is history, and mixing the two made a screen of ten
-/// decisions look like a screen of forty. `showDismissed` false keeps only the
-/// groups that still hold something pending, and hides the answered hosts
-/// inside them.
+/// The service decides (`served-by-main-link`, the rule behind its counts);
+/// every window reads that one mark — list, group caption, tray popup — so no
+/// surface offers or counts a row another one hides. Takes a wire row or a
+/// grouped host.
+function autoRuleShownByDefault(row) {
+    return !(row && (row["served-by-main-link"] === true || row.servedByMainLink === true))
+}
+
+/// The wire rows a window may offer unasked: what the tray popup chooses from.
+function autoRuleRowsShownByDefault(rows) {
+    return (rows || []).filter(function(row) { return !!row && autoRuleShownByDefault(row) })
+}
+
+/// Pending hosts a group card lists after the list's filters: its caption.
+function countShownPendingAutoRuleHosts(group) {
+    var n = 0
+    var hosts = (group || {}).hosts || []
+    for (var h = 0; h < hosts.length; h += 1) {
+        if (hosts[h] && hosts[h].status === "pending") n += 1
+    }
+    return n
+}
+
 /// Split off the hosts the main route already serves.
 ///
 /// The service withholds these from the tray and marks them here. They are not
@@ -1123,7 +1480,9 @@ function autoRuleRowThirdParty(row) {
 /// isn't this host in the list" is visible instead of absent.
 ///
 /// A group whose hosts are ALL served disappears from the main list; a mixed
-/// group keeps the hosts that still carry a question.
+/// group keeps the hosts that still carry a question. The id lists shrink with
+/// the hosts: the card's buttons act on what the card shows, never on a host
+/// the user cannot see.
 function filterAutoRuleGroupsServedByMainLink(groups, showServed) {
     if (showServed) return groups || []
     var out = []
@@ -1131,12 +1490,20 @@ function filterAutoRuleGroupsServedByMainLink(groups, showServed) {
         var g = groups[i]
         if (!g) continue
         var hosts = []
+        var pendingIds = []
+        var dismissedIds = []
         for (var h = 0; h < (g.hosts || []).length; h += 1) {
-            if (g.hosts[h] && g.hosts[h].servedByMainLink !== true) hosts.push(g.hosts[h])
+            var host = g.hosts[h]
+            if (!host || !autoRuleShownByDefault(host)) continue
+            hosts.push(host)
+            if (host.status === "pending") pendingIds.push(host.id)
+            else dismissedIds.push(host.id)
         }
         if (hosts.length === 0) continue
         var copy = Object.assign({}, g)
         copy.hosts = hosts
+        copy.pendingIds = pendingIds
+        copy.dismissedIds = dismissedIds
         out.push(copy)
     }
     return out
@@ -1148,12 +1515,19 @@ function countAutoRuleHostsServedByMainLink(groups) {
     for (var i = 0; i < (groups || []).length; i += 1) {
         var hosts = (groups[i] || {}).hosts || []
         for (var h = 0; h < hosts.length; h += 1) {
-            if (hosts[h] && hosts[h].servedByMainLink === true) n += 1
+            if (hosts[h] && !autoRuleShownByDefault(hosts[h])) n += 1
         }
     }
     return n
 }
 
+/// Split the merged suggestion groups by status.
+///
+/// The inbox is a list of things to answer; an address already answered with
+/// "don't suggest again" is history, and mixing the two made a screen of ten
+/// decisions look like a screen of forty. `showDismissed` false keeps only the
+/// groups that still hold something pending, and hides the answered hosts
+/// inside them.
 function filterAutoRuleGroupsByStatus(groups, showDismissed) {
     if (showDismissed) return groups || []
     var out = []
@@ -1219,8 +1593,7 @@ function groupAutoRuleRows(candidates, dismissed) {
             primaryBehavior: String(row["primary-behavior"] || row.primaryBehavior || ""),
             anchorRefusesMainLink: (row["anchor-refuses-main-link"] === true)
                 || (row.anchorRefusesMainLink === true),
-            servedByMainLink: (row["served-by-main-link"] === true)
-                || (row.servedByMainLink === true),
+            servedByMainLink: !autoRuleShownByDefault(row),
             thirdParty: autoRuleRowThirdParty(row),
             observedMembers: (row["observed-members"] || row.observedMembers || []).map(String),
             timestampMs: ts

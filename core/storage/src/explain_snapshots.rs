@@ -10,36 +10,27 @@
 //! from the engine's caller), and PRIMARY KEY collisions surface as
 //! `Internal` errors the orchestrator can log + drop.
 
+use nrr_domain::decision_explain::ExplainDetailLevel;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{StorageError, StorageResult};
 
-/// Wire-stable redaction-mode slug used in the `redaction_level`
-/// column. Matches the slugs documented by
-/// `nrr_diagnostics::ExplainQueryKind` for round-trip consistency.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExplainRedactionLevel {
-    CompactUi,
-    Diagnostics,
-    DeveloperTrace,
+/// The `redaction_level` column's spelling of a detail level; the table's
+/// CHECK constraint pins exactly these three.
+fn level_slug(level: ExplainDetailLevel) -> &'static str {
+    match level {
+        ExplainDetailLevel::CompactUi => "compact-ui",
+        ExplainDetailLevel::Diagnostics => "diagnostics",
+        ExplainDetailLevel::DeveloperTrace => "developer-trace",
+    }
 }
 
-impl ExplainRedactionLevel {
-    pub fn slug(self) -> &'static str {
-        match self {
-            Self::CompactUi => "compact-ui",
-            Self::Diagnostics => "diagnostics",
-            Self::DeveloperTrace => "developer-trace",
-        }
-    }
-
-    pub fn from_slug(s: &str) -> Option<Self> {
-        match s {
-            "compact-ui" => Some(Self::CompactUi),
-            "diagnostics" => Some(Self::Diagnostics),
-            "developer-trace" => Some(Self::DeveloperTrace),
-            _ => None,
-        }
+fn level_from_slug(s: &str) -> Option<ExplainDetailLevel> {
+    match s {
+        "compact-ui" => Some(ExplainDetailLevel::CompactUi),
+        "diagnostics" => Some(ExplainDetailLevel::Diagnostics),
+        "developer-trace" => Some(ExplainDetailLevel::DeveloperTrace),
+        _ => None,
     }
 }
 
@@ -48,7 +39,7 @@ impl ExplainRedactionLevel {
 pub struct ExplainSnapshotRecord {
     pub decision_id: String,
     pub created_at: i64,
-    pub redaction_level: ExplainRedactionLevel,
+    pub redaction_level: ExplainDetailLevel,
     /// Opaque JSON payload — the producer (`ProductionDiagnosticsFacade`)
     /// rehydrates this into an `ExplainResponse` via `serde_json`.
     pub payload_json: String,
@@ -77,7 +68,7 @@ impl<'c> ExplainSnapshotRepository<'c> {
                 params![
                     record.decision_id,
                     record.created_at,
-                    record.redaction_level.slug(),
+                    level_slug(record.redaction_level),
                     record.payload_json,
                     record.expires_at,
                 ],
@@ -108,7 +99,7 @@ impl<'c> ExplainSnapshotRepository<'c> {
             .optional()
             .map_err(|e| StorageError::Internal(format!("explain_snapshots get: {e}")))?
             .map(|(id, created_at, level_slug, payload, expires_at)| {
-                let level = ExplainRedactionLevel::from_slug(&level_slug).ok_or_else(|| {
+                let level = level_from_slug(&level_slug).ok_or_else(|| {
                     StorageError::Internal(format!(
                         "explain_snapshots: unknown redaction_level slug {level_slug:?}"
                     ))
@@ -170,7 +161,7 @@ mod tests {
         ExplainSnapshotRecord {
             decision_id: id.into(),
             created_at,
-            redaction_level: ExplainRedactionLevel::CompactUi,
+            redaction_level: ExplainDetailLevel::CompactUi,
             payload_json: r#"{"input":null,"summary":{"summary_key":"ok"}}"#.into(),
             expires_at,
         }
@@ -179,13 +170,13 @@ mod tests {
     #[test]
     fn redaction_level_slug_roundtrips() {
         for v in [
-            ExplainRedactionLevel::CompactUi,
-            ExplainRedactionLevel::Diagnostics,
-            ExplainRedactionLevel::DeveloperTrace,
+            ExplainDetailLevel::CompactUi,
+            ExplainDetailLevel::Diagnostics,
+            ExplainDetailLevel::DeveloperTrace,
         ] {
-            assert_eq!(ExplainRedactionLevel::from_slug(v.slug()), Some(v));
+            assert_eq!(level_from_slug(level_slug(v)), Some(v));
         }
-        assert_eq!(ExplainRedactionLevel::from_slug("bogus"), None);
+        assert_eq!(level_from_slug("bogus"), None);
     }
 
     #[test]

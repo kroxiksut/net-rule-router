@@ -43,25 +43,29 @@ impl<'c> VpnClientAppsRepository<'c> {
         if exe_path.trim().is_empty() {
             return Ok(());
         }
-        self.conn
-            .execute(
-                "INSERT INTO vpn_client_apps (exe_path, learned_at)
+        // The eviction keeps the cap only if it commits with the insert.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| StorageError::Internal(format!("vpn_client_apps tx: {e}")))?;
+        tx.execute(
+            "INSERT INTO vpn_client_apps (exe_path, learned_at)
                  VALUES (?1, ?2)
                  ON CONFLICT(exe_path) DO UPDATE SET learned_at = excluded.learned_at",
-                params![exe_path, now],
-            )
-            .map_err(|e| StorageError::Internal(format!("vpn_client_apps upsert: {e}")))?;
-        self.conn
-            .execute(
-                "DELETE FROM vpn_client_apps WHERE exe_path IN (
+            params![exe_path, now],
+        )
+        .map_err(|e| StorageError::Internal(format!("vpn_client_apps upsert: {e}")))?;
+        tx.execute(
+            "DELETE FROM vpn_client_apps WHERE exe_path IN (
                      SELECT exe_path FROM vpn_client_apps
                      ORDER BY learned_at DESC, exe_path ASC
                      LIMIT -1 OFFSET ?1
                  )",
-                params![MAX_CLIENT_APPS as i64],
-            )
-            .map_err(|e| StorageError::Internal(format!("vpn_client_apps evict: {e}")))?;
-        Ok(())
+            params![MAX_CLIENT_APPS as i64],
+        )
+        .map_err(|e| StorageError::Internal(format!("vpn_client_apps evict: {e}")))?;
+        tx.commit()
+            .map_err(|e| StorageError::Internal(format!("vpn_client_apps commit: {e}")))
     }
 
     /// Load every persisted client exe path, newest first.
@@ -101,12 +105,12 @@ mod tests {
         let conn = migrated_conn();
         let repo = VpnClientAppsRepository::new(&conn);
         repo.upsert(r"C:\Apps\openvpn.exe", 100).expect("insert");
-        repo.upsert(r"C:\Apps\swiftvpn 3.0.exe", 200)
+        repo.upsert(r"C:\Apps\examplevpn 3.0.exe", 200)
             .expect("insert");
         assert_eq!(
             repo.load().expect("load"),
             vec![
-                r"C:\Apps\swiftvpn 3.0.exe".to_string(),
+                r"C:\Apps\examplevpn 3.0.exe".to_string(),
                 r"C:\Apps\openvpn.exe".to_string()
             ]
         );
@@ -154,6 +158,30 @@ mod tests {
             loaded.first().map(String::as_str),
             Some(format!(r"C:\Apps\client-{}.exe", MAX_CLIENT_APPS + 3).as_str()),
             "newest row survives"
+        );
+    }
+
+    #[test]
+    fn a_failed_eviction_rolls_the_upsert_back_so_the_cap_holds() {
+        let conn = migrated_conn();
+        let repo = VpnClientAppsRepository::new(&conn);
+        for i in 0..MAX_CLIENT_APPS {
+            repo.upsert(&format!(r"C:\Apps\client-{i}.exe"), i as i64)
+                .expect("fill to cap");
+        }
+        let before = repo.load().expect("load");
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_evict BEFORE DELETE ON vpn_client_apps
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .expect("trigger");
+
+        assert!(repo.upsert(r"C:\Apps\late.exe", 10_000).is_err());
+
+        assert_eq!(
+            repo.load().expect("load"),
+            before,
+            "table unchanged, cap holds"
         );
     }
 }

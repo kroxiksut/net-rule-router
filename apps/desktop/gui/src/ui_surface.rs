@@ -1,8 +1,9 @@
-use nrr_application::backend_facade::network_interfaces::RouteSelectionRequest;
-use nrr_application::backend_facade::rules::RulesScreenRequest;
 use nrr_application::backend_facade::{
     BackendConnectionStatus, BackendFacade, BackendProviderKind,
 };
+use nrr_application::mock_backend::network_interfaces::RouteSelectionRequest;
+use nrr_application::mock_backend::rules::RulesScreenRequest;
+use nrr_shared::launcher_rpc::HostAnswerDeadlines;
 use nrr_shared::{
     resolve_catalog_text, AppSection, AppShellModel, LocaleLoadStatus, RouteBehaviorMode, ThemeMode,
 };
@@ -80,51 +81,19 @@ fn reset_script_command_line(path: &str) -> String {
     }
 }
 
-fn default_archive_folder_hint() -> String {
-    if let Some(profile) = env::var_os("USERPROFILE") {
-        let mut path = PathBuf::from(profile);
-        path.push("Documents");
-        path.push("NetRuleRouter");
-        path.push("diagnostic-archives");
-        return path.to_string_lossy().into_owned();
-    }
-    r"%USERPROFILE%\Documents\NetRuleRouter\diagnostic-archives".to_string()
-}
-
-fn resolve_logs_directory() -> Option<PathBuf> {
-    // The service's own operational-log directory, asked of the layer that
-    // declares it (`%ProgramData%\<product>\logs` on Windows,
-    // `/var/log/<product>` on Linux). The user-facing "Open logs folder"
-    // action MUST land there or the user sees an empty directory.
-    let leaf = nrr_platform_api::paths::product_dir_leaf();
-    let mut candidates = Vec::new();
-    candidates.extend(nrr_platform_api::paths::production_logs_dir());
-    // Fallbacks for environments where the service isn't installed
-    // (dev/test). We do NOT create the production one — the service owns
-    // that path and the GUI shouldn't be racing the ACL setup. Per-user
-    // candidates remain as last resort.
-    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(local_app_data).join(leaf).join("logs"));
-    }
-    if let Some(app_data) = env::var_os("APPDATA") {
-        candidates.push(PathBuf::from(app_data).join(leaf).join("logs"));
-    }
-    candidates.push(env::temp_dir().join(leaf).join("logs"));
-
-    // Existing path wins — and only if THIS process can actually list it.
-    // The service's log directory is closed to ordinary users, so offering to
-    // open a folder the user cannot read would send them to an empty window
-    // with no explanation; the window shows "unavailable" instead, and the
-    // diagnostics archive is the path that works for everyone.
-    if let Some(existing) = candidates
-        .iter()
-        .find(|p| p.is_dir() && fs::read_dir(p).is_ok())
-    {
-        return Some(existing.clone());
-    }
-    candidates
-        .into_iter()
-        .find(|candidate| fs::create_dir_all(candidate).is_ok())
+/// URL of the service's operational-log directory (the `paths` SSOT), for
+/// "Open logs folder"; its parent while the service has not written a log yet.
+/// Offered whether or not THIS process can list it: the file manager asks for
+/// the access itself. Never created here: the service owns it and its ACL. The
+/// C++ host reads this same value from the launch context.
+pub fn logs_folder_url() -> Option<String> {
+    let dir = nrr_platform_api::paths::production_logs_dir()?;
+    let existing = if dir.is_dir() {
+        dir
+    } else {
+        dir.parent().filter(|p| p.is_dir())?.to_path_buf()
+    };
+    Some(path_to_file_url(&existing))
 }
 
 /// Embedded: the package does not ship `LICENSE` as a file.
@@ -205,6 +174,7 @@ pub fn write_qt_context_file_at(
     request: &crate::app_shell::LaunchRequest,
     backend: &dyn BackendFacade,
     backend_status: &BackendConnectionStatus,
+    answer_deadlines: &HostAnswerDeadlines,
 ) -> Result<(), String> {
     // One pass over the locale files, not three: each of the old calls loaded,
     // parsed and validated both files in full, and this emitter needs all three
@@ -221,7 +191,7 @@ pub fn write_qt_context_file_at(
         .iter()
         .filter(|report| report.status == LocaleLoadStatus::AcceptedWithWarnings)
         .collect::<Vec<_>>();
-    let base_route_selection_request = RouteSelectionRequest {
+    let interfaces_request = RouteSelectionRequest {
         primary_candidate_id: if preferences.selected_primary_interface_id.trim().is_empty() {
             None
         } else {
@@ -256,12 +226,7 @@ pub fn write_qt_context_file_at(
             Some(preferences.selected_secondary_interface_name.clone())
         },
         secondary_candidate_confirmed: preferences.secondary_role_user_confirmed,
-        include_bluetooth_adapters: preferences.show_bluetooth_adapters,
         behavior_mode: preferences.route_behavior_mode,
-    };
-    let interfaces_request = RouteSelectionRequest {
-        include_bluetooth_adapters: true,
-        ..base_route_selection_request.clone()
     };
     // Backend snapshots flow through `BackendFacade`. For mock /
     // preview-local providers, the methods delegate to the same
@@ -314,11 +279,13 @@ pub fn write_qt_context_file_at(
     };
     timed("rules", t);
     let t = std::time::Instant::now();
+    // Out of budget there is no answer, so neither may read as a healthy
+    // service: the same "unknown" the facade hands out on an IPC failure.
     let diagnostics_status = if budget_left(&cold_start_started) {
         backend.diagnostics_status_snapshot()
     } else {
         budget_spent = true;
-        nrr_application::mock_backend::diagnostics::preview_diagnostics_status()
+        nrr_application::mock_backend::diagnostics::DiagnosticsStatusDto::unavailable()
     };
     timed("diagnostics", t);
     let t = std::time::Instant::now();
@@ -326,7 +293,7 @@ pub fn write_qt_context_file_at(
         backend.list_security_alerts(None)
     } else {
         budget_spent = true;
-        nrr_application::mock_backend::diagnostics::preview_active_security_alerts()
+        nrr_application::mock_backend::diagnostics::SecurityAlertsView::unavailable()
     };
     timed("alerts", t);
     // Logs and audit are NOT fetched here. Both are paged screens the user
@@ -340,18 +307,10 @@ pub fn write_qt_context_file_at(
     let audit_page = nrr_application::mock_backend::logs::PageResult::<
         nrr_application::mock_backend::logs::AuditEntryDto,
     >::empty();
-    let t = std::time::Instant::now();
-    let security_snapshot = if budget_left(&cold_start_started) {
-        backend.status_snapshot()
-    } else {
-        budget_spent = true;
-        nrr_application::mock_backend::security_status::security_status_preview_snapshot()
-    };
-    timed("status", t);
     let total: u128 = cold_start_timings.iter().map(|(_, ms)| ms).sum();
     if budget_spent {
         println!(
-            "NRR_LAUNCHER[cold-start] budget of {}ms spent — the rest is local,              the window opens now and the GUI refreshes from the service",
+            "NRR_LAUNCHER[cold-start] budget of {}ms spent — the rest is local, the window opens now and the GUI refreshes from the service",
             COLD_START_BACKEND_BUDGET.as_millis()
         );
     }
@@ -368,9 +327,7 @@ pub fn write_qt_context_file_at(
     let icon_file_url = resolve_icon_path()
         .as_ref()
         .map(|path| path_to_file_url(path));
-    let logs_folder_url = resolve_logs_directory()
-        .as_ref()
-        .map(|path| path_to_file_url(path));
+    let logs_folder_url = logs_folder_url();
     let reset_script_path =
         resolve_reset_script_path().map(|path| path.to_string_lossy().into_owned());
     let reset_script_command = reset_script_path.as_deref().map(reset_script_command_line);
@@ -395,25 +352,13 @@ pub fn write_qt_context_file_at(
             "errors": report.errors,
         })).collect::<Vec<_>>(),
     });
-    let interfaces_role_assignment_advisory = json!({
-        "manualConfirmationRequired": interfaces_snapshot
-            .role_assignment_advisory
-            .manual_confirmation_required,
-        "userChoicePriorityNote": interfaces_snapshot
-            .role_assignment_advisory
-            .user_choice_priority_note,
-        "conflictWarning": interfaces_snapshot
-            .role_assignment_advisory
-            .conflict_warning,
-        "warnings": interfaces_snapshot.role_assignment_advisory.warnings,
-    });
     let interface_rows_json = interfaces_snapshot
         .rows
         .iter()
         .map(|row| {
             json!({
                 "persistentId": row.persistent_id,
-                "name": row.windows_name,
+                "name": row.name,
                 "description": row.interface_description,
                 "type": row.interface_type,
                 "ip": row.local_ip,
@@ -431,8 +376,6 @@ pub fn write_qt_context_file_at(
                     "connectivityState": row.observed_facts.connectivity_state.title(),
                     "externalIpStatus": row.observed_facts.external_ip_status.title(),
                     "externalIp": row.observed_facts.external_ip,
-                    "externalProbeAttempted": row.observed_facts.external_probe_attempted,
-                    "externalProbeNote": row.observed_facts.external_probe_note,
                 },
                 "derivedAssessment": {
                     "vpnTunnelLikelihood": row.derived_assessment.vpn_tunnel_likelihood.title(),
@@ -453,7 +396,6 @@ pub fn write_qt_context_file_at(
                     "class": row.recommendation.class.title(),
                     "confidence": row.recommendation.confidence.title(),
                     "advisoryOnly": row.recommendation.advisory_only,
-                    "summary": row.recommendation.summary,
                     "keySignals": row.recommendation.key_signals,
                     "excludedAlternatives": row.recommendation.excluded_alternatives,
                 },
@@ -467,18 +409,15 @@ pub fn write_qt_context_file_at(
     // runtime-bound type, so we surface it alongside the runtime types as a
     // synthetic entry. The QML dialog uses string ids and reads localized
     // titles via `rules.type.<id>`, so adding "zone" here is non-invasive.
-    // Validation status comes from the strict semantic validator in
-    // `nrr-domain`: same rules as the QML Add-Rule dialog enforces, so
-    // any row imported from a hand-edited file gets the same diagnosis
-    // as if the user had typed it. The validator is pure; no I/O. The
-    // mock fixture also includes one row with a deliberately malformed
-    // IPv4 (`300.1.1.1` from `nrr-mock-backend::rules`) so the red-state
-    // GUI rendering is exercised without a real service.
+    // Validation status is the per-row verdict of `nrr-domain` — the one the
+    // Add/Edit dialog is gated on, so a typed and an imported row are judged
+    // alike.
     //
-    // Production path: the parser-supplied status now ships over IPC
-    // from the service via `RulesListResponse.rows[i].validation_status`
-    // (16.4 / 16.11). The in-place revalidation below is retained as
-    // a fallback for the preview (mock) mode only.
+    // In production the parser-supplied status ships over IPC from the
+    // service via `RulesListResponse.rows[i].validation_status`. The
+    // in-place revalidation below is retained as a fallback for the
+    // preview (mock) mode only, whose fixture (`nrr-mock-backend::rules`)
+    // carries only valid match values today.
     // Demo rules are something the user asks for — the first-run wizard's
     // "use built-in demo rules", the Rules screen's "load demo rules" — never
     // something a launch hands them. A service-backed start therefore carries
@@ -605,6 +544,8 @@ pub fn write_qt_context_file_at(
         "backendServiceBacked": backend_service_backed,
         "iconFileUrl": icon_file_url,
         "platformProfile": platform_profile,
+        // How long `RpcTransport.qml` waits for each answer; the launcher owns the budgets.
+        "rpcAnswerDeadlines": answer_deadlines,
         // First-run answers supplied ahead of launch (installer payload, or a
         // file beside a portable copy). `completesFirstRun` is the wizard's
         // whole gate; the individual answers pre-fill it when it does open.
@@ -772,10 +713,6 @@ pub fn write_qt_context_file_at(
             "lastLoadedPathSecondary": preferences.last_loaded_path_secondary.clone(),
             "autoOpenOnLaunchPathPrimary": preferences.auto_open_on_launch_path_primary.clone(),
             "autoOpenOnLaunchPathSecondary": preferences.auto_open_on_launch_path_secondary.clone(),
-            "lastFileSyncedRevisionIdPrimary": preferences.last_file_synced_revision_id_primary.clone(),
-            "lastFileSyncedRevisionIdSecondary": preferences.last_file_synced_revision_id_secondary.clone(),
-            "lastFileSyncedHashPrimary": preferences.last_file_synced_hash_primary.clone(),
-            "lastFileSyncedHashSecondary": preferences.last_file_synced_hash_secondary.clone(),
             // UAC decline state, surfaced so the FirstLaunchInstallDialog
             // and connection-banner action can downgrade to passive when
             // re-prompting is annoying.
@@ -790,6 +727,9 @@ pub fn write_qt_context_file_at(
             "importOnlyActive": preferences.import_only_active,
             "compatBannerMode": preferences.compat_banner_mode.clone(),
             "updatePageUrl": preferences.update_page_url.clone(),
+            "updateCheckEnabled": preferences.update_check_enabled,
+            "updateCheckIntervalDays": preferences.update_check_interval_days,
+            "dismissedUpdateVersion": preferences.dismissed_update_version.clone(),
             "showBundledPresets": preferences.show_bundled_presets,
             // Folder the user keeps their own rule sets in. Empty means the
             // quick-load dropdown lists the shipped sets.
@@ -824,48 +764,6 @@ pub fn write_qt_context_file_at(
             "nativeLabel": descriptor.native_label,
         })).collect::<Vec<_>>(),
         "firstRun": {
-            "wizardRequired": first_run.wizard_required,
-            "selectedScenario": first_run.selected_scenario.slug(),
-            "availableScenarios": first_run.available_scenarios.iter().map(|scenario| json!({
-                "id": scenario.slug(),
-                "title": resolve_catalog_text(
-                    &locale_catalog,
-                    &preferences.language,
-                    &format!("first-run.scenario.{}", scenario.slug()),
-                    scenario.title(),
-                ),
-            })).collect::<Vec<_>>(),
-            "steps": first_run.steps.iter().map(|step| json!({
-                "id": resolve_catalog_text(
-                    &locale_catalog,
-                    &preferences.language,
-                    &format!("first-run.step.{}", first_run_step_key(step.id)),
-                    step.id.title(),
-                ),
-                "required": step.required
-            })).collect::<Vec<_>>(),
-            "startupStates": first_run.startup_states.iter().map(|state| json!({
-                "section": state.section.slug(),
-                "sectionLabel": resolve_catalog_text(
-                    &locale_catalog,
-                    &preferences.language,
-                    &format!("section.{}", state.section.slug()),
-                    state.section.title(),
-                ),
-                "state": resolve_catalog_text(
-                    &locale_catalog,
-                    &preferences.language,
-                    &format!("first-run.state.{}", startup_state_key(state.state)),
-                    state.state.title(),
-                ),
-                "note": state.note,
-            })).collect::<Vec<_>>(),
-            "listEditingPreviewNotice": resolve_catalog_text(
-                &locale_catalog,
-                &preferences.language,
-                "first-run.notice.list-editing-preview",
-                first_run.list_editing_preview_notice,
-            ),
             "completionNotice": resolve_catalog_text(
                 &locale_catalog,
                 &preferences.language,
@@ -874,18 +772,11 @@ pub fn write_qt_context_file_at(
             ),
         },
         "interfaces": {
-            "roleExplanation": resolve_catalog_text(
-                &locale_catalog,
-                &preferences.language,
-                "interfaces.role-explanation",
-                interfaces_snapshot.role_explanation,
-            ),
             "dataSource": interfaces_snapshot.data_source.title(),
             "selectedBehaviorMode": interfaces_snapshot.selected_behavior_mode.slug(),
-            "roleAssignmentAdvisory": interfaces_role_assignment_advisory,
+            // QML labels each mode itself from `interfaces.mode.<id>`.
             "supportedBehaviorModes": interfaces_snapshot.supported_behavior_modes.iter().map(|mode| json!({
                 "id": mode.slug(),
-                "label": mode.user_label(),
             })).collect::<Vec<_>>(),
             "rows": interface_rows_json,
         },
@@ -914,6 +805,10 @@ pub fn write_qt_context_file_at(
                 "auditWriteHealthy": diagnostics_status.security_status.audit_write_healthy,
             },
             "alertsStale": active_alerts.stale,
+            // The service answered but could not read its alert store: the
+            // list says nothing, which is not "no alerts".
+            "alertsUnreadable": !diagnostics_status.stale
+                && !diagnostics_status.security_status.alerts_readable,
             "activeAlerts": active_alerts.alerts.iter().map(|alert| json!({
                 "alertId": alert.alert_id,
                 "kind": alert.kind,
@@ -931,20 +826,14 @@ pub fn write_qt_context_file_at(
             "logHealth": {
                 "dirWritable": diagnostics_status.log_health.dir_writable,
                 "totalSizeBytes": diagnostics_status.log_health.total_size_bytes,
+                "auditSizeBytes": diagnostics_status.log_health.audit_size_bytes,
                 "fileCount": diagnostics_status.log_health.file_count,
                 "droppedCount": diagnostics_status.log_health.dropped_count,
                 "lastCleanupAt": diagnostics_status.log_health.last_cleanup_at,
             },
-            "diagnosticMode": {
-                "active": diagnostics_status.diagnostic_mode.active,
-                "expiresAt": diagnostics_status.diagnostic_mode.expires_at,
-                "remainingMs": diagnostics_status.diagnostic_mode.remaining_ms,
-                "scopeKey": diagnostics_status.diagnostic_mode.scope_key,
-            },
             // Cold-start emit is null; the GUI fetches a real explain
-            // sample on demand via `rpcExplainGetBySample` /
-            // `rpcExplainGetByDecisionId` and renders it in the
-            // Diagnostics section. The cold JSON slot stays `null`
+            // sample on demand via `rpcExplainGetBySample` and renders it
+            // in the Diagnostics section. The cold JSON slot stays `null`
             // because explain output is per-decision, not a bootstrap
             // snapshot.
             "explainSample": null,
@@ -981,45 +870,8 @@ pub fn write_qt_context_file_at(
             "totalKnownCount": audit_page.total_count,
             "stale": audit_page.stale,
         },
-        "diagnosticsSettings": {
-            "retention": {
-                "logsMaxAgeDays": 90,
-                "logsMaxSizeMb": 50,
-                "auditMaxAgeDays": 365,
-                "auditMaxSizeMb": 50,
-            },
-            "storageHealth": {
-                "logsSizeBytes": diagnostics_status.log_health.total_size_bytes,
-                "auditSizeBytes": diagnostics_status.log_health.audit_size_bytes,
-                "logFileCount": diagnostics_status.log_health.file_count,
-                "droppedEvents": diagnostics_status.log_health.dropped_count,
-                "lastCleanup": diagnostics_status.log_health.last_cleanup_at,
-                "dirWritable": diagnostics_status.log_health.dir_writable,
-            },
-            "diagnosticMode": {
-                "active": diagnostics_status.diagnostic_mode.active,
-                "selectedTtlMs": 3_600_000_i64,
-                "remainingMs": diagnostics_status.diagnostic_mode.remaining_ms,
-                "expiresAt": diagnostics_status.diagnostic_mode.expires_at,
-                "scopeKey": diagnostics_status.diagnostic_mode.scope_key,
-            },
-            "auditChain": {
-                "verified": diagnostics_status.security_status.audit_chain_ok,
-            },
-            "activeAlertsCount": diagnostics_status.security_status.active_alert_count,
-            "archiveDefaultFolder": default_archive_folder_hint(),
-        },
-        "security": {
-            "activeRevision": security_snapshot.active_revision,
-            "pendingChanges": security_snapshot.pending_changes.title(),
-            "tamperAlerts": security_snapshot.tamper_alerts.title(),
-            "rollbackState": security_snapshot.rollback_state.title(),
-            "serviceStatus": security_snapshot.service_status.title(),
-            "explainWarnings": security_snapshot.explain_warnings.title(),
-        },
         "about": {
             "productName": about.product_name,
-            "edition": about.edition,
             "version": about.version,
             "license": about.license,
             "buildProfile": about.build_profile,
@@ -1033,12 +885,18 @@ pub fn write_qt_context_file_at(
             "logsFolderUrl": logs_folder_url,
             "licenseText": license_text,
         },
-        // Daily GitHub release check result (from the launcher-maintained
+        // Scheduled GitHub release check result (from the launcher-maintained
         // cache; see `crate::update_check`). `null` when up to date / never
-        // checked / cache unreadable — the QML notification only fires on
-        // a concrete newer version.
-        "updateCheck": crate::update_check::update_available(env!("CARGO_PKG_VERSION"))
+        // checked / cache unreadable / the check is switched off — the QML
+        // notification only fires on a concrete newer version.
+        "updateCheck": preferences
+            .update_check_enabled
+            .then(|| crate::update_check::update_available(env!("CARGO_PKG_VERSION")))
+            .flatten()
             .map(|(version, url)| json!({ "latestVersion": version, "url": url })),
+        // The frequency dropdown offers exactly what the preference accepts.
+        "updateCheckIntervalChoices":
+            nrr_ui_support::ui_preferences::UPDATE_CHECK_INTERVAL_DAYS_CHOICES,
         "eula": {
             // Back-compat: `text` = the text for the CURRENT app language.
             "text": eula_text,
@@ -1079,34 +937,33 @@ pub fn apply_qt_preferences_payload(
     Ok(payload.apply_over(current))
 }
 
-fn first_run_step_key(step: nrr_shared::FirstRunStepId) -> &'static str {
-    match step {
-        nrr_shared::FirstRunStepId::Welcome => "welcome",
-        nrr_shared::FirstRunStepId::BasicScenarioSelection => "basic-scenario-selection",
-        nrr_shared::FirstRunStepId::RoutesSetup => "routes-setup",
-        nrr_shared::FirstRunStepId::RulesSetup => "rules-setup",
-        nrr_shared::FirstRunStepId::DiagnosticsPreview => "diagnostics-preview",
-        nrr_shared::FirstRunStepId::Finish => "finish",
-    }
-}
-
-fn startup_state_key(state: nrr_shared::StartupDataState) -> &'static str {
-    match state {
-        nrr_shared::StartupDataState::Empty => "empty",
-        nrr_shared::StartupDataState::SemiEmpty => "semi-empty",
-        nrr_shared::StartupDataState::TestDataPreview => "test-data-preview",
-    }
-}
-
-fn path_to_file_url(path: &Path) -> String {
+/// `file://` URL for a local path, percent-encoded: a reader parses it with a
+/// URL parser, which would cut `C:\Users\C#dev` at `#` and decode `%XX`.
+pub fn path_to_file_url(path: &Path) -> String {
     let normalized = path.to_string_lossy().replace('\\', "/");
-    if normalized.starts_with('/') {
-        format!("file://{normalized}")
+    let mut url = String::with_capacity(normalized.len() + 8);
+    url.push_str(if normalized.starts_with('/') {
+        "file://"
     } else {
-        format!("file:///{normalized}")
+        "file:///"
+    });
+    for byte in normalized.bytes() {
+        // RFC 3986 `pchar` plus the separator; everything else is escaped.
+        if byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&byte) {
+            url.push(char::from(byte));
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            url.push('%');
+            url.push(char::from(HEX[usize::from(byte >> 4)]));
+            url.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
     }
+    url
 }
 
+/// Every field is an `Option`: a missing key keeps the stored value, where a
+/// serde default would reset it. Fields whose stored value is itself optional
+/// take [`present`], so an explicit `null` still clears them.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QtPreferencesPayload {
@@ -1116,34 +973,22 @@ struct QtPreferencesPayload {
     minimize_to_tray_instead_of_close: Option<bool>,
     #[serde(default)]
     show_notifications: Option<bool>,
-    /// Additive: a payload written before the per-kind mute existed leaves the
-    /// stripe enabled, which is the pre-existing behaviour.
-    #[serde(default = "default_true")]
-    notify_suggestion_changes: bool,
-    /// Additive: a payload written before this mute existed leaves the
-    /// block-notice notification enabled, which is the pre-existing behaviour.
-    #[serde(default = "default_true")]
-    notify_block_notices: bool,
-    /// Additive: a payload written before this notice existed leaves it
-    /// enabled — the condition it reports is invisible everywhere else.
-    #[serde(default = "default_true")]
-    notify_rule_duplicates: bool,
-    /// Additive: a payload written before this existed leaves addresses
-    /// visible, which is the pre-existing behaviour.
     #[serde(default)]
-    hide_block_notice_addresses: bool,
-    /// Additive: absent means the opaque default.
-    #[serde(default = "default_tray_notice_opacity_percent")]
-    tray_notice_opacity_percent: u16,
+    notify_suggestion_changes: Option<bool>,
+    #[serde(default)]
+    notify_block_notices: Option<bool>,
+    #[serde(default)]
+    notify_rule_duplicates: Option<bool>,
+    #[serde(default)]
+    hide_block_notice_addresses: Option<bool>,
+    #[serde(default)]
+    tray_notice_opacity_percent: Option<u16>,
     #[serde(default)]
     reopen_last_section_on_startup: Option<bool>,
     #[serde(default)]
     first_run_completed: Option<bool>,
-    // EULA acceptance version. `#[serde(default)]` (→ 0 = not accepted) keeps
-    // the round-trip backward-compatible with QML builds that don't emit the
-    // key, matching the safe default (re-prompt the agreement).
     #[serde(default)]
-    accepted_eula_version: u32,
+    accepted_eula_version: Option<u32>,
     #[serde(default)]
     theme_mode: Option<String>,
     #[serde(default)]
@@ -1165,312 +1010,178 @@ struct QtPreferencesPayload {
     #[serde(default)]
     route_secondary_label: Option<String>,
     #[serde(default)]
-    selected_primary_interface_id: String,
+    selected_primary_interface_id: Option<String>,
     #[serde(default)]
     selected_primary_interface_name: Option<String>,
     #[serde(default)]
-    primary_role_user_confirmed: bool,
+    primary_role_user_confirmed: Option<bool>,
     #[serde(default)]
-    selected_secondary_interface_id: String,
+    selected_secondary_interface_id: Option<String>,
     #[serde(default)]
     selected_secondary_interface_name: Option<String>,
     #[serde(default)]
-    secondary_role_user_confirmed: bool,
+    secondary_role_user_confirmed: Option<bool>,
     #[serde(default)]
     route_behavior_mode: Option<String>,
     #[serde(default)]
-    show_bluetooth_adapters: bool,
-    // Security-audit viewing-tab display toggle. `#[serde(default)]` (→ false)
-    // keeps the round-trip backward-compatible with QML builds that don't emit
-    // the key and matches the safe default (tab hidden).
+    show_bluetooth_adapters: Option<bool>,
     #[serde(default)]
-    show_audit_tab: bool,
+    show_audit_tab: Option<bool>,
     // Idle delay before a settings panel commits its drafts on its own.
-    // `#[serde(default)]` (→ 0) marks "key absent"; the store substitutes its
-    // own default for anything outside the supported range.
     #[serde(default)]
-    settings_autosave_secs: u32,
-    // Administrator-rights idle auto-revoke opt-out. `#[serde(default)]`
-    // (→ false) keeps the secure default (auto-revoke ON) for QML builds that
-    // don't emit the key.
+    settings_autosave_secs: Option<u32>,
     #[serde(default)]
-    admin_auto_revoke_disabled: bool,
-    // Idle minutes before the elevated broker session is retired. `#[serde
-    // (default)]` (→ 0) marks "key absent"; the store keeps its own value for
-    // anything outside the supported range.
+    admin_auto_revoke_disabled: Option<bool>,
+    // Idle minutes before the elevated broker session is retired.
     #[serde(default)]
-    admin_auto_revoke_minutes: u32,
-    // Legacy kill-switch mode A opt-in. `#[serde(default)]` (→ false) keeps the
-    // round-trip backward-compatible with QML builds that don't emit the key and
-    // matches the safe default (mode A hidden from the selector).
+    admin_auto_revoke_minutes: Option<u32>,
     #[serde(default)]
-    allow_mode_a_killswitch: bool,
-    // Detailed routing mode: reveals the DNS/fake-IP tuning toggles in
-    // routing settings. `#[serde(default)]` (→ false) keeps the round-trip
-    // backward-compatible with QML builds that don't emit the key and matches
-    // the safe default (toggles hidden, built-in defaults apply).
+    allow_mode_a_killswitch: Option<bool>,
+    // Reveals the DNS/fake-IP tuning toggles in routing settings.
     #[serde(default)]
-    routing_detailed_mode: bool,
-    // Virtual-machines screen opt-in. `#[serde(default)]` (→ false) matches the
-    // safe default: the unverified screen stays hidden.
+    routing_detailed_mode: Option<bool>,
     #[serde(default)]
-    show_virtual_machines_section: bool,
+    show_virtual_machines_section: Option<bool>,
     #[serde(default)]
-    app_groups_offer_dismissed: bool,
-    // "Remembered but absent" ghost-row display toggle. Default true
-    // (via `default_true`) so a QML build that omits the key keeps the ON
-    // default rather than silently flipping the toggle off.
-    #[serde(default = "default_true")]
-    show_remembered_adapters: bool,
-    #[serde(default = "default_true")]
-    auto_confirm_adapter_id_change: bool,
-    // Block-all banner opt-out. `default_true` so a QML build that
-    // omits the key keeps the warn-ON default rather than silencing the banner.
-    #[serde(default = "default_true")]
-    warn_kill_switch_block_all: bool,
-    // Block-all banner acknowledgement. `#[serde(default)]` (→ false) keeps the
-    // round-trip backward-compatible with QML builds that omit the key and
-    // matches the safe default (banner shown).
+    app_groups_offer_dismissed: Option<bool>,
     #[serde(default)]
-    kill_switch_banner_acknowledged: bool,
-    // "Additional adapter not found" banner acknowledgement. `#[serde(default)]`
-    // (→ false) keeps the round-trip backward-compatible with QML builds that
-    // omit the key and matches the safe default (banner shown).
+    show_remembered_adapters: Option<bool>,
     #[serde(default)]
-    missing_secondary_banner_acknowledged: bool,
-    // Selected traffic-statistics period slug. `#[serde(default)]` (→ empty
-    // string) keeps the round-trip backward-compatible with QML builds that
-    // omit the key; the apply-back below keeps the stored value when empty.
+    auto_confirm_adapter_id_change: Option<bool>,
     #[serde(default)]
-    traffic_stats_period: String,
-    // Remembered CSV export unit. Same empty-means-absent contract as the
-    // period above; the apply-back only accepts a known slug.
+    warn_kill_switch_block_all: Option<bool>,
     #[serde(default)]
-    traffic_export_unit: String,
-    // Remembered support-archive privacy tier. Same empty-means-absent contract
-    // as the export unit above; the apply-back only accepts a known slug.
+    kill_switch_banner_acknowledged: Option<bool>,
     #[serde(default)]
-    diagnostics_archive_redaction_level: String,
-    // Remembered "current session only" archive scope. `default_true` so a QML
-    // build that omits the key keeps the narrow-scope default rather than
-    // silently widening the archive to the full retained history.
-    #[serde(default = "default_true")]
-    diagnostics_archive_session_only: bool,
-    // Raw-log attachment cap in MiB; `0` = unlimited. `Option` so a payload
-    // that OMITS the key (older QML build) keeps the stored value instead of
-    // resetting a cap the user picked.
+    missing_secondary_banner_acknowledged: Option<bool>,
+    #[serde(default)]
+    traffic_stats_period: Option<String>,
+    #[serde(default)]
+    traffic_export_unit: Option<String>,
+    #[serde(default)]
+    diagnostics_archive_redaction_level: Option<String>,
+    #[serde(default)]
+    diagnostics_archive_session_only: Option<bool>,
+    // Raw-log attachment cap in MiB; `0` = unlimited.
     #[serde(default)]
     archive_log_budget_mib: Option<u32>,
-    // Notification-dismiss signature. `Option` so a payload that OMITS the
-    // key (older QML build) keeps the stored value, while an explicit empty
-    // string is an honest "never dismissed" state.
+    // The signatures, paths and blobs below clear on an explicit empty string.
     #[serde(default)]
     unenforced_apps_ack_sig: Option<String>,
-    // Overlap pairs kept by the user. `Option` so a payload that OMITS the
-    // key keeps the stored value; an explicit empty string clears the list.
     #[serde(default)]
     rules_overlap_keep_sig: Option<String>,
-    // Same shape: overlaps between the routes the user confirmed.
     #[serde(default)]
     route_overlaps_confirmed_sig: Option<String>,
-    // Confirmed VPN executable path. `Option` so a payload that OMITS the
-    // key (older QML build) keeps the stored value; an explicit empty
-    // string is an honest "not set" state.
     #[serde(default)]
     confirmed_vpn_exe_path: Option<String>,
-    // Full semicolon-joined set of confirmed VPN executables. `Option` so
-    // a payload that OMITS the key (older QML build) keeps the stored
-    // value; an explicit empty string is an honest "none".
     #[serde(default)]
     confirmed_vpn_exe_paths: Option<String>,
-    // Device-local mirror of the per-SID policy toggles (subdomain
-    // coverage, shared-IP policy, aggressive kill-switch), so they survive
-    // a service-DB wipe. `#[serde(default)]` keeps them additive.
-    // Subdomain coverage defaults ON, so an older QML build that omits the
-    // key must read `true`, not serde's bare `false`.
-    #[serde(default = "default_true")]
-    route_include_subdomains: bool,
+    // Device-local mirrors of the per-SID policy settings, so they survive a
+    // service-DB wipe.
     #[serde(default)]
-    route_shared_ip_policy: String,
+    route_include_subdomains: Option<bool>,
     #[serde(default)]
-    route_kill_switch_block_all: bool,
-    // Remaining routing/blocking mirrors so ALL aggressive settings survive
-    // a service-DB wipe. Explicit default fns keep a QML build that omits
-    // the key from silently flipping the safe/default value: fail-closed →
-    // true, protocols → all (127), enforcement → reactive.
-    #[serde(default = "default_true")]
-    route_kill_switch_fail_closed: bool,
-    #[serde(default = "default_kill_switch_protocols")]
-    route_kill_switch_protocols: u32,
-    // The MASTER kill-switch toggle + DNS-over-primary opt-in.
-    // `#[serde(default)]` → false (the safe default OFF) keeps a QML build
-    // that omits the key backward-compatible.
+    route_shared_ip_policy: Option<String>,
     #[serde(default)]
-    route_kill_switch_enabled: bool,
-    // Default flipped to true (see ui_preferences); an older QML build
-    // that omits the key reads the new safe-usable default.
-    #[serde(default = "default_true")]
-    route_allow_dns_over_primary: bool,
-    // Mode-A coverage strategy + hosts-bypass mirrors. Explicit default
-    // fns so an older QML build that omits the keys reads the intended
-    // defaults (fail-closed-unknown / bypass ON), never `""` / `false`.
-    #[serde(default = "default_mode_a_coverage_strategy")]
-    route_mode_a_coverage_strategy: String,
-    #[serde(default = "default_true")]
-    route_resolve_hosts_bypass: bool,
-    #[serde(default = "default_enforcement_mode")]
-    route_enforcement_mode: String,
-    // Device-local mirror of the GLOBAL "secondary tunnel liveness window"
-    // (seconds). `0` = disabled (safe default); any non-zero value is
-    // clamped to `[5, 3600]` in `apply_over`.
-    #[serde(default = "default_liveness_window_secs")]
-    route_liveness_window_secs: u32,
-    // Pending offline routing intents (opaque compact-JSON object as a
-    // string; empty = none). `#[serde(default)]` keeps older QML builds
-    // additive.
+    route_kill_switch_block_all: Option<bool>,
     #[serde(default)]
-    route_pending_offline_json: String,
-    // Diagnostics cache-viewer persisted column widths (opaque compact-JSON
-    // object as a string; empty = defaults). `#[serde(default)]` keeps older
-    // QML builds that omit the key additive.
+    route_kill_switch_fail_closed: Option<bool>,
     #[serde(default)]
-    cache_table_column_widths: String,
-    // Last-known service-owned values mirrored for display while the service is
-    // stopped (opaque compact-JSON object as a string; empty = nothing
-    // mirrored). `#[serde(default)]` keeps older QML builds additive.
+    route_kill_switch_protocols: Option<u32>,
     #[serde(default)]
-    service_backed_mirror_json: String,
-    // The user's intent for the service-owned settings (opaque compact-JSON
-    // object as a string; empty = never touched). `#[serde(default)]` keeps
-    // older QML builds additive.
+    route_kill_switch_enabled: Option<bool>,
     #[serde(default)]
-    service_intent_json: String,
+    route_allow_dns_over_primary: Option<bool>,
+    #[serde(default)]
+    route_mode_a_coverage_strategy: Option<String>,
+    #[serde(default)]
+    route_resolve_hosts_bypass: Option<bool>,
+    #[serde(default)]
+    route_enforcement_mode: Option<String>,
+    // Secondary tunnel liveness window in seconds; `0` = disabled.
+    #[serde(default)]
+    route_liveness_window_secs: Option<u32>,
+    // Opaque compact-JSON objects carried as strings.
+    #[serde(default)]
+    route_pending_offline_json: Option<String>,
+    #[serde(default)]
+    cache_table_column_widths: Option<String>,
+    #[serde(default)]
+    service_backed_mirror_json: Option<String>,
+    #[serde(default)]
+    service_intent_json: Option<String>,
     #[serde(default)]
     last_opened_section: Option<String>,
 
-    // File-source state. Optional: an older QML build may not emit
-    // these keys, so #[serde(default)] keeps the round-trip
-    // backward-compatible.
-    #[serde(default)]
-    last_saved_path_primary: Option<String>,
-    #[serde(default)]
-    last_saved_path_secondary: Option<String>,
+    // File-source state.
+    #[serde(default, deserialize_with = "present")]
+    last_saved_path_primary: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    last_saved_path_secondary: Option<Option<String>>,
     // Display-only "Source:" paths (may point inside the bundled presets
     // tree — read-only source, never a save target).
-    #[serde(default)]
-    last_loaded_path_primary: Option<String>,
-    #[serde(default)]
-    last_loaded_path_secondary: Option<String>,
-    #[serde(default)]
-    auto_open_on_launch_path_primary: Option<String>,
-    #[serde(default)]
-    auto_open_on_launch_path_secondary: Option<String>,
-    #[serde(default)]
-    last_file_synced_revision_id_primary: Option<String>,
-    #[serde(default)]
-    last_file_synced_revision_id_secondary: Option<String>,
-    #[serde(default)]
-    last_file_synced_hash_primary: Option<String>,
-    #[serde(default)]
-    last_file_synced_hash_secondary: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    last_loaded_path_primary: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    last_loaded_path_secondary: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    auto_open_on_launch_path_primary: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    auto_open_on_launch_path_secondary: Option<Option<String>>,
 
-    // UAC decline state. An older QML build may not emit these keys;
-    // `#[serde(default)]` keeps the round-trip backward compatible.
+    #[serde(default, deserialize_with = "present")]
+    service_install_uac_declined_at_epoch: Option<Option<i64>>,
     #[serde(default)]
-    service_install_uac_declined_at_epoch: Option<i64>,
+    service_install_uac_declined_count: Option<u32>,
+    /// "Stop offering to install the service".
     #[serde(default)]
-    service_install_uac_declined_count: u32,
-    /// "Stop offering to install the service". Absent from an older QML build
-    /// reads as `false` — the offer keeps working, which is the safe default
-    /// for the one thing without which nothing is enforced.
-    #[serde(default)]
-    service_install_prompt_suppressed: bool,
+    service_install_prompt_suppressed: Option<bool>,
 
-    // The two bools default to `true` (matching `UiPreferences::default`)
-    // via explicit default fns so a QML build that omits them never
-    // silently flips them off; `compat_banner_mode` defaults to "auto";
-    // `update_page_url` to "".
-    #[serde(default = "default_true")]
-    auto_load_rules_on_launch: bool,
-    #[serde(default = "default_true")]
-    export_include_comments: bool,
-    #[serde(default = "default_true")]
-    import_only_active: bool,
-    #[serde(default = "default_compat_banner_mode")]
-    compat_banner_mode: String,
     #[serde(default)]
-    update_page_url: String,
-    // Bundled-preset visibility. Defaults to `true` via the explicit
-    // default fn so a QML build that omits the key never silently hides
-    // the preset row.
-    #[serde(default = "default_true")]
-    show_bundled_presets: bool,
-    // Folder the user keeps their own rule sets in. `Option` so a payload
-    // that OMITS the key (older QML build) keeps the configured folder,
-    // while an explicit empty string is an honest "back to the shipped sets".
+    auto_load_rules_on_launch: Option<bool>,
+    #[serde(default)]
+    export_include_comments: Option<bool>,
+    #[serde(default)]
+    import_only_active: Option<bool>,
+    #[serde(default)]
+    compat_banner_mode: Option<String>,
+    #[serde(default)]
+    update_page_url: Option<String>,
+    #[serde(default)]
+    update_check_enabled: Option<bool>,
+    #[serde(default)]
+    update_check_interval_days: Option<u32>,
+    #[serde(default)]
+    dismissed_update_version: Option<String>,
+    #[serde(default)]
+    show_bundled_presets: Option<bool>,
+    // Folder the user keeps their own rule sets in; an explicit empty string
+    // is "back to the shipped sets".
     #[serde(default)]
     user_presets_dir: Option<String>,
-    // The remembered quick-load selection, `<source>:<label>`. `Option` for the
-    // same reason as the folder above: an omitted key (older QML build) must
-    // keep the choice the user already made, while an explicit empty string is
-    // an honest "forget it, fall back to the default pick".
+    // The remembered quick-load selection, `<source>:<label>`.
     #[serde(default)]
     selected_preset_set: Option<String>,
-    // Acknowledgement of the "this folder is overwritten by an update"
-    // warning. Plain bool: absent (older QML) reads as `false`, which
-    // simply means the warning is shown again — the safe direction.
+    // Acknowledgement of the "this folder is overwritten by an update" warning.
     #[serde(default)]
-    allow_saving_into_bundled_presets: bool,
-    // Dismissal of the one-time rule-set-folder offer. Absent reads as
-    // `false`, i.e. the offer may still appear: harmless, and the banner
-    // itself only shows while no folder is configured.
+    allow_saving_into_bundled_presets: Option<bool>,
     #[serde(default)]
-    rules_folder_suggestion_dismissed: bool,
-    // Merge conflict-resolution policy. Defaults to "union" via the
-    // explicit default fn so a QML build that omits the key keeps the
-    // safe interactive behaviour (conflicts surfaced for the user to resolve).
-    #[serde(default = "default_merge_conflict_policy")]
-    merge_conflict_policy: String,
-    // Persisted per-adapter ack for the split-routing banner. Wire key
-    // `secondarySplitAckAdapterName` (camelCase via the struct's rename_all).
-    // `#[serde(default)]` (empty string) keeps the round-trip additive.
+    rules_folder_suggestion_dismissed: Option<bool>,
     #[serde(default)]
-    secondary_split_ack_adapter_name: String,
+    merge_conflict_policy: Option<String>,
+    // Per-adapter ack for the split-routing banner.
+    #[serde(default)]
+    secondary_split_ack_adapter_name: Option<String>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_tray_notice_opacity_percent() -> u16 {
-    100
-}
-
-fn default_compat_banner_mode() -> String {
-    String::from("auto")
-}
-
-fn default_merge_conflict_policy() -> String {
-    String::from("union")
-}
-
-fn default_kill_switch_protocols() -> u32 {
-    127
-}
-
-fn default_enforcement_mode() -> String {
-    // Kept in sync with `EnforcementMode::default().as_slug()`.
-    String::from("resolver")
-}
-
-/// Kept in sync with `ModeACoverageStrategy::default().as_slug()`
-/// (permissive default, no catch-all).
-fn default_mode_a_coverage_strategy() -> String {
-    String::from("per-ip")
-}
-
-fn default_liveness_window_secs() -> u32 {
-    0
+/// A key that is present, `null` included: `Some(None)` clears a stored
+/// optional value, where an absent key (`None`, via `default`) keeps it.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 mod preferences_payload;
@@ -1532,6 +1243,9 @@ fn backend_provider_is_service_backed(kind: BackendProviderKind) -> bool {
 
 #[cfg(test)]
 mod reset_script_tests;
+
+#[cfg(test)]
+mod file_url_tests;
 
 #[cfg(test)]
 mod backend_provider_tests;

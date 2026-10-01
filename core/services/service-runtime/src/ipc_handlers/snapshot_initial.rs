@@ -114,7 +114,7 @@ impl IpcHandler for SnapshotInitialHandler {
             ctx.caller_stored(),
         );
         let adapters = self.adapters.adapters_snapshot(false);
-        let diag_status = self.diagnostics.get_status();
+        let diag_status = self.diagnostics.get_status(&ctx.diagnostics_audience());
         let active_alerts_count = diag_status.active_alerts.len() as u32;
         let active_revision_id = health.active_revision_id.clone();
 
@@ -231,7 +231,7 @@ mod tests {
             adapter_name: "Wi-Fi".into(),
             ipv6_if_index: 12,
             physical_address: None,
-            windows_name: "Wireless LAN".into(),
+            name: "Wireless LAN".into(),
             interface_description: "".into(),
             interface_type: "ieee80211".into(),
             oper_status: "up".into(),
@@ -286,7 +286,7 @@ mod tests {
             adapter_name: "Wi-Fi".into(),
             ipv6_if_index: 12,
             physical_address: None,
-            windows_name: "Wireless LAN".into(),
+            name: "Wireless LAN".into(),
             interface_description: "".into(),
             interface_type: "ieee80211".into(),
             oper_status: "up".into(),

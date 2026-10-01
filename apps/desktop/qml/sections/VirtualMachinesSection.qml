@@ -103,8 +103,8 @@ ColumnLayout {
     function _pinFailureText(failure) {
         var error = String((failure || {}).error || "failed")
         if (error === "machine-not-mutable")
-            return root.tr("rules.vm.pin.error.running",
-                "The machine is running. Power it off and try again.")
+            return root.tr("rules.vm.pin.error.not-mutable",
+                "The machine is running or suspended. Shut it down completely and try again.")
         if (error === "tool-missing")
             return root.tr("rules.vm.pin.error.tool-missing",
                 "VBoxManage was not found. Reinstall VirtualBox or change the machine in VirtualBox itself.")

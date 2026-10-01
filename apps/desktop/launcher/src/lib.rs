@@ -14,6 +14,7 @@ pub mod backend_factory;
 pub mod console_path;
 pub mod console_path_local;
 pub mod diag_stream;
+pub mod ipc_backend_facade;
 pub mod launcher;
 pub mod local_handlers;
 pub(crate) mod prefs_persistence;

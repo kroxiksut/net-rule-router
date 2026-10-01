@@ -74,6 +74,27 @@ browser.exe
     assert!(!result.rules[0].enabled);
 }
 
+/// A spaced note ending in something that reads as a file name is prose: only a
+/// program image name earns the exception above.
+#[test]
+fn a_note_ending_in_a_file_name_is_not_a_disabled_rule() {
+    let result = parse_canonical_rules(&format!(
+        "--- {NATIVE_APP}
+# see readme.txt
+# note v1.2
+   # indented note.pdf
+# My Tool.EXE
+browser.exe
+"
+    ));
+    let values: Vec<(&str, bool)> = result
+        .rules
+        .iter()
+        .map(|r| (r.match_value.as_str(), r.enabled))
+        .collect();
+    assert_eq!(values, vec![("My Tool.EXE", false), ("browser.exe", true)]);
+}
+
 #[test]
 fn a_multi_word_note_stays_a_comment() {
     let result = parse_canonical_rules(
@@ -291,12 +312,12 @@ fn duplicate_unknown_section_creates_two_passthrough_blocks() {
 
 #[test]
 fn duplicate_known_section_merges_rules_and_flags_diagnostic() {
-    let input = "--- Domains\nab.test\n--- Domains\nya.ru\n";
+    let input = "--- Domains\nab.test\n--- Domains\nsite.example.ru\n";
     let result = parse_canonical_rules(input);
     // Rules from both blocks are present in encounter order.
     assert_eq!(result.rules.len(), 2);
     assert_eq!(result.rules[0].match_value, "ab.test");
-    assert_eq!(result.rules[1].match_value, "ya.ru");
+    assert_eq!(result.rules[1].match_value, "site.example.ru");
     // Diagnostic fires with `is_known_section = true`.
     assert_eq!(result.duplicate_sections.len(), 1);
     let dup = &result.duplicate_sections[0];
@@ -318,7 +339,7 @@ fn multiple_distinct_duplicates_in_order() {
 
 #[test]
 fn id_hint_increments_sequentially() {
-    let input = "--- Zones\nru\n--- Domains\nab.test\nya.ru\n";
+    let input = "--- Zones\nru\n--- Domains\nab.test\nsite.example.ru\n";
     let result = parse_canonical_rules(input);
     assert_eq!(result.rules.len(), 3);
     assert_eq!(result.rules[0].id_hint, 1);
@@ -558,7 +579,7 @@ fn parsed_rule_keeps_section_name_case() {
 fn duplicate_known_section_with_passthrough_after_does_not_confuse() {
     // The foreign section is unknown, Domains is known. Two of each.
     let input = format!(
-        "--- Domains\nab.test\n--- {FOREIGN_A}\nfirefox\n--- Domains\nya.ru\n--- {FOREIGN_A}\nchromium\n"
+        "--- Domains\nab.test\n--- {FOREIGN_A}\nfirefox\n--- Domains\nsite.example.ru\n--- {FOREIGN_A}\nchromium\n"
     );
     let result = parse_canonical_rules(&input);
     assert_eq!(result.rules.len(), 2);

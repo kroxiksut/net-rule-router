@@ -1,5 +1,5 @@
-//! Log level, validation status, first-run steps and the gates that decide
-//! what a not-yet-configured install may do.
+//! Log level, validation status and the first-run gates that decide what a
+//! not-yet-configured install may do.
 
 use super::*;
 
@@ -104,81 +104,6 @@ impl RuleValidationStatus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FirstRunStepId {
-    Welcome,
-    BasicScenarioSelection,
-    RoutesSetup,
-    RulesSetup,
-    DiagnosticsPreview,
-    Finish,
-}
-
-impl FirstRunStepId {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::Welcome => "Welcome",
-            Self::BasicScenarioSelection => "Basic scenario selection",
-            Self::RoutesSetup => "Routes setup",
-            Self::RulesSetup => "Rules setup",
-            Self::DiagnosticsPreview => "Diagnostics preview",
-            Self::Finish => "Finish",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FirstRunScenarioId {
-    QuickStart,
-    GuidedDefault,
-}
-
-impl FirstRunScenarioId {
-    pub const fn slug(self) -> &'static str {
-        match self {
-            Self::QuickStart => "quick-start",
-            Self::GuidedDefault => "guided-default",
-        }
-    }
-
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::QuickStart => "Quick start",
-            Self::GuidedDefault => "Guided default setup",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FirstRunStepSpec {
-    pub id: FirstRunStepId,
-    pub required: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum StartupDataState {
-    Empty,
-    SemiEmpty,
-    TestDataPreview,
-}
-
-impl StartupDataState {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::Empty => "empty",
-            Self::SemiEmpty => "semi-empty",
-            Self::TestDataPreview => "test-data-preview",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SectionStartupState {
-    pub section: AppSection,
-    pub state: StartupDataState,
-    pub note: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SetupActionAvailability {
     Allowed,
     SoftGuided,
@@ -203,13 +128,8 @@ pub struct SetupActionGate {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FirstRunContract {
-    pub steps: &'static [FirstRunStepSpec],
-    pub scenarios: &'static [FirstRunScenarioId],
-    pub default_scenario: FirstRunScenarioId,
     pub quick_start_path_sections: &'static [AppSection],
-    pub startup_states: &'static [SectionStartupState],
     pub action_gates_before_completion: &'static [SetupActionGate],
-    pub list_editing_preview_notice: &'static str,
     pub completion_notice: &'static str,
 }
 

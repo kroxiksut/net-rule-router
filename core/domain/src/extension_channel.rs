@@ -11,8 +11,8 @@
 //! as constants in [`ExtensionChannelPolicy`]:
 //!
 //! 1. **Non-interactive channels always require review.** A non-interactive
-//!    extension request (automated, no user present) must produce a
-//!    `PendingRevision` — it may never activate policy silently.
+//!    extension request (automated, no user present) must produce a pending
+//!    revision — it may never activate policy silently.
 //!
 //! 2. **Mass changes always require review.** Any request that changes more than
 //!    [`ExtensionChannelPolicy::MAX_INTERACTIVE_RULE_CHANGES`] rules is treated
@@ -33,7 +33,7 @@
 //!
 //! [`validate_extension_request`] returns a [`ReviewRequirement`] for every
 //! request. The service must honour this: if review is required, the request
-//! creates a `PendingRevision`; it cannot be immediately activated.
+//! creates a pending revision; it cannot be immediately activated.
 //!
 //! # Provenance
 //!
@@ -125,7 +125,7 @@ impl ExtensionChannelKind {
 /// waiting for a response, or by an automated process with no user present.
 ///
 /// Interactivity determines whether the narrow immediate-apply path is available.
-/// Non-interactive requests **always** produce a `PendingRevision` and require
+/// Non-interactive requests **always** produce a pending revision and require
 /// user review.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExtensionInteractivity {
@@ -179,7 +179,7 @@ pub struct ExtensionRequestScope {
 ///
 /// Included in review summaries, audit events, and security-visible status so
 /// the user can trace the origin of any extension-sourced policy change.
-/// The service stores this alongside the `PolicyRevision`.
+/// The service stores this alongside the revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtensionProvenance {
     /// Stable identifier of the extension channel that submitted the request.
@@ -233,7 +233,7 @@ pub enum ExtensionScopeViolation {
 
 // ── ReviewRequirement ─────────────────────────────────────────────────────────
 
-/// Whether an extension request requires the `PendingRevision` review flow.
+/// Whether an extension request requires the review flow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReviewRequirement {
     /// The request is within the narrow allowed scope for immediate application.
@@ -243,8 +243,8 @@ pub enum ReviewRequirement {
     /// Conditions: interactive, ≤ `MAX_INTERACTIVE_RULE_CHANGES` rule changes,
     /// no behavior mode change, no binding change.
     ImmediateApplyPermitted,
-    /// The request must go through the `PendingRevision` review flow before
-    /// activation. The `violations` list explains why.
+    /// The request must go through the review flow before activation. The
+    /// `violations` list explains why.
     ReviewRequired {
         /// One or more policy constraints that require the review flow.
         violations: Vec<ExtensionScopeViolation>,

@@ -16,7 +16,8 @@
 //!   empty string — always valid.
 
 use nrr_domain::rules_file::{
-    parse_rules_file, HostPlatform, ParseWarning, RulesFileSection, CURRENT_PRESET_FORMAT_VERSION,
+    parse_rules_file, HostPlatform, ParseWarning, RulesFileSection,
+    CURRENT_RULES_FILE_FORMAT_VERSION,
 };
 
 // ── preset file two-file independence ────────────────────────────────────────
@@ -305,7 +306,7 @@ fn fixture_preset_with_extended_sections_parses_correctly() {
     assert!(outcome.preset_metadata.is_some());
     assert_eq!(outcome.file_format_version, Some(1));
     assert!(
-        outcome.file_format_version <= Some(CURRENT_PRESET_FORMAT_VERSION),
+        outcome.file_format_version <= Some(CURRENT_RULES_FILE_FORMAT_VERSION),
         "a build must understand every version up to its own"
     );
 

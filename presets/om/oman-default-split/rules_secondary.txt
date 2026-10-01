@@ -1,91 +1,62 @@
 ﻿# NetRuleRouter preset - version 1
 # name: Oman Default Split - Secondary Route
-# description: Foreign social, messaging, developer, and AI services routed to secondary
+# description: Messengers, calling apps and platforms blocked or restricted by operators in Oman
 # author: NetRuleRouter contributors
-# preset_version: 1
+# preset_version: 2
 
 --- Zones
 # Keep empty to avoid over-broad routing by TLD
 
 --- Domains
-*.facebook.com
-*.instagram.com
-*.threads.com
-*.x.com
-*.twitter.com
-*.youtube.com
-*.googlevideo.com
-*.tiktok.com
-*.discord.com
-*.reddit.com
-*.linkedin.com
-*.telegram.org
-*.t.me
-*.whatsapp.com
-*.signal.org
-*.openai.com
-*.chatgpt.com
-*.anthropic.com
-*.claude.ai
-*.claude.com
-*.perplexity.ai
-*.mistral.ai
-api.mistral.ai
-*.cohere.com
-*.cursor.com
-*.openrouter.ai
-*.midjourney.com
-*.jetbrains.com
-plugins.jetbrains.com
+# Checked: September 2026. AI, developer and major social services are not listed: they serve Oman directly.
+# Calls reach relay servers by address; the app rules below carry them on desktop.
+
+*.signal.org  # Signal: blocked nationwide
+*.signal.me  # Signal: blocked nationwide
+*.viber.com  # Viber: blocked nationwide
+*.line.me  # LINE: blocked nationwide
+*.line-apps.com  # LINE: blocked nationwide
+*.line-scdn.net  # LINE: blocked nationwide
+*.threema.ch  # Threema: blocked nationwide
+*.matrix.org  # Element (Matrix): blocked nationwide
+*.element.io  # Element (Matrix): blocked nationwide
+*.vector.im  # Element (Matrix): blocked nationwide
+*.riot.im  # Element (Matrix): blocked nationwide
+*.getsession.org  # Session: blocked by most operators
+*.wire.com  # Wire: restricted by most operators
+*.imo.im  # imo: restricted by some operators
+*.tango.me  # Tango: restricted by some operators
+
+*.clubhouse.com  # Clubhouse: blocked nationwide since 2021
+*.clubhouseapi.com  # Clubhouse: blocked nationwide since 2021
+
+*.vk.com  # VK: blocked nationwide
+*.vk.me  # VK: blocked nationwide
+*.userapi.com  # VK: blocked nationwide
+*.vkuser.net  # VK: blocked nationwide
+*.vk-cdn.net  # VK: blocked nationwide
+*.mail.ru  # Mail.ru: blocked nationwide
+*.imgsmail.ru  # Mail.ru: blocked nationwide
+
+*.truecaller.com  # Truecaller: blocked nationwide
+*.tinyurl.com  # TinyURL link shortener: blocked nationwide
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 
 --- Windows
-telegram.exe
-WhatsAp*.exe
-discord.exe
-signal.exe
-viber.exe
-line.exe
-skype.exe
-zoom.exe
-slack.exe
-chatgpt.exe
-claude.exe
-poe.exe
-codex.exe
-codex*.exe
-Cursor.exe
-Windsurf.exe
-jetbrains-toolbox.exe
-idea64.exe
-pycharm64.exe
-webstorm64.exe
-clion64.exe
-rider64.exe
-goland64.exe
-fleet.exe
+Signal.exe  # Signal: blocked nationwide
+Viber.exe  # Viber: blocked nationwide
+Element.exe  # Element (Matrix): blocked nationwide
+# LINE.exe    # LINE: process name too generic, check on your machine
+# Session.exe    # Session: process name too generic, check on your machine
+# Wire.exe    # Wire: process name too generic, check on your machine
 
 --- Linux
-clion
-codex
-codex*
-cursor
-discord
-goland
-idea
-jetbrains-toolbox
-pycharm
-rider
-signal-desktop
-slack
-telegram
-telegram-desktop
-viber
-webstorm
-windsurf
-zoom
+signal-desktop  # Signal: blocked nationwide
+viber  # Viber: blocked nationwide
+element-desktop  # Element (Matrix): blocked nationwide
+session-desktop  # Session: blocked by most operators
 
 --- MacOS
 # (reserved - not applied on Windows)

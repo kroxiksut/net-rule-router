@@ -5,7 +5,7 @@
 NetRuleRouter can point itself at the program you use as your VPN. This is done
 in **Settings → Routing behavior → Your VPN client**, or from the first-launch
 onboarding. Telling the app which program is your VPN lets its traffic keep
-flowing over your main link while leak protection (the kill switch) is on — so
+flowing over your main link while leak protection is on — so
 the VPN can always reach its own server and reconnect, instead of being blocked
 along with everything else.
 

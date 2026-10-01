@@ -1,4 +1,4 @@
-//! Block T (traffic counter) — per-interface octet counters via `GetIfTable2`.
+//! Traffic-counter core — per-interface octet counters via `GetIfTable2`.
 //!
 //! Backs `WindowsInterfaceCounterSource` (`crate::interface_traffic`). Unlike
 //! `GetAdaptersAddresses` (which carries no byte counters), `MIB_IF_ROW2`
@@ -105,9 +105,9 @@ fn decode_row(row: &MIB_IF_ROW2) -> InterfaceCounters {
         alias
     };
     let interface_type = InterfaceType::from_raw(row.Type);
-    // Block T Feature 1 — the raw MIB type alone under-detects a real VPN
-    // adapter (see `text_indicates_vpn_tunnel`'s doc comment), so OR it with
-    // the same name/description keyword heuristic the "Interfaces & routes"
+    // The raw MIB type alone under-detects a real VPN adapter (see
+    // `text_indicates_vpn_tunnel`'s doc comment), so OR it with the same
+    // name/description keyword heuristic the "Interfaces & routes"
     // VPN-likelihood assessment uses.
     let is_tunnel = matches!(interface_type, InterfaceType::Tunnel)
         || text_indicates_vpn_tunnel(&format!("{stable_name} {description}"));

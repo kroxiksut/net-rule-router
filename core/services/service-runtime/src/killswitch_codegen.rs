@@ -174,9 +174,10 @@ impl KillSwitchProtocols {
         }
     }
 
-    /// `true` when at least one protocol is selected (else the block is inert).
+    /// `true` when at least one enforced protocol is selected (`other` blocks
+    /// nothing, matching `KILL_SWITCH_PROTOCOLS_ENFORCED`).
     fn any(self) -> bool {
-        self.tcp || self.udp || self.icmp || self.igmp || self.gre || self.esp || self.other
+        self.tcp || self.udp || self.icmp || self.igmp || self.gre || self.esp
     }
 
     /// Any TCP/UDP selected → emit an ALE-layer block. `pub(crate)` — the
@@ -203,12 +204,10 @@ impl KillSwitchProtocols {
     /// protocol-agnostic block-all. A proto-agnostic packet-layer block would
     /// sit ABOVE every ALE verdict and silently kill primary-route rule
     /// permits, the DNS exemption, the app exemptions and the service's own
-    /// Mode-B resolver upstream (SYSTEM raw UDP) whenever "Other" is in the
-    /// mask — which is the DEFAULT (127). TCP/UDP are enforced exclusively at
-    /// the ALE connect layer (SID-scoped and permit/app/DNS-aware); the packet
-    /// layer owns only what ALE cannot see. Trade-off accepted by the user: an
-    /// exotic IP protocol outside the named set passes. The GUI "Other"
-    /// checkbox needs re-labeling.
+    /// Mode-B resolver upstream whenever "Other" is in the mask, which is the
+    /// default. TCP/UDP are enforced exclusively at the ALE connect layer; the
+    /// packet layer owns only what ALE cannot see. An exotic IP protocol
+    /// outside the named set passes; the GUI box is labelled "legacy".
     fn wants_packet_layer(self) -> bool {
         self.icmp || self.igmp || self.gre || self.esp
     }
@@ -623,10 +622,10 @@ fn block_app_off_secondary(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec 
 /// it with zero configuration; the user can add their own via primary app rules.
 ///
 /// Patterns are OS-neutral case-insensitive globs (matched by the platform app
-/// resolver's `glob_match`). `*vpn*` covers most branded clients (NordVPN,
-/// ProtonVPN, ExpressVPN, swiftvpn VPN, …); the rest name clients that lack
-/// "vpn" in their executable. This is neutral policy DATA co-located with the
-/// emitter — the OS-specific `.exe` handling lives in the Windows resolver.
+/// resolver's `glob_match`). `*vpn*` covers most branded clients; the rest
+/// name clients that lack "vpn" in their executable. This is neutral policy
+/// DATA co-located with the emitter — the OS-specific `.exe` handling lives in
+/// the Windows resolver.
 ///
 /// These are GLOBS, and the WFP `ALE_APP_ID` condition
 /// keys on a real on-disk file path (`FwpmGetAppIdFromFileName0`), NOT a glob.
@@ -698,7 +697,7 @@ pub const CLIENT_TREE_EXEMPT_CAP: usize = 24;
 /// The OTHER executables of each recognised tunnel client, so the exemption
 /// covers the process that actually performs the handshake.
 ///
-/// A client is not one binary. `swiftvpn 3.0.exe` is a window: its
+/// A client is not one binary. `examplevpn 3.0.exe` is a window: its
 /// transports are `OpenVPN\openvpn.exe` and `XRay\ExternalBinaries\xray.exe`,
 /// each a separate process, and one of them — never the window — is what talks
 /// to the server. Exempting only the resolved binary is why one observed outage
@@ -924,7 +923,7 @@ pub fn catch_all_kill_switch_filters(
     filters
 }
 
-/// Block D (fake-IP, slice 5) — permit the user's connections into the fake pool.
+/// Fake-IP: permit the user's connections into the fake pool.
 ///
 /// When fake-IP is on, an application reaches a scope host by connecting to its
 /// FAKE address (out of the pool), which the OS routes into the TUN. Under a

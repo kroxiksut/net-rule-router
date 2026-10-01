@@ -59,15 +59,15 @@ fn suffix_rule(id: &str, s: &str) -> CanonicalRule {
 
 #[test]
 fn an_auto_added_rule_covers_a_host_without_making_it_an_anchor() {
-    let mut auto = suffix_rule("r-auto", "githubusercontent.com");
+    let mut auto = suffix_rule("r-auto", "usercontent.example");
     auto.origin = Some(nrr_domain::RuleOrigin::auto(
         nrr_domain::AutoRuleReason::UserConfirmed,
-        "www.googletagmanager.com",
+        "www.tagmanager.example",
         "2026-08-11",
     ));
     let set = CanonicalRuleSet::from_rules(vec![auto, suffix_rule("r-user", "example.com")]);
 
-    let auto_host = rule_set_match_origin("raw.githubusercontent.com", &set);
+    let auto_host = rule_set_match_origin("raw.usercontent.example", &set);
     assert!(auto_host.matched);
     assert!(!auto_host.user_authored);
 
@@ -243,7 +243,7 @@ fn fake_pool_answers_still_anchor_companion_learning() {
         let sum = c.consume(
             &[
                 obs("site.example", [198, 18, 0, 7]),
-                obs("cdn.example", [23, 10, 20, 138]),
+                obs("cdn.example", [100, 64, 0, 138]),
             ],
             at_ms(visit),
         );
@@ -285,7 +285,7 @@ fn loopback_pinned_hosts_never_anchor_companion_learning() {
             &[
                 obs("site.example", [127, 0, 0, 1]),
                 obs("other.example", [0, 0, 0, 0]),
-                obs("cdn.example", [23, 10, 20, 138]),
+                obs("cdn.example", [100, 64, 0, 138]),
             ],
             at_ms(visit),
         );
@@ -314,14 +314,14 @@ fn caches_subdomain_matching_a_suffix_rule() {
     // cdn-17.example.com is an unknowable subdomain — only observation
     // reveals it. It matches `*.example.com`.
     let sum = c.consume(
-        &[obs("cdn-17.example.com", [23, 10, 20, 138])],
+        &[obs("cdn-17.example.com", [100, 64, 0, 138])],
         SystemTime::now(),
     );
     assert_eq!(sum.matched, 1);
     assert!(sum.made_progress());
     assert_eq!(
         lookup.ips_for_hostname("cdn-17.example.com"),
-        vec![Ipv4Addr::new(23, 10, 20, 138)]
+        vec![Ipv4Addr::new(100, 64, 0, 138)]
     );
     // And the suffix fan-out now finds it.
     assert_eq!(
@@ -339,12 +339,12 @@ fn seed_from_os_cache_caches_rule_matches_skips_others_and_loopback() {
         // Matches the `.example` zone rule → seeded.
         OsCachedResolution {
             canonical_hostname: "shop.example".into(),
-            addresses: vec![Ipv4Addr::new(1, 2, 3, 4)],
+            addresses: vec![Ipv4Addr::new(100, 64, 1, 4)],
         },
         // No rule → ignored.
         OsCachedResolution {
             canonical_hostname: "other.test".into(),
-            addresses: vec![Ipv4Addr::new(8, 8, 8, 8)],
+            addresses: vec![Ipv4Addr::new(100, 64, 8, 8)],
         },
         // Matches the zone name but is an ad-block loopback pin → dropped
         // before it can become a /32 (mirrors the observe path).
@@ -369,7 +369,7 @@ fn seed_from_os_cache_caches_rule_matches_skips_others_and_loopback() {
     assert_eq!(sum.ignored, 1, "other.test matched no rule");
     assert_eq!(
         lookup.ips_for_hostname("shop.example"),
-        vec![Ipv4Addr::new(1, 2, 3, 4)]
+        vec![Ipv4Addr::new(100, 64, 1, 4)]
     );
     assert!(lookup.ips_for_hostname("other.test").is_empty());
     assert!(
@@ -407,11 +407,14 @@ fn caches_host_matching_a_zone_rule() {
         Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
         active_sid("S-A"),
     );
-    let sum = c.consume(&[obs("site.example.ru", [5, 5, 5, 5])], SystemTime::now());
+    let sum = c.consume(
+        &[obs("site.example.ru", [100, 64, 5, 5])],
+        SystemTime::now(),
+    );
     assert_eq!(sum.matched, 1);
     assert_eq!(
         lookup.ips_for_hostname("site.example.ru"),
-        vec![Ipv4Addr::new(5, 5, 5, 5)]
+        vec![Ipv4Addr::new(100, 64, 5, 5)]
     );
 }
 
@@ -424,18 +427,27 @@ fn re_observing_an_unchanged_host_is_refresh_not_progress() {
         Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
         active_sid("S-A"),
     );
-    let first = c.consume(&[obs("site.example.ru", [5, 5, 5, 5])], SystemTime::now());
+    let first = c.consume(
+        &[obs("site.example.ru", [100, 64, 5, 5])],
+        SystemTime::now(),
+    );
     assert_eq!(first.matched, 1);
     assert_eq!(first.refreshed, 0);
     // Same host, same address: recency is renewed but the enforceable set
     // is untouched — the recompute hook must stay silent, else an open
     // rule site keeps the full route/WFP re-derivation cycling forever.
-    let second = c.consume(&[obs("site.example.ru", [5, 5, 5, 5])], SystemTime::now());
+    let second = c.consume(
+        &[obs("site.example.ru", [100, 64, 5, 5])],
+        SystemTime::now(),
+    );
     assert_eq!(second.matched, 0);
     assert_eq!(second.refreshed, 1);
     assert!(!second.made_progress());
     // A new address IS progress — the codegen now derives a different set.
-    let third = c.consume(&[obs("site.example.ru", [6, 6, 6, 6])], SystemTime::now());
+    let third = c.consume(
+        &[obs("site.example.ru", [100, 64, 6, 6])],
+        SystemTime::now(),
+    );
     assert_eq!(third.matched, 1);
     assert!(third.made_progress());
 }
@@ -447,7 +459,7 @@ fn re_seeding_unchanged_os_cache_entries_is_not_progress() {
     let reader = Arc::new(MockDnsCacheRead::new());
     reader.set_entries(vec![OsCachedResolution {
         canonical_hostname: "shop.example".into(),
-        addresses: vec![Ipv4Addr::new(1, 2, 3, 4)],
+        addresses: vec![Ipv4Addr::new(100, 64, 1, 4)],
     }]);
     let c = consumer(
         vec![zone_rule("r1", "example")],
@@ -475,10 +487,13 @@ fn ignores_host_matching_no_rule() {
         Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
         active_sid("S-A"),
     );
-    let sum = c.consume(&[obs("unrelated.org", [1, 1, 1, 1])], SystemTime::now());
+    let sum = c.consume(
+        &[obs("unrelated.example.org", [100, 64, 1, 1])],
+        SystemTime::now(),
+    );
     assert_eq!(sum.matched, 0);
     assert_eq!(sum.ignored, 1);
-    assert!(lookup.ips_for_hostname("unrelated.org").is_empty());
+    assert!(lookup.ips_for_hostname("unrelated.example.org").is_empty());
 }
 
 #[test]
@@ -493,7 +508,7 @@ fn apex_matches_suffix_rule() {
         Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
         active_sid("S-A"),
     );
-    let sum = c.consume(&[obs("example.com", [2, 2, 2, 2])], SystemTime::now());
+    let sum = c.consume(&[obs("example.com", [100, 64, 2, 2])], SystemTime::now());
     assert_eq!(sum.matched, 1);
     assert!(!lookup.ips_for_hostname("example.com").is_empty());
 }
@@ -508,7 +523,7 @@ fn no_active_user_caches_nothing() {
         Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
         none_sid,
     );
-    let sum = c.consume(&[obs("a.example.com", [1, 2, 3, 4])], SystemTime::now());
+    let sum = c.consume(&[obs("a.example.com", [100, 64, 1, 4])], SystemTime::now());
     assert_eq!(sum.matched, 0);
     assert_eq!(sum.ignored, 1);
     assert!(lookup.ips_for_hostname("a.example.com").is_empty());
@@ -517,19 +532,23 @@ fn no_active_user_caches_nothing() {
 #[test]
 fn secondary_ip_owners_maps_ips_to_their_rule_host() {
     let fqdn = MockFqdnCacheLookup::new();
-    fqdn.set_ips("openai.com", vec![Ipv4Addr::new(1, 2, 3, 4)]);
-    fqdn.set_ips("cdn.example.com", vec![Ipv4Addr::new(9, 9, 9, 9)]);
+    fqdn.set_ips("assistant.test", vec![Ipv4Addr::new(100, 64, 1, 4)]);
+    fqdn.set_ips("cdn.example.com", vec![Ipv4Addr::new(100, 64, 9, 9)]);
     let secondary = CanonicalRuleSet::from_rules(vec![
-        exact_fqdn_rule("r1", "openai.com"),
+        exact_fqdn_rule("r1", "assistant.test"),
         suffix_rule("r2", "example.com"),
     ]);
     let owners = build_secondary_ip_owners(&secondary, &fqdn);
     assert_eq!(
-        owners.get(&Ipv4Addr::new(1, 2, 3, 4)).map(String::as_str),
-        Some("openai.com")
+        owners
+            .get(&Ipv4Addr::new(100, 64, 1, 4))
+            .map(String::as_str),
+        Some("assistant.test")
     );
     assert_eq!(
-        owners.get(&Ipv4Addr::new(9, 9, 9, 9)).map(String::as_str),
+        owners
+            .get(&Ipv4Addr::new(100, 64, 9, 9))
+            .map(String::as_str),
         Some("cdn.example.com")
     );
 }
@@ -544,21 +563,33 @@ fn detects_collateral_when_direct_host_shares_a_secondary_ip() {
         active_sid("S-A"),
     );
     // A secondary host resolves and is cached (→ /32 out the secondary adapter).
-    let s1 = c.consume(&[obs("cdn.example.com", [9, 9, 9, 9])], SystemTime::now());
+    let s1 = c.consume(
+        &[obs("cdn.example.com", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
     assert_eq!(s1.matched, 1);
     assert_eq!(s1.collateral, 0);
     // A DIRECT host (matches no secondary rule) resolves to the SAME IP →
     // collateral: it silently rides the secondary /32 out the secondary adapter. This is
-    // exactly the "2ip.ru shows the VPN address" case (2ip.ru is a primary
+    // exactly the "IP-echo site shows the VPN address" case (such a site is a primary
     // .ru host; here we use an unmatched host, same `!in_secondary` path).
-    let s2 = c.consume(&[obs("victim.org", [9, 9, 9, 9])], SystemTime::now());
+    let s2 = c.consume(
+        &[obs("victim.example.org", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
     assert_eq!(s2.ignored, 1);
     assert_eq!(s2.collateral, 1);
     // Re-observing the same pair is deduped (one WARN per pair).
-    let s3 = c.consume(&[obs("victim.org", [9, 9, 9, 9])], SystemTime::now());
+    let s3 = c.consume(
+        &[obs("victim.example.org", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
     assert_eq!(s3.collateral, 0);
     // A direct host on a different, unclaimed IP is not collateral.
-    let s4 = c.consume(&[obs("clean.org", [10, 0, 0, 1])], SystemTime::now());
+    let s4 = c.consume(
+        &[obs("clean.example.org", [10, 0, 0, 1])],
+        SystemTime::now(),
+    );
     assert_eq!(s4.collateral, 0);
 }
 
@@ -581,34 +612,46 @@ fn collateral_with_unusable_secondary_still_counts_and_records_census() {
     )
     .with_secondary_usable_gate(Arc::new(move || gate.load(Ordering::Relaxed)));
     // A secondary rule host resolves → its IP becomes secondary-owned.
-    let s1 = c.consume(&[obs("cdn.example.com", [9, 9, 9, 9])], SystemTime::now());
+    let s1 = c.consume(
+        &[obs("cdn.example.com", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
     assert_eq!(s1.matched, 1);
     // A direct host shares the IP while the secondary is UNUSABLE.
-    let s2 = c.consume(&[obs("victim.org", [9, 9, 9, 9])], SystemTime::now());
+    let s2 = c.consume(
+        &[obs("victim.example.org", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
     assert_eq!(s2.collateral, 1, "detection still counts under the gate");
     {
         let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
         assert!(
             guard
-                .direct_host_count_for_ip(Ipv4Addr::new(9, 9, 9, 9))
+                .direct_host_count_for_ip(Ipv4Addr::new(100, 64, 9, 9))
                 .unwrap_or(0)
                 >= 1,
             "census tenant recording must survive the gate"
         );
     }
     // Repeats stay deduped exactly as before.
-    let s3 = c.consume(&[obs("victim.org", [9, 9, 9, 9])], SystemTime::now());
+    let s3 = c.consume(
+        &[obs("victim.example.org", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
     assert_eq!(s3.collateral, 0);
     // Recovery: with the secondary usable again a NEW collateral pair
     // takes the historic WARN path and is counted identically.
     usable.store(true, Ordering::Relaxed);
-    let s4 = c.consume(&[obs("victim2.org", [9, 9, 9, 9])], SystemTime::now());
+    let s4 = c.consume(
+        &[obs("victim2.example.org", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
     assert_eq!(s4.collateral, 1);
 }
 
 /// A host a MAIN-route rule claims keeps its census seat however wide that
 /// rule is, and is marked as main-route-claimed. Dropping it — the "narrower
-/// claim wins" posture — re-pinned the Google front-end addresses shared by
+/// claim wins" posture — re-pinned the CDN front-end addresses shared by
 /// `*.search.example` and a named `aistudio.search.example`, and search died in
 /// every browser: the pin cannot divert a host the user routed the other
 /// way, it can only cut it.
@@ -625,7 +668,7 @@ fn a_host_claimed_by_a_wide_main_route_rule_stays_a_census_tenant() {
     // The named secondary rule resolves → the address is secondary-owned.
     assert_eq!(
         c.consume(
-            &[obs("aistudio.search.example", [9, 9, 9, 9])],
+            &[obs("aistudio.search.example", [100, 64, 9, 9])],
             SystemTime::now()
         )
         .matched,
@@ -633,13 +676,13 @@ fn a_host_claimed_by_a_wide_main_route_rule_stays_a_census_tenant() {
     );
     // A neighbour on the same address, held only by the wide primary rule.
     c.consume(
-        &[obs("workspace.search.example", [9, 9, 9, 9])],
+        &[obs("workspace.search.example", [100, 64, 9, 9])],
         SystemTime::now(),
     );
     let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
     assert!(
         guard
-            .direct_host_count_for_ip(Ipv4Addr::new(9, 9, 9, 9))
+            .direct_host_count_for_ip(Ipv4Addr::new(100, 64, 9, 9))
             .unwrap_or(0)
             >= 1,
         "a main-route-claimed host keeps its census seat"
@@ -648,7 +691,7 @@ fn a_host_claimed_by_a_wide_main_route_rule_stays_a_census_tenant() {
         guard
             .shared_ip_census_primary_ruled_ips()
             .unwrap_or_default()
-            .contains(&Ipv4Addr::new(9, 9, 9, 9)),
+            .contains(&Ipv4Addr::new(100, 64, 9, 9)),
         "and the address is flagged as main-route-claimed, so fail-closed spares it"
     );
 }
@@ -668,12 +711,15 @@ fn an_unclaimed_bystander_does_not_flag_the_address_main_route_claimed() {
         active_sid("S-A"),
     );
     assert_eq!(
-        c.consume(&[obs("assistant.example", [9, 9, 9, 9])], SystemTime::now())
-            .matched,
+        c.consume(
+            &[obs("assistant.example", [100, 64, 9, 9])],
+            SystemTime::now()
+        )
+        .matched,
         1
     );
     c.consume(
-        &[obs("a.nel.cloudflare.com", [9, 9, 9, 9])],
+        &[obs("report.telemetry.example", [100, 64, 9, 9])],
         SystemTime::now(),
     );
     let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -701,18 +747,21 @@ fn a_neighbour_with_no_rule_of_its_own_stays_a_census_tenant() {
         active_sid("S-A"),
     );
     assert_eq!(
-        c.consume(&[obs("assistant.example", [9, 9, 9, 9])], SystemTime::now())
-            .matched,
+        c.consume(
+            &[obs("assistant.example", [100, 64, 9, 9])],
+            SystemTime::now()
+        )
+        .matched,
         1
     );
     c.consume(
-        &[obs("a.nel.cloudflare.com", [9, 9, 9, 9])],
+        &[obs("report.telemetry.example", [100, 64, 9, 9])],
         SystemTime::now(),
     );
     let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
     assert!(
         guard
-            .direct_host_count_for_ip(Ipv4Addr::new(9, 9, 9, 9))
+            .direct_host_count_for_ip(Ipv4Addr::new(100, 64, 9, 9))
             .unwrap_or(0)
             >= 1,
         "an unclaimed bystander keeps its veto"
@@ -732,20 +781,20 @@ fn a_neighbour_claimed_as_narrowly_stays_a_census_tenant() {
     );
     assert_eq!(
         c.consume(
-            &[obs("aistudio.search.example", [9, 9, 9, 9])],
+            &[obs("aistudio.search.example", [100, 64, 9, 9])],
             SystemTime::now()
         )
         .matched,
         1
     );
     c.consume(
-        &[obs("workspace.search.example", [9, 9, 9, 9])],
+        &[obs("workspace.search.example", [100, 64, 9, 9])],
         SystemTime::now(),
     );
     let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
     assert!(
         guard
-            .direct_host_count_for_ip(Ipv4Addr::new(9, 9, 9, 9))
+            .direct_host_count_for_ip(Ipv4Addr::new(100, 64, 9, 9))
             .unwrap_or(0)
             >= 1,
         "an equally specific claim is not outranked"
@@ -766,16 +815,22 @@ fn fake_ip_gate_keeps_census_and_summary_but_only_changes_log_level() {
         active_sid("S-A"),
     )
     .with_fake_ip_gate(Arc::new(|| true));
-    let s1 = c.consume(&[obs("cdn.example.com", [9, 9, 9, 9])], SystemTime::now());
+    let s1 = c.consume(
+        &[obs("cdn.example.com", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
     assert_eq!(s1.matched, 1);
     // The direct host on the shared IP is still counted as collateral (only
     // the log line's severity changed).
-    let s2 = c.consume(&[obs("victim.org", [9, 9, 9, 9])], SystemTime::now());
+    let s2 = c.consume(
+        &[obs("victim.example.org", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
     assert_eq!(s2.collateral, 1);
     // The tenant is still recorded in the census (direct_on_ip > 0).
     let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
     let tenants = guard
-        .direct_host_count_for_ip(Ipv4Addr::new(9, 9, 9, 9))
+        .direct_host_count_for_ip(Ipv4Addr::new(100, 64, 9, 9))
         .unwrap_or(0);
     assert!(
         tenants >= 1,
@@ -819,14 +874,14 @@ fn loopback_and_unspecified_observations_are_not_cached_or_collateral() {
     let s4 = c.consume(
         &[DnsObservation {
             hostname: "mix.example.com".into(),
-            ipv4s: vec![Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(8, 8, 4, 4)],
+            ipv4s: vec![Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(198, 51, 100, 4)],
         }],
         SystemTime::now(),
     );
     assert_eq!(s4.matched, 1);
     assert_eq!(
         lookup.ips_for_hostname("mix.example.com"),
-        vec![Ipv4Addr::new(8, 8, 4, 4)]
+        vec![Ipv4Addr::new(198, 51, 100, 4)]
     );
 }
 

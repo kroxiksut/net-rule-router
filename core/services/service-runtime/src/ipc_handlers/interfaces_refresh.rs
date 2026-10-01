@@ -135,7 +135,7 @@ mod tests {
             adapter_name: "Wi-Fi".into(),
             ipv6_if_index: 12,
             physical_address: None,
-            windows_name: "Wireless LAN".into(),
+            name: "Wireless LAN".into(),
             interface_description: "".into(),
             interface_type: "ieee80211".into(),
             oper_status: "up".into(),

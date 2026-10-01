@@ -7,11 +7,10 @@ publish = false
 license = "MPL-2.0"
 
 # Thin Linux daemon entrypoint binary — the sibling of `nrr-windows-service`.
-# All orchestration lives in `nrr-service-runtime`; this crate carries only the
-# systemd glue: argv dispatch, the install/uninstall executors over the pure
-# plans from `nrr-platform-linux::systemd`, a status banner, and the `run`
-# daemon body. The real enforcement supervisor + AF_UNIX IPC server land when a
-# systemd/root host is available (block 19.2).
+# Orchestration lives in `nrr-service-runtime`; this crate carries the systemd
+# glue: argv dispatch, install/uninstall over the plans from
+# `nrr-platform-linux::systemd`, a status banner, the policy stack wiring and
+# the AF_UNIX IPC server.
 
 # The crate name states the PLATFORM; the produced executable states the ROLE.
 # The `d` suffix is the Unix daemon tradition; an `nrr-service` symlink is
@@ -37,8 +36,7 @@ nrr-platform-linux = { path = "../../platform/linux" }
 nrr-platform-api = { path = "../../platform/api" }
 # `run` bootstraps storage + installs the NDJSON tracing subscriber; both are
 # OS-neutral. Also provides the IPC router / server traits + envelopes the
-# AF_UNIX server dispatches through. The full ServiceSupervisor is Windows-only
-# for now (HW-gated).
+# AF_UNIX server dispatches through, and the supervised runtime.
 nrr-service-runtime = { path = "../service-runtime" }
 # Needed to construct the production `StorageProfile` for the bootstrap config.
 nrr-storage = { path = "../../storage" }
@@ -49,9 +47,6 @@ nrr-storage = { path = "../../storage" }
 # Retention policies and the cleanup scope the supervised runtime's diagnostics
 # jobs take as inputs.
 nrr-diagnostics = { path = "../../diagnostics" }
-# The enforcement-mode enum the runtime deps carry (the daemon boots Reactive:
-# the local DNS resolver is a Windows mechanism today).
-nrr-domain = { path = "../../domain" }
 # The IPC provider bundle is assembled over the state database: every provider
 # behind the handler registry takes the same shared connection.
 rusqlite = { version = "0.32", features = ["bundled"] }

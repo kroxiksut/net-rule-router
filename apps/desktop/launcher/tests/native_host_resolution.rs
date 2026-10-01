@@ -18,6 +18,8 @@ fn env_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// Release builds ignore the variable by design.
+#[cfg(debug_assertions)]
 #[test]
 fn explicit_env_override_is_honoured() {
     let _serialised = env_guard();

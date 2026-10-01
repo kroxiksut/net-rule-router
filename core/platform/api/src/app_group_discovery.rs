@@ -92,7 +92,7 @@ impl AppGroupKind {
     }
 
     /// Whether this group's connections must be kept OUT of the FCrDNS
-    /// rule-host learner. A P2P peer's ISP hostname (`host.corbina.ru`)
+    /// rule-host learner. A P2P peer's ISP hostname (`host.isp.example`)
     /// forward-confirms and matches a broad zone rule (`.ru`), so learning it
     /// inflates the zone permit cap with junk peers. Only the
     /// peer-to-peer groups carry this flag.
@@ -156,6 +156,11 @@ pub struct DiscoveredApp {
 /// Discover known application-group members on this machine. Never an error — a
 /// backend that cannot enumerate returns an empty list. Runs with the caller's
 /// privileges (process enumeration + HKCU/HKLM reads + feature probing).
+///
+/// A backend that can read a hypervisor's arguments moves a guest that
+/// [`guest_network_bypasses_process`] to the kernel virtual networks. Windows
+/// does not read them: there a QEMU guest on a TAP adapter is still offered as
+/// a routable hypervisor, though no application rule reaches its traffic.
 pub trait AppGroupDiscoveryPort: Send + Sync {
     fn discover_app_groups(&self) -> Vec<DiscoveredApp>;
 }
@@ -212,10 +217,20 @@ pub const APP_GROUP_DICTIONARY: &[AppGroupEntry] = &[
     },
     // ── Virtualization: console/computer emulators with network traffic ──────
     // Ahead of the Android entry: "Dolphin Emulator" must not be caught by its
-    // generic `emulator`.
+    // generic `emulator`. Bare "dolphin" is KDE's file manager on Linux; the
+    // emulator ships as `dolphin-emu` there precisely to avoid it.
     AppGroupEntry {
         kind: AppGroupKind::ConsoleEmulator,
-        keywords: &["retroarch", "dolphin", "pcsx2", "rpcs3", "cemu", "citra"],
+        keywords: &[
+            "retroarch",
+            "dolphin-emu",
+            "dolphin.exe",
+            "dolphin emulator",
+            "pcsx2",
+            "rpcs3",
+            "cemu",
+            "citra",
+        ],
     },
     // ── Virtualization: Android emulators ────────────────────────────────────
     // The AVD's own backend, `qemu-system-*`, is a hypervisor by the entry above.
@@ -642,6 +657,27 @@ mod tests {
             classify_app("emulator.exe"),
             Some(AppGroupKind::AndroidEmulator)
         );
+    }
+
+    /// Dolphin the emulator (Windows `Dolphin.exe`, Linux `dolphin-emu`, and
+    /// installed-program display name "Dolphin Emulator") must classify as
+    /// [`AppGroupKind::ConsoleEmulator`], while KDE's unrelated file manager
+    /// — bare `dolphin`, no suffix, Linux-only — must not.
+    #[test]
+    fn dolphin_emulator_matches_without_catching_kde_file_manager() {
+        assert_eq!(
+            classify_app("Dolphin.exe"),
+            Some(AppGroupKind::ConsoleEmulator)
+        );
+        assert_eq!(
+            classify_app("dolphin-emu"),
+            Some(AppGroupKind::ConsoleEmulator)
+        );
+        assert_eq!(
+            classify_app("Dolphin Emulator"),
+            Some(AppGroupKind::ConsoleEmulator)
+        );
+        assert_eq!(classify_app("dolphin"), None);
     }
 
     #[test]

@@ -496,6 +496,11 @@ const UDP_PENDING_DIAL_QUEUE: usize = 8;
 /// it a new client's datagram is dropped and its retransmission retries.
 const MAX_PENDING_UDP_DIALS: usize = 128;
 
+/// Ceiling on UDP client flows (live plus dialing), the twin of
+/// [`MAX_ACTIVE_TCP_FLOWS`]: each holds an upstream socket and a reader thread,
+/// each bind two socket buffers. A client past it is told port-unreachable.
+const MAX_ACTIVE_UDP_FLOWS: usize = 512;
+
 /// Metadata ring slots per UDP socket — the max datagrams that can queue before
 /// the oldest is dropped (UDP is lossy; TCP would need more).
 const UDP_META_SLOTS: usize = 64;
@@ -557,11 +562,14 @@ pub struct FakeIpStack {
     udp_binds: HashMap<(std::net::IpAddr, u16), UdpBind>,
     socket_buffer_bytes: usize,
     max_flows: usize,
+    max_udp_flows: usize,
+    /// Set on the first refusal at the UDP cap, cleared once well under it.
+    udp_capacity_warned: bool,
     waker: Arc<StackWaker>,
     log_gate: Arc<DialLogGate>,
     flow_observer: Arc<dyn FlowObserver>,
     health: Arc<super::health::FakeIpHealth>,
-    /// Fake-IP instant reset (schema v40 `fake_ip_instant_rst`) — the live
+    /// Fake-IP instant reset (`fake_ip_instant_rst`) — the live
     /// gate the TCP dial-worker reads per dial. `true` (default) keeps the
     /// instant-reset behaviour for a source-policy refusal; `false` holds and
     /// retries that refusal class (see [`dial_tcp_with_hold`]). Production
@@ -646,6 +654,8 @@ impl FakeIpStack {
             udp_binds: HashMap::new(),
             socket_buffer_bytes: DEFAULT_SOCKET_BUFFER_BYTES,
             max_flows: MAX_ACTIVE_TCP_FLOWS,
+            max_udp_flows: MAX_ACTIVE_UDP_FLOWS,
+            udp_capacity_warned: false,
             waker,
             log_gate: DialLogGate::new(),
             flow_observer: Arc::new(NoopFlowObserver),
@@ -670,7 +680,7 @@ impl FakeIpStack {
         self
     }
 
-    /// Wire the live `fake_ip_instant_rst` gate (schema v40). Builder-style;
+    /// Wire the live `fake_ip_instant_rst` gate Builder-style;
     /// the default is a private flag defaulting to `true` (instant-reset),
     /// so a caller that never wires this — every existing test — sees
     /// unchanged behaviour.
@@ -695,6 +705,12 @@ impl FakeIpStack {
     #[cfg(test)]
     fn with_max_flows(mut self, flows: usize) -> Self {
         self.max_flows = flows.max(1);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_max_udp_flows(mut self, flows: usize) -> Self {
+        self.max_udp_flows = flows.max(1);
         self
     }
 

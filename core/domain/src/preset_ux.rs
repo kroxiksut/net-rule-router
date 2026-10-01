@@ -50,7 +50,7 @@ pub enum PresetImportErrorCategory {
     FileTooLarge,
     /// File bytes are not valid UTF-8 (or an unsupported byte-order mark).
     EncodingError,
-    /// Rule count across all sections exceeds [`crate::preset_validation::MAX_RULES_PER_FILE`].
+    /// Rule count across all sections exceeds [`nrr_shared::rules_json::FREE_MAX_RULES`].
     TooManyRules,
     /// At least one match value exceeds [`crate::preset_validation::MAX_MATCH_VALUE_LEN`].
     MatchValueTooLong,

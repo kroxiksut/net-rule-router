@@ -33,25 +33,25 @@ fn default_is_recoverable_with_canonical_constants() {
 }
 
 #[test]
-fn verbose_logging_defaults_to_false_for_implicit_record() {
+fn verbose_logging_defaults_to_normal_for_implicit_record() {
     let dir = tempfile::tempdir().expect("temp dir");
     let conn = open_state_db(&dir);
     let repo = ServiceStabilityConfigRepository::new(&conn);
     let r = repo.get_or_default().expect("get");
-    assert!(
-        !r.verbose_logging,
-        "implicit default must have verbose=false"
+    assert_eq!(
+        r.verbose_until_ms, None,
+        "implicit default is normal logging"
     );
 }
 
 #[test]
-fn verbose_logging_roundtrips_through_set_and_get() {
+fn verbose_deadline_roundtrips_through_set_and_get() {
     let dir = tempfile::tempdir().expect("temp dir");
     let conn = open_state_db(&dir);
     let repo = ServiceStabilityConfigRepository::new(&conn);
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        true,
+        Some(i64::MAX),
         false,
         false,
         true,
@@ -70,31 +70,29 @@ fn verbose_logging_roundtrips_through_set_and_get() {
     )
     .expect("set");
     let r = repo.get_or_default().expect("get");
-    assert!(r.verbose_logging, "verbose=true must be persisted");
+    assert_eq!(
+        r.verbose_until_ms,
+        Some(i64::MAX),
+        "the deadline must persist"
+    );
 
-    // Critical-with-verbose-true is a valid combination — the
+    // Critical-with-verbose is a valid combination — the
     // schema CHECK only constrains the policy parameter columns.
     assert_eq!(r.ipc_accept_policy, IpcAcceptPolicyRecord::Critical);
 }
 
-/// Direct coverage for the standalone boot-time probe.
-/// `main.rs`/`scm.rs` call `probe_verbose_logging` (not the repository
-/// directly) on a short-lived connection before installing the tracing
-/// subscriber, so this is the exact function that must reflect a saved
-/// GUI toggle at service startup.
+/// The boot path reads the deadline through this probe on a short-lived
+/// connection, before tracing exists.
 #[test]
-fn probe_verbose_logging_reflects_persisted_value() {
+fn probe_verbose_until_reflects_persisted_value() {
     let dir = tempfile::tempdir().expect("temp dir");
     let conn = open_state_db(&dir);
-    assert!(
-        !probe_verbose_logging(&conn),
-        "implicit default must probe false"
-    );
+    assert_eq!(probe_verbose_until(&conn), None, "implicit default");
 
     let repo = ServiceStabilityConfigRepository::new(&conn);
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        true,
+        Some(i64::MAX),
         false,
         false,
         true,
@@ -112,15 +110,12 @@ fn probe_verbose_logging_reflects_persisted_value() {
         1,
     )
     .expect("set");
-    assert!(
-        probe_verbose_logging(&conn),
-        "probe must observe a persisted verbose=true row"
-    );
+    assert_eq!(probe_verbose_until(&conn), Some(i64::MAX));
 }
 
 #[test]
 fn fake_ip_enabled_defaults_false_and_roundtrips() {
-    // Block D (S4.7) — machine-wide fake-IP toggle: off for the implicit
+    // Machine-wide fake-IP toggle: off for the implicit
     // default record and for a pre-v34 row; an explicit `true` persists.
     let dir = tempfile::tempdir().expect("temp dir");
     let conn = open_state_db(&dir);
@@ -131,7 +126,7 @@ fn fake_ip_enabled_defaults_false_and_roundtrips() {
     );
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -152,7 +147,7 @@ fn fake_ip_enabled_defaults_false_and_roundtrips() {
     let r = repo.get_or_default().expect("get");
     assert!(r.fake_ip_enabled, "fake_ip_enabled=true must persist");
     // Unrelated flags untouched.
-    assert!(!r.verbose_logging && !r.conn_trace_ndjson);
+    assert!(r.verbose_until_ms.is_none() && !r.conn_trace_ndjson);
 }
 
 #[test]
@@ -169,7 +164,7 @@ fn fake_ip_udp_relay_defaults_false_and_roundtrips() {
     );
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -210,7 +205,7 @@ fn fake_ip_instant_rst_defaults_true_and_roundtrips() {
     );
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -244,7 +239,7 @@ fn fake_ip_instant_rst_defaults_true_and_roundtrips() {
 fn set_rules_lock(repo: &ServiceStabilityConfigRepository<'_>, allow: bool, now_ms: i64) {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -350,7 +345,7 @@ fn conn_trace_flags_default_and_roundtrip_independently() {
     // GUI on, NDJSON off — independent toggles.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         true,
         true,
@@ -372,7 +367,7 @@ fn conn_trace_flags_default_and_roundtrip_independently() {
     assert!(!r.conn_trace_ndjson, "ndjson must stay off");
     assert!(r.conn_trace_gui, "gui must persist on");
     // Unrelated flags untouched.
-    assert!(!r.verbose_logging);
+    assert!(r.verbose_until_ms.is_none());
 }
 
 #[test]
@@ -391,7 +386,7 @@ fn rule_scope_defaults_to_service_driven_and_roundtrips() {
     // Flip to app-driven (false); other flags untouched.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         false,
@@ -411,7 +406,7 @@ fn rule_scope_defaults_to_service_driven_and_roundtrips() {
     .expect("set");
     let r = repo.get_or_default().expect("get");
     assert!(!r.rule_scope_service_driven, "app-driven must persist");
-    assert!(!r.verbose_logging && !r.conn_trace_ndjson && !r.conn_trace_gui);
+    assert!(r.verbose_until_ms.is_none() && !r.conn_trace_ndjson && !r.conn_trace_gui);
 }
 
 #[test]
@@ -428,7 +423,7 @@ fn routing_stop_policy_defaults_to_persist_and_roundtrips() {
     // Explicit persist roundtrips; unrelated flags untouched.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -453,7 +448,7 @@ fn routing_stop_policy_defaults_to_persist_and_roundtrips() {
     // Explicit teardown (full restore-pristine) roundtrips back.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -496,7 +491,7 @@ fn cache_refresh_interval_defaults_and_roundtrips() {
     // clamped up by the write path before it reaches the schema CHECK.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -543,7 +538,7 @@ fn enforcement_mode_defaults_to_resolver_and_roundtrips() {
     // untouched.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -574,7 +569,7 @@ fn enforcement_mode_defaults_to_resolver_and_roundtrips() {
     // proves persistence rather than agreement with the default.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -616,7 +611,7 @@ fn secondary_liveness_window_defaults_disabled_and_roundtrips() {
     // A valid in-range value round-trips unchanged; unrelated flags untouched.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -641,7 +636,7 @@ fn secondary_liveness_window_defaults_disabled_and_roundtrips() {
     // A below-min non-zero value is clamped UP to 5 on write (never rejected).
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -670,7 +665,7 @@ fn secondary_liveness_window_defaults_disabled_and_roundtrips() {
     // An above-max value is clamped DOWN to 3600 on write.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -699,7 +694,7 @@ fn secondary_liveness_window_defaults_disabled_and_roundtrips() {
     // 0 (disabled) round-trips back unchanged.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -799,7 +794,7 @@ fn set_recoverable_then_get_roundtrips() {
     };
     repo.set(
         &policy,
-        false,
+        None,
         false,
         false,
         true,
@@ -830,7 +825,7 @@ fn set_critical_then_get_returns_critical_with_null_params() {
     let repo = ServiceStabilityConfigRepository::new(&conn);
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -859,7 +854,7 @@ fn set_overwrites_previous_row() {
     let repo = ServiceStabilityConfigRepository::new(&conn);
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -883,7 +878,7 @@ fn set_overwrites_previous_row() {
             backoff_base_ms: 100,
             backoff_cap_ms: 1_500,
         },
-        false,
+        None,
         false,
         false,
         true,
@@ -967,7 +962,7 @@ fn schema_rejects_second_row() {
     let repo = ServiceStabilityConfigRepository::new(&conn);
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
-        false,
+        None,
         false,
         false,
         true,
@@ -1015,4 +1010,17 @@ fn validate_recoverable_params_rejects_inverted_cap() {
 #[test]
 fn validate_recoverable_params_rejects_zero_restarts() {
     assert!(validate_recoverable_params(0, 100, 5_000).is_err());
+}
+
+#[test]
+fn schema_rejects_a_non_positive_verbose_deadline() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let res = conn.execute(
+        "INSERT INTO service_stability_config
+            (id, ipc_accept_kind, ipc_max_restarts, ipc_backoff_base_ms, ipc_backoff_cap_ms, set_by_sid, updated_at, verbose_until_ms)
+         VALUES (1, 'critical', NULL, NULL, NULL, NULL, 1, 0)",
+        [],
+    );
+    assert!(res.is_err(), "a deadline of 0 must be rejected");
 }

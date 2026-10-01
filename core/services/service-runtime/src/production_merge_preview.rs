@@ -30,7 +30,7 @@ use nrr_domain::merge::{
     merge_rule_books_with_resolutions, ConflictRule, ConflictSide, MergeConflict, MergeOrigin,
     MergePolicy, MergeResult, MergedRuleEntry,
 };
-use nrr_domain::preset_canonicalize::canonicalize_preset_rules;
+use nrr_domain::preset_canonicalize::{canonicalize_preset_rules, PresetRulesCanonicalizeOutcome};
 use nrr_domain::review::SubdomainCoverage;
 use nrr_domain::rules_file::{parse_rules_file, HostPlatform};
 use nrr_domain::rules_json_codec;
@@ -157,9 +157,11 @@ impl ProductionMergePreviewSource {
         };
         match record {
             Some(rec) => {
-                let dto = rules_json::from_canonical_string(&rec.rules_json).map_err(|e| {
-                    MergePreviewError::ServiceDecodeError(format!("wire parse: {e}"))
-                })?;
+                let dto = crate::production_rules_provider::read_stored_rules(
+                    &rec.rules_json,
+                    &rec.revision_id,
+                )
+                .map_err(|e| MergePreviewError::ServiceDecodeError(format!("wire parse: {e}")))?;
                 let content =
                     rules_json_codec::decode(dto, HostPlatform::compiled()).map_err(|e| {
                         MergePreviewError::ServiceDecodeError(format!("codec decode: {e}"))
@@ -232,9 +234,19 @@ fn canonicalize_side(
     );
     match outcome.rule_set() {
         Some(set) => Ok(set.clone()),
-        None => Err(MergePreviewError::FileCanonicalizeRejected(format!(
-            "{route:?} rules failed canonicalization"
-        ))),
+        None => {
+            // Named, so a file past the rule cap does not read as a bad value.
+            let reasons: Vec<String> = match &outcome {
+                PresetRulesCanonicalizeOutcome::Rejected { errors } => {
+                    errors.iter().map(ToString::to_string).collect()
+                }
+                _ => Vec::new(),
+            };
+            Err(MergePreviewError::FileCanonicalizeRejected(format!(
+                "{route:?} rules failed canonicalization: {}",
+                reasons.join("; ")
+            )))
+        }
     }
 }
 
@@ -528,7 +540,7 @@ mod tests {
             .merge_preview(
                 nrr_storage::BASELINE_PRINCIPAL,
                 MergePreviewInput {
-                    primary_text: "--- IP\n1.2.3.4\n",
+                    primary_text: "--- IP\n192.0.2.4\n",
                     secondary_text: "",
                     policy: MergePolicyDto::Union,
                     resolutions: &[],
@@ -538,7 +550,7 @@ mod tests {
             )
             .expect("merge preview");
         assert_eq!(out.file_only.len(), 1, "one file-only rule");
-        assert_eq!(out.file_only[0].value, "1.2.3.4");
+        assert_eq!(out.file_only[0].value, "192.0.2.4");
         assert_eq!(out.file_only[0].type_slug, "exact-ip");
         assert!(out.service_only.is_empty());
         assert!(out.conflicts.is_empty());
@@ -549,25 +561,25 @@ mod tests {
     fn diverged_file_and_service_produce_buckets() {
         const CALLER: &str = "S-1-5-21-merge-1001";
         let conn = open_state_db_in_memory();
-        // Service has 1.2.3.4 (primary) + 9.9.9.9 (primary).
+        // Service has 192.0.2.4 (primary) + 198.51.100.9 (primary).
         seed_active_revision_for(
             &conn,
             CALLER,
             CanonicalRuleBook {
                 primary: CanonicalRuleSet::from_rules(vec![
-                    ip_rule("r-1", [1, 2, 3, 4], true),
-                    ip_rule("r-2", [9, 9, 9, 9], true),
+                    ip_rule("r-1", [192, 0, 2, 4], true),
+                    ip_rule("r-2", [198, 51, 100, 9], true),
                 ]),
                 secondary: CanonicalRuleSet::default(),
             },
         );
-        // File (primary) has 1.2.3.4 (same) + 5.5.5.5 (new). 9.9.9.9 dropped.
+        // File (primary) has 192.0.2.4 (same) + 198.51.100.5 (new). 198.51.100.9 dropped.
         let source = ProductionMergePreviewSource::new(Arc::clone(&conn));
         let out = source
             .merge_preview(
                 CALLER,
                 MergePreviewInput {
-                    primary_text: "--- IP\n1.2.3.4\n5.5.5.5\n",
+                    primary_text: "--- IP\n192.0.2.4\n198.51.100.5\n",
                     secondary_text: "",
                     policy: MergePolicyDto::Union,
                     resolutions: &[],
@@ -576,16 +588,16 @@ mod tests {
                 },
             )
             .expect("merge preview");
-        // 5.5.5.5 is file-only; 9.9.9.9 is service-only; 1.2.3.4 is identical.
+        // 198.51.100.5 is file-only; 198.51.100.9 is service-only; 192.0.2.4 is identical.
         let file_vals: Vec<_> = out.file_only.iter().map(|e| e.value.clone()).collect();
         let svc_vals: Vec<_> = out.service_only.iter().map(|e| e.value.clone()).collect();
         assert!(
-            file_vals.contains(&"5.5.5.5".to_string()),
-            "file-only 5.5.5.5"
+            file_vals.contains(&"198.51.100.5".to_string()),
+            "file-only 198.51.100.5"
         );
         assert!(
-            svc_vals.contains(&"9.9.9.9".to_string()),
-            "service-only 9.9.9.9"
+            svc_vals.contains(&"198.51.100.9".to_string()),
+            "service-only 198.51.100.9"
         );
         assert!(out.conflicts.is_empty(), "no attribute conflicts");
         assert!(!out.noop);
@@ -595,13 +607,36 @@ mod tests {
     fn invalid_file_text_is_rejected() {
         let conn = open_state_db_in_memory();
         let source = ProductionMergePreviewSource::new(Arc::clone(&conn));
-        // A bare-glob `*` app rule fails semantic canonicalization (it would
-        // match every process) — the merge preview surfaces that as a clean
-        // rejection rather than silently swallowing the file. Platform
-        // sections are only canonicalized on their own OS, so the rule must sit
-        // in the section active on THIS host; otherwise it is preserved-but-
-        // inactive and never reaches canonicalization (making the test pass on
-        // Windows but silently no-op on Linux/macOS).
+        // A name in the IP section is a genuine semantic error (never a
+        // domain rule by fallback) — the merge preview surfaces that as a
+        // clean rejection rather than silently swallowing the file.
+        let err = source
+            .merge_preview(
+                nrr_storage::BASELINE_PRINCIPAL,
+                MergePreviewInput {
+                    primary_text: "--- IP\nnot-an-ip\n",
+                    secondary_text: "",
+                    policy: MergePolicyDto::Union,
+                    resolutions: &[],
+                    keep_secondary: &[],
+                    include_child_processes: false,
+                },
+            )
+            .expect_err("must reject a name in the IP section");
+        assert!(matches!(
+            err,
+            MergePreviewError::FileCanonicalizeRejected(_)
+        ));
+    }
+
+    #[test]
+    fn a_bare_glob_app_rule_is_dropped_not_rejected() {
+        let conn = open_state_db_in_memory();
+        let source = ProductionMergePreviewSource::new(Arc::clone(&conn));
+        // A bare `*` is refused outright the same way a no-destination
+        // address is: dropped, the rest of the file still merges. Platform
+        // sections are only canonicalized on their own OS, so both rules must
+        // sit in the section active on THIS host.
         let host_section = if cfg!(target_os = "windows") {
             "--- Windows"
         } else if cfg!(target_os = "linux") {
@@ -609,8 +644,8 @@ mod tests {
         } else {
             "--- MacOS"
         };
-        let file_text = format!("{host_section}\n*\n");
-        let err = source
+        let file_text = format!("{host_section}\nchrome.exe\n*\n");
+        let out = source
             .merge_preview(
                 nrr_storage::BASELINE_PRINCIPAL,
                 MergePreviewInput {
@@ -622,10 +657,7 @@ mod tests {
                     include_child_processes: false,
                 },
             )
-            .expect_err("must reject bare-glob app rule");
-        assert!(matches!(
-            err,
-            MergePreviewError::FileCanonicalizeRejected(_)
-        ));
+            .expect("the bare glob is dropped, the rest of the file still merges");
+        assert!(!out.noop, "chrome.exe is a new rule to merge in");
     }
 }

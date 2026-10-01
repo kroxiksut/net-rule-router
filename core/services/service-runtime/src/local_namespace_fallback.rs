@@ -77,9 +77,9 @@ impl LocalNamespaceFallbackResolver {
         self
     }
 
-    fn fallback_servers(&self) -> Vec<Ipv4Addr> {
+    fn fallback_servers(&self, budget: Duration) -> Vec<Ipv4Addr> {
         self.servers
-            .upstream_candidates_v4()
+            .upstream_candidates_v4_within(budget)
             .into_iter()
             .map(|c: UpstreamDnsCandidate| c.server)
             .filter(|s| is_private_resolver(*s))
@@ -93,19 +93,20 @@ impl UpstreamResolver for LocalNamespaceFallbackResolver {
     fn resolve_within(
         &self,
         hostname: &str,
-        _family: AddressFamily,
+        family: AddressFamily,
         budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
         let started = std::time::Instant::now();
-        let first = self
-            .inner
-            .resolve_within(hostname, AddressFamily::Ipv4, budget);
+        let first = self.inner.resolve_within(hostname, family, budget);
         // Only a clean non-existence is worth a second opinion. Everything else
-        // either succeeded or is being retried below us.
-        if !matches!(first, Err(ResolveError::NoRecords)) {
+        // either succeeded or is being retried below us. An empty AAAA is what
+        // most names answer, and the client falls back to the A asked beside
+        // it, which does take this path: re-asking here would cost nearly
+        // every IPv6 query a wait on a resolver that may be dead.
+        if family == AddressFamily::Ipv6 || !matches!(first, Err(ResolveError::NoRecords)) {
             return first;
         }
-        for server in self.fallback_servers() {
+        for server in self.fallback_servers(budget.saturating_sub(started.elapsed())) {
             // Whatever the upstream left. A private resolver asked after the
             // client has already given up answers into nothing.
             let left = budget.saturating_sub(started.elapsed());
@@ -119,7 +120,7 @@ impl UpstreamResolver for LocalNamespaceFallbackResolver {
                 // resolver that does not answer promptly has nothing to add.
                 1,
             );
-            if let Ok(resolved) = direct.resolve_within(hostname, AddressFamily::Ipv4, left) {
+            if let Ok(resolved) = direct.resolve_within(hostname, family, left) {
                 if !resolved.addresses.is_empty() {
                     tracing::info!(
                         target: "nrr::dns-resolver",
@@ -202,8 +203,8 @@ mod tests {
             assert!(is_private_resolver(private), "{private}");
         }
         for public in [
-            Ipv4Addr::new(1, 1, 1, 1),
-            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(100, 64, 1, 1),
+            Ipv4Addr::new(100, 64, 8, 8),
             Ipv4Addr::new(172, 15, 0, 1),
             Ipv4Addr::new(172, 32, 0, 1),
             Ipv4Addr::LOCALHOST,
@@ -218,7 +219,7 @@ mod tests {
     fn an_answered_name_never_reaches_the_fallback() {
         let inner = Arc::new(Fixed(
             Ok(ResolvedAddresses {
-                addresses: vec![IpAddr::V4(Ipv4Addr::new(23, 10, 20, 138))],
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 138))],
                 ttl_seconds: 60,
             }),
             Mutex::new(0),
@@ -257,7 +258,7 @@ mod tests {
         let inner = Arc::new(Fixed(Err(ResolveError::NoRecords), Mutex::new(0)));
         let r = LocalNamespaceFallbackResolver::new(
             inner,
-            Arc::new(Servers(vec![Ipv4Addr::new(1, 1, 1, 1)])),
+            Arc::new(Servers(vec![Ipv4Addr::new(100, 64, 1, 1)])),
             Duration::from_millis(1),
         );
         assert!(matches!(
@@ -276,7 +277,82 @@ mod tests {
             Duration::from_millis(1),
         )
         .already_asked(vec![corp()]);
-        assert_eq!(r.fallback_servers(), vec![Ipv4Addr::new(10, 0, 0, 1)]);
+        assert_eq!(
+            r.fallback_servers(Duration::from_secs(1)),
+            vec![Ipv4Addr::new(10, 0, 0, 1)]
+        );
+    }
+
+    struct Recording(
+        Result<ResolvedAddresses, ResolveError>,
+        Mutex<Vec<AddressFamily>>,
+    );
+    impl UpstreamResolver for Recording {
+        fn resolve_within(
+            &self,
+            _hostname: &str,
+            family: AddressFamily,
+            _budget: Duration,
+        ) -> Result<ResolvedAddresses, ResolveError> {
+            self.1.lock().unwrap().push(family);
+            self.0.clone()
+        }
+    }
+
+    struct CountingServers(Mutex<u32>);
+    impl SystemDnsServersPort for CountingServers {
+        fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+            *self.0.lock().unwrap() += 1;
+            vec![UpstreamDnsCandidate::new(None, corp())]
+        }
+    }
+
+    /// An AAAA reaches the upstream as an AAAA, and its answer comes back.
+    #[test]
+    fn the_family_asked_is_the_family_passed_down() {
+        let v6: std::net::Ipv6Addr = "2001:db8::7".parse().unwrap();
+        let inner = Arc::new(Recording(
+            Ok(ResolvedAddresses {
+                addresses: vec![IpAddr::V6(v6)],
+                ttl_seconds: 60,
+            }),
+            Mutex::new(Vec::new()),
+        ));
+        let r = LocalNamespaceFallbackResolver::new(
+            Arc::clone(&inner) as Arc<dyn UpstreamResolver>,
+            Arc::new(Servers(vec![corp()])),
+            Duration::from_millis(1),
+        );
+        let answer = r.resolve("host.example", AddressFamily::Ipv6).unwrap();
+        assert_eq!(answer.addresses, vec![IpAddr::V6(v6)]);
+        r.resolve("host.example", AddressFamily::Ipv4).unwrap();
+        assert_eq!(
+            *inner.1.lock().unwrap(),
+            vec![AddressFamily::Ipv6, AddressFamily::Ipv4]
+        );
+    }
+
+    /// An empty AAAA is the ordinary answer; the A asked beside it carries the
+    /// second opinion, so the private resolvers are not even looked up.
+    #[test]
+    fn an_empty_aaaa_is_not_re_asked_of_the_private_resolvers() {
+        let inner = Arc::new(Fixed(Err(ResolveError::NoRecords), Mutex::new(0)));
+        let servers = Arc::new(CountingServers(Mutex::new(0)));
+        let r = LocalNamespaceFallbackResolver::new(
+            inner,
+            Arc::clone(&servers) as Arc<dyn SystemDnsServersPort>,
+            Duration::from_millis(1),
+        )
+        // Listed but excluded, so the A below looks them up without a packet.
+        .already_asked(vec![corp()]);
+        assert!(matches!(
+            r.resolve("host.example", AddressFamily::Ipv6),
+            Err(ResolveError::NoRecords)
+        ));
+        assert_eq!(*servers.0.lock().unwrap(), 0);
+        // The A path still asks them.
+        let _ = r.resolve("host.example", AddressFamily::Ipv4);
+        assert_eq!(*servers.0.lock().unwrap(), 1);
     }
 
     /// The bound holds however many resolvers the machine lists.
@@ -289,6 +365,9 @@ mod tests {
             Arc::new(Servers(many)),
             Duration::from_millis(1),
         );
-        assert_eq!(r.fallback_servers().len(), MAX_FALLBACK_SERVERS);
+        assert_eq!(
+            r.fallback_servers(Duration::from_secs(1)).len(),
+            MAX_FALLBACK_SERVERS
+        );
     }
 }

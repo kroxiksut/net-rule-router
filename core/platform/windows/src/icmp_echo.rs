@@ -198,7 +198,7 @@ mod tests {
     #[ignore = "needs a routed network path"]
     fn a_hop_limit_of_one_is_answered_by_the_first_router() {
         let outcome = WindowsIcmpEcho.echo(&EchoProbe {
-            destination: Ipv4Addr::new(1, 1, 1, 1),
+            destination: Ipv4Addr::new(198, 51, 100, 1),
             source: None,
             ttl: 1,
             payload: b"nrr-echo".to_vec(),

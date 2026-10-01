@@ -1,6 +1,6 @@
 //! Storage layer trait interfaces.
 //!
-//! These four traits define the complete public boundary between the service
+//! These three traits define the complete public boundary between the service
 //! layer and the SQLite backend.
 //!
 //! No SQL leaks past this boundary.  The service layer depends on these traits;
@@ -10,12 +10,10 @@
 //!
 //! - **`CacheRepository`** — owns the FQDN/IP cache (`nrr_fqdn_ip_cache.db`).
 //!   Rebuildable on corruption without user interaction.
-//! - **`RevisionMetadataRepository`** — owns service-critical state
-//!   (`nrr_service_state.db`): active revision pointer, LKG pointer, integrity
-//!   metadata.  Corruption here triggers a LKG fallback, not a simple rebuild.
+//! - **`RevisionMetadataRepository`** — the keyless integrity report over
+//!   service-critical state (`nrr_service_state.db`). Recovery is the keyed
+//!   per-principal sweep's, never this trait's.
 //! - **`MigrationRunner`** — schema evolution for both databases.
-//! - **`StorageHealthChecker`** — read-only health snapshot for diagnostics and
-//!   the GUI status surface (via the service facade).
 //!
 //! # Startup sequence
 //!
@@ -35,8 +33,8 @@ use nrr_domain::revision::RevisionId;
 use crate::dto::{
     CacheEntryRow, CacheLookupRequest, CacheLookupResult, CacheResetReason, CacheResetSummary,
     CacheStats, CleanupPolicy, CleanupSummary, ExpiredHostname, IntegrityCheckResult,
-    IntegrityStatus, LookupEventEntry, MigrationSummary, NegativeCacheEntry, NegativeCacheReason,
-    RecoveryAction, ResolutionEntry, SchemaVerification, StorageHealthStatus,
+    MigrationSummary, NegativeCacheEntry, NegativeCacheReason, RecoveryAction, ResolutionEntry,
+    SchemaVerification,
 };
 use crate::error::StorageResult;
 use crate::resolution_source::StorageResolutionSource;
@@ -100,11 +98,6 @@ pub trait CacheRepository {
         retry_after: SystemTime,
         source: StorageResolutionSource,
     ) -> StorageResult<()>;
-
-    /// Record a minimal lookup event for explain correlation.
-    ///
-    /// No raw hostname or IP is stored — only direction, state, and timestamps.
-    fn record_lookup_event(&self, event: LookupEventEntry) -> StorageResult<()>;
 
     // ── DNS refresh ──────────────────────────────────────────────────────────
 
@@ -278,36 +271,25 @@ pub trait CacheRepository {
 
     // ── Revision lifecycle ────────────────────────────────────────────────────
 
-    /// Mark cache entries from previous revisions as `stale_usable`.
-    ///
-    /// Entries are kept as reusable network observations; they are not deleted.
-    /// Returns the number of rows updated.
-    fn mark_revision_stale(&self, new_active_revision_id: &str) -> StorageResult<u64>;
-
     // ── Maintenance ───────────────────────────────────────────────────────────
 
-    /// Remove expired resolutions, negative cache entries, and old lookup
-    /// events according to `policy`.  Runs `periodic_vacuum` when
+    /// Remove expired resolutions, negative cache entries, old lookup events
+    /// and shared-IP direct tenants not seen within the policy's age, in
+    /// batches of `policy.batch_size`. Runs `periodic_vacuum` when
     /// `policy.run_vacuum` is `true`.
     ///
-    /// **Nothing schedules this, on purpose.** An expired resolution is not
-    /// waste: the row stays as a reusable network observation (`stale_usable`),
-    /// the DNS refresh re-resolves it in place, and enforcement reads it while
-    /// it does. A periodic sweep would delete rows the enforcement path is
-    /// still looking at, to reclaim space on a table that holds a few thousand
-    /// rows — a risk with nothing on the other side of it.
-    ///
-    /// So this is the caller-driven path (a user asking to clear the cache),
-    /// not a background one, and `CleanupPolicy::run_vacuum` has no production
-    /// writer for the same reason. The journal is kept small by the WAL
-    /// checkpoint on the maintenance tick instead.
+    /// Run by the service's hourly maintenance tick. It is safe there because
+    /// a held (non-traffic) resolution goes only after the 30-day backstop,
+    /// far outside the window enforcement reads; without it months of
+    /// browsing pile up under every suffix scan and census query.
     fn cleanup_expired(
         &self,
         now: SystemTime,
         policy: &CleanupPolicy,
     ) -> StorageResult<CleanupSummary>;
 
-    /// Delete all FQDN/IP cache rows.  Does not touch `nrr_service_state.db`,
+    /// Delete all FQDN/IP cache rows, the shared-IP census included.  Does not
+    /// touch `fake_ip_bindings`, `nrr_service_state.db`,
     /// audit events, or user rules files.
     fn clear_cache(&self, reason: CacheResetReason) -> StorageResult<CacheResetSummary>;
 
@@ -331,8 +313,7 @@ pub trait CacheRepository {
     /// Returns live aggregate row counts from the FQDN/IP cache data tables.
     ///
     /// Used by the service facade to populate
-    /// [`CacheDiagnosticSummary`][crate::explain::CacheDiagnosticSummary] for the
-    /// GUI health surface.  The query is a single-pass SELECT — inexpensive on
+    /// the GUI cache surface.  The query is a single-pass SELECT — inexpensive on
     /// a warm WAL database.
     fn get_cache_stats(&self) -> StorageResult<CacheStats>;
 
@@ -351,8 +332,7 @@ pub trait CacheRepository {
 
     /// Read the most recent rebuild/refresh timestamp.
     /// Returns `Ok(None)` when the singleton row has not been written
-    /// (fresh install, no warm-up writes, no clear yet). The IPC
-    /// status handler exposes this via `StorageHealthStatus`.
+    /// (fresh install, no warm-up writes, no clear yet).
     fn get_last_rebuild_at_ms(&self) -> StorageResult<Option<i64>>;
 
     /// Run `PRAGMA integrity_check(1)` on the cache database.
@@ -369,52 +349,21 @@ pub trait CacheRepository {
 
 // ── RevisionMetadataRepository ────────────────────────────────────────────────
 
-/// Read/write interface for service-critical state in `nrr_service_state.db`.
+/// Read-only integrity surface of `nrr_service_state.db` for the keyless boot
+/// check.
 ///
-/// Corruption here is NOT recoverable by a simple rebuild — it triggers a
-/// fallback to the last-known-good revision.
+/// Deliberately has no way to move a pointer: this store cannot tell whose
+/// revision to trust, so it reports and the keyed per-principal sweep in the
+/// service recovers.
 pub trait RevisionMetadataRepository {
-    // ── Revision pointers ─────────────────────────────────────────────────────
-
-    /// Returns the currently active policy revision id, or `None` if no
-    /// revision has been activated yet (fresh install).
+    /// The baseline principal's active pointer, or `None` before the first
+    /// activation.
     fn get_active_revision(&self) -> StorageResult<Option<RevisionId>>;
 
-    /// Sets the active revision pointer.  Called by the service after a policy
-    /// revision is validated and applied.
-    fn set_active_revision(&self, revision_id: &RevisionId) -> StorageResult<()>;
-
-    /// The revision to roll back to: the most recent one that was active and
-    /// got replaced. `None` when nothing has ever been superseded.
-    ///
-    /// Derived from `revisions`, not stored anywhere — which is why this trait
-    /// has no `set_last_known_good`. There used to be one, and nothing in the
-    /// product ever called it, so the recovery flow always found an empty
-    /// table. A fact that can be read off the revision history must not also be
-    /// maintained by hand.
-    fn get_last_known_good(&self) -> StorageResult<Option<RevisionId>>;
-
-    // ── Integrity ─────────────────────────────────────────────────────────────
-
-    /// Runs a full integrity check and returns the result.
-    ///
-    /// The storage layer checks SQLite `PRAGMA integrity_check`, validates the
-    /// active revision pointer format, and verifies any stored content hash.
-    /// It returns a [`RecoveryAction`] alongside the result so the service
-    /// layer can decide what to do — the storage layer never applies the action.
+    /// SQLite structure, every principal's pointer and the row it names, and
+    /// every principal's rollback target. Returns the finding and a hint; the
+    /// storage layer never applies the action.
     fn check_integrity(&self) -> StorageResult<(IntegrityCheckResult, RecoveryAction)>;
-
-    /// Persists the outcome of the latest integrity check (timestamp + result)
-    /// for health reporting.
-    fn record_integrity_check(
-        &self,
-        result: &IntegrityCheckResult,
-        checked_at: SystemTime,
-    ) -> StorageResult<()>;
-
-    /// Returns the latest stored integrity status for health reporting without
-    /// re-running the check.
-    fn get_integrity_status(&self) -> StorageResult<IntegrityStatus>;
 }
 
 // ── MigrationRunner ───────────────────────────────────────────────────────────
@@ -437,15 +386,4 @@ pub trait MigrationRunner {
     /// Verifies that the schema is internally consistent after migration
     /// (tables, indexes, foreign keys).
     fn verify_schema(&self) -> StorageResult<SchemaVerification>;
-}
-
-// ── StorageHealthChecker ──────────────────────────────────────────────────────
-
-/// Read-only health snapshot for the GUI diagnostics surface.
-///
-/// The snapshot is delivered to the GUI through the service facade
-/// over IPC — the GUI never reads SQLite directly.
-pub trait StorageHealthChecker {
-    /// Returns a point-in-time health snapshot for both databases.
-    fn check_health(&self) -> StorageResult<StorageHealthStatus>;
 }

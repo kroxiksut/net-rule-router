@@ -78,11 +78,9 @@
 //! `filterKey` matches the [namespace signature](NRR_FILTER_KEY_DATA1).
 //! Filters added by Windows itself or by other products are skipped.
 //!
-//! Live WFP records carry [`WfpFilterRecord::app_pattern`] and
-//! [`WfpFilterRecord::user_sid`] as `None` — the kernel does not retain
-//! the user-facing path or the original string SID. Callers cross-
-//! reference against `nrr-storage` persisted state if they need those
-//! fields back.
+//! Live WFP records carry [`WfpFilterRecord::app_pattern`] as `None` — the
+//! kernel keeps only the NT-path blob. [`WfpFilterRecord::user_sid`] is read
+//! back from the `ALE_USER_ID` descriptor, which names the SID in its one ACE.
 
 #![allow(unsafe_code)]
 
@@ -117,7 +115,7 @@ use crate::types::{
 };
 
 use super::wfp_engine::token_to_handle;
-use super::wfp_sublayer::{ensure_sublayer, NRR_SUBLAYER_GUID};
+use super::wfp_sublayer::{ensure_sublayer_once, NRR_SUBLAYER_GUID};
 
 // Shared with the classifiers in `nrr-platform-api`: they key on the NAME, so
 // a rename here has to be a compile error there rather than a policy that
@@ -193,9 +191,8 @@ pub fn filter_id_from_guid(guid: &GUID) -> Option<WfpFilterId> {
 
 /// Add a WFP filter inside the current transaction.
 ///
-/// Side-effect: idempotently ensures the NetRuleRouter sub-layer is
-/// present in the engine. Callers don't need to register the sub-layer
-/// separately.
+/// Side-effect: ensures the NetRuleRouter sub-layer is present, once per
+/// transaction. Callers don't need to register the sub-layer separately.
 ///
 /// Returns the same [`WfpFilterId`] the caller passed in `spec.id` —
 /// the FFI does not surface Win32's runtime `filterId: u64` (which is
@@ -224,8 +221,8 @@ pub fn add_filter(
         sd_size = size;
     }
 
-    // --- 2. Privileged step: idempotently ensure the sub-layer. -----
-    if let Err(e) = ensure_sublayer(token) {
+    // --- 2. Privileged step: ensure the sub-layer. -----------------
+    if let Err(e) = ensure_sublayer_once(token) {
         free_sd_if_owned(sd_handle);
         return Err(e);
     }
@@ -456,10 +453,8 @@ pub fn delete_filter(token: &WfpEngineToken, id: WfpFilterId) -> Result<(), Plat
 /// layer whose `filterKey` matches our namespace signature.
 ///
 /// Filters added by other products or by the system are silently
-/// skipped. The returned [`WfpFilterRecord::app_pattern`] and
-/// [`WfpFilterRecord::user_sid`] are always `None` — the kernel does
-/// not retain the original Win32 path or string SID. Callers cross-
-/// reference against persisted state when they need those fields.
+/// skipped. The returned [`WfpFilterRecord::app_pattern`] is always `None`:
+/// the kernel does not retain the original Win32 path.
 pub fn enumerate_our_filters(
     token: &WfpEngineToken,
 ) -> Result<Vec<WfpFilterRecord>, PlatformError> {
@@ -688,9 +683,7 @@ fn decode_filter_row(row: &FWPM_FILTER0) -> Option<WfpFilterRecord> {
         0
     };
 
-    // Walk conditions for remote_ip / remote_subnet / remote_port /
-    // local-interface LUID. We don't reconstruct app_pattern (no NT-path
-    // reversal) or user_sid (skipped — apply layer cross-references storage).
+    // No app_pattern: the NT-path blob does not reverse to the user's path.
     let decoded = decode_conditions(row);
 
     let (remote_ip, remote_ip_set) = match decoded.v4_hosts.len() {
@@ -715,7 +708,7 @@ fn decode_filter_row(row: &FWPM_FILTER0) -> Option<WfpFilterRecord> {
         remote_ip_set_v6,
         remote_port: decoded.remote_port,
         weight,
-        user_sid: None,
+        user_sid: decoded.user_sid,
         app_pattern: None,
         local_interface_luid: decoded.local_interface_luid,
         remote_subnet: decoded.remote_subnet,
@@ -738,6 +731,8 @@ struct DecodedConditions {
     v6_hosts: Vec<Ipv6Addr>,
     remote_subnet_v6: Option<(Ipv6Addr, u8)>,
     ip_protocol: Option<u8>,
+    /// Per-user reconcile deletes by this; `None` leaves a filter alone.
+    user_sid: Option<String>,
 }
 
 fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
@@ -812,9 +807,79 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
         {
             // SAFETY: `r#type == FWP_UINT8` selects the `uint8: u8` arm.
             out.ip_protocol = Some(unsafe { cond.conditionValue.Anonymous.uint8 });
+        } else if cond.fieldKey == FWPM_CONDITION_ALE_USER_ID
+            && cond.conditionValue.r#type == FWP_SECURITY_DESCRIPTOR_TYPE
+        {
+            // SAFETY: `r#type == FWP_SECURITY_DESCRIPTOR_TYPE` selects the
+            // `sd: *mut FWP_BYTE_BLOB` arm; Win32-owned, valid while `row` is.
+            let blob = unsafe { cond.conditionValue.Anonymous.sd };
+            if !blob.is_null() {
+                // SAFETY: pointer valid per above.
+                let blob = unsafe { *blob };
+                if !blob.data.is_null() {
+                    // SAFETY: `data` holds `size` bytes for as long as `row`.
+                    let sd = unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) };
+                    out.user_sid = sid_of_user_condition(sd);
+                }
+            }
         }
     }
     out
+}
+
+/// The SID of the single allow-ACE in a self-relative security descriptor —
+/// the shape [`sddl_for_sid`] writes. Parsed from the bytes rather than
+/// through SDDL, which prints some account SIDs as aliases. Any other shape
+/// is not one we wrote, so it names nobody.
+fn sid_of_user_condition(sd: &[u8]) -> Option<String> {
+    const SE_DACL_PRESENT: u16 = 0x0004;
+    const SE_SELF_RELATIVE: u16 = 0x8000;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    let u16_at = |at: usize| Some(u16::from_le_bytes(sd.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(sd.get(at..at + 4)?.try_into().ok()?));
+
+    let control = u16_at(2)?;
+    if control & SE_SELF_RELATIVE == 0 || control & SE_DACL_PRESENT == 0 {
+        return None;
+    }
+    // Header: revision, sbz1, control, then owner/group/sacl/dacl offsets.
+    let acl = usize::try_from(u32_at(16)?).ok()?;
+    // ACL header: revision, sbz1, size, ace count, sbz2.
+    if acl == 0 || u16_at(acl + 4)? != 1 {
+        return None;
+    }
+    let ace = acl + 8;
+    if *sd.get(ace)? != ACCESS_ALLOWED_ACE_TYPE {
+        return None;
+    }
+    // ACE: type, flags, size, access mask, then the SID.
+    let ace_end = ace + usize::from(u16_at(ace + 2)?);
+    format_sid(sd.get(ace + 8..ace_end)?)
+}
+
+/// `S-R-I-S…` from a binary SID: the authority is big-endian, and printed in
+/// hex when it does not fit 32 bits, as `ConvertSidToStringSidW` does.
+fn format_sid(sid: &[u8]) -> Option<String> {
+    use std::fmt::Write;
+    let (&revision, rest) = sid.split_first()?;
+    let (&count, rest) = rest.split_first()?;
+    if revision != 1 {
+        return None;
+    }
+    let authority = rest
+        .get(..6)?
+        .iter()
+        .fold(0u64, |acc, b| acc << 8 | u64::from(*b));
+    let subs = rest.get(6..6 + 4 * usize::from(count))?;
+    let mut out = if authority >> 32 == 0 {
+        format!("S-1-{authority}")
+    } else {
+        format!("S-1-0x{authority:012X}")
+    };
+    for sub in subs.chunks_exact(4) {
+        let _ = write!(out, "-{}", u32::from_le_bytes(sub.try_into().ok()?));
+    }
+    Some(out)
 }
 
 /// Inverse of [`prefix_to_mask`]: count the leading one-bits of a
@@ -1292,9 +1357,51 @@ mod tests {
         res.expect("add_filter with app_pattern");
     }
 
+    /// The descriptor `add_filter` builds names its SID back unchanged, well-known
+    /// SIDs included. No admin needed.
+    #[test]
+    fn a_user_condition_descriptor_names_its_sid() {
+        for sid in [
+            "S-1-5-21-1-2-3-1001",
+            "S-1-5-21-1-2-3-500",
+            "S-1-1-0",
+            "S-1-5-18",
+        ] {
+            let (psd, size) = sddl_for_sid(sid).expect("sddl");
+            // SAFETY: `psd` points at `size` bytes Win32 allocated, freed below.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(psd.0 as *const u8, size as usize) }.to_vec();
+            free_sd_if_owned(psd);
+            assert_eq!(sid_of_user_condition(&bytes).as_deref(), Some(sid));
+        }
+    }
+
+    #[test]
+    fn a_descriptor_not_shaped_like_ours_names_nobody() {
+        let (psd, size) = sddl_for_sid("S-1-5-21-1-2-3-1001").expect("sddl");
+        // SAFETY: as above.
+        let ours =
+            unsafe { std::slice::from_raw_parts(psd.0 as *const u8, size as usize) }.to_vec();
+        free_sd_if_owned(psd);
+
+        assert_eq!(sid_of_user_condition(&[]), None);
+        assert_eq!(
+            sid_of_user_condition(&ours[..ours.len() - 1]),
+            None,
+            "truncated"
+        );
+        let mut no_dacl = ours.clone();
+        no_dacl[2] &= !0x04;
+        assert_eq!(sid_of_user_condition(&no_dacl), None);
+        let mut deny = ours.clone();
+        let acl = u32::from_le_bytes(ours[16..20].try_into().expect("4 bytes")) as usize;
+        deny[acl + 8] = 1; // ACCESS_DENIED_ACE_TYPE
+        assert_eq!(sid_of_user_condition(&deny), None);
+    }
+
     /// Smoke test: add a filter with `user_sid = Everyone` so SDDL
     /// conversion runs end-to-end without depending on a real
-    /// per-user SID. Requires admin.
+    /// per-user SID, and read the SID back through enumeration. Requires admin.
     #[test]
     #[ignore = "requires admin: FwpmFilterAdd0 needs elevation"]
     fn add_filter_with_user_sid_uses_sddl_round_trip_on_windows() {
@@ -1308,10 +1415,17 @@ mod tests {
         spec.user_sid = Some("S-1-1-0".into()); // Everyone
 
         let res = add_filter(&token, &spec);
+        let listed = enumerate_our_filters(&token);
         transaction_abort(&token);
         engine_close(token).expect("FwpmEngineClose0");
 
         res.expect("add_filter with user_sid");
+        let found = listed
+            .expect("enumerate_our_filters")
+            .into_iter()
+            .find(|r| r.id == spec.id)
+            .expect("filter must appear in enumeration");
+        assert_eq!(found.user_sid.as_deref(), Some("S-1-1-0"));
     }
 
     /// Path that doesn't exist on disk → `app_id_from_path` returns an

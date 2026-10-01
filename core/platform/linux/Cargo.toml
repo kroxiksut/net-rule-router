@@ -16,8 +16,8 @@ path = "src/lib.rs"
 [dependencies]
 nrr-platform-api = { path = "../api" }
 nrr-shared = { path = "../../../shared/contracts" }
-# nftables JSON API (`libnftables-json`): typed ruleset model plus a helper that
-# drives the `nft` binary. MIT OR Apache-2.0 — deliberately NOT `libnftnl`
+# nftables JSON API (`libnftables-json`): the typed ruleset model; `nft_apply`
+# runs `nft -j -f -` itself, under a deadline and the C locale. MIT OR Apache-2.0 — deliberately NOT `libnftnl`
 # (GPLv2+) or `rustables` (GPLv3+), either of which would relicense the whole
 # product; running `nft` as a child process creates no derivative work. Kept as
 # an unconditional dependency, not Linux-only, so the IR-to-JSON rendering is

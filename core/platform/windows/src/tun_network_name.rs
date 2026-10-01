@@ -127,7 +127,8 @@ fn rename(network: &INetwork, name: &str) -> Rename {
             target: "nrr::fake-ip",
             msg_key = "win-tun-rename-failed",
             was = %current,
-            "could not rename the tunnel network: {e}",
+            error = %e,
+            "could not rename the tunnel network",
         ),
     }
     Rename::Settled

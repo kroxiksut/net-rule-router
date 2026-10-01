@@ -65,15 +65,19 @@ pub fn engine_open() -> Result<WfpEngineToken, PlatformError> {
             message: format!("Win32 error 0x{code:08X}"),
         });
     }
-    Ok(WfpEngineToken {
+    let token = WfpEngineToken {
         raw: handle.0 as usize as u64,
-    })
+    };
+    // A reused handle value must not inherit a closed session's answer.
+    super::wfp_sublayer::forget_ensured_sublayer(&token);
+    Ok(token)
 }
 
 /// Close a previously opened WFP engine session. The token is
 /// consumed by value to make double-close at the type level
 /// impossible.
 pub fn engine_close(token: WfpEngineToken) -> Result<(), PlatformError> {
+    super::wfp_sublayer::forget_ensured_sublayer(&token);
     let handle = token_to_handle(&token);
     // SAFETY: `handle` was returned by a successful `FwpmEngineOpen0`
     // and is consumed by-value here, so the same token cannot reach

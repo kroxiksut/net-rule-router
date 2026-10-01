@@ -29,6 +29,7 @@ use nrr_platform_api::{classify_availability, AdapterAvailability, PlatformError
 use crate::app_observation_lookup::{AppObservationLookup, AppObservationStore};
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::killswitch_codegen::{FailClosedExemptions, KillSwitchResolution};
+use crate::machine_reading::MachineReading;
 use crate::per_sid_orchestrator::{
     PerSidBehaviorMode, PerSidBinding, RoutePolicySource, RulesProvider,
 };
@@ -407,7 +408,8 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger for RouteAndFilterA
                     target: "nrr::route-coordinator",
                     msg_key = "route-policy-recompute-failed",
                     sid = %sid,
-                    "route recompute after policy change failed: {e:?}",
+                    error = %e,
+                    "route recompute after policy change failed",
                 ),
             }
         }

@@ -76,9 +76,12 @@ fn target_to_category(target: &str) -> Option<EventCategory> {
     let area = target.strip_prefix("nrr::")?;
     // `-` and `_` are both in use for the same areas (`fake-ip` / `fake_ip`,
     // `dns-resolver` / `dns_resolver`); one spelling here, normalised on the
-    // way in.
-    let normalized = area.replace('_', "-");
-    Some(category_of_area(&normalized))
+    // way in, and only allocated for when there is something to normalise.
+    if area.contains('_') {
+        Some(category_of_area(&area.replace('_', "-")))
+    } else {
+        Some(category_of_area(area))
+    }
 }
 
 /// Maps a target's area (everything after `nrr::`) to its category.
@@ -145,10 +148,17 @@ fn category_of_area(area: &str) -> EventCategory {
 
 // ── Field visitor ─────────────────────────────────────────────────────────────
 
-/// The field a per-principal call site already carries. Lifting it to a column
-/// of its own is what lets a read be scoped to the caller without asking every
-/// call site to change.
-const OWNER_FIELD: &str = "sid";
+/// Field names that say whose activity a line is about. Lifting them to a
+/// column of their own is what lets a read be scoped to the caller; a name
+/// missing here makes its line a machine line every user can read.
+pub const PRINCIPAL_FIELDS: &[&str] = &["sid", "principal", "caller", "user_sid"];
+
+/// Field names that carry several principals at once.
+pub const PRINCIPAL_LIST_FIELDS: &[&str] = &["principals"];
+
+/// Owner of a line about more than one principal. It matches nobody's
+/// principal, so only a machine-wide reader sees the line.
+pub const SEVERAL_PRINCIPALS: &str = "several";
 
 /// A call site's stable message id. It names the line's locale key and is not
 /// payload: the GUI translates by it, the English text stays the fallback.
@@ -178,14 +188,27 @@ impl EventFieldVisitor {
         }
     }
 
-    /// Whose line this is, read from the event's own `sid` field. The value
-    /// stays in the payload too: it is already shown in the log view, and the
-    /// column exists to be filtered on, not to hide anything.
+    /// Whose line this is, read from the event's own principal fields. The
+    /// values stay in the payload too: the column exists to be filtered on,
+    /// not to hide anything.
     fn owner(&self) -> Option<String> {
-        match self.fields.get(OWNER_FIELD) {
-            Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-            _ => None,
+        let mut owner: Option<&str> = None;
+        let single = PRINCIPAL_FIELDS
+            .iter()
+            .filter_map(|name| self.fields.get(*name)?.as_str())
+            .filter_map(principal_value);
+        let listed = PRINCIPAL_LIST_FIELDS
+            .iter()
+            .filter_map(|name| self.fields.get(*name)?.as_str())
+            .flat_map(principal_list);
+        for value in single.chain(listed) {
+            match owner {
+                None => owner = Some(value),
+                Some(seen) if seen == value => {}
+                Some(_) => return Some(SEVERAL_PRINCIPALS.to_string()),
+            }
         }
+        owner.map(str::to_string)
     }
 
     fn into_payload(self) -> Option<serde_json::Value> {
@@ -234,6 +257,41 @@ impl Visit for EventFieldVisitor {
             field.name().to_string(),
             serde_json::Value::String(format!("{value:?}")),
         );
+    }
+}
+
+/// One principal as a call site recorded it: plain (`%sid`), quoted (`?sid`)
+/// or as an `Option` (`?maybe_sid`).
+fn principal_value(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    let raw = raw
+        .strip_prefix("Some(")
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(raw);
+    let raw = raw
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or(raw);
+    (!raw.is_empty() && raw != "None").then_some(raw)
+}
+
+/// The principals in a debug-printed collection. Anything it cannot read item
+/// by item counts as several: guessing one owner would show the line to them.
+fn principal_list(raw: &str) -> Vec<&str> {
+    let trimmed = raw.trim();
+    if matches!(trimmed, "" | "[]" | "{}") {
+        return Vec::new();
+    }
+    let quoted: Vec<&str> = trimmed
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .filter(|item| !item.is_empty())
+        .collect();
+    if quoted.is_empty() {
+        vec![SEVERAL_PRINCIPALS]
+    } else {
+        quoted
     }
 }
 
@@ -389,12 +447,9 @@ pub enum TracingInstallOutcome {
 /// `nrr::*` target prefilter (see [`target_to_category`]).
 pub const DEFAULT_TRACING_FILTER: &str = "nrr=info,info";
 
-/// Verbose variant of [`DEFAULT_TRACING_FILTER`]. When
-/// the GUI toggle "Verbose service logging" is on (persisted in
-/// `service_stability_config.verbose_logging`), the installer picks
-/// this directive instead so `tracing::debug!` events in `nrr_*` crates
-/// reach the operational NDJSON. `NRR_LOG` env var still wins over
-/// both — dev override remains intact.
+/// Verbose variant of [`DEFAULT_TRACING_FILTER`], picked while a verbose
+/// logging window is open so `tracing::debug!` events in `nrr_*` crates reach
+/// the operational NDJSON. `NRR_LOG` still wins at boot.
 pub const VERBOSE_TRACING_FILTER: &str = "nrr=debug,info";
 
 /// Live handle to swap the process's tracing
@@ -463,6 +518,13 @@ impl TracingVerbosityHandle {
                 "live tracing verbosity reload failed; filter unchanged",
             );
         }
+    }
+
+    /// The directive the live filter holds right now; `None` once the
+    /// subscriber it belonged to is gone.
+    #[must_use]
+    pub fn active_directive(&self) -> Option<String> {
+        self.handle.with_current(ToString::to_string).ok()
     }
 }
 
@@ -734,6 +796,55 @@ mod tests {
         );
     }
 
+    /// Call sites name the principal `caller`, `principal` or list several in
+    /// `principals`, not only `sid`. Each of those lines used to become a
+    /// machine line every user could read.
+    #[test]
+    fn every_principal_field_name_owns_the_line() {
+        let dir = tempfile::tempdir().expect("temp");
+        let writer = Arc::new(LogWriter::open(LogWriterConfig::new(dir.path())));
+        let layer = NdjsonTracingLayer::new(Arc::clone(&writer));
+
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let unresolved = vec!["S-1-5-21-1".to_string(), "S-1-5-21-2".to_string()];
+        let one = Some("S-1-5-21-4".to_string());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "nrr::service", caller = %"S-1-5-21-1", "a");
+            tracing::info!(target: "nrr::service", principal = "S-1-5-21-2", "b");
+            tracing::info!(target: "nrr::service", principals = ?unresolved, "c");
+            tracing::info!(target: "nrr::service", user_sid = ?one, "d");
+            tracing::info!(target: "nrr::service", sid = "S-1-5-21-5", caller = "S-1-5-21-6", "e");
+            tracing::info!(target: "nrr::service", count = 1, "machine");
+        });
+
+        let file = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .next()
+            .expect("one log file");
+        let text = std::fs::read_to_string(file.path()).expect("read log");
+        let owners: Vec<Option<String>> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<crate::event::LogEvent>(l)
+                    .expect("event")
+                    .principal
+            })
+            .collect();
+        assert_eq!(
+            owners,
+            [
+                Some("S-1-5-21-1".to_string()),
+                Some("S-1-5-21-2".to_string()),
+                Some(SEVERAL_PRINCIPALS.to_string()),
+                Some("S-1-5-21-4".to_string()),
+                Some(SEVERAL_PRINCIPALS.to_string()),
+                None,
+            ]
+        );
+    }
+
     /// A field the mode may not disclose costs the VALUE, never the line.
     /// The negative control alone (the value is gone) passes just as well when
     /// the whole event was thrown away — which is exactly what happened: the
@@ -936,13 +1047,9 @@ mod tests {
         );
     }
 
-    /// Reads the live `EnvFilter`'s directive string back out through the
-    /// shared `reload::Handle`, for assertions in
-    /// [`verbosity_handle_reload_swaps_filter_without_panicking`].
     fn current_filter_string(handle: &TracingVerbosityHandle) -> String {
         handle
-            .handle
-            .with_current(ToString::to_string)
+            .active_directive()
             .expect("reload handle's Layer must still be alive in this test")
     }
 

@@ -259,7 +259,7 @@ fn a_suffix_covering_the_anchor_itself_is_never_proposed() {
         &[
             "search.example",
             "accounts.search.example",
-            "content.googleapis.com",
+            "content.cdnhost.test",
         ],
     );
 

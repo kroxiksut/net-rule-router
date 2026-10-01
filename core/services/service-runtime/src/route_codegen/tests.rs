@@ -31,7 +31,7 @@ fn app_only_rule_routes_every_observed_destination() {
     let apps = MockAppObservationLookup::new();
     apps.set_ips(
         "messenger.exe",
-        vec![ip(23, 10, 20, 153), ip(23, 10, 20, 137)],
+        vec![ip(203, 0, 113, 153), ip(203, 0, 113, 137)],
     );
     let rs = ruleset(vec![app_rule("R-app", "messenger.exe")]);
 
@@ -54,7 +54,7 @@ fn app_only_rule_routes_every_observed_destination() {
         })
         .collect();
     dests.sort();
-    assert_eq!(dests, vec![ip(23, 10, 20, 137), ip(23, 10, 20, 153)]);
+    assert_eq!(dests, vec![ip(203, 0, 113, 137), ip(203, 0, 113, 153)]);
     assert!(out
         .routes
         .iter()
@@ -128,9 +128,12 @@ fn app_only_rule_without_observations_diagnoses_and_routes_nothing() {
 fn app_only_rule_skips_destinations_the_shared_address_policy_declined() {
     let cache = MockFqdnCacheLookup::new();
     let apps = MockAppObservationLookup::new();
-    apps.set_ips("messenger.exe", vec![ip(8, 8, 8, 8), ip(23, 10, 20, 137)]);
+    apps.set_ips(
+        "messenger.exe",
+        vec![ip(198, 51, 100, 8), ip(203, 0, 113, 137)],
+    );
     let rs = ruleset(vec![app_rule("R-app", "messenger.exe")]);
-    let denied: HashSet<Ipv4Addr> = [ip(8, 8, 8, 8)].into_iter().collect();
+    let denied: HashSet<Ipv4Addr> = [ip(198, 51, 100, 8)].into_iter().collect();
 
     let out = generate_secondary_routes(
         &rs,
@@ -150,7 +153,7 @@ fn app_only_rule_skips_destinations_the_shared_address_policy_declined() {
             IpAddr::V6(_) => None,
         })
         .collect();
-    assert_eq!(dests, vec![ip(23, 10, 20, 137)]);
+    assert_eq!(dests, vec![ip(203, 0, 113, 137)]);
 }
 
 fn target() -> SecondaryRouteTarget {
@@ -195,8 +198,8 @@ fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
 /// was dead in every browser while both rules were honoured individually.
 #[test]
 fn a_shared_address_is_not_pinned_into_the_tunnel() {
-    let shared = ip(23, 10, 20, 161);
-    let only_theirs = ip(23, 10, 20, 150);
+    let shared = ip(203, 0, 113, 161);
+    let only_theirs = ip(203, 0, 113, 150);
     let cache = MockFqdnCacheLookup::new();
     cache.set_ips("translate.search.example", vec![shared]);
     cache.set_ips("docs.search.example", vec![shared, only_theirs]);
@@ -249,7 +252,7 @@ fn a_shared_address_is_not_pinned_into_the_tunnel() {
 /// same function.
 #[test]
 fn the_main_links_own_rules_are_never_held_back() {
-    let shared = ip(23, 10, 20, 161);
+    let shared = ip(203, 0, 113, 161);
     let cache = MockFqdnCacheLookup::new();
     cache.set_ips("translate.search.example", vec![shared]);
     cache.set_ips("docs.search.example", vec![shared]);
@@ -295,7 +298,7 @@ fn exact_ip_emits_one_host_route_via_secondary() {
     let rs = ruleset(vec![rule(
         "r-ip",
         true,
-        CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(23, 10, 20, 138))),
+        CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(203, 0, 113, 138))),
     )]);
     let out = generate_secondary_routes(
         &rs,
@@ -308,7 +311,7 @@ fn exact_ip_emits_one_host_route_via_secondary() {
     );
     assert_eq!(out.routes.len(), 1);
     let r = &out.routes[0];
-    assert_eq!(r.destination, ip(23, 10, 20, 138));
+    assert_eq!(r.destination, ip(203, 0, 113, 138));
     assert_eq!(r.prefix_length, 32);
     assert_eq!(r.next_hop, ip(10, 0, 0, 1));
     assert_eq!(r.interface_index, 7);
@@ -322,7 +325,7 @@ fn disabled_rule_is_skipped() {
     let rs = ruleset(vec![rule(
         "r-off",
         false,
-        CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(1, 1, 1, 1))),
+        CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(198, 51, 100, 1))),
     )]);
     let out = generate_secondary_routes(
         &rs,
@@ -537,7 +540,7 @@ fn loopback_and_unspecified_destinations_are_not_routed() {
     // the routable IP.
     cache.set_ips(
         "mixed.example.com",
-        vec![ip(127, 0, 0, 1), ip(23, 10, 20, 138)],
+        vec![ip(127, 0, 0, 1), ip(203, 0, 113, 138)],
     );
     let rs = ruleset(vec![
         rule(
@@ -580,7 +583,7 @@ fn loopback_and_unspecified_destinations_are_not_routed() {
             IpAddr::V6(_) => None,
         })
         .collect();
-    assert_eq!(dests, BTreeSet::from([ip(23, 10, 20, 138)]));
+    assert_eq!(dests, BTreeSet::from([ip(203, 0, 113, 138)]));
 }
 
 #[test]
@@ -649,7 +652,7 @@ fn combined_app_and_address_rule_is_not_routed_in_free() {
     )));
 }
 
-// ── mode-aware generate_routes (block 16.18.vpn) ──
+// ── mode-aware generate_routes ──
 
 /// Startup orphan adoption recognises our leftovers by metric plus shape.
 /// Its shape list is derived from the overlay constants — this is the other
@@ -678,7 +681,7 @@ fn every_shape_the_codegen_emits_is_one_adoption_recognises() {
             rule(
                 "R-sec",
                 true,
-                CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(1, 1, 1, 1))),
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(198, 51, 100, 1))),
             ),
             app_rule("R-app", "assistant.exe"),
         ],
@@ -689,35 +692,113 @@ fn every_shape_the_codegen_emits_is_one_adoption_recognises() {
         interface_index: 12,
     };
 
+    // The counter-overlay follows the tunnel's catch-alls, so the shapes it
+    // emits depend on them: none visible, a redirect-gateway pair, a Wintun
+    // redirect set, the whole default on-link, and the narrowest we answer.
+    let tunnel_sets: [&[(Ipv4Addr, u8)]; 5] = [
+        &[],
+        &[(ip(0, 0, 0, 0), 1), (ip(128, 0, 0, 0), 1)],
+        &[
+            (ip(0, 0, 0, 0), 5),
+            (ip(8, 0, 0, 0), 7),
+            (ip(11, 0, 0, 0), 8),
+            (ip(12, 0, 0, 0), 6),
+            (ip(16, 0, 0, 0), 4),
+            (ip(32, 0, 0, 0), 3),
+            (ip(64, 0, 0, 0), 2),
+            (ip(128, 0, 0, 0), 2),
+            (ip(192, 0, 0, 0), 9),
+            (ip(172, 0, 0, 0), 12),
+        ],
+        &[(ip(0, 0, 0, 0), 0)],
+        &[(ip(100, 0, 0, 0), 10), (ip(200, 0, 0, 0), 11)],
+    ];
+
     for mode in [
         RouteBehaviorMode::PreferPrimary,
         RouteBehaviorMode::PreferSecondaryWhenAvailable,
         RouteBehaviorMode::StrictSecondaryFailClosed,
     ] {
         for primary_opt in [None, Some(&primary)] {
-            let out = generate_routes(
-                mode,
-                &rb,
-                primary_opt,
-                &v6_capable_target(),
-                &cache,
-                &apps,
-                &std::collections::HashSet::new(),
-                crate::address_ownership::ZoneVsIpOrder::default(),
-                &[],
-            );
-            for route in &out.routes {
-                assert!(
-                        is_owned_shape(route.destination, route.prefix_length),
-                        "{mode:?} emits /{} but orphan adoption would not recognise it:                          a crash leaves that route steering traffic into a dead tunnel",
-                        route.prefix_length,
-                    );
-                assert_eq!(
-                    route.metric, SECONDARY_ROUTE_METRIC,
-                    "adoption also keys on the metric",
+            for tunnel in tunnel_sets {
+                let out = generate_routes(
+                    mode,
+                    &rb,
+                    primary_opt,
+                    &v6_capable_target(),
+                    &cache,
+                    &apps,
+                    &std::collections::HashSet::new(),
+                    crate::address_ownership::ZoneVsIpOrder::default(),
+                    tunnel,
                 );
+                for route in &out.routes {
+                    assert!(
+                        is_owned_route(route),
+                        "{mode:?} over {tunnel:?} emits {}/{} at metric {} but adoption would not recognise it: a crash leaves that route steering traffic into a dead tunnel",
+                        route.destination,
+                        route.prefix_length,
+                        route.metric,
+                    );
+                }
             }
         }
+    }
+}
+
+/// Whatever the tunnel installs, the counter-overlay never produces a length
+/// the adoption signature does not cover.
+#[test]
+fn no_tunnel_prefix_yields_an_overlay_half_adoption_misses() {
+    for n in 0..=32u8 {
+        for (dest, len) in counter_overlay_for(&[(ip(64, 0, 0, 0), n)]) {
+            assert!(
+                is_owned_shape(IpAddr::V4(dest), len),
+                "tunnel /{n} yields {dest}/{len}, which adoption would not recognise",
+            );
+        }
+    }
+}
+
+/// The signature is metric AND shape AND the main table: a stranger's route
+/// of the very same shape is not ours to adopt or sweep.
+#[test]
+fn a_route_of_our_shape_is_ours_only_at_our_metric_in_the_main_table() {
+    let route = |n: u8, metric: u32, table| RouteEntry {
+        destination: IpAddr::V4(ip(64, 0, 0, 0)),
+        prefix_length: n,
+        next_hop: IpAddr::V4(ip(192, 168, 1, 1)),
+        interface_index: 12,
+        metric,
+        is_ours: false,
+        table,
+    };
+    let main = nrr_platform_api::RouteTableRef::Main;
+    for n in [1, 3, 8, 13, 32] {
+        assert!(is_owned_route(&route(
+            n,
+            SECONDARY_ROUTE_METRIC,
+            main.clone()
+        )));
+        assert!(!is_owned_route(&route(
+            n,
+            SECONDARY_ROUTE_METRIC + 1,
+            main.clone()
+        )));
+        assert!(!is_owned_route(&route(n, 0, main.clone())));
+        assert!(!is_owned_route(&route(
+            n,
+            SECONDARY_ROUTE_METRIC,
+            nrr_platform_api::RouteTableRef::Tagged(100),
+        )));
+    }
+    // Wider than any overlay half and narrower than a host route.
+    for n in [0, 14, 24, 31] {
+        assert!(!is_owned_route(&route(
+            n,
+            SECONDARY_ROUTE_METRIC,
+            main.clone()
+        )));
     }
 }
 
@@ -832,12 +913,12 @@ fn mode_a_prefer_primary_emits_secondary_host_routes_no_overlay() {
         vec![rule(
             "p",
             true,
-            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(8, 8, 8, 8))),
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(198, 51, 100, 8))),
         )],
         vec![rule(
             "s",
             true,
-            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(1, 1, 1, 1))),
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(198, 51, 100, 1))),
         )],
     );
     let out = generate_routes(
@@ -854,7 +935,7 @@ fn mode_a_prefer_primary_emits_secondary_host_routes_no_overlay() {
     // No /1 overlay in mode A; only the secondary rule's /32 (primary rule
     // is irrelevant — default already rides primary).
     assert_eq!(out.routes.len(), 1);
-    assert_eq!(out.routes[0].destination, ip(1, 1, 1, 1));
+    assert_eq!(out.routes[0].destination, ip(198, 51, 100, 1));
     assert_eq!(out.routes[0].prefix_length, 32);
     assert_eq!(out.routes[0].interface_index, 7); // secondary ifindex
 }
@@ -869,7 +950,7 @@ fn the_counter_overlay_is_one_bit_longer_than_whatever_the_tunnel_installed() {
         counter_overlay_for(&[(ip(0, 0, 0, 0), 1), (ip(128, 0, 0, 0), 1)]),
         COUNTER_OVERLAY.to_vec()
     );
-    // swiftvpn over WireGuard: a redirect SET. Against it the /2s lost —
+    // examplevpn over WireGuard: a redirect SET. Against it the /2s lost —
     // `64.0.0.0/2` and `128.0.0.0/2` tie on length at a better metric and
     // the rest are longer — so every non-rule connection rode the tunnel.
     // Each prefix gets its two halves, one bit longer.
@@ -920,7 +1001,7 @@ fn tunnel_catch_alls_are_the_wide_unicast_routes_on_the_tunnel_that_are_not_ours
         r([224, 0, 0, 0], 3, 66, false), // multicast: every interface has it
         r([10, 88, 0, 191], 32, 66, false), // the tunnel's own address
         r([10, 200, 0, 0], 16, 66, false), // a corporate split-tunnel network
-        r([23, 10, 20, 78], 32, 66, true), // our rule route
+        r([203, 0, 113, 78], 32, 66, true), // our rule route
         r([0, 0, 0, 0], 0, 19, false),   // the primary's default
     ];
     assert_eq!(
@@ -940,7 +1021,7 @@ fn mode_a_with_primary_adds_counter_overlay_via_primary() {
         vec![rule(
             "s",
             true,
-            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(1, 1, 1, 1))),
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(198, 51, 100, 1))),
         )], // foreign → secondary
     );
     let primary = SecondaryRouteTarget {
@@ -987,7 +1068,7 @@ fn mode_a_with_primary_adds_counter_overlay_via_primary() {
     let f = out
         .routes
         .iter()
-        .find(|r| r.destination == ip(1, 1, 1, 1))
+        .find(|r| r.destination == ip(198, 51, 100, 1))
         .expect("secondary /32 route");
     assert_eq!(f.prefix_length, 32);
     assert_eq!(f.interface_index, 7);
@@ -1002,7 +1083,7 @@ fn mode_b_owns_overlay_via_secondary_and_pulls_primary_exceptions() {
         vec![rule(
             "p",
             true,
-            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(8, 8, 8, 8))),
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(198, 51, 100, 8))),
         )],
         vec![],
     );
@@ -1028,11 +1109,11 @@ fn mode_b_owns_overlay_via_secondary_and_pulls_primary_exceptions() {
     assert!(overlay.iter().all(|r| r.interface_index == 7));
     assert!(overlay.iter().any(|r| r.destination == ip(0, 0, 0, 0)));
     assert!(overlay.iter().any(|r| r.destination == ip(128, 0, 0, 0)));
-    // Exception: primary rule 8.8.8.8/32 via the PRIMARY NIC (ifindex 12).
+    // Exception: primary rule 198.51.100.8/32 via the PRIMARY NIC (ifindex 12).
     let exc = out
         .routes
         .iter()
-        .find(|r| r.destination == ip(8, 8, 8, 8))
+        .find(|r| r.destination == ip(198, 51, 100, 8))
         .expect("primary exception route");
     assert_eq!(exc.prefix_length, 32);
     assert_eq!(exc.interface_index, 12);
@@ -1046,7 +1127,7 @@ fn mode_b_without_primary_target_keeps_overlay_and_diagnoses() {
         vec![rule(
             "p",
             true,
-            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(8, 8, 8, 8))),
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(198, 51, 100, 8))),
         )],
         vec![],
     );
@@ -1072,7 +1153,10 @@ fn mode_b_without_primary_target_keeps_overlay_and_diagnoses() {
 
 #[test]
 fn dns_via_secondary_routes_pin_each_resolver_to_the_secondary() {
-    let servers = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
+    let servers = [
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(198, 51, 100, 8),
+    ];
     let routes = dns_via_secondary_routes(&servers, &target());
     assert_eq!(routes.len(), 2);
     for (route, expected) in routes.iter().zip(servers.iter()) {

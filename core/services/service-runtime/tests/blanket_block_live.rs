@@ -33,6 +33,12 @@ use nrr_service_runtime::killswitch_codegen::KillSwitchProtocols;
 const SERVER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
 const LAN: (Ipv4Addr, u8) = (Ipv4Addr::new(192, 168, 1, 0), 24);
 const IFACE_ENV: &str = "NRR_LIVE_TEST_IFACE";
+/// Above every range a distro's `useradd` assigns by default (`UID_MIN`/`UID_MAX`,
+/// usually 1000..60000) and outside systemd's `DynamicUser` band (61184..65519):
+/// no real login account or service can hold it, unlike `nobody` (65534), which
+/// some daemons run under. `skuid` matches the raw number — the account need not
+/// exist.
+const TEST_UID: u32 = 999_999;
 
 fn is_root() -> bool {
     std::fs::read_to_string("/proc/self/status")
@@ -156,7 +162,7 @@ fn the_blanket_block_lands_below_the_escapes_it_must_not_cut() {
     eprintln!("blanket_block_live: binding to `{link}`");
 
     let flows = plan_catch_all_kill_switch(
-        "unix:uid:1000",
+        &format!("unix:uid:{TEST_UID}"),
         &[SERVER],
         &[LAN],
         // No IPv6 on this fixture: the subject is the v4 blanket block.
@@ -171,7 +177,7 @@ fn the_blanket_block_lands_below_the_escapes_it_must_not_cut() {
         NftPolicyEnforcer::new(Arc::new(BoundToLink(link)), adapters).with_table(table.clone());
     enforcer
         .enforce(&[EnforcementPlan {
-            principal: UserPrincipal::from_linux_uid(1000),
+            principal: UserPrincipal::from_linux_uid(TEST_UID),
             flows,
             routes: Vec::new(),
             policy_rules: Vec::new(),
@@ -196,7 +202,7 @@ fn the_blanket_block_lands_below_the_escapes_it_must_not_cut() {
         "the block sits above the LAN — the local network would be cut:\n{installed}",
     );
     assert!(
-        installed.contains("meta skuid 1000"),
+        installed.contains(&format!("meta skuid {TEST_UID}")),
         "the block is not scoped to the user it belongs to:\n{installed}",
     );
 

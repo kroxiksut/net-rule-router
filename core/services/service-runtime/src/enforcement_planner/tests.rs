@@ -408,7 +408,7 @@ fn slices123_neutral_pipeline_matches_current_codegen() {
     );
     let mut obs = MapObs::default();
     obs.0
-        .insert("aiclient.exe".into(), vec![Ipv4Addr::new(23, 10, 20, 159)]);
+        .insert("aiclient.exe".into(), vec![Ipv4Addr::new(203, 0, 113, 159)]);
 
     let sid = "S-1-5-21-1-2-3-1001";
     let rb = book(
@@ -658,7 +658,7 @@ fn slice8_derived_sets_match_current_codegen() {
     );
     let mut obs = MapObs::default();
     obs.0
-        .insert("aiclient.exe".into(), vec![Ipv4Addr::new(23, 10, 20, 159)]);
+        .insert("aiclient.exe".into(), vec![Ipv4Addr::new(203, 0, 113, 159)]);
 
     let sid = "S-1-5-21-1-2-3-1001";
     let rb = book(
@@ -751,7 +751,7 @@ fn slice8_derived_sets_match_current_codegen() {
     // test that proves nothing.
     assert_eq!(
         app_observed_destinations(&flows, RouteRole::Secondary),
-        vec![Ipv4Addr::new(23, 10, 20, 159)],
+        vec![Ipv4Addr::new(203, 0, 113, 159)],
     );
     assert_eq!(
         vpn_default_exempt_paths(&resolver),
@@ -1002,7 +1002,10 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
 
     let principal = nrr_platform_api::enforcement::UserPrincipal::from_linux_uid(1000);
     let sid = principal.as_stored().to_string();
-    let resolvers = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(77, 88, 8, 8)];
+    let resolvers = [
+        Ipv4Addr::new(198, 51, 100, 8),
+        Ipv4Addr::new(203, 0, 113, 53),
+    ];
     let resolvers_v6 = [Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53)];
     let all: Vec<IpAddr> = resolvers
         .iter()
@@ -1099,9 +1102,9 @@ fn slice_doh_dot_matches_current_codegen() {
 
     let sid = "S-1-5-21-1-2-3-1001";
     let ips = [
-        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-        IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)),
-        IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 53)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x8888)),
         IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53)),
     ];
 
@@ -1148,13 +1151,13 @@ fn doh_lockdown_skips_exempt_resolver_ips() {
         Ipv4Addr::new(169, 254, 1, 1).into(), // link-local — skipped
         Ipv6Addr::LOCALHOST.into(),           // loopback — skipped
         Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into(), // link-local — skipped
-        Ipv4Addr::new(9, 9, 9, 9).into(),     // public — blocked
+        Ipv4Addr::new(198, 51, 100, 9).into(), // public — blocked
     ];
     let filters = doh_dot_block_filters(sid, &ips, false);
     assert_eq!(filters.len(), 2, "only the public IP yields TCP+UDP blocks");
     assert!(filters
         .iter()
-        .all(|f| f.covers_v4(Ipv4Addr::new(9, 9, 9, 9))));
+        .all(|f| f.covers_v4(Ipv4Addr::new(198, 51, 100, 9))));
     assert!(!filters
         .iter()
         .any(|f| f.covers_v4(Ipv4Addr::new(127, 0, 0, 1))
@@ -1172,10 +1175,10 @@ fn doh_lockdown_covers_ipv6_without_moving_the_v4_filters() {
 
     let sid = "S-1-5-21-1-2-3-1001";
     let v4: [IpAddr; 2] = [
-        Ipv4Addr::new(8, 8, 8, 8).into(),
-        Ipv4Addr::new(1, 1, 1, 1).into(),
+        Ipv4Addr::new(198, 51, 100, 8).into(),
+        Ipv4Addr::new(198, 51, 100, 1).into(),
     ];
-    let v6 = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+    let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x8888);
     let mixed: Vec<IpAddr> = v4.iter().copied().chain([IpAddr::V6(v6)]).collect();
 
     let before = doh_dot_block_filters(sid, &v4, true);
@@ -1418,7 +1421,7 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
     // it only ever proves the two pipelines agree about IPv4.
     let ips = [
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
-        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)),
         IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5)),
     ];
     let servers = [Ipv4Addr::new(203, 0, 113, 7)];
@@ -1646,7 +1649,7 @@ fn slice5_routes_match_current_codegen() {
     // loopback (non-routable skip). Primary: an ExactIp + an ExactFqdn fan-out.
     let rb = book(
         vec![
-            exact_ip_rule("p-ip", Ipv4Addr::new(8, 8, 8, 8)),
+            exact_ip_rule("p-ip", Ipv4Addr::new(198, 51, 100, 8)),
             rule(
                 "p-fqdn",
                 CanonicalAddressMatch::ExactFqdn("api.example.com".into()),
@@ -1654,8 +1657,8 @@ fn slice5_routes_match_current_codegen() {
             ),
         ],
         vec![
-            exact_ip_rule("s-ip", Ipv4Addr::new(1, 1, 1, 1)),
-            exact_ip_rule("s-ip-dup", Ipv4Addr::new(1, 1, 1, 1)),
+            exact_ip_rule("s-ip", Ipv4Addr::new(198, 51, 100, 1)),
+            exact_ip_rule("s-ip-dup", Ipv4Addr::new(198, 51, 100, 1)),
             rule(
                 "s-suffix",
                 CanonicalAddressMatch::SuffixDomain("corp.example".into()),
@@ -1705,7 +1708,20 @@ fn slice5_routes_match_current_codegen() {
     let denied: std::collections::HashSet<Ipv4Addr> =
         [Ipv4Addr::new(198, 51, 100, 2)].into_iter().collect();
 
-    for denylist in [std::collections::HashSet::new(), denied] {
+    // A redirect SET narrower and wider than a `/1` pair: the fixed `/2`s lose
+    // to it, so both sides must shape the counter-overlay from it.
+    let redirect_set = [
+        (Ipv4Addr::new(0, 0, 0, 0), 5),
+        (Ipv4Addr::new(8, 0, 0, 0), 7),
+        (Ipv4Addr::new(64, 0, 0, 0), 2),
+        (Ipv4Addr::new(192, 0, 0, 0), 9),
+    ];
+    for (denylist, catch_alls) in [
+        (std::collections::HashSet::new(), &[][..]),
+        (denied.clone(), &[][..]),
+        (std::collections::HashSet::new(), &redirect_set[..]),
+        (denied, &redirect_set[..]),
+    ] {
         for mode in [
             RouteBehaviorMode::PreferPrimary,
             RouteBehaviorMode::PreferSecondaryWhenAvailable,
@@ -1724,7 +1740,7 @@ fn slice5_routes_match_current_codegen() {
                     &apps,
                     &denylist,
                     crate::address_ownership::ZoneVsIpOrder::default(),
-                    &[],
+                    catch_alls,
                 );
                 let plan = EnforcementPlan {
                     principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(
@@ -1741,13 +1757,14 @@ fn slice5_routes_match_current_codegen() {
                         &denylist,
                         FamilyScope::V4Only,
                         crate::address_ownership::ZoneVsIpOrder::default(),
+                        catch_alls,
                     ),
                     policy_rules: Vec::new(),
                 };
                 let lowered = lower_routes(&plan, sec_target, has_primary.then_some(pri_target));
                 assert!(
                     route_sets_equal(&current.routes, &lowered),
-                    "route set mismatch for mode {mode:?}, has_primary {has_primary}\n\
+                    "route set mismatch for mode {mode:?}, has_primary {has_primary}, catch-alls {catch_alls:?}\n\
                          codegen: {:#?}\nlowered: {:#?}",
                     current.routes,
                     lowered
@@ -1755,6 +1772,59 @@ fn slice5_routes_match_current_codegen() {
             }
         }
     }
+}
+
+/// Mode A's counter-overlay comes from the one function the codegen uses, on
+/// every OS: the neutral plan is what Linux enforces, and a fixed `/2` set there
+/// loses to a tunnel that redirects with narrower prefixes.
+#[test]
+fn the_planned_counter_overlay_answers_the_tunnel_it_is_given() {
+    let rb = book(Vec::new(), Vec::new());
+    let cache = MapCache::default();
+    let apps = crate::app_observation_lookup::MockAppObservationLookup::new();
+    let overlay = |catch_alls: &[(Ipv4Addr, u8)], has_primary: bool| {
+        let mut got: Vec<(Ipv4Addr, u8)> = plan_routes(
+            RouteBehaviorMode::PreferPrimary,
+            &rb,
+            has_primary,
+            &cache,
+            &apps,
+            &std::collections::HashSet::new(),
+            FamilyScope::V4Only,
+            crate::address_ownership::ZoneVsIpOrder::default(),
+            catch_alls,
+        )
+        .into_iter()
+        .map(|r| {
+            assert_eq!(r.egress, EgressRef::Primary);
+            match r.dst {
+                DstMatch::SubnetV4 { net, prefix } => (net, prefix),
+                other => panic!("an overlay is a v4 subnet, got {other:?}"),
+            }
+        })
+        .collect();
+        got.sort_unstable_by_key(|&(d, n)| (u32::from(d), n));
+        got
+    };
+    let redirect_set = [
+        (Ipv4Addr::new(0, 0, 0, 0), 5),
+        (Ipv4Addr::new(8, 0, 0, 0), 7),
+        (Ipv4Addr::new(64, 0, 0, 0), 2),
+        (Ipv4Addr::new(192, 0, 0, 0), 9),
+    ];
+    assert_eq!(
+        overlay(&redirect_set, true),
+        crate::route_codegen::counter_overlay_for(&redirect_set)
+    );
+    assert_eq!(
+        overlay(&[], true),
+        crate::route_codegen::COUNTER_OVERLAY.to_vec(),
+        "an unknown tunnel keeps the classic /2 set"
+    );
+    assert!(
+        overlay(&redirect_set, false).is_empty(),
+        "no primary, no overlay"
+    );
 }
 
 /// The planner twin of the codegen skip: an application + address rule plans

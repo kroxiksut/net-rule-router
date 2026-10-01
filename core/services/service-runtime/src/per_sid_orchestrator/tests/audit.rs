@@ -254,8 +254,8 @@ fn rdp_user_lifecycle_install_remove_install_different_user() {
 /// Performance smoke at modest scale: 10 SIDs × 2 filters each.
 /// Validates the orchestrator does not silently drop filters when
 /// many users are active simultaneously, and that audit records
-/// every SID. Production performance ceiling (50 RDP × 100 rules
-/// = 5000 filters) is documented in TASKS_RU; smaller smoke test
+/// every SID. The production performance ceiling (50 RDP × 100 rules
+/// = 5000 filters) is documented separately; smaller smoke test
 /// here confirms the linear scaling is correct at least at the
 /// small end.
 #[test]

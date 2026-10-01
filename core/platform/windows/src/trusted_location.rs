@@ -164,6 +164,39 @@ pub fn owner_is_trusted(path: &Path) -> Result<bool, String> {
     Ok(is_trusted(&sid_string(owner)?))
 }
 
+/// Every path at or below `root`, and those owned outside
+/// SYSTEM/Administrators/TrustedInstaller. Reparse points are listed but not
+/// entered: [`lock_down_service_tree`] refuses them anyway.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TreeOwnership {
+    pub entries: std::collections::BTreeSet<PathBuf>,
+    pub foreign: std::collections::BTreeSet<PathBuf>,
+}
+
+/// Reads [`TreeOwnership`]. An entry whose owner cannot be read is an error,
+/// never "trusted": an account can deny even administrators that read.
+pub fn tree_ownership(root: &Path) -> Result<TreeOwnership, String> {
+    let mut census = TreeOwnership::default();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+        if !owner_is_trusted(&path)? {
+            census.foreign.insert(path.clone());
+        }
+        if meta.is_dir() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            let entries =
+                std::fs::read_dir(&path).map_err(|e| format!("list {}: {e}", path.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("list {}: {e}", path.display()))?;
+                pending.push(entry.path());
+            }
+        }
+        census.entries.insert(path);
+    }
+    Ok(census)
+}
+
 /// The first path at or below `root` that is a reparse point, if any.
 pub fn first_reparse_point(root: &Path) -> Result<Option<PathBuf>, String> {
     let mut pending = vec![root.to_path_buf()];
@@ -380,6 +413,18 @@ mod tests {
         assert_eq!(owner_is_trusted(system32), Ok(true));
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(owner_is_trusted(dir.path()), Ok(false));
+    }
+
+    #[test]
+    fn a_tree_this_user_created_is_reported_as_foreign_with_every_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("logs").join("planted.db");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, b"x").expect("write");
+        let census = tree_ownership(dir.path()).expect("readable");
+        assert_eq!(census.entries.len(), 3);
+        assert_eq!(census.foreign, census.entries);
+        assert!(census.entries.contains(&file));
     }
 
     #[test]

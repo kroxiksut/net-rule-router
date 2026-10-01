@@ -181,9 +181,9 @@ fn no_ui_crate_reaches_the_service_through_any_chain() {
 fn the_transitive_check_can_actually_fail() {
     // A guard that never fires is indistinguishable from no guard — which is
     // exactly how the manifest scan passed while the leak was live. Positive
-    // control: `nrr-application` genuinely does reach the UI and preview
-    // crates, so the detector must see them there.
-    let reachable = reachable_crates("nrr-application");
+    // control: the GUI library genuinely does reach the UI and preview crates,
+    // so the detector must see them there.
+    let reachable = reachable_crates("nrr-desktop-gui");
     for expected in ["nrr-ui-support", "nrr-mock-backend"] {
         assert!(
             reachable.contains(expected),

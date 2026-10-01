@@ -258,8 +258,8 @@ pub(crate) struct RuleSetMatch {
 /// Companion learning anchors on the second. An auto-added rule is a companion
 /// somebody already accepted — usually a CDN or an API host — and letting its
 /// own hosts anchor makes every accepted suggestion breed the next generation
-/// (`*.githubusercontent.com` accepted, then `raw.githubusercontent.com`
-/// proposing `github.com`).
+/// (`*.usercontent.example` accepted, then `raw.usercontent.example`
+/// proposing `site.example`).
 pub(crate) fn rule_set_match_origin(hostname: &str, set: &CanonicalRuleSet) -> RuleSetMatch {
     let mut out = RuleSetMatch::default();
     for rule in set.rules().iter().filter(|r| r.enabled) {

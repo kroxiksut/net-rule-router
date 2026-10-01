@@ -14,9 +14,10 @@ param()
 $ErrorActionPreference = 'Continue'
 
 $root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'lib\service-paths.ps1')
 
-Write-Host "==> sc query NetRuleRouter" -ForegroundColor Cyan
-$scOutput = sc.exe query NetRuleRouter 2>&1
+Write-Host "==> sc query $NrrServiceName" -ForegroundColor Cyan
+$scOutput = sc.exe query $NrrServiceName 2>&1
 $scExit = $LASTEXITCODE
 Write-Host $scOutput
 
@@ -25,28 +26,9 @@ if ($scExit -ne 0) {
     return
 }
 
-$exeName = 'nrr-service.exe'
-
-# Honour `.cargo/config.toml::build.target-dir` redirect.
-function Resolve-TargetRoot {
-    param([string] $RepoRoot)
-    $cfg = Join-Path $RepoRoot '.cargo\config.toml'
-    if (Test-Path $cfg) {
-        $content = Get-Content $cfg -Raw
-        if ($content -match '(?m)^\s*target-dir\s*=\s*"([^"]+)"') {
-            $td = $Matches[1] -replace '/', '\'
-            if ([System.IO.Path]::IsPathRooted($td)) { return $td }
-            return (Join-Path $RepoRoot $td)
-        }
-    }
-    return (Join-Path $RepoRoot 'target')
-}
+$exeName = $NrrServiceExeName
 $targetRoot = Resolve-TargetRoot $root
-$debugPath = Join-Path $targetRoot "debug\$exeName"
-$releasePath = Join-Path $targetRoot "release\$exeName"
-$exePath = $null
-if (Test-Path $debugPath) { $exePath = $debugPath }
-elseif (Test-Path $releasePath) { $exePath = $releasePath }
+$exePath = Resolve-RepoServiceBinary -TargetRoot $targetRoot -Mode 'auto'
 
 if ($exePath) {
     Write-Host ""

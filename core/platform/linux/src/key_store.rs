@@ -53,10 +53,6 @@ const KEY_FILE_NAME: &str = "db-mac-key.bin";
 /// The re-sign-pending marker, kept beside the key under the same mode.
 const RESIGN_MARKER_FILE_NAME: &str = "db-mac-resign-pending.bin";
 
-/// Canonical production directory — root-owned service state, the Linux analog
-/// of the Windows `systemprofile` tree.
-const DEFAULT_STATE_DIR: &str = "/var/lib/netrulerouter";
-
 /// Owner-only directory mode (`rwx------`).
 const DIR_MODE: u32 = 0o700;
 
@@ -83,13 +79,13 @@ impl FileKeyStore {
         }
     }
 
-    /// The canonical production location `/var/lib/netrulerouter/db-mac-key.bin`,
+    /// The canonical production location, in the service's state root,
     /// hardening the directory to `0700` on save.
-    pub fn default_system() -> Self {
-        Self {
-            path: Path::new(DEFAULT_STATE_DIR).join(KEY_FILE_NAME),
+    pub fn default_system() -> Option<Self> {
+        nrr_platform_api::paths::production_data_root().map(|root| Self {
+            path: root.join(KEY_FILE_NAME),
             harden_dir: true,
-        }
+        })
     }
 
     /// The resolved key-file path (exposed for diagnostics / tests).
@@ -123,9 +119,10 @@ impl FileKeyStore {
                     .map_err(|e| classify("key_store::save::chmod_dir", parent, e))?;
             }
         }
-        // Write to a sibling temp file (created `0600`) then rename, so a crash
-        // mid-write never leaves a truncated blob that reads as "present but
-        // corrupt", and the content is never briefly world-readable.
+        // Temp file created `0600`, fsynced, renamed, then the directory
+        // fsynced: short of that a power cut can leave the new name over a
+        // zero-length file, and a lost key costs every signed revision its
+        // verification.
         let tmp = path.with_extension("bin.tmp");
         {
             let mut f = std::fs::OpenOptions::new()
@@ -136,6 +133,7 @@ impl FileKeyStore {
                 .open(&tmp)
                 .map_err(|e| classify("key_store::save::open_tmp", &tmp, e))?;
             f.write_all(bytes)
+                .and_then(|()| f.sync_all())
                 .map_err(|e| classify("key_store::save::write_tmp", &tmp, e))?;
         }
         // `OpenOptions::mode` only applies when creating; enforce `0600` in case
@@ -143,7 +141,10 @@ impl FileKeyStore {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(FILE_MODE))
             .map_err(|e| classify("key_store::save::chmod_tmp", &tmp, e))?;
         std::fs::rename(&tmp, path).map_err(|e| classify("key_store::save::rename", path, e))?;
-        Ok(())
+        let dir = path.parent().unwrap_or_else(|| Path::new("/"));
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| classify("key_store::save::sync_dir", dir, e))
     }
 
     fn remove(path: &Path) -> Result<(), PlatformError> {
@@ -320,10 +321,23 @@ mod tests {
 
     #[test]
     fn default_system_targets_root_owned_state_dir() {
-        let store = FileKeyStore::default_system();
+        let store = FileKeyStore::default_system().expect("a state root on Unix");
         assert_eq!(
             store.path(),
             Path::new("/var/lib/netrulerouter/db-mac-key.bin")
         );
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_behind() {
+        let dir = temp_dir();
+        let store = store_in(&dir);
+        store.save(&[1u8; 8]).expect("save");
+        let names: Vec<_> = std::fs::read_dir(store.path().parent().expect("parent"))
+            .expect("list")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(KEY_FILE_NAME)]);
     }
 }

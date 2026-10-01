@@ -83,7 +83,7 @@ impl DohLockdownScope {
 pub enum DohTarget {
     /// A single resolver address, either family.
     Ip(IpAddr),
-    /// A resolver hostname (e.g. `dns.google`), resolved to IPs at apply time.
+    /// A resolver hostname (e.g. `resolver.example`), resolved to IPs at apply time.
     Host(String),
 }
 
@@ -374,12 +374,12 @@ mod tests {
 
         let entries = vec![
             DohResolverEntry {
-                target: DohTarget::Ip(Ipv4Addr::new(8, 8, 8, 8).into()),
+                target: DohTarget::Ip(Ipv4Addr::new(198, 51, 100, 8).into()),
                 comment: "Google".into(),
                 enabled: true,
             },
             DohResolverEntry {
-                target: DohTarget::Host("dns.google".into()),
+                target: DohTarget::Host("resolver.example".into()),
                 comment: "Google DoH host".into(),
                 enabled: false,
             },
@@ -388,11 +388,11 @@ mod tests {
         let loaded = repo.load_all().expect("load");
         assert_eq!(loaded.len(), 2);
         // Ordered host before ip? Order is (target_kind ASC): 'host' < 'ip'.
-        assert_eq!(loaded[0].target, DohTarget::Host("dns.google".into()));
+        assert_eq!(loaded[0].target, DohTarget::Host("resolver.example".into()));
         assert!(!loaded[0].enabled);
         assert_eq!(
             loaded[1].target,
-            DohTarget::Ip(Ipv4Addr::new(8, 8, 8, 8).into())
+            DohTarget::Ip(Ipv4Addr::new(198, 51, 100, 8).into())
         );
         assert!(loaded[1].enabled);
     }
@@ -546,13 +546,13 @@ mod tests {
 
     #[test]
     fn target_parse_and_render() {
-        let ip = DohTarget::parse("ip", "8.8.8.8").expect("ip");
-        assert_eq!(ip, DohTarget::Ip(Ipv4Addr::new(8, 8, 8, 8).into()));
+        let ip = DohTarget::parse("ip", "198.51.100.8").expect("ip");
+        assert_eq!(ip, DohTarget::Ip(Ipv4Addr::new(198, 51, 100, 8).into()));
         assert_eq!(ip.kind_str(), "ip");
-        assert_eq!(ip.value_str(), "8.8.8.8");
+        assert_eq!(ip.value_str(), "198.51.100.8");
 
-        let host = DohTarget::parse("host", "DNS.Google").expect("host");
-        assert_eq!(host, DohTarget::Host("dns.google".into()));
+        let host = DohTarget::parse("host", "RESOLVER.Example").expect("host");
+        assert_eq!(host, DohTarget::Host("resolver.example".into()));
         assert_eq!(host.kind_str(), "host");
 
         assert!(DohTarget::parse("ip", "not-an-ip").is_none());

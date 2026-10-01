@@ -75,8 +75,7 @@
 //! **elevated admin token** on Windows Vista+. `NT AUTHORITY\LocalService`
 //! is insufficient for both operations. The service must run as
 //! `NT AUTHORITY\LocalSystem` or as a dedicated account in the Administrators
-//! group. See `service_lifecycle::PRIVILEGE_MATRIX` and
-//! `service_lifecycle::required_service_identity()`.
+//! group.
 
 // ── WFP Provider GUID ─────────────────────────────────────────────────────────
 

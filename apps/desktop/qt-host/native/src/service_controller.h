@@ -2,10 +2,6 @@
 
 #include "native_bridge.h"
 
-#ifndef Q_OS_WIN
-#include <unistd.h>
-#endif
-
 // ── NrrServiceController ─────────────────────────────────────────────────
 //
 // Q_OBJECT bridge for the Windows Service Control Manager. Wraps the
@@ -32,29 +28,18 @@
 // The service binary is the one beside this host, or the path the launcher
 // hands over in `--nrr-service-exe=` (see the constructor).
 
-// True when THIS process already carries an elevated
-// (high-integrity admin) token. When already elevated, a child launched
-// with the default shell verb inherits our token with NO extra UAC
-// prompt; only a non-elevated process needs the `runas` verb (which
-// raises UAC). Used by the service worker so "Run as administrator" users
-// don't get re-prompted on every service operation.
-inline bool nrrProcessIsElevated() {
-#ifdef Q_OS_WIN
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
-        return false;
-    }
-    TOKEN_ELEVATION elevation{};
-    DWORD bytes = 0;
-    const BOOL ok = GetTokenInformation(token, TokenElevation,
-                                        &elevation, sizeof(elevation), &bytes);
-    CloseHandle(token);
-    return ok && elevation.TokenIsElevated != 0;
-#else
-    // The POSIX counterpart of an elevated token: root is what may write a
-    // unit file, reshape nftables and read the service's own data tree.
-    return ::geteuid() == 0;
-#endif
+// How long a direct elevated run may take once its prompt is answered.
+inline constexpr int kElevatedRunTimeoutMs = 30000;
+
+// How long the GUI waits for the launcher to answer a broker-routed action.
+// Must exceed the broker's own bound for it (`client_answer_timeout` for
+// `broker.service-control`: settle 1.5 s + child budget 90 s + margin 5 s),
+// or a slow restart that succeeds reads as a failure; the direct run's
+// allowance on top covers the prompt and the RPC hop. A Rust test pins it.
+inline constexpr int kBrokerServiceControlTimeoutMs = 96500 + kElevatedRunTimeoutMs;
+
+inline QString nrrServiceOperationTimedOut() {
+    return QStringLiteral("Timed out waiting for service operation");
 }
 
 class NrrServiceWorker : public QObject {
@@ -64,7 +49,7 @@ public:
 
 public slots:
     /// Invokes `<servicePath> <command>` via `ShellExecuteExW` with the
-    /// `runas` verb, waits up to 30 s for completion, and emits
+    /// `runas` verb, waits up to `kElevatedRunTimeoutMs`, and emits
     /// `result(operation, success, errorMessage)` on the controller's
     /// signal slot.
     void runElevated(const QString &operation,
@@ -106,11 +91,10 @@ public slots:
             return;
         }
 
-        const DWORD wait = WaitForSingleObject(sei.hProcess, 30000);
+        const DWORD wait = WaitForSingleObject(sei.hProcess, kElevatedRunTimeoutMs);
         if (wait != WAIT_OBJECT_0) {
             CloseHandle(sei.hProcess);
-            emit result(operation, false,
-                        QStringLiteral("Timed out waiting for service operation"));
+            emit result(operation, false, nrrServiceOperationTimedOut());
             return;
         }
         DWORD exitCode = 1;
@@ -204,6 +188,10 @@ public:
     }
 
     ~NrrServiceController() override {
+        // A query still running must not report into a half-destroyed controller.
+        if (statusProc_ != nullptr) {
+            disconnect(statusProc_, nullptr, this, nullptr);
+        }
         workerThread_.quit();
         workerThread_.wait();
     }
@@ -214,42 +202,16 @@ public:
     QString activeOperation() const { return activeOperation_; }
 
     Q_INVOKABLE void refreshStatus() {
+#ifndef Q_OS_WIN
+        querySystemdStatus();
+#else
         QString reason;
         const Status next = queryStatus(&reason);
-        if (next != status_ || reason != statusReason_) {
-            status_ = next;
-            statusReason_ = reason;
-            emit statusChanged();
-        }
-        // Keep polling while a transition is in flight so transient
-        // START_PENDING / STOP_PENDING states clear without a user click.
-        if (status_ == StartPending || status_ == StopPending) {
-            pendingPollTimer_.start(kPendingPollIntervalMs);
-        } else {
-            pendingPollTimer_.stop();
-        }
+        applyStatus(next, reason);
+#endif
     }
 
     Q_INVOKABLE QString servicePath() const { return servicePath_; }
-
-    /// Directory where the service writes its NDJSON
-    /// operational + audit logs. Mirrors
-    /// `StorageProfile::ProductionService` topology on the Rust side:
-    /// `%ProgramData%\NetRuleRouter\logs`. Returns the parent
-    /// `%ProgramData%\NetRuleRouter` if `logs\` doesn't yet exist
-    /// (service installed but never started — log dir is created
-    /// on first write).
-    Q_INVOKABLE QString serviceLogsDirectoryPath() const {
-        const QString programData = qEnvironmentVariable("ProgramData");
-        if (programData.isEmpty()) { return QString(); }
-        const QString logs =
-            QDir::cleanPath(programData + QStringLiteral("/NetRuleRouter/logs"));
-        if (QFileInfo::exists(logs)) { return logs; }
-        const QString parent =
-            QDir::cleanPath(programData + QStringLiteral("/NetRuleRouter"));
-        if (QFileInfo::exists(parent)) { return parent; }
-        return logs;  // return the canonical target even if missing
-    }
 
     Q_INVOKABLE bool isCurrentProcessElevated() const {
         return nrrProcessIsElevated();
@@ -414,24 +376,80 @@ private:
     static constexpr const char *SYSTEMD_UNIT = "netrulerouter.service";
     static constexpr int kSystemctlTimeoutMs = 2000;
 
-    Status queryStatus(QString *reason) const {
-#ifndef Q_OS_WIN
-        // The same two properties the Rust systemd port reads. The GUI polls
-        // this, so it stays one short read-only call rather than an IPC hop
-        // that would itself fail whenever the service is down.
-        QProcess systemctl;
-        systemctl.start(QStringLiteral("systemctl"),
-                        {QStringLiteral("show"), QStringLiteral("--property=LoadState,ActiveState"),
-                         QStringLiteral("--"), QString::fromLatin1(SYSTEMD_UNIT)});
-        if (!systemctl.waitForFinished(kSystemctlTimeoutMs)) {
-            systemctl.kill();
-            *reason = QStringLiteral("systemctl show did not answer");
-            return Unknown;
+    void applyStatus(Status next, const QString &reason) {
+        if (next != status_ || reason != statusReason_) {
+            status_ = next;
+            statusReason_ = reason;
+            emit statusChanged();
         }
+        // Keep polling while a transition is in flight so transient
+        // START_PENDING / STOP_PENDING states clear without a user click.
+        if (status_ == StartPending || status_ == StopPending) {
+            pendingPollTimer_.start(kPendingPollIntervalMs);
+        } else {
+            pendingPollTimer_.stop();
+        }
+    }
+
+#ifndef Q_OS_WIN
+    // Absolute, never PATH: whoever controls a PATH entry would answer for
+    // systemd. `/bin` covers systems without the merged `/usr`.
+    static QString systemctlPath() {
+        for (const char *candidate : {"/usr/bin/systemctl", "/bin/systemctl"}) {
+            const QString path = QString::fromLatin1(candidate);
+            if (QFileInfo(path).isExecutable()) {
+                return path;
+            }
+        }
+        return QString();
+    }
+
+    // The same two properties the Rust systemd port reads, asked without
+    // blocking: the GUI polls this, and a wait froze the window on every tick.
+    // A query still running absorbs the next tick instead of stacking another.
+    void querySystemdStatus() {
+        if (statusProc_ != nullptr) {
+            return;
+        }
+        const QString program = systemctlPath();
+        if (program.isEmpty()) {
+            applyStatus(Unknown, QStringLiteral("systemctl not found"));
+            return;
+        }
+        auto *proc = new QProcess(this);
+        statusProc_ = proc;
+        connect(proc, &QProcess::finished, this,
+                [this, proc](int, QProcess::ExitStatus exitStatus) {
+                    statusProc_ = nullptr;
+                    proc->deleteLater();
+                    QString reason = QStringLiteral("systemctl show did not answer");
+                    Status next = Unknown;
+                    if (exitStatus == QProcess::NormalExit) {
+                        next = parseSystemdStatus(
+                            QString::fromUtf8(proc->readAllStandardOutput()), &reason);
+                    }
+                    applyStatus(next, reason);
+                });
+        // Every other error is followed by `finished`; a failed start is not.
+        connect(proc, &QProcess::errorOccurred, this,
+                [this, proc](QProcess::ProcessError error) {
+                    if (error != QProcess::FailedToStart) {
+                        return;
+                    }
+                    statusProc_ = nullptr;
+                    proc->deleteLater();
+                    applyStatus(Unknown, QStringLiteral("systemctl could not be started"));
+                });
+        QTimer::singleShot(kSystemctlTimeoutMs, proc, [proc]() { proc->kill(); });
+        proc->start(program,
+                    {QStringLiteral("show"), QStringLiteral("--property=LoadState,ActiveState"),
+                     QStringLiteral("--"), QString::fromLatin1(SYSTEMD_UNIT)});
+    }
+
+    static Status parseSystemdStatus(const QString &output, QString *reason) {
         QString loadState;
         QString activeState;
-        const QStringList lines = QString::fromUtf8(systemctl.readAllStandardOutput())
-                                      .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        const QStringList lines = output.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
         for (const QString &line : lines) {
             if (line.startsWith(QLatin1String("LoadState=")))
                 loadState = line.mid(10).trimmed();
@@ -454,7 +472,9 @@ private:
         *reason = QStringLiteral("systemctl reported LoadState=%1 ActiveState=%2")
                       .arg(loadState, activeState);
         return Unknown;
+    }
 #else
+    Status queryStatus(QString *reason) const {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
         if (!scm) {
             *reason = QStringLiteral("OpenSCManager failed: %1").arg(GetLastError());
@@ -490,8 +510,8 @@ private:
             case SERVICE_STOP_PENDING:   return StopPending;
             default:                     return Unknown;
         }
-#endif
     }
+#endif
 
     void dispatch(const QString &operation, const QString &command) {
         if (servicePath_.isEmpty()) {
@@ -527,27 +547,32 @@ private:
     /// response arrives. Mirrors `onWorkerResult` / `onWorkerUacDeclined`
     /// (including the install → start chain) so the broker path is
     /// behaviourally identical to the direct elevated path.
+    ///
+    /// An answer that never comes (launcher gone, broker killed) ends the
+    /// operation as a timeout, or `busy` and the spinner would stay forever.
     void dispatchViaBroker(const QString &operation, const QString &command) {
         const QString corr = bridge_->emitServiceControlRpc(command, servicePath_);
-        if (corr.isEmpty()) {
-            // No channel — fall back to a direct elevated run.
-            QMetaObject::invokeMethod(
-                worker_, "runElevated", Qt::QueuedConnection,
-                Q_ARG(QString, operation),
-                Q_ARG(QString, servicePath_),
-                Q_ARG(QString, command));
-            return;
-        }
         auto conn = std::make_shared<QMetaObject::Connection>();
+        auto *deadline = new QTimer(this);
+        deadline->setSingleShot(true);
         *conn = connect(
             bridge_, &NrrNativeBridge::rpcResponse, this,
-            [this, conn, corr, operation](
+            [this, conn, deadline, corr, operation](
                 const QString &cid, bool ok, const QVariant &,
                 const QString &errorCode, const QString &errorMessage) {
                 if (cid != corr) { return; }
                 QObject::disconnect(*conn);
+                deadline->stop();
+                deadline->deleteLater();
                 onBrokerServiceControlResult(operation, ok, errorCode, errorMessage);
             });
+        connect(deadline, &QTimer::timeout, this, [this, conn, deadline, operation]() {
+            QObject::disconnect(*conn);
+            deadline->deleteLater();
+            onBrokerServiceControlResult(operation, false, QString(),
+                                         nrrServiceOperationTimedOut());
+        });
+        deadline->start(kBrokerServiceControlTimeoutMs);
     }
 
     void onBrokerServiceControlResult(const QString &operation, bool ok,
@@ -597,6 +622,8 @@ private:
     /// when none is).
     QString startMode_;
     QProcess *startModeProc_ = nullptr;
+    /// The Linux `systemctl show` in flight (null when none is).
+    QProcess *statusProc_ = nullptr;
     Status status_ = Unknown;
     QString statusReason_;
     bool busy_ = false;

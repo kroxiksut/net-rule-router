@@ -1,6 +1,6 @@
 # Recovering network access
 
-NetRuleRouter's protections — the kill-switch, per-site routing, and (in Mode B)
+NetRuleRouter's protections — leak protection, per-site routing, and (in Mode B)
 directing name resolution through the app — are enforced by Windows itself, not
 by the app process. That is what makes them reliable: they keep working even if
 the app's window is closed. It also means that if the background service stops

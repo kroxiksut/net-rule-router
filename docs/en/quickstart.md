@@ -7,8 +7,8 @@ IP address, or application. It works with connections you already have
 (main internet + VPN, two providers, Wi-Fi + Ethernet), and is not a VPN
 client, proxy, or anonymity tool.
 
-> **This is pre-alpha.** Emergency blocking (kill switch) and leak
-> protection (fail-closed) have not yet passed full testing and may work
+> **This is pre-alpha.** Leak protection and its block-all mode have not
+> yet passed full testing and may work
 > incorrectly — up to a complete loss of network access until the mode is
 > disabled. They are available in settings, but enabling them is at your
 > own risk.
@@ -56,7 +56,7 @@ routing does not apply.
 
 2. **Choose two routes.** On the *Interfaces & routes* screen, specify
    which network adapter is the *main* (primary) one and which is the
-   *additional* (secondary, for example VPN). Both can be given custom
+   *additional* one (for example, a VPN). Both can be given custom
    names — they will be visible in the rules.
 
    ![Interfaces & routes: the main and the additional adapter](images/interfaces-routes.png)
@@ -100,7 +100,7 @@ carried out yet, so the service refuses it.
 
 The service routes exactly what the rules say and nothing else. Sites that
 used to open for you over the VPN keep going out over the main connection
-until they appear in the rules of the additional (secondary) route — a
+until they appear in the rules of the additional route — a
 preset ships someone else's list, not yours.
 
 So right after the first setup, go through the sites you actually use over
@@ -194,14 +194,14 @@ far beyond the one machine. When the app knows the full name, such as
 ### If you have no additional connection
 
 You may not have a VPN or a second line — then simply **do not assign** an
-additional (secondary) route during setup. Rules that direct traffic to the
+additional route during setup. Rules that direct traffic to the
 additional route will be ignored, and all traffic will go the usual way,
 through the main channel. This is expected behavior, not an error: the
 rules stay in place and will work as soon as you assign an additional
 route (for example, install a VPN).
 
 If you want traffic from such rules to be **blocked instead of using the
-main channel**, turn on emergency blocking (kill switch) — but read the
+main channel**, turn on leak protection — but read the
 warning at the beginning of this document: in pre-alpha that mode is
 enabled at your own risk.
 
@@ -290,10 +290,10 @@ most — including turning the rules off for a moment.
 
 The app makes no permanent changes to your system: all routes and blocking
 filters it creates are **temporary** — they do not survive a reboot. If
-after experimenting with rules (especially with emergency blocking modes)
+after experimenting with rules (especially with leak protection or block-all)
 you lost network access, proceed step by step:
 
-1. **Turn off emergency blocking / leak protection** in the app settings
+1. **Turn off leak protection** in the app settings
    and apply the changes.
 2. **Stop the service** — Settings → Service management → Stop service.
    When the service stops, it removes its routes and protection, every

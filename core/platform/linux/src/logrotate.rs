@@ -37,12 +37,7 @@ pub const LOGROTATE_CONFIG_DIR: &str = "/etc/logrotate.d";
 
 /// Our drop-in file name. Matches the systemd unit leaf (`netrulerouter`) so an
 /// admin finds both artefacts under the same name.
-pub const LOGROTATE_CONFIG_NAME: &str = "netrulerouter";
-
-/// The operational log directory this config governs. MUST mirror
-/// `nrr-storage`'s Linux production `logs_dir` (`/var/log/netrulerouter`); the
-/// two are a single source of truth for where operational NDJSON lives.
-pub const OPERATIONAL_LOG_DIR: &str = "/var/log/netrulerouter";
+pub const LOGROTATE_CONFIG_NAME: &str = nrr_shared::product_identity::PRODUCT_NAME_UNIX;
 
 /// Backstop size ceiling per file. Deliberately far above the in-app 50 MiB
 /// operational cap (CLAUDE.md retention default) so logrotate only ever fires
@@ -90,7 +85,7 @@ pub fn render_logrotate_config() -> String {
          \x20   size {size}\n\
          \x20   rotate {keep}\n\
          }}\n",
-        dir = OPERATIONAL_LOG_DIR,
+        dir = crate::systemd::log_dir().display(),
         age = BACKSTOP_MAX_AGE_DAYS,
         size = BACKSTOP_SIZE,
         keep = BACKSTOP_ROTATE_KEEP,

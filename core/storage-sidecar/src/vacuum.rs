@@ -19,12 +19,11 @@
 //! in WAL mode needs only the write lock, and the checkpoint after it never
 //! blocks (see [`SidecarDb::vacuum_now_at`]).
 
-use std::time::SystemTime;
-
 use rusqlite::{params, OptionalExtension};
 
 use crate::db::{SidecarDb, BUSY_TIMEOUT};
 use crate::error::SidecarResult;
+use nrr_sqlite_support::unix_now_ms;
 
 /// File-size threshold above which the startup VACUUM is considered.
 /// Ten mebibytes — below this the wasted space is too small to matter
@@ -150,17 +149,6 @@ fn sidecar_disk_footprint(db_path: &std::path::Path) -> u64 {
     };
     main.saturating_add(with_suffix("-wal"))
         .saturating_add(with_suffix("-shm"))
-}
-
-/// Current Unix epoch in milliseconds. Duplicated across DAO modules
-/// so each file remains self-contained; the alternative is a tiny
-/// shared `time` module, which feels over-engineered for ~6 lines.
-fn unix_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

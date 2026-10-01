@@ -25,21 +25,26 @@
 #![cfg(target_os = "linux")]
 
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nrr_platform_linux::systemd::{notify, notify_ready, watchdog_interval, NotifyState};
+use nrr_platform_linux::daemon_lock::DaemonLock;
+use nrr_platform_linux::systemd::{notify, watchdog_interval, NotifyError, NotifyState};
 use nrr_service_runtime::ipc_handlers::stub::DegradedPolicyManager;
 use nrr_service_runtime::managers::HealthReporter;
-use nrr_service_runtime::state::ServiceRuntimeState;
+use nrr_service_runtime::principal_enforcement::PrincipalEnforcementCycle;
+use nrr_service_runtime::state::{ServiceHealthSeverity, ServiceRuntimeState};
 use nrr_service_runtime::{
-    install_ndjson_tracing, run_bootstrap, run_supervised_runtime, BootstrapConfig,
+    install_ndjson_tracing_with_verbose, run_bootstrap, run_supervised_runtime, BootstrapConfig,
     ContractNegotiateHandler, EventBus, HealthAggregator, HealthComponent, IpcHandlerRegistry,
     ServiceController, ServiceHealthHandler, ServiceSnapshot, StatusUpdatesSubscribeHandler,
     StopToken,
 };
 use nrr_shared::ipc::IpcOperationName;
 use nrr_storage::StorageProfile;
+
+use crate::unix_socket_server::{epoch_secs, SOCKET_PATH};
 
 /// Fallback watchdog ping cadence when `$WATCHDOG_USEC` is absent (i.e. the unit
 /// declared no `WatchdogSec`, or we are not running under systemd).
@@ -50,6 +55,19 @@ const DEFAULT_WATCHDOG_PING: Duration = Duration::from_secs(30);
 /// the kernel. Left to its default disposition that signal would kill the
 /// process outright, and the filters and routes would outlive the service.
 pub fn run() -> ExitCode {
+    // Claimed before anything is opened or changed: a second daemon would
+    // migrate the same databases, take the live socket and rewrite the same
+    // nft table. Refused on stderr, which the journal keeps; tracing is not up.
+    let socket = std::path::Path::new(SOCKET_PATH);
+    crate::unix_socket_server::prepare_socket_dir(socket);
+    let instance = match DaemonLock::acquire(socket) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("{}: not starting: {e}", crate::DAEMON_NAME);
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Bootstrap storage: resolves the Linux production topology (/var/lib for
     // state + audit, /var/log for operational logs) and opens the DBs + writers.
     // Needs root / the systemd StateDirectory + LogsDirectory; degrades to a
@@ -57,9 +75,20 @@ pub fn run() -> ExitCode {
     let artifacts = run_bootstrap(&BootstrapConfig::new(StorageProfile::ProductionService));
 
     // Install the NDJSON tracing subscriber so operational events are persisted
-    // (same subscriber the Windows service uses; OS-neutral).
+    // (same subscriber the Windows service uses; OS-neutral). A stored verbose
+    // window is resumed and ended on time; the session's timer holds what it
+    // needs, so the handle is not kept here.
     if let Some(writer) = artifacts.log_writer.as_ref() {
-        let _ = install_ndjson_tracing(Arc::clone(writer));
+        let state_db = &artifacts.topology.state_db_path;
+        let verbose = nrr_service_runtime::verbose_logging::verbose_at_boot(state_db);
+        let (_, handle) = install_ndjson_tracing_with_verbose(Arc::clone(writer), verbose);
+        if verbose {
+            let _window = nrr_service_runtime::verbose_logging::VerboseLogging::resume(
+                nrr_service_runtime::verbose_logging::persisted_until_at_boot(state_db),
+                nrr_service_runtime::verbose_logging::now_ms(),
+                Some(Arc::new(handle)),
+            );
+        }
     } else {
         eprintln!(
             "warning: operational log writer unavailable; tracing events will not be persisted"
@@ -68,9 +97,7 @@ pub fn run() -> ExitCode {
 
     // The IPC server is NOT bound here: the supervised runtime binds it as part
     // of its accept-task bundle, so a bind failure lands in health rather than
-    // beside it. Binding once here and again there would put two servers on one
-    // socket path — and the first would carry its own health aggregator,
-    // reporting state nobody fills.
+    // beside it.
 
     // Ask the enforcement mechanism whether it can work AT ALL, before anything
     // depends on it. A missing `nftables` package is a fact the operator can act
@@ -84,39 +111,13 @@ pub fn run() -> ExitCode {
         "linux-service bootstrap complete; supervised runtime starting",
     );
 
-    // Signal readiness: Type=notify holds the unit "activating" until this,
-    // matching the Windows "report Running only after bootstrap" contract.
-    match notify_ready() {
-        Ok(true) => tracing::info!(
-            target: "nrr::lifecycle",
-            msg_key = "linux-svc-sdnotify-ready-sent",
-            "sd_notify READY sent"
-        ),
-        Ok(false) => {
-            tracing::info!(
-                target: "nrr::lifecycle",
-                msg_key = "linux-svc-sdnotify-not-under-systemd",
-                "no NOTIFY_SOCKET; not under systemd notify"
-            )
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "nrr::lifecycle",
-                msg_key = "linux-svc-sdnotify-ready-failed",
-                error = %e,
-                "sd_notify READY failed"
-            )
-        }
-    }
-
-    // Watchdog pings run beside the runtime, not instead of it: systemd must
-    // keep hearing from the process while the supervisor does the work.
     let interval = watchdog_interval(std::env::var("WATCHDOG_USEC").ok().as_deref())
         .unwrap_or(DEFAULT_WATCHDOG_PING);
     let stop = StopToken::new();
 
-    // Catch the stop signals before anything is enforced, so there is no window
-    // in which policy is installed and the only way out of it is a kill.
+    // Catch the stop signals before anything is enforced — DNS capture below
+    // already rewrites the machine — so no window exists in which policy is
+    // installed and the only way out of it is a kill.
     let stop_on_signal = stop.clone();
     if let Err(e) = nrr_platform_linux::signals::install_stop_signals(move || {
         tracing::info!(
@@ -135,12 +136,8 @@ pub fn run() -> ExitCode {
     }
 
     // The same supervised runtime the Windows service runs — supervisor, health
-    // aggregation, IPC accept task, retention jobs. Until this landed the daemon
-    // idled in a sleep loop, so none of those existed on Linux.
+    // aggregation, IPC accept task, retention jobs.
     let health = Arc::new(HealthAggregator::new());
-    // Started here, not earlier, because it now VOUCHES for the runtime instead
-    // of only proving the process exists.
-    spawn_watchdog(interval, stop.clone(), Arc::clone(&health));
     // One bus, two ends: the runtime tasks publish into it, the socket server's
     // workers drain it for their subscription. Two instances would leave a
     // subscribed client silently on poll-only.
@@ -161,13 +158,16 @@ pub fn run() -> ExitCode {
         Arc::clone(&event_bus),
         dns_capture,
     );
+    let enforcement = policy_stack.as_ref().map(|stack| Arc::clone(&stack.cycle));
 
     let ipc = crate::runtime_deps::build_ipc_server(
         &artifacts,
         Arc::clone(&health),
         Arc::clone(&event_bus),
         policy_stack.as_ref(),
+        instance,
     );
+    let accept_heartbeat = Arc::clone(&ipc.accept_heartbeat);
     // Observed resolutions: systemd-resolved tells us what it answered, so the
     // addresses behind a domain rule are learnt without touching the data path.
     // Absent where resolved does not serve the machine's lookups, and that is
@@ -183,16 +183,57 @@ pub fn run() -> ExitCode {
         dns_observation,
         adapter_source,
     );
-    let controller = LogController;
-    let reason = run_supervised_runtime(&controller, &stop, artifacts, deps);
+    spawn_watchdog(
+        interval,
+        stop.clone(),
+        Heartbeats {
+            health: Arc::clone(&health),
+            enforcement,
+            accept: accept_heartbeat,
+        },
+    );
+    // READY comes from here, once the runtime reports the socket bound.
+    let controller = LogController::new(health, notify);
+    run_supervised_runtime(&controller, &stop, artifacts, deps);
 
     tracing::info!(
         target: "nrr::lifecycle",
         msg_key = "linux-svc-runtime-stopped",
-        reason = ?reason,
         "linux-service runtime stopped",
     );
     ExitCode::SUCCESS
+}
+
+/// What the watchdog vouches for: the adapter monitor's tick, the enforcement
+/// pass and the accept loop — any one of them wedged is a wedged daemon.
+struct Heartbeats {
+    health: Arc<HealthAggregator>,
+    enforcement: Option<Arc<PrincipalEnforcementCycle>>,
+    /// Epoch seconds of the last finished accept; `0` = none yet.
+    accept: Arc<AtomicU64>,
+}
+
+impl Heartbeats {
+    /// `None` = no evidence either way (a component that is not wired, or an
+    /// acceptor that has not accepted yet), never evidence of death.
+    fn readings(&self) -> [(&'static str, Option<u64>); 3] {
+        let adapters = self
+            .health
+            .snapshot()
+            .components
+            .iter()
+            .find(|c| c.component == HealthComponent::Adapters)
+            .map(|c| c.updated_at_epoch_secs);
+        let accept = self.accept.load(Ordering::Relaxed);
+        [
+            ("adapter-monitor", adapters),
+            (
+                "enforcement",
+                self.enforcement.as_ref().map(|c| c.last_pass_epoch_secs()),
+            ),
+            ("ipc-accept", (accept != 0).then_some(accept)),
+        ]
+    }
 }
 
 /// Ping systemd on its own thread at half the declared timeout, for as long as
@@ -200,23 +241,25 @@ pub fn run() -> ExitCode {
 ///
 /// Separate from the runtime on purpose: a watchdog that shares a thread with
 /// the work it is supposed to vouch for stops pinging exactly when the work
-/// wedges — which is the one moment systemd needs to hear silence.
-///
-/// It also has to be able to STOP vouching, or the separation buys nothing: an
-/// unconditional ping says "the process is scheduled", which a wedged runtime
-/// satisfies. The evidence used is the adapter monitor's health record, the one
-/// supervisor task that runs on a fixed 1 s tick — see
-/// [`runtime_looks_alive`].
-fn spawn_watchdog(interval: Duration, stop: StopToken, health: Arc<HealthAggregator>) {
+/// wedges — which is the one moment systemd needs to hear silence. And it
+/// withholds the ping when any heartbeat goes stale, or the separation buys
+/// nothing: an unconditional ping says only "the process is scheduled".
+fn spawn_watchdog(interval: Duration, stop: StopToken, beats: Heartbeats) {
+    let window = liveness_window(interval);
     let spawned = std::thread::Builder::new()
         .name("nrr-sd-watchdog".to_owned())
         .spawn(move || {
             while !stop.is_stop_requested() {
+                // An idle acceptor sits in `accept`; the poke makes a live one
+                // turn once, and refresh its beat, before the next look.
+                let _ = std::os::unix::net::UnixStream::connect(SOCKET_PATH);
                 std::thread::sleep(interval);
-                if !runtime_looks_alive(&health.snapshot()) {
+                let stale = stale_heartbeats(epoch_secs(), window, &beats.readings());
+                if !stale.is_empty() {
                     tracing::error!(
                         target: "nrr::lifecycle",
                         msg_key = "linux-svc-watchdog-heartbeat-stale",
+                        stale = %stale.join(", "),
                         "runtime heartbeat is stale — withholding the systemd watchdog ping",
                     );
                     continue;
@@ -234,38 +277,104 @@ fn spawn_watchdog(interval: Duration, stop: StopToken, health: Arc<HealthAggrega
     }
 }
 
-/// How long the runtime's heartbeat may go unrefreshed before the watchdog
-/// stops vouching for it. The adapter monitor records health every second, so
-/// this is a sixty-fold margin: it fires on a wedge, never on a slow moment.
+/// How long a heartbeat may go unrefreshed before the watchdog stops vouching.
+/// The adapter monitor beats every second and enforcement every ten, so a
+/// minute fires on a wedge, never on a slow moment.
 const RUNTIME_LIVENESS_WINDOW_SECS: u64 = 60;
 
-/// Is the runtime still doing work, as opposed to merely being scheduled?
-///
-/// Read off the ADAPTER MONITOR's record specifically, not the snapshot's own
-/// `stale` flag. That flag is true when ANY component is old, and most
-/// components are event-driven — recorded once at spawn and then correctly
-/// silent — so a healthy service reads as stale within half a minute of
-/// starting. The adapter monitor is the one task with a fixed periodic tick,
-/// which makes its timestamp the only honest heartbeat in the snapshot.
-///
-/// Absent (no adapter monitor wired) means "no evidence either way", and the
-/// watchdog keeps pinging: withholding on missing evidence would have systemd
-/// restart a service that is running fine.
-fn runtime_looks_alive(snapshot: &ServiceSnapshot) -> bool {
-    let Some(heartbeat) = snapshot
-        .components
-        .iter()
-        .find(|c| c.component == HealthComponent::Adapters)
-    else {
-        return true;
-    };
-    snapshot.snapshot_refreshed_at_epoch_secs
-        <= heartbeat.updated_at_epoch_secs + RUNTIME_LIVENESS_WINDOW_SECS
+/// The window, widened for a long ping interval: the acceptor is poked once
+/// per interval, so its beat is up to one interval old by design.
+fn liveness_window(interval: Duration) -> u64 {
+    RUNTIME_LIVENESS_WINDOW_SECS.max(interval.as_secs().saturating_mul(2))
 }
 
-/// Reports runtime state to the log, since systemd has no per-state channel the
-/// way the Windows SCM does — `sd_notify` covers readiness and stopping only.
-struct LogController;
+/// Names of the heartbeats older than `window` seconds at `now`.
+fn stale_heartbeats(
+    now: u64,
+    window: u64,
+    readings: &[(&'static str, Option<u64>)],
+) -> Vec<&'static str> {
+    readings
+        .iter()
+        .filter(|(_, beat)| beat.is_some_and(|at| now > at.saturating_add(window)))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Whether systemd may be told the unit is up.
+#[derive(Debug, PartialEq, Eq)]
+enum Readiness {
+    NotYet,
+    Ready,
+    /// Running, but the socket could not be bound: a client would get ENOENT
+    /// from a unit systemd calls active.
+    Unservable(String),
+}
+
+fn readiness(state: ServiceRuntimeState, snapshot: &ServiceSnapshot) -> Readiness {
+    match state {
+        ServiceRuntimeState::Running | ServiceRuntimeState::Degraded => {
+            match snapshot
+                .components
+                .iter()
+                .find(|c| c.component == HealthComponent::Ipc)
+            {
+                Some(ipc) if ipc.severity == ServiceHealthSeverity::Blocking => {
+                    Readiness::Unservable(ipc.message.clone())
+                }
+                _ => Readiness::Ready,
+            }
+        }
+        // The listener stays down on purpose until the operator acts; not
+        // reporting ready would only have systemd restart it in a loop.
+        ServiceRuntimeState::RecoveryRequired => Readiness::Ready,
+        _ => Readiness::NotYet,
+    }
+}
+
+type Notifier = fn(&[NotifyState]) -> Result<bool, NotifyError>;
+
+/// Reports runtime state to the log, and readiness and stopping to systemd —
+/// `sd_notify` has no per-state channel the way the Windows SCM does.
+struct LogController {
+    health: Arc<HealthAggregator>,
+    notify: Notifier,
+    ready_sent: AtomicBool,
+}
+
+impl LogController {
+    fn new(health: Arc<HealthAggregator>, notify: Notifier) -> Self {
+        Self {
+            health,
+            notify,
+            ready_sent: AtomicBool::new(false),
+        }
+    }
+
+    fn signal_ready(&self) {
+        if self.ready_sent.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        match (self.notify)(&[NotifyState::Ready]) {
+            Ok(true) => tracing::info!(
+                target: "nrr::lifecycle",
+                msg_key = "linux-svc-sdnotify-ready-sent",
+                "sd_notify READY sent"
+            ),
+            Ok(false) => tracing::info!(
+                target: "nrr::lifecycle",
+                msg_key = "linux-svc-sdnotify-not-under-systemd",
+                "no NOTIFY_SOCKET; not under systemd notify"
+            ),
+            Err(e) => tracing::warn!(
+                target: "nrr::lifecycle",
+                msg_key = "linux-svc-sdnotify-ready-failed",
+                error = %e,
+                "sd_notify READY failed"
+            ),
+        }
+    }
+}
 
 impl ServiceController for LogController {
     fn report(&self, state: ServiceRuntimeState) {
@@ -275,8 +384,18 @@ impl ServiceController for LogController {
             state = ?state,
             "runtime state"
         );
+        match readiness(state, &self.health.snapshot()) {
+            Readiness::NotYet => {}
+            Readiness::Ready => self.signal_ready(),
+            Readiness::Unservable(reason) => tracing::error!(
+                target: "nrr::lifecycle",
+                msg_key = "linux-svc-sdnotify-ready-withheld",
+                reason = %reason,
+                "the service socket is not bound; READY withheld so systemd does not report a service nobody can reach",
+            ),
+        }
         if matches!(state, ServiceRuntimeState::Stopping) {
-            let _ = notify(&[NotifyState::Stopping]);
+            let _ = (self.notify)(&[NotifyState::Stopping]);
         }
     }
 }
@@ -340,9 +459,8 @@ pub(crate) fn serving_registry_with(
         IpcOperationName::StatusUpdatesSubscribe,
         StatusUpdatesSubscribeHandler::new(event_bus),
     );
-    // Policy state stays "recovery required": no policy store is wired on this
-    // platform yet, and that is the truth the GUI needs in order to render
-    // something other than a spinner.
+    // Fallback when there is no state database: policy state stays "recovery
+    // required", which lets the GUI render something other than a spinner.
     registry.register(
         IpcOperationName::ServiceHealthGet,
         ServiceHealthHandler::new(
@@ -392,18 +510,20 @@ fn build_dns_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nrr_service_runtime::state::{ServiceHealthSeverity, ServicePolicyState};
+    use nrr_service_runtime::state::ServicePolicyState;
     use nrr_service_runtime::HealthComponentSnapshot;
+    use std::cell::RefCell;
 
-    fn snapshot_with(adapters_age_secs: Option<u64>) -> ServiceSnapshot {
-        let now = 1_000_000u64;
-        let components = adapters_age_secs
-            .map(|age| {
+    const NOW: u64 = 1_000_000;
+
+    fn snapshot_with(ipc: Option<ServiceHealthSeverity>) -> ServiceSnapshot {
+        let components = ipc
+            .map(|severity| {
                 vec![HealthComponentSnapshot {
-                    component: HealthComponent::Adapters,
-                    severity: ServiceHealthSeverity::Ok,
-                    message: "adapter monitor tick ok".to_owned(),
-                    updated_at_epoch_secs: now - age,
+                    component: HealthComponent::Ipc,
+                    severity,
+                    message: "ipc bind failed: address in use".to_owned(),
+                    updated_at_epoch_secs: NOW,
                 }]
             })
             .unwrap_or_default();
@@ -413,28 +533,127 @@ mod tests {
             components,
             current_revision: None,
             policy_state: ServicePolicyState::NoState,
-            snapshot_refreshed_at_epoch_secs: now,
+            snapshot_refreshed_at_epoch_secs: NOW,
             stale: false,
         }
     }
 
-    /// The adapter monitor ticks every second. A minute of silence from it is a
-    /// wedge, and that is the case the watchdog exists to report.
+    /// A wedged enforcement pass or accept loop used to go unnoticed while
+    /// the adapter monitor kept ticking.
     #[test]
-    fn a_stalled_heartbeat_withholds_the_ping() {
-        assert!(runtime_looks_alive(&snapshot_with(Some(1))));
-        assert!(runtime_looks_alive(&snapshot_with(Some(
-            RUNTIME_LIVENESS_WINDOW_SECS
-        ))));
-        assert!(!runtime_looks_alive(&snapshot_with(Some(
-            RUNTIME_LIVENESS_WINDOW_SECS + 1
-        ))));
+    fn any_stale_heartbeat_withholds_the_ping() {
+        let fresh = NOW - 1;
+        let old = NOW - RUNTIME_LIVENESS_WINDOW_SECS - 1;
+        let window = RUNTIME_LIVENESS_WINDOW_SECS;
+        let all_fresh = [
+            ("adapter-monitor", Some(fresh)),
+            ("enforcement", Some(fresh)),
+            ("ipc-accept", Some(fresh)),
+        ];
+        assert!(stale_heartbeats(NOW, window, &all_fresh).is_empty());
+
+        let enforcement_hung = [
+            ("adapter-monitor", Some(fresh)),
+            ("enforcement", Some(old)),
+            ("ipc-accept", Some(fresh)),
+        ];
+        assert_eq!(
+            stale_heartbeats(NOW, window, &enforcement_hung),
+            vec!["enforcement"]
+        );
+
+        let acceptor_dead = [
+            ("adapter-monitor", Some(fresh)),
+            ("enforcement", Some(fresh)),
+            ("ipc-accept", Some(old)),
+        ];
+        assert_eq!(
+            stale_heartbeats(NOW, window, &acceptor_dead),
+            vec!["ipc-accept"]
+        );
+        // Exactly at the edge is still alive.
+        let edge = [("adapter-monitor", Some(NOW - window))];
+        assert!(stale_heartbeats(NOW, window, &edge).is_empty());
     }
 
-    /// No adapter monitor is no evidence, not evidence of death: withholding
-    /// here would have systemd restart a service that is running fine.
+    /// Missing evidence is not evidence of death: withholding here would have
+    /// systemd restart a service that is running fine.
     #[test]
-    fn a_missing_heartbeat_component_keeps_the_ping() {
-        assert!(runtime_looks_alive(&snapshot_with(None)));
+    fn a_missing_heartbeat_keeps_the_ping() {
+        let none = [
+            ("adapter-monitor", None),
+            ("enforcement", None),
+            ("ipc-accept", None),
+        ];
+        assert!(stale_heartbeats(NOW, RUNTIME_LIVENESS_WINDOW_SECS, &none).is_empty());
+    }
+
+    /// The acceptor is poked once per interval, so a long interval must not
+    /// read its by-design age as a wedge.
+    #[test]
+    fn the_window_covers_two_ping_intervals() {
+        assert_eq!(
+            liveness_window(Duration::from_secs(15)),
+            RUNTIME_LIVENESS_WINDOW_SECS
+        );
+        assert_eq!(liveness_window(Duration::from_secs(90)), 180);
+    }
+
+    thread_local! {
+        static SENT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn recording(states: &[NotifyState]) -> Result<bool, NotifyError> {
+        SENT.with(|sent| {
+            sent.borrow_mut()
+                .extend(states.iter().map(|s| format!("{s:?}")))
+        });
+        Ok(true)
+    }
+
+    fn sent() -> Vec<String> {
+        SENT.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
+    }
+
+    /// READY went out before the socket existed; a client then got ENOENT
+    /// from a unit systemd already called active.
+    #[test]
+    fn ready_waits_for_the_running_report_and_is_sent_once() {
+        let _ = sent();
+        let controller = LogController::new(Arc::new(HealthAggregator::new()), recording);
+        controller.report(ServiceRuntimeState::Starting);
+        assert!(sent().is_empty(), "nothing is ready while starting");
+        controller.report(ServiceRuntimeState::Running);
+        assert_eq!(sent(), vec!["Ready".to_owned()]);
+        controller.report(ServiceRuntimeState::Running);
+        assert!(sent().is_empty(), "READY is sent once");
+        controller.report(ServiceRuntimeState::Stopping);
+        assert_eq!(sent(), vec!["Stopping".to_owned()]);
+    }
+
+    #[test]
+    fn an_unbound_socket_withholds_ready() {
+        assert!(matches!(
+            readiness(
+                ServiceRuntimeState::Running,
+                &snapshot_with(Some(ServiceHealthSeverity::Blocking))
+            ),
+            Readiness::Unservable(_)
+        ));
+        assert_eq!(
+            readiness(
+                ServiceRuntimeState::Running,
+                &snapshot_with(Some(ServiceHealthSeverity::Ok))
+            ),
+            Readiness::Ready
+        );
+        assert_eq!(
+            readiness(ServiceRuntimeState::Starting, &snapshot_with(None)),
+            Readiness::NotYet
+        );
+        assert_eq!(
+            readiness(ServiceRuntimeState::RecoveryRequired, &snapshot_with(None)),
+            Readiness::Ready
+        );
     }
 }

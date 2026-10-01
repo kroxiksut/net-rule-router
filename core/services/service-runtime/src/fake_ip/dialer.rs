@@ -915,7 +915,7 @@ mod tests {
         let dialer = MockRelayDialer::new();
         dialer.set_response(b"from-upstream");
         let mut stream = dialed(
-            dialer.connect_tcp(&target("1.2.3.4:443", RouteRole::Secondary)),
+            dialer.connect_tcp(&target("192.0.2.4:443", RouteRole::Secondary)),
             "dial",
         );
 
@@ -934,7 +934,7 @@ mod tests {
     fn a_half_close_stops_further_writes() {
         let dialer = MockRelayDialer::new();
         let mut stream = dialed(
-            dialer.connect_tcp(&target("1.2.3.4:443", RouteRole::Primary)),
+            dialer.connect_tcp(&target("192.0.2.4:443", RouteRole::Primary)),
             "dial",
         );
         stream.shutdown_write().expect("shutdown");
@@ -945,7 +945,7 @@ mod tests {
     fn an_unreachable_upstream_surfaces_as_an_error() {
         let dialer = MockRelayDialer::new();
         dialer.fail_dials("network unreachable");
-        let error = dial_error(dialer.connect_tcp(&target("1.2.3.4:443", RouteRole::Primary)));
+        let error = dial_error(dialer.connect_tcp(&target("192.0.2.4:443", RouteRole::Primary)));
         assert!(matches!(error, RelayError::Upstream { .. }));
         // The attempt is still recorded — diagnostics must show what was tried.
         assert_eq!(dialer.dials().len(), 1);
@@ -956,7 +956,7 @@ mod tests {
         let dialer = MockRelayDialer::new();
         dialer.set_response(b"server-reply");
         let stream = dialed(
-            dialer.connect_tcp(&target("1.2.3.4:443", RouteRole::Primary)),
+            dialer.connect_tcp(&target("192.0.2.4:443", RouteRole::Primary)),
             "dial",
         );
         let split = match stream.into_split() {

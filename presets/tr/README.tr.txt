@@ -8,3 +8,4 @@ Beklenen yapı:
 - tr/<pack-name>/rules_secondary.txt
 
 Yazar: depo katkıcıları
+Kontrol tarihi: Eylül 2026 (secondary rota listesi, kamuya açık raporlara göre)

@@ -1,43 +1,18 @@
 //! Live tracing-verbosity control seam.
 //!
-//! `nrr-windows-service` reads the persisted `verbose_logging` flag before
-//! installing the global tracing subscriber, so a fresh service start
-//! always begins at the right filter (`DEFAULT_TRACING_FILTER` /
-//! `VERBOSE_TRACING_FILTER`, see `nrr_diagnostics::logs::tracing_layer`).
-//! A mid-session `Set` (the GUI Save button) must additionally reach the
-//! *running* process's `EnvFilter`, not just SQLite — that live reload is
-//! what this module wires up.
-//!
-//! # Design — policy/mechanism seam
-//!
-//! The reload primitive (`tracing_subscriber::reload::Handle`) is a
-//! concrete `nrr-diagnostics` type (`TracingVerbosityHandle`) constructed
-//! once, at boot, alongside `install_ndjson_tracing_with_verbose` in
-//! `nrr-windows-service`. `nrr-service-runtime` (this crate) must not
-//! depend on `tracing-subscriber`'s reload machinery directly — instead it
-//! defines the narrow [`VerbosityControl`] trait so:
-//!
-//! - `ProductionServiceStability::set` (in `production_settings.rs`) can
-//!   drive live verbosity through an `Option<Arc<dyn VerbosityControl>>`
-//!   field, exactly mirroring the existing `liveness_tracker` /
-//!   `resolver_controller` optional-live-apply fields on the same struct.
-//! - Tests inject a fake recorder instead of a real subscriber.
-//! - `None` (tests, non-Windows, degraded boot) is a safe default: the
-//!   value still persists to SQLite and takes effect on the next restart.
-//!
-//! `nrr_diagnostics::TracingVerbosityHandle` implements this trait directly
-//! below, so production wiring (`runtime_deps.rs`) can pass the boot-time
-//! handle straight through `Arc::clone` without an extra adapter type.
+//! The reload primitive is a concrete `nrr-diagnostics` type
+//! (`TracingVerbosityHandle`) built at boot beside the tracing installer; this
+//! crate reaches it only through [`VerbosityControl`], so tests inject a
+//! recorder and a boot without a log writer simply has none. The window that
+//! decides WHEN to be verbose is `crate::verbose_logging`.
 
 /// Applies a live change to the process's tracing verbosity.
 ///
 /// Implementations MUST be best-effort: a failure to reload the filter is
-/// diagnostic-only and must never surface as a settings-write error (the
-/// caller is a `ServiceStabilityConfigSet` IPC handler on the hot path of
-/// an admin-gated but otherwise ordinary settings save).
+/// diagnostic-only and must never fail the settings write that caused it.
 pub trait VerbosityControl: Send + Sync {
-    /// Switches the live tracing filter to the verbose directive
-    /// (`verbose == true`) or the default directive (`verbose == false`).
+    /// Switches the live filter to the verbose directive (`true`) or the
+    /// default one (`false`).
     fn set_verbose(&self, verbose: bool);
 }
 
@@ -46,8 +21,3 @@ impl VerbosityControl for nrr_diagnostics::TracingVerbosityHandle {
         nrr_diagnostics::TracingVerbosityHandle::set_verbose(self, verbose);
     }
 }
-
-// A `FakeVerbosityControl` test double (recording calls for handler-level
-// assertions) lives alongside `ProductionServiceStability`'s existing test
-// module in `production_settings.rs`, which is the only consumer that needs
-// it — see `service_stability_tests::verbose_logging_set_drives_live_reload`.

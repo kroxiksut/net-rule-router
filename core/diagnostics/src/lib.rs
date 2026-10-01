@@ -20,7 +20,7 @@
 //! ```text
 //! nrr-diagnostics
 //!   → nrr-domain   (DecisionExplain, ExplainDetailLevel, rule/decision types)
-//!   → nrr-storage  (DiagnosticRedactionLevel, LookupExplainSummary, cache health)
+//!   → nrr-storage  (DiagnosticRedactionLevel, cache health)
 //!   → nrr-shared   (IPC DTOs, route/adapter types)
 //! ```
 //!
@@ -49,7 +49,6 @@ pub mod facade;
 pub mod local_offset;
 pub mod logs;
 pub mod privacy;
-pub mod query;
 pub mod reason;
 pub mod redaction;
 pub mod retention;
@@ -64,10 +63,12 @@ pub use archive::{
 };
 pub use audit::{
     compute_chain_hash, local_date_string, utc_date_string, ActorKind, AuditChainAnchor,
-    AuditChainAnchorStore, AuditChainVerification, AuditEventInput, AuditEventKind,
-    AuditEventResult, AuditQueryFilter, AuditReader, AuditTailIntegrity, AuditWriter,
-    AuditWriterConfig, FileAnchorStore, InMemorySecurityAlertsRepository, SecurityAlert,
-    SecurityAlertState, SecurityAlertsRepository, AUDIT_CHAIN_GENESIS, DEFAULT_MAX_FILE_SIZE_BYTES,
+    AuditChainAnchorStore, AuditChainBreak, AuditChainBreakKind, AuditChainRestartError,
+    AuditChainRestartRequest, AuditChainVerification, AuditChainVerifier, AuditEventInput,
+    AuditEventKind, AuditEventResult, AuditQueryFilter, AuditReader, AuditRestartKey,
+    AuditTailIntegrity, AuditWriter, AuditWriterConfig, FileAnchorStore,
+    InMemorySecurityAlertsRepository, SecurityAlert, SecurityAlertState, SecurityAlertsRepository,
+    AUDIT_CHAIN_GENESIS, DEFAULT_MAX_FILE_SIZE_BYTES,
 };
 pub use error::{DiagnosticsError, DiagnosticsResult};
 pub use event::{AuditEvent, LogEvent, AUDIT_EVENT_SCHEMA_VERSION, LOG_EVENT_SCHEMA_VERSION};
@@ -76,24 +77,21 @@ pub use explain::{
 };
 pub use facade::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, ClearLogsRequest, ClearLogsResult,
-    DiagnosticModeStateDto, DiagnosticsFacade, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
-    MockDiagnosticsFacade, MockScenario, PageCursor, PageResult, PaginationParams,
-    SecurityAlertDto, SetDiagnosticModeRequest,
+    DiagnosticsFacade, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, MockDiagnosticsFacade,
+    MockScenario, PageCursor, PageResult, PaginationParams, SecurityAlertDto,
 };
 pub use logs::{
     install_ndjson_tracing, install_ndjson_tracing_with_console,
     install_ndjson_tracing_with_console_and_verbose, install_ndjson_tracing_with_verbose,
-    LogFilter, LogQueryFilter, LogReader, LogWriter, LogWriterConfig, LoggingMode,
-    NdjsonTracingLayer, TracingInstallOutcome, TracingVerbosityHandle, DEFAULT_TRACING_FILTER,
-    VERBOSE_TRACING_FILTER,
+    LogFileIndex, LogFilter, LogPage, LogQueryFilter, LogReader, LogWriter, LogWriterConfig,
+    LoggingMode, NdjsonTracingLayer, TracingInstallOutcome, TracingVerbosityHandle,
+    DEFAULT_TRACING_FILTER, VERBOSE_TRACING_FILTER,
 };
 pub use privacy::{
     redact_adapter_id, redact_hostname, redact_ipv4, redact_ipv4_str, redact_process_path,
-    redact_resolver_source, DiagnosticSession, DiagnosticSessionScope, Redacted, RedactionMode,
-    SecretNeverLog, MARKER_DIAGNOSTIC_REQUIRED, MARKER_MASKED_IPV4, MARKER_MASKED_PATH,
+    redact_resolver_source, Redacted, RedactionMode, MARKER_MASKED_IPV4, MARKER_MASKED_PATH,
     MARKER_PRIVATE_IPV4, MARKER_PUBLIC_IPV4, MARKER_REDACTED,
 };
-pub use query::{DiagnosticsQueryService, NoopQueryService};
 pub use reason::{reason_code_meta, ReasonCode, ReasonCodeMeta, ALL_REASON_CODES};
 pub use redaction::{
     explain_to_redaction, redaction_to_explain, DiagnosticRedactionLevel, ExplainDetailLevel,

@@ -8,3 +8,4 @@
 - jp/<pack-name>/rules_secondary.txt
 
 作成者: リポジトリ貢献者
+確認: 2026年9月

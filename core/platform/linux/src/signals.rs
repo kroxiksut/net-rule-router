@@ -1,5 +1,10 @@
-//! Graceful-stop signals for the daemon: `SIGTERM` (systemd stop) and
-//! `SIGINT` (Ctrl+C in a console run).
+//! Graceful-stop signals for the daemon: `SIGTERM` (systemd stop), `SIGINT`
+//! (Ctrl+C in a console run) and `SIGHUP` (the terminal of a foreground run
+//! went away, e.g. a closed SSH session).
+//!
+//! `SIGHUP` stops rather than being ignored: its default disposition already
+//! ends the process, so the only change is that teardown now runs. The unit
+//! declares no `ExecReload`, so no reload is lost.
 //!
 //! The Linux analog of the Windows service's SCM stop control. It exists for
 //! one reason: the daemon's teardown removes the packet filters and the routes
@@ -54,6 +59,7 @@ where
 {
     install_handler(libc::SIGTERM)?;
     install_handler(libc::SIGINT)?;
+    install_handler(libc::SIGHUP)?;
 
     std::thread::Builder::new()
         .name("nrr-stop-signal".to_owned())

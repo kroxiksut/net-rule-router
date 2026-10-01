@@ -6,10 +6,10 @@ use super::*;
 fn a_renamed_connection_still_reads_as_a_personal_tunnel() {
     let mut tun = adapter("tap", 7, true, true, None);
     tun.description = "TAP-Windows Adapter V9".into();
-    tun.friendly_name = "swiftvpn VPN OpenVPN Adapter".into();
+    tun.friendly_name = "examplevpn VPN OpenVPN Adapter".into();
     assert_eq!(
         personal_tunnel_name(&[adapter("wifi", 3, true, true, Some([192, 168, 0, 1])), tun]),
-        Some("swiftvpn VPN OpenVPN Adapter".to_string())
+        Some("examplevpn VPN OpenVPN Adapter".to_string())
     );
 }
 
@@ -28,7 +28,7 @@ fn a_corporate_client_raises_no_offer() {
 #[test]
 fn a_tunnel_that_is_down_raises_no_offer() {
     let mut tun = adapter("tap", 9, false, false, None);
-    tun.friendly_name = "Mullvad VPN".into();
+    tun.friendly_name = "ExampleVPN".into();
     assert_eq!(personal_tunnel_name(&[tun]), None);
 }
 
@@ -52,7 +52,7 @@ fn route_entry(
 
 #[test]
 fn derives_tunnel_next_hop_from_redirect_gateway_split_routes() {
-    // Mirrors a live swiftvpn OpenVPN table: split-default via the
+    // Mirrors a live examplevpn OpenVPN table: split-default via the
     // peer 10.91.192.1, no adapter gateway, on ifindex 78.
     let routes = vec![
         route_entry([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, 1),
@@ -110,7 +110,7 @@ fn derive_primary_target_picks_lowest_metric_default_off_secondary() {
         route_entry([0, 0, 0, 0], 0, [10, 91, 192, 1], 78, 1),  // VPN /0 on secondary → excluded
         route_entry([0, 0, 0, 0], 0, [192, 168, 1, 254], 12, 5), // lower-metric default → wins
     ];
-    let t = derive_primary_target(&routes, 78).expect("primary derived from OS default");
+    let t = derive_primary_target(&routes, 78, &[]).expect("primary derived from OS default");
     assert_eq!(t.interface_index, 12);
     assert_eq!(t.gateway, Ipv4Addr::new(192, 168, 1, 254));
 }
@@ -119,7 +119,71 @@ fn derive_primary_target_picks_lowest_metric_default_off_secondary() {
 fn derive_primary_target_none_when_only_secondary_has_default() {
     // The VPN replaced /0 itself; nothing left to derive → None (caller warns).
     let routes = vec![route_entry([0, 0, 0, 0], 0, [10, 91, 192, 1], 78, 1)];
-    assert!(derive_primary_target(&routes, 78).is_none());
+    assert!(derive_primary_target(&routes, 78, &[]).is_none());
+}
+
+#[test]
+fn derive_primary_target_falls_back_to_on_link_default() {
+    // PPPoE: the uplink's /0 is on-link, no gateway.
+    let routes = vec![
+        route_entry([0, 0, 0, 0], 0, [0, 0, 0, 0], 15, 10),
+        route_entry([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, 1),
+    ];
+    let t = derive_primary_target(&routes, 78, &[]).expect("on-link /0 is a primary");
+    assert_eq!(t.interface_index, 15);
+    assert_eq!(t.gateway, Ipv4Addr::UNSPECIFIED);
+}
+
+#[test]
+fn derive_primary_target_prefers_any_gateway_route_over_on_link() {
+    let routes = vec![
+        route_entry([0, 0, 0, 0], 0, [0, 0, 0, 0], 15, 1),
+        route_entry([0, 0, 0, 0], 0, [192, 168, 1, 1], 12, 50),
+    ];
+    let t = derive_primary_target(&routes, 78, &[]).expect("gateway route");
+    assert_eq!(t.interface_index, 12);
+}
+
+#[test]
+fn derive_primary_target_skips_on_link_default_of_foreign_tunnel_or_ours() {
+    let mut ours = route_entry([0, 0, 0, 0], 0, [0, 0, 0, 0], 16, 1);
+    ours.is_ours = true;
+    let routes = vec![route_entry([0, 0, 0, 0], 0, [0, 0, 0, 0], 20, 5), ours];
+    assert!(derive_primary_target(&routes, 78, &[20]).is_none());
+    // Positive control: the same table without the tunnel verdict derives it.
+    assert_eq!(
+        derive_primary_target(&routes, 78, &[]).map(|t| t.interface_index),
+        Some(20)
+    );
+}
+
+#[test]
+fn recompute_mode_a_counter_overlay_via_derived_pppoe_primary() {
+    let api = Arc::new(MockWindowsApi::new());
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn_id = vpn.stable_id();
+    let mut pppoe = adapter("pppoe", 15, true, true, None);
+    pppoe.friendly_name = "WAN Miniport (PPPOE)".into();
+    pppoe.description = "WAN Miniport (PPPOE)".into();
+    api.set_adapter_infos(vec![vpn, pppoe]);
+    api.set_route_table(vec![route_entry([0, 0, 0, 0], 0, [0, 0, 0, 0], 15, 10)]);
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 203, 0, 113, 138)]),
+    );
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary("S-IVANOV", &vpn_id);
+    let coord = coordinator_with_policy(Arc::clone(&api), Arc::clone(&rules), policy);
+
+    coord.recompute_active(&["S-IVANOV".to_string()]).unwrap();
+
+    let table = api.get_ip_forward_table().unwrap();
+    let counter: Vec<_> = table.iter().filter(|r| r.prefix_length == 2).collect();
+    assert_eq!(counter.len(), 4, "counter-overlay via the PPPoE uplink");
+    assert!(counter
+        .iter()
+        .all(|r| r.interface_index == 15 && r.next_hop == Ipv4Addr::UNSPECIFIED));
 }
 
 #[test]
@@ -129,7 +193,7 @@ fn recompute_mode_a_emits_counter_overlay_via_derived_primary() {
     // primary; we derive it from the OS default route. Without this fix,
     // unmatched traffic silently rode the VPN's redirect.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let vpn_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     api.set_route_table(vec![
@@ -138,7 +202,7 @@ fn recompute_mode_a_emits_counter_overlay_via_derived_primary() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 23, 10, 20, 138)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 203, 0, 113, 138)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &vpn_id); // ONLY secondary bound
@@ -167,7 +231,7 @@ fn recompute_active_routes_via_derived_next_hop_for_gatewayless_vpn() {
     // resolve_target derives the tunnel peer from the route table and the
     // /32 overlay is installed via it.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, None); // up, IPv4, NO gateway
+    let vpn = adapter("examplevpnvpn", 78, true, true, None); // up, IPv4, NO gateway
     let bound_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     api.set_route_table(vec![
@@ -178,7 +242,7 @@ fn recompute_active_routes_via_derived_next_hop_for_gatewayless_vpn() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 23, 10, 20, 138)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 203, 0, 113, 138)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &bound_id);
@@ -190,7 +254,7 @@ fn recompute_active_routes_via_derived_next_hop_for_gatewayless_vpn() {
     let table = api.get_ip_forward_table().unwrap();
     let ours = table
         .iter()
-        .find(|r| r.destination == Ipv4Addr::new(23, 10, 20, 138))
+        .find(|r| r.destination == Ipv4Addr::new(203, 0, 113, 138))
         .expect("our /32 overlay must be present");
     assert_eq!(
         ours.next_hop,
@@ -207,7 +271,7 @@ fn cache_keeps_routes_when_vpn_catch_all_vanishes() {
     // the cached next-hop keeps our /32 routes alive instead of tearing them
     // down. Guards the gateway-less-VPN next-hop cache.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, None); // up, IPv4, NO gateway
+    let vpn = adapter("examplevpnvpn", 78, true, true, None); // up, IPv4, NO gateway
     let bound_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     api.set_route_table(vec![
@@ -217,7 +281,7 @@ fn cache_keeps_routes_when_vpn_catch_all_vanishes() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 23, 10, 20, 138)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 203, 0, 113, 138)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &bound_id);
@@ -229,13 +293,13 @@ fn cache_keeps_routes_when_vpn_catch_all_vanishes() {
         api.get_ip_forward_table()
             .unwrap()
             .iter()
-            .any(|r| r.destination == Ipv4Addr::new(23, 10, 20, 138)),
+            .any(|r| r.destination == Ipv4Addr::new(203, 0, 113, 138)),
         "our /32 installed in cycle 1"
     );
 
     // The VPN's catch-all routes vanish (reconnect blip) — only our /32 left.
     api.set_route_table(vec![route_entry(
-        [23, 10, 20, 138],
+        [203, 0, 113, 138],
         32,
         [10, 91, 192, 1],
         78,
@@ -248,7 +312,7 @@ fn cache_keeps_routes_when_vpn_catch_all_vanishes() {
         api.get_ip_forward_table()
             .unwrap()
             .iter()
-            .any(|r| r.destination == Ipv4Addr::new(23, 10, 20, 138)),
+            .any(|r| r.destination == Ipv4Addr::new(203, 0, 113, 138)),
         "our /32 survives via the cached next-hop (NOT cleared)"
     );
 }
@@ -259,7 +323,7 @@ fn resolve_secondary_luid_returns_luid_for_bound_usable_secondary() {
     // orchestrator the secondary interface LUID to pin its egress
     // condition to.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let bound_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     let rules = Arc::new(FakeRules::new());
@@ -290,7 +354,7 @@ fn resolve_egress_source_ips_returns_the_adapters_own_addresses() {
     // resolved adapter's OWN unicast address, and a down secondary must
     // yield None (the relay then refuses instead of leaking).
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -306,7 +370,7 @@ fn resolve_egress_source_ips_returns_the_adapters_own_addresses() {
     assert_eq!(secondary, Some(Ipv4Addr::new(192, 168, 1, 50)));
 
     // The secondary goes down → its source disappears, the primary stays.
-    let vpn_down = adapter("swiftvpnvpn", 78, false, true, Some([10, 0, 0, 1]));
+    let vpn_down = adapter("examplevpnvpn", 78, false, true, Some([10, 0, 0, 1]));
     let eth_up = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     api.set_adapter_infos(vec![vpn_down, eth_up]);
     let (primary, secondary) = coord.resolve_egress_source_ips("S-IVANOV");
@@ -320,7 +384,7 @@ fn kill_switch_exemptions_resolves_luid_servers_and_subnets() {
     // exemptions: the secondary LUID, the VPN server IP (bootstrap host
     // route via the primary gateway), and the primary's connected subnet.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -337,7 +401,7 @@ fn kill_switch_exemptions_resolves_luid_servers_and_subnets() {
     let coord = coordinator_with_policy(Arc::clone(&api), Arc::clone(&rules), policy);
 
     let ex = coord
-        .kill_switch_exemptions("S-IVANOV")
+        .kill_switch_exemptions("S-IVANOV", &coord.read_machine())
         .expect("exemptions resolve when secondary + primary are usable");
     assert_eq!(
         ex.secondary_luid,
@@ -354,7 +418,7 @@ fn kill_switch_exemptions_resolves_luid_servers_and_subnets() {
 #[test]
 fn our_own_exception_routes_are_not_mistaken_for_vpn_server_ips() {
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -372,7 +436,7 @@ fn our_own_exception_routes_are_not_mistaken_for_vpn_server_ips() {
     let coord = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy);
 
     let before = coord
-        .kill_switch_exemptions("S-IVANOV")
+        .kill_switch_exemptions("S-IVANOV", &coord.read_machine())
         .expect("exemptions resolve");
     assert!(
         before
@@ -383,7 +447,7 @@ fn our_own_exception_routes_are_not_mistaken_for_vpn_server_ips() {
 
     coord.reconciler.adopt_owned(vec![ours]);
     let after = coord
-        .kill_switch_exemptions("S-IVANOV")
+        .kill_switch_exemptions("S-IVANOV", &coord.read_machine())
         .expect("exemptions resolve");
     assert_eq!(
         after.bootstrap_server_ips,
@@ -398,7 +462,7 @@ fn our_own_exception_routes_are_not_mistaken_for_vpn_server_ips() {
 #[test]
 fn an_unreadable_route_table_keeps_the_kill_switch_off() {
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -412,13 +476,17 @@ fn an_unreadable_route_table_keeps_the_kill_switch_off() {
     policy.bind_secondary("S-IVANOV", &vpn_id);
     let coord = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy);
     assert!(
-        coord.kill_switch_exemptions("S-IVANOV").is_some(),
+        coord
+            .kill_switch_exemptions("S-IVANOV", &coord.read_machine())
+            .is_some(),
         "the fixture itself must resolve"
     );
 
     api.set_route_table_read_error(Some("enumeration failed"));
     assert!(
-        coord.kill_switch_exemptions("S-IVANOV").is_none(),
+        coord
+            .kill_switch_exemptions("S-IVANOV", &coord.read_machine())
+            .is_none(),
         "an unknown set of local subnets must not arm a kill-switch"
     );
 }
@@ -429,7 +497,7 @@ fn an_unreadable_route_table_keeps_the_kill_switch_off() {
 #[test]
 fn fail_closed_falls_back_to_the_last_known_local_subnets() {
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -443,14 +511,14 @@ fn fail_closed_falls_back_to_the_last_known_local_subnets() {
     policy.bind_secondary("S-IVANOV", &vpn_id);
     let coord = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy);
 
-    let warm = coord.fail_closed_exemptions("S-IVANOV");
+    let warm = coord.fail_closed_exemptions("S-IVANOV", &coord.read_machine());
     assert_eq!(
         warm.local_subnets,
         vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]
     );
 
     api.set_route_table_read_error(Some("enumeration failed"));
-    let degraded = coord.fail_closed_exemptions("S-IVANOV");
+    let degraded = coord.fail_closed_exemptions("S-IVANOV", &coord.read_machine());
     assert_eq!(
         degraded.local_subnets,
         vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
@@ -463,7 +531,7 @@ fn kill_switch_exemptions_cache_keeps_server_ip_after_bootstrap_route_vanishes()
     // The VPN client drops the bootstrap route while disconnected; the
     // last-known server IP must survive (else reconnection deadlocks).
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -482,7 +550,9 @@ fn kill_switch_exemptions_cache_keeps_server_ip_after_bootstrap_route_vanishes()
     let coord = coordinator_with_policy(Arc::clone(&api), Arc::clone(&rules), policy);
 
     // Cycle 1: server IP present → cached.
-    let ex1 = coord.kill_switch_exemptions("S-IVANOV").unwrap();
+    let ex1 = coord
+        .kill_switch_exemptions("S-IVANOV", &coord.read_machine())
+        .unwrap();
     assert_eq!(
         ex1.bootstrap_server_ips,
         vec![Ipv4Addr::new(203, 0, 113, 7)]
@@ -492,7 +562,9 @@ fn kill_switch_exemptions_cache_keeps_server_ip_after_bootstrap_route_vanishes()
     api.set_route_table(vec![]);
 
     // Cycle 2: live table empty → cache fallback keeps the server IP.
-    let ex2 = coord.kill_switch_exemptions("S-IVANOV").unwrap();
+    let ex2 = coord
+        .kill_switch_exemptions("S-IVANOV", &coord.read_machine())
+        .unwrap();
     assert_eq!(
         ex2.bootstrap_server_ips,
         vec![Ipv4Addr::new(203, 0, 113, 7)],
@@ -504,99 +576,102 @@ fn kill_switch_exemptions_cache_keeps_server_ip_after_bootstrap_route_vanishes()
 fn description_matches_display_name_version_robust_and_symmetric() {
     // Live description carries an extra version token vs the saved name.
     assert!(description_matches_display_name(
-        "SwiftVPN 3.0 OpenVPN Adapter",
-        "swiftvpn VPN OpenVPN Adapter",
+        "ExampleVPN 3.0 OpenVPN Adapter",
+        "examplevpn VPN OpenVPN Adapter",
     ));
     // regression: the SAVED name carries the version token and the
     // live adapter dropped it — the "every other day" heal failure. The old
     // directional subset returned false here; symmetric containment heals it.
     assert!(description_matches_display_name(
-        "swiftvpn VPN OpenVPN Adapter",
-        "SwiftVPN 3.0 OpenVPN Adapter",
+        "examplevpn VPN OpenVPN Adapter",
+        "ExampleVPN 3.0 OpenVPN Adapter",
     ));
     // Both sides versioned, different versions → same family.
     assert!(description_matches_display_name(
-        "swiftvpn VPN 4.1 OpenVPN Adapter",
-        "SwiftVPN 3.0 OpenVPN Adapter",
+        "examplevpn VPN 4.1 OpenVPN Adapter",
+        "ExampleVPN 3.0 OpenVPN Adapter",
     ));
     // Survives a version bump (saved has no version).
     assert!(description_matches_display_name(
-        "swiftvpn VPN 4.1 OpenVPN Adapter",
-        "swiftvpn VPN OpenVPN Adapter",
+        "examplevpn VPN 4.1 OpenVPN Adapter",
+        "examplevpn VPN OpenVPN Adapter",
     ));
     // Case-insensitive.
     assert!(description_matches_display_name(
-        "SWIFTVPN vpn openvpn ADAPTER",
-        "swiftvpn VPN OpenVPN Adapter",
+        "EXAMPLEVPN vpn openvpn ADAPTER",
+        "examplevpn VPN OpenVPN Adapter",
     ));
     // Different adapter → no match, both directions.
     assert!(!description_matches_display_name(
-        "Intel(R) Ethernet Connection (2) I219-V",
-        "swiftvpn VPN OpenVPN Adapter",
+        "Ethernet Connection (2)",
+        "examplevpn VPN OpenVPN Adapter",
     ));
     assert!(!description_matches_display_name(
-        "swiftvpn VPN OpenVPN Adapter",
-        "Intel(R) Ethernet Connection (2) I219-V",
+        "examplevpn VPN OpenVPN Adapter",
+        "Ethernet Connection (2)",
     ));
     // Empty / whitespace-only display_name never matches.
     assert!(!description_matches_display_name("anything at all", "   "));
     // A name reduced to ONLY a version token has an empty core → no match
     // (never heal to an adapter whose family is unidentifiable).
-    assert!(!description_matches_display_name("3.0", "swiftvpn VPN"));
+    assert!(!description_matches_display_name("3.0", "examplevpn VPN"));
     // The vendor spells the same brand with an underscore on its WireGuard
-    // adapter and with spaces on its OpenVPN one. Treating "swiftvpn_VPN"
+    // adapter and with spaces on its OpenVPN one. Treating "examplevpn_VPN"
     // as one opaque token left a live, connected tunnel unrecognised while the
     // bound TAP device sat broken, and the route stayed fail-closed.
     assert!(description_matches_display_name(
-        "swiftvpn_VPN",
-        "swiftvpn VPN OpenVPN Adapter",
+        "examplevpn_VPN",
+        "examplevpn VPN OpenVPN Adapter",
     ));
     // Category words alone are not evidence: an adapter called just "VPN" is a
     // token-subset of every VPN name there is.
     assert!(!description_matches_display_name(
         "VPN",
-        "swiftvpn VPN OpenVPN Adapter",
+        "examplevpn VPN OpenVPN Adapter",
     ));
     assert!(!description_matches_display_name(
         "VPN Tunnel",
-        "swiftvpn VPN OpenVPN Adapter",
+        "examplevpn VPN OpenVPN Adapter",
     ));
     // A different vendor's tunnel never answers to ours, even though both
     // carry the category words.
     assert!(!description_matches_display_name(
         "othervendor_VPN Adapter",
-        "swiftvpn VPN OpenVPN Adapter",
+        "examplevpn VPN OpenVPN Adapter",
     ));
 }
 
 #[test]
 fn a_renamed_connection_on_a_stock_driver_still_answers_to_its_saved_name() {
-    // The Windows 11 case: swiftvpn renames the CONNECTION but ships the
+    // The Windows 11 case: examplevpn renames the CONNECTION but ships the
     // stock TAP driver, so the saved name shares no token with the driver
     // description and only the friendly name can identify the adapter.
     let mut vpn = adapter("tap", 9, true, true, Some([10, 88, 0, 1]));
     vpn.description = "TAP-Windows Adapter V9".into();
-    vpn.friendly_name = "swiftvpn VPN OpenVPN Adapter".into();
+    vpn.friendly_name = "examplevpn VPN OpenVPN Adapter".into();
 
     assert!(!description_matches_display_name(
         &vpn.description,
-        "swiftvpn VPN OpenVPN Adapter"
+        "examplevpn VPN OpenVPN Adapter"
     ));
     assert!(adapter_answers_to_saved_name(
         &vpn,
-        "swiftvpn VPN OpenVPN Adapter"
+        "examplevpn VPN OpenVPN Adapter"
     ));
     // The stored name follows the connection, so the GUI keeps the label
     // the user recognises.
-    assert_eq!(preferred_display_name(&vpn), "swiftvpn VPN OpenVPN Adapter");
+    assert_eq!(
+        preferred_display_name(&vpn),
+        "examplevpn VPN OpenVPN Adapter"
+    );
 
     // An unrelated adapter must not be adopted through either name.
     let mut wifi = adapter("wifi", 17, true, true, Some([192, 168, 0, 1]));
-    wifi.description = "Intel(R) Dual Band Wireless-AC 7265".into();
+    wifi.description = "Dual Band Wireless Adapter".into();
     wifi.friendly_name = "Wi-Fi".into();
     assert!(!adapter_answers_to_saved_name(
         &wifi,
-        "swiftvpn VPN OpenVPN Adapter"
+        "examplevpn VPN OpenVPN Adapter"
     ));
 }
 
@@ -624,7 +699,7 @@ fn recompute_active_resolves_target_and_routes_for_the_active_user() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 1, 1, 1, 1)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 198, 51, 100, 1)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &sec_id);
@@ -635,7 +710,7 @@ fn recompute_active_resolves_target_and_routes_for_the_active_user() {
     let table = api.get_ip_forward_table().unwrap();
     let r = table
         .iter()
-        .find(|r| r.destination == Ipv4Addr::new(1, 1, 1, 1))
+        .find(|r| r.destination == Ipv4Addr::new(198, 51, 100, 1))
         .unwrap();
     assert_eq!(r.interface_index, 9);
     assert_eq!(r.next_hop, Ipv4Addr::new(10, 0, 0, 1));
@@ -648,7 +723,7 @@ fn adopt_orphans_picks_our_signature_then_recompute_purges_unwanted() {
     // .1 deletes .2 but leaves the foreign route untouched.
     let api = Arc::new(MockWindowsApi::new());
     let ours_a = RouteEntry {
-        destination: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        destination: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
         prefix_length: 32,
         next_hop: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         interface_index: 9,
@@ -657,12 +732,12 @@ fn adopt_orphans_picks_our_signature_then_recompute_purges_unwanted() {
         table: nrr_platform_api::RouteTableRef::Main,
     };
     let ours_b = RouteEntry {
-        destination: IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
+        destination: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
         ..ours_a.clone()
     };
     // Foreign: a /24 at a different metric — must NOT be adopted.
     let foreign = RouteEntry {
-        destination: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 0)),
+        destination: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)),
         prefix_length: 24,
         next_hop: IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
         interface_index: 3,
@@ -678,7 +753,7 @@ fn adopt_orphans_picks_our_signature_then_recompute_purges_unwanted() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 1, 1, 1, 1)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 198, 51, 100, 1)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &sec_id);
@@ -691,12 +766,15 @@ fn adopt_orphans_picks_our_signature_then_recompute_purges_unwanted() {
     coord.recompute_active(&["S-IVANOV".to_string()]).unwrap();
     let dests = table_dests(&api);
     assert!(
-        dests.contains(&Ipv4Addr::new(1, 1, 1, 1)),
+        dests.contains(&Ipv4Addr::new(198, 51, 100, 1)),
         "desired route kept"
     );
-    assert!(!dests.contains(&Ipv4Addr::new(2, 2, 2, 2)), "orphan purged");
     assert!(
-        dests.contains(&Ipv4Addr::new(8, 8, 8, 0)),
+        !dests.contains(&Ipv4Addr::new(198, 51, 100, 2)),
+        "orphan purged"
+    );
+    assert!(
+        dests.contains(&Ipv4Addr::new(198, 51, 100, 0)),
         "foreign route untouched"
     );
 }
@@ -721,7 +799,7 @@ fn adopt_orphans_claims_mode_a_counter_overlay_not_just_slash32() {
     };
     // Our /32 secondary host route @metric5.
     let host = RouteEntry {
-        destination: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        destination: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
         prefix_length: 32,
         next_hop: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         interface_index: 9,

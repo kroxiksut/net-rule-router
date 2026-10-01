@@ -131,7 +131,7 @@ fn lookup_fresh_ip(a: u8, b: u8, c: u8, d: u8) -> LookupResult {
 fn lookup_stale_not_usable() -> LookupResult {
     LookupResult {
         selected_ip: Some(ResolvedAddressEntry {
-            addr: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4)),
             cache_state: CacheEntryState::StaleNotUsable,
             source: LookupSource::CacheHit,
             resolved_at: None,
@@ -561,17 +561,17 @@ fn a_rule_on_the_observed_address_matches_even_when_the_cache_says_another() {
         vec![rule(
             "r-observed",
             Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(
-                9, 9, 9, 9,
+                203, 0, 113, 9,
             )))),
             None,
         )],
         vec![],
     );
-    let input = input_full("example.com", Ipv4Addr::new(9, 9, 9, 9), "curl");
+    let input = input_full("example.com", Ipv4Addr::new(203, 0, 113, 9), "curl");
     // The cache holds a DIFFERENT, perfectly fresh address for that host.
     let d = match_rules(
         &input,
-        &lookup_fresh_ip(1, 2, 3, 4),
+        &lookup_fresh_ip(192, 0, 2, 4),
         &rb,
         default_zone_policy(),
         prefer_primary(),
@@ -584,7 +584,7 @@ fn a_rule_on_the_observed_address_matches_even_when_the_cache_says_another() {
         vec![rule(
             "r-cached",
             Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(
-                1, 2, 3, 4,
+                192, 0, 2, 4,
             )))),
             None,
         )],
@@ -592,7 +592,7 @@ fn a_rule_on_the_observed_address_matches_even_when_the_cache_says_another() {
     );
     let d = match_rules(
         &input,
-        &lookup_fresh_ip(1, 2, 3, 4),
+        &lookup_fresh_ip(192, 0, 2, 4),
         &rb,
         default_zone_policy(),
         prefer_primary(),
@@ -739,8 +739,8 @@ fn exact_fqdn_beats_suffix_domain_for_same_hostname() {
 
 #[test]
 fn exact_ip_matches_observed_ip() {
-    let rb = book(vec![rule("r1", Some(exact_ip(1, 2, 3, 4)), None)], vec![]);
-    let input = input_ip(Ipv4Addr::new(1, 2, 3, 4));
+    let rb = book(vec![rule("r1", Some(exact_ip(192, 0, 2, 4)), None)], vec![]);
+    let input = input_ip(Ipv4Addr::new(192, 0, 2, 4));
     let d = match_rules(
         &input,
         &empty_lookup(),
@@ -753,16 +753,16 @@ fn exact_ip_matches_observed_ip() {
 
 #[test]
 fn exact_ip_uses_lookup_over_observed_ip() {
-    // Observed IP = 1.2.3.4 but lookup resolved 5.6.7.8 → rule for 5.6.7.8 wins
+    // Observed IP = 192.0.2.4 but lookup resolved 198.51.100.8 → rule for 198.51.100.8 wins
     let rb = book(
         vec![
-            rule("r-obs", Some(exact_ip(1, 2, 3, 4)), None),
-            rule("r-lookup", Some(exact_ip(5, 6, 7, 8)), None),
+            rule("r-obs", Some(exact_ip(192, 0, 2, 4)), None),
+            rule("r-lookup", Some(exact_ip(198, 51, 100, 8)), None),
         ],
         vec![],
     );
-    let input = input_ip(Ipv4Addr::new(1, 2, 3, 4));
-    let lookup = lookup_fresh_ip(5, 6, 7, 8);
+    let input = input_ip(Ipv4Addr::new(192, 0, 2, 4));
+    let lookup = lookup_fresh_ip(198, 51, 100, 8);
     let d = match_rules(
         &input,
         &lookup,
@@ -775,8 +775,8 @@ fn exact_ip_uses_lookup_over_observed_ip() {
 
 #[test]
 fn exact_ip_falls_back_to_observed_when_lookup_stale_not_usable() {
-    let rb = book(vec![rule("r1", Some(exact_ip(1, 2, 3, 4)), None)], vec![]);
-    let input = input_ip(Ipv4Addr::new(1, 2, 3, 4));
+    let rb = book(vec![rule("r1", Some(exact_ip(192, 0, 2, 4)), None)], vec![]);
+    let input = input_ip(Ipv4Addr::new(192, 0, 2, 4));
     let lookup = lookup_stale_not_usable(); // stale-not-usable → ignored
     let d = match_rules(
         &input,
@@ -790,8 +790,11 @@ fn exact_ip_falls_back_to_observed_when_lookup_stale_not_usable() {
 
 #[test]
 fn exact_ip_no_match_different_ip() {
-    let rb = book(vec![rule("r1", Some(exact_ip(9, 9, 9, 9)), None)], vec![]);
-    let input = input_ip(Ipv4Addr::new(1, 2, 3, 4));
+    let rb = book(
+        vec![rule("r1", Some(exact_ip(203, 0, 113, 9)), None)],
+        vec![],
+    );
+    let input = input_ip(Ipv4Addr::new(192, 0, 2, 4));
     let d = match_rules(
         &input,
         &empty_lookup(),
@@ -823,7 +826,7 @@ fn zone_matches_hostname() {
 fn zone_skipped_when_hostname_unavailable() {
     let rb = book(vec![rule("r1", Some(zone("ru")), None)], vec![]);
     // No hostname in input — only IP
-    let input = input_ip(Ipv4Addr::new(1, 2, 3, 4));
+    let input = input_ip(Ipv4Addr::new(192, 0, 2, 4));
     let d = match_rules(
         &input,
         &empty_lookup(),
@@ -838,16 +841,16 @@ fn zone_skipped_when_hostname_unavailable() {
 
 #[test]
 fn zone_policy_default_ip_beats_zone() {
-    // Both ExactIp(1.2.3.4) and Zone("ru") rules present for hostname "example.ru"
+    // Both ExactIp(192.0.2.4) and Zone("ru") rules present for hostname "example.ru"
     // Default policy (prefer_ip = true): ExactIp is evaluated first → wins
     let rb = book(
         vec![
-            rule("r-ip", Some(exact_ip(1, 2, 3, 4)), None),
+            rule("r-ip", Some(exact_ip(192, 0, 2, 4)), None),
             rule("r-zone", Some(zone("ru")), None),
         ],
         vec![],
     );
-    let input = input_full("example.ru", Ipv4Addr::new(1, 2, 3, 4), "chrome.exe");
+    let input = input_full("example.ru", Ipv4Addr::new(192, 0, 2, 4), "chrome.exe");
     let d = match_rules(
         &input,
         &empty_lookup(),
@@ -863,12 +866,12 @@ fn zone_policy_default_ip_beats_zone() {
 fn zone_policy_prefer_zone_beats_ip() {
     let rb = book(
         vec![
-            rule("r-ip", Some(exact_ip(1, 2, 3, 4)), None),
+            rule("r-ip", Some(exact_ip(192, 0, 2, 4)), None),
             rule("r-zone", Some(zone("ru")), None),
         ],
         vec![],
     );
-    let input = input_full("example.ru", Ipv4Addr::new(1, 2, 3, 4), "chrome.exe");
+    let input = input_full("example.ru", Ipv4Addr::new(192, 0, 2, 4), "chrome.exe");
     let zone_first = ZonePriorityPolicy { prefer_ip: false };
     let d = match_rules(&input, &empty_lookup(), &rb, zone_first, prefer_primary());
     assert_eq!(matched_class(&d), Some(MatchClass::Zone));
@@ -922,7 +925,7 @@ fn a_glob_without_the_suffix_still_names_the_process() {
     let input = normalize_runtime_input(&runtime_input_for(
         "example.com",
         None,
-        Some("qbittorrent.exe"),
+        Some("exampletorrent.exe"),
     ));
     let d = match_rules(
         &input,

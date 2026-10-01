@@ -22,42 +22,26 @@ pub fn product_dir_leaf() -> &'static str {
     }
 }
 
-/// One candidate root, and whether a file written there survives a reboot.
-///
-/// The flag is not decoration: a store that lands on the temp directory tells
-/// the user its settings are not being kept, and it can only say that if the
-/// answer travels with the path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserAppRoot {
-    /// Already ends in [`product_dir_leaf`] — callers add their own subfolder.
-    pub path: PathBuf,
-    pub is_profile_persistent: bool,
-}
-
-/// Roots for per-user application files, best first. Callers walk the list and
-/// take the first they can create.
+/// Roots for per-user application files, best first, each already ending in
+/// [`product_dir_leaf`]. Callers walk the list and take the first they can
+/// create.
 ///
 /// Windows keeps the roaming profile, then the local one. Elsewhere it is
 /// `$XDG_CONFIG_HOME`, falling back to the `~/.config` the spec defines when
 /// the variable is unset. The temp directory closes the list on every OS as
-/// the answer of last resort, marked non-persistent.
-pub fn user_app_roots() -> Vec<UserAppRoot> {
+/// the answer of last resort.
+pub fn user_app_roots() -> Vec<PathBuf> {
     let leaf = product_dir_leaf();
-    let mut roots: Vec<UserAppRoot> = Vec::new();
-    let mut push = |base: PathBuf, is_profile_persistent: bool| {
-        roots.push(UserAppRoot {
-            path: base.join(leaf),
-            is_profile_persistent,
-        });
-    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push = |base: PathBuf| roots.push(base.join(leaf));
 
     #[cfg(windows)]
     {
         if let Some(app_data) = std::env::var_os("APPDATA") {
-            push(PathBuf::from(app_data), true);
+            push(PathBuf::from(app_data));
         }
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            push(PathBuf::from(local_app_data), true);
+            push(PathBuf::from(local_app_data));
         }
     }
 
@@ -67,13 +51,13 @@ pub fn user_app_roots() -> Vec<UserAppRoot> {
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
         {
-            push(base, true);
+            push(base);
         } else if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-            push(PathBuf::from(home).join(".config"), true);
+            push(PathBuf::from(home).join(".config"));
         }
     }
 
-    push(std::env::temp_dir(), false);
+    push(std::env::temp_dir());
     roots
 }
 
@@ -81,7 +65,7 @@ pub fn user_app_roots() -> Vec<UserAppRoot> {
 /// diagnostics and tests. A caller that is about to WRITE wants
 /// [`user_app_roots`], which lets it fall to the next candidate.
 pub fn user_config_root() -> Option<PathBuf> {
-    user_app_roots().into_iter().next().map(|root| root.path)
+    user_app_roots().into_iter().next()
 }
 
 #[cfg(test)]
@@ -92,25 +76,25 @@ mod tests {
     fn every_root_ends_in_the_product_leaf() {
         for root in user_app_roots() {
             assert_eq!(
-                root.path.file_name().and_then(|name| name.to_str()),
+                root.file_name().and_then(|name| name.to_str()),
                 Some(product_dir_leaf()),
                 "candidate does not end in the product directory: {}",
-                root.path.display()
+                root.display()
             );
         }
     }
 
     #[test]
-    fn the_last_resort_is_temp_and_says_it_does_not_persist() {
+    fn the_last_resort_is_temp_and_the_only_one() {
         let roots = user_app_roots();
+        let temp = std::env::temp_dir();
         let last = roots.last().expect("at least the temp candidate");
-        assert!(!last.is_profile_persistent);
-        assert!(last.path.starts_with(std::env::temp_dir()));
+        assert!(last.starts_with(&temp));
         assert!(
             roots[..roots.len() - 1]
                 .iter()
-                .all(|root| root.is_profile_persistent),
-            "only the temp candidate may be non-persistent"
+                .all(|root| !root.starts_with(&temp)),
+            "only the last candidate may be the temp directory"
         );
     }
 
@@ -125,10 +109,10 @@ mod tests {
             "no profile root was offered: {:?}",
             roots
                 .iter()
-                .map(|r| r.path.display().to_string())
+                .map(|r| r.display().to_string())
                 .collect::<Vec<_>>()
         );
-        assert!(roots[0].is_profile_persistent);
+        assert!(!roots[0].starts_with(std::env::temp_dir()));
     }
 
     #[cfg(not(windows))]
@@ -145,7 +129,7 @@ mod tests {
         };
         let expected = expected_base.join(product_dir_leaf());
         assert!(
-            user_app_roots().iter().any(|root| root.path == expected),
+            user_app_roots().contains(&expected),
             "XDG_CONFIG_HOME is set but no candidate uses it"
         );
     }

@@ -9,6 +9,7 @@
 # Usage:
 #   ./scripts/check.sh
 #   ./scripts/check.sh --require-cargo-deny
+#   ./scripts/check.sh --comment-hygiene-only
 
 set -euo pipefail
 
@@ -16,11 +17,13 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
 require_cargo_deny=0
+comment_hygiene_only=0
 for arg in "$@"; do
   case "$arg" in
     --require-cargo-deny) require_cargo_deny=1 ;;
+    --comment-hygiene-only) comment_hygiene_only=1 ;;
     *)
-      echo "unknown argument: $arg (expected --require-cargo-deny)" >&2
+      echo "unknown argument: $arg (expected --require-cargo-deny or --comment-hygiene-only)" >&2
       exit 2
       ;;
   esac
@@ -80,7 +83,7 @@ cyan "[check] sync duplicates"
 # git without an executable bit, so a direct call fails on a fresh checkout.
 bash "$script_dir/clean-sync-duplicates.sh"
 
-cyan "[check] comment hygiene: no task references or dates in comments"
+cyan "[check] comment hygiene and public-docs terms"
 # A word repeated back to back in a comment. Eight of these shipped at once when
 # a blind find-and-replace put a replacement word into sentences that already
 # carried it, and the gate above had no reason to look: nothing about them is a
@@ -137,8 +140,54 @@ check_doubled_words() {
   return 0
 }
 
+# Public documentation names benefits, never internal mechanisms or private
+# documents. The terms live in lib/public-docs-terms.rules, shared with
+# check.ps1; code is not scanned, the slugs are legal there.
+check_public_docs_terms() {
+  local rules="$script_dir/lib/public-docs-terms.rules"
+  local patterns=() line pat sample
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    case "$line" in '' | '#'*) continue ;; esac
+    pat="${line%%$'\t'*}"
+    sample="${line#*$'\t'}"
+    if ! grep -qiP -e "$pat" <<<"$sample"; then
+      echo "public docs gate self-test failed: '$pat' no longer matches its sample." >&2
+      return 1
+    fi
+    patterns+=("$pat")
+  done <"$rules"
+  [ "${#patterns[@]}" -eq 0 ] && { echo "public docs gate: $rules holds no patterns." >&2; return 1; }
+
+  local joined="" p
+  for p in "${patterns[@]}"; do joined="${joined:+$joined|}$p"; done
+
+  local scope='^((README|ROADMAP)[^/]*\.md|CONTRIBUTING\.md|SECURITY\.md|STRUCTURE\.md|(.*/)?AGENTS\.md|docs/.*\.md)$'
+  local report
+  report="$(git -C "$repo_root" ls-files -z --cached --others --exclude-standard |
+    { grep -zE "$scope" || true; } |
+    (cd "$repo_root" && xargs -0 -r grep -nIiP -e "$joined" || true))"
+  [ -z "$report" ] && return 0
+  local total o
+  total="$(printf '%s\n' "$report" | wc -l)"
+  while IFS= read -r o; do
+    yellow "  $o"
+  done < <(printf '%s\n' "$report" | head -n 20)
+  if [ "$total" -gt 20 ]; then
+    yellow "  ... and $((total - 20)) more"
+  fi
+  echo "public docs: $total line(s) name an internal mechanism or a private document." >&2
+  return 1
+}
+
 check_comment_hygiene
 check_doubled_words
+check_public_docs_terms
+
+if [ "$comment_hygiene_only" -eq 1 ]; then
+  green "[check] comment hygiene only: passed"
+  exit 0
+fi
 
 # Invoked as `cargo-fmt`, not `cargo fmt`: a user-level cargo alias named
 # `fmt` shadows the subcommand and makes cargo emit a warning on stderr,

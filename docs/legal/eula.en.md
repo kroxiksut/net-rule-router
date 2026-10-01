@@ -40,7 +40,7 @@ third-party components, their licenses, and how to verify them is in the
 You are using an **early test version**. This means:
 
 - individual features may work incorrectly or not work at all;
-- the emergency blocking (kill switch) and leak protection (fail-closed)
+- the leak protection and block-all
   modes have **not been fully verified** — enabling them may lead to a
   partial or complete loss of network access until the mode is disabled
   or the computer is restarted;

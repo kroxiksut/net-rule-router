@@ -37,7 +37,8 @@
 //! `accept_one` blocks on `UnixListener::accept`. `request_shutdown` flips the
 //! flag and wakes the blocked accept by self-connecting to the socket (the same
 //! technique the Windows server uses via `CreateFileW`). The tick then re-checks
-//! the flag and returns `ShutdownRequested`.
+//! the flag and returns `ShutdownRequested`. Workers read the same flag between
+//! requests, so connected clients are drained rather than waited out.
 //!
 //! ## Push delivery
 //!
@@ -54,11 +55,12 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use nrr_platform_linux::daemon_lock::DaemonLock;
 use nrr_platform_linux::peer_cred::classify_unix_client;
 use nrr_service_runtime::connection_slot::PerPrincipalSlots;
 use nrr_service_runtime::ipc_push::{
@@ -132,16 +134,31 @@ pub struct UnixDomainSocketServer {
     /// Shared bus the per-connection workers drain for their subscription.
     /// `None` leaves a subscribed client on request/response only.
     event_bus: Option<Arc<EventBus>>,
+    /// The machine-wide claim, taken before the path is ever unlinked. Kept
+    /// for the server's life so a rebind after an accept error is not refused
+    /// by this same daemon.
+    instance: Mutex<Option<DaemonLock>>,
+    /// Epoch seconds of the last accept any of this server's acceptors
+    /// finished; `0` = none yet. The watchdog's evidence the loop is alive.
+    accept_heartbeat: Arc<AtomicU64>,
 }
 
 impl UnixDomainSocketServer {
     /// Construct a server bound to the canonical [`SOCKET_PATH`].
     pub fn new(router: Arc<IpcRouter>) -> Self {
-        Self {
-            router,
-            socket_path: PathBuf::from(SOCKET_PATH),
-            event_bus: None,
+        Self::new_at(router, SOCKET_PATH)
+    }
+
+    /// Hand over the claim the daemon took at start.
+    pub fn with_daemon_lock(self, lock: DaemonLock) -> Self {
+        if let Ok(mut slot) = self.instance.lock() {
+            *slot = Some(lock);
         }
+        self
+    }
+
+    pub fn accept_heartbeat(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.accept_heartbeat)
     }
 
     /// Attach the shared `EventBus` so workers can flush push frames after a
@@ -151,33 +168,51 @@ impl UnixDomainSocketServer {
         self
     }
 
-    /// Construct a server bound to an explicit path — used by tests to bind a
-    /// throwaway socket in a temp dir instead of the root-owned `/run` path.
-    #[cfg(test)]
+    /// Construct a server bound to an explicit path — tests bind a throwaway
+    /// socket in a temp dir instead of the root-owned `/run` path.
     fn new_at(router: Arc<IpcRouter>, socket_path: impl Into<PathBuf>) -> Self {
         Self {
             router,
             socket_path: socket_path.into(),
             event_bus: None,
+            instance: Mutex::new(None),
+            accept_heartbeat: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Claim the machine if this server does not hold the claim yet. Without
+    /// it the unlink below would take a live daemon's socket.
+    fn hold_instance(&self) -> Result<(), IpcBindError> {
+        let mut slot = self
+            .instance
+            .lock()
+            .map_err(|_| IpcBindError::Other("instance lock state poisoned".to_owned()))?;
+        if slot.is_none() {
+            *slot = Some(
+                DaemonLock::acquire(&self.socket_path)
+                    .map_err(|e| IpcBindError::Other(e.to_string()))?,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Create the socket's directory, traversable. `/run/netrulerouter` is
+/// systemd's `RuntimeDirectory` in production; a daemon started any other way
+/// must not end up with a mode that depends on how it was launched.
+pub(crate) fn prepare_socket_dir(socket_path: &std::path::Path) {
+    if let Some(parent) = socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
     }
 }
 
 impl IpcServer for UnixDomainSocketServer {
     fn bind(&self) -> Result<Box<dyn IpcAcceptor>, IpcBindError> {
-        // The parent dir (`/run/netrulerouter`) is systemd's `RuntimeDirectory`
-        // in production; create it best-effort so tests (and a non-systemd smoke
-        // run) can bind too.
-        if let Some(parent) = self.socket_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-            // Traversable, set explicitly rather than left to the umask: under
-            // systemd `RuntimeDirectoryMode` already says this, but a daemon
-            // started any other way must not end up with a directory whose mode
-            // depends on how the process was launched.
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
-        }
-        // A stale socket file from a previous run makes `bind` fail with
-        // EADDRINUSE — remove it first (absence is fine).
+        prepare_socket_dir(&self.socket_path);
+        self.hold_instance()?;
+        // Ours to replace now: a stale file from a dead run makes `bind` fail
+        // with EADDRINUSE, and absence is fine.
         match std::fs::remove_file(&self.socket_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -225,6 +260,7 @@ impl IpcServer for UnixDomainSocketServer {
             active_count: Arc::new(AtomicUsize::new(0)),
             per_uid: Arc::new(PerPrincipalSlots::default()),
             worker_handles: Arc::new(Mutex::new(Vec::new())),
+            accept_heartbeat: Arc::clone(&self.accept_heartbeat),
         }))
     }
 }
@@ -246,10 +282,47 @@ pub struct UnixDomainSocketAcceptor {
     /// Per-user share of `active_count`, so one account cannot take the lot.
     per_uid: Arc<PerPrincipalSlots<u32>>,
     worker_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Shared with the server; see [`UnixDomainSocketServer::accept_heartbeat`].
+    accept_heartbeat: Arc<AtomicU64>,
 }
 
 impl IpcAcceptor for UnixDomainSocketAcceptor {
     fn accept_one(&self) -> AcceptOutcome {
+        let outcome = self.accept_next();
+        self.accept_heartbeat.store(epoch_secs(), Ordering::Relaxed);
+        outcome
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        // Wake a blocked `accept` by self-connecting. Best-effort: if nothing is
+        // blocked, the connection is simply accepted and dropped on the
+        // shutdown re-check.
+        let _ = UnixStream::connect(&self.socket_path);
+    }
+
+    fn join_workers(&self) {
+        if let Ok(mut guard) = self.worker_handles.lock() {
+            let handles = std::mem::take(&mut *guard);
+            for h in handles {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn active_connections(&self) -> usize {
+        self.active_count.load(Ordering::SeqCst)
+    }
+}
+
+pub(crate) fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+impl UnixDomainSocketAcceptor {
+    fn accept_next(&self) -> AcceptOutcome {
         if self.shutdown_requested.load(Ordering::SeqCst) {
             return AcceptOutcome::ShutdownRequested;
         }
@@ -299,6 +372,7 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
 
         let router = Arc::clone(&self.router);
         let bus = self.event_bus.clone();
+        let shutdown = Arc::clone(&self.shutdown_requested);
         // A guard, so a panic in dispatch cannot leak the slot - see
         // `connection_slot`.
         let slot = nrr_service_runtime::connection_slot::ConnectionSlot::claim(Arc::clone(
@@ -309,7 +383,7 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
             .spawn(move || {
                 let _slot = slot;
                 let _uid_slot = uid_slot;
-                handle_connection(stream, identity, router, bus);
+                handle_connection(stream, identity, router, bus, &shutdown);
             });
 
         match spawn {
@@ -328,27 +402,6 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
                 })
             }
         }
-    }
-
-    fn request_shutdown(&self) {
-        self.shutdown_requested.store(true, Ordering::SeqCst);
-        // Wake a blocked `accept` by self-connecting. Best-effort: if nothing is
-        // blocked, the connection is simply accepted and dropped on the
-        // shutdown re-check.
-        let _ = UnixStream::connect(&self.socket_path);
-    }
-
-    fn join_workers(&self) {
-        if let Ok(mut guard) = self.worker_handles.lock() {
-            let handles = std::mem::take(&mut *guard);
-            for h in handles {
-                let _ = h.join();
-            }
-        }
-    }
-
-    fn active_connections(&self) -> usize {
-        self.active_count.load(Ordering::SeqCst)
     }
 }
 
@@ -376,12 +429,14 @@ enum ReaderMsg {
 
 /// Per-connection worker: classify the caller once, then serve framed
 /// request→response pairs — interleaved with push flushes once the client
-/// subscribes — until it disconnects or a frame is malformed.
+/// subscribes — until it disconnects, a frame is malformed or the acceptor
+/// shuts down.
 fn handle_connection(
     mut stream: UnixStream,
     identity: nrr_platform_linux::peer_cred::UnixClientIdentity,
     router: Arc<IpcRouter>,
     event_bus: Option<Arc<EventBus>>,
+    shutdown: &AtomicBool,
 ) {
     let principal: Option<UserPrincipal> = Some(identity.principal.clone());
     // What the OS says the program is — not what the connection claims. A
@@ -418,14 +473,12 @@ fn handle_connection(
             loop {
                 let msg = match read_frame::<_, IpcRequestEnvelope>(&mut reader) {
                     Ok(req) => ReaderMsg::Request(req),
+                    // EOF, and the first-frame timeout: a client that never
+                    // introduced itself gives its slot back without an answer.
                     Err(e) if e.is_transport_dead() => ReaderMsg::Closed,
-                    Err(_) if first => {
-                        // Nothing arrived in the window - including a read that
-                        // timed out, which `read_frame` reports as a broken
-                        // frame. Treat it as a client that never introduced
-                        // itself and give the slot back.
-                        ReaderMsg::Closed
-                    }
+                    // Garbage is answered even on the first frame, so a client
+                    // speaking the wrong protocol hears why instead of a bare
+                    // EOF it would retry forever.
                     Err(_) => ReaderMsg::Malformed,
                 };
                 if first {
@@ -441,7 +494,11 @@ fn handle_connection(
         .ok();
 
     let mut subscription_id: Option<String> = None;
-    loop {
+    // A request already being dispatched finishes and is answered; an idle
+    // client (an open GUI or tray) otherwise held `join_workers`, and the stop,
+    // for the whole supervisor budget. `recv_timeout` bounds the wait for the
+    // flag, and the shutdown below hands the client its EOF.
+    while !shutdown.load(Ordering::SeqCst) {
         match reader_rx.recv_timeout(PUSH_POLL_INTERVAL) {
             Ok(ReaderMsg::Request(request)) => {
                 profile = narrow_profile_from_handshake(profile, &request);
@@ -752,6 +809,74 @@ mod tests {
         );
     }
 
+    /// A client speaking the wrong protocol hears why, not a bare EOF.
+    #[test]
+    fn garbage_on_the_first_frame_is_answered_as_malformed() {
+        use std::io::Write;
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let server = UnixDomainSocketServer::new_at(empty_router(), &sock);
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+
+        for garbage in [&0u32.to_be_bytes()[..], b"\x00\x00\x00\x05hello"] {
+            let acc = Arc::clone(&acceptor);
+            let ticker = thread::spawn(move || acc.accept_one());
+            let mut client = connect(&sock);
+            client.write_all(garbage).expect("write garbage");
+            let response: IpcResponseEnvelope =
+                read_frame(&mut client).expect("an answer, not EOF");
+            assert_eq!(
+                response.error.map(|e| e.code),
+                Some(IpcErrorCode::MalformedRequest)
+            );
+            let _ = ticker.join();
+        }
+        acceptor.request_shutdown();
+        acceptor.join_workers();
+    }
+
+    /// A second daemon used to unlink the live socket and bind its own, leaving
+    /// the first one serving an anonymous inode.
+    #[test]
+    fn a_second_server_cannot_take_a_live_socket() {
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let first_server = UnixDomainSocketServer::new_at(empty_router(), &sock);
+        let first = first_server.bind().expect("first bind");
+        let node = std::fs::metadata(&sock).expect("stat").ino();
+
+        let intruder = UnixDomainSocketServer::new_at(empty_router(), &sock);
+        assert!(intruder.bind().is_err(), "a live daemon's socket was taken");
+        assert_eq!(std::fs::metadata(&sock).expect("stat").ino(), node);
+        assert!(UnixStream::connect(&sock).is_ok());
+
+        // Positive control: once the first daemon is gone, the next one starts.
+        drop(first);
+        drop(first_server);
+        let successor = UnixDomainSocketServer::new_at(empty_router(), &sock);
+        successor
+            .bind()
+            .expect("bind after the previous daemon exited");
+    }
+
+    #[test]
+    fn every_accept_refreshes_the_heartbeat() {
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let server = UnixDomainSocketServer::new_at(empty_router(), &sock);
+        let heartbeat = server.accept_heartbeat();
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+        assert_eq!(heartbeat.load(Ordering::Relaxed), 0);
+
+        let acc = Arc::clone(&acceptor);
+        let ticker = thread::spawn(move || acc.accept_one());
+        drop(connect(&sock));
+        let _ = ticker.join();
+        assert!(heartbeat.load(Ordering::Relaxed) > 0);
+        acceptor.request_shutdown();
+        acceptor.join_workers();
+    }
+
     #[test]
     fn a_rebind_does_not_lose_its_socket_to_the_acceptor_it_replaced() {
         let dir = temp_dir();
@@ -984,5 +1109,56 @@ mod tests {
             "got {outcome:?}"
         );
         acceptor.join_workers();
+    }
+
+    /// An open GUI or tray sits connected and silent. Its worker never looked
+    /// at the shutdown flag, so a stop waited out the whole supervisor budget
+    /// and left the connection undrained.
+    #[test]
+    fn a_stop_drains_an_idle_connected_client_promptly() {
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let server = UnixDomainSocketServer::new_at(empty_router(), &sock);
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+
+        let acc = Arc::clone(&acceptor);
+        let ticker = thread::spawn(move || acc.accept_one());
+        // Spoken once, like a real client, so the first-frame timeout is off
+        // and nothing but the stop can end this connection.
+        let mut client = connect(&sock);
+        write_frame(&mut client, &sample_request()).expect("client writes request");
+        let _: IpcResponseEnvelope = read_frame(&mut client).expect("client reads response");
+        assert!(matches!(
+            ticker.join().expect("ticker thread"),
+            AcceptOutcome::Connected
+        ));
+
+        // Positive control: an idle client keeps its worker alive on its own.
+        thread::sleep(PUSH_POLL_INTERVAL * 3);
+        assert_eq!(acceptor.active_connections(), 1);
+
+        let started = Instant::now();
+        acceptor.request_shutdown();
+        let joiner = {
+            let acc = Arc::clone(&acceptor);
+            thread::spawn(move || acc.join_workers())
+        };
+        let deadline = started + Duration::from_secs(2);
+        while !joiner.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "join_workers still waiting on an idle client after a stop"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        joiner.join().expect("joiner thread");
+        assert_eq!(acceptor.active_connections(), 0);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut byte = [0u8; 1];
+        let n = std::io::Read::read(&mut client, &mut byte).expect("EOF, not a timeout");
+        assert_eq!(n, 0, "the client must see the connection closed");
     }
 }

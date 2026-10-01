@@ -14,9 +14,8 @@ use nrr_diagnostics::error::DiagnosticsResult;
 use nrr_diagnostics::explain::{ExplainQuery, ExplainResponse};
 use nrr_diagnostics::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
-    LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard,
-    ServiceHealthCard, SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticsDataOrigin, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
+    LogHealthCard, SecurityAlertDto, SecurityStatusCard, ServiceHealthCard,
 };
 use nrr_diagnostics::facade::pagination::{PageResult, PaginationParams};
 use nrr_diagnostics::facade::service::DiagnosticsFacade;
@@ -160,6 +159,7 @@ impl FakeDiagnostics {
                 audit_chain_ok: true,
                 active_alert_count: 0,
                 audit_write_healthy: true,
+                alerts_readable: true,
             },
             active_alerts: Vec::new(),
             cache_health: CacheHealthCard {
@@ -174,7 +174,6 @@ impl FakeDiagnostics {
                 dropped_count: 0,
                 last_cleanup_at: None,
             },
-            diagnostic_mode: DiagnosticModeStateDto::inactive(),
             stale: false,
             origin: DiagnosticsDataOrigin::Service,
         }
@@ -218,7 +217,11 @@ impl FakeDiagnostics {
 }
 
 impl DiagnosticsFacade for FakeDiagnostics {
-    fn get_status(&self) -> DiagnosticsStatusDto {
+    fn get_status(
+        &self,
+        audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
+    ) -> DiagnosticsStatusDto {
+        *self.last_audience.lock().unwrap() = Some(audience.clone());
         self.status.lock().unwrap().clone()
     }
     fn list_log_entries(
@@ -241,13 +244,15 @@ impl DiagnosticsFacade for FakeDiagnostics {
         *self.last_audience.lock().unwrap() = Some(audience.clone());
         Ok(PageResult::single_page(self.audit.lock().unwrap().clone()))
     }
-    fn list_active_alerts(&self) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
+    fn list_alerts(
+        &self,
+        _filter: nrr_diagnostics::facade::service::AlertListFilter,
+        audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
+        *self.last_audience.lock().unwrap() = Some(audience.clone());
         Ok(self.alerts.lock().unwrap().clone())
     }
     fn acknowledge_alert(&self, _req: &AcknowledgeAlertRequest) -> DiagnosticsResult<()> {
-        Ok(())
-    }
-    fn set_diagnostic_mode(&self, _req: &SetDiagnosticModeRequest) -> DiagnosticsResult<()> {
         Ok(())
     }
     fn clear_logs(&self, _req: &ClearLogsRequest) -> DiagnosticsResult<ClearLogsResult> {

@@ -766,14 +766,18 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 // `block_secondary_when_unavailable`.
                 let kill_switch_resolver: nrr_service_runtime::per_sid_orchestrator::KillSwitchResolver = {
                         let coord = Arc::clone(&route_coord);
-                        Arc::new(move |sid: &str| coord.kill_switch_exemptions(sid))
+                        Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
+                            coord.kill_switch_exemptions(sid, machine)
+                        })
                     };
                 // What policy may do about IPv6 for this SID: the same
                 // coordinator, because the answer is a fact about the links it
                 // already resolves.
                 let ipv6_guard_resolver: nrr_service_runtime::per_sid_orchestrator::Ipv6GuardResolver = {
                         let coord = Arc::clone(&route_coord);
-                        Arc::new(move |sid: &str| coord.ipv6_guard(sid))
+                        Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
+                            coord.ipv6_guard(sid, machine)
+                        })
                     };
                 // Fail-closed exemptions: resolved even
                 // when the secondary is gone, so a fail-closed block-all
@@ -781,8 +785,16 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 // reconnect. Same route coordinator, different entrypoint.
                 let fail_closed_exemptions_resolver: nrr_service_runtime::per_sid_orchestrator::FailClosedExemptionsResolver = {
                         let coord = Arc::clone(&route_coord);
-                        Arc::new(move |sid: &str| coord.fail_closed_exemptions(sid))
+                        Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
+                            coord.fail_closed_exemptions(sid, machine)
+                        })
                     };
+                // The one reading of the machine each compute hands the three
+                // resolvers above, so a pass enumerates it once.
+                let machine_reader: nrr_service_runtime::per_sid_orchestrator::MachineReader = {
+                    let coord = Arc::clone(&route_coord);
+                    Arc::new(move || coord.read_machine())
+                };
                 // Learned VPN client apps: pre-seed the
                 // verified-client registry from the state DB so the proactive
                 // app-scoped exemption arms on the FIRST compute of the
@@ -832,6 +844,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             audit,
                         )
                         .with_failure_mode_source(failure_mode_source)
+                        .with_machine_reader(machine_reader)
                         .with_kill_switch_resolver(kill_switch_resolver)
                         .with_ipv6_guard_resolver(ipv6_guard_resolver)
                         .with_fail_closed_exemptions_resolver(fail_closed_exemptions_resolver)
@@ -924,7 +937,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                                     tracing::warn!(
                                         target: "nrr::route-coordinator",
                                         msg_key = "svc-persid-route-sync-before-pin-failed",
-                                        "route sync before installing new destination pins failed: {e:?}",
+                                        error = %e,
+                                        "route sync before installing new destination pins failed",
                                     );
                                 }
                             })
@@ -1060,7 +1074,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     Err(e) => tracing::warn!(
                         target: "nrr::runtime",
                         msg_key = "svc-persid-startup-block-strip-failed",
-                        "startup block-filter reconciliation failed: {e:?}",
+                        error = %e,
+                        "startup block-filter reconciliation failed",
                     ),
                 }
                 // Recompute the route table on every active-user transition
@@ -1074,7 +1089,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             tracing::error!(
                                 target: "nrr::route-coordinator",
                                 msg_key = "svc-persid-route-recompute-failed",
-                                "route recompute on active-user change failed: {e:?}",
+                                error = %e,
+                                "route recompute on active-user change failed",
                             );
                         }
                     }));
@@ -1164,7 +1180,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         tracing::error!(
                             target: "nrr::per_sid_orchestrator",
                             msg_key = "svc-persid-pause-read-failed-reconcile",
-                            "pause-state read failed; skipping reconcile: {e:?}",
+                            error = %e,
+                            "pause-state read failed; skipping reconcile",
                         );
                         return;
                     }
@@ -1187,7 +1204,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     tracing::error!(
                         target: "nrr::per_sid_orchestrator",
                         msg_key = "svc-persid-pause-aware-reconcile-failed",
-                        "pause-aware reconcile failed: {e:?}",
+                        error = %e,
+                        "pause-aware reconcile failed",
                     );
                 }
             }));
@@ -1223,7 +1241,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         tracing::error!(
                             target: "nrr::fake-ip",
                             msg_key = "svc-persid-pause-read-failed-fakeip-replan",
-                            "pause-state read failed; skipping fake-IP replan: {e:?}",
+                            error = %e,
+                            "pause-state read failed; skipping fake-IP replan",
                         );
                         return;
                     }
@@ -1249,7 +1268,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         target: "nrr::fake-ip",
                         msg_key = "svc-persid-fakeip-recompile-failed",
                         sid = %sid,
-                        "fake-IP replan: per-SID recompile failed: {e:?}",
+                        error = %e,
+                        "fake-IP replan: per-SID recompile failed",
                     );
                 }
             }

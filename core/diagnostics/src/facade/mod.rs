@@ -21,11 +21,10 @@ pub mod service;
 
 pub use dto::{
     audit_write_status_to_str, AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter,
-    CacheHealthCard, ClearLogsRequest, ClearLogsResult, DiagnosticModeStateDto,
-    DiagnosticsDataOrigin, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, LogHealthCard,
-    SecurityAlertDto, SecurityAlertsView, SecurityStatusCard, ServiceHealthCard,
-    SetDiagnosticModeRequest,
+    CacheHealthCard, ClearLogsRequest, ClearLogsResult, DiagnosticsDataOrigin,
+    DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto,
+    SecurityAlertsView, SecurityStatusCard, ServiceHealthCard,
 };
 pub use mock::{MockDiagnosticsFacade, MockScenario};
 pub use pagination::{PageCursor, PageResult, PaginationParams, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
-pub use service::DiagnosticsFacade;
+pub use service::{AlertListFilter, DiagnosticsFacade};

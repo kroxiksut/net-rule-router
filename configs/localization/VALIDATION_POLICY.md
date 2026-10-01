@@ -1,4 +1,4 @@
-# Locale Validation Policy (Block 3.7)
+# Locale Validation Policy
 
 This document defines runtime validation behavior for `locales/*.json`.
 

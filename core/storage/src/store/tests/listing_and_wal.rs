@@ -16,7 +16,7 @@ fn periodic_vacuum_preserves_data_and_schema() {
             .upsert_resolution(ResolutionEntry {
                 canonical_hostname: "vacuum.test".into(),
                 raw_hostname_sample: None,
-                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3))],
+                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 3))],
                 ttl_seconds: Some(300),
                 source: StorageResolutionSource::Dns,
                 resolved_at: SystemTime::now(),
@@ -101,7 +101,7 @@ fn wal_reader_observes_committed_write() {
             .upsert_resolution(ResolutionEntry {
                 canonical_hostname: "durable.test".into(),
                 raw_hostname_sample: None,
-                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(7, 7, 7, 7))],
+                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))],
                 ttl_seconds: Some(300),
                 source: StorageResolutionSource::Dns,
                 resolved_at: SystemTime::now(),
@@ -115,64 +115,6 @@ fn wal_reader_observes_committed_write() {
         .query_row("SELECT COUNT(*) FROM hostnames", [], |r| r.get(0))
         .expect("count");
     assert_eq!(count, 1, "reader must observe committed write");
-}
-
-// ── invalidation cause integration ────────────────────────────────────────
-
-#[test]
-fn invalidation_cause_file_modified_marks_stale_not_full_clear() {
-    use crate::rebuild::InvalidationCause;
-
-    let dir = tempfile::tempdir().expect("tmp");
-    let store = migrated_cache_store(&dir);
-    let now = SystemTime::now();
-
-    store
-        .upsert_resolution(ResolutionEntry {
-            canonical_hostname: "rules.test".into(),
-            raw_hostname_sample: None,
-            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
-            ttl_seconds: Some(300),
-            source: StorageResolutionSource::Dns,
-            resolved_at: now,
-            active_revision_id: Some("rev-a".into()),
-        })
-        .expect("upsert");
-
-    // ExternalFileModified → mark-stale, not full clear.
-    let cause = InvalidationCause::ExternalFileModified;
-    assert!(
-        !cause.requires_full_clear(),
-        "file change is a mark-stale invalidation"
-    );
-
-    let staled = store.mark_revision_stale("rev-b").expect("mark stale");
-    assert_eq!(staled, 1);
-
-    // Entry must still be in the cache (just marked stale).
-    let result = store
-        .get_by_hostname(
-            "rules.test",
-            &FreshnessThresholds::default_production(),
-            CachePriorityStrategy::default(),
-        )
-        .expect("lookup");
-    assert!(
-        !result.resolved_ips.is_empty(),
-        "entry must survive mark-stale"
-    );
-    assert!(
-        result
-            .resolved_ips
-            .iter()
-            .any(|e| e.cache_state == CacheEntryState::StaleUsable),
-        "entry must be stale after mark_revision_stale",
-    );
-
-    // CacheStats must reflect the stale count without inflating resolution_count.
-    let stats = store.get_cache_stats().expect("stats");
-    assert_eq!(stats.resolution_count, 1);
-    assert_eq!(stats.stale_resolution_count, 1);
 }
 
 // ── list_expired_resolutions ────────────────────────────────────────────
@@ -222,7 +164,7 @@ fn list_expired_resolutions_returns_only_expired_dns_rows() {
     seed_resolution(
         &store,
         "expired.test",
-        Ipv4Addr::new(1, 1, 1, 1),
+        Ipv4Addr::new(198, 51, 100, 1),
         StorageResolutionSource::Dns,
         past_resolved,
         60,
@@ -230,7 +172,7 @@ fn list_expired_resolutions_returns_only_expired_dns_rows() {
     seed_resolution(
         &store,
         "fresh.test",
-        Ipv4Addr::new(2, 2, 2, 2),
+        Ipv4Addr::new(198, 51, 100, 2),
         StorageResolutionSource::Dns,
         recent_resolved,
         3_600,
@@ -256,7 +198,7 @@ fn list_expired_resolutions_excludes_observed_from_traffic() {
     seed_resolution(
         &store,
         "dns.test",
-        Ipv4Addr::new(1, 1, 1, 1),
+        Ipv4Addr::new(198, 51, 100, 1),
         StorageResolutionSource::Dns,
         past,
         60,
@@ -264,7 +206,7 @@ fn list_expired_resolutions_excludes_observed_from_traffic() {
     seed_resolution(
         &store,
         "observed.test",
-        Ipv4Addr::new(2, 2, 2, 2),
+        Ipv4Addr::new(198, 51, 100, 2),
         StorageResolutionSource::ObservedFromTraffic,
         past,
         60,
@@ -290,7 +232,7 @@ fn list_expired_resolutions_orders_hot_first() {
         seed_resolution(
             &store,
             name,
-            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(198, 51, 100, 1),
             StorageResolutionSource::Dns,
             past,
             60,
@@ -362,7 +304,7 @@ fn list_hostnames_under_suffix_returns_only_subdomains_not_apex() {
     seed_resolution(
         &store,
         "example.com",
-        Ipv4Addr::new(1, 1, 1, 1),
+        Ipv4Addr::new(198, 51, 100, 1),
         StorageResolutionSource::Dns,
         now,
         300,
@@ -370,7 +312,7 @@ fn list_hostnames_under_suffix_returns_only_subdomains_not_apex() {
     seed_resolution(
         &store,
         "www.example.com",
-        Ipv4Addr::new(2, 2, 2, 2),
+        Ipv4Addr::new(198, 51, 100, 2),
         StorageResolutionSource::Dns,
         now,
         300,
@@ -378,7 +320,7 @@ fn list_hostnames_under_suffix_returns_only_subdomains_not_apex() {
     seed_resolution(
         &store,
         "api.example.com",
-        Ipv4Addr::new(3, 3, 3, 3),
+        Ipv4Addr::new(198, 51, 100, 3),
         StorageResolutionSource::Dns,
         now,
         300,
@@ -408,7 +350,7 @@ fn list_hostnames_under_suffix_treats_like_wildcards_as_literal_text() {
         seed_resolution(
             &store,
             host,
-            Ipv4Addr::new(9, 9, 9, 9),
+            Ipv4Addr::new(198, 51, 100, 9),
             StorageResolutionSource::Dns,
             now,
             300,
@@ -469,7 +411,7 @@ fn list_hostnames_under_suffix_is_case_insensitive_and_strips_trailing_dot() {
     seed_resolution(
         &store,
         "api.example.com",
-        Ipv4Addr::new(1, 1, 1, 1),
+        Ipv4Addr::new(198, 51, 100, 1),
         StorageResolutionSource::Dns,
         now,
         300,

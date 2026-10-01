@@ -14,7 +14,7 @@ fn a_half_close_waits_for_the_dial_that_carries_the_request() {
     ] {
         assert!(
             !client_fin_may_propagate(false, state),
-            "{state:?}: while the dial is in flight the client's bytes are still in the                  socket buffer, so forwarding the FIN sends the upstream home empty-handed",
+            "{state:?}: while the dial is in flight the client's bytes are still in the socket buffer, so forwarding the FIN sends the upstream home empty-handed",
         );
         assert!(client_fin_may_propagate(true, state), "{state:?}");
     }

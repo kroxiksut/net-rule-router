@@ -14,10 +14,11 @@ use nrr_domain::{
     import::IMPORT_FILE_SIZE_LIMIT_BYTES,
     preset_validation::{
         validate_preset_bytes, PresetFileValidationOutcome, PresetImportRejectedReason,
-        PresetImportWarning, MAX_MATCH_VALUE_LEN, MAX_RULES_PER_FILE,
+        PresetImportWarning, MAX_MATCH_VALUE_LEN,
     },
     rules_file::RulesFileSection,
 };
+use nrr_shared::rules_json::FREE_MAX_RULES;
 
 // ── Empty file ────────────────────────────────────────────────────────────────
 
@@ -213,7 +214,7 @@ fn duplicate_rules_are_accepted_at_parse_level() {
 #[test]
 fn exactly_at_rule_count_limit_is_accepted() {
     let mut content = String::from("--- Domains\n");
-    for i in 0..MAX_RULES_PER_FILE as usize {
+    for i in 0..FREE_MAX_RULES {
         content.push_str(&format!("h{i}.example.com\n"));
     }
     let outcome = validate_preset_bytes(content.as_bytes());
@@ -223,7 +224,7 @@ fn exactly_at_rule_count_limit_is_accepted() {
 #[test]
 fn one_over_rule_count_limit_is_rejected() {
     let mut content = String::from("--- Domains\n");
-    for i in 0..=(MAX_RULES_PER_FILE as usize) {
+    for i in 0..=FREE_MAX_RULES {
         content.push_str(&format!("h{i}.example.com\n"));
     }
     let outcome = validate_preset_bytes(content.as_bytes());
@@ -231,7 +232,7 @@ fn one_over_rule_count_limit_is_rejected() {
         outcome,
         PresetFileValidationOutcome::Rejected(PresetImportRejectedReason::TooManyRules {
             count, limit
-        }) if count == MAX_RULES_PER_FILE + 1 && limit == MAX_RULES_PER_FILE
+        }) if count as usize == FREE_MAX_RULES + 1 && limit as usize == FREE_MAX_RULES
     ));
 }
 
@@ -239,7 +240,7 @@ fn one_over_rule_count_limit_is_rejected() {
 fn rule_count_spans_both_free_and_extended_sections() {
     // Split rules between a Free section and an extended section.
     // Combined they exceed the limit.
-    let half = MAX_RULES_PER_FILE as usize / 2;
+    let half = FREE_MAX_RULES / 2;
     let mut content = String::from("--- Domains\n");
     for i in 0..half {
         content.push_str(&format!("h{i}.example.com\n"));
@@ -263,7 +264,7 @@ fn encoding_check_happens_before_rule_count() {
     // if it were valid — must be rejected for encoding, not count.
     let mut bytes: Vec<u8> = Vec::new();
     bytes.extend_from_slice(b"--- Domains\n");
-    for _ in 0..=(MAX_RULES_PER_FILE as usize) {
+    for _ in 0..=FREE_MAX_RULES {
         bytes.extend_from_slice(b"example.com\n");
     }
     bytes.push(0xFF); // poison byte
@@ -281,7 +282,7 @@ fn length_check_happens_before_count_check() {
     let long_val = "a".repeat(MAX_MATCH_VALUE_LEN + 1);
     let mut content = String::from("--- Domains\n");
     content.push_str(&format!("{long_val}\n"));
-    for i in 0..=(MAX_RULES_PER_FILE as usize) {
+    for i in 0..=FREE_MAX_RULES {
         content.push_str(&format!("h{i}.example.com\n"));
     }
     let outcome = validate_preset_bytes(content.as_bytes());

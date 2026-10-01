@@ -11,8 +11,10 @@ use super::*;
 ///
 /// - **`PreferPrimary`** (mode A): secondary-bound rules → `/32` via
 ///   [`EgressRef::Secondary`], through the denylist-filtered cache view; with a
-///   primary target (`has_primary`), the four `/2` [`COUNTER_OVERLAY`] blocks via
-///   [`EgressRef::Primary`] so non-rule traffic rides the primary.
+///   primary target (`has_primary`), the counter-overlay via [`EgressRef::Primary`]
+///   so non-rule traffic rides the primary. Shaped by the same
+///   [`counter_overlay_for`] as the codegen: a fixed `/2` set loses to a tunnel
+///   that redirects with narrower prefixes.
 /// - **`PreferSecondaryWhenAvailable` / `StrictSecondaryFailClosed`** (mode B): the
 ///   `/1` split-default overlay ([`OVERLAY_LOW`] + [`OVERLAY_HIGH`]) via the
 ///   secondary, plus (with a primary target) the primary-bound rules pulled back
@@ -23,8 +25,8 @@ use super::*;
 /// shared-IP policy denylist applied to the mode-A secondary fan-out only.
 /// `lower_windows::lower_routes` resolves each [`EgressRef`] to its concrete
 /// gateway + interface index. Pure: no I/O beyond the injected cache reader.
-// Eight independent inputs, none of which belongs to another: grouping them
-// into a bag would hide which ones a caller actually varies.
+// Independent inputs, none of which belongs to another: grouping them into a
+// bag would hide which ones a caller actually varies.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_routes(
     mode: RouteBehaviorMode,
@@ -38,6 +40,8 @@ pub fn plan_routes(
     // principal's `zone_priority_over_ip`. The two can only contest the same
     // address in the ownership arbiter, so this is the whole of its reach here.
     order: crate::address_ownership::ZoneVsIpOrder,
+    // The tunnel's own catch-all prefixes; empty when they are not known.
+    tunnel_catch_alls: &[(Ipv4Addr, u8)],
 ) -> Vec<RouteIntent> {
     let mut routes = Vec::new();
     // Ownership from the UNFILTERED cache: the denylist view exists to trim
@@ -64,9 +68,9 @@ pub fn plan_routes(
                 &mut seen,
                 &mut routes,
             );
-            // Mode-A counter-overlay: four /2 via the primary (needs a primary).
+            // Mode-A counter-overlay via the primary (needs a primary).
             if has_primary {
-                for (net, prefix) in COUNTER_OVERLAY {
+                for (net, prefix) in counter_overlay_for(tunnel_catch_alls) {
                     routes.push(overlay_intent(net, prefix, EgressRef::Primary));
                 }
             }
@@ -233,7 +237,7 @@ fn push_host_route(
     true
 }
 
-/// One overlay route intent (a `/1` split-default half or a `/2` counter-overlay
+/// One overlay route intent (a `/1` split-default half or a counter-overlay
 /// block) via `egress`.
 fn overlay_intent(net: Ipv4Addr, prefix: u8, egress: EgressRef) -> RouteIntent {
     RouteIntent {
@@ -244,7 +248,6 @@ fn overlay_intent(net: Ipv4Addr, prefix: u8, egress: EgressRef) -> RouteIntent {
     }
 }
 
-/// An empty denylist for callers with no shared-IP policy in play.
 /// The floor a blanket block may never cut, as neutral flows.
 ///
 /// The strict mode's default catch-all blocks everything no rule permitted —

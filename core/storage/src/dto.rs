@@ -147,57 +147,11 @@ impl NegativeCacheReason {
     }
 }
 
-/// Minimal event record written to the `lookup_events` table for explain
-/// correlation.  No raw hostname or IP is stored — only a direction + state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LookupEventEntry {
-    pub direction: LookupDirection,
-    pub result_state: LookupResultState,
-    pub error_code: Option<String>,
-    pub duration_ms: u32,
-    pub created_at: SystemTime,
-    /// Short TTL expiry — row is removed during the next cleanup pass.
-    pub expires_at: SystemTime,
-}
-
-/// Outcome state of a single lookup event.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LookupResultState {
-    Hit,
-    Miss,
-    StaleUsed,
-    NegativeCached,
-    Conflicting,
-    Error,
-}
-
-impl LookupResultState {
-    /// TEXT value stored in the `lookup_events.result_state` column.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Hit => "hit",
-            Self::Miss => "miss",
-            Self::StaleUsed => "stale_used",
-            Self::NegativeCached => "negative_cached",
-            Self::Conflicting => "conflicting",
-            Self::Error => "error",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "hit" => Some(Self::Hit),
-            "miss" => Some(Self::Miss),
-            "stale_used" => Some(Self::StaleUsed),
-            "negative_cached" => Some(Self::NegativeCached),
-            "conflicting" => Some(Self::Conflicting),
-            "error" => Some(Self::Error),
-            _ => None,
-        }
-    }
-}
-
 // ── Cleanup / reset ───────────────────────────────────────────────────────────
+
+/// How long a direct tenant stays in the shared-IP census without being seen
+/// again. Aging one out narrows the kill-switch exemption, so this errs long.
+pub const SHARED_IP_DIRECT_HOST_MAX_AGE_SECS: u64 = 30 * 86_400;
 
 /// Parameters that govern the cleanup pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +162,8 @@ pub struct CleanupPolicy {
     pub max_lookup_events: usize,
     /// Remove lookup events older than this (seconds).
     pub max_lookup_event_age_secs: u64,
+    /// Drop a shared-IP direct tenant not re-observed for this long (seconds).
+    pub max_shared_ip_direct_host_age_secs: u64,
     /// Maximum rows removed per single SQL statement (prevents lock starvation).
     pub batch_size: usize,
     /// Whether to run `VACUUM` / WAL checkpoint after this cleanup pass.
@@ -220,6 +176,7 @@ impl Default for CleanupPolicy {
             max_negative_cache_age_secs: 3_600,
             max_lookup_events: 500,
             max_lookup_event_age_secs: 86_400,
+            max_shared_ip_direct_host_age_secs: SHARED_IP_DIRECT_HOST_MAX_AGE_SECS,
             batch_size: 200,
             run_vacuum: false,
         }
@@ -232,6 +189,7 @@ pub struct CleanupSummary {
     pub expired_resolutions_removed: u64,
     pub negative_cache_entries_removed: u64,
     pub lookup_events_removed: u64,
+    pub shared_ip_direct_hosts_removed: u64,
     pub vacuumed: bool,
 }
 
@@ -252,6 +210,7 @@ pub struct CacheResetSummary {
     pub resolutions_removed: u64,
     pub negative_cache_removed: u64,
     pub lookup_events_removed: u64,
+    pub shared_ip_direct_hosts_removed: u64,
     pub completed_at: SystemTime,
 }
 
@@ -261,16 +220,9 @@ pub struct CacheResetSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IntegrityCheckResult {
     Ok,
-    /// Everything verified, but there is no revision to roll back TO: the
-    /// active one is the only one there has ever been. Not a failure — a first
-    /// start looks exactly like this — yet the caller cannot promise a
-    /// fallback, and `Ok` gave it no way to tell the two apart (see
-    /// [`crate::error::IntegrityFailureKind::MissingLastKnownGood`], which
-    /// existed with nothing able to produce it).
-    OkNoRollbackTarget,
     /// `nrr_fqdn_ip_cache.db` is corrupt — can be rebuilt without user action.
     CacheCorruptRebuildable,
-    /// `nrr_service_state.db` integrity failed — must fall back to LKG.
+    /// `nrr_service_state.db` integrity failed.
     PolicyIntegrityFailed {
         details: String,
     },
@@ -291,28 +243,11 @@ pub enum RecoveryAction {
     None,
     RebuildCache,
     RestoreFromBackup,
-    /// Fall back to the last-known-good revision pointer.
+    /// Recoverable from the principal's own trusted history (the keyed sweep
+    /// in the service does it).
     FallbackToLastKnownGood,
     /// Problem cannot be resolved automatically — show user dialog.
     RequireUserAction(String),
-}
-
-/// Per-database integrity state as seen by the health checker.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DbIntegrityState {
-    Ok,
-    CacheCorruptRebuildable,
-    PolicyIntegrityFailed,
-    UnsupportedSchema,
-    Unavailable,
-}
-
-/// Aggregated integrity status for both databases.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IntegrityStatus {
-    pub cache_db: DbIntegrityState,
-    pub state_db: DbIntegrityState,
-    pub last_verified_at: Option<SystemTime>,
 }
 
 // ── Migration ─────────────────────────────────────────────────────────────────
@@ -347,7 +282,6 @@ impl SchemaVerification {
 /// Live aggregate row counts from the FQDN/IP cache data tables.
 ///
 /// Produced by [`CacheRepository::get_cache_stats`][crate::repository::CacheRepository::get_cache_stats]
-/// and consumed by [`build_cache_diagnostic_summary`][crate::explain::build_cache_diagnostic_summary]
 /// for the GUI health surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheStats {
@@ -391,43 +325,4 @@ pub struct CacheEntryRow {
     pub resolved_at: SystemTime,
     /// Absolute expiry time for the mapping.
     pub expires_at: SystemTime,
-}
-
-// ── Health ────────────────────────────────────────────────────────────────────
-
-/// User-visible health state of a single database.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OverallHealthState {
-    Healthy,
-    Rebuilding,
-    Stale,
-    Corrupted,
-    ResetRequired,
-    Unavailable,
-}
-
-/// Health snapshot for a single database file.
-#[derive(Clone, Debug)]
-pub struct DbHealthStatus {
-    pub path_exists: bool,
-    pub schema_version: Option<u32>,
-    pub last_migration_at: Option<SystemTime>,
-    pub last_integrity_check_at: Option<SystemTime>,
-    pub last_cleanup_at: Option<SystemTime>,
-    /// For the FQDN cache DB, the most recent time the
-    /// cache was rebuilt or refreshed (read from
-    /// `cache_metadata.last_rebuild_at`). `None` for the state DB and
-    /// for a never-rebuilt cache. Surfaced via `StorageHealthStatus`
-    /// into the GUI's diagnostics section so operators can tell
-    /// whether the cache view is fresh.
-    pub last_rebuild_at: Option<SystemTime>,
-    pub overall: OverallHealthState,
-}
-
-/// Aggregated health status for both storage databases.
-#[derive(Clone, Debug)]
-pub struct StorageHealthStatus {
-    pub cache_db: DbHealthStatus,
-    pub state_db: DbHealthStatus,
-    pub checked_at: SystemTime,
 }

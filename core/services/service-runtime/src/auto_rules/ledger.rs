@@ -77,12 +77,14 @@ impl AutoRulesEngine {
             .remove(sid);
     }
 
+    /// The number every badge reports: offers the inbox shows by default.
     pub(super) fn pending_count(&self, sid: &str) -> usize {
-        self.pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(sid)
-            .map_or(0, Vec::len)
+        shown_by_default_count(&self.candidates(sid))
+    }
+
+    /// [`Self::pending_count`] against a rules snapshot the caller already holds.
+    pub(super) fn pending_count_under(&self, sid: &str, snapshot: &ActiveRulesSnapshot) -> usize {
+        shown_by_default_count(&self.candidates_under(sid, Some(snapshot)))
     }
 
     /// Ids that must not be offered: refused earlier (durable) or authored this
@@ -309,8 +311,8 @@ impl AutoRulesEngine {
                     sid = %sid,
                     code = %e.code,
                     anchor = %top_anchor(fresh),
-                    "could not add discovered addresses automatically: {}",
-                    e.message,
+                    error = %e.message,
+                    "could not add discovered addresses automatically",
                 );
                 0
             }

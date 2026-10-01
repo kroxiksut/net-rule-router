@@ -24,7 +24,7 @@ fn registry_marks_app_only_blocks_as_app_scoped_and_destination_blocks_as_not() 
         Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
     )
     .with_app_resolver(Arc::new(resolver))
-    .with_kill_switch_resolver(Arc::new(|_| Some(full_ks_resolution())))
+    .with_kill_switch_resolver(Arc::new(|_, _| Some(full_ks_resolution())))
     .with_killswitch_drop_registry(Arc::clone(&registry));
 
     // One secondary address rule (destination pin) + one secondary app
@@ -108,7 +108,7 @@ fn fixture_with_app_observation(
     )
     .with_app_resolver(Arc::new(resolver))
     .with_app_observations(observations)
-    .with_kill_switch_resolver(Arc::new(move |_| resolution.clone()));
+    .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()));
     let secondary = CanonicalRuleSet::from_rules(vec![
         CanonicalRule {
             id: RuleId("r-ip".into()),

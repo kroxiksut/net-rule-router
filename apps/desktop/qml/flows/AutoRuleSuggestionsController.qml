@@ -26,7 +26,8 @@ QtObject {
 
     /// Wire rows from the last `autorules.candidates.list`.
     property var autoRuleCandidates: []
-    /// How many the service is holding — drives the chip in the Rules header.
+    /// How many the list shows by default, as the service counts them — drives
+    /// the sidebar badges. Never re-counted here: a second rule would drift.
     property int autoRuleCandidatesPending: 0
     property bool _autoRuleFetchInFlight: false
     /// Id of the banner currently on screen, so a newer push can replace it.
@@ -56,7 +57,7 @@ QtObject {
             }
             var list = payload.candidates || payload["candidates"] || []
             autoRuleSuggestionsController.autoRuleCandidates = list
-            autoRuleSuggestionsController.autoRuleCandidatesPending = list.length
+            autoRuleSuggestionsController.autoRuleCandidatesPending = Number(payload["pending-count"] || 0)
             // Why the list is empty, when it is: companions the service saw but
             // did not offer because they already travel the same route.
             autoRuleSuggestionsController.autoRuleInertDropped = Number(payload["inert-dropped"] || 0)
@@ -152,17 +153,16 @@ QtObject {
     }
 
     /// The answer says what is left; take the banner down once nothing is.
+    /// The list is re-read either way: a zero count can still leave rows the
+    /// main route handles, listed behind their toggle.
     function _noteAutoRulePending(payload) {
         var left = (payload || {}).pending
         if (left === undefined) left = (payload || {})["pending"]
         if (left === undefined) return
         autoRuleCandidatesPending = Number(left)
-        if (autoRuleCandidatesPending <= 0) {
-            autoRuleCandidates = []
+        if (autoRuleCandidatesPending <= 0)
             root.notificationsController._dropPushNotice(_autoRuleNoticeId)
-        } else {
-            refreshAutoRuleCandidates()
-        }
+        refreshAutoRuleCandidates()
     }
 
     /// Id of the failure notice currently shown per service operation, so a

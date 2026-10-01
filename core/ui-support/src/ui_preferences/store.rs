@@ -5,6 +5,7 @@
 //! settings they never changed.
 
 use super::*;
+use std::time::{Duration, SystemTime};
 
 /// What a session got when it opened the preferences store.
 ///
@@ -43,39 +44,24 @@ pub fn open_for_session(store: UiPreferencesStore) -> SessionPreferences {
 
 pub struct UiPreferencesStore {
     pub(super) path: PathBuf,
-    pub(super) legacy_paths: Vec<PathBuf>,
-    pub(super) is_profile_persistent: bool,
 }
 
 impl UiPreferencesStore {
     pub fn managed_local() -> io::Result<Self> {
-        let storage = resolve_storage_location()?;
-        let legacy_paths = legacy_preference_paths(storage.root.clone());
         Ok(Self {
-            path: storage.root.join(STABLE_PREFERENCES_FILE_NAME),
-            legacy_paths,
-            is_profile_persistent: storage.is_profile_persistent,
+            path: resolve_storage_root()?.join(STABLE_PREFERENCES_FILE_NAME),
         })
     }
 
     pub fn for_path(path: PathBuf) -> Self {
-        Self {
-            path,
-            legacy_paths: Vec::new(),
-            is_profile_persistent: true,
-        }
+        Self { path }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn is_profile_persistent(&self) -> bool {
-        self.is_profile_persistent
-    }
-
     pub fn load(&self) -> io::Result<UiPreferences> {
-        self.try_migrate_legacy_file()?;
         match fs::read_to_string(&self.path) {
             Ok(content) if has_preference_lines(&content) => {
                 let parsed = parse_preferences(&content);
@@ -115,101 +101,127 @@ impl UiPreferencesStore {
     }
 
     pub fn save(&self, preferences: &UiPreferences) -> io::Result<()> {
-        self.try_migrate_legacy_file()?;
+        self.sweep_orphaned_tmp_files();
+        let staged = self.stage(preferences)?;
+        self.retire_primary_to_backup();
+        self.commit(&staged)
+    }
+
+    /// Writes the new payload under a scratch name and flushes it. The name is
+    /// unique per writer: the GUI and the tray both save, and a shared
+    /// `<path>.tmp` lets one truncate the other's file mid-write.
+    pub(super) fn stage(&self, preferences: &UiPreferences) -> io::Result<PathBuf> {
+        use std::io::Write;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-
-        // Write-then-rename: `fs::rename` replaces the destination in one step
-        // on every supported OS, so a process killed at any point leaves either
-        // the old file or the new one — never a truncated one. Deleting the
-        // destination first would open exactly that window, and it buys
-        // nothing.
-        // The scratch name is unique per writer. Both the GUI and the tray save
-        // preferences, and a single `<path>.tmp` shared between them lets the
-        // second writer truncate the first one's file mid-write — the first
-        // then renames the other's half-written payload into place, defeating
-        // the very swap this dance exists for.
         let temporary_path = self.path.with_extension(format!(
             "{}-{}.tmp",
             std::process::id(),
             SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
-        let payload = format_preferences(preferences);
-        {
-            use std::io::Write;
+        // Written as one closure so any failure past file creation removes the
+        // scratch file instead of orphaning it: `?` alone would return before
+        // cleanup ran.
+        let write = (|| -> io::Result<()> {
             let mut file = fs::File::create(&temporary_path)?;
-            file.write_all(payload.as_bytes())?;
-            // The rename survives a process kill, but not a power cut: the
-            // journal can commit the rename while the data blocks are still
-            // in the write-behind cache, and recovery then produces an empty
-            // file under the final name. Flush the data before the swap.
-            file.sync_all()?;
-        }
-        // Keep the outgoing file as the fallback `load` recovers from — but
-        // never let a gutted primary overwrite a good backup.
-        if let Ok(current) = fs::read_to_string(&self.path) {
-            if has_preference_lines(&current) {
-                let _ = fs::write(self.backup_path(), current);
+            #[cfg(test)]
+            if FORCE_NEXT_STAGE_WRITE_FAILURE.with(|flag| flag.replace(false)) {
+                return Err(io::Error::other("forced for a test"));
+            }
+            file.write_all(format_preferences(preferences).as_bytes())?;
+            // A rename survives a process kill but not a power cut: the journal
+            // can commit it before the data blocks, leaving an empty file.
+            file.sync_all()
+        })();
+        match write {
+            Ok(()) => Ok(temporary_path),
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_path);
+                Err(error)
             }
         }
-        let renamed = fs::rename(&temporary_path, &self.path);
+    }
+
+    /// Deletes this store's own `.tmp` scratch files once they are old enough
+    /// that no writer still owns them: a write error in [`Self::stage`] before
+    /// this cleanup existed, or a crash between staging and [`Self::commit`],
+    /// left them here forever. The one-minute floor is well past any save's
+    /// write-and-rename, so a concurrent writer's own in-flight file is never
+    /// touched. Best effort: a failed listing or delete does not fail the save.
+    fn sweep_orphaned_tmp_files(&self) {
+        let (Some(parent), Some(stem)) = (self.path.parent(), self.path.file_stem()) else {
+            return;
+        };
+        let Some(stem) = stem.to_str() else {
+            return;
+        };
+        let prefix = format!("{stem}.");
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        let cutoff = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+                continue;
+            }
+            let is_old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| modified < cutoff);
+            if is_old {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Moves the outgoing primary over the backup in one rename, so the backup
+    /// is always a whole file. A husk primary is left alone: it must never
+    /// replace a good backup.
+    pub(super) fn retire_primary_to_backup(&self) {
+        let whole = fs::read_to_string(&self.path).is_ok_and(|c| has_preference_lines(&c));
+        if whole {
+            // Best effort: without a backup the save still lands.
+            let _ = fs::rename(&self.path, self.backup_path());
+        }
+    }
+
+    /// Renames the staged file into place; `fs::rename` replaces the
+    /// destination in one step on every supported OS.
+    pub(super) fn commit(&self, staged: &Path) -> io::Result<()> {
+        let renamed = fs::rename(staged, &self.path);
         if renamed.is_err() {
-            // Nothing else will ever look at this name again, so a failed swap
-            // must not leave it behind.
-            let _ = fs::remove_file(&temporary_path);
+            let _ = fs::remove_file(staged);
         }
         renamed
     }
-
-    fn try_migrate_legacy_file(&self) -> io::Result<()> {
-        if self.path.exists() {
-            return Ok(());
-        }
-
-        for legacy_path in &self.legacy_paths {
-            if !legacy_path.exists() {
-                continue;
-            }
-
-            if let Some(parent) = self.path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            match fs::rename(legacy_path, &self.path) {
-                Ok(_) => return Ok(()),
-                Err(_) => {
-                    // Cross-volume move fallback.
-                    fs::copy(legacy_path, &self.path)?;
-                    fs::remove_file(legacy_path)?;
-                    return Ok(());
-                }
-            }
-        }
-
-        Ok(())
-    }
 }
 
-struct StorageLocation {
-    root: PathBuf,
-    is_profile_persistent: bool,
+// Test-only fault injection: proves `stage`'s cleanup removes a scratch file
+// that really exists on disk, not just one that failed to be created. Compiled
+// out of every non-test build; thread-local so parallel tests cannot trip it
+// for each other.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_NEXT_STAGE_WRITE_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Where the OS wants a per-user file kept is not this crate's business — it
 /// asks [`nrr_shared::user_paths`], which is also what the localization layer
 /// reads, so the override directory and the settings file cannot drift apart.
-fn resolve_storage_location() -> io::Result<StorageLocation> {
+fn resolve_storage_root() -> io::Result<PathBuf> {
     let mut last_error = None;
     for root in nrr_shared::user_paths::user_app_roots() {
-        let managed_path = root.path.join(MANAGED_SUBFOLDER);
+        let managed_path = root.join(MANAGED_SUBFOLDER);
         match fs::create_dir_all(&managed_path) {
-            Ok(_) => {
-                return Ok(StorageLocation {
-                    root: managed_path,
-                    is_profile_persistent: root.is_profile_persistent,
-                });
-            }
+            Ok(_) => return Ok(managed_path),
             Err(error) => {
                 last_error = Some(error);
             }
@@ -224,23 +236,6 @@ fn resolve_storage_location() -> io::Result<StorageLocation> {
             "No candidate path is available for managed UI storage.",
         ))
     }
-}
-
-fn legacy_preference_paths(root: PathBuf) -> Vec<PathBuf> {
-    let mut paths = LEGACY_PREFERENCES_FILE_NAMES
-        .iter()
-        .map(|name| root.join(name))
-        .collect::<Vec<_>>();
-    let temp_root = env::temp_dir()
-        .join(MANAGED_ROOT_FOLDER)
-        .join(MANAGED_SUBFOLDER);
-    paths.extend(
-        LEGACY_PREFERENCES_FILE_NAMES
-            .iter()
-            .map(|name| temp_root.join(name)),
-    );
-    paths.push(temp_root.join(STABLE_PREFERENCES_FILE_NAME));
-    paths
 }
 
 /// Whether `content` carries at least one `key=value` line — what separates a

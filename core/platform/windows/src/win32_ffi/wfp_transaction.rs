@@ -32,6 +32,7 @@ const TXN_READ_WRITE: u32 = 0;
 
 /// Begin a read-write WFP transaction on the given engine handle.
 pub fn transaction_begin(token: &WfpEngineToken) -> Result<(), PlatformError> {
+    super::wfp_sublayer::forget_ensured_sublayer(token);
     let handle = token_to_handle(token);
     // SAFETY: `handle` was produced by a successful `FwpmEngineOpen0`
     // and outlives this call (caller owns the token).
@@ -75,6 +76,8 @@ pub fn transaction_commit(token: &WfpEngineToken) -> Result<(), PlatformError> {
 /// implicitly via the audit pathway upstream — but we never propagate
 /// it.
 pub fn transaction_abort(token: &WfpEngineToken) {
+    // The rollback takes a sub-layer this transaction created with it.
+    super::wfp_sublayer::forget_ensured_sublayer(token);
     let handle = token_to_handle(token);
     // SAFETY: handle is valid; abort cleans up regardless of outcome.
     let _ = unsafe { FwpmTransactionAbort0(handle) };

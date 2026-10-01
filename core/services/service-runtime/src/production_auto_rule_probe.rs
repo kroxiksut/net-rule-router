@@ -296,7 +296,8 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
             tracing::warn!(
                 target: "nrr::auto-rules",
                 msg_key = "prod-autorule-probe-spawn-failed",
-                "could not start the main-link probe pass: {e}",
+                error = %e,
+                "could not start the main-link probe pass",
             );
             return AutoRuleCandidatesProbeResponse::default();
         }

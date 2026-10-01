@@ -33,9 +33,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nrr_diagnostics::audit::writer::{AuditEventInput, AuditWriter};
 use nrr_diagnostics::audit::{ActorKind, AuditEventKind, AuditEventResult};
 use nrr_diagnostics::reason::review::APPROVED as REVIEW_APPROVED;
-use nrr_diagnostics::reason::{apply as apply_reason, integrity, ReasonCode};
+use nrr_diagnostics::reason::{apply as apply_reason, import, integrity, ReasonCode};
 use nrr_diagnostics::sink::AuditSink;
 use nrr_domain::revision::RevisionId;
+use nrr_domain::rules_revision::RulesRevisionSource;
+use serde_json::json;
 
 use crate::activation_coordinator::{
     ActivationAuditEmitter, ActivationAuditEvent, DispatchFailure, IdGenerator, PreFlightCategory,
@@ -142,17 +144,17 @@ impl IdGenerator for ProductionIdGenerator {
 ///
 /// Mapping rationale:
 /// - `RevisionActivated` → `RevisionActivated` (`apply.completed`)
-/// - `RevisionRejected` → `RevisionActivated` with `result = Failure`
-///   and `apply.failed` reason code (no separate `RevisionRejected`
-///   variant in `AuditEventKind`)
+/// - `RevisionRejected` → `ReviewRejected` with `result = Failure` and the
+///   `apply.failed` reason: the revision was refused, not activated
 /// - `RolledBack` / `RollbackRequested` → `RollbackStarted` /
 ///   `RollbackCompleted` with apply.rollback_* reason codes
 /// - `ActivationStarted` → `RevisionActivated` with `apply.started`
 ///   reason and `result = Success` (the start is a successful event;
 ///   apply outcome lands in `RevisionActivated`/`RevisionRejected`)
-/// - `RevisionSubmitted` / `DryRunRequested` / `TokenIssued` /
-///   `TokenConsumed` → `ReviewApproved` (closest fit; a future revision
-///   may add dedicated audit kinds if precision is needed)
+/// - `RevisionSubmitted` from a preset import → `ImportCreated`
+///   (`import.candidate_created`): the import is what made the candidate
+/// - any other `RevisionSubmitted` / `DryRunRequested` / `TokenIssued` /
+///   `TokenConsumed` → `ReviewApproved` (closest fit)
 /// - `PreFlight*` → `RevisionActivated` with `apply.verification_failed`
 ///   reason on failure
 /// - `ActiveIntegrityRejected` → `UntrustedRevisionRejected` with
@@ -225,7 +227,7 @@ impl ProductionActivationAuditEmitter {
             tracing::error!(
                 target: "nrr::audit",
                 msg_key = "prod-coord-activation-audit-append-failed",
-                error = ?e,
+                error = %e,
                 "audit append failed for activation event",
             );
         }
@@ -238,17 +240,30 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
             ActivationAuditEvent::RevisionSubmitted {
                 revision_id,
                 content_hash,
-                source: _,
+                source,
                 correlation_id: _,
                 was_dedup,
             } => {
-                let payload = format!(
-                    r#"{{"event":"submitted","content_hash":"{content_hash}","dedup":{was_dedup}}}"#,
-                );
+                let payload = json!({
+                    "event": "submitted",
+                    "content_hash": content_hash,
+                    "dedup": was_dedup,
+                })
+                .to_string();
+                let (kind, reason) = match source {
+                    RulesRevisionSource::PresetImport => {
+                        (AuditEventKind::ImportCreated, import::CANDIDATE_CREATED)
+                    }
+                    RulesRevisionSource::GuiRulesEdit
+                    | RulesRevisionSource::RecoveryLkg
+                    | RulesRevisionSource::Rollback => {
+                        (AuditEventKind::ReviewApproved, REVIEW_APPROVED)
+                    }
+                };
                 self.append(
-                    AuditEventKind::ReviewApproved,
+                    kind,
                     AuditEventResult::Success,
-                    REVIEW_APPROVED,
+                    reason,
                     Some(revision_id),
                     Some(payload),
                 );
@@ -262,7 +277,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                     AuditEventResult::Success,
                     REVIEW_APPROVED,
                     Some(revision_id),
-                    Some(r#"{"event":"dry_run_requested"}"#.to_string()),
+                    Some(json!({ "event": "dry_run_requested" }).to_string()),
                 );
             }
             ActivationAuditEvent::TokenIssued {
@@ -270,7 +285,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 token: _,
                 ttl_secs,
             } => {
-                let payload = format!(r#"{{"event":"token_issued","ttl_secs":{ttl_secs}}}"#);
+                let payload = json!({ "event": "token_issued", "ttl_secs": ttl_secs }).to_string();
                 self.append(
                     AuditEventKind::ReviewApproved,
                     AuditEventResult::Success,
@@ -288,7 +303,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                     AuditEventResult::Success,
                     REVIEW_APPROVED,
                     Some(revision_id),
-                    Some(r#"{"event":"token_consumed"}"#.to_string()),
+                    Some(json!({ "event": "token_consumed" }).to_string()),
                 );
             }
             ActivationAuditEvent::ActivationStarted {
@@ -297,7 +312,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 ..
             } => {
                 let payload =
-                    format!(r#"{{"event":"activation_started","attempt_id":"{attempt_id}"}}"#);
+                    json!({ "event": "activation_started", "attempt_id": attempt_id }).to_string();
                 self.append(
                     AuditEventKind::RevisionActivated,
                     AuditEventResult::Success,
@@ -315,17 +330,18 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                     AuditEventResult::Success,
                     apply_reason::STARTED,
                     Some(revision_id),
-                    Some(r#"{"event":"pre_flight_passed"}"#.to_string()),
+                    Some(json!({ "event": "pre_flight_passed" }).to_string()),
                 );
             }
             ActivationAuditEvent::PreFlightFailed {
                 revision_id,
                 sid_failures,
             } => {
-                let payload = format!(
-                    r#"{{"event":"pre_flight_failed","failure_count":{}}}"#,
-                    sid_failures.len()
-                );
+                let payload = json!({
+                    "event": "pre_flight_failed",
+                    "failure_count": sid_failures.len(),
+                })
+                .to_string();
                 self.append(
                     AuditEventKind::RevisionActivated,
                     AuditEventResult::Failure,
@@ -338,10 +354,11 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 revision_id,
                 sid_failures,
             } => {
-                let payload = format!(
-                    r#"{{"event":"pre_flight_passed_but_apply_failed","failure_count":{}}}"#,
-                    sid_failures.len()
-                );
+                let payload = json!({
+                    "event": "pre_flight_passed_but_apply_failed",
+                    "failure_count": sid_failures.len(),
+                })
+                .to_string();
                 self.append(
                     AuditEventKind::RevisionActivated,
                     AuditEventResult::Failure,
@@ -357,12 +374,13 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 succeeded_sids,
                 drift_sids,
             } => {
-                let payload = format!(
-                    r#"{{"event":"revision_activated","previous":{},"succeeded":{},"drift":{}}}"#,
-                    previous_revision_id.map_or("null".to_string(), |s| format!("\"{s}\"")),
-                    succeeded_sids.len(),
-                    drift_sids.len(),
-                );
+                let payload = json!({
+                    "event": "revision_activated",
+                    "previous": previous_revision_id,
+                    "succeeded": succeeded_sids.len(),
+                    "drift": drift_sids.len(),
+                })
+                .to_string();
                 self.append(
                     AuditEventKind::RevisionActivated,
                     AuditEventResult::Success,
@@ -378,12 +396,9 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 reason,
                 sid_failures: _,
             } => {
-                let payload = format!(
-                    r#"{{"event":"revision_rejected","reason":"{}"}}"#,
-                    reason.replace('"', "\\\"")
-                );
+                let payload = json!({ "event": "revision_rejected", "reason": reason }).to_string();
                 self.append(
-                    AuditEventKind::RevisionActivated,
+                    AuditEventKind::ReviewRejected,
                     AuditEventResult::Failure,
                     apply_reason::FAILED,
                     Some(revision_id.clone()),
@@ -395,7 +410,8 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 target,
                 correlation_id: _,
             } => {
-                let payload = format!(r#"{{"event":"rollback_requested","target":"{target}"}}"#);
+                let payload =
+                    json!({ "event": "rollback_requested", "target": target }).to_string();
                 self.append(
                     AuditEventKind::RollbackStarted,
                     AuditEventResult::Success,
@@ -409,9 +425,12 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 from_revision_id,
                 to_revision_id,
             } => {
-                let payload = format!(
-                    r#"{{"event":"rolled_back","from":"{from_revision_id}","to":"{to_revision_id}"}}"#
-                );
+                let payload = json!({
+                    "event": "rolled_back",
+                    "from": from_revision_id,
+                    "to": to_revision_id,
+                })
+                .to_string();
                 self.append(
                     AuditEventKind::RollbackCompleted,
                     AuditEventResult::Success,
@@ -435,9 +454,12 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 // rollback kind with a reset-specific payload. No target
                 // revision id — the user falls through to baseline via the
                 // provider read-through, not to a specific revision.
-                let payload = format!(
-                    r#"{{"event":"reset_to_baseline","principal":"{principal}","deleted":{deleted_revisions}}}"#
-                );
+                let payload = json!({
+                    "event": "reset_to_baseline",
+                    "principal": principal,
+                    "deleted": deleted_revisions,
+                })
+                .to_string();
                 self.append(
                     AuditEventKind::RollbackCompleted,
                     AuditEventResult::Success,
@@ -465,16 +487,16 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                         format!("rule-cap-exceeded({user_rule_count}>{cap})")
                     }
                 };
-                let payload = format!(
-                    r#"{{"event":"active_integrity_rejected","principal":"{principal}","reason":"{reason_slug}","rejected_user_rule_count":{rejected_user_rule_count},"trusted_source_revision_id":{},"trusted_user_rule_count":{},"new_active_revision_id":{}}}"#,
-                    trusted_source_revision_id
-                        .as_deref()
-                        .map_or("null".to_string(), |s| format!("\"{s}\"")),
-                    trusted_user_rule_count.map_or("null".to_string(), |n| n.to_string()),
-                    new_active_revision_id
-                        .as_deref()
-                        .map_or("null".to_string(), |s| format!("\"{s}\"")),
-                );
+                let payload = json!({
+                    "event": "active_integrity_rejected",
+                    "principal": principal,
+                    "reason": reason_slug,
+                    "rejected_user_rule_count": rejected_user_rule_count,
+                    "trusted_source_revision_id": trusted_source_revision_id,
+                    "trusted_user_rule_count": trusted_user_rule_count,
+                    "new_active_revision_id": new_active_revision_id,
+                })
+                .to_string();
                 self.append(
                     AuditEventKind::UntrustedRevisionRejected,
                     AuditEventResult::Failure,
@@ -948,10 +970,11 @@ impl RecoveryAuditSink for ProductionRecoveryAuditSink {
             } => (
                 AuditEventKind::RecoveryActionRequested,
                 ReasonCode("integrity.recovery_started"),
-                format!(
-                    r#"{{"event":"recovery_started","attempt_id":"{}","phase":"{}"}}"#,
-                    attempt_id, phase_found,
-                ),
+                json!({
+                    "event": "recovery_started",
+                    "attempt_id": attempt_id,
+                    "phase": phase_found,
+                }),
                 None,
             ),
             RecoveryAuditRecord::RollbackInitiated {
@@ -960,19 +983,13 @@ impl RecoveryAuditSink for ProductionRecoveryAuditSink {
             } => (
                 AuditEventKind::RollbackStarted,
                 apply_reason::ROLLBACK_STARTED,
-                format!(
-                    r#"{{"event":"recovery_rollback_initiated","attempt_id":"{}"}}"#,
-                    attempt_id,
-                ),
+                json!({ "event": "recovery_rollback_initiated", "attempt_id": attempt_id }),
                 target_revision,
             ),
             RecoveryAuditRecord::RollbackCompleted { attempt_id } => (
                 AuditEventKind::RollbackCompleted,
                 apply_reason::ROLLBACK_COMPLETED,
-                format!(
-                    r#"{{"event":"recovery_rollback_completed","attempt_id":"{}"}}"#,
-                    attempt_id,
-                ),
+                json!({ "event": "recovery_rollback_completed", "attempt_id": attempt_id }),
                 None,
             ),
             // Deliberately NOT `AuditEventKind::RollbackCompleted`: nothing was
@@ -981,30 +998,19 @@ impl RecoveryAuditSink for ProductionRecoveryAuditSink {
             RecoveryAuditRecord::RollbackDeferred { attempt_id, reason } => (
                 AuditEventKind::RecoveryActionRequested,
                 ReasonCode("integrity.rollback_deferred"),
-                format!(
-                    r#"{{"event":"recovery_rollback_deferred","attempt_id":"{}","reason":"{}"}}"#,
-                    attempt_id,
-                    reason.replace('"', "\\\""),
-                ),
+                json!({ "event": "recovery_rollback_deferred", "attempt_id": attempt_id, "reason": reason }),
                 None,
             ),
             RecoveryAuditRecord::VerificationPassed { attempt_id } => (
                 AuditEventKind::RecoveryActionRequested,
                 ReasonCode("integrity.recovery_verified"),
-                format!(
-                    r#"{{"event":"recovery_verification_passed","attempt_id":"{}"}}"#,
-                    attempt_id,
-                ),
+                json!({ "event": "recovery_verification_passed", "attempt_id": attempt_id }),
                 None,
             ),
             RecoveryAuditRecord::ManualActionRequired { attempt_id, reason } => (
                 AuditEventKind::IntegrityFailureDetected,
                 ReasonCode("integrity.policy_integrity_failure"),
-                format!(
-                    r#"{{"event":"recovery_manual_action_required","attempt_id":"{}","reason":"{}"}}"#,
-                    attempt_id,
-                    reason.replace('"', "\\\""),
-                ),
+                json!({ "event": "recovery_manual_action_required", "attempt_id": attempt_id, "reason": reason }),
                 None,
             ),
             RecoveryAuditRecord::SafeDisableExecuted {
@@ -1013,20 +1019,13 @@ impl RecoveryAuditSink for ProductionRecoveryAuditSink {
             } => (
                 AuditEventKind::RecoveryActionRequested,
                 ReasonCode("integrity.safe_disable_executed"),
-                format!(
-                    r#"{{"event":"safe_disable","correlation_id":"{}","reason":"{}"}}"#,
-                    correlation_id,
-                    reason.replace('"', "\\\""),
-                ),
+                json!({ "event": "safe_disable", "correlation_id": correlation_id, "reason": reason }),
                 None,
             ),
             RecoveryAuditRecord::MarkerCleared { attempt_id } => (
                 AuditEventKind::RecoveryActionRequested,
                 ReasonCode("integrity.marker_cleared"),
-                format!(
-                    r#"{{"event":"recovery_marker_cleared","attempt_id":"{}"}}"#,
-                    attempt_id,
-                ),
+                json!({ "event": "recovery_marker_cleared", "attempt_id": attempt_id }),
                 None,
             ),
         };
@@ -1044,7 +1043,7 @@ impl RecoveryAuditSink for ProductionRecoveryAuditSink {
             risk_level: None,
             result,
             reason_code: reason,
-            payload_summary_json: Some(payload),
+            payload_summary_json: Some(payload.to_string()),
         };
         self.writer
             .append(input)
@@ -1382,6 +1381,199 @@ mod tests {
                 }
             ));
         }
+    }
+
+    // ── Audit payloads ───────────────────────────────────────────────────────
+
+    /// A Windows path, a quote, a newline and control characters: what a
+    /// rejection reason or a caller-supplied id may carry. Built from code
+    /// points so the fixture carries no escapes of its own.
+    fn nasty() -> String {
+        [
+            'C',
+            ':',
+            char::from(92u8),
+            'p',
+            char::from(34u8),
+            char::from(10u8),
+            char::from(13u8),
+            char::from(9u8),
+            char::from(1u8),
+            char::from(31u8),
+            'q',
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn payloads_in(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        nrr_diagnostics::audit::AuditReader::new(dir)
+            .scan(
+                &nrr_diagnostics::audit::AuditQueryFilter::new(),
+                &nrr_shared::diagnostics_dto::DiagnosticsAudience::Machine,
+            )
+            .into_iter()
+            .map(|e| {
+                let raw = e.payload_summary_json.expect("a payload");
+                serde_json::from_str(&raw).unwrap_or_else(|err| panic!("{err}: {raw}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn activation_payloads_carry_any_text_as_valid_json_and_the_chain_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = Arc::new(AuditWriter::open(
+            nrr_diagnostics::audit::writer::AuditWriterConfig::new(dir.path()),
+        ));
+        let emitter = ProductionActivationAuditEmitter::new(
+            Arc::clone(&writer),
+            Arc::new(ProductionIdGenerator::new()),
+        );
+        let n = nasty();
+        emitter.emit(ActivationAuditEvent::RevisionSubmitted {
+            revision_id: n.clone(),
+            content_hash: n.clone(),
+            source: nrr_domain::rules_revision::RulesRevisionSource::GuiRulesEdit,
+            correlation_id: n.clone(),
+            was_dedup: false,
+        });
+        emitter.emit(ActivationAuditEvent::RevisionRejected {
+            principal: n.clone(),
+            revision_id: n.clone(),
+            reason: n.clone(),
+            sid_failures: vec![],
+        });
+        emitter.emit(ActivationAuditEvent::RollbackRequested {
+            target: n.clone(),
+            correlation_id: n.clone(),
+        });
+        emitter.emit(ActivationAuditEvent::RevisionActivated {
+            principal: n.clone(),
+            revision_id: n.clone(),
+            previous_revision_id: Some(n.clone()),
+            succeeded_sids: vec![],
+            drift_sids: vec![],
+        });
+        emitter.emit(ActivationAuditEvent::RolledBack {
+            principal: n.clone(),
+            from_revision_id: n.clone(),
+            to_revision_id: n.clone(),
+        });
+        emitter.emit(ActivationAuditEvent::ActiveIntegrityRejected {
+            principal: n.clone(),
+            rejected_revision_id: n.clone(),
+            reason: RevisionRejectReason::Tampered,
+            rejected_user_rule_count: 1,
+            trusted_source_revision_id: Some(n.clone()),
+            trusted_user_rule_count: None,
+            new_active_revision_id: None,
+        });
+
+        let payloads = payloads_in(dir.path());
+        assert_eq!(payloads.len(), 6);
+        let text = |i: usize, key: &str| payloads[i][key].as_str().map(str::to_owned);
+        assert_eq!(text(0, "content_hash"), Some(n.clone()));
+        assert_eq!(text(1, "reason"), Some(n.clone()));
+        assert_eq!(text(2, "target"), Some(n.clone()));
+        assert_eq!(text(3, "previous"), Some(n.clone()));
+        assert_eq!(text(4, "from"), Some(n.clone()));
+        assert_eq!(text(4, "to"), Some(n.clone()));
+        assert_eq!(text(5, "trusted_source_revision_id"), Some(n.clone()));
+        assert!(payloads[5]["new_active_revision_id"].is_null());
+        assert!(writer.verify_chain(None).chain_ok);
+    }
+
+    /// An import and a refusal each land under their own kind, not under the
+    /// approval or activation they used to be filed as.
+    #[test]
+    fn an_import_and_a_rejection_are_recorded_as_what_they_are() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = Arc::new(AuditWriter::open(
+            nrr_diagnostics::audit::writer::AuditWriterConfig::new(dir.path()),
+        ));
+        let emitter = ProductionActivationAuditEmitter::new(
+            Arc::clone(&writer),
+            Arc::new(ProductionIdGenerator::new()),
+        );
+        let submitted = |source| ActivationAuditEvent::RevisionSubmitted {
+            revision_id: "rev-1".into(),
+            content_hash: "hash".into(),
+            source,
+            correlation_id: "corr".into(),
+            was_dedup: false,
+        };
+        emitter.emit(submitted(RulesRevisionSource::PresetImport));
+        emitter.emit(submitted(RulesRevisionSource::GuiRulesEdit));
+        emitter.emit(ActivationAuditEvent::RevisionRejected {
+            principal: "S-1-A".into(),
+            revision_id: "rev-1".into(),
+            reason: "apply failed".into(),
+            sid_failures: vec![],
+        });
+
+        let events: Vec<(String, String, String)> =
+            nrr_diagnostics::audit::AuditReader::new(dir.path())
+                .scan(
+                    &nrr_diagnostics::audit::AuditQueryFilter::new(),
+                    &nrr_shared::diagnostics_dto::DiagnosticsAudience::Machine,
+                )
+                .into_iter()
+                .map(|e| (e.kind, e.result, e.reason_code))
+                .collect();
+        let row = |kind: &str, result: &str, reason: &str| {
+            (kind.to_string(), result.to_string(), reason.to_string())
+        };
+        assert_eq!(
+            events,
+            vec![
+                row("import_created", "success", "import.candidate_created"),
+                row("review_approved", "success", "review.approved"),
+                row("review_rejected", "failure", "apply.failed"),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_payloads_carry_any_text_as_valid_json_and_the_chain_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = Arc::new(AuditWriter::open(
+            nrr_diagnostics::audit::writer::AuditWriterConfig::new(dir.path()),
+        ));
+        let sink = ProductionRecoveryAuditSink::new(
+            Arc::clone(&writer),
+            Arc::new(ProductionIdGenerator::new()),
+        );
+        let n = nasty();
+        for record in [
+            RecoveryAuditRecord::RecoveryStarted {
+                attempt_id: n.clone(),
+                phase_found: n.clone(),
+            },
+            RecoveryAuditRecord::RollbackDeferred {
+                attempt_id: n.clone(),
+                reason: n.clone(),
+            },
+            RecoveryAuditRecord::ManualActionRequired {
+                attempt_id: n.clone(),
+                reason: n.clone(),
+            },
+            RecoveryAuditRecord::SafeDisableExecuted {
+                correlation_id: n.clone(),
+                reason: n.clone(),
+            },
+        ] {
+            sink.emit(record).expect("append");
+        }
+
+        let payloads = payloads_in(dir.path());
+        assert_eq!(payloads.len(), 4);
+        assert_eq!(payloads[0]["phase"].as_str(), Some(n.as_str()));
+        for p in &payloads[1..] {
+            assert_eq!(p["reason"].as_str(), Some(n.as_str()), "{p}");
+        }
+        assert_eq!(payloads[3]["correlation_id"].as_str(), Some(n.as_str()));
+        assert!(writer.verify_chain(None).chain_ok);
     }
 
     // ── ProductionApplyMarkerStore ───────────────────────────────────────────

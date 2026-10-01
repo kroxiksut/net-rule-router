@@ -379,14 +379,14 @@ mod tests {
     #[test]
     fn an_answer_of_the_other_family_is_not_an_address() {
         // Right question type, wrong record inside.
-        let message = response_of(4, &[a_record(60, [1, 2, 3, 4])], 0, TYPE_AAAA);
+        let message = response_of(4, &[a_record(60, [192, 0, 2, 4])], 0, TYPE_AAAA);
         assert_eq!(
             decode_response(&message, 4, "example.com", AddressFamily::Ipv6),
             Ok(DnsAnswer::NoAddresses)
         );
 
         // Right record, wrong question echoed back: not an answer to ours.
-        let crossed = response_of(5, &[a_record(60, [1, 2, 3, 4])], 0, TYPE_A);
+        let crossed = response_of(5, &[a_record(60, [192, 0, 2, 4])], 0, TYPE_A);
         assert!(matches!(
             decode_response(&crossed, 5, "example.com", AddressFamily::Ipv6),
             Err(DnsDecodeError::WrongQuestion { .. })
@@ -415,7 +415,10 @@ mod tests {
     fn addresses_and_the_smallest_ttl_come_back() {
         let message = response(
             7,
-            &[a_record(300, [23, 10, 20, 138]), a_record(60, [1, 2, 3, 4])],
+            &[
+                a_record(300, [203, 0, 113, 138]),
+                a_record(60, [192, 0, 2, 4]),
+            ],
             0,
         );
 
@@ -425,7 +428,7 @@ mod tests {
         assert_eq!(
             answer,
             DnsAnswer::Addresses {
-                addresses: vec![v4(23, 10, 20, 138), v4(1, 2, 3, 4)],
+                addresses: vec![v4(203, 0, 113, 138), v4(192, 0, 2, 4)],
                 // The answer is only good while its shortest-lived record is.
                 min_ttl: 60,
             }
@@ -436,7 +439,7 @@ mod tests {
     /// path could answer first and put its own address in the routing policy.
     #[test]
     fn a_reply_to_a_different_question_is_rejected() {
-        let message = response(7, &[a_record(60, [1, 2, 3, 4])], 0);
+        let message = response(7, &[a_record(60, [192, 0, 2, 4])], 0);
 
         assert!(matches!(
             decode_response(&message, 8, "example.com", AddressFamily::Ipv4),
@@ -482,7 +485,7 @@ mod tests {
     /// "these are all the addresses".
     #[test]
     fn a_server_truncated_answer_says_so() {
-        let mut message = response(1, &[a_record(60, [1, 2, 3, 4])], 0);
+        let mut message = response(1, &[a_record(60, [192, 0, 2, 4])], 0);
         // TC is bit 9 of the flags word, which lives in the HIGH byte.
         message[2] |= 0x02;
 
@@ -514,7 +517,7 @@ mod tests {
     /// silent slice of whatever follows in memory.
     #[test]
     fn a_record_running_past_the_end_is_truncated() {
-        let mut message = response(1, &[a_record(60, [1, 2, 3, 4])], 0);
+        let mut message = response(1, &[a_record(60, [192, 0, 2, 4])], 0);
         message.truncate(message.len() - 2);
 
         assert_eq!(

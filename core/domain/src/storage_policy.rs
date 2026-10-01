@@ -10,22 +10,21 @@
 //!
 //! | Store                     | Owner        | Version constant                      |
 //! |---------------------------|--------------|----------------------------------------|
-//! | UI preferences file       | UI runtime   | [`UI_PREFS_CURRENT_SCHEMA_VERSION`]   |
-//! | Rules file (external)     | User / editor| [`RULES_FILE_CURRENT_FORMAT_VERSION`] |
-//! | Service revision store    | Background service | (implemented separately)         |
+//! | UI preferences file       | UI runtime   | `nrr_ui_support` `CURRENT_UI_PREFS_SCHEMA_VERSION` |
+//! | Rules file (external)     | User / editor| [`CURRENT_RULES_FILE_FORMAT_VERSION`] |
+//! | Service revision store    | Background service | last `MigrationDef` in `nrr-storage` `MIGRATIONS` |
 //!
 //! # Compatibility policy (all stores)
 //!
 //! See [`CompatibilityPolicy`] for the full rationale. In summary:
 //!
 //! - **Backward-compatible read**: the current build can always read files
-//!   written by an older build, loading all known fields and ignoring any
-//!   unrecognised ones.
+//!   written by an older build, loading all known fields.
 //! - **Additive-only new fields**: new schema versions add optional fields.
 //!   Existing fields are never removed or renamed without a migration step.
 //! - **Forward-graceful read**: a file from a newer build is read in degrade
-//!   mode — known fields are loaded, unknown fields are silently ignored, and
-//!   a diagnostic is emitted. No silent data loss.
+//!   mode — known fields are loaded, unknown ones are kept and written back,
+//!   and a diagnostic is emitted. No silent data loss.
 //! - **Silent reset forbidden**: no migration may discard a user-configured
 //!   value without explicit user action or a documented migration mapping.
 //!
@@ -45,23 +44,15 @@
 //!
 //! # Migration triggers
 //!
-//! See [`MigrationTrigger`]. UI preferences are migrated automatically on
-//! first load after an upgrade. The service revision store requires an explicit
-//! migration step with pre-migration backup and post-migration verification.
+//! See [`MigrationTrigger`]. UI preferences need no migration step: every
+//! load reads the keys it knows and the next save stamps the current version.
+//! The service revision store runs its pending schema steps on open, after a
+//! pre-migration snapshot.
 
 // ── Version constants (re-exported for discoverability) ──────────────────────
 
-/// The UI preferences schema version this build writes and fully understands.
-///
-/// Defined in `nrr-ui-support`; mirrored here as a domain-level constant for
-/// cross-store version tracking and documentation purposes.
-pub const UI_PREFS_CURRENT_SCHEMA_VERSION: u32 = 1;
-
 /// The rules file format version this build writes and fully understands.
-///
-/// Defined in [`crate::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION`];
-/// mirrored here for cross-store documentation.
-pub const RULES_FILE_CURRENT_FORMAT_VERSION: u32 = 1;
+pub use crate::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION;
 
 // ── Compatibility policy ──────────────────────────────────────────────────────
 
@@ -74,8 +65,11 @@ pub const RULES_FILE_CURRENT_FORMAT_VERSION: u32 = 1;
 /// # Rules
 ///
 /// 1. **Backward-compatible read** (old file, new build): all known fields are
-///    loaded without error. Unrecognised fields from a future schema are
-///    silently dropped — no panic, no error, no silent reset of known values.
+///    loaded without error — no panic, no silent reset of known values. In UI
+///    preferences a key unknown to this build is kept verbatim and written back
+///    when the file declares this schema version or newer (a setting from a
+///    build that has it); in an older file it is the residue of a removed key
+///    and is dropped.
 ///
 /// 2. **Additive-only changes**: new schema versions may add fields. Existing
 ///    fields must not be removed or semantically changed without a migration
@@ -83,7 +77,8 @@ pub const RULES_FILE_CURRENT_FORMAT_VERSION: u32 = 1;
 ///
 /// 3. **Forward-graceful read** (new file, old build): when the file's
 ///    schema version exceeds the build's `CURRENT_*_VERSION`, known fields are
-///    still loaded. A non-fatal diagnostic (eprintln/tracing::warn) is emitted.
+///    still loaded and unknown ones carried through a save. A non-fatal
+///    diagnostic (eprintln/tracing::warn) is emitted.
 ///    The file is **not** automatically downgraded — the caller decides whether
 ///    to overwrite.
 ///
@@ -91,11 +86,11 @@ pub const RULES_FILE_CURRENT_FORMAT_VERSION: u32 = 1;
 ///    equivalent in the new schema. Fields without a mapping must be preserved
 ///    at their previous value or explicitly dropped with user notification.
 ///
-/// 5. **Version absent → legacy v0**: a file without a `schema_version` header
-///    was written by a pre-versioning build. It is loaded with the v0 → v1
-///    field mapping (all v1 fields that exist in v0 are read directly; new
-///    fields get their default values). On next save the file is upgraded to
-///    the current version.
+/// 5. **Version absent → legacy file**: a UI preferences file without a
+///    `schema_version` line was written by a pre-versioning build. Its known
+///    keys are read as they are, keys it lacks take their defaults, and keys
+///    this build does not know are dropped; the next save stamps the current
+///    version. There is no per-version mapping code.
 pub struct CompatibilityPolicy;
 
 // ── Storage topology ─────────────────────────────────────────────────────────
@@ -110,12 +105,12 @@ pub struct CompatibilityPolicy;
 /// - **Path**: `managed\ui-preferences.conf` under the per-user configuration
 ///   root the OS declares (`nrr_shared::user_paths`): `%APPDATA%\NetRuleRouter`
 ///   on Windows, `$XDG_CONFIG_HOME/netrulerouter` elsewhere. Falls to the next
-///   candidate when one cannot be created, ending at the temp directory, which
-///   the store reports as non-persistent. Debug and release builds share it.
+///   candidate when one cannot be created, ending at the temp directory.
+///   Debug and release builds share it.
 /// - **Format**: line-oriented `key=value` text with a `# comment` header and
 ///   a `schema_version=N` field on the first non-comment line.
 /// - **Owner**: `nrr-ui-support` crate (`UiPreferencesStore`).
-/// - **Migration trigger**: automatic on first `load()` after upgrade.
+/// - **Migration trigger**: none; see rule 5 of [`CompatibilityPolicy`].
 /// - **Failure mode**: on write failure, previous file is left intact (atomic
 ///   rename via `.tmp` → target); load falls back to `UiPreferences::default()`.
 ///
@@ -134,21 +129,22 @@ pub struct CompatibilityPolicy;
 ///
 /// # Service revision store
 ///
-/// - **Path**: service-owned path, e.g.
-///   `%ProgramData%\NetRuleRouter\revisions.db` (exact path TBD).
+/// - **Path**: `nrr_service_state.db` under the service data root
+///   (`nrr_platform_api::paths::production_data_root`).
 /// - **Format**: SQLite database.
-/// - **Owner**: `nrr-windows-service` (background service process only). No
-///   other crate may write to this store.
+/// - **Owner**: the background service process only (`nrr-storage`, driven by
+///   `nrr-service-runtime`). No other process writes to this store.
 /// - **Contents**: canonical policy revisions, active revision pointer,
 ///   last-known-good pointer, per-revision integrity metadata (hash + signature
 ///   chain), import provenance, and audit events.
-/// - **Migration trigger**: explicit migration step on service startup when
-///   the stored `schema_version` is less than `SERVICE_STORE_CURRENT_VERSION`.
-///   The service must take an exclusive lock, snapshot the current store, run
-///   the migration, verify integrity, then swap the active pointer.
-/// - **Failure mode**: if migration fails, the service reverts to the
-///   pre-migration snapshot and enters read-only safe mode. It does **not**
-///   silently activate the partially migrated store.
+/// - **Migration trigger**: on open, when the recorded schema version (the
+///   highest applied step in `schema_migrations`) is below the last
+///   `MigrationDef` in `nrr-storage`'s `MIGRATIONS`. The file is first copied to
+///   `<data dir>/backups/migrations`; a failed copy refuses the upgrade.
+/// - **Failure mode**: every pending step runs in ONE immediate transaction,
+///   so a failing step rolls the whole run back and the database stays at its
+///   previous version; the open fails with `MigrationFailed`. Checksums of the
+///   applied steps are verified on every open.
 pub struct StorageTopology;
 
 // ── Migration triggers ────────────────────────────────────────────────────────
@@ -160,28 +156,26 @@ pub struct StorageTopology;
 ///
 /// # Automatic migrations (run silently on startup, safe to repeat)
 ///
-/// - **UI preferences v0 → v1**: triggered on first `UiPreferencesStore::load()`
-///   after upgrade. All v1 fields that exist in v0 are mapped directly; new
-///   fields receive their defaults. The upgraded file is written on the next
-///   `save()` call.
-/// - **Legacy filename migration**: `ui-preferences-v1.conf` → `ui-preferences.conf`
-///   (already implemented in `UiPreferencesStore::try_migrate_legacy_file`).
+/// - **UI preferences**: nothing to run. A key added in a new build is not a
+///   version bump; removing or re-meaning one is. `UiPreferencesStore::load()`
+///   reads the keys it knows, and the next `save()` stamps
+///   `CURRENT_UI_PREFS_SCHEMA_VERSION`.
 ///
 /// # Semi-automatic migrations (require passing all integrity checks)
 ///
-/// - **Service revision store schema upgrade**: triggered on service startup
-///   when `stored_schema_version < SERVICE_STORE_CURRENT_VERSION`. The service
-///   automatically takes a snapshot, runs the migration, verifies integrity,
-///   and switches the active pointer. No user interaction is required **unless**
-///   the migration fails — see failure mode in [`StorageTopology`].
+/// - **Service revision store schema upgrade**: on open, when the recorded
+///   schema version is below the last `MigrationDef` in `MIGRATIONS`. The store
+///   is snapshotted, then the pending steps run in one transaction. No user
+///   interaction is required **unless** the upgrade fails — see failure mode in
+///   [`StorageTopology`].
 ///
 /// # Blocking migrations (require explicit administrator action)
 ///
-/// - **Downgrade / unsupported version**: when the stored schema version is
-///   greater than the service's `SERVICE_STORE_CURRENT_VERSION` (file from a
-///   newer build), the service refuses to start and emits a clear error. The
-///   administrator must either upgrade the service binary or restore a
-///   compatible snapshot.
+/// - **Downgrade / unsupported version**: when the recorded schema version is
+///   greater than the last step this build knows (a file from a newer build),
+///   the open fails with `UnsupportedSchemaVersion` and policy load reports
+///   recovery required; nothing is migrated down. The administrator must either
+///   upgrade the service binary or restore a compatible snapshot.
 /// - **Corrupted integrity metadata**: the service refuses to activate any
 ///   revision whose stored hash does not match the recomputed hash. Manual
 ///   investigation and explicit operator override are required.

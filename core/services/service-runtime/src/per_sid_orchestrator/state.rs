@@ -18,6 +18,12 @@ use super::*;
 /// `PreFlightThenAllOrNothing → Strict`); tests use a constant.
 pub type FilterFailureModeSource = Arc<dyn Fn() -> FilterFailureMode + Send + Sync>;
 
+/// One reading of the links and the route table per compute: every resolver
+/// below answers from it, so a pass enumerates the machine once and sees one
+/// state of it. Defaults to an empty machine; production reads through the
+/// route coordinator (`read_machine`) and must wire it with the resolvers.
+pub type MachineReader = Arc<dyn Fn() -> MachineReading + Send + Sync>;
+
 /// resolves everything the kill-switch
 /// needs about a SID's secondary interface (LUID + catch-all exemptions).
 /// Read fresh on every apply so a secondary adapter reconnect (new LUID / new server IP)
@@ -27,7 +33,8 @@ pub type FilterFailureModeSource = Arc<dyn Fn() -> FilterFailureMode + Send + Sy
 /// unknown interface would never match, turning the paired block into a
 /// black hole). Production resolves it through the route coordinator
 /// (`kill_switch_exemptions`); tests inject a closure.
-pub type KillSwitchResolver = Arc<dyn Fn(&str) -> Option<KillSwitchResolution> + Send + Sync>;
+pub type KillSwitchResolver =
+    Arc<dyn Fn(&str, &MachineReading) -> Option<KillSwitchResolution> + Send + Sync>;
 
 /// Answers what policy may do about IPv6 for one SID's bindings this pass.
 ///
@@ -38,7 +45,7 @@ pub type KillSwitchResolver = Arc<dyn Fn(&str) -> Option<KillSwitchResolution> +
 /// shape from before the family existed; production resolves it through the
 /// route coordinator.
 pub type Ipv6GuardResolver =
-    Arc<dyn Fn(&str) -> crate::enforcement_planner::Ipv6Guard + Send + Sync>;
+    Arc<dyn Fn(&str, &MachineReading) -> crate::enforcement_planner::Ipv6Guard + Send + Sync>;
 
 /// resolves the fail-closed exemptions for a SID when the
 /// secondary is unresolvable but a fail-closed kill-switch must still arm.
@@ -46,7 +53,8 @@ pub type Ipv6GuardResolver =
 /// block-all (mode B) does not brick LAN/manageability or trap tunnel
 /// reconnection. Defaults to empty; production resolves it through the route
 /// coordinator (`fail_closed_exemptions`).
-pub type FailClosedExemptionsResolver = Arc<dyn Fn(&str) -> FailClosedExemptions + Send + Sync>;
+pub type FailClosedExemptionsResolver =
+    Arc<dyn Fn(&str, &MachineReading) -> FailClosedExemptions + Send + Sync>;
 
 /// Proactive VPN-client exemption — yields the concrete exe paths
 /// of VPN client applications whose role was VERIFIED by a kill-switch drop
@@ -139,6 +147,7 @@ pub struct PerSidApplyOrchestrator {
     /// exemptions the kill-switch needs. Defaults to "unresolved" →
     /// kill-switch off, so the feature is inert until production wires a
     /// real resolver via [`Self::with_kill_switch_resolver`].
+    pub(super) machine_reader: MachineReader,
     pub(super) kill_switch_resolver: KillSwitchResolver,
     pub(super) ipv6_guard_resolver: Ipv6GuardResolver,
     /// fail-closed exemptions resolver. Used when the
@@ -226,6 +235,9 @@ pub struct PerSidApplyOrchestrator {
     /// [`PostureLogEvent::Heartbeat`]); steady-state re-derivations between
     /// those fire at `debug`.
     pub(super) posture_log_state: Mutex<HashMap<String, PostureLogLatch>>,
+    /// Last logged `(kept, dropped, app_covered)` of the trimmed pin set per
+    /// SID: the compute runs every few seconds and the trim rarely changes.
+    pub(super) pin_trim_log_state: Mutex<HashMap<String, PinTrimCounts>>,
     /// When the provider yields a context whose scope is enabled, the codegen is
     /// augmented: the fake pool is permitted, and the real IPs a fake-routed host
     /// shares with a directly-routed one lose their `/32` permit (fed into the

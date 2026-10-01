@@ -1,4 +1,4 @@
-//! Block T (traffic counter) — Windows interface-counter source.
+//! Traffic-counter core — Windows interface-counter source.
 //!
 //! The neutral value type (`InterfaceCounters`) and the `InterfaceCounterSource`
 //! port live in `nrr-platform-api`; re-export them so

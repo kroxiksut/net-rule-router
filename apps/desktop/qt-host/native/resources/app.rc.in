@@ -1,6 +1,6 @@
 IDI_APP_ICON ICON "@APP_ICON_PATH@"
 
-// Block 16.QoL+ (2026-06-05) — version/description resource so Windows shows a
+// Version/description resource so Windows shows a
 // friendly, trustworthy name for this process. Without it, Task Manager and the
 // "Apps" view list the raw image name `nrr_qt_native_host.exe`, which looks
 // foreign/suspicious to an end user sitting under the NetRuleRouter app group.

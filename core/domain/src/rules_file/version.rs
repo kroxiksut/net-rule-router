@@ -4,8 +4,9 @@ use super::*;
 
 /// Format version recognised by this build.
 ///
-/// The header line `# NetRuleRouter rules file — version N` is parsed from the
-/// file preamble. When `N` equals this constant the file is fully understood.
+/// One format, two preamble headers: `# NetRuleRouter rules file — version N`
+/// and `# NetRuleRouter preset — version N` (the writer's form, followed by
+/// preset metadata). When `N` equals this constant the file is fully understood.
 /// When `N` is greater, known sections are still parsed but unrecognised
 /// sections/fields are ignored and [`ParseWarning::UnknownFormatVersion`] is
 /// emitted.
@@ -18,9 +19,6 @@ use super::*;
 /// of the format we actually write was greeted with "some rules may be
 /// ignored".
 pub const CURRENT_RULES_FILE_FORMAT_VERSION: u32 = 4;
-
-/// Format version recognised by this build for `# NetRuleRouter preset — version N` headers.
-pub const CURRENT_PRESET_FORMAT_VERSION: u32 = 4;
 
 /// Optional metadata declared in a preset file's preamble comments.
 ///

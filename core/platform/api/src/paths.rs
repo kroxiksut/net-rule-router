@@ -27,8 +27,7 @@ pub fn product_dir_leaf() -> &'static str {
 ///
 /// This is the READ answer. A caller about to write walks
 /// [`nrr_shared::user_paths::user_app_roots`] instead, which offers the next
-/// candidate when one cannot be created and says which of them survive a
-/// reboot.
+/// candidate when one cannot be created.
 pub fn user_config_root() -> Option<PathBuf> {
     nrr_shared::user_paths::user_config_root()
 }
@@ -138,7 +137,7 @@ pub fn ensure_user_runtime_dir() -> std::io::Result<PathBuf> {
 /// look and a create is caught either way, and a sticky `/tmp` keeps anyone
 /// else from swapping it afterwards.
 #[cfg(not(windows))]
-fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 

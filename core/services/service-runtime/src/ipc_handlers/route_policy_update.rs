@@ -69,6 +69,14 @@ impl IpcHandler for RoutePolicyUpdateHandler {
             }));
         }
 
+        if !nrr_shared::ipc_payloads::is_valid_kill_switch_protocols(req.kill_switch_protocols) {
+            return Err(map_write_error(
+                RoutePolicyWriteError::InvalidKillSwitchProtocols {
+                    bits: req.kill_switch_protocols,
+                },
+            ));
+        }
+
         match self.writer.update_for_sid(ctx.caller_stored(), &req) {
             Ok(dto) => {
                 // The policy is durably written; trigger a mid-session WFP
@@ -111,7 +119,8 @@ fn map_write_error(err: RoutePolicyWriteError) -> IpcError {
         | RoutePolicyWriteError::PlaceholderAdapter { .. }
         | RoutePolicyWriteError::PrimaryEqualsSecondary
         | RoutePolicyWriteError::StrictModeRequiresSecondary
-        | RoutePolicyWriteError::InvalidNetworkDomain => IpcError {
+        | RoutePolicyWriteError::InvalidNetworkDomain
+        | RoutePolicyWriteError::InvalidKillSwitchProtocols { .. } => IpcError {
             code: IpcErrorCode::PreconditionFailed,
             message: err.to_string(),
             diagnostics_id: None,
@@ -292,6 +301,27 @@ mod tests {
             writer.seen_sid.lock().unwrap().is_none(),
             "a binding that names no adapter of this machine must not reach storage"
         );
+    }
+
+    /// Leak protection is switched off by its master toggle; a mask with no
+    /// protocol left would read as on while blocking nothing.
+    #[test]
+    fn a_protocol_mask_that_selects_nothing_is_refused_before_the_writer() {
+        for bits in [0u16, 0x80] {
+            let writer = Arc::new(ScriptedWriter {
+                outcome: Mutex::new(Ok(sample_dto())),
+                seen_sid: Mutex::new(None),
+            });
+            let h =
+                RoutePolicyUpdateHandler::new(writer.clone() as Arc<dyn RoutePolicyWriter>, None);
+            let mut payload = bind_primary_payload("Wi-Fi");
+            payload["kill-switch-protocols"] = bits.into();
+            let err = h
+                .handle(&req(payload), &ctx("S-1-5-21-1"))
+                .expect_err("an empty mask is refused");
+            assert_eq!(err.code, IpcErrorCode::PreconditionFailed, "{bits:#x}");
+            assert!(writer.seen_sid.lock().unwrap().is_none(), "{bits:#x}");
+        }
     }
 
     #[test]

@@ -20,15 +20,11 @@
 use std::ffi::c_void;
 use std::net::{Ipv4Addr, SocketAddr};
 
-use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
+use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
 };
 use windows::Win32::Networking::WinSock::AF_INET;
-use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-};
 
 use nrr_platform_api::FlowOwnerLookup;
 
@@ -92,73 +88,104 @@ pub(crate) fn row_endpoint(addr: u32, port: u32) -> Endpoint {
     (ip, port)
 }
 
-/// Two-call `GetExtendedTcpTable`: size probe, then a right-sized read. Returns
-/// the raw table buffer, or `None` on any error.
+/// Reads of the table before giving up on one that keeps outgrowing the buffer.
+const TABLE_READ_ATTEMPTS: usize = 4;
+
+/// Rows of slack over the size the API asked for: connections open between
+/// that answer and the next read.
+const TABLE_HEADROOM_ROWS: usize = 64;
+
+/// `GetExtendedTcpTable` into a buffer grown until the table fits. Returns the
+/// raw table buffer, or `None` on a real error, which is logged.
 ///
 /// `pub(crate)`: `stale_flows` reuses this to walk the same table for a
 /// different purpose (range membership, not endpoint matching).
 pub(crate) fn read_tcp_owner_pid_table() -> Option<Vec<u8>> {
-    let mut size: u32 = 0;
-    // SAFETY: the size probe passes a null table pointer, which the API accepts,
-    // writing the required byte count into `size`. It returns
-    // ERROR_INSUFFICIENT_BUFFER when the table is non-empty.
-    let probe = unsafe {
-        GetExtendedTcpTable(
-            None,
-            &mut size,
-            false,
-            AF_INET.0 as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
-    };
-    if probe != ERROR_INSUFFICIENT_BUFFER.0 || size == 0 {
-        return None;
+    let read = read_growing(
+        std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>(),
+        TABLE_HEADROOM_ROWS * std::mem::size_of::<MIB_TCPROW_OWNER_PID>(),
+        |buffer, size| {
+            // SAFETY: `buffer` is writable for `*size` bytes, which is its full
+            // length; the API writes at most that much, or only updates `size`.
+            unsafe {
+                GetExtendedTcpTable(
+                    Some(buffer.as_mut_ptr().cast::<c_void>()),
+                    size,
+                    false,
+                    AF_INET.0 as u32,
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                )
+            }
+        },
+    );
+    match read {
+        Ok(buffer) => Some(buffer),
+        Err(TableReadError::Failed(code)) => {
+            tracing::warn!(
+                target: "nrr::conn-observe",
+                code,
+                "reading the TCP connection table failed",
+            );
+            None
+        }
+        Err(TableReadError::KeptGrowing { last_size }) => {
+            tracing::warn!(
+                target: "nrr::conn-observe",
+                last_size,
+                attempts = TABLE_READ_ATTEMPTS,
+                "the TCP connection table kept outgrowing the read buffer",
+            );
+            None
+        }
     }
-    let mut buffer = vec![0u8; size as usize];
-    // SAFETY: `buffer` is `size` bytes, exactly what the probe requested; the
-    // API fills it with a `MIB_TCPTABLE_OWNER_PID`. `size` is updated in place.
-    let code = unsafe {
-        GetExtendedTcpTable(
-            Some(buffer.as_mut_ptr().cast::<c_void>()),
-            &mut size,
-            false,
-            AF_INET.0 as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
-    };
-    if code != 0 {
-        return None;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TableReadError {
+    /// The API's error code.
+    Failed(u32),
+    /// Every attempt came back too small; the size it last asked for.
+    KeptGrowing { last_size: u32 },
+}
+
+/// Call `fetch(buffer, size)` — a Win32 "fill this, or tell me the size" API —
+/// until it succeeds, growing the buffer to the size it asks for plus
+/// `headroom`, for at most [`TABLE_READ_ATTEMPTS`] calls.
+fn read_growing(
+    initial: usize,
+    headroom: usize,
+    mut fetch: impl FnMut(&mut [u8], &mut u32) -> u32,
+) -> Result<Vec<u8>, TableReadError> {
+    let mut buffer = vec![0u8; initial];
+    let mut last_size = 0u32;
+    for _ in 0..TABLE_READ_ATTEMPTS {
+        let mut size =
+            u32::try_from(buffer.len()).map_err(|_| TableReadError::KeptGrowing { last_size })?;
+        match fetch(&mut buffer, &mut size) {
+            0 => return Ok(buffer),
+            code if code == ERROR_INSUFFICIENT_BUFFER.0 => {
+                last_size = size;
+                // Grow even on an answer no larger than the buffer, or the next
+                // attempt would fail the same way.
+                let next = (size as usize)
+                    .max(buffer.len())
+                    .saturating_add(headroom.max(1));
+                buffer.clear();
+                buffer.resize(next, 0);
+            }
+            code => return Err(TableReadError::Failed(code)),
+        }
     }
-    Some(buffer)
+    Err(TableReadError::KeptGrowing { last_size })
 }
 
 /// The lower-cased image basename (e.g. `"wireguard.exe"`) of process `pid`, or
 /// `None` when the process cannot be opened or queried (already exited, or the
 /// service lacks rights — either way self-heal simply skips this flow).
 fn process_image_basename(pid: u32) -> Option<String> {
-    // SAFETY: `OpenProcess` returns a handle we close below on every path.
-    let handle: HANDLE =
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-    let mut buf = [0u16; 260]; // MAX_PATH
-    let mut len = buf.len() as u32;
-    // SAFETY: `handle` is a live process handle; `buf`/`len` describe a valid
-    // wide-string output buffer. On success `len` is updated to the char count.
-    let result = unsafe {
-        QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        )
-    };
-    // SAFETY: `handle` was opened above and is not used after this call.
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
-    result.ok()?;
-    let full = String::from_utf16_lossy(&buf[..len as usize]);
+    let full = crate::win32_ffi::process::process_image_path(pid)?;
+    let full = full.to_string_lossy();
     let base = full
         .rsplit(['\\', '/'])
         .next()
@@ -199,6 +226,85 @@ mod tests {
             "198.18.0.7:443".parse().expect("addr"),
         );
         assert!(out.is_none());
+    }
+
+    /// A fake "fill or report the size" API over a table that is `sizes[n]`
+    /// bytes on the n-th call.
+    fn table_growing_by_call(sizes: Vec<u32>) -> impl FnMut(&mut [u8], &mut u32) -> u32 {
+        let mut call = 0usize;
+        move |buffer, size| {
+            let needed = sizes[call.min(sizes.len() - 1)];
+            call += 1;
+            assert_eq!(*size as usize, buffer.len());
+            if *size < needed {
+                *size = needed;
+                return ERROR_INSUFFICIENT_BUFFER.0;
+            }
+            buffer[0] = 0xAB;
+            0
+        }
+    }
+
+    #[test]
+    fn a_table_that_grows_between_calls_is_still_read() {
+        // Asked for 100 bytes, then the table grew past 100 + headroom.
+        let got = read_growing(8, 16, table_growing_by_call(vec![100, 200, 200]));
+        let buffer = got.expect("read on the third call");
+        assert!(buffer.len() >= 200);
+        assert_eq!(buffer[0], 0xAB);
+    }
+
+    #[test]
+    fn a_table_that_fits_is_read_in_one_call() {
+        let mut calls = 0;
+        let mut inner = table_growing_by_call(vec![4]);
+        let got = read_growing(8, 16, |b, s| {
+            calls += 1;
+            inner(b, s)
+        });
+        assert_eq!(got.map(|b| b.len()), Ok(8));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_table_outgrowing_every_attempt_is_reported_not_emptied() {
+        let sizes = (1..=TABLE_READ_ATTEMPTS as u32 + 1)
+            .map(|n| n * 10_000)
+            .collect();
+        let got = read_growing(8, 16, table_growing_by_call(sizes));
+        assert_eq!(
+            got,
+            Err(TableReadError::KeptGrowing {
+                last_size: TABLE_READ_ATTEMPTS as u32 * 10_000
+            })
+        );
+    }
+
+    #[test]
+    fn a_size_answer_no_larger_than_the_buffer_still_grows_it() {
+        let mut seen = Vec::new();
+        let got = read_growing(8, 16, |buffer, size| {
+            seen.push(buffer.len());
+            if seen.len() < 3 {
+                return ERROR_INSUFFICIENT_BUFFER.0; // `size` left as offered
+            }
+            *size = 0;
+            0
+        });
+        assert!(got.is_ok());
+        assert_eq!(seen, vec![8, 24, 40]);
+    }
+
+    #[test]
+    fn a_real_error_is_returned_as_is() {
+        let got = read_growing(8, 16, |_, _| 87); // ERROR_INVALID_PARAMETER
+        assert_eq!(got, Err(TableReadError::Failed(87)));
+    }
+
+    #[test]
+    fn the_live_table_reads() {
+        let buffer = read_tcp_owner_pid_table().expect("the TCP table is readable");
+        assert!(buffer.len() >= std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>());
     }
 
     #[test]

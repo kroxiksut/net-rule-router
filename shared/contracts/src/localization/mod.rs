@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub const LOCALE_SCHEMA_VERSION: &str = "1.0";
-pub const LOCALE_SCHEMA_PATH: &str = "configs/localization/locale.schema.v1.json";
 const RESERVED_ROOT_NAMESPACES: &[&str] = &["_system", "_service", "_internal"];
 const ALLOWED_METADATA_FIELDS: &[&str] =
     &["language", "label", "nativeLabel", "version", "fallbacks"];

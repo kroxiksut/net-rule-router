@@ -51,6 +51,16 @@ enum CompensatingAction {
     },
 }
 
+/// What a rollback left in place because its undo step failed.
+#[derive(Debug, Default)]
+pub struct RollbackResidue {
+    pub errors: Vec<PlatformError>,
+    /// Added by the transaction and still in the table.
+    pub still_added: Vec<RouteEntry>,
+    /// Removed by the transaction and still missing from the table.
+    pub still_removed: Vec<RouteEntry>,
+}
+
 // ── RoutingTransaction ────────────────────────────────────────────────────────
 
 /// Executes a batch of routing-table mutations with compensating actions.
@@ -178,44 +188,57 @@ impl RoutingTransaction {
     /// Best-effort: errors from compensating actions are collected and
     /// returned rather than aborting the rollback loop.
     pub fn rollback(&mut self) -> Vec<PlatformError> {
-        let mut errors = Vec::new();
+        self.rollback_with_residue().errors
+    }
+
+    /// [`Self::rollback`], also naming the mutations it could not undo, so a
+    /// caller tracking what it owns in the table can stay accurate.
+    pub fn rollback_with_residue(&mut self) -> RollbackResidue {
+        let mut residue = RollbackResidue::default();
         // Drain in reverse — last action undone first.
         while let Some(undo) = self.compensating.pop() {
-            let result = match &undo {
+            match undo {
                 CompensatingAction::DeleteRoute(entry) => {
-                    // Undo AddRoute: delete what we added.
-                    match self.api.delete_ip_forward_entry(entry) {
-                        Err(e) if e.classify() == ErrorClass::Idempotent => Ok(()),
-                        other => other,
+                    if let Err(e) = self.delete_tolerant(&entry) {
+                        residue.errors.push(e);
+                        residue.still_added.push(entry);
                     }
                 }
                 CompensatingAction::AddRoute(entry) => {
-                    // Undo DeleteRoute: re-add what we deleted.
-                    match self.api.create_ip_forward_entry(entry) {
-                        Err(e) if e.classify() == ErrorClass::Idempotent => Ok(()),
-                        other => other,
+                    if let Err(e) = self.create_tolerant(&entry) {
+                        residue.errors.push(e);
+                        residue.still_removed.push(entry);
                     }
                 }
                 CompensatingAction::SwapRoute {
                     delete_new,
                     restore_old,
                 } => {
-                    // Undo UpdateRoute: delete new entry, restore old.
-                    let _ = match self.api.delete_ip_forward_entry(delete_new) {
-                        Err(e) if e.classify() == ErrorClass::Idempotent => Ok(()),
-                        other => other,
-                    };
-                    match self.api.create_ip_forward_entry(restore_old) {
-                        Err(e) if e.classify() == ErrorClass::Idempotent => Ok(()),
-                        other => other,
+                    if self.delete_tolerant(&delete_new).is_err() {
+                        residue.still_added.push(delete_new);
+                    }
+                    if let Err(e) = self.create_tolerant(&restore_old) {
+                        residue.errors.push(e);
+                        residue.still_removed.push(restore_old);
                     }
                 }
-            };
-            if let Err(e) = result {
-                errors.push(e);
             }
         }
-        errors
+        residue
+    }
+
+    fn delete_tolerant(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+        match self.api.delete_ip_forward_entry(entry) {
+            Err(e) if e.classify() == ErrorClass::Idempotent => Ok(()),
+            other => other,
+        }
+    }
+
+    fn create_tolerant(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+        match self.api.create_ip_forward_entry(entry) {
+            Err(e) if e.classify() == ErrorClass::Idempotent => Ok(()),
+            other => other,
+        }
     }
 
     /// Discard the journal after a successful apply + verify.
@@ -413,6 +436,45 @@ mod tests {
         assert!(errors.is_empty());
         let table = api.get_ip_forward_table().unwrap();
         assert!(table.is_empty(), "r1 must have been rolled back");
+    }
+
+    fn fatal() -> PlatformError {
+        PlatformError::Win32 {
+            operation: "simulated",
+            code: 0x5, // ERROR_ACCESS_DENIED → Fatal
+            message: "simulated fatal".into(),
+        }
+    }
+
+    /// A caller that tracks what it owns needs to know which undo steps did
+    /// not land; a clean rollback leaves nothing behind.
+    #[test]
+    fn rollback_residue_names_what_could_not_be_undone() {
+        let api = api();
+        let kept = route([10, 0, 0, 0], [192, 168, 1, 1], 5, true);
+        let dropped = route([10, 0, 1, 0], [192, 168, 1, 1], 5, true);
+        api.create_ip_forward_entry(&dropped).unwrap();
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        tx.execute(&[
+            RoutingAction::DeleteRoute(dropped.clone()),
+            RoutingAction::AddRoute(kept.clone()),
+        ])
+        .unwrap();
+
+        // Every undo fails: the add stays, the delete stays undone.
+        api.set_force_error(Some(fatal()));
+        let residue = tx.rollback_with_residue();
+        assert_eq!(residue.errors.len(), 2);
+        assert_eq!(residue.still_added, vec![kept.clone()]);
+        assert_eq!(residue.still_removed, vec![dropped.clone()]);
+
+        // Positive control: the same transaction shape rolls back cleanly.
+        api.set_force_error(None);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        tx.execute(&[RoutingAction::AddRoute(dropped)]).unwrap();
+        let residue = tx.rollback_with_residue();
+        assert!(residue.errors.is_empty());
+        assert!(residue.still_added.is_empty() && residue.still_removed.is_empty());
     }
 
     #[test]

@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn builds_a_response_with_pointer_ttl_and_rdata() {
         let q = query("assistant.example", QTYPE_A);
-        let resp = build_a_response(&q, &[ip(23, 10, 20, 159)], 60).expect("resp");
+        let resp = build_a_response(&q, &[ip(203, 0, 113, 159)], 60).expect("resp");
         // QR set, RA set, RCODE 0.
         assert_eq!(resp[2] & 0x80, 0x80, "QR bit");
         assert_eq!(resp[2] & 0x01, 0x01, "RD preserved");
@@ -811,12 +811,12 @@ mod tests {
             "TTL"
         );
         assert_eq!(u16::from_be_bytes([ans[10], ans[11]]), 4, "RDLENGTH");
-        assert_eq!(&ans[12..16], &[23, 10, 20, 159], "RDATA");
+        assert_eq!(&ans[12..16], &[203, 0, 113, 159], "RDATA");
     }
 
     #[test]
     fn a_response_none_when_no_ips() {
-        assert!(build_a_response(&query("x.com", QTYPE_A), &[], 60).is_none());
+        assert!(build_a_response(&query("short.example", QTYPE_A), &[], 60).is_none());
     }
 
     #[test]
@@ -912,7 +912,7 @@ mod tests {
 
         // Same question type, wrong record width inside: the answer section is
         // an AAAA record delivered under an `A` question.
-        let mut forged = build_a_response(&a_q, &[ip(1, 2, 3, 4)], 60).expect("resp");
+        let mut forged = build_a_response(&a_q, &[ip(100, 64, 1, 4)], 60).expect("resp");
         let rr_start = parse_question(&a_q).expect("q").question_end;
         forged[rr_start + 2..rr_start + 4].copy_from_slice(&QTYPE_AAAA.to_be_bytes());
         assert_eq!(
@@ -938,13 +938,13 @@ mod tests {
     #[test]
     fn only_v4_keeps_the_v4_half() {
         let mixed = [
-            IpAddr::V4(ip(1, 2, 3, 4)),
+            IpAddr::V4(ip(100, 64, 1, 4)),
             ip6("2001:db8::1"),
-            IpAddr::V4(ip(5, 6, 7, 8)),
+            IpAddr::V4(ip(100, 64, 5, 8)),
         ];
         assert_eq!(
             only_v4(&mixed),
-            vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)],
+            vec![Ipv4Addr::new(100, 64, 1, 4), Ipv4Addr::new(100, 64, 5, 8)],
         );
     }
 
@@ -953,12 +953,13 @@ mod tests {
         let q = build_address_query(7, "assistant.example", QTYPE_A).expect("query");
         // Reuse the server-side builder, then rewrite the two answer TTLs to
         // differ so min-TTL selection is observable.
-        let mut resp = build_a_response(&q, &[ip(1, 2, 3, 4), ip(5, 6, 7, 8)], 300).expect("resp");
+        let mut resp =
+            build_a_response(&q, &[ip(100, 64, 1, 4), ip(100, 64, 5, 8)], 300).expect("resp");
         let ans2_ttl_at = parse_question(&q).expect("q").question_end + 16 + 6;
         resp[ans2_ttl_at..ans2_ttl_at + 4].copy_from_slice(&120u32.to_be_bytes());
         match parse_address_response(7, "assistant.example", QTYPE_A, &resp) {
             AddressResponseOutcome::Answers { addresses, min_ttl } => {
-                assert_eq!(addresses, vec![ip(1, 2, 3, 4), ip(5, 6, 7, 8)]);
+                assert_eq!(addresses, vec![ip(100, 64, 1, 4), ip(100, 64, 5, 8)]);
                 assert_eq!(min_ttl, 120);
             }
             other => panic!("expected answers, got {other:?}"),
@@ -997,10 +998,10 @@ mod tests {
         resp.extend_from_slice(&[0x00, 0x01]);
         resp.extend_from_slice(&45u32.to_be_bytes());
         resp.extend_from_slice(&[0x00, 0x04]);
-        resp.extend_from_slice(&[9, 9, 9, 9]);
+        resp.extend_from_slice(&[100, 64, 9, 9]);
         match parse_address_response(9, "www.example.com", QTYPE_A, &resp) {
             AddressResponseOutcome::Answers { addresses, min_ttl } => {
-                assert_eq!(addresses, vec![ip(9, 9, 9, 9)]);
+                assert_eq!(addresses, vec![ip(100, 64, 9, 9)]);
                 assert_eq!(min_ttl, 45, "CNAME TTL must not participate");
             }
             other => panic!("expected answers, got {other:?}"),
@@ -1046,7 +1047,7 @@ mod tests {
     fn a_response_rejects_addresses_owned_by_an_unrelated_name() {
         let q = build_address_query(11, "secure.example", QTYPE_A).expect("query");
         let mut resp = response_frame(&q, 3);
-        push_a_rr(&mut resp, &[0xC0, 0x0C], ip(23, 10, 20, 135), 300);
+        push_a_rr(&mut resp, &[0xC0, 0x0C], ip(203, 0, 113, 135), 300);
         push_a_rr(
             &mut resp,
             &encoded("assistant.example"),
@@ -1063,7 +1064,7 @@ mod tests {
             AddressResponseOutcome::Answers { addresses, .. } => {
                 assert_eq!(
                     addresses,
-                    vec![ip(23, 10, 20, 135)],
+                    vec![ip(203, 0, 113, 135)],
                     "only the question's own address survives"
                 );
             }
@@ -1096,7 +1097,12 @@ mod tests {
     fn a_response_accepts_a_record_preceding_its_cname() {
         let q = build_address_query(13, "www.example.com", QTYPE_A).expect("query");
         let mut resp = response_frame(&q, 2);
-        push_a_rr(&mut resp, &encoded("edge.example.com"), ip(9, 9, 9, 9), 45);
+        push_a_rr(
+            &mut resp,
+            &encoded("edge.example.com"),
+            ip(100, 64, 9, 9),
+            45,
+        );
         // CNAME www.example.com → edge.example.com, emitted last.
         resp.extend_from_slice(&[0xC0, 0x0C]);
         resp.extend_from_slice(&QTYPE_CNAME.to_be_bytes());
@@ -1107,7 +1113,7 @@ mod tests {
         resp.extend_from_slice(&target);
         match parse_address_response(13, "www.example.com", QTYPE_A, &resp) {
             AddressResponseOutcome::Answers { addresses, min_ttl } => {
-                assert_eq!(addresses, vec![ip(9, 9, 9, 9)]);
+                assert_eq!(addresses, vec![ip(100, 64, 9, 9)]);
                 assert_eq!(min_ttl, 45);
             }
             other => panic!("expected answers, got {other:?}"),
@@ -1134,7 +1140,7 @@ mod tests {
             AddressResponseOutcome::NoRecords
         );
         // Wrong id / wrong question / a query frame → Mismatch.
-        let ok = build_a_response(&q, &[ip(1, 1, 1, 1)], 60).expect("ok");
+        let ok = build_a_response(&q, &[ip(100, 64, 1, 1)], 60).expect("ok");
         assert_eq!(
             parse_address_response(4, "x.example", QTYPE_A, &ok),
             AddressResponseOutcome::Mismatch
@@ -1190,9 +1196,9 @@ mod tests {
 
     #[test]
     fn ptr_query_encodes_reversed_in_addr_arpa() {
-        let q = build_ptr_query(0x1234, ip(8, 8, 4, 4)).expect("query");
+        let q = build_ptr_query(0x1234, ip(198, 51, 100, 4)).expect("query");
         let parsed = parse_question(&q).expect("parse");
-        assert_eq!(parsed.qname, "4.4.8.8.in-addr.arpa");
+        assert_eq!(parsed.qname, "4.100.51.198.in-addr.arpa");
         assert_eq!(parsed.qtype, QTYPE_PTR);
         assert_eq!(u16::from_be_bytes([q[0], q[1]]), 0x1234);
         assert_eq!(q[2] & 0x01, 0x01, "RD set");
@@ -1200,8 +1206,8 @@ mod tests {
 
     #[test]
     fn ptr_response_collects_target_names() {
-        let resp = ptr_response(5, ip(23, 10, 20, 138), &["example.com", "www.example.com"]);
-        match parse_ptr_response(5, ip(23, 10, 20, 138), &resp) {
+        let resp = ptr_response(5, ip(203, 0, 113, 138), &["example.com", "www.example.com"]);
+        match parse_ptr_response(5, ip(203, 0, 113, 138), &resp) {
             PtrResponseOutcome::Names(names) => {
                 assert_eq!(names, vec!["example.com", "www.example.com"]);
             }
@@ -1234,11 +1240,11 @@ mod tests {
             resp.extend_from_slice(&rdata);
         }
 
-        let addr = ip(23, 10, 20, 138);
+        let addr = ip(203, 0, 113, 138);
         let mut resp = ptr_response(7, addr, &["example.com"]);
         // A second answer, filed under an unrelated owner.
         resp[6..8].copy_from_slice(&2u16.to_be_bytes());
-        push_foreign_ptr_rr(&mut resp, "1.2.3.4.in-addr.arpa", "attacker.example");
+        push_foreign_ptr_rr(&mut resp, "100.64.1.4.in-addr.arpa", "attacker.example");
 
         match parse_ptr_response(7, addr, &resp) {
             PtrResponseOutcome::Names(names) => {
@@ -1257,7 +1263,7 @@ mod tests {
         // RDATA target uses a compression pointer back into the question's
         // `in-addr.arpa` suffix — decode_name must follow it.
         let id = 6;
-        let target_ip = ip(1, 2, 3, 4);
+        let target_ip = ip(100, 64, 1, 4);
         let q = build_ptr_query(id, target_ip).expect("q");
         let mut resp = q.clone();
         resp[2] = 0x80;
@@ -1269,8 +1275,8 @@ mod tests {
         resp.extend_from_slice(&[0x00, 0x01]);
         resp.extend_from_slice(&3600u32.to_be_bytes());
         // Offset of "in-addr.arpa" inside the question: header(12) + labels for
-        // "4.2.3.1" = 4 labels ("4","2","3","1") each 2 bytes = 8 → 12+8 = 20.
-        let in_addr_off: u16 = 0x0C + 8;
+        // "4.1.64.100" = labels of 2+2+3+4 bytes = 11 → 12+11 = 23.
+        let in_addr_off: u16 = 0x0C + 11;
         let mut rdata = Vec::new();
         rdata.push(4);
         rdata.extend_from_slice(b"host");
@@ -1285,7 +1291,7 @@ mod tests {
 
     #[test]
     fn ptr_response_classifies_errors_and_mismatches() {
-        let target_ip = ip(1, 1, 1, 1);
+        let target_ip = ip(100, 64, 1, 1);
         let q = build_ptr_query(3, target_ip).expect("q");
         let nx = build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
         assert_eq!(
@@ -1304,7 +1310,7 @@ mod tests {
             PtrResponseOutcome::Mismatch
         );
         assert_eq!(
-            parse_ptr_response(3, ip(9, 9, 9, 9), &ok),
+            parse_ptr_response(3, ip(100, 64, 9, 9), &ok),
             PtrResponseOutcome::Mismatch
         );
         // TC → Truncated.

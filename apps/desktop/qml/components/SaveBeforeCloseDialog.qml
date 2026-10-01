@@ -8,8 +8,7 @@ import "../theme"
 // rules revision diverges from the last file sync. Lets the user:
 //   - Save to existing imported paths (`prefs.lastSavedPath_<role>`)
 //   - Save As... (user picks new paths)
-//   - Discard & rollback (revert active to last_file_synced_revision_id;
-//     when None, import empty preset to produce an empty revision)
+//   - Discard & rollback (review an empty preset on both routes)
 //   - Cancel (abort close)
 //
 // The dialog does NOT trigger on close-to-tray — data preserved.
@@ -137,7 +136,7 @@ Dialog {
             }
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("dialog.save-before-close.cancel", "Cancel")
+                text: root.tr("action.cancel", "Cancel")
                 onClicked: { root.cancelled(); root.close() }
             }
         }

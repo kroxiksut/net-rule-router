@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn disabled_scope_yields_an_empty_plan() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("assistant.example", vec![ip(23, 10, 20, 140)]);
+        cache.set_ips("assistant.example", vec![ip(203, 0, 113, 140)]);
         let plan = plan_fake_ip_enforcement(
             &FakeIpScope::disabled(),
             &CanonicalRuleSet::from_rules(vec![fqdn_rule("assistant.example")]),
@@ -245,7 +245,7 @@ mod tests {
         let cache = MockFqdnCacheLookup::new();
         cache.set_ips(
             "assistant.example",
-            vec![ip(23, 10, 20, 140), ip(23, 10, 20, 141)],
+            vec![ip(203, 0, 113, 140), ip(203, 0, 113, 141)],
         );
         let plan = plan_fake_ip_enforcement(
             &FakeIpScope::enabled(Vec::<String>::new()),
@@ -262,20 +262,20 @@ mod tests {
     fn only_the_ip_a_direct_host_shares_is_suppressed() {
         let cache = MockFqdnCacheLookup::new();
         // .32 is shared with a direct host (a non-scope host on the same CDN IP);
-        // .33 is unique to chatgpt.
+        // .33 is unique to assistant.
         cache.set_ips(
             "assistant.example",
-            vec![ip(23, 10, 20, 140), ip(23, 10, 20, 141)],
+            vec![ip(203, 0, 113, 140), ip(203, 0, 113, 141)],
         );
         let plan = plan_fake_ip_enforcement(
             &FakeIpScope::enabled(Vec::<String>::new()),
             &CanonicalRuleSet::from_rules(vec![fqdn_rule("assistant.example")]),
             &cache,
-            &SharedSet(vec![ip(23, 10, 20, 140)]),
+            &SharedSet(vec![ip(203, 0, 113, 140)]),
         );
         // Pinning the shared one would drag its direct co-tenant into the
         // tunnel; the unshared one has no co-tenant to drag.
-        assert_eq!(plan.suppress_ips, vec![ip(23, 10, 20, 140)]);
+        assert_eq!(plan.suppress_ips, vec![ip(203, 0, 113, 140)]);
     }
 
     /// Regression guard: an address a direct host also uses must never keep a
@@ -284,8 +284,8 @@ mod tests {
     #[test]
     fn a_shared_ip_is_never_left_pinnable_to_the_tunnel() {
         let cache = MockFqdnCacheLookup::new();
-        let shared = ip(23, 10, 20, 152);
-        cache.set_ips("gemini.search.example", vec![shared]);
+        let shared = ip(203, 0, 113, 152);
+        cache.set_ips("ai.search.example", vec![shared]);
         cache.set_ips(
             "aistudio.search.example",
             vec![shared, ip(216, 58, 198, 46)],
@@ -293,7 +293,7 @@ mod tests {
         let plan = plan_fake_ip_enforcement(
             &FakeIpScope::enabled(Vec::<String>::new()),
             &CanonicalRuleSet::from_rules(vec![
-                fqdn_rule("gemini.search.example"),
+                fqdn_rule("ai.search.example"),
                 fqdn_rule("aistudio.search.example"),
             ]),
             &cache,
@@ -319,18 +319,18 @@ mod tests {
     #[test]
     fn a_suffix_rule_enumerates_cached_subhosts() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("api.openai.com", vec![ip(104, 18, 0, 1)]);
-        cache.set_ips("cdn.openai.com", vec![ip(104, 18, 0, 2)]);
+        cache.set_ips("api.assistant.test", vec![ip(203, 0, 113, 201)]);
+        cache.set_ips("cdn.assistant.test", vec![ip(203, 0, 113, 202)]);
         // Both shared, so the suffix fan-out itself is what is under test here.
         let plan = plan_fake_ip_enforcement(
             &FakeIpScope::enabled(Vec::<String>::new()),
-            &CanonicalRuleSet::from_rules(vec![suffix_rule("openai.com")]),
+            &CanonicalRuleSet::from_rules(vec![suffix_rule("assistant.test")]),
             &cache,
-            &SharedSet(vec![ip(104, 18, 0, 1), ip(104, 18, 0, 2)]),
+            &SharedSet(vec![ip(203, 0, 113, 201), ip(203, 0, 113, 202)]),
         );
         let mut got = plan.suppress_ips;
         got.sort();
-        assert_eq!(got, vec![ip(104, 18, 0, 1), ip(104, 18, 0, 2)]);
+        assert_eq!(got, vec![ip(203, 0, 113, 201), ip(203, 0, 113, 202)]);
     }
 
     fn ctx(enabled: bool) -> FakeIpEnforcementContext {
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn augmentation_is_empty_when_fake_ip_is_off() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("assistant.example", vec![ip(23, 10, 20, 140)]);
+        cache.set_ips("assistant.example", vec![ip(203, 0, 113, 140)]);
         let aug = augment_codegen_for_fake_ip(
             "S",
             &ctx(false),
@@ -365,11 +365,11 @@ mod tests {
         let cache = MockFqdnCacheLookup::new();
         cache.set_ips(
             "assistant.example",
-            vec![ip(23, 10, 20, 140), ip(23, 10, 20, 141)],
+            vec![ip(203, 0, 113, 140), ip(203, 0, 113, 141)],
         );
         // .32 is shared with a direct host (in the base denylist).
         let mut base = HashSet::new();
-        base.insert(ip(23, 10, 20, 140));
+        base.insert(ip(203, 0, 113, 140));
         let aug = augment_codegen_for_fake_ip(
             "S-1-5-21-3",
             &ctx(true),
@@ -378,9 +378,9 @@ mod tests {
             &base,
             false,
         );
-        // Only the shared .32 loses its /32 permit; .33 belongs to chatgpt
+        // Only the shared .32 loses its /32 permit; .33 belongs to assistant
         // alone and keeps the route its rule already implies.
-        assert_eq!(aug.denylist_additions, vec![ip(23, 10, 20, 140)]);
+        assert_eq!(aug.denylist_additions, vec![ip(203, 0, 113, 140)]);
         // A real address is never blocked outright: the shared one would take
         // its direct co-tenant down with it, the unshared one is simply routed.
         assert!(
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn udp_relay_enabled_drops_pool_udp_blocks() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("assistant.example", vec![ip(23, 10, 20, 140)]);
+        cache.set_ips("assistant.example", vec![ip(203, 0, 113, 140)]);
         let aug = augment_codegen_for_fake_ip(
             "S-1-5-21-3",
             &ctx(true),

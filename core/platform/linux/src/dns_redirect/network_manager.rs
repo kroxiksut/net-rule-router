@@ -8,6 +8,7 @@
 //! nothing else does.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use nrr_platform_api::dns::{SystemDnsServersPort, UpstreamDnsCandidate};
 use nrr_platform_api::dns_redirect::{RedirectHandle, RedirectState, SystemDnsRedirectPort};
@@ -131,7 +132,40 @@ impl<C: DnsCommands> NetworkManagerDnsRedirect<C> {
         std::fs::read_to_string(self.files.nm_drop_in())
             .is_ok_and(|text| super::resolv_conf::is_ours(&text))
     }
+
+    /// Our drop-in stands and the file leads to `listener`. A loopback server
+    /// first is a local cache NetworkManager runs in front of us, which
+    /// forwards to us.
+    fn reaches(&self, listener: Ipv4Addr) -> bool {
+        let first = std::fs::read_to_string(&self.files.resolv_conf)
+            .ok()
+            .and_then(|text| nameservers(&text).first().copied());
+        self.drop_in_is_ours()
+            && first.is_some_and(|server| server == listener || server.is_loopback())
+    }
+
+    /// Whether NetworkManager wrote the file from the drop-in it just took.
+    /// `dns=none` or `rc-manager=unmanaged` take the drop-in and never write
+    /// the file, so re-writing the drop-in changes nothing.
+    pub(crate) fn writes_listener(&self, listener: SocketAddr) -> bool {
+        let Ok(listener) = super::loopback_listener_v4(listener) else {
+            return false;
+        };
+        let deadline = Instant::now() + WRITE_SETTLE;
+        loop {
+            if self.reaches(listener) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
+
+/// How long NetworkManager gets to write the file after its reload returns.
+const WRITE_SETTLE: Duration = Duration::from_secs(1);
 
 impl<C: DnsCommands> SystemDnsRedirectPort for NetworkManagerDnsRedirect<C> {
     fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
@@ -174,11 +208,12 @@ impl<C: DnsCommands> SystemDnsRedirectPort for NetworkManagerDnsRedirect<C> {
         })
     }
 
-    fn inspect(&self, _handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
-        // NetworkManager keeps writing what the drop-in says; the drop-in is
-        // what can go missing. The file may name a local cache NetworkManager
-        // runs in front of us, so it is not the test here.
-        Ok(if self.drop_in_is_ours() {
+    fn inspect(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
+        // The drop-in can go missing, and NetworkManager can stop taking it
+        // (`dns=none`, a reload that rejected it) with the drop-in intact:
+        // the file then names someone else.
+        let listener = super::loopback_listener_v4(handle.listener)?;
+        Ok(if self.reaches(listener) {
             RedirectState::Active
         } else {
             RedirectState::Inactive

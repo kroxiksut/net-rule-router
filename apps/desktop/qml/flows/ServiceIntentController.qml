@@ -1,14 +1,13 @@
 import QtQuick 2.15
+import "../lib/pure.js" as Pure
 
 // Non-visual controller for SERVICE INTENT: what the user actually decided
-// about the settings the service owns, and pushing that back into a service
-// that disagrees.
+// about the settings the service owns, and what to do when the service
+// disagrees.
 //
-// Extracted from Main.qml (thin-shell rule). This is what makes the service the
-// source of truth about STATE without making it the source of truth about
-// INTENT: a wiped or freshly installed state DB answers with its own defaults,
-// and replaying the record is what stops those defaults from silently becoming
-// the user's settings.
+// The service is the source of truth about STATE, not about INTENT: a wiped or
+// freshly installed state DB answers with its own defaults, and the record is
+// what lets the GUI show that difference instead of silently adopting them.
 //
 // `serviceIntentReplayed` stays a signal ON THE WINDOW rather than moving here:
 // two settings panels listen for it in `Connections { target: root }` blocks
@@ -24,7 +23,7 @@ QtObject {
     /// The service-owned settings the user has actually decided about, as a
     /// map of WIRE key -> value. Distinct from the display mirror above: the
     /// mirror records what the service last said, this records what the user
-    /// asked for. Only the second one may be replayed back to the service.
+    /// asked for. Only the second one is compared with the service.
     /// Degrades to "nothing recorded" on any parse error.
     function _readServiceIntent() {
         var raw = String((root.prefs && root.prefs.serviceIntentJson) || "")
@@ -38,49 +37,96 @@ QtObject {
         }
     }
 
-    /// Record what the user asked a service-owned setting to be. Called from
-    /// the single write path (`root.applyServiceStabilityPatch`) for user-originated
-    /// changes only, so a read-back, a replay or an internal re-seed can never
-    /// masquerade as a decision the user made.
-    function _recordServiceIntent(values) {
-        if (!values || typeof values !== "object") return
-        var intent = _readServiceIntent()
-        var changed = false
-        for (var key in values) {
-            var value = values[key]
-            if (value === undefined) continue
-            if (JSON.stringify(intent[key]) === JSON.stringify(value)) continue
-            intent[key] = value
-            changed = true
-        }
-        if (!changed) return
-        root.prefs.serviceIntentJson = JSON.stringify({ "stability": intent })
-        root.emitPrefs()
+    /// Recorded intents the service holds otherwise, as wire key ->
+    /// { mine, service }. The settings panels show these instead of the GUI
+    /// silently rewriting a machine-wide value.
+    property var divergence: ({})
+
+    /// Whether this GUI process itself runs elevated. A live broker session
+    /// does not count.
+    function _appElevated() {
+        if (typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.isElevated !== "function")
+            return false
+        return !!nrrNativeBridge.isElevated()
     }
 
-    /// Push the user's recorded decisions back into a service that disagrees
-    /// with them. This is what makes a service the source of truth about
-    /// *state* without making it the source of truth about *intent*: a wiped
-    /// or freshly installed state DB answers with its own defaults, and
-    /// without this the GUI would adopt those defaults and the user's settings
-    /// would silently disappear.
-    ///
-    /// Keys the user parked while offline are skipped — the pending-changes
-    /// dialog owns those, and replaying them here would apply changes the user
-    /// has not confirmed yet.
-    /// Attempts left in the current replay run, and the backoff between them.
+    /// Record what the user asked a service-owned setting to be, once the
+    /// service CONFIRMED the write merged onto `before`. Called from the single
+    /// write path (`root.applyServiceStabilityPatch`) for user-originated
+    /// changes only, so a read-back, a replay or an internal re-seed can never
+    /// masquerade as a decision the user made. A refused or unanswered write
+    /// records nothing: it would come back on every start.
+    function _recordServiceIntentAfterWrite(partial, before) {
+        var next = Pure.stabilityIntentAfterWrite(_readServiceIntent(), partial || {},
+                                                  before || {}, _appElevated())
+        if (next !== null) {
+            root.prefs.serviceIntentJson = JSON.stringify({ "stability": next })
+            root.emitPrefs()
+        }
+        _dropDivergence(partial)
+    }
+
+    /// The user just chose these keys themselves; what the service holds now is
+    /// their word, not an administrator's.
+    function _dropDivergence(values) {
+        var next = {}
+        var dropped = false
+        for (var key in divergence) {
+            if (values && values.hasOwnProperty(key)) { dropped = true; continue }
+            next[key] = divergence[key]
+        }
+        if (dropped) divergence = next
+    }
+
+    /// "Apply my choice" on a divergence line. An ordinary user write, so the
+    /// launcher may ask for administrator approval: the click is the gesture.
+    function applyMine(key) {
+        var row = divergence[key]
+        if (!row) return
+        var partial = {}
+        partial[key] = row["mine"]
+        root.applyServiceStabilityPatch(partial, function(ok, code) {
+            if (!ok) {
+                root.statusLine = root.tr("status.route-policy-failed",
+                        "Could not save the setting to the service: ")
+                    + ((typeof root.ipcErrorLabel === "function")
+                        ? root.ipcErrorLabel(String(code || "unknown"))
+                        : String(code || "unknown"))
+                return
+            }
+            // The panels re-read on this signal and show the value just applied.
+            root.serviceIntentReplayed()
+        }, "user:intent-apply")
+    }
+
+    /// "Keep the service value" on a divergence line: forget the recorded
+    /// choice, so the line does not come back on the next connect.
+    function keepServiceValue(key) {
+        var next = Pure.stabilityIntentWithout(_readServiceIntent(), key)
+        if (next !== null) {
+            root.prefs.serviceIntentJson = JSON.stringify({ "stability": next })
+            root.emitPrefs()
+        }
+        var gone = {}
+        gone[key] = true
+        _dropDivergence(gone)
+    }
+
+    /// Attempts left in the current reconcile run, and the backoff between them.
     /// A connect lands while the service is still migrating its database and
-    /// arming enforcement, so its IPC is at its slowest exactly when we ask —
-    /// a single attempt loses the user's settings to that root.
+    /// arming enforcement, so its IPC is at its slowest exactly when we ask.
     property int _serviceIntentAttemptsLeft: 0
     readonly property var _serviceIntentBackoffMs: [2000, 6000, 15000]
     property var _serviceIntentRetryTimer: null
 
-    /// Set when the user changes a service-owned setting themselves. A replay
-    /// that fires afterwards would push the older recorded value over the
-    /// fresher one, so it stands down instead.
+    /// Set when the user changes a service-owned setting themselves: their
+    /// write settles the difference, so a pending retry stands down.
     property bool _serviceIntentSupersededByUser: false
 
+    /// Compare the user's recorded decisions with the service on connect.
+    /// Nothing is written back: a machine-wide value is never replayed unasked,
+    /// so every difference is shown (`divergence`) for the user to settle.
     function replayServiceIntentToService() {
         _serviceIntentSupersededByUser = false
         _serviceIntentAttemptsLeft = _serviceIntentBackoffMs.length
@@ -92,11 +138,9 @@ QtObject {
         var hasIntent = false
         for (var probe in intent) { hasIntent = true; break }
         if (!hasIntent) {
-            // Not a failure, but not nothing either: it means no setting the
-            // user changed while the service was down is waiting to be
-            // delivered. Told apart from "the replay ran" only by this line —
-            // and telling them apart is the whole triage.
-            console.log("service-intent replay: nothing recorded to replay")
+            // Logged so triage can tell "nothing recorded" from "the read ran".
+            console.log("service-intent reconcile: nothing recorded to compare")
+            divergence = ({})
             root.serviceIntentReplayed()
             return
         }
@@ -117,35 +161,15 @@ QtObject {
                 _scheduleServiceIntentRetry("read-failed:" + String(code || ""))
                 return
             }
-            var live = payload || {}
-            var patch = {}
-            var diverged = false
-            for (var key in intent) {
-                if (parked.hasOwnProperty(key)) continue
-                if (JSON.stringify(live[key]) === JSON.stringify(intent[key])) continue
-                patch[key] = intent[key]
-                diverged = true
-            }
-            if (!diverged) {
-                console.log("service-intent replay: the service already holds every",
-                            "recorded intent — nothing to push")
-                _serviceIntentAttemptsLeft = 0
-                root.serviceIntentReplayed()
-                return
-            }
-            console.log("service-intent replay: pushing", JSON.stringify(patch))
-            root.applyServiceStabilityPatch(patch, function(ok2, code2) {
-                if (ok2) {
-                    _serviceIntentAttemptsLeft = 0
-                    root.serviceIntentReplayed()
-                    return
-                }
-                _scheduleServiceIntentRetry("write-failed:" + String(code2 || ""))
-            }, "intent-replay")
+            divergence = Pure.stabilityIntentDivergence(intent, payload || {}, parked)
+            console.log("service-intent reconcile: recorded intents the service holds otherwise:",
+                        Object.keys(divergence).length)
+            _serviceIntentAttemptsLeft = 0
+            root.serviceIntentReplayed()
         })
     }
 
-    /// Retry unless we are out of attempts or the reason to replay is gone.
+    /// Retry unless we are out of attempts or the reason to compare is gone.
     /// Emits `root.serviceIntentReplayed()` on the last failure too: the panels
     /// wait on that signal to re-read, and leaving them waiting forever would
     /// be worse than reporting a service we could not reconcile with.

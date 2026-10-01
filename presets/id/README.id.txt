@@ -11,6 +11,4 @@ Struktur yang diharapkan:
 - id/<pack-name>/rules_secondary.txt
 
 Penulis: kontributor repositori
-
-Catatan:
-- Konten paket awal dapat dihasilkan AI dan mungkin belum terverifikasi.
+Diperiksa: September 2026 (daftar rute secondary, berdasarkan laporan publik)

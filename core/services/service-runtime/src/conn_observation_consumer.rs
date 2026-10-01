@@ -343,10 +343,11 @@ pub struct ConnectionObservationConsumer {
     coordinator: Arc<SecondaryRouteCoordinator>,
     active_sid: ActiveSidFn,
     /// Whether to emit the per-connection detail line (process + remote IP +
-    /// egress) to the operational NDJSON. Off when the user enabled only the
-    /// GUI-stream output (the panel is pushed to directly instead). The aggregate
-    /// per-tick summary is logged regardless — it carries counts, no PII.
-    log_ndjson: bool,
+    /// egress) to the operational NDJSON. Shared with the settings writer so
+    /// the toggle applies without a restart; read once per batch. The
+    /// aggregate per-tick summary is logged regardless — it carries counts,
+    /// no PII.
+    log_ndjson: Arc<AtomicBool>,
     /// App-routing via observation — when wired, every observed
     /// `(process → remote IP)` is recorded here so the WFP codegen can route an
     /// `Application` rule's traffic via the secondary adapter. `None` keeps the

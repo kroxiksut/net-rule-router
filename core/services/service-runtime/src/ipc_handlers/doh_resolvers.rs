@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn get_returns_stored_list() {
         let store = Arc::new(MemStore {
-            entries: Mutex::new(vec![entry("ip", "8.8.8.8")]),
+            entries: Mutex::new(vec![entry("ip", "198.51.100.8")]),
         });
         let h = DohResolversGetHandler::new(store);
         let v = h
@@ -203,7 +203,7 @@ mod tests {
             .unwrap();
         let parsed: DohResolversGetResponse = serde_json::from_value(v).unwrap();
         assert_eq!(parsed.resolvers.len(), 1);
-        assert_eq!(parsed.resolvers[0].target, "8.8.8.8");
+        assert_eq!(parsed.resolvers[0].target, "198.51.100.8");
     }
 
     #[test]
@@ -223,7 +223,10 @@ mod tests {
             Some(Arc::clone(&trigger) as Arc<dyn RoutePolicyApplyTrigger>),
         );
         let payload = serde_json::to_value(DohResolversSetRequest {
-            resolvers: vec![entry("ip", "1.1.1.1"), entry("host", "dns.google")],
+            resolvers: vec![
+                entry("ip", "198.51.100.1"),
+                entry("host", "resolver.example"),
+            ],
         })
         .unwrap();
         let v = h

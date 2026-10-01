@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use nrr_domain::auto_rule_budget::{auto_rules_over_budget, MAX_AUTO_RULES};
+use nrr_domain::auto_rule_budget::{auto_rule_allowance, auto_rule_count, auto_rules_over_budget};
 use nrr_domain::canonical::{
     CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
 };
@@ -177,6 +177,7 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
 
         let added = added_date(now);
         let mut book = snapshot.rule_book;
+        let budget = auto_rule_allowance(auto_rule_count(&book));
         let mut authored = 0_u32;
         let mut landed: Vec<&AuthoredRule> = Vec::new();
         for rule in rules {
@@ -191,7 +192,7 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
             // active revision and log a spurious activation).
             return Ok(AuthoredOutcome::default());
         }
-        evict_over_budget(&mut book, principal);
+        evict_over_budget(&mut book, budget, principal);
 
         let content = RulesRevisionContent::new(book);
         let rules_json = rules_json::to_canonical_string(&rules_json_codec::encode(&content))
@@ -243,13 +244,13 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
     }
 }
 
-/// Drops the oldest app-authored rules when the book has outgrown their budget.
+/// Drops the oldest app-authored rules when the book has outgrown `budget`.
 ///
-/// Runs on the write path rather than on a sweep: this is the only place the
-/// set grows, so it is the only place it can overflow, and a user who never
-/// accepts another suggestion never pays for a pass over their rules.
-fn evict_over_budget(book: &mut CanonicalRuleBook, principal: &str) {
-    let doomed = auto_rules_over_budget(book, MAX_AUTO_RULES);
+/// `budget` is the allowance of the book as read, so a book saved above the
+/// ceiling keeps its size: it is neither trimmed nor let grow. Runs on the
+/// write path because this is the only place the set grows.
+fn evict_over_budget(book: &mut CanonicalRuleBook, budget: usize, principal: &str) {
+    let doomed = auto_rules_over_budget(book, budget);
     if doomed.is_empty() {
         return;
     }
@@ -272,7 +273,7 @@ fn evict_over_budget(book: &mut CanonicalRuleBook, principal: &str) {
         msg_key = "autorules-authored-over-budget",
         sid = %principal,
         dropped = doomed.len(),
-        budget = MAX_AUTO_RULES,
+        budget,
         sample = %doomed.iter().take(5).map(RuleId::as_str).collect::<Vec<_>>().join(", "),
         "app-authored rules over budget — dropped the oldest; a site that still needs one is offered it again",
     );
@@ -463,6 +464,7 @@ fn added_date(now: SystemTime) -> String {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use nrr_domain::auto_rule_budget::MAX_AUTO_RULES;
     use std::time::Duration;
 
     fn empty_book() -> CanonicalRuleBook {
@@ -658,6 +660,97 @@ mod tests {
                 "cdn-relay.example".into()
             ))
         );
+    }
+
+    struct FixedBook(CanonicalRuleBook);
+
+    impl RulesProvider for FixedBook {
+        fn active_rules(&self) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+            Some(crate::per_sid_orchestrator::ActiveRulesSnapshot {
+                rule_book: self.0.clone(),
+                behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
+            })
+        }
+    }
+
+    /// A book of `n` app-authored rules; `old-0` is the single oldest.
+    fn authored_book(n: usize) -> CanonicalRuleBook {
+        let rules = (0..n)
+            .map(|i| CanonicalRule {
+                id: RuleId(format!("old-{i}")),
+                enabled: true,
+                address_match: Some(CanonicalAddressMatch::ExactFqdn(format!("h{i}.example"))),
+                app_match: None,
+                comment: String::new(),
+                action: RuleAction::Route,
+                origin: Some(RuleOrigin::auto(
+                    AutoRuleReason::SiteCompanion,
+                    "site.example",
+                    if i == 0 { "2026-01-01" } else { "2026-02-01" },
+                )),
+            })
+            .collect();
+        CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(Vec::new()),
+            secondary: CanonicalRuleSet::from_rules(rules),
+        }
+    }
+
+    /// Accepts one suggestion over a book of `carried` app rules and returns
+    /// the ids of the app rules in the written book.
+    fn accept_one_over(carried: usize) -> Vec<String> {
+        let exec = Arc::new(crate::ipc_handlers::test_fakes::FakeMutationExecutor::default());
+        let author = ProductionAutoRuleAuthor::new(
+            Arc::new(FixedBook(authored_book(carried))),
+            Arc::clone(&exec) as Arc<dyn MutationExecutor>,
+        );
+        let outcome = author
+            .author(
+                "S-1-5-21-1-1",
+                &AutoRuleReason::UserConfirmed,
+                &[exact("fresh.example")],
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_785_456_000),
+                "c-1",
+            )
+            .expect("authored");
+        assert_eq!(outcome, 1);
+        let written = exec
+            .last_executed
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("one write");
+        let json = written.payload["rules-json"].as_str().expect("rules-json");
+        let dto = rules_json::from_canonical_string(json).expect("decodes");
+        dto.primary
+            .iter()
+            .chain(dto.secondary.iter())
+            .filter(|rule| rule.origin.is_some())
+            .map(|rule| rule.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_book_saved_above_the_ceiling_keeps_its_size_without_growing() {
+        let ids = accept_one_over(2_500);
+        assert_eq!(ids.len(), 2_500);
+        assert!(
+            !ids.iter().any(|id| id == "old-0"),
+            "the oldest one made room"
+        );
+        assert!(ids.iter().any(|id| id == "old-1"));
+    }
+
+    #[test]
+    fn a_book_under_the_ceiling_just_grows() {
+        let ids = accept_one_over(1_500);
+        assert_eq!(ids.len(), 1_501);
+        assert!(ids.iter().any(|id| id == "old-0"));
+    }
+
+    #[test]
+    fn a_book_at_the_ceiling_evicts_down_to_it() {
+        assert_eq!(accept_one_over(MAX_AUTO_RULES).len(), MAX_AUTO_RULES);
     }
 
     #[test]

@@ -28,9 +28,14 @@ pub enum Link {
 /// is the only thing that tells us apart from the application, and it can only
 /// narrow what we may ask for.
 pub fn open() -> (ServiceIpcClient, Link) {
+    open_within(CONNECT_TIMEOUT)
+}
+
+/// [`open`] with a budget of the caller's choosing.
+pub fn open_within(budget: Duration) -> (ServiceIpcClient, Link) {
     nrr_ipc_client::declare_client_kind(ContractNegotiateClientKind::Console);
     let client = ServiceIpcClient::start();
-    let link = wait(&client, CONNECT_TIMEOUT);
+    let link = wait(&client, budget);
     (client, link)
 }
 
@@ -154,6 +159,16 @@ mod tests {
             wait(
                 &FakeService::new(ConnectionStatus::Refused {
                     reason: "no slot".into()
+                }),
+                long
+            ),
+            Link::Refused(_)
+        ));
+        assert!(matches!(
+            wait(
+                &FakeService::new(ConnectionStatus::ProtocolMismatch {
+                    server_version: 2,
+                    client_version: 1,
                 }),
                 long
             ),

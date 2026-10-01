@@ -99,6 +99,8 @@ const DIAGNOSTIC_FIELDS: &[&str] = &[
     "next_hop",
     "peer",
     "previous",
+    // Other users' identities, in a line that is about several of them.
+    "principals",
     "qname",
     "real",
     "rejected",
@@ -148,19 +150,91 @@ pub fn classify(payload: Option<&serde_json::Value>) -> PrivacyClass {
         .unwrap_or(PrivacyClass::PublicSummary)
 }
 
-/// Replace the values of fields that outrank `ceiling`, in place.
+/// Replace the values of fields that outrank `ceiling`, in place. Returns
+/// whether any value changed.
 ///
 /// Only the offending fields lose their value — the event, its message and
 /// every field the mode does allow stay readable.
-pub fn redact_above(payload: &mut serde_json::Value, ceiling: PrivacyClass) {
+pub fn redact_above(payload: &mut serde_json::Value, ceiling: PrivacyClass) -> bool {
     let Some(map) = payload.as_object_mut() else {
-        return;
+        return false;
     };
+    let mut changed = false;
     for (name, value) in map.iter_mut() {
-        if field_class(name) > ceiling {
+        if field_class(name) > ceiling && value.as_str() != Some(REDACTED) {
             *value = serde_json::Value::String(REDACTED.to_string());
+            changed = true;
         }
     }
+    changed
+}
+
+/// The same cap for a payload already flattened to name/value text, as the
+/// log listing's translation placeholders are.
+pub fn redact_args_above(
+    args: &mut std::collections::BTreeMap<String, String>,
+    ceiling: PrivacyClass,
+) {
+    for (name, value) in args.iter_mut() {
+        if field_class(name) > ceiling {
+            REDACTED.clone_into(value);
+        }
+    }
+}
+
+/// One stored log line capped at an export's `ceiling`, or `None` when it may
+/// not ship at all.
+///
+/// A line carries the ceiling of the mode it was WRITTEN in; an export has its
+/// own, and an hour of verbose logging must not decide what a Default bundle
+/// discloses for the whole retention window. The payload is re-classified by
+/// its field names rather than trusted by its stamp, so a line from before a
+/// name joined the lists is capped too. A line already within the ceiling ships
+/// byte for byte.
+#[must_use]
+pub fn cap_stored_line(line: &str, ceiling: PrivacyClass) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+
+    // The typed form keeps the writer's field order; anything else is still
+    // capped, just re-serialised in key order.
+    if let Ok(mut event) = serde_json::from_str::<crate::event::LogEvent>(line) {
+        let class = event.privacy_class.max(classify(event.payload.as_ref()));
+        if class == PrivacyClass::SecretNeverLog {
+            return None;
+        }
+        if class <= ceiling {
+            return Some(Cow::Borrowed(line));
+        }
+        let changed = event
+            .payload
+            .as_mut()
+            .is_some_and(|payload| redact_above(payload, ceiling));
+        if !changed && event.privacy_class <= ceiling {
+            return Some(Cow::Borrowed(line));
+        }
+        event.privacy_class = event.privacy_class.min(ceiling);
+        return event.to_ndjson().ok().map(Cow::Owned);
+    }
+
+    let mut value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let stamped = value
+        .get("privacy_class")
+        .and_then(|v| serde_json::from_value::<PrivacyClass>(v.clone()).ok())
+        .unwrap_or(PrivacyClass::PublicSummary);
+    let class = stamped.max(classify(value.get("payload")));
+    if class == PrivacyClass::SecretNeverLog {
+        return None;
+    }
+    if class <= ceiling {
+        return Some(Cow::Borrowed(line));
+    }
+    if let Some(payload) = value.get_mut("payload") {
+        redact_above(payload, ceiling);
+    }
+    if let Some(stamp) = value.get_mut("privacy_class") {
+        *stamp = serde_json::Value::String(stamped.min(ceiling).as_str().to_string());
+    }
+    serde_json::to_string(&value).ok().map(Cow::Owned)
 }
 
 #[cfg(test)]
@@ -323,10 +397,39 @@ mod tests {
     }
 
     #[test]
+    fn other_peoples_principals_are_not_public() {
+        // A machine line listing the users a pass could not protect named
+        // every one of them to every reader.
+        assert_eq!(field_class("principals"), PrivacyClass::Diagnostic);
+        // The line's own owner stays readable: it is what scopes the line.
+        assert_eq!(field_class("sid"), PrivacyClass::PublicSummary);
+    }
+
+    #[test]
     fn a_mode_that_allows_addresses_still_hides_process_paths() {
         let mut payload = json!({ "host": "example.com", "path": "C:\\app.exe" });
         redact_above(&mut payload, PrivacyClass::Diagnostic);
         assert_eq!(payload["host"], json!("example.com"));
         assert_eq!(payload["path"], json!(REDACTED));
+    }
+
+    /// A line that is not a typed log event is still capped, and a secret is
+    /// never shipped at any ceiling.
+    #[test]
+    fn an_untyped_line_is_capped_and_a_secret_never_ships() {
+        let line = r#"{"privacy_class":"diagnostic","payload":{"host":"example.com","n":1}}"#;
+        let capped = cap_stored_line(line, PrivacyClass::PublicSummary).expect("ships");
+        assert!(!capped.contains("example.com"), "{capped}");
+        assert!(
+            capped.contains(r#""privacy_class":"public_summary""#),
+            "{capped}"
+        );
+        assert_eq!(
+            cap_stored_line(line, PrivacyClass::Diagnostic).as_deref(),
+            Some(line)
+        );
+
+        let secret = r#"{"privacy_class":"secret_never_log","payload":{"n":1}}"#;
+        assert_eq!(cap_stored_line(secret, PrivacyClass::Sensitive), None);
     }
 }

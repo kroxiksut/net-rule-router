@@ -77,6 +77,8 @@ pub enum HealthComponent {
     /// Optional supervised tasks (observers, learning, housekeeping). Degraded
     /// while one is between a failure and its restart; the message names it.
     BackgroundTasks,
+    /// Stored-revision integrity checking. Reported only when it could not run.
+    Integrity,
 }
 
 impl HealthComponent {
@@ -89,6 +91,7 @@ impl HealthComponent {
             Self::Apply => "apply",
             Self::Adapters => "adapters",
             Self::BackgroundTasks => "background-tasks",
+            Self::Integrity => "integrity",
         }
     }
 }
@@ -315,9 +318,9 @@ impl HealthAggregator {
                     ServiceHealthSeverity::Ok,
                     format!("active revision loaded: {}", s.revision_id),
                 ),
-                PolicyLoadResult::LkgFallbackApplied(s) => (
+                PolicyLoadResult::IntegrityFailureReported(details) => (
                     ServiceHealthSeverity::Warning,
-                    format!("active recovered from LKG: {}", s.revision_id),
+                    format!("integrity failure reported: {details}"),
                 ),
                 PolicyLoadResult::NoActiveRevision => (
                     ServiceHealthSeverity::Ok,
@@ -594,21 +597,16 @@ mod tests {
     }
 
     #[test]
-    fn record_policy_lkg_fallback_marks_warning_and_keeps_summary() {
+    fn record_policy_integrity_report_warns_without_blocking() {
         let agg = HealthAggregator::new();
         agg.clear_lifecycle_override();
-        let summary = ActiveRevisionState {
-            revision_id: "rev-lkg".into(),
-            provenance: "recovery-fallback".into(),
-            rule_count: 0,
-            behavior_mode: "auto".into(),
-            content_hash_hex: "deadbeef".into(),
-            activated_at_iso: "t".into(),
-        };
-        agg.record_policy(&PolicyLoadResult::LkgFallbackApplied(summary.clone()));
+        agg.record_policy(&PolicyLoadResult::IntegrityFailureReported(
+            "active revision signature mismatch".into(),
+        ));
         let snap = agg.snapshot();
-        assert_eq!(snap.policy_state, ServicePolicyState::LkgReady);
-        assert_eq!(snap.current_revision, Some(summary));
+        assert_eq!(snap.policy_state, ServicePolicyState::ActiveInvalid);
+        assert_ne!(snap.state, ServiceRuntimeState::RecoveryRequired);
+        assert!(snap.current_revision.is_none());
         let policy = snap
             .components
             .iter()

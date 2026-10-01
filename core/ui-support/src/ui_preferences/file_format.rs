@@ -7,15 +7,24 @@
 use super::*;
 
 pub(super) fn parse_preferences(content: &str) -> UiPreferences {
-    let mut preferences = UiPreferences::default();
-    let newer_schema =
-        declared_schema_version(content).filter(|v| *v > CURRENT_UI_PREFS_SCHEMA_VERSION);
-    preferences.forward_compat.newer_schema_version = newer_schema;
-    // The defaults were built from the SYSTEM language, which is not the one
-    // the user picked. Whether the file carried its own values decides whether
-    // they get recomputed below.
+    parse_preferences_with(content, detected_system_language)
+}
+
+/// `system_language` is asked only when the file names no language: the probe
+/// sits on every GUI and tray start.
+pub(super) fn parse_preferences_with(
+    content: &str,
+    system_language: impl FnOnce() -> String,
+) -> UiPreferences {
+    let mut preferences = UiPreferences::with_language(String::new());
+    let declared = declared_schema_version(content);
+    preferences.forward_compat.newer_schema_version =
+        declared.filter(|v| *v > CURRENT_UI_PREFS_SCHEMA_VERSION);
+    let carry_unknown = declared.is_some_and(|v| v >= CURRENT_UI_PREFS_SCHEMA_VERSION);
+    // Language and labels are settled after the loop, from what the file held.
     let mut language_seen = false;
-    let mut labels_seen = false;
+    let mut primary_label_seen = false;
+    let mut secondary_label_seen = false;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -140,13 +149,13 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
             "route_primary_label" => {
                 if !value.is_empty() {
                     preferences.route_primary_label = value.to_string();
-                    labels_seen = true;
+                    primary_label_seen = true;
                 }
             }
             "route_secondary_label" => {
                 if !value.is_empty() {
                     preferences.route_secondary_label = value.to_string();
-                    labels_seen = true;
+                    secondary_label_seen = true;
                 }
             }
             "show_bluetooth_adapters" => {
@@ -232,13 +241,12 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.missing_secondary_banner_acknowledged = parsed;
                 }
             }
-            // Selected traffic-statistics period slug. Non-empty gate so a
-            // missing key keeps the `"today"` default; the GUI normalizes any
-            // unexpected slug back to `"today"`.
             "traffic_stats_period" => {
-                if !value.is_empty() {
-                    preferences.traffic_stats_period = value.to_string();
-                }
+                preferences.traffic_stats_period = allowed_slug_or(
+                    value,
+                    &TRAFFIC_STATS_PERIODS,
+                    &preferences.traffic_stats_period,
+                );
             }
             // Remembered CSV export unit. Only a known slug is accepted, so a
             // hand-edited or older file cannot leave the panel on a unit the
@@ -376,18 +384,6 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
             "auto_open_on_launch_path_secondary" => {
                 preferences.auto_open_on_launch_path_secondary = parse_optional_string(value);
             }
-            "last_file_synced_revision_id_primary" => {
-                preferences.last_file_synced_revision_id_primary = parse_optional_string(value);
-            }
-            "last_file_synced_revision_id_secondary" => {
-                preferences.last_file_synced_revision_id_secondary = parse_optional_string(value);
-            }
-            "last_file_synced_hash_primary" => {
-                preferences.last_file_synced_hash_primary = parse_optional_string(value);
-            }
-            "last_file_synced_hash_secondary" => {
-                preferences.last_file_synced_hash_secondary = parse_optional_string(value);
-            }
             "service_install_uac_declined_at_epoch" => {
                 preferences.service_install_uac_declined_at_epoch = parse_optional_i64(value);
             }
@@ -422,6 +418,24 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
             }
             "update_page_url" => {
                 preferences.update_page_url = value.to_string();
+            }
+            "update_check_enabled" => {
+                if let Some(parsed) = parse_bool(value) {
+                    preferences.update_check_enabled = parsed;
+                }
+            }
+            "dismissed_update_version" => {
+                preferences.dismissed_update_version = storable_line_or(
+                    key,
+                    value.to_string(),
+                    std::mem::take(&mut preferences.dismissed_update_version),
+                );
+            }
+            "update_check_interval_days" => {
+                if let Ok(parsed) = value.parse::<u32>() {
+                    preferences.update_check_interval_days =
+                        clamp_update_check_interval_days(parsed);
+                }
             }
             "show_bundled_presets" => {
                 if let Some(parsed) = parse_bool(value) {
@@ -459,10 +473,14 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.route_include_subdomains = parsed;
                 }
             }
+            // A slug off the wire list would be refused by `route.policy.update`
+            // when the GUI reseeds a wiped service from this mirror.
             "route_shared_ip_policy" => {
-                if !value.is_empty() {
-                    preferences.route_shared_ip_policy = value.to_string();
-                }
+                preferences.route_shared_ip_policy = allowed_slug_or(
+                    value,
+                    &SHARED_IP_POLICIES,
+                    &preferences.route_shared_ip_policy,
+                );
             }
             "route_kill_switch_block_all" => {
                 if let Some(parsed) = parse_bool(value) {
@@ -474,19 +492,17 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.route_kill_switch_fail_closed = parsed;
                 }
             }
-            "route_kill_switch_protocols" => {
-                // Masking a nonsense value invents a meaning for it: `128 &
-                // 0x7F` is 0, and an empty protocol mask makes the codegen emit
-                // no filter at all — the kill switch reads as ON and blocks
-                // nothing. A value outside the mask, or one that selects
-                // nothing, is not a preference; it is a damaged line, and the
-                // default (every protocol) is the safe reading.
-                if let Ok(parsed) = value.parse::<u32>() {
-                    if parsed != 0 && parsed & !0x7F == 0 {
-                        preferences.route_kill_switch_protocols = parsed;
-                    }
+            // A line that blocks nothing keeps the default (every protocol)
+            // rather than being masked into a selection nobody made.
+            "route_kill_switch_protocols" => match value.parse::<u16>() {
+                Ok(bits) if nrr_shared::ipc_payloads::is_valid_kill_switch_protocols(bits) => {
+                    preferences.route_kill_switch_protocols = u32::from(bits);
                 }
-            }
+                _ => eprintln!(
+                    "nrr: route_kill_switch_protocols={value} blocks no protocol; \
+                     reading it as every protocol"
+                ),
+            },
             "route_kill_switch_enabled" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.route_kill_switch_enabled = parsed;
@@ -548,12 +564,12 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
                 preferences.service_intent_json =
                     storable_json_blob_or_empty(key, value.to_string());
             }
-            // A key this build has none for. From a NEWER file it is a setting
-            // the user made in a build that has one, so it is kept verbatim and
-            // written back; from a file of our own version it is the residue of
-            // a key we removed, and dropping it is how the file shrinks.
+            // A key this build has none for. Keys are added without a schema
+            // bump and removed with one, so at our version or above it is a
+            // setting made in a build that has it: kept verbatim and written
+            // back. In an older file it is the residue of a removed key.
             _ => {
-                if newer_schema.is_some() {
+                if carry_unknown {
                     preferences
                         .forward_compat
                         .unknown_lines
@@ -563,12 +579,16 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
         }
     }
 
-    // A file that named a language but no labels was written before the labels
-    // existed; deriving them from the system language then hands a Russian-UI
-    // user "Primary"/"Secondary".
-    if language_seen && !labels_seen {
-        let (primary, secondary) = default_route_labels(&preferences.language);
+    if !language_seen {
+        preferences.language = system_language();
+    }
+    // A missing label follows the language the user runs, not the system's:
+    // otherwise a Russian-UI user of an old file gets "Primary"/"Secondary".
+    let (primary, secondary) = default_route_labels(&preferences.language);
+    if !primary_label_seen {
         preferences.route_primary_label = primary;
+    }
+    if !secondary_label_seen {
         preferences.route_secondary_label = secondary;
     }
 
@@ -582,11 +602,9 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
 /// `{…}` object up to [`MAX_STORED_JSON_BLOB_BYTES`] — plenty for every routing
 /// field with headroom, small enough that a corrupted preferences file cannot
 /// balloon memory. Public because the QML payload path applies the SAME gate on
-/// the way in: five hand-copied versions of it lived here and in `ui_surface`,
-/// and one threshold drifting apart from the rest loses a blob silently.
-/// Rejects any embedded newline (L3 review-fix): the value lives on ONE
-/// `key=value` line, so a `\n`/`\r` would split it into bogus extra lines on
-/// the next read — reject rather than corrupt the line-oriented file.
+/// the way in; a second copy of the threshold would lose a blob silently.
+/// Rejects any embedded newline: the value lives on ONE `key=value` line, so a
+/// `\n`/`\r` would split it into bogus extra lines on the next read.
 pub fn is_storable_json_blob(value: &str) -> bool {
     value.is_empty()
         || (value.len() <= MAX_STORED_JSON_BLOB_BYTES
@@ -597,10 +615,9 @@ pub fn is_storable_json_blob(value: &str) -> bool {
 
 /// A blob that passes [`is_storable_json_blob`], or `""` plus a diagnostic.
 ///
-/// Both sides of the round-trip reduce a rejected blob to "none", and both used
-/// to do it silently — so `service_intent_json`, the only record of what the
-/// user decided, could evaporate in exactly the way the field exists to
-/// prevent. `field` names the key so the line is actionable.
+/// Both sides of the round-trip reduce a rejected blob to "none"; done silently,
+/// `service_intent_json` — the only record of what the user decided — would
+/// evaporate unnoticed. `field` names the key so the line is actionable.
 pub fn storable_json_blob_or_empty(field: &str, value: String) -> String {
     if is_storable_json_blob(&value) {
         return value;
@@ -628,11 +645,9 @@ fn normalize_theme_preferences(preferences: &mut UiPreferences) {
 /// Renders one preference value so it cannot become two lines.
 ///
 /// The file is `key=value` per line and the parser splits on the first `=`, so
-/// a value carrying a newline used to write a SECOND, forged pair — a label of
-/// `Main` plus a newline plus `first_run_completed=false` restarted the setup
-/// wizard on the next launch. The reader rejected such values on some paths;
-/// the writer accepted every one of them. A preset directory whose name
-/// contains a newline is perfectly legal on Linux, so this is not hypothetical.
+/// a value carrying a newline would write a SECOND, forged pair — a label of
+/// `Main` plus a newline plus `first_run_completed=false` restarts the setup
+/// wizard. A preset directory whose name contains a newline is legal on Linux.
 ///
 /// Control characters are replaced rather than dropped: what the user typed
 /// stays recognisable, and the file stays parseable.
@@ -691,10 +706,6 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
             "last_saved_path_secondary={}\n",
             "auto_open_on_launch_path_primary={}\n",
             "auto_open_on_launch_path_secondary={}\n",
-            "last_file_synced_revision_id_primary={}\n",
-            "last_file_synced_revision_id_secondary={}\n",
-            "last_file_synced_hash_primary={}\n",
-            "last_file_synced_hash_secondary={}\n",
             "service_install_uac_declined_at_epoch={}\n",
             "service_install_uac_declined_count={}\n",
             "service_install_prompt_suppressed={}\n",
@@ -744,7 +755,10 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
             "notify_block_notices={}\n",
             "notify_rule_duplicates={}\n",
             "hide_block_notice_addresses={}\n",
-            "tray_notice_opacity_percent={}\n"
+            "tray_notice_opacity_percent={}\n",
+            "update_check_enabled={}\n",
+            "update_check_interval_days={}\n",
+            "dismissed_update_version={}\n"
         ),
         preferences.forward_compat.schema_stamp(),
         one_line(&preferences.launch_window_on_startup),
@@ -788,10 +802,6 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
         optional_string_field(&preferences.last_saved_path_secondary),
         optional_string_field(&preferences.auto_open_on_launch_path_primary),
         optional_string_field(&preferences.auto_open_on_launch_path_secondary),
-        optional_string_field(&preferences.last_file_synced_revision_id_primary),
-        optional_string_field(&preferences.last_file_synced_revision_id_secondary),
-        optional_string_field(&preferences.last_file_synced_hash_primary),
-        optional_string_field(&preferences.last_file_synced_hash_secondary),
         optional_i64_field(preferences.service_install_uac_declined_at_epoch),
         one_line(&preferences.service_install_uac_declined_count),
         one_line(&preferences.service_install_prompt_suppressed),
@@ -841,7 +851,10 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
         one_line(&preferences.notify_block_notices),
         one_line(&preferences.notify_rule_duplicates),
         one_line(&preferences.hide_block_notice_addresses),
-        preferences.tray_notice_opacity_percent
+        preferences.tray_notice_opacity_percent,
+        one_line(&preferences.update_check_enabled),
+        preferences.update_check_interval_days,
+        one_line(&preferences.dismissed_update_version)
     );
 
     for line in &preferences.forward_compat.unknown_lines {
@@ -901,10 +914,9 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-/// Clamped, not rejected. Rejecting made an out-of-range value load as the
-/// DEFAULT, and the default is the maximum — so `20` ("nearly transparent")
-/// came back as 100, fully opaque, the opposite of what was asked. The
-/// write path clamps for exactly this reason; the read path now agrees.
+/// Clamped, not rejected, like the write path: rejecting loads the default,
+/// which is the maximum, so `20` ("nearly transparent") would come back fully
+/// opaque.
 fn parse_tray_notice_opacity_percent(value: &str) -> Option<u16> {
     let parsed = value.parse::<u16>().ok()?;
     Some(parsed.clamp(

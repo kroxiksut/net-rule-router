@@ -30,7 +30,9 @@
 //!   ├─ revisions: candidate→active, previous→superseded
 //!   ├─ active_revision_pointer ← target
 //!   ├─ ApplyAttemptMarker cleared
-//!   └─ Audit "revision-activated" or "pre-flight-passed-but-apply-failed"
+//!   ├─ Audit "revision-activated" or "pre-flight-passed-but-apply-failed"
+//!   └─ Commit fails → revert touched SIDs, reject, clear marker,
+//!      `ActivationNotRecorded` (the token stays spent)
 //!
 //! Phase 3b — COMMIT-ON-FAILURE (SQLite TX)
 //!   ├─ revisions: candidate→rejected
@@ -216,6 +218,14 @@ impl ActivationCoordinator {
         self
     }
 
+    /// The key an administrator's audit chain restart is sealed with. `None`
+    /// without a signing key: then no restart can be told from a forged one.
+    pub fn audit_restart_key(&self) -> Option<nrr_diagnostics::AuditRestartKey> {
+        self.signing_key
+            .as_deref()
+            .and_then(nrr_diagnostics::AuditRestartKey::derive)
+    }
+
     /// The store the signing key was loaded from, so acknowledging a key
     /// reset can clear its re-sign marker.
     #[must_use]
@@ -237,27 +247,52 @@ impl ActivationCoordinator {
         }
     }
 
-    /// Re-sign every `revisions` row with the
-    /// current key. Invoked by the `SecurityAlertAck` flow: when the
-    /// user acknowledges a `DbTamperDetected` / `KeyResetWithExistingData`
-    /// alert they accept the current DB state, so the service stamps it
-    /// as authoritative and the next load verifies clean. No-op (returns
-    /// 0) when no signing key is configured.
-    pub(crate) fn re_sign_all_revisions(
+    /// Every signed row with its verdict under the current key. Empty without
+    /// a key: nothing can be verified, so nothing can be adopted either.
+    pub(crate) fn integrity_scan(
         &self,
-    ) -> Result<nrr_storage::revisions::ReSignReport, PolicyError> {
+    ) -> Result<Vec<nrr_storage::revisions::ScannedRow>, PolicyError> {
+        if self.signing_key.is_none() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn.lock().expect("connection mutex poisoned");
         self.revisions_repo(&conn)
-            .re_sign_all()
+            .integrity_scan()
             .map_err(|e| PolicyError::StorageFailure {
-                operation: "re_sign_all",
+                operation: "integrity_scan",
                 message: e.to_string(),
             })
     }
 
-    /// Lets the next boot sweep run again. Only after
-    /// [`Self::re_sign_all_revisions`] succeeded with a key: unsigned, nothing
-    /// was re-signed and the rows still predate the key.
+    /// Re-signs the requested rows that still hold the content they were
+    /// shown with. See [`RevisionsRepository::adopt_rows`].
+    pub(crate) fn adopt_rows(
+        &self,
+        requests: &[nrr_storage::revisions::AdoptionRequest<'_>],
+    ) -> Result<Vec<nrr_storage::revisions::AdoptionOutcome>, PolicyError> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        self.revisions_repo(&conn)
+            .adopt_rows(requests)
+            .map_err(|e| PolicyError::StorageFailure {
+                operation: "adopt_rows",
+                message: e.to_string(),
+            })
+    }
+
+    /// Whether the key store holds the re-sign marker written for the current
+    /// key — the only thing that lets a key-reset acknowledgement adopt rows.
+    pub(crate) fn key_reset_pending(&self) -> bool {
+        match (&self.signing_key, &self.key_store) {
+            (Some(key), Some(store)) => {
+                crate::tamper_bootstrap::resign_pending(store.as_ref(), key)
+            }
+            _ => false,
+        }
+    }
+
+    /// Lets the next boot sweep run again. Only after the acknowledged rows
+    /// were re-signed with a key: unsigned, nothing was re-signed and the rows
+    /// still predate the key.
     pub(crate) fn clear_key_reset_marker(&self) -> Result<(), PolicyError> {
         let (Some(_), Some(store)) = (&self.signing_key, &self.key_store) else {
             return Ok(());
@@ -306,7 +341,10 @@ impl ActivationCoordinator {
         // Before the dedup: resubmitting an old revision's content is a new
         // submission, while rollback — which re-activates history on purpose —
         // never comes through here.
-        if let Some((rule_id, reason)) = unsupported_rule_shape(&submission.rules_json) {
+        let carried = self.rules_json_in_force_for(&submission.principal);
+        if let Some((rule_id, reason)) =
+            unsupported_rule_shape(&submission.rules_json, carried.as_deref())
+        {
             return Err(PolicyError::UnsupportedRuleShape { rule_id, reason });
         }
         if let Some(hit) = control_character_in_rules(&submission.rules_json) {
@@ -314,6 +352,10 @@ impl ActivationCoordinator {
                 rule_id: hit.rule_id,
                 field: hit.field,
             });
+        }
+        let rules = rules_with_refused_values(&submission.rules_json, carried.as_deref());
+        if !rules.is_empty() {
+            return Err(PolicyError::InvalidRuleValue { rules });
         }
         let conn = self.conn.lock().expect("connection mutex poisoned");
         let repo = self.revisions_repo(&conn);
@@ -449,10 +491,8 @@ impl ActivationCoordinator {
         let token = self.ids.new_token();
         let now = self.clock.now_secs();
         let expires = now + ttl_secs;
-        let payload = format!(
-            r#"{{"op":"activate","revision_id":"{}"}}"#,
-            revision_id.as_str()
-        );
+        let payload = serde_json::json!({ "op": "activate", "revision_id": revision_id.as_str() })
+            .to_string();
 
         let conn = self.conn.lock().expect("connection mutex poisoned");
         let store = MutationTokenStoreSqlite::new(&conn);
@@ -554,21 +594,17 @@ impl ActivationCoordinator {
             crate::applying_revision_overlay::publish(&conn, &principal, &record.rules_json)
         };
         let phase2 = self.phase2_apply(&targets, &record.rules_json);
+        let touched = phase2.touched();
 
-        match policy {
+        let committed = match policy {
             ApplyFailurePolicy::AllOrNothing | ApplyFailurePolicy::PreFlightThenAllOrNothing => {
-                if phase2.failed.is_empty() {
-                    let outcome =
-                        self.phase3a_success(&principal, revision_id, &phase1, vec![], now);
-                    drop(overlay);
-                    outcome
-                } else {
+                if !phase2.failed.is_empty() {
                     // The revert must restore the stored revision, so readers
                     // go back to it first.
                     drop(overlay);
                     let pre_flight_passed =
                         matches!(policy, ApplyFailurePolicy::PreFlightThenAllOrNothing);
-                    self.phase3b_revert_and_reject(
+                    return self.phase3b_revert_and_reject(
                         &principal,
                         revision_id,
                         &phase1,
@@ -576,17 +612,19 @@ impl ActivationCoordinator {
                         phase2,
                         pre_flight_passed,
                         now,
-                    )
+                    );
                 }
+                self.phase3a_success(&principal, revision_id, &phase1, vec![], now)
             }
             ApplyFailurePolicy::BestEffort => {
-                if phase2.failed.is_empty() {
-                    self.phase3a_success(&principal, revision_id, &phase1, vec![], now)
-                } else {
-                    self.phase3a_success(&principal, revision_id, &phase1, phase2.failed, now)
-                }
+                self.phase3a_success(&principal, revision_id, &phase1, phase2.failed, now)
             }
-        }
+        };
+        // Committed or not, the stored pointer is the truth from here on.
+        drop(overlay);
+        committed.or_else(|error| {
+            self.phase3a_unrecorded(&principal, revision_id, &phase1, &touched, error, now)
+        })
     }
 
     // ── rollback_to ──────────────────────────────────────────────────────────
@@ -763,6 +801,25 @@ impl ActivationCoordinator {
             })
     }
 
+    /// The stored rules `principal` is under right now, as the rules provider
+    /// resolves them (applying overlay, own revision, baseline read-through)
+    /// but without its read-time expansions: the gate compares stored books.
+    /// `None` on a storage error, which leaves the gate checking every rule.
+    pub(crate) fn rules_json_in_force_for(&self, principal: &str) -> Option<String> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let repo = self.revisions_repo(&conn);
+        let resolve = |p: &str| match crate::applying_revision_overlay::applying_for(&conn, p) {
+            Some(json) => Ok(Some(json.to_string())),
+            None => repo.get_active_for(p).map(|r| r.map(|r| r.rules_json)),
+        };
+        match resolve(principal) {
+            Ok(None) if principal != nrr_storage::BASELINE_PRINCIPAL => {
+                resolve(nrr_storage::BASELINE_PRINCIPAL).ok().flatten()
+            }
+            found => found.ok().flatten(),
+        }
+    }
+
     pub fn last_known_good(&self) -> Result<Option<RevisionId>, PolicyError> {
         let conn = self.conn.lock().expect("connection mutex poisoned");
         let lkg = self.revisions_repo(&conn).last_known_good().map_err(|e| {
@@ -795,7 +852,8 @@ impl ActivationCoordinator {
     // inherent impl, split across files.
 }
 
-/// The first rule in `rules_json` whose shape enforcement cannot carry out.
+/// The first rule `rules_json` adds or changes over `carried_rules_json` (the
+/// book in force) whose shape enforcement cannot carry out.
 ///
 /// The submission gate, shared by the coordinator and the executor's
 /// previews. Deliberately NOT part of the decoder: stored revisions must keep
@@ -803,13 +861,25 @@ impl ActivationCoordinator {
 /// one's.
 pub(crate) fn unsupported_rule_shape(
     rules_json: &str,
+    carried_rules_json: Option<&str>,
 ) -> Option<(String, nrr_domain::rule_shape::UnsupportedShapeReason)> {
-    let dto = nrr_shared::rules_json::from_canonical_string(rules_json).ok()?;
-    let content =
+    let decode = |dto| {
         nrr_domain::rules_json_codec::decode(dto, nrr_domain::rules_file::HostPlatform::compiled())
-            .ok()?;
-    nrr_domain::rule_shape::first_unsupported(
-        &content.rule_book,
+            .ok()
+            .map(|content| content.rule_book)
+    };
+    let book = nrr_shared::rules_json::from_canonical_string(rules_json)
+        .ok()
+        .and_then(decode)?;
+    // An undecodable book in force spares nothing: the gate fails closed.
+    let carried = carried_rules_json
+        .and_then(|json| {
+            crate::production_rules_provider::read_stored_rules(json, "rules-in-force").ok()
+        })
+        .and_then(decode);
+    nrr_domain::rule_shape::first_unsupported_new(
+        &book,
+        carried.as_ref(),
         crate::wfp_codegen::current_rule_shape_support(),
     )
     .map(|(rule, reason)| (rule.id.as_str().to_string(), reason))
@@ -822,6 +892,23 @@ pub(crate) fn control_character_in_rules(
 ) -> Option<nrr_shared::rules_json::ForbiddenFieldText> {
     let dto = nrr_shared::rules_json::from_canonical_string(rules_json).ok()?;
     nrr_shared::rules_json::first_forbidden_field_text(&dto)
+}
+
+/// The rules `rules_json` carries with a value the rules table marks as an
+/// error, sparing a value the book in force (`carried_rules_json`) already
+/// holds. Like the shape gate it is not the decoder's: a stored revision must
+/// keep decoding. Empty for an undecodable payload, which the codec refuses.
+pub(crate) fn rules_with_refused_values(
+    rules_json: &str,
+    carried_rules_json: Option<&str>,
+) -> Vec<nrr_domain::rule_value_validation::RefusedRuleValue> {
+    let parse = |json: &str| nrr_shared::rules_json::from_canonical_string(json).ok();
+    let Some(book) = parse(rules_json) else {
+        return Vec::new();
+    };
+    // An unreadable book in force spares nothing: the gate fails closed.
+    let carried = carried_rules_json.and_then(parse);
+    nrr_domain::rule_value_validation::rules_with_refused_values(&book, carried.as_ref())
 }
 
 /// Classifies a verified-history entry against the activation-integrity
@@ -858,6 +945,20 @@ struct Phase1Outcome {
 struct Phase2Outcome {
     succeeded: Vec<String>,
     failed: Vec<(String, String)>,
+}
+
+impl Phase2Outcome {
+    /// Every SID phase 2 TOUCHED, not just the ones it finished: a failed
+    /// apply may have installed part of its set before failing.
+    fn touched(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.succeeded
+            .iter()
+            .chain(self.failed.iter().map(|(sid, _)| sid))
+            .filter(|sid| seen.insert(sid.as_str()))
+            .cloned()
+            .collect()
+    }
 }
 
 struct PreFlightOutcome {

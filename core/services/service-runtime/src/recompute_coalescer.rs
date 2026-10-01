@@ -121,22 +121,61 @@ mod tests {
         (hook, runs, overlaps)
     }
 
+    /// Waits for `done`, bounded so a regression fails instead of hanging.
+    fn wait_until(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "never happened");
+            std::thread::yield_now();
+        }
+    }
+
+    /// The first pass is held open until all eight callers have asked, so the
+    /// burst is a burst however slowly the threads start: the first pass covers
+    /// the first caller, and the seven who asked during it share exactly one.
     #[test]
     fn a_burst_of_callers_never_runs_passes_side_by_side_and_shares_them() {
-        let (inner, runs, overlaps) = slow_pass(60);
-        let hook = coalesce(inner);
+        let (pass, runs, overlaps) = slow_pass(10);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let inner = {
+            let (gate, entered) = (Arc::clone(&gate), Arc::clone(&entered));
+            Arc::new(move || {
+                entered.fetch_add(1, Ordering::SeqCst);
+                let (open, opened) = &*gate;
+                let mut open = open.lock().expect("gate");
+                while !*open {
+                    open = opened.wait(open).expect("gate");
+                }
+                drop(open);
+                pass();
+            }) as RouteRecomputeHook
+        };
+        let coalescer = Arc::new(Coalescer {
+            inner,
+            state: Mutex::new(State::default()),
+            finished: Condvar::new(),
+        });
         let callers: Vec<_> = (0..8)
             .map(|_| {
-                let hook = hook.clone();
-                std::thread::spawn(move || hook())
+                let coalescer = Arc::clone(&coalescer);
+                std::thread::spawn(move || coalescer.call())
             })
             .collect();
+        wait_until(|| coalescer.lock().requested == 8);
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "a second pass started beside the one held open"
+        );
+        *gate.0.lock().expect("gate") = true;
+        gate.1.notify_all();
         for caller in callers {
             caller.join().expect("caller");
         }
         assert_eq!(overlaps.load(Ordering::SeqCst), 0);
         let runs = runs.load(Ordering::SeqCst);
-        assert!((1..=3).contains(&runs), "eight callers took {runs} passes");
+        assert_eq!(runs, 2, "eight callers took {runs} passes");
     }
 
     /// The caller's change landed before it called; a pass that was already

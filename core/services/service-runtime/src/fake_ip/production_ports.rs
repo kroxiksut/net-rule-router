@@ -133,7 +133,7 @@ impl RelayNameResolver for ConfirmedNameResolver {
                 tracing::debug!(
                     target: "nrr::fake_ip",
                     hostname = %hostname,
-                    error = ?error,
+                    error = %error,
                     "resolved at dial time but could not cache it — the flow still goes through",
                 );
             }
@@ -368,16 +368,16 @@ mod tests {
         cache.set_ips(
             "assistant.example",
             vec![
-                Ipv4Addr::new(23, 10, 20, 140),
-                Ipv4Addr::new(23, 10, 20, 141),
+                Ipv4Addr::new(203, 0, 113, 140),
+                Ipv4Addr::new(203, 0, 113, 141),
             ],
         );
         let resolver = CacheUpstreamResolver::new(cache);
         assert_eq!(
             resolver.addresses_for("assistant.example"),
             vec![
-                IpAddr::V4(Ipv4Addr::new(23, 10, 20, 140)),
-                IpAddr::V4(Ipv4Addr::new(23, 10, 20, 141)),
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 140)),
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 141)),
             ]
         );
         // An un-cached host yields nothing — the relay then fails the flow closed
@@ -430,7 +430,7 @@ mod tests {
         );
         // A primary-only rule host, and an unmatched host, both take the primary.
         assert_eq!(selector.route_for("primary.example"), RouteRole::Primary);
-        assert_eq!(selector.route_for("random.net"), RouteRole::Primary);
+        assert_eq!(selector.route_for("random.example.net"), RouteRole::Primary);
     }
 
     #[test]

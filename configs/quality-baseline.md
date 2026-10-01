@@ -1,6 +1,6 @@
 ﻿# Quality Baseline
 
-This file fixes the initial Block 1.5 baseline for local checks, CI, naming, and dependency policy.
+This file fixes the baseline for local checks, CI, naming, and dependency policy.
 
 ## Local Green Baseline
 

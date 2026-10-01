@@ -8,9 +8,9 @@
 //!
 //! `caller_sid.is_empty()` is treated as a transport error (`Internal`)
 //! for per-SID writers (routing pause, autostart). The two singleton
-//! mutators (retention, apply failure policy) are admin-gated upstream
-//! by `IpcOperationSpec::requires_service_mutation_privilege = true`;
-//! the handlers themselves do not re-check elevation.
+//! mutators (retention, apply failure policy) are gated upstream by the
+//! envelope class and the handler-side value check; the handlers here do not
+//! re-check elevation.
 
 use std::sync::Arc;
 

@@ -19,23 +19,24 @@
 //!   `RuleAction::Block` (Slice 2, with the packet-layer mirror) and
 //!   `Application` rules (Slice 3: per-exe `ALE_APP_ID` filters + observed-dest
 //!   `/32`s). Proven by `tests::slices123_neutral_pipeline_matches_current_codegen`.
-//! - **Sub-slices 4a + 4b: the per-destination kill-switch.**
+//! - **The per-destination kill-switch.**
 //!   `plan_kill_switch_destinations` reproduces
 //!   `killswitch_codegen::kill_switch_filters` — the ALE `OnlyVia(Secondary)`
 //!   pair (4a) plus the packet-layer multi-protocol egress pairs and the "Other"
 //!   block-all with per-protocol permit exceptions (4b).
-//! - **Sub-slice 4c: the catch-all (Mode-B) kill-switch.**
+//! - **The catch-all (Mode-B) kill-switch.**
 //!   `plan_catch_all_kill_switch` reproduces
 //!   `killswitch_codegen::catch_all_kill_switch_filters` (blanket egress permit +
 //!   subnet/host exemptions + ALE/packet blocks + the IPv6 cut).
-//! - **Sub-slice 4d: fail-closed + per-app kill-switch + app exemption.**
+//! - **Fail-closed + per-app kill-switch + app exemption.**
 //!   `plan_app_kill_switch` / `plan_primary_app_exempt` /
 //!   `plan_fail_closed_destinations` / `plan_fail_closed_apps` /
 //!   `plan_fail_closed_block_all` reproduce the rest of `killswitch_codegen` —
 //!   completing the whole module.
 //! - **Slice 5: the system route table + the fail-closed default block.**
 //!   `plan_routes` reproduces `route_codegen::generate_routes` (the `/32` host
-//!   fan-out + `/1`/`/2` overlays as neutral [`RouteIntent`]s), and
+//!   fan-out, the `/1` overlay and the counter-overlay as neutral
+//!   [`RouteIntent`]s), and
 //!   `plan_route_rules` emits the `StrictSecondaryFailClosed`
 //!   [`PrecedenceClass::DefaultCatchAll`] block. Each slice is proven behaviourally
 //!   equivalent to the current codegen by a `#[cfg(windows)] tests::slice*` test.
@@ -61,7 +62,7 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 // The caps live with the bands they protect.
 use crate::killswitch_codegen::KillSwitchProtocols;
 use crate::route_codegen::{
-    COUNTER_OVERLAY, MAX_ROUTES_PER_RULE, OVERLAY_HIGH, OVERLAY_LOW, SECONDARY_ROUTE_METRIC,
+    counter_overlay_for, MAX_ROUTES_PER_RULE, OVERLAY_HIGH, OVERLAY_LOW, SECONDARY_ROUTE_METRIC,
 };
 use crate::secondary_ip_policy::DenylistFilteredCache;
 use crate::wfp_bands::{APP_KILLSWITCH_MAX_APPS, KILLSWITCH_MAX_DESTINATIONS};
@@ -120,7 +121,7 @@ fn principal_scope(sid: &str) -> PrincipalScope {
     )
 }
 
-/// Per-destination packet-layer slot window (Sub-slice 4b), mirroring the
+/// Per-destination packet-layer slot window, mirroring the
 /// `idx * 16` weight window in `killswitch_codegen::packet_egress_pairs`. Each
 /// protected destination reserves 16 within-band ordinal slots at the packet
 /// layer (one per selectable protocol) so `lower_windows` reconstructs the exact

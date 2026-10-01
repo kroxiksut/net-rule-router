@@ -28,13 +28,13 @@ fn fixture_with_resolution_and_vpn_clients(
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| resolution.clone()))
+        .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
         .with_vpn_client_apps_provider(Arc::new(move || client_paths.clone())),
     );
     (api, orch, source, rules)
 }
 
-const VPN_CLIENT_PATH: &str = r"C:\Apps\swiftvpn 3.0.exe";
+const VPN_CLIENT_PATH: &str = r"C:\Apps\examplevpn 3.0.exe";
 
 /// Find the app-exempt permit for [`VPN_CLIENT_PATH`], if any installed.
 fn find_client_exempt(
@@ -62,7 +62,7 @@ fn verified_vpn_client_exempt_installed_when_mode_b_catch_all_arms() {
         Some(full_ks_resolution()),
         vec![VPN_CLIENT_PATH.to_string()],
     );
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -103,7 +103,7 @@ fn verified_vpn_client_exempt_installed_when_pair_cannot_arm_fail_closed() {
         Some(resolution),
         vec![VPN_CLIENT_PATH.to_string()],
     );
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -122,7 +122,7 @@ fn verified_vpn_client_exempt_not_emitted_for_mode_a_pinning() {
         Some(full_ks_resolution()),
         vec![VPN_CLIENT_PATH.to_string()],
     );
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP")); // PreferPrimary
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -177,7 +177,7 @@ fn fail_closed_block_all_permits_what_the_main_link_names_and_nothing_else() {
     };
     assert!(
         has_primary_permit(primary_only),
-        "a primary-only host gets a transport permit so ping survives the block-all (HW-0718)"
+        "a primary-only host gets a transport permit so ping survives the block-all"
     );
     assert!(
         has_primary_permit(shared),
@@ -245,7 +245,7 @@ fn fixture_with_census(
         cache,
         Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
     )
-    .with_kill_switch_resolver(Arc::new(move |_| resolution.clone()))
+    .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
     .with_fake_ip_context_provider(Arc::new(move || {
         fake_ip_effective
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -274,7 +274,7 @@ fn fixture_with_census(
 fn a_main_route_named_ip_is_spared_by_the_block_all_in_both_modes() {
     use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(23, 10, 20, 163);
+    let shared = Ipv4Addr::new(203, 0, 113, 163);
     for (strict, expect_permit) in [(false, true), (true, true)] {
         let (api, orch, src, rules) = fixture_with_census(
             None,
@@ -327,7 +327,7 @@ fn known_direct_exemption_keeps_census_shared_ip_under_mode_b_block_all() {
     // is still subtracted and stays blocked. Requires an effective fake-IP
     // datapath since  (the rule host is then enforced by name).
     use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(23, 10, 20, 163);
+    let shared = Ipv4Addr::new(203, 0, 113, 163);
     let pinned = Ipv4Addr::new(203, 0, 113, 9);
     let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
     registry.register(&[shared, pinned]);
@@ -403,7 +403,7 @@ fn smart_exemption_requires_fake_ip_datapath() {
     // through this exemption while the rule host was fail-closed).
     use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(23, 10, 20, 163);
+    let shared = Ipv4Addr::new(203, 0, 113, 163);
     let (api, orch, src, rules) = fixture_with_census(
         None,
         &[shared],
@@ -438,7 +438,7 @@ fn known_direct_exemption_denied_for_shared_ip_when_fake_ip_not_effective() {
     // down, a census-shared known-direct IP is subtracted like any other
     // secondary destination and earns no block-all exemption.
     use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(23, 10, 20, 163);
+    let shared = Ipv4Addr::new(203, 0, 113, 163);
     let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
     registry.register(&[shared]);
     let (api, orch, src, rules) = fixture_with_census(
@@ -483,7 +483,7 @@ fn fake_ip_datapath_flip_retightens_shared_ip_exemption_on_recompute() {
     // tightening pass must also DELETE the superseded permit — an add-only
     // pass would leave the leak installed.
     use std::sync::atomic::{AtomicBool, Ordering};
-    let shared = Ipv4Addr::new(23, 10, 20, 163);
+    let shared = Ipv4Addr::new(203, 0, 113, 163);
     let effective = Arc::new(AtomicBool::new(true));
     let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
     registry.register(&[shared]);
@@ -653,7 +653,7 @@ fn kill_switch_fail_closed_mode_b_blocks_all_when_unresolved() {
     assert_eq!(
         blocks.len(),
         7,
-        "mode-B fail-closed: V4 ALE block-all + 4 named V4 packet blocks (16.HW-0716) + V6 ALE + V6 packet block-all"
+        "mode-B fail-closed: V4 ALE block-all + 4 named V4 packet blocks + V6 ALE + V6 packet block-all"
     );
 }
 
@@ -688,9 +688,9 @@ fn a_machine_wide_cut_is_announced_to_the_principal_who_did_not_ask_for_it() {
         Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
         Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
     )
-    .with_kill_switch_resolver(Arc::new(move |_| resolution.clone()))
+    .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
     .with_events(Arc::clone(&bus));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
 
     // B is on the primary with no cut of its own; A then arms the mode-B
     // catch-all, which is a packet-layer block-all.
@@ -723,7 +723,7 @@ fn a_machine_wide_cut_is_announced_to_the_principal_who_did_not_ask_for_it() {
 #[test]
 fn a_live_catch_all_reports_itself_as_a_block_all() {
     let (_api, orch, src, rules) = fixture_with_resolution(Some(full_ks_resolution()));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -738,7 +738,7 @@ fn two_triggers_for_one_sid_do_not_interleave() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let (api, orch, src, rules) = fixture_with_resolution(Some(full_ks_resolution()));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
     let orch = Arc::new(orch);
 
@@ -782,7 +782,7 @@ fn turning_the_guard_off_in_strict_does_not_cut_the_machine_off() {
     // no loopback, no LAN, no DHCP and no route to the VPN server.
     let resolution = KillSwitchResolution {
         secondary_luid: KS_LUID,
-        bootstrap_server_ips: vec![Ipv4Addr::new(9, 9, 9, 9)],
+        bootstrap_server_ips: vec![Ipv4Addr::new(198, 51, 100, 9)],
         bootstrap_server_ips_v6: Vec::new(),
         local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
         local_subnets_v6: Vec::new(),
@@ -813,7 +813,7 @@ fn turning_the_guard_off_in_strict_does_not_cut_the_machine_off() {
     assert!(
         filters
             .iter()
-            .any(|f| f.action == WfpAction::Permit && f.covers_v4(Ipv4Addr::new(9, 9, 9, 9))),
+            .any(|f| f.action == WfpAction::Permit && f.covers_v4(Ipv4Addr::new(198, 51, 100, 9))),
         "and so must the way to the VPN server",
     );
 }
@@ -828,7 +828,7 @@ fn a_device_on_the_machines_own_lan_is_never_pinned_to_the_tunnel() {
     const REMOTE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
     let resolution = KillSwitchResolution {
         secondary_luid: KS_LUID,
-        bootstrap_server_ips: vec![Ipv4Addr::new(9, 9, 9, 9)],
+        bootstrap_server_ips: vec![Ipv4Addr::new(198, 51, 100, 9)],
         bootstrap_server_ips_v6: Vec::new(),
         local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
         local_subnets_v6: Vec::new(),
@@ -955,7 +955,7 @@ fn block_all_arming_edge_flushes_os_dns_cache_once_per_transition() {
         cache,
         Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
     )
-    .with_kill_switch_resolver(Arc::new(|_| None)) // secondary unresolved
+    .with_kill_switch_resolver(Arc::new(|_, _| None)) // secondary unresolved
     .with_dns_cache_control(Arc::clone(&flusher) as Arc<dyn nrr_platform_api::DnsCacheControlPort>);
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
     let armed_snap = || {
@@ -1097,6 +1097,31 @@ fn posture_log_event_heartbeats_via_orchestrator_latch() {
     );
 }
 
+/// The pin set is recomputed every few seconds; an unchanged trim must not
+/// repeat its line each time.
+#[test]
+fn an_unchanged_pin_trim_is_logged_once() {
+    let (_api, orch, _src, _rules) = fixture_with_luid(None);
+    assert!(
+        orch.pin_trim_changed("S-A", Some((3, 2, 1))),
+        "first trim logs"
+    );
+    assert!(
+        !orch.pin_trim_changed("S-A", Some((3, 2, 1))),
+        "the same trim on the next tick is quiet"
+    );
+    assert!(
+        orch.pin_trim_changed("S-A", Some((4, 1, 1))),
+        "a different trim logs"
+    );
+    assert!(orch.pin_trim_changed("S-B", Some((4, 1, 1))), "per SID");
+    assert!(!orch.pin_trim_changed("S-A", None));
+    assert!(
+        orch.pin_trim_changed("S-A", Some((4, 1, 1))),
+        "after a pass with nothing trimmed the same trim is news again"
+    );
+}
+
 /// Entering fail-closed must ask for a re-resolve immediately.
 ///
 /// The usual cause is a tunnel adapter recreated with a new GUID: the name
@@ -1119,7 +1144,7 @@ fn arming_fail_closed_asks_for_a_re_resolve_at_once() {
         Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
     )
     // Secondary unresolved → the fail-closed posture arms.
-    .with_kill_switch_resolver(Arc::new(|_| None))
+    .with_kill_switch_resolver(Arc::new(|_, _| None))
     .with_rebind_requests(Arc::clone(&requests));
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
     source.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
@@ -1240,6 +1265,40 @@ fn recompile_for_sid_replaces_filter_set() {
     assert!(filters[0].user_sid.as_deref() == Some("A"));
 }
 
+/// A recompile that changes block ids replaces them add-first: no state the
+/// engine passes through lacks both the old and the new block set.
+#[test]
+fn recompile_that_changes_block_ids_never_uncovers() {
+    let (api, orch, src, rules) = fixture_with_luid(None);
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
+    src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let block_ids = |api: &MockWindowsApi| -> Vec<u64> {
+        api.wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.action == WfpAction::Block)
+            .map(|f| f.id.raw)
+            .collect()
+    };
+    let old = block_ids(&api);
+
+    api.record_wfp_history();
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 10)));
+    orch.recompile_for_sid("S-1-5-21-A").unwrap();
+    let new = block_ids(&api);
+
+    assert!(!old.is_empty() && old != new, "the block set must change");
+    for (step, state) in api.wfp_history().iter().enumerate() {
+        let holds = |ids: &[u64]| ids.iter().all(|id| state.contains(id));
+        assert!(
+            holds(&old) || holds(&new),
+            "step {step}: neither block set is complete"
+        );
+    }
+}
+
 #[test]
 fn recompile_with_unchanged_rules_touches_nothing() {
     //  — the window-free recompile: an apply that changes
@@ -1286,13 +1345,13 @@ fn recompile_with_rules_uses_the_supplied_snapshot_not_the_provider() {
     // activation dispatches BEFORE the active
     // pointer commits, so the provider (storage read) must NOT be
     // consulted when the caller hands the revision content. Model the
-    // exact 0716 failure: provider says "no active rules" (pointer not
+    // failure: provider says "no active rules" (pointer not
     // committed yet) while the dispatcher holds the new revision.
     let (api, orch, src, rules, _audit) = fixture();
     src.set("A", snap_primary_only("Ethernet"));
     rules.clear();
 
-    // Storage-read path installs nothing (this WAS the 0716 bug's shape).
+    // Storage-read path installs nothing (the shape of the bug this guards).
     assert_eq!(orch.recompile_for_sid("A").unwrap(), 0);
     assert_eq!(api.wfp_filters.lock().unwrap().len(), 0);
 
@@ -1313,7 +1372,7 @@ fn policy_apply_trigger_recompiles_for_console_fallback_sid_without_tray() {
     src.set("S-CONSOLE", snap_primary_only("Ethernet"));
     let registry = Arc::new(ActiveSidRegistry::new());
 
-    // Without the fallback the trigger skips (pre-0716 behaviour).
+    // Without the fallback the trigger skips (the old behaviour).
     let bare = OrchestratorRoutePolicyApplyTrigger::new(Arc::clone(&orch), Arc::clone(&registry));
     bare.on_policy_changed("S-CONSOLE");
     assert_eq!(api.wfp_filters.lock().unwrap().len(), 0);

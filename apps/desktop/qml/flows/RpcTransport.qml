@@ -1,4 +1,5 @@
 import QtQuick 2.15
+import "../lib/pure.js" as Pure
 
 // Correlation-id RPC transport over the C++ NrrNativeBridge.
 //
@@ -15,13 +16,15 @@ import QtQuick 2.15
 // injected (`bridge: nrrNativeBridge`) instead of referenced as a global,
 // keeping the component free of hidden coupling and usable from any surface.
 //
-// Each set/refresh helper records a `correlation_id → { cb, deadline }` entry
-// before emitting the bridge request. When the bridge's `rpcResponse` signal
-// fires, `handleRpcResponse` dispatches the matching callback (or logs an
-// unknown correlation). A periodic GC fires synthetic timeout errors on stale
-// callbacks so the table cannot grow unbounded if the launcher / service drops
-// a response. The 30 s budget is well above the longest expected round-trip
-// (mutation submit + apply ~ 5 s typical, <= 15 s worst-case).
+// Each call registers a `correlation_id → { cb, deadline }` entry right after
+// the bridge emits the request. When the bridge's `rpcResponse` signal fires,
+// `handleRpcResponse` dispatches the matching callback. A periodic GC fires a
+// synthetic `rpc-timed-out` on callbacks past their deadline, so a response the
+// launcher never sends cannot hold an entry forever.
+//
+// The deadline is per operation and comes from the launcher (`answerDeadlines`,
+// derived from the budgets its dispatcher runs on), so the transport never
+// gives up on an answer that is still allowed to arrive.
 QtObject {
     id: transport
 
@@ -30,11 +33,56 @@ QtObject {
     // builds) each forwarder returns "" and callers treat that as "offline".
     property var bridge: null
 
-    readonly property int rpcTimeoutMs: 30000
+    // `{ defaultMs, operationsMs: { <slug>: ms } }` from the launch context.
+    property var answerDeadlines: null
 
-    // correlation-id -> { cb, deadline }. Reassigned wholesale on every
-    // mutation so QML property-change tracking observes the update.
+    // Only without a launcher context, where no answer ever comes.
+    readonly property int _contextlessDeadlineMs: 30000
+
+    // correlation-id -> { cb, deadline, operation }. Reassigned wholesale on
+    // every mutation so QML property-change tracking observes the update.
     property var pendingRpc: ({})
+
+    // correlation-id -> { operation, at }, filled by the bridge's
+    // `rpcRequested` and taken by the registration that follows on the same
+    // call stack.
+    property var _requestedOps: ({})
+
+    // correlation-id -> { operation, wasLong, at } of calls the GC failed, so
+    // their real answer is recognised instead of dropped as unknown.
+    property var _expiredRpc: ({})
+    readonly property int _recordMemoryMs: 600000
+
+    // A call the GC had already failed has answered after all. Its callback ran
+    // with `rpc-timed-out`; a surface whose state the call may have changed
+    // re-reads it from here.
+    signal lateResponse(string correlationId, string operation, bool wasLong,
+                        bool ok, string errorCode)
+
+    // The service refused a change until a security alert is acknowledged —
+    // an alert the surface may not list yet. Wire slug of
+    // `IpcErrorCode::SecurityAlertUnacknowledged`, pinned by a test.
+    readonly property string securityAlertGateCode: "security-alert-unacknowledged"
+    signal securityAlertGateHit()
+
+    function answerDeadlineMs(operation) {
+        var table = answerDeadlines
+        if (!table) return _contextlessDeadlineMs
+        var perOp = table.operationsMs ? Number(table.operationsMs[operation]) : NaN
+        if (perOp > 0) return perOp
+        var fallback = Number(table.defaultMs)
+        return fallback > 0 ? fallback : _contextlessDeadlineMs
+    }
+
+    property Connections _requestWatch: Connections {
+        target: transport.bridge
+        ignoreUnknownSignals: true
+        function onRpcRequested(correlationId, operation) {
+            transport._requestedOps[correlationId] = {
+                operation: String(operation || ""), at: Date.now()
+            }
+        }
+    }
 
     readonly property bool bridgeAvailable: typeof bridge !== "undefined"
         && bridge !== null
@@ -54,8 +102,15 @@ QtObject {
 
     function registerRpcCallback(correlationId, callback) {
         if (!correlationId || correlationId === "") return
+        var requested = _requestedOps[correlationId]
+        delete _requestedOps[correlationId]
+        var operation = requested === undefined ? "" : requested.operation
         var table = pendingRpc
-        table[correlationId] = { cb: callback, deadline: Date.now() + rpcTimeoutMs }
+        table[correlationId] = {
+            cb: callback,
+            deadline: Date.now() + answerDeadlineMs(operation),
+            operation: operation
+        }
         pendingRpc = table
     }
 
@@ -77,6 +132,54 @@ QtObject {
         var longs = pendingLongRpc
         delete longs[correlationId]
         pendingLongRpc = longs
+    }
+
+    // A confirmed mutation's `ok` only says it was accepted; the verdict is on
+    // its operation record. `done("")` once it completed, `done(code)` when it
+    // failed. A record this account cannot read (another administrator
+    // confirmed it) is judged by `settleByState(done)` from what the service
+    // holds now.
+    function readMutationOutcome(confirmAnswer, settleByState, done) {
+        var operationId = String((confirmAnswer && confirmAnswer["operation-id"]) || "")
+        var corr = (operationId !== "" && bridgeAvailable
+                    && typeof bridge.rpcOperationStatusGet === "function")
+            ? bridge.rpcOperationStatusGet(operationId) : ""
+        if (!corr) {
+            settleByState(done)
+            return
+        }
+        registerRpcCallback(corr, function(ok, status) {
+            var failure = Pure.operationOutcome(ok, status)
+            if (failure === transport.securityAlertGateCode) transport.securityAlertGateHit()
+            if (failure === null) settleByState(done)
+            else done(failure)
+        })
+    }
+
+    // `settleByState` for a mutation the preview describes: it took effect
+    // exactly when the same payload now previews as unchanged —
+    // `unchanged(summary)`, an empty diff unless given.
+    function settleByPreview(kind, payload, unchanged) {
+        var isUnchanged = (typeof unchanged === "function") ? unchanged : Pure.reviewSummaryIsEmpty
+        return function(done) {
+            var again = Object.assign({}, payload, {
+                "correlation-id": kind + "-outcome-" + Date.now() + "-"
+                    + Math.floor(Math.random() * 1e6)
+            })
+            var corr = (bridgeAvailable && typeof bridge.rpcMutationSubmit === "function")
+                ? bridge.rpcMutationSubmit(kind, again, true /* dryRun */, "") : ""
+            if (!corr) {
+                done("unknown")
+                return
+            }
+            registerLongRpcCallback(corr, function(ok, p, code) {
+                if (!ok) {
+                    done(String(code || "unknown"))
+                    return
+                }
+                done(Pure.previewOutcome((p && p["review-summary"]) || p || {}, isUnchanged))
+            })
+        }
     }
 
     // --- Bridge forwarders (guarded; return "" when the bridge is absent) ---
@@ -117,6 +220,12 @@ QtObject {
     function rpcSystemTheme() {
         return (bridgeAvailable && typeof bridge.rpcSystemTheme === "function")
             ? bridge.rpcSystemTheme()
+            : ""
+    }
+    // The Help menu's "Check for updates"; "" means no bridge.
+    function rpcUpdateCheckRun() {
+        return (bridgeAvailable && typeof bridge.rpcUpdateCheckRun === "function")
+            ? bridge.rpcUpdateCheckRun()
             : ""
     }
     // App-group routing discovery (mirrors rpcVpnDiscover); "" == scan-failed.
@@ -248,13 +357,24 @@ QtObject {
     function handleRpcResponse(correlationId, ok, payload, errorCode, errorMessage) {
         var entry = pendingRpc[correlationId]
         if (entry === undefined) {
-            console.log("rpc: unknown correlation id", correlationId)
+            var expired = _expiredRpc[correlationId]
+            if (expired === undefined) {
+                console.log("rpc: unknown correlation id", correlationId)
+                return
+            }
+            delete _expiredRpc[correlationId]
+            console.log("rpc: late answer", correlationId, expired.operation,
+                "ok=" + ok, String(errorCode || ""),
+                (Date.now() - expired.at) + " ms after its deadline")
+            lateResponse(correlationId, expired.operation, expired.wasLong,
+                         !!ok, String(errorCode || ""))
             return
         }
         var table = pendingRpc
         delete table[correlationId]
         pendingRpc = table
         _forgetLongRpc(correlationId)
+        if (!ok && String(errorCode || "") === securityAlertGateCode) securityAlertGateHit()
         try {
             entry.cb(ok, payload, errorCode, errorMessage)
         } catch (e) {
@@ -264,6 +384,7 @@ QtObject {
 
     function gcPendingRpc() {
         var now = Date.now()
+        _forgetOldRecords(now)
         var table = pendingRpc
         var stale = []
         for (var id in table) {
@@ -272,16 +393,32 @@ QtObject {
         if (stale.length === 0) return
         for (var i = 0; i < stale.length; i++) {
             var entry = table[stale[i]]
+            var wasLong = pendingLongRpc[stale[i]] !== undefined
             delete table[stale[i]]
             _forgetLongRpc(stale[i])
+            _expiredRpc[stale[i]] = { operation: entry.operation, wasLong: wasLong, at: now }
+            console.log("rpc: no answer in time", stale[i], entry.operation)
             try {
                 entry.cb(false, null, "rpc-timed-out",
-                    "no response within " + (rpcTimeoutMs / 1000) + " s")
+                    "no response within "
+                    + Math.round(answerDeadlineMs(entry.operation) / 1000) + " s")
             } catch (e) {
                 console.log("rpc: gc callback exception", e)
             }
         }
         pendingRpc = table
+    }
+
+    // Requests nobody registered for, and failed calls that never answered:
+    // neither may pile up over a long session.
+    function _forgetOldRecords(now) {
+        var id
+        for (id in _requestedOps) {
+            if (now - _requestedOps[id].at > _recordMemoryMs) delete _requestedOps[id]
+        }
+        for (id in _expiredRpc) {
+            if (now - _expiredRpc[id].at > _recordMemoryMs) delete _expiredRpc[id]
+        }
     }
 
     // Pending-RPC garbage collector. Declared as a property-held Timer so the

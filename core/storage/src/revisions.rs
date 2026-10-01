@@ -10,9 +10,8 @@
 //!    [`insert_candidate`].
 //! 2. Service issues a confirmation token and the user activates →
 //!    the activation coordinator opens an SQL transaction, calls
-//!    [`mark_apply_succeeded`] (atomic Phase 3a) or
-//!    [`mark_apply_failed`] (Phase 3b), and updates the
-//!    `active_revision_pointer` via [`set_active_pointer`].
+//!    [`mark_apply_succeeded`] or [`mark_apply_failed`] atomically, and
+//!    updates the `active_revision_pointer` via [`set_active_pointer`].
 //! 3. On rollback, [`mark_rolled_back`] flips the previously-active
 //!    revision to `RolledBack` while a fresh candidate is created and
 //!    activated through the same flow.
@@ -22,8 +21,8 @@
 //! Single-writer (`&Connection` borrowed). Concurrent activations from
 //! different threads serialise through the partial unique index
 //! `idx_one_active_revision` — only one `status='active'` row may exist
-//! at any time. The activation coordinator wraps the multi-statement
-//! Phase 3 commit in a SQL transaction so the index check fires under
+//! at any time. The activation coordinator wraps its multi-statement
+//! commit in a SQL transaction so the index check fires under
 //! `BEGIN IMMEDIATE`.
 //!
 //! ## Serialisation boundary
@@ -78,8 +77,8 @@ pub struct VerifiedHistoryEntry {
 pub struct ActiveRevisionPointer {
     pub revision_id: String,
     pub activated_at: i64,
-    /// Links to `apply_snapshots.attempt_id` while a Phase 2 apply is in
-    /// flight. Cleared by Phase 3a commit on success.
+    /// Always `None`: no writer records an attempt here. Kept because the
+    /// column is part of the pointer's signed fields.
     pub apply_attempt_id: Option<String>,
 }
 
@@ -144,7 +143,7 @@ fn risk_level_from_slug(s: &str) -> Option<RiskLevel> {
 /// The optional `signing_key` enables tamper detection on the `row_hmac`
 /// column added in v11. When set, every
 /// `insert_candidate` computes a fresh HMAC and persists it
-/// alongside the row; `read_verified` / `re_sign_all` query and
+/// alongside the row; `read_verified` / `re_sign_row` query and
 /// repair the column. When `None` (back-compat default), the row is
 /// inserted with the empty-blob default and `read_verified` flags
 /// it as `Unsigned`. Existing read methods that don't return a
@@ -155,20 +154,16 @@ pub struct RevisionsRepository<'c> {
     signing_key: Option<Vec<u8>>,
 }
 
-/// What a bulk re-sign did. `adopted_tampered` names the rows whose stored
-/// signature did NOT match before being replaced — the ones where re-signing
-/// legitimised an edit nobody here made.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReSignReport {
-    pub re_signed: usize,
-    pub adopted_tampered: Vec<String>,
-}
-
+mod integrity;
 mod pointer;
 mod reads;
 mod retention;
 mod signing;
 mod transitions;
+
+pub use integrity::{
+    AdoptionOutcome, AdoptionRequest, IntegrityRowKind, ScannedContent, ScannedRow,
+};
 
 // Re-exported so `revisions::tests` (a sibling of `signing`) can reach it
 // through its `use super::*;`, matching the pre-split single-module layout.

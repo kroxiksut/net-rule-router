@@ -9,4 +9,4 @@ Expected structure:
 - bh/<pack-name>/rules_secondary.txt
 
 Author: repository contributors
-Note: initial pack content may be unverified.
+Checked: September 2026

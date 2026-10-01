@@ -48,7 +48,7 @@ fn any_qml_file_contains(relative_dir: &str, needle: &str) -> bool {
 }
 
 #[test]
-fn block_3_1_token_contract_documents_required_sets() {
+fn theme_token_contract_documents_required_sets() {
     let tokens_doc = read_file("configs/theme/TOKENS.md");
     for marker in [
         "Color Tokens",

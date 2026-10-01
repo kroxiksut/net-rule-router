@@ -126,16 +126,10 @@ pub struct PreFlightWarning {
 /// Reason a pre-flight check flagged a SID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PreFlightCategory {
-    /// SID was active at Phase 1 snapshot but is no longer in the
-    /// registry by the time pre-flight runs.
-    SidLeftRegistry,
     /// Two filter specs would collide on FNV-1a `WfpFilterId`.
     FilterIdCollision,
     /// Action plan exceeds `MAX_FILTERS_PER_TRANSACTION` × N batches.
     BatchOverflow,
-    /// Routing-table addition conflicts with an existing system route
-    /// the engine cannot safely override.
-    RoutingConflict,
     /// Rules JSON failed to deserialise / interpret. Pre-flight blocker.
     InvalidRulesContent,
     /// An application rule matched no executable, so it would be stored and
@@ -146,6 +140,19 @@ pub enum PreFlightCategory {
     /// cannot resolve. The revision applies, and its leak guard sits
     /// fail-closed until the adapter comes back.
     BindingUnresolved,
+}
+
+impl PreFlightCategory {
+    /// Whether this finding refuses the activation outright. The one answer
+    /// both the coordinator and the review read: a second list goes stale the
+    /// day a category is added. Exhaustive on purpose, for the same reason.
+    #[must_use]
+    pub const fn blocks_activation(self) -> bool {
+        match self {
+            Self::FilterIdCollision | Self::BatchOverflow | Self::InvalidRulesContent => true,
+            Self::AppRuleUnenforceable | Self::BindingUnresolved => false,
+        }
+    }
 }
 
 /// Returned by [`ActivationCoordinator::dry_run_rules`].
@@ -244,8 +251,21 @@ pub enum PolicyError {
         /// `address-match`, `app-match`, `comment` or `origin`.
         field: &'static str,
     },
+    /// Submitted rules whose value the per-row verdict refuses (a zone `123`,
+    /// an address in a domain rule). Refused at submission, like an unsupported
+    /// shape; a value the book in force already holds is spared.
+    InvalidRuleValue {
+        rules: Vec<nrr_domain::rule_value_validation::RefusedRuleValue>,
+    },
     /// Another activation held the machine-wide gate for the whole wait.
     ActivationBusy,
+    /// The rules were applied but the activation could not be recorded, so
+    /// they were reverted and the previous revision stays in force. The
+    /// confirmation token is spent; retrying takes a new review.
+    ActivationNotRecorded {
+        revision_id: RevisionId,
+        detail: String,
+    },
 }
 
 /// Why [`ActivationCoordinator`] refused to treat a row as trustworthy.
@@ -263,6 +283,89 @@ pub enum RevisionRejectReason {
     RuleCapExceeded { user_rule_count: usize, cap: usize },
 }
 
+impl std::fmt::Display for RevisionRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsigned => f.write_str("it carries no signature"),
+            Self::Tampered => f.write_str("its signature does not match its content"),
+            Self::RuleCapExceeded {
+                user_rule_count,
+                cap,
+            } => write!(
+                f,
+                "its {user_rule_count} user rules exceed the cap of {cap}"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StorageFailure { operation, message } => {
+                write!(f, "rules storage failed in {operation}: {message}")
+            }
+            Self::ConfirmationTokenUnknown => f.write_str("the confirmation token is unknown"),
+            Self::ConfirmationTokenAlreadyUsed => {
+                f.write_str("the confirmation token was already used")
+            }
+            Self::ConfirmationTokenExpired => f.write_str("the confirmation token has expired"),
+            Self::ConfirmationTokenForOtherRevision => {
+                f.write_str("the confirmation token was issued for another revision")
+            }
+            Self::RevisionNotFound(id) => write!(f, "revision {id} does not exist"),
+            Self::RevisionNotInExpectedStatus {
+                revision_id,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "revision {revision_id} is {}, expected {expected}",
+                actual.as_slug()
+            ),
+            Self::NoLastKnownGood => f.write_str("there is no earlier revision to roll back to"),
+            Self::MarkerWriteFailed(detail) => {
+                write!(f, "the apply-attempt marker could not be written: {detail}")
+            }
+            Self::RevisionIntegrityRejected {
+                revision_id,
+                reason,
+            } => write!(f, "revision {revision_id} is not trusted: {reason}"),
+            Self::UnsupportedRuleShape { rule_id, reason } => write!(
+                f,
+                "rule {rule_id} has a shape enforcement cannot carry out ({reason})"
+            ),
+            Self::ControlCharacterInRule { rule_id, field } => write!(
+                f,
+                "rule {rule_id} holds a line break or control character in its {field}"
+            ),
+            // Ids only: the values are the user's destinations.
+            Self::InvalidRuleValue { rules } => {
+                let ids: Vec<&str> = rules.iter().map(|r| r.rule_id.as_str()).collect();
+                write!(
+                    f,
+                    "{} rules hold a value their type refuses: {}",
+                    rules.len(),
+                    ids.join(", ")
+                )
+            }
+            Self::ActivationBusy => {
+                f.write_str("another activation held the gate for the whole wait")
+            }
+            Self::ActivationNotRecorded {
+                revision_id,
+                detail,
+            } => write!(
+                f,
+                "revision {revision_id} was applied but could not be recorded, so it was \
+                 reverted: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PolicyError {}
+
 /// Outcome of [`ActivationCoordinator::enforce_active_integrity_for`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActiveIntegrityOutcome {
@@ -274,6 +377,12 @@ pub enum ActiveIntegrityOutcome {
     NoActiveRevision,
     /// The active revision verified and is within the Free rule cap.
     Trusted { revision_id: String },
+    /// The revision (or its absence) was trusted, but the pointer named
+    /// something else or its signature failed; it now follows the status.
+    PointerRealigned {
+        pointer_was: Option<String>,
+        revision_id: Option<String>,
+    },
     /// The active revision failed the gate; the coordinator rolled back
     /// to the newest prior revision that both verifies and respects the
     /// cap.
@@ -294,4 +403,7 @@ pub enum ActiveIntegrityOutcome {
         reason: RevisionRejectReason,
         rejected_user_rule_count: usize,
     },
+    /// The check itself failed for this principal. Its active revision is
+    /// left as it was, and the sweep goes on to the next principal.
+    CheckFailed { error: PolicyError },
 }

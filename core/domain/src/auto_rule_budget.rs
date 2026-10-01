@@ -21,6 +21,29 @@ use crate::{RuleId, RuleOrigin};
 /// set size that would show up in enforcement.
 pub const MAX_AUTO_RULES: usize = 2_000;
 
+/// How many app-authored rules a write may carry when it replaces a book that
+/// holds `carried` of them. A book saved before the budget existed stays
+/// editable at its size; it only may not grow.
+#[must_use]
+pub const fn auto_rule_allowance(carried: usize) -> usize {
+    if carried > MAX_AUTO_RULES {
+        carried
+    } else {
+        MAX_AUTO_RULES
+    }
+}
+
+/// App-authored rules in `book`, both routes together.
+#[must_use]
+pub fn auto_rule_count(book: &CanonicalRuleBook) -> usize {
+    book.primary
+        .rules()
+        .iter()
+        .chain(book.secondary.rules().iter())
+        .filter(|rule| added_date(rule).is_some())
+        .count()
+}
+
 /// Ids of the app-authored rules to drop so `book` fits `budget`, oldest first.
 ///
 /// Empty when the book is within budget. Only rules the app authored are
@@ -126,6 +149,7 @@ mod tests {
         );
         // Budget 0: everything the app authored goes, nothing else does.
         assert_eq!(auto_rules_over_budget(&b, 0), vec![RuleId("a1".into())]);
+        assert_eq!(auto_rule_count(&b), 1);
     }
 
     #[test]

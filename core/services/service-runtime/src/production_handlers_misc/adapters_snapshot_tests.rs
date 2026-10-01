@@ -2,43 +2,79 @@ use super::*;
 use nrr_platform_api::adapters::{IfOperStatus, InterfaceType};
 use nrr_platform_api::route_table::RouteTablePort;
 use nrr_platform_api::windows_api::MockWindowsApi;
+use nrr_platform_api::{
+    InterfaceRowsPort, InterfacesDataSource, MockInterfaceRows, PlaceholderInterfaceRows,
+};
 use std::net::Ipv4Addr;
+
+fn provider_over(api: Arc<MockWindowsApi>) -> MonitoredAdaptersSnapshotProvider {
+    MonitoredAdaptersSnapshotProvider::new(
+        api as Arc<dyn RouteTablePort>,
+        Arc::new(PlaceholderInterfaceRows) as Arc<dyn InterfaceRowsPort>,
+    )
+}
 
 #[test]
 fn empty_adapter_list_yields_empty_wire_response() {
-    let api = Arc::new(MockWindowsApi::new());
-    let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
+    let provider = provider_over(Arc::new(MockWindowsApi::new()));
     let resp = provider.adapters_snapshot(false);
     assert!(resp.adapters.is_empty());
-    // The spelling used to be hardcoded `windows-live`, which is also what
-    // this assertion pinned. Which of the two the enumeration reaches is a
-    // property of the HOST (a Windows box with adapters answers live, a
-    // Linux one answers with the placeholder), so the assertion below is
-    // the honesty invariant instead: the label has to be one the contract
-    // defines, and it must round-trip.
-    let source = nrr_platform_api::InterfacesDataSource::from_title(&resp.data_source);
+    let source = InterfacesDataSource::from_title(&resp.data_source);
     assert_eq!(source.title(), resp.data_source);
 }
 
 /// The placeholder dataset must never be announced as a live enumeration:
 /// four invented adapters presented as this machine's own are what a user
-/// binds a route to (§36.15.1).
+/// binds a route to.
 #[test]
 fn placeholder_rows_are_never_announced_as_live() {
-    let api = Arc::new(MockWindowsApi::new());
-    let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
+    let provider = provider_over(Arc::new(MockWindowsApi::new()));
     let resp = provider.adapters_snapshot(false);
-    let placeholder_shipped = resp
+    assert!(resp
         .rows
         .iter()
-        .any(|row| row.adapter_name.starts_with("{FAKE-"));
-    if placeholder_shipped {
-        assert_eq!(
-            resp.data_source,
-            nrr_platform_api::InterfacesDataSource::FallbackMock.title(),
-            "placeholder rows announced as a live enumeration",
-        );
-    }
+        .any(|row| row.adapter_name.starts_with("{FAKE-")));
+    assert_eq!(
+        resp.data_source,
+        InterfacesDataSource::FallbackMock.title(),
+        "placeholder rows announced as a live enumeration",
+    );
+}
+
+/// The provenance on the wire is the enumeration's own, and the probe is asked
+/// for only when the caller asked for it.
+#[test]
+fn snapshot_reports_the_enumerations_provenance_and_forwards_the_probe_flag() {
+    let rows = Arc::new(MockInterfaceRows::new(
+        InterfacesDataSource::LinuxLive,
+        nrr_platform_api::fallback_rows(),
+    ));
+    let provider = MonitoredAdaptersSnapshotProvider::new(
+        Arc::new(MockWindowsApi::new()) as Arc<dyn RouteTablePort>,
+        Arc::clone(&rows) as Arc<dyn InterfaceRowsPort>,
+    );
+    assert_eq!(
+        provider.adapters_snapshot(false).data_source,
+        InterfacesDataSource::LinuxLive.title()
+    );
+    provider.adapters_snapshot_probing_external_ip();
+    assert_eq!(rows.probe_requests(), [false, true]);
+}
+
+/// A plain refresh shows what the service sends; unscored rows turned every
+/// badge into "allowed, not recommended" the moment the user refreshed.
+#[test]
+fn snapshot_rows_arrive_scored() {
+    let provider = provider_over(Arc::new(MockWindowsApi::new()));
+    let resp = provider.adapters_snapshot(false);
+    assert!(resp
+        .rows
+        .iter()
+        .all(|row| !row.recommendation.key_signals.is_empty()));
+    assert!(resp
+        .rows
+        .iter()
+        .any(|row| row.recommendation.class == "preferred-primary"));
 }
 
 #[test]
@@ -57,7 +93,7 @@ fn projection_carries_mac_and_index() {
         ipv6_addresses: Vec::new(),
         gateways: vec![Ipv4Addr::new(192, 168, 1, 1)],
     }]);
-    let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
+    let provider = provider_over(api);
     let resp = provider.adapters_snapshot(false);
     assert_eq!(resp.adapters.len(), 1);
     let entry = &resp.adapters[0];
@@ -121,7 +157,7 @@ impl AdapterAddressRecorder for FakeAddressRecorder {
 fn rows_with_fresh_ethernet_probe() -> Vec<nrr_platform_api::interface_rows::InterfaceRouteRow> {
     let mut rows = nrr_platform_api::interface_rows::fallback_rows();
     for row in &mut rows {
-        if row.windows_name == "Ethernet" {
+        if row.name == "Ethernet" {
             nrr_platform_api::interface_rows::apply_external_probe(
                 &mut row.observed_facts,
                 nrr_platform_api::ExternalIpProbeOutcome::Resolved(std::net::Ipv4Addr::new(
@@ -134,14 +170,14 @@ fn rows_with_fresh_ethernet_probe() -> Vec<nrr_platform_api::interface_rows::Int
 }
 
 #[test]
-fn fold_cached_external_persists_fresh_resolution_keyed_by_windows_name() {
+fn fold_cached_external_persists_fresh_resolution_keyed_by_name() {
     // The Ethernet entry's `adapter_name` ("{FAKE-ETHERNET-ADAPTER}", a
-    // GUID) is deliberately distinct from `windows_name` ("Ethernet") —
-    // proves the join key used is `windows_name`, matching the traffic
+    // GUID) is deliberately distinct from `name` ("Ethernet") —
+    // proves the join key used is `name`, matching the traffic
     // ledger's `Alias`-derived key, not the low-level identity GUID.
     let api = Arc::new(MockWindowsApi::new());
     let recorder = Arc::new(FakeAddressRecorder::new());
-    let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
+    let provider = provider_over(api)
         .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
 
     let mut rows = rows_with_fresh_ethernet_probe();
@@ -157,7 +193,7 @@ fn fold_cached_external_persists_fresh_resolution_keyed_by_windows_name() {
         calls[0],
         (
             "Ethernet".to_string(),
-            "192.168.1.20".to_string(),
+            "192.0.2.20".to_string(),
             "203.0.113.10".to_string(),
         )
     );
@@ -182,7 +218,7 @@ fn a_remembered_address_under_a_reused_name_is_forgotten_not_shown() {
         "Ethernet".to_string(),
         ("10.9.9.9".to_string(), Some("198.51.100.200".to_string())),
     );
-    let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
+    let provider = provider_over(api)
         .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
 
     // A snapshot with NO fresh probe — the common one, and the only kind
@@ -204,10 +240,10 @@ fn a_remembered_address_under_a_reused_name_is_forgotten_not_shown() {
     let recorder = Arc::new(FakeAddressRecorder::new());
     recorder.stored.lock().expect("lock").insert(
         "Ethernet".to_string(),
-        ("192.168.1.20".to_string(), Some("203.0.113.10".to_string())),
+        ("192.0.2.20".to_string(), Some("203.0.113.10".to_string())),
     );
     let api = Arc::new(MockWindowsApi::new());
-    let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
+    let provider = provider_over(api)
         .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
     let mut rows = rows_with_fresh_ethernet_probe();
     for row in &mut rows {
@@ -226,7 +262,7 @@ fn fold_cached_external_does_not_persist_a_replayed_address() {
     // recorder — only a genuinely fresh resolution does.
     let api = Arc::new(MockWindowsApi::new());
     let recorder = Arc::new(FakeAddressRecorder::new());
-    let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
+    let provider = provider_over(api)
         .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
 
     let mut first = rows_with_fresh_ethernet_probe();
@@ -248,7 +284,7 @@ fn fold_cached_external_does_not_persist_a_replayed_address() {
 #[test]
 fn without_a_recorder_fold_cached_external_is_a_noop_for_persistence() {
     let api = Arc::new(MockWindowsApi::new());
-    let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
+    let provider = provider_over(api);
     let mut rows = nrr_platform_api::interface_rows::fallback_rows();
     // Must not panic without a recorder wired.
     provider.fold_cached_external(&mut rows);

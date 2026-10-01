@@ -26,14 +26,12 @@
 //! 4. Merge          merge preset rules with the other route from the active config
 //!                     → ActiveConfiguration (only selected route's rules replaced)
 //! 5. Validate full  validate_and_canonicalize(&merged_config) → CanonicalProfile
-//! 6. Build request  ImportRequest { revision_id, content_hash, … }
-//! 7. Candidate      process_import(request, active_hash, pending_hash)
-//!                     → ImportResult::PendingReview(PendingRevision)
-//! 8. Review         user sees diff dialog; GUI calls ApprovePendingReview command
-//! 9. Activate       service activates the pending revision
+//! 6. Candidate      service stores the merged book as a candidate revision
+//! 7. Review         user sees diff dialog; GUI calls ApprovePendingReview command
+//! 8. Activate       service activates the pending revision
 //! ```
 //!
-//! Stages 1–7 and 8–9 are separated by the review gate: **the active revision
+//! Stages 1–6 and 7–8 are separated by the review gate: **the active revision
 //! never changes unless the user explicitly confirms the review dialog.**
 //!
 //! # Import semantics
@@ -71,8 +69,8 @@ use crate::rules_file::HostPlatform;
 /// Specification for a preset import operation.
 ///
 /// Supplied by the GUI when the user completes the file picker. The service
-/// reads the file at `source_path`, runs stages 1–7 of the import
-/// pipeline, and returns a `PendingRevision` for review.
+/// reads the file at `source_path`, runs stages 1–6 of the import
+/// pipeline, and returns a candidate revision for review.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresetImportSpec {
     /// Which route's rules are replaced by the imported file.
@@ -149,7 +147,7 @@ pub struct PresetExportMetadata {
 ///
 /// When `true`, selecting a file for one route automatically opens a second
 /// file picker for the other route. Both files are validated and imported in a
-/// single operation — the result is one `PendingRevision` that replaces both
+/// single operation — the result is one candidate revision that replaces both
 /// routes' rules.
 ///
 /// Stored in `UiPreferences::import_both_files_together`.
@@ -172,14 +170,12 @@ pub const IMPORT_BOTH_FILES_TOGETHER_DEFAULT: bool = false;
 /// | 3 | Canonicalize  | `preset_canonicalize` | `ParseOutcome` → `CanonicalRuleSet`   |
 /// | 4 | Merge         | Service         | preset rules + active config → `ActiveConfiguration` |
 /// | 5 | Full validate | `validation`    | `ActiveConfiguration` → `CanonicalProfile`|
-/// | 6 | Build request | Service         | `CanonicalProfile` → `ImportRequest`      |
-/// | 7 | Candidate     | `import`        | `ImportRequest` → `ImportResult`          |
-/// | 8 | Review        | GUI             | user confirms diff dialog                 |
-/// | 9 | Activate      | Service         | `ApprovePendingReview` command → active   |
+/// | 6 | Candidate     | Service         | merged book → candidate revision          |
+/// | 7 | Review        | GUI             | user confirms diff dialog                 |
+/// | 8 | Activate      | Service         | `ApprovePendingReview` command → active   |
 ///
-/// Stages 2–3 are implemented at the domain level.
-/// Stages 5 and 7 are implemented at the domain level.
-/// Stages 1, 4 (merge), 6, 8–9 belong to the service layer.
+/// Stages 2, 3 and 5 are implemented at the domain level; 1, 4 (merge), 6 and
+/// 8 belong to the service layer.
 pub struct PresetImportPipelineDoc;
 
 // ── Round-trip guarantee ──────────────────────────────────────────────────────

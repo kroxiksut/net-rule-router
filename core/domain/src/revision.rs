@@ -1,35 +1,9 @@
-//! Revision identity model and provenance types for the policy revision system.
-//!
-//! This module defines the foundational types for the revision system:
-//! - [`RevisionId`] — human-readable, prefixed-UUID identifier for a revision.
-//! - [`RevisionSeq`] — monotonic sequence number assigned by the service.
-//! - [`ContentHash`] — SHA-256 fingerprint over policy-content fields.
-//! - [`UnixTimestamp`] — UTC Unix timestamp (seconds since epoch).
-//! - [`ImportChannel`] — how an artifact was imported.
-//! - [`ImportedArtifact`] — provenance record for an externally imported config.
-//!
-//! [`crate::canonical::CanonicalProfile`] is the input type consumed by
-//! `PolicyRevision`. It is produced by the
-//! validation pipeline and carries all policy-relevant content
-//! in a normalized form. The content hash in each `PolicyRevision` is computed
-//! over its `CanonicalProfile` fields.
-//!
-//! # SHA-256 hash scope
-//!
-//! `ContentHash` covers exactly: `primary` binding + `secondary` binding +
-//! `behavior_mode` + `rule_book`. Display labels, import metadata, actor
-//! identity, and timestamps are excluded from the hash. This ensures that two
-//! configurations with the same routing policy produce the same fingerprint
-//! regardless of how they were labeled or when they were imported.
-//!
-//! Actual SHA-256 computation is performed by the service layer.
-//! This module defines the type boundary only.
+//! Revision identity and provenance: [`RevisionId`], [`ContentHash`],
+//! [`UnixTimestamp`], [`RevisionSource`] and [`RiskLevel`]. The revision
+//! lifecycle itself is `rules_revision` and the storage layer's; the audit
+//! trail is `nrr-diagnostics`.
 
 use core::fmt;
-
-// `CanonicalProfile` is the policy-content input consumed by `PolicyRevision`.
-// Re-export here so revision-system consumers can access it from one location.
-pub use crate::canonical::CanonicalProfile;
 
 // ── RevisionId ────────────────────────────────────────────────────────────────
 
@@ -82,77 +56,11 @@ impl fmt::Display for RevisionId {
     }
 }
 
-// ── RevisionSeq ───────────────────────────────────────────────────────────────
-
-/// Monotonically increasing sequence number assigned to each revision.
-///
-/// Sequences start at `1`. The service increments the counter for every new
-/// revision, including pending candidates that are later rejected. This allows
-/// detection of gaps (e.g. from an externally truncated audit log).
-///
-/// Persistent storage and counter management are implemented by the service layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RevisionSeq(u64);
-
-impl RevisionSeq {
-    /// The first valid sequence number.
-    pub const FIRST: Self = Self(1);
-
-    /// Constructs a `RevisionSeq` from a raw `u64`. Must be `>= 1`.
-    pub fn new(value: u64) -> Result<Self, &'static str> {
-        if value == 0 {
-            Err("revision sequence number must be >= 1")
-        } else {
-            Ok(Self(value))
-        }
-    }
-
-    /// Returns the raw sequence value.
-    pub fn value(self) -> u64 {
-        self.0
-    }
-
-    /// Returns the next sequence number, or `None` on overflow.
-    ///
-    /// Overflow is physically impossible in practice (u64::MAX revisions at
-    /// one per nanosecond would require ~584 years), but the type signature
-    /// is honest rather than panicking.
-    pub fn next(self) -> Option<Self> {
-        self.0.checked_add(1).map(Self)
-    }
-}
-
-impl fmt::Display for RevisionSeq {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 // ── ContentHash ───────────────────────────────────────────────────────────────
 
-/// SHA-256 content fingerprint of a policy revision.
-///
-/// Computed over the canonical policy fields of a [`CanonicalProfile`]:
-/// `primary` + `secondary` + `behavior_mode` + `rule_book`.
-///
-/// # Excluded fields
-///
-/// Display labels (`route_primary_label`, `route_secondary_label`), import
-/// metadata, actor identity, and timestamps are **not** included in the hash.
-/// Two configurations with identical routing policy always produce the same
-/// `ContentHash` regardless of when or how they were created.
-///
-/// # Computation
-///
-/// SHA-256 computation is implemented by the service layer.
-/// This type holds the result; it does not perform the computation.
-///
-/// # Integrity
-///
-/// The hash is stored separately from the content it covers. The service
-/// verifies integrity by recomputing the hash on load and comparing with the
-/// stored value. Reserve under HMAC with a service-owned key is planned for
-/// a future version.
+/// SHA-256 fingerprint of a revision's policy content: bindings, behavior
+/// mode and rule book, never labels or timestamps, so identical policy hashes
+/// alike however it was created. Computed by the service; this type holds it.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ContentHash([u8; 32]);
 
@@ -216,12 +124,8 @@ impl fmt::Display for ContentHash {
 
 // ── UnixTimestamp ─────────────────────────────────────────────────────────────
 
-/// UTC Unix timestamp, expressed as seconds since the Unix epoch (1970-01-01).
-///
-/// Used for `ImportedArtifact::imported_at` and `PolicyRevision::created_at`.
-/// The service layer supplies the value; this type is a thin
-/// newtype that makes the unit explicit and prevents accidental mixing with
-/// other `u64` quantities.
+/// UTC seconds since the Unix epoch. A newtype so the unit cannot be mixed up
+/// with other `u64` quantities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnixTimestamp(u64);
 
@@ -243,71 +147,9 @@ impl fmt::Display for UnixTimestamp {
     }
 }
 
-// ── ImportChannel ─────────────────────────────────────────────────────────────
-
-/// How a configuration artifact was imported.
-///
-/// `Snapshot` is the only implemented import mode in the Free edition.
-/// `Linked` is reserved in the type system for future use but must not be
-/// passed to any live code path — attempts to use `Linked` channels are
-/// treated as a programming error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ImportChannel {
-    /// The external file was read and its content was copied into the
-    /// revision store at import time. The original file path is recorded
-    /// for provenance only; future changes to the file do not affect the
-    /// stored revision.
-    Snapshot,
-    /// Reserved for a future "linked import" mode where the service tracks
-    /// the external file and automatically detects changes. Not implemented
-    /// in the Free edition.
-    Linked,
-}
-
-// ── ImportedArtifact ──────────────────────────────────────────────────────────
-
-/// Provenance record for a configuration imported from an external file.
-///
-/// Attached to a `PolicyRevision` when the revision originates from an
-/// external source (a YAML preset file, a Full Settings export, or a
-/// manually prepared config). Revisions created by direct GUI edits do not
-/// carry an `ImportedArtifact`.
-///
-/// # Hash coverage
-///
-/// `file_hash` is the SHA-256 of the raw file bytes at the time of import.
-/// It is distinct from `ContentHash` in `PolicyRevision`: `file_hash` covers
-/// the serialized file format; `ContentHash` covers the deserialized,
-/// normalized canonical policy content.
-///
-/// Both hashes are stored so that:
-/// - `file_hash` can verify that the imported file was not tampered with
-///   before parsing.
-/// - `ContentHash` can detect semantic equivalence across different file
-///   representations of the same policy.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImportedArtifact {
-    /// Human-readable source description.
-    ///
-    /// For file imports: the absolute or relative path to the imported file.
-    /// For clipboard or other non-file sources: a descriptive label.
-    pub source_path: String,
-    /// SHA-256 hash of the raw file bytes at import time.
-    pub file_hash: ContentHash,
-    /// UTC timestamp when the import was initiated.
-    pub imported_at: UnixTimestamp,
-    /// Import mode. `Linked` is reserved; only `Snapshot` is implemented.
-    pub channel: ImportChannel,
-}
-
 // ── RevisionSource ────────────────────────────────────────────────────────────
 
-/// How a policy revision was created.
-///
-/// `source` is recorded in `PolicyRevision` for audit and review-flow purposes.
-/// It determines whether a revision requires `PendingRevision` review before
-/// activation (imported / file-sync) or may activate immediately (direct GUI
-/// edit within narrow approved flows).
+/// How a policy revision was created; an input to risk scoring.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RevisionSource {
     /// User saved changes directly via the GUI (add/edit/delete rule, adapter
@@ -319,31 +161,13 @@ pub enum RevisionSource {
     /// mode). Treated the same as a direct edit for activation purposes when
     /// explicitly confirmed by the user.
     FileSync,
-    /// Configuration was imported from an external file. Requires
-    /// `PendingRevision` review before activation (non-interactive origin).
-    Import(ImportedArtifact),
-}
-
-// ── RevisionActor ─────────────────────────────────────────────────────────────
-
-/// Who initiated the revision-related action.
-///
-/// In the Free edition all interactive actions are `LocalUser`. `Service` is
-/// used for automated actions: periodic integrity checks, auto-apply of file
-/// changes, and rollback triggered by the service watchdog.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RevisionActor {
-    /// The local user acting through the GUI.
-    LocalUser,
-    /// The background Windows service acting autonomously.
-    Service,
 }
 
 // ── RiskLevel ─────────────────────────────────────────────────────────────────
 
-/// Basic risk classification assigned to a candidate `PolicyRevision`.
+/// Basic risk classification assigned to a candidate revision.
 ///
-/// Assigned by the service before creating a `PolicyRevision`. Higher risk
+/// Assigned by the service before the candidate is stored. Higher risk
 /// levels require more explicit user review and generate persistent alerts
 /// until acknowledged. See `SECURITY.md §Review and Approval Flow`.
 ///
@@ -378,14 +202,20 @@ pub enum RiskLevel {
     Critical,
 }
 
+impl RiskLevel {
+    pub const fn as_slug(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
 impl fmt::Display for RiskLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Low => f.write_str("low"),
-            Self::Medium => f.write_str("medium"),
-            Self::High => f.write_str("high"),
-            Self::Critical => f.write_str("critical"),
-        }
+        f.write_str(self.as_slug())
     }
 }
 
@@ -428,500 +258,6 @@ impl From<RiskLevel> for nrr_shared::ipc_payloads::ReviewRiskLevel {
             RiskLevel::Critical => Self::Critical,
         }
     }
-}
-
-// ── IntegrityStatus ───────────────────────────────────────────────────────────
-
-/// Integrity verification state of a `PolicyRevision`.
-///
-/// The service computes a SHA-256 hash over policy-content fields when a
-/// revision is created and stores it separately from the content. On each
-/// load, the service recomputes and compares. A mismatch indicates unexpected
-/// mutation of service-owned state (tampering or storage corruption).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum IntegrityStatus {
-    /// Hash has not yet been verified against content. Initial state after
-    /// creating a revision in memory before the first persist-and-verify cycle.
-    Unverified,
-    /// Recomputed hash matches the stored `ContentHash`. Content is intact.
-    Verified,
-    /// Recomputed hash does not match the stored `ContentHash`. Service-owned
-    /// state was mutated outside approved product flows. A `TamperAlert`
-    /// `AuditEvent` must be emitted and the user must be notified.
-    Tampered,
-}
-
-// ── RevisionDiffSummary ───────────────────────────────────────────────────────
-
-/// High-level summary of what changed between two consecutive revisions.
-///
-/// Attached to a `PolicyRevision` when a previous revision exists to compare
-/// against. `None` on the very first revision (no predecessor).
-///
-/// # Scope
-///
-/// This struct carries boolean flags and counts suitable for the review UI
-/// and risk assessment. Detailed per-rule diffs (added/removed/modified rule
-/// identities) are out of scope for this struct — that belongs to a dedicated
-/// diff view in the review flow.
-///
-/// # Full criteria
-///
-/// This struct is the structural baseline for the full diff metadata model;
-/// the service populates it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RevisionDiffSummary {
-    /// At least one route binding (primary or secondary adapter) changed.
-    pub changed_interface_bindings: bool,
-    /// The default routing behavior mode changed.
-    pub changed_default_behavior: bool,
-    /// At least one rule was added, removed, or modified across either rule set.
-    pub changed_rules: bool,
-    /// Number of rules added across both rule sets.
-    pub rules_added: u32,
-    /// Number of rules removed across both rule sets.
-    pub rules_removed: u32,
-    /// Number of rules modified (match value, app match, enabled state, or
-    /// comment changed) across both rule sets.
-    pub rules_modified: u32,
-}
-
-impl RevisionDiffSummary {
-    /// Returns `true` when this diff contains no changes at all.
-    ///
-    /// A no-op diff can occur if a re-import produces the same canonical
-    /// content as the active revision. The service should skip creating a new
-    /// revision in this case, but this helper guards against accidents.
-    pub fn is_empty(&self) -> bool {
-        !self.changed_interface_bindings
-            && !self.changed_default_behavior
-            && !self.changed_rules
-            && self.rules_added == 0
-            && self.rules_removed == 0
-            && self.rules_modified == 0
-    }
-}
-
-// ── PolicyRevision ────────────────────────────────────────────────────────────
-
-/// An immutable snapshot of a validated routing policy at a point in time.
-///
-/// `PolicyRevision` is the core record of the revision system. Once created,
-/// its policy-content fields must never be mutated — a new revision must be
-/// created instead. The `integrity_status` field may be updated by the service
-/// after verification.
-///
-/// # Identity
-///
-/// Each revision has a unique `id` (prefixed UUID) and a monotonic `seq`.
-/// The `seq` counter is shared across all revisions including rejected
-/// candidates, allowing detection of gaps in the audit log.
-///
-/// # Immutability invariant
-///
-/// Fields covered by `content_hash` (`content`) must not change after the
-/// hash is computed. The service enforces this by treating deserialized
-/// revisions as immutable value objects and rebuilding the entire revision
-/// when content needs to change.
-///
-/// # Persistence
-///
-/// `PolicyRevision` is a pure domain type. Persistence, loading, and SHA-256
-/// computation are implemented by the service layer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PolicyRevision {
-    /// Unique identifier for this revision.
-    pub id: RevisionId,
-    /// Monotonic sequence number. Assigned at creation time.
-    pub seq: RevisionSeq,
-    /// UTC timestamp when this revision was created.
-    pub created_at: UnixTimestamp,
-    /// How this revision was created (direct edit, file sync, or import).
-    pub source: RevisionSource,
-    /// Who initiated the action that created this revision.
-    pub actor: RevisionActor,
-    /// Normalized, validated policy content. The `content_hash` covers these fields.
-    pub content: CanonicalProfile,
-    /// SHA-256 fingerprint of `content`. Stored separately to enable integrity
-    /// verification without re-parsing the full content.
-    pub content_hash: ContentHash,
-    /// Summary of changes relative to the immediately preceding revision.
-    /// `None` for the first revision (no predecessor to diff against).
-    pub diff_summary: Option<RevisionDiffSummary>,
-    /// Risk classification assigned by the service at creation time.
-    pub risk_level: RiskLevel,
-    /// Whether the stored `content_hash` has been verified against `content`.
-    pub integrity_status: IntegrityStatus,
-}
-
-// ── PendingRevision ───────────────────────────────────────────────────────────
-
-/// A candidate revision awaiting explicit user review and confirmation.
-///
-/// `PendingRevision` is created when a non-interactive or high-risk change
-/// arrives (import, linked-file update, high-risk bulk change). It must be
-/// explicitly approved by the user before the service may activate it.
-///
-/// # Supersession (variant A)
-///
-/// If a new import arrives while a `PendingRevision` is already waiting,
-/// the old candidate is silently displaced. The service records the
-/// displacement in the audit log (`AuditEventKind::PendingSuperseded`) and
-/// replaces the pending slot with the new candidate. Only one pending revision
-/// exists at a time in the Free edition.
-///
-/// # Activation path
-///
-/// `Pending` → (user approves) → `Active` via `ActiveRevision`.
-/// `Pending` → (user rejects / new import arrives) → displaced; candidate
-///   is retained in history but never activated.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingRevision {
-    /// The candidate revision awaiting confirmation.
-    pub candidate: PolicyRevision,
-    /// UTC timestamp when this revision entered the pending state.
-    pub queued_at: UnixTimestamp,
-    /// ID of the previously pending revision that was displaced when this one
-    /// was queued (variant A). `None` if no pending revision existed before.
-    pub displaced_revision_id: Option<RevisionId>,
-}
-
-// ── ActiveRevision ────────────────────────────────────────────────────────────
-
-/// The currently applied policy revision.
-///
-/// Only the background service may transition a revision to `Active`. The GUI
-/// may request activation (approve pending) but the service is the sole
-/// authority that writes routing policy to the system.
-///
-/// # State machine position
-///
-/// `Active` revisions are superseded (not deleted) when a new revision is
-/// activated. The superseded revision remains in history and is eligible as
-/// a rollback target.
-///
-/// # Rollback
-///
-/// Rolling back to `LastKnownGoodRevision` creates a new `Active` revision
-/// (a copy of the last-known-good content with a new `RevisionId` and `seq`),
-/// rather than reactivating the old revision object in place. This preserves
-/// the append-only audit history.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ActiveRevision {
-    /// The currently applied revision.
-    pub revision: PolicyRevision,
-    /// UTC timestamp when this revision became active.
-    pub activated_at: UnixTimestamp,
-}
-
-// ── LastKnownGoodRevision ─────────────────────────────────────────────────────
-
-/// The last revision that successfully completed the full review-and-confirm
-/// flow, regardless of subsequent network or service status.
-///
-/// `LastKnownGoodRevision` is updated every time a revision is successfully
-/// activated (user-confirmed or narrow-approved direct edit). It is the
-/// rollback target when the service detects a problem with the current active
-/// revision or the user requests a safe rollback.
-///
-/// # Update rule
-///
-/// The service sets `LastKnownGoodRevision` ← current `ActiveRevision` each
-/// time a new revision is successfully activated. The service may
-/// optionally require a "verified applied" signal (e.g. routing table confirmed
-/// updated) before promoting to last-known-good.
-///
-/// # Rollback semantics
-///
-/// Rollback to last-known-good creates a NEW revision (new `id` + `seq`) with
-/// `source = DirectEdit`, `actor = Service`, and content cloned from
-/// `last_known_good.revision.content`. This preserves append-only history and
-/// produces a full audit trail of the rollback action.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LastKnownGoodRevision {
-    /// The last confirmed-good revision.
-    pub revision: PolicyRevision,
-    /// UTC timestamp when this revision was confirmed as "good".
-    pub confirmed_at: UnixTimestamp,
-}
-
-// ── AuditEvent ────────────────────────────────────────────────────────────────
-
-/// Unique identifier for an audit event.
-///
-/// Format: `"evt-{uuid_v4}"`. Same prefix convention as [`RevisionId`] but
-/// with the `evt-` prefix to distinguish event IDs from revision IDs in logs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct AuditEventId(String);
-
-impl AuditEventId {
-    const PREFIX: &'static str = "evt-";
-
-    /// Constructs an `AuditEventId` from a pre-formatted prefixed string.
-    pub fn from_prefixed_string(id: String) -> Result<Self, &'static str> {
-        let suffix = id
-            .strip_prefix(Self::PREFIX)
-            .ok_or("audit event id must start with \"evt-\"")?;
-        if suffix.is_empty() {
-            return Err("audit event id suffix must not be empty");
-        }
-        Ok(Self(id))
-    }
-
-    /// Returns the full identifier string.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for AuditEventId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Why a pending revision was rejected.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RejectionReason {
-    /// The user explicitly dismissed the pending revision in the review UI.
-    UserRejected,
-    /// Validation of the candidate content failed (e.g. re-validation after
-    /// adapter snapshot changed).
-    ValidationFailed,
-    /// Integrity check on the candidate revision failed before activation.
-    IntegrityCheckFailed,
-    /// The pending revision was displaced by a newer import before the user
-    /// reviewed it (supersession, variant A).
-    SupersededByNewerImport,
-}
-
-/// The kind of a recorded audit event.
-///
-/// Each variant captures the minimum data needed to reconstruct what happened
-/// without requiring access to the full revision store.
-///
-/// # Transitions that MUST generate an `AuditEvent`
-///
-/// All security-relevant state transitions must produce an audit event:
-/// `Import`, `Approval`, `Activation`, `Rejection`, `Rollback`,
-/// `TamperAlert`, `IntegrityFailure`, `PendingSuperseded`.
-///
-/// # Transitions that generate only operational log entries
-///
-/// Routine, non-security events that do not change policy state: periodic
-/// integrity checks that pass, service health pings, GUI snapshot refreshes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AuditEventKind {
-    /// A new configuration was imported from an external source and entered
-    /// the pending queue. Generated when `PendingRevision` is created.
-    Import {
-        /// The artifact that was imported.
-        artifact: ImportedArtifact,
-        /// The sequence number assigned to the new pending revision.
-        candidate_seq: RevisionSeq,
-    },
-    /// The user approved a pending revision for activation.
-    Approval {
-        /// ID of the revision that was approved.
-        approved_revision_id: RevisionId,
-        /// ID of the revision that was active before this approval, if any.
-        previous_revision_id: Option<RevisionId>,
-    },
-    /// A revision became the active revision.
-    ///
-    /// Generated after every successful activation, including direct GUI edits
-    /// that skip the pending queue (narrow immediate-apply paths).
-    Activation {
-        /// ID of the revision that was activated.
-        revision_id: RevisionId,
-    },
-    /// A pending revision was rejected without activation.
-    Rejection {
-        /// ID of the revision that was rejected.
-        revision_id: RevisionId,
-        /// Reason for rejection.
-        reason: RejectionReason,
-    },
-    /// A rollback to a previous revision was performed.
-    ///
-    /// Rollback creates a NEW revision (new `id`/`seq`) rather than
-    /// reactivating the old revision object in place.
-    Rollback {
-        /// ID of the revision that was active before the rollback.
-        from_revision_id: RevisionId,
-        /// ID of the new revision created to represent the rolled-back content.
-        to_revision_id: RevisionId,
-    },
-    /// Service-owned state was found to be inconsistent: the recomputed
-    /// SHA-256 hash of a revision's content did not match the stored hash.
-    TamperAlert {
-        /// ID of the revision whose integrity check failed.
-        revision_id: RevisionId,
-        /// The hash recomputed from the current content.
-        detected_hash: ContentHash,
-        /// The hash stored at creation time.
-        stored_hash: ContentHash,
-    },
-    /// An integrity verification operation failed in a way that prevented
-    /// comparison (e.g. hash storage corrupted, revision record unreadable).
-    IntegrityFailure {
-        /// Human-readable description of the failure mode.
-        detail: String,
-    },
-    /// A pending revision was displaced by a newer import before the user
-    /// reviewed it (supersession, variant A — Free edition single-pending slot).
-    PendingSuperseded {
-        /// ID of the pending revision that was displaced.
-        old_revision_id: RevisionId,
-        /// Sequence number of the new pending revision that took its place.
-        new_candidate_seq: RevisionSeq,
-    },
-}
-
-/// An immutable, append-only audit record.
-///
-/// Audit events are written by the service and must never be modified or
-/// deleted. The full history of audit events constitutes the audit trail for
-/// all policy-affecting actions.
-///
-/// # Ordering
-///
-/// Events are ordered by `timestamp`. The service must assign timestamps
-/// monotonically (or at least non-decreasingly). Consumers should use
-/// `seq`-based ordering when timestamps collide.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuditEvent {
-    /// Unique identifier for this event.
-    pub id: AuditEventId,
-    /// UTC timestamp when the event was recorded.
-    pub timestamp: UnixTimestamp,
-    /// The revision associated with this event, if applicable.
-    /// `None` for events not tied to a specific revision (e.g. `IntegrityFailure`
-    /// when the revision record itself is unreadable).
-    pub revision_id: Option<RevisionId>,
-    /// Who initiated the action.
-    pub actor: RevisionActor,
-    /// The specific event that occurred.
-    pub kind: AuditEventKind,
-}
-
-// ── RevisionState & state machine ────────────────────────────────────────────
-
-/// Lifecycle state of a `PolicyRevision`.
-///
-/// Every revision starts as either `Pending` (non-interactive or high-risk
-/// origin) or transitions directly to `Active` (narrow immediate-apply paths
-/// for direct GUI edits). Terminal states (`Superseded`, `Rejected`,
-/// `RolledBack`) are permanent — revisions in these states are never
-/// reactivated.
-///
-/// # Valid transitions
-///
-/// ```text
-/// Pending ──(approved)──────────────────► Active
-/// Pending ──(rejected/superseded)───────► Rejected
-/// Active  ──(new revision activated)────► Superseded
-/// Active  ──(rollback initiated)─────────► RolledBack
-/// ```
-///
-/// All other transitions are invalid. Terminal states have no outgoing edges.
-/// Rollback creates a NEW `Active` revision rather than restoring a previous
-/// revision to `Active`, preserving the append-only history.
-///
-/// # Audit events
-///
-/// Every state transition MUST generate an `AuditEvent`:
-/// - `Pending → Active`: `Approval` + `Activation`
-/// - `Pending → Rejected`: `Rejection` (with `RejectionReason`)
-/// - `Active → Superseded`: `Activation` (of the new revision)
-/// - `Active → RolledBack`: `Rollback`
-///
-/// Operational log entries only (no `AuditEvent`): periodic integrity checks
-/// that pass, service health pings, GUI snapshot refreshes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RevisionState {
-    /// Awaiting explicit user review and confirmation.
-    Pending,
-    /// Currently applied routing policy.
-    Active,
-    /// Was active; superseded by a newer revision. Retained in history.
-    Superseded,
-    /// Was pending; rejected by the user or displaced by a newer import.
-    /// Never activated. Retained in history.
-    Rejected,
-    /// Was active; rolled back. The content was re-applied in a new revision.
-    /// Retained in history for auditability.
-    RolledBack,
-}
-
-impl RevisionState {
-    /// Returns `true` when this state can transition to `next`.
-    ///
-    /// Use this to validate a transition before recording an `AuditEvent` or
-    /// updating persistent storage. An invalid transition indicates a
-    /// programming error in the caller — the service should log it as an
-    /// integrity anomaly and abort the operation.
-    pub const fn can_transition_to(self, next: RevisionState) -> bool {
-        matches!(
-            (self, next),
-            (RevisionState::Pending, RevisionState::Active)
-                | (RevisionState::Pending, RevisionState::Rejected)
-                | (RevisionState::Active, RevisionState::Superseded)
-                | (RevisionState::Active, RevisionState::RolledBack)
-        )
-    }
-
-    /// Returns `true` if this is a terminal state (no outgoing transitions).
-    pub const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            RevisionState::Superseded | RevisionState::Rejected | RevisionState::RolledBack
-        )
-    }
-}
-
-// ── RollbackOutcome ───────────────────────────────────────────────────────────
-
-/// Why a rollback attempt was blocked before any state change occurred.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RollbackBlockedReason {
-    /// There is no `LastKnownGoodRevision` to roll back to. This can happen
-    /// on the first-ever activation before any revision has been confirmed good,
-    /// or if the last-known-good record was lost.
-    NoLastKnownGood,
-    /// The last-known-good revision is already the active revision. There is
-    /// nothing to roll back to.
-    LastKnownGoodIsAlreadyActive,
-    /// The `LastKnownGoodRevision` failed its integrity check before the
-    /// service could apply it. Rolling back to a potentially tampered revision
-    /// is refused until the user explicitly overrides.
-    IntegrityCheckFailed,
-}
-
-/// Outcome of a rollback-to-last-known-good operation.
-///
-/// Rollback is an atomic service operation that:
-/// 1. Verifies the `LastKnownGoodRevision` passes an integrity check.
-/// 2. Creates a **new** `PolicyRevision` (new `id` + `seq`) whose `content`
-///    clones the last-known-good content.  `source = DirectEdit`,
-///    `actor = Service`.
-/// 3. Transitions the current `ActiveRevision` to `RolledBack`.
-/// 4. Activates the new revision.
-/// 5. Emits a `Rollback` `AuditEvent`.
-///
-/// On `Blocked`, no state change is made and no `AuditEvent` is emitted.
-/// An operational log entry is written explaining the block reason.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RollbackOutcome {
-    /// Rollback completed. A new revision was created and activated.
-    Success {
-        /// The new revision's identifier (cloned content, new identity).
-        new_revision_id: RevisionId,
-        /// The new revision's sequence number.
-        new_seq: RevisionSeq,
-    },
-    /// Rollback was refused before any state change occurred.
-    Blocked(RollbackBlockedReason),
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -41,31 +41,10 @@ use core::fmt;
 
 use crate::{
     import::IMPORT_FILE_SIZE_LIMIT_BYTES,
-    rules_file::{
-        parse_rules_file, ParseOutcome, ParseWarning, CURRENT_PRESET_FORMAT_VERSION,
-        CURRENT_RULES_FILE_FORMAT_VERSION,
-    },
+    rules_file::{parse_rules_file, ParseOutcome, ParseWarning},
 };
 
 // ── Resource limits ───────────────────────────────────────────────────────────
-
-/// Maximum total number of rule entries across all sections in one rules file.
-///
-/// Applies to both working rules files and preset files. Counts entries in
-/// known Free-edition sections **and** unknown (unsupported) sections combined.
-/// Disabled entries count toward the limit — they are stored and must not
-/// cause unbounded resource consumption.
-///
-/// DERIVED from the product-wide Free cap
-/// ([`nrr_shared::rules_json::FREE_MAX_RULES`], counted across BOTH files at
-/// apply time): one file must be able to carry the whole allowance, so the
-/// per-file parse guard equals the cap. Zone/suffix fan-out hosts are derived
-/// permits, never rule entries, and do not count here.
-///
-/// Derived rather than restated: the number lived here as its own literal while
-/// the doc named the constant it was supposed to equal, which is how two copies
-/// of one cap drift without anything failing.
-pub const MAX_RULES_PER_FILE: u32 = nrr_shared::rules_json::FREE_MAX_RULES as u32;
 
 /// Maximum byte length of a single match value string.
 ///
@@ -103,7 +82,7 @@ pub enum PresetFileValidationOutcome {
     /// The file passed all checks. No warnings.
     ///
     /// The caller may proceed to `rules_file_to_route_rule_set` →
-    /// `validate_and_canonicalize` → `process_import`.
+    /// `validate_and_canonicalize` → candidate revision.
     Accepted { parse_outcome: ParseOutcome },
 
     /// The file passed all checks but has non-blocking issues.
@@ -174,8 +153,10 @@ pub enum PresetImportRejectedReason {
     /// Other encodings (UTF-16, Latin-1, etc.) must be re-saved as UTF-8 first.
     EncodingError,
 
-    /// The total number of rule entries across all sections exceeds
-    /// [`MAX_RULES_PER_FILE`].
+    /// More of the user's own entries than the Free cap
+    /// ([`nrr_shared::rules_json::FREE_MAX_RULES`]: one file carries the whole
+    /// allowance), or more app-authored ones than their budget. Disabled and
+    /// unknown-section entries count too.
     TooManyRules { count: u32, limit: u32 },
 
     /// A match value string exceeds [`MAX_MATCH_VALUE_LEN`] bytes.
@@ -413,24 +394,28 @@ pub fn validate_preset_bytes(bytes: &[u8]) -> PresetFileValidationOutcome {
         return PresetFileValidationOutcome::Rejected(reason);
     }
 
-    // Stage 5: total rule count check (known + unknown, enabled + disabled).
-    let known_count: usize = parse_outcome
+    // Stage 5: the user's own rules (known + unknown, enabled + disabled)
+    // against their cap — the same count the service caps a revision by, so an
+    // exported book re-imports. App-authored ones are held to the book the
+    // file lands in, which only the service's write knows.
+    let entries = parse_outcome
         .parsed
         .sections
         .iter()
-        .map(|s| s.entries.len())
-        .sum();
-    let unknown_count: usize = parse_outcome
-        .unknown_sections
-        .iter()
-        .map(|s| s.entries.len())
-        .sum();
-    let total = (known_count + unknown_count) as u32;
-
-    if total > MAX_RULES_PER_FILE {
+        .flat_map(|s| s.entries.iter())
+        .chain(
+            parse_outcome
+                .unknown_sections
+                .iter()
+                .flat_map(|s| s.entries.iter()),
+        );
+    if let Some(excess) =
+        crate::validation::rule_cap_excess(entries.map(|e| e.origin.is_none()), None)
+    {
+        let (count, limit) = excess.count_and_limit();
         return PresetFileValidationOutcome::Rejected(PresetImportRejectedReason::TooManyRules {
-            count: total,
-            limit: MAX_RULES_PER_FILE,
+            count: u32::try_from(count).unwrap_or(u32::MAX),
+            limit: u32::try_from(limit).unwrap_or(u32::MAX),
         });
     }
 
@@ -445,19 +430,10 @@ pub fn validate_preset_bytes(bytes: &[u8]) -> PresetFileValidationOutcome {
                     entry_count: *entry_count,
                 })
             }
-            ParseWarning::UnknownFormatVersion {
-                found,
-                supported: _,
-            } => {
-                let supported = parse_outcome
-                    .preset_metadata
-                    .as_ref()
-                    .map_or(CURRENT_RULES_FILE_FORMAT_VERSION, |_| {
-                        CURRENT_PRESET_FORMAT_VERSION
-                    });
+            ParseWarning::UnknownFormatVersion { found, supported } => {
                 Some(PresetImportWarning::FormatVersionMismatch {
                     found: *found,
-                    supported,
+                    supported: *supported,
                 })
             }
             // Provenance defects in the app-authored section are not an import
@@ -551,6 +527,7 @@ fn truncate_for_display(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nrr_shared::rules_json::FREE_MAX_RULES;
 
     // ── Accepted ─────────────────────────────────────────────────────────────
 
@@ -758,9 +735,8 @@ mod tests {
 
     #[test]
     fn file_exceeding_rule_count_is_rejected() {
-        // Build a file with MAX_RULES_PER_FILE + 1 rules.
         let mut content = String::from("--- Domains\n");
-        for i in 0..=(MAX_RULES_PER_FILE as usize) {
+        for i in 0..=FREE_MAX_RULES {
             content.push_str(&format!("host{i}.example.com\n"));
         }
         let outcome = validate_preset_bytes(content.as_bytes());
@@ -769,7 +745,7 @@ mod tests {
             PresetFileValidationOutcome::Rejected(PresetImportRejectedReason::TooManyRules {
                 limit,
                 ..
-            }) if limit == MAX_RULES_PER_FILE
+            }) if limit as usize == FREE_MAX_RULES
         ));
     }
 
@@ -777,7 +753,7 @@ mod tests {
     fn rule_count_includes_disabled_entries() {
         // Disabled entries count toward the limit.
         let mut content = String::from("--- Domains\n");
-        for i in 0..=(MAX_RULES_PER_FILE as usize) {
+        for i in 0..=FREE_MAX_RULES {
             content.push_str(&format!("# host{i}.example.com\n"));
         }
         let outcome = validate_preset_bytes(content.as_bytes());
@@ -791,13 +767,56 @@ mod tests {
     fn rule_count_includes_unknown_extended_section_entries() {
         // Entries in unknown sections count toward the total rule limit.
         let mut content = String::from("--- CIDR\n");
-        for i in 0..=(MAX_RULES_PER_FILE as usize) {
+        for i in 0..=FREE_MAX_RULES {
             content.push_str(&format!("10.0.{}.0/24\n", i % 256));
         }
         let outcome = validate_preset_bytes(content.as_bytes());
         assert!(matches!(
             outcome,
             PresetFileValidationOutcome::Rejected(PresetImportRejectedReason::TooManyRules { .. })
+        ));
+    }
+
+    fn book_file(user: usize, auto: usize) -> String {
+        let mut content = String::from("--- Domains\n");
+        for i in 0..user {
+            content.push_str(&format!("host{i}.example.com\n"));
+        }
+        content.push_str("--- Auto\n");
+        for i in 0..auto {
+            content.push_str(&format!(
+                "cdn{i}.example.net  # auto:site-companion anchor:example.com added:2026-07-31\n"
+            ));
+        }
+        content
+    }
+
+    /// An export of a legitimate book — the user's allowance nearly spent,
+    /// plus the app's companions — must import back.
+    #[test]
+    fn app_authored_entries_do_not_spend_the_users_file_allowance() {
+        let outcome = validate_preset_bytes(book_file(9_000, 1_500).as_bytes());
+        assert!(outcome.is_accepted(), "{outcome:?}");
+        let full = validate_preset_bytes(
+            book_file(FREE_MAX_RULES, crate::auto_rule_budget::MAX_AUTO_RULES).as_bytes(),
+        );
+        assert!(full.is_accepted(), "{full:?}");
+    }
+
+    /// An export of a book saved before the app's budget must read back: the
+    /// budget is held against the book the file lands in, by the service.
+    #[test]
+    fn app_authored_entries_past_their_budget_are_left_to_the_service() {
+        let auto_cap = crate::auto_rule_budget::MAX_AUTO_RULES;
+        let outcome = validate_preset_bytes(book_file(10, auto_cap + 500).as_bytes());
+        assert!(outcome.is_accepted(), "{outcome:?}");
+        let over_users = validate_preset_bytes(book_file(FREE_MAX_RULES + 1, 10).as_bytes());
+        assert!(matches!(
+            over_users,
+            PresetFileValidationOutcome::Rejected(PresetImportRejectedReason::TooManyRules {
+                count,
+                limit,
+            }) if count as usize == FREE_MAX_RULES + 1 && limit as usize == FREE_MAX_RULES
         ));
     }
 
@@ -1020,14 +1039,6 @@ mod tests {
     }
 
     // ── Constants ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn max_rules_per_file_matches_the_free_product_cap() {
-        // One file must be able to carry the whole Free allowance (9 999,
-        // enforced across both files at apply time by
-        // `nrr_shared::rules_json::FREE_MAX_RULES`).
-        assert_eq!(MAX_RULES_PER_FILE, 9_999);
-    }
 
     #[test]
     fn max_match_value_len_is_two_sixty() {

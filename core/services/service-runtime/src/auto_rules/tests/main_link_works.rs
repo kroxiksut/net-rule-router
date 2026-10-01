@@ -12,14 +12,14 @@ fn pending_candidate(dto: AutoRuleCandidateDto) -> PendingCandidate {
 }
 
 /// The reported case, one step earlier than the check that was supposed to
-/// cover it: nothing had measured `cdnjs` yet, and an unmeasured host reads
+/// cover it: nothing had measured the shared CDN yet, and an unmeasured host reads
 /// exactly like an unreachable one. `news.example` hit it after `assistant.example` did,
 /// because the fix had been aimed at the verdict, not at its absence.
 #[test]
 fn a_third_party_with_no_verdict_yet_waits_instead_of_asking() {
     let unmeasured = main_link_dto(
         "news.example",
-        "cdnjs.cloudflare.com",
+        "libs.sharedcdn.example",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         "", // the pass has not answered for it yet
     );
@@ -69,7 +69,7 @@ fn the_hold_releases_the_sites_own_names_and_answered_hosts() {
     ] {
         let answered = main_link_dto(
             "news.example",
-            "cdnjs.cloudflare.com",
+            "libs.sharedcdn.example",
             AUTO_RULE_SIGNAL_DELIVERY_NAME,
             behavior,
         );
@@ -82,12 +82,12 @@ fn the_hold_releases_the_sites_own_names_and_answered_hosts() {
 
 #[test]
 fn a_shared_cdn_that_answers_on_the_main_link_is_not_worth_asking_about() {
-    // The reported case: cdnjs answers perfectly well without the tunnel, and
+    // The reported case: a shared CDN answers perfectly well without the tunnel, and
     // the tray kept offering it because delivery names skipped the check that
     // co-activity names already had.
     let cdn = main_link_dto(
         "assistant.example",
-        "cdnjs.cloudflare.com",
+        "libs.sharedcdn.example",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     );
@@ -95,7 +95,7 @@ fn a_shared_cdn_that_answers_on_the_main_link_is_not_worth_asking_about() {
 
     let ad = main_link_dto(
         "assistant.example",
-        "casalemedia.com",
+        "adnetwork.example",
         AUTO_RULE_SIGNAL_CO_ACTIVITY,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     );
@@ -104,8 +104,8 @@ fn a_shared_cdn_that_answers_on_the_main_link_is_not_worth_asking_about() {
 
 #[test]
 fn the_sites_own_name_keeps_its_question_even_when_it_answers() {
-    // Answering is not serving: ChatGPT answers main-link addresses with a
-    // refusal, so its own names stay on offer whatever the connectivity says.
+    // Answering is not serving: the assistant site answers main-link addresses
+    // with a refusal, so its own names stay on offer whatever the connectivity says.
     let own = main_link_dto(
         "assistant.example",
         "cdn.assistant.example",
@@ -116,7 +116,7 @@ fn the_sites_own_name_keeps_its_question_even_when_it_answers() {
 
     let brand = main_link_dto(
         "assistant.example",
-        "chatgpt.io",
+        "assistant-app.example",
         AUTO_RULE_SIGNAL_BRAND_RELATED,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     );
@@ -131,7 +131,7 @@ fn a_host_that_fails_on_the_main_link_is_still_asked_about() {
     for behavior in [AUTO_RULE_PRIMARY_BEHAVIOR_STALLS, ""] {
         let dto = main_link_dto(
             "assistant.example",
-            "cdnjs.cloudflare.com",
+            "libs.sharedcdn.example",
             AUTO_RULE_SIGNAL_DELIVERY_NAME,
             behavior,
         );
@@ -152,7 +152,7 @@ fn a_settled_candidate_does_not_hold_the_host_on_the_additional_route() {
     );
     let settled = main_link_dto(
         "assistant.example",
-        "cdnjs.cloudflare.com",
+        "libs.sharedcdn.example",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     );
@@ -169,7 +169,7 @@ fn a_settled_candidate_does_not_hold_the_host_on_the_additional_route() {
     );
 
     assert!(
-        !engine.covers_pending_secondary_host("cdnjs.cloudflare.com"),
+        !engine.covers_pending_secondary_host("libs.sharedcdn.example"),
         "a host the tray will not ask about must not be pinned as if accepted"
     );
     assert!(engine.covers_pending_secondary_host("assets.example"));
@@ -182,7 +182,7 @@ fn a_settled_candidate_does_not_hold_the_host_on_the_additional_route() {
 fn an_unchanged_dropped_set_is_not_worth_a_second_line() {
     let note = QuietNote {
         inert: 2,
-        sample: vec!["ozonru.me (www.ozon.ru)".to_string()],
+        sample: vec!["shopmedia.example (www.shop.example)".to_string()],
     };
     assert!(
         quiet_note_is_news(None, &note),
@@ -194,7 +194,7 @@ fn an_unchanged_dropped_set_is_not_worth_a_second_line() {
     // tells them apart, so it has to count as news.
     let swapped = QuietNote {
         inert: 2,
-        sample: vec!["cdnjs.cloudflare.com (www.ozon.ru)".to_string()],
+        sample: vec!["libs.sharedcdn.example (www.shop.example)".to_string()],
     };
     assert!(quiet_note_is_news(Some(&note), &swapped));
 

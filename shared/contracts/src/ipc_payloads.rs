@@ -200,7 +200,7 @@ pub struct SnapshotInterfacesResponse {
 pub struct InterfaceRowDto {
     pub persistent_id: String,
     pub adapter_name: String,
-    pub windows_name: String,
+    pub name: String,
     pub interface_description: String,
     pub interface_type: String,
     pub is_bluetooth_like: bool,
@@ -273,7 +273,6 @@ pub struct InterfaceRecommendationDto {
     pub class: String,
     pub confidence: String,
     pub advisory_only: bool,
-    pub summary: String,
     pub key_signals: Vec<String>,
     pub excluded_alternatives: Vec<String>,
 }
@@ -284,11 +283,9 @@ pub struct InterfaceRecommendationDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct SecondaryRouteStateDto {
-    /// `true` ⇒ behavior_mode is `StrictSecondaryFailClosed` AND the
-    /// secondary adapter is currently unavailable, so traffic that
-    /// would route through secondary is being blocked. The GUI
-    /// surfaces this as a top-level banner. The flag is decision-time
-    /// runtime state, not stored policy.
+    /// `true` ⇒ leak protection is on with the "block" failure mode and the
+    /// additional adapter is unavailable, so traffic bound for it is being
+    /// blocked. Runtime state, not stored policy.
     #[serde(default)]
     pub fail_closed_active: bool,
 }
@@ -301,7 +298,7 @@ pub struct AdapterEntry {
     pub ipv6_if_index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub physical_address: Option<String>,
-    pub windows_name: String,
+    pub name: String,
     pub interface_description: String,
     pub interface_type: String,
     pub oper_status: String,
@@ -368,6 +365,89 @@ pub struct SecurityAlertMutationPayload {
     /// event. Empty / missing ⇒ a generic system-generated reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The unverified rows the dry-run listed, echoed back: the service
+    /// re-signs only those whose content still matches. Absent ⇒ nothing is
+    /// adopted, and a key reset stays pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt_rows: Option<Vec<IntegrityRowRef>>,
+}
+
+/// Which signed table an unverified row lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IntegrityRowKind {
+    Revision,
+    /// The row saying which revision a principal has active.
+    ActivePointer,
+}
+
+/// A signed row and the content it was shown with. Equality over all four
+/// fields is what adoption matches on.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct IntegrityRowRef {
+    pub row_kind: IntegrityRowKind,
+    pub principal: String,
+    /// The revision, or the one a pointer selects.
+    pub revision_id: String,
+    /// Key-independent SHA-256 hex of the row's signed fields.
+    pub content_hash: String,
+}
+
+/// One row an acknowledgement would adopt, as the dialog lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct UnverifiedRowDto {
+    #[serde(flatten)]
+    pub row: IntegrityRowRef,
+    /// Belongs to the shared baseline rather than one user.
+    pub baseline: bool,
+    /// Unix seconds: when the revision was created, or the pointer set.
+    pub created_at: i64,
+    /// Revision source slug; `None` for a pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Revision status slug; `None` for a pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_count: Option<u32>,
+}
+
+// ── AuditChainRestart ────────────────────────────────────────────────────────
+
+/// Payload of `MutationKind::AuditChainRestart`: the digest the dry-run
+/// showed, echoed back. The service restarts only while its own verification
+/// still yields that digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AuditChainRestartPayload {
+    pub breaks_digest: String,
+}
+
+/// One place the audit chain does not verify.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AuditChainBreakDto {
+    /// `hash-mismatch`, `seam`, `corrupt-line`, `unreadable-file`,
+    /// `tail-truncated`.
+    pub kind: String,
+    pub file: String,
+    /// 1-based line; 0 when the break is not one line.
+    pub line: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
+/// What restarting the audit chain would paper over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AuditChainRestartPreviewDto {
+    /// All breaks since the last restart; `breaks` lists the first few.
+    pub break_count: u64,
+    pub breaks: Vec<AuditChainBreakDto>,
+    /// Empty when nothing is broken, and then there is nothing to confirm.
+    pub breaks_digest: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -490,9 +570,8 @@ pub struct StatusUpdatesSubscribeResponse {
 /// clients that don't recognise a kind drop it.
 ///
 /// Wire-tagged externally (`tag = "type"`) so a client can demux by
-/// reading just the discriminator before deserialising the body. We
-/// use `"type"` rather than `"kind"` because some variants carry a
-/// per-variant `kind` field of their own (e.g. `AlertRaised.kind`).
+/// reading just the discriminator before deserialising the body. `"type"`
+/// rather than `"kind"` keeps the tag clear of any variant's own `kind` field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 // `rename_all` renames the VARIANTS only. Without `rename_all_fields` the
 // payload fields stay snake_case while every QML reader indexes kebab-case,
@@ -527,18 +606,10 @@ pub enum StatusUpdateEvent {
     /// Adapter set changed (interface added/removed/role-changed). The
     /// client should refresh `SnapshotInterfacesGet`.
     AdaptersChanged { data_source: String },
-    /// New security alert raised. Subscribers paint the alert badge
-    /// without a separate roundtrip.
-    AlertRaised { alert_id: String, kind: String },
-    /// An operation handle reached `Completed` (mutation, rollback,
-    /// safe-disable). Carries the terminal `state` slug
-    /// (`"completed"` / `"failed"`).
-    OperationFinished {
-        operation_id: String,
-        state: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error_code: Option<String>,
-    },
+    /// An alert was raised, acknowledged or resolved while the service ran;
+    /// clients re-read the list. Everyone's news: a blocking alert refuses
+    /// every user's rule changes until someone acknowledges it.
+    SecurityAlertsChanged,
     /// Buffer overflow signal — client should issue
     /// `SnapshotInitialGet` to fully resync. Carries the count of
     /// events dropped on the way out.
@@ -571,16 +642,10 @@ pub enum StatusUpdateEvent {
     /// Retention settings row was rewritten.
     RetentionSettingsChanged,
     // ── Mutation push events ────────────────────────────────────────
-    /// A `MutationSubmit` correlation-id reached a
-    /// new lifecycle phase. Tracks the per-mutation flow so the GUI
-    /// can drive `MutationsModel.hasInFlight` without polling.
-    ///
-    /// Distinct from `OperationFinished` (which is operation-id
-    /// keyed and only fires on terminal states): `MutationProgress`
-    /// is correlation-id keyed (caller-supplied, not service-issued)
-    /// and fires on every lifecycle phase — `started`, `completed`,
-    /// `failed`. The GUI uses correlation-id to match the event to
-    /// the original `rpcMutationSubmit` callback in `pendingRpc`.
+    /// A `MutationSubmit` correlation-id reached a new lifecycle phase
+    /// (`started`, `completed`, `failed`), so the GUI drives
+    /// `MutationsModel.hasInFlight` without polling. Keyed by the caller's
+    /// correlation id, matched to the `rpcMutationSubmit` callback.
     MutationProgress {
         /// Caller-supplied correlation id from `rpcMutationSubmit`.
         correlation_id: String,
@@ -593,6 +658,10 @@ pub enum StatusUpdateEvent {
         /// `IpcErrorCode` slugs).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_code: Option<String>,
+        /// Whose rules the mutation changes. `None` for the admin baseline,
+        /// which every un-diverged user runs, and for machine-wide kinds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sid: Option<String>,
     },
     /// A SID's set of pending auto-rule candidates changed — the service
     /// noticed further hosts a routed site needs and parked them for review
@@ -601,6 +670,8 @@ pub enum StatusUpdateEvent {
     /// alongside, used to name the site in the prompt.
     AutoRuleCandidatesChanged {
         sid: String,
+        /// Offers the inbox shows by default — the same number as
+        /// `AutoRuleCandidatesListResponse::pending_count`.
         pending_count: u64,
         top_anchor: String,
     },
@@ -739,17 +810,17 @@ impl StatusUpdateEvent {
             | Self::BlockNoticeRaised { sid, .. }
             | Self::EnforcementStatusChanged { sid, .. }
             | Self::AutostartStateChanged { sid, .. } => Some(sid.as_str()),
-            // A baseline revision carries no SID and reaches everyone.
-            Self::RevisionStatusChanged { sid, .. } => sid.as_deref(),
+            // The baseline carries no SID and reaches everyone.
+            Self::RevisionStatusChanged { sid, .. } | Self::MutationProgress { sid, .. } => {
+                sid.as_deref()
+            }
             Self::HealthChanged { .. }
             | Self::ProtectionCoverageChanged { .. }
             | Self::AdaptersChanged { .. }
-            | Self::AlertRaised { .. }
-            | Self::OperationFinished { .. }
+            | Self::SecurityAlertsChanged
             | Self::Overflow { .. }
             | Self::ApplyFailurePolicyChanged { .. }
-            | Self::RetentionSettingsChanged
-            | Self::MutationProgress { .. } => None,
+            | Self::RetentionSettingsChanged => None,
         }
     }
 }
@@ -778,12 +849,27 @@ pub struct StatusUpdatesPollRequest {}
 
 // ── RollbackRequest ──────────────────────────────────────────────────────────
 
+/// Two-phase like `ProductImpactDisableRequest`: the dry-run (envelope class
+/// `ReadSnapshot`) mints a token bound to this operation and the caller, and
+/// the rollback itself must present it. It rolls back the caller's own rules
+/// (`UserScopedMutation`), or with `admin_baseline` the shared baseline
+/// (`RecoveryAction`, elevation).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RollbackRequest {
     /// `None` ⇒ rollback to LKG.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_revision_id: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub admin_baseline: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RollbackDryRunResponse {
+    pub confirmation_token: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -978,6 +1064,11 @@ fn default_true() -> bool {
 fn shared_ip_policy_default() -> String {
     "majority-of-ip".to_string()
 }
+
+/// Every `shared_ip_policy` slug the service accepts, for the allow-lists of
+/// its mirrors. Pinned 1:1 with `nrr_domain::shared_ip::SharedIpPolicy`.
+pub const SHARED_IP_POLICY_SLUGS: [&str; 3] =
+    ["majority-of-ip", "majority-of-rules", "any-rule-domain"];
 
 // Probing bounds a peer that omits them agrees to. The same three numbers live
 // in the stored row (`nrr-storage::route_bindings`) and in the QML defaults

@@ -144,15 +144,13 @@ impl LogWriterInner {
         Ok(())
     }
 
-    /// Returns `Err(())` on write failure so the caller can increment dropped count.
-    fn write_event(&mut self, event: &LogEvent) -> Result<OpenOutcome, ()> {
+    /// Appends one already-serialised line; `Err(())` lets the caller count
+    /// the drop.
+    fn write_line(&mut self, line: &[u8]) -> Result<OpenOutcome, ()> {
         let outcome = self.ensure_open()?;
-        let line = event.to_ndjson().map_err(|_| ())?;
-        let line_nl = format!("{line}\n");
         let (file, _) = self.current.as_mut().expect("open after ensure_open");
-        file.write_all(line_nl.as_bytes()).map_err(|_| ())?;
-        file.flush().map_err(|_| ())?;
-        self.current_size += line_nl.len() as u64;
+        file.write_all(line).map_err(|_| ())?;
+        self.current_size += line.len() as u64;
         Ok(outcome)
     }
 }
@@ -217,8 +215,15 @@ impl DiagnosticsSink for LogWriter {
         {
             return;
         }
+        // Serialised before the lock: every logging thread queues on it, so it
+        // should cover the file I/O only.
+        let Ok(mut line) = event.to_ndjson() else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        line.push('\n');
         let mut inner = self.inner.lock().expect("LogWriter mutex");
-        match inner.write_event(&event) {
+        match inner.write_line(line.as_bytes()) {
             Ok(OpenOutcome::Recreated) => {
                 self.recreated.fetch_add(1, Ordering::Relaxed);
             }

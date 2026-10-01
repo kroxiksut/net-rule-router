@@ -44,6 +44,10 @@ pub enum IpcErrorCode {
     /// rule-changing operation — submit, preset import, reset-to-baseline,
     /// rollback — so a client that maps this code once covers all of them.
     RulesLocked,
+    /// A change was refused because a blocking security alert awaits
+    /// acknowledgement. Not `Forbidden`: elevation does not cure it, and the
+    /// client has to send the user to the alert rather than to a UAC prompt.
+    SecurityAlertUnacknowledged,
     /// Request envelope's `protocol_version` is incompatible with
     /// this service binary. Client should call `ContractNegotiate`.
     InvalidVersion,
@@ -57,6 +61,12 @@ pub enum IpcErrorCode {
     /// A documented precondition was violated (e.g. mutation
     /// submitted before review confirmation).
     PreconditionFailed,
+    /// The confirmation token of a prior dry-run outlived its TTL. The client
+    /// re-runs the review; kept apart from [`Self::PreconditionFailed`] so no
+    /// client has to read the message to tell the two apart.
+    ConfirmationExpired,
+    /// The confirmation token was never issued, already spent or collected.
+    ConfirmationUnknown,
     /// Service is in `Degraded` health and cannot fulfil the
     /// request right now. Caller should observe `ServiceHealth`
     /// and retry.
@@ -130,6 +140,11 @@ pub const SERVICE_PIPE_CLIENT_ACCESS: u32 = 0x0012_008B;
 /// rules-read-only state into two unrelated errors.
 pub const RULES_LOCKED_CLIENT_SLUG: &str = "rules-locked";
 
+/// [`IpcErrorCode::SecurityAlertUnacknowledged`] as clients spell it — also the
+/// `code` of a mutation the executor's own alert gate failed, so both refusals
+/// reach the window as one condition.
+pub const SECURITY_ALERT_UNACKNOWLEDGED_CLIENT_SLUG: &str = "security-alert-unacknowledged";
+
 /// Maximum size of a single wire-format frame (request or response),
 /// in bytes. Both client (`nrr-ipc-client`) and server
 /// (`nrr-windows-service`) enforce this limit. Frames larger than this
@@ -156,7 +171,7 @@ pub const IPC_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 ///   `DiagnosticQuery` are read-only);
 /// - whether elevation is required;
 /// - whether a confirmation token must be carried (`MutationRequest`,
-///   `RecoveryAction`, `SafeDisable`).
+///   `SafeDisable`, `UserScopedMutation`).
 ///
 /// Declared here, alongside the wire format, because BOTH sides need the same
 /// answer and neither may derive its own: the class is what the service's
@@ -170,7 +185,6 @@ pub enum IpcOperationClass {
     DiagnosticAction,
     MutationRequest,
     ReviewConfirmation,
-    RecoveryAction,
     SafeDisable,
     /// per-SID user configuration write. Mutating (flows through the mutation
     /// queue, audited before execution) but does **not** require client
@@ -197,10 +211,7 @@ pub enum IpcOperationClass {
 /// Editing the policy every user falls back to. The one operation where a
 /// mistake reaches somebody who never asked for it.
 pub const ACTION_EDIT_BASELINE: &str = "netrulerouter.edit-baseline";
-/// Taking the machine's networking apart to get it back: dropping owned routes
-/// and filters wholesale.
-pub const ACTION_RECOVER_NETWORK: &str = "netrulerouter.recover-network";
-/// Turning protection off on purpose. Named apart from recovery because an
+/// Turning protection off on purpose. Named apart from editing because an
 /// administrator may well allow one and not the other.
 pub const ACTION_DISABLE_PROTECTION: &str = "netrulerouter.disable-protection";
 /// Wiping data the whole machine shares. Named apart from the three above
@@ -211,13 +222,12 @@ pub const ACTION_CLEAR_SHARED_DATA: &str = "netrulerouter.clear-shared-data";
 impl IpcOperationClass {
     /// Every class, so a caller that has to reason about all of them (the
     /// polkit action file, an audit of the gates) cannot miss one added later.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::ReadSnapshot,
         Self::DiagnosticQuery,
         Self::DiagnosticAction,
         Self::MutationRequest,
         Self::ReviewConfirmation,
-        Self::RecoveryAction,
         Self::SafeDisable,
         Self::UserScopedConfiguration,
         Self::UserScopedMutation,
@@ -232,7 +242,6 @@ impl IpcOperationClass {
             Self::DiagnosticAction
             | Self::MutationRequest
             | Self::ReviewConfirmation
-            | Self::RecoveryAction
             | Self::SafeDisable
             | Self::UserScopedConfiguration
             | Self::UserScopedMutation
@@ -246,13 +255,12 @@ impl IpcOperationClass {
     /// Windows answers the elevation question before the request arrives — the
     /// broker holds the rights. Where the privileged process is the service
     /// itself, the question is asked here instead, and this is the name it is
-    /// asked under. Three names rather than one, because an administrator
+    /// asked under. Several names rather than one, because an administrator
     /// writing a rule wants to distinguish "may edit the shared baseline" from
-    /// "may take the network apart to recover it".
+    /// "may switch protection off".
     pub const fn authorization_action(self) -> Option<&'static str> {
         match self {
             Self::MutationRequest | Self::ReviewConfirmation => Some(ACTION_EDIT_BASELINE),
-            Self::RecoveryAction => Some(ACTION_RECOVER_NETWORK),
             Self::SafeDisable => Some(ACTION_DISABLE_PROTECTION),
             Self::MachineScopedAction => Some(ACTION_CLEAR_SHARED_DATA),
             Self::ReadSnapshot
@@ -285,10 +293,7 @@ impl IpcOperationClass {
     pub const fn requires_confirmation_token(self) -> bool {
         matches!(
             self,
-            Self::MutationRequest
-                | Self::RecoveryAction
-                | Self::SafeDisable
-                | Self::UserScopedMutation
+            Self::MutationRequest | Self::SafeDisable | Self::UserScopedMutation
         )
     }
 
@@ -299,7 +304,6 @@ impl IpcOperationClass {
             Self::DiagnosticAction => "diagnostic-action",
             Self::MutationRequest => "mutation-request",
             Self::ReviewConfirmation => "review-confirmation",
-            Self::RecoveryAction => "recovery-action",
             Self::SafeDisable => "safe-disable",
             Self::UserScopedConfiguration => "user-scoped-configuration",
             Self::UserScopedMutation => "user-scoped-mutation",
@@ -323,11 +327,21 @@ pub fn canonical_operation_class(
 ) -> IpcOperationClass {
     // Two-phase operations: the dry-run pass is classified read-only so it can
     // MINT the confirmation token the confirm pass is then required to carry.
-    if matches!(op, IpcOperationName::ProductImpactDisableTemporary) {
-        return if dry_run_flag(payload) {
-            IpcOperationClass::ReadSnapshot
+    if matches!(
+        op,
+        IpcOperationName::ProductImpactDisableTemporary | IpcOperationName::RollbackRequest
+    ) && dry_run_flag(payload)
+    {
+        return IpcOperationClass::ReadSnapshot;
+    }
+    // Rolling back is a rule-book write like an edit, and is classed as one:
+    // the caller's own chain needs no rights, the shared baseline asks under
+    // the same name an edit of it does.
+    if matches!(op, IpcOperationName::RollbackRequest) {
+        return if names_admin_baseline(payload) {
+            IpcOperationClass::MutationRequest
         } else {
-            IpcOperationClass::SafeDisable
+            IpcOperationClass::UserScopedMutation
         };
     }
     if matches!(op, IpcOperationName::MutationSubmit) {
@@ -338,12 +352,10 @@ pub fn canonical_operation_class(
         // confirms as an elevation-gated service-global mutation. The flag only
         // steers the class here; the target principal is always resolved by the
         // service, never carried in the payload.
-        let admin_baseline = payload
+        if payload
             .get(MUTATION_PAYLOAD_FIELD)
-            .and_then(|p| p.get(ADMIN_BASELINE_FIELD))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if admin_baseline {
+            .is_some_and(names_admin_baseline)
+        {
             return IpcOperationClass::MutationRequest;
         }
         // Per-principal rules / preset edits: two-phase but NOT elevation-gated,
@@ -383,9 +395,18 @@ pub fn canonical_operation_class(
 const DRY_RUN_FIELD: &str = "dry-run";
 const MUTATION_KIND_FIELD: &str = "mutation-kind";
 const MUTATION_PAYLOAD_FIELD: &str = "payload";
-/// Not a field of `MutationSubmitRequest` — it lives inside the kind-specific
-/// payload, whose schema the wire layer deliberately does not own.
+/// Inside the kind-specific payload of `MutationSubmitRequest` (whose schema
+/// the wire layer does not own), at the top of `RollbackRequest`.
 const ADMIN_BASELINE_FIELD: &str = "admin-baseline";
+
+/// Whether a rule-book write names the shared admin baseline rather than the
+/// caller's own rules.
+fn names_admin_baseline(value: &serde_json::Value) -> bool {
+    value
+        .get(ADMIN_BASELINE_FIELD)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
 
 /// `dry-run: true` in the envelope payload.
 fn dry_run_flag(payload: &serde_json::Value) -> bool {
@@ -458,7 +479,8 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // sees a timeout instead of addresses. DiagnosticQuery dispatches
         // immediately and still requires no elevation.
         IpcOperationName::InterfacesRefreshRequest => IpcOperationClass::DiagnosticQuery,
-        IpcOperationName::RollbackRequest => IpcOperationClass::RecoveryAction,
+        // The baseline form; the payload branch above picks between the two.
+        IpcOperationName::RollbackRequest => IpcOperationClass::MutationRequest,
         IpcOperationName::ProductImpactDisableTemporary => IpcOperationClass::SafeDisable,
         // Per-SID user configuration writes go through the mutation queue
         // (single-writer invariant) but do not require client elevation.
@@ -479,18 +501,14 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         | IpcOperationName::LogRetentionConfigSet
         | IpcOperationName::ServiceStabilityConfigSet => IpcOperationClass::UserScopedConfiguration,
         // Maintenance of what the service OBSERVED, not of what it enforces:
-        // clearing operational logs, discarding the rebuildable FQDN/IP cache,
-        // toggling an in-memory diagnostic session. Mutating and queued like the
-        // settings writes, but they configure nothing, which is the distinction
-        // `DiagnosticAction` names.
+        // clearing operational logs, discarding the rebuildable FQDN/IP cache.
+        // Mutating and queued like the settings writes, but they configure
+        // nothing, which is the distinction `DiagnosticAction` names.
         IpcOperationName::LogsClear
         | IpcOperationName::CacheClear
-        | IpcOperationName::DiagnosticModeSet
         // The export writes a FILE, and at `redaction-level: diagnostics` that
-        // file holds unredacted hostnames, addresses and an audit summary. As a
-        // read it was not audited at all, while `DiagnosticModeSet` — which
-        // lifts the same redaction for on-screen viewers only — was. Same
-        // class: no elevation, no token, but a record that it happened.
+        // file holds unredacted hostnames, addresses and an audit summary: no
+        // elevation, no token, but a record that it happened.
         | IpcOperationName::DiagnosticsExportArchive => IpcOperationClass::DiagnosticAction,
         // DoH resolver baseline replace. Machine-wide config write kept at the
         // settings class. NOTE: `requires_service_mutation_privilege` in the
@@ -498,7 +516,7 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // it must not be cited as one.
         IpcOperationName::DohResolversSet => IpcOperationClass::UserScopedConfiguration,
         // Opt-in browser-history seed; a GUI-only maintenance command like
-        // CacheClear / DiagnosticModeSet.
+        // CacheClear.
         IpcOperationName::SeedFromBrowserHistory => IpcOperationClass::UserScopedConfiguration,
         // Service-global traffic-stats settings write / reset (admin-gated in
         // the catalog); same envelope class as other settings writes.
@@ -717,7 +735,7 @@ mod tests {
         fixed_operation_class, ipc_endpoint_security_specs, IpcAclPrincipal,
         IpcDegradationBehavior, IpcEndpointAccessClass, IpcEndpointName, IpcErrorCode,
         IpcFailureMode, IpcOperationClass, IpcTransportKind, ACTION_CLEAR_SHARED_DATA,
-        ACTION_DISABLE_PROTECTION, ACTION_EDIT_BASELINE, ACTION_RECOVER_NETWORK, IPC_ACL_POLICY,
+        ACTION_DISABLE_PROTECTION, ACTION_EDIT_BASELINE, IPC_ACL_POLICY,
         IPC_CALLER_IDENTITY_POLICY, IPC_FAILURE_AND_DEGRADATION_POLICY, IPC_TRANSPORT_KIND,
         SERVICE_ENDPOINT_ADDRESS,
     };
@@ -826,6 +844,41 @@ mod tests {
         assert_ne!(IpcErrorCode::RulesLocked, IpcErrorCode::Forbidden);
     }
 
+    /// The alert gate is not a `Forbidden`: a client that read it as one would
+    /// retry through elevation, which cannot lift it.
+    #[test]
+    fn the_security_alert_gate_is_a_distinct_wire_code() {
+        let wire = "\"security_alert_unacknowledged\"";
+        assert_eq!(
+            serde_json::to_string(&IpcErrorCode::SecurityAlertUnacknowledged).expect("serialise"),
+            wire
+        );
+        let back: IpcErrorCode = serde_json::from_str(wire).expect("deserialise");
+        assert_eq!(back, IpcErrorCode::SecurityAlertUnacknowledged);
+        assert_eq!(
+            super::SECURITY_ALERT_UNACKNOWLEDGED_CLIENT_SLUG,
+            wire.trim_matches('"').replace('_', "-")
+        );
+    }
+
+    #[test]
+    fn confirmation_token_failures_have_their_own_wire_codes() {
+        for (code, wire) in [
+            (
+                IpcErrorCode::ConfirmationExpired,
+                "\"confirmation_expired\"",
+            ),
+            (
+                IpcErrorCode::ConfirmationUnknown,
+                "\"confirmation_unknown\"",
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&code).expect("serialise"), wire);
+            let back: IpcErrorCode = serde_json::from_str(wire).expect("deserialise");
+            assert_eq!(back, code);
+        }
+    }
+
     /// The action names are the product's, so they must be derived from its
     /// unix spelling rather than typed independently. The test pins the SHAPE:
     /// a rename reaches them, a typo does not survive.
@@ -833,8 +886,8 @@ mod tests {
     fn authorization_actions_are_named_after_the_product() {
         for action in [
             ACTION_EDIT_BASELINE,
-            ACTION_RECOVER_NETWORK,
             ACTION_DISABLE_PROTECTION,
+            ACTION_CLEAR_SHARED_DATA,
         ] {
             assert!(
                 action.starts_with(crate::product_identity::PRODUCT_NAME_UNIX),
@@ -855,7 +908,6 @@ mod tests {
             IpcOperationClass::ReadSnapshot,
             IpcOperationClass::DiagnosticQuery,
             IpcOperationClass::DiagnosticAction,
-            IpcOperationClass::RecoveryAction,
             IpcOperationClass::SafeDisable,
             IpcOperationClass::UserScopedConfiguration,
             IpcOperationClass::MachineScopedAction,
@@ -898,17 +950,7 @@ mod tests {
     /// would silently become either unaskable or gratuitously interactive.
     #[test]
     fn every_elevated_class_has_an_action_and_no_other_does() {
-        for class in [
-            IpcOperationClass::ReadSnapshot,
-            IpcOperationClass::DiagnosticQuery,
-            IpcOperationClass::DiagnosticAction,
-            IpcOperationClass::MutationRequest,
-            IpcOperationClass::ReviewConfirmation,
-            IpcOperationClass::RecoveryAction,
-            IpcOperationClass::SafeDisable,
-            IpcOperationClass::UserScopedConfiguration,
-            IpcOperationClass::UserScopedMutation,
-        ] {
+        for class in IpcOperationClass::ALL {
             assert_eq!(
                 class.requires_elevation(),
                 class.authorization_action().is_some(),
@@ -936,7 +978,7 @@ mod tests {
         ] {
             assert!(
                 object.contains_key(field),
-                "`{field}` is not a field of a serialised MutationSubmitRequest;                  keys are {:?}",
+                "`{field}` is not a field of a serialised MutationSubmitRequest; keys are {:?}",
                 object.keys().collect::<Vec<_>>()
             );
         }
@@ -964,9 +1006,11 @@ mod tests {
             );
         }
         // Positive control on the other direction: a kind outside the list, and
-        // an unparsable one, both land on the stricter class.
+        // an unparsable one, both land on the stricter class. A chain restart
+        // is one of them: only an administrator confirms it.
         for payload in [
             serde_json::json!({"mutation-kind": "route-bindings-update", "payload": {}}),
+            serde_json::json!({"mutation-kind": "audit-chain-restart", "payload": {}}),
             serde_json::json!({"mutation-kind": "no-such-kind", "payload": {}}),
             serde_json::json!({"payload": {}}),
         ] {
@@ -977,6 +1021,71 @@ mod tests {
             );
         }
     }
+    /// The dry-run of a recovery operation is what mints its token, so it must
+    /// not need one; the real pass keeps its gated class.
+    #[test]
+    fn recovery_dry_runs_are_reads_and_the_real_passes_stay_gated() {
+        let rollback = IpcOperationName::RollbackRequest;
+        let safe_disable = IpcOperationName::ProductImpactDisableTemporary;
+        for op in [rollback, safe_disable] {
+            for dry in [
+                serde_json::json!({"dry-run": true}),
+                serde_json::json!({"dry-run": true, "admin-baseline": true}),
+            ] {
+                assert_eq!(
+                    super::canonical_operation_class(op, &dry),
+                    IpcOperationClass::ReadSnapshot,
+                    "{op:?} {dry}"
+                );
+            }
+        }
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"dry-run": false}),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                super::canonical_operation_class(safe_disable, &payload),
+                IpcOperationClass::SafeDisable
+            );
+            // The caller's own chain: a token, no elevation.
+            assert_eq!(
+                super::canonical_operation_class(rollback, &payload),
+                IpcOperationClass::UserScopedMutation
+            );
+        }
+        // The shared baseline stays behind elevation, asked under the same
+        // name as an edit of it: undoing an edit is an edit.
+        let baseline = serde_json::json!({"dry-run": false, "admin-baseline": true});
+        let class = super::canonical_operation_class(rollback, &baseline);
+        assert_eq!(class, IpcOperationClass::MutationRequest);
+        assert!(class.requires_elevation());
+        assert_eq!(class.authorization_action(), Some(ACTION_EDIT_BASELINE));
+        let edit = serde_json::json!({
+            "mutation-kind": "rules-update",
+            "payload": {"admin-baseline": true},
+        });
+        assert_eq!(
+            super::canonical_operation_class(IpcOperationName::MutationSubmit, &edit),
+            class
+        );
+        for class in [
+            IpcOperationClass::SafeDisable,
+            IpcOperationClass::UserScopedMutation,
+            IpcOperationClass::MutationRequest,
+        ] {
+            assert!(class.requires_confirmation_token(), "{class:?}");
+        }
+        let request = crate::ipc_payloads::RollbackRequest {
+            target_revision_id: None,
+            dry_run: true,
+            admin_baseline: true,
+        };
+        let wire = serde_json::to_value(&request).expect("request serialises");
+        assert_eq!(wire[super::DRY_RUN_FIELD], true);
+        assert_eq!(wire[super::ADMIN_BASELINE_FIELD], true);
+    }
+
     /// The endpoint address carries the product name. Both are declared in this
     /// crate, and nothing outside it can notice when they part company.
     #[test]

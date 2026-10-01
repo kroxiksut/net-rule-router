@@ -195,8 +195,11 @@ impl IcmpSocket {
     }
 
     pub(crate) fn open_kind(kind: libc::c_int) -> std::io::Result<Self> {
+        // CLOEXEC: a privileged raw socket must not leak into the `nft` /
+        // `resolvectl` children spawned while a probe is in flight.
         // SAFETY: `socket` takes three integers and returns a descriptor.
-        let fd = unsafe { libc::socket(libc::AF_INET, kind, libc::IPPROTO_ICMP) };
+        let fd =
+            unsafe { libc::socket(libc::AF_INET, kind | libc::SOCK_CLOEXEC, libc::IPPROTO_ICMP) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -443,5 +446,17 @@ mod tests {
             return; // No permission to send: nothing to assert.
         }
         assert!(!LinuxIcmpProbe.is_reachable(target, Duration::from_millis(300)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_socket_is_not_inherited_by_children() {
+        let Ok(socket) = IcmpSocket::open() else {
+            return; // No permission to open: nothing to assert.
+        };
+        // SAFETY: F_GETFD on a descriptor this test owns only reads its flags.
+        let flags = unsafe { libc::fcntl(socket.0, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 }

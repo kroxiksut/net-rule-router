@@ -26,7 +26,8 @@ pub fn wire_orchestrator_to_registry(
             tracing::error!(
                 target: "nrr::per_sid_orchestrator",
                 msg_key = "persid-registry-reconcile-failed",
-                "reconcile failed: {e:?}",
+                error = %e,
+                "reconcile failed",
             );
         }
     }));
@@ -140,7 +141,8 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger
             Err(e) => tracing::error!(
                 target: "nrr::per_sid_orchestrator",
                 msg_key = "persid-registry-recompile-failed",
-                "route policy recompile failed: {e:?}",
+                error = %e,
+                "route policy recompile failed",
             ),
         }
     }

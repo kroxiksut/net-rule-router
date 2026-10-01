@@ -14,14 +14,18 @@ nrr-domain = { path = "../domain" }
 # The production data/log roots are derived once, in the layer that owns OS
 # shape; storage consumes them instead of deriving a second copy.
 nrr-platform-api = { path = "../platform/api" }
+# The migration runner and connection setup, shared with the GUI sidecar.
+nrr-sqlite-support = { path = "../sqlite-support" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 bitflags = "2"
 sha2 = "0.10"
-# Block 16.QoL+8 — HMAC-SHA256 over canonical revision row content
+# HMAC-SHA256 over canonical revision row content
 # for tamper detection. Key lives in DPAPI-protected per-user storage
 # (LocalSystem profile); the algorithm itself stays in this crate
 # because it's a pure function of the row bytes.
 hmac = "0.12"
+# A stored value read back as its default is logged, not silently replaced.
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

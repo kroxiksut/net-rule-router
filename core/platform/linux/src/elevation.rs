@@ -44,6 +44,12 @@ use nrr_platform_api::elevation::{ElevatedRun, PrivilegedRelaunchPort};
 /// polkit authentication dialog, then execs the helper as root.
 pub const PKEXEC_PROGRAM: &str = "pkexec";
 
+fn pkexec_status(argv: &[String]) -> std::io::Result<std::process::ExitStatus> {
+    Command::new(crate::command::system_tool(PKEXEC_PROGRAM)?)
+        .args(argv)
+        .status()
+}
+
 /// Outcome of an elevation attempt. Mirrors the semantics of the Windows
 /// broker's `SpawnOutcome` so a future neutral seam can unify them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +70,7 @@ pub enum ElevationOutcome {
 /// Unlike the Windows broker's PowerShell path, there is NO shell string and
 /// therefore no quoting/injection surface: `pkexec` `execve`s the helper
 /// directly, so each element is passed as a distinct argv entry. The returned
-/// vector is `[helper, args...]` — the arguments to `Command::new(PKEXEC_PROGRAM)`.
+/// vector is `[helper, args...]` — the arguments to `pkexec`.
 pub fn pkexec_argv(helper: &Path, args: &[String]) -> Vec<String> {
     let mut argv = Vec::with_capacity(1 + args.len());
     argv.push(helper.to_string_lossy().into_owned());
@@ -98,7 +104,7 @@ pub fn classify_pkexec_exit(code: Option<i32>) -> ElevationOutcome {
 /// tests.
 pub fn run_pkexec(helper: &Path, args: &[String]) -> ElevationOutcome {
     let argv = pkexec_argv(helper, args);
-    match Command::new(PKEXEC_PROGRAM).args(&argv).status() {
+    match pkexec_status(&argv) {
         Ok(status) => classify_pkexec_exit(status.code()),
         Err(e) => ElevationOutcome::Failed(format!("spawn {PKEXEC_PROGRAM}: {e}")),
     }
@@ -132,7 +138,7 @@ impl PrivilegedRelaunchPort for PkexecRelaunch {
 
     fn relaunch_and_wait(&self, program: &Path, args: &[String]) -> ElevatedRun {
         let argv = pkexec_argv(program, args);
-        match Command::new(PKEXEC_PROGRAM).args(&argv).status() {
+        match pkexec_status(&argv) {
             // The child's code and pkexec's own share one channel — 126 and 127
             // are pkexec's, everything else is the child's. Documented on
             // `classify_pkexec_exit`; the console's codes stay clear of both.

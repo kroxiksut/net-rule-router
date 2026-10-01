@@ -27,22 +27,23 @@ pub(crate) fn user_diagnostics_dir() -> PathBuf {
     #[cfg(windows)]
     {
         let mut dir = env::temp_dir();
-        dir.push("NetRuleRouter");
+        dir.push(nrr_shared::product_identity::PRODUCT_NAME);
         dir
     }
     #[cfg(not(windows))]
     {
+        use nrr_shared::product_identity::PRODUCT_NAME_UNIX;
         if let Some(base) = env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-            return PathBuf::from(base).join("netrulerouter");
+            return PathBuf::from(base).join(PRODUCT_NAME_UNIX);
         }
         if let Some(home) = env::var_os("HOME").filter(|v| !v.is_empty()) {
             return PathBuf::from(home)
                 .join(".local")
                 .join("state")
-                .join("netrulerouter");
+                .join(PRODUCT_NAME_UNIX);
         }
         let mut dir = env::temp_dir();
-        dir.push("netrulerouter");
+        dir.push(PRODUCT_NAME_UNIX);
         dir
     }
 }

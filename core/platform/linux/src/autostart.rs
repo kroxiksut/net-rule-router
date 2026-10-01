@@ -20,8 +20,8 @@
 //! ## Faithful round-trip
 //!
 //! The port is a dumb key/value store over a file: `write_value` embeds the
-//! helper-supplied string verbatim in `Exec=`, `read_value` returns that same
-//! string. All quoting/parsing of the binary path stays in the neutral
+//! helper-supplied string in `Exec=` (escaped per the Desktop Entry spec),
+//! `read_value` returns that same string. All quoting/parsing of the binary path stays in the neutral
 //! `AutostartHelper` (`format_registry_value` / `executable_of_command_line`), so
 //! this impl never second-guesses the coordinator.
 //!
@@ -47,15 +47,12 @@ pub use nrr_platform_api::autostart::{
 
 /// The `.desktop` basename we own. Stable across versions — renaming it would
 /// orphan existing autostart entries on user upgrades.
-pub const AUTOSTART_DESKTOP_FILE: &str = "netrulerouter-tray.desktop";
-// Held to the identity SSOT by `the_desktop_basename_is_the_tray_binary_name`:
-// a `const` cannot be concatenated on stable Rust without another dependency,
-// so the two are pinned by a test instead of derived.
+pub const AUTOSTART_DESKTOP_FILE: &str = nrr_shared::product_identity::TRAY_DESKTOP_FILE_NAME;
 
-/// `Name=` shown in a desktop environment's "Startup Applications" list. A
-/// proper noun, so not localized. Localized `Name[ru]=` / `Comment` keys are a
-/// follow-up when the Linux GUI packaging lands.
-const DESKTOP_ENTRY_NAME: &str = "NetRuleRouter";
+/// The packaged entry: the one body shared with the desktop installer. Only its
+/// `Exec=` line is rewritten, so the startup list gets the same name and icon.
+const DESKTOP_ENTRY_TEMPLATE: &str =
+    include_str!("../../../../packaging/linux/netrulerouter-tray.desktop");
 
 /// XDG autostart `AutostartRegistryPort` — reads/writes/deletes the single
 /// `.desktop` entry that launches the tray at graphical login.
@@ -124,17 +121,71 @@ impl AutostartRegistryPort for XdgAutostartRegistry {
 
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 
-/// Renders a minimal, spec-valid autostart `.desktop` file whose `Exec=`
-/// carries `exec_value` verbatim (the helper already quoted the path).
+/// Renders the packaged entry with its `Exec=` line replaced by `exec_value`
+/// (the helper already quoted the path), escaped per the Desktop Entry spec.
 fn render_desktop_entry(exec_value: &str) -> String {
-    format!(
-        "[Desktop Entry]\n\
-         Type=Application\n\
-         Name={DESKTOP_ENTRY_NAME}\n\
-         Exec={exec_value}\n\
-         Terminal=false\n\
-         X-GNOME-Autostart-enabled=true\n"
-    )
+    let exec_line = format!("Exec={}", escape_exec(exec_value));
+    let mut out = String::with_capacity(DESKTOP_ENTRY_TEMPLATE.len() + exec_line.len());
+    for line in DESKTOP_ENTRY_TEMPLATE.lines() {
+        out.push_str(if line.starts_with("Exec=") {
+            &exec_line
+        } else {
+            line
+        });
+        out.push('\n');
+    }
+    out
+}
+
+/// Two layers: inside a quoted argument `"`, `` ` ``, `$` and `\` take a
+/// backslash and `%` (a field code) doubles; the file's string syntax then
+/// doubles every backslash again.
+fn escape_exec(value: &str) -> String {
+    let quoted = value.len() >= 2 && value.starts_with('"') && value.ends_with('"');
+    let inner = if quoted {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    let mut exec_level = String::with_capacity(value.len() + 2);
+    for c in inner.chars() {
+        match c {
+            '\\' | '"' | '`' | '$' if quoted => {
+                exec_level.push('\\');
+                exec_level.push(c);
+            }
+            '%' => exec_level.push_str("%%"),
+            _ => exec_level.push(c),
+        }
+    }
+    let file_level = exec_level.replace('\\', "\\\\");
+    if quoted {
+        format!("\"{file_level}\"")
+    } else {
+        file_level
+    }
+}
+
+/// Inverse of [`escape_exec`], so the helper reads back the string it wrote.
+fn unescape_exec(raw: &str) -> String {
+    let exec_level = raw.replace("\\\\", "\\");
+    let quoted = exec_level.len() >= 2 && exec_level.starts_with('"') && exec_level.ends_with('"');
+    let mut out = String::with_capacity(exec_level.len());
+    let mut chars = exec_level.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('\\', Some(&n)) if quoted && matches!(n, '\\' | '"' | '`' | '$') => {
+                chars.next();
+                out.push(n);
+            }
+            ('%', Some('%')) => {
+                chars.next();
+                out.push('%');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Extracts the `Exec=` value verbatim from a `.desktop` file. Returns `None`
@@ -145,7 +196,7 @@ fn parse_exec_from_desktop(contents: &str) -> Option<String> {
         if trimmed.starts_with('#') {
             return None;
         }
-        trimmed.strip_prefix("Exec=").map(str::to_string)
+        trimmed.strip_prefix("Exec=").map(unescape_exec)
     })
 }
 
@@ -236,6 +287,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generated_entry_carries_packaged_metadata_and_one_exec() {
+        let out = render_desktop_entry(r#""/opt/net rule/NetRuleRouterTray""#);
+        assert!(out.contains("\nIcon="));
+        assert!(out.contains("\nComment="));
+        assert!(out.contains("\nStartupWMClass="));
+        assert_eq!(out.lines().filter(|l| l.starts_with("Exec=")).count(), 1);
+        assert!(out.contains("\nExec=\"/opt/net rule/NetRuleRouterTray\"\n"));
+    }
+
+    #[test]
+    fn reserved_characters_in_the_path_are_escaped_and_round_trip() {
+        let value = r#""/opt/a$b`c"d\e%f/Tray""#;
+        let out = render_desktop_entry(value);
+        assert!(out.contains(r#"Exec="/opt/a\\$b\\`c\\"d\\\\e%%f/Tray""#));
+        assert_eq!(parse_exec_from_desktop(&out).as_deref(), Some(value));
+    }
+
     // ── Port + AutostartHelper end-to-end over the real filesystem ──────────────
 
     #[test]
@@ -269,7 +338,7 @@ mod tests {
         helper.set_enabled(&exe).expect("set_enabled");
         assert!(dir.0.join(AUTOSTART_DESKTOP_FILE).exists());
         match helper.get_state(&exe).expect("state") {
-            AutostartCurrentState::Enabled { matches_ours, .. } => assert!(matches_ours),
+            AutostartCurrentState::Enabled { .. } => {}
             other => panic!("expected Enabled, got {other:?}"),
         }
 

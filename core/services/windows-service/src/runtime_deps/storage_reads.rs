@@ -175,243 +175,10 @@ pub(super) fn open_settings_connection(path: &std::path::Path) -> Option<Arc<Mut
     }
 }
 
-/// Run the DB-MAC tamper bootstrap over the
-/// state DB and return its outcome, which carries the row-MAC signing key
-/// (loaded or freshly generated). On failure, returns `None` so the
-/// coordinator runs unsigned (routing is unaffected). Alerts raised here land in the
-/// same `security_alerts` table the IPC handlers read, so the GUI
-/// surfaces them and the mutation gate engages until acknowledged.
-///
-pub(super) fn run_db_mac_tamper_bootstrap(
-    conn: &Arc<Mutex<Connection>>,
-    key_store: &dyn nrr_platform_api::key_store::KeyStore,
-) -> Option<nrr_service_runtime::tamper_bootstrap::TamperBootstrapOutcome> {
-    let alerts_repo: Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository> =
-        Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(conn)));
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    match run_tamper_bootstrap(conn, key_store, &alerts_repo, now_ms) {
-        Ok(outcome) => {
-            if outcome.raised_blocking_alert {
-                tracing::warn!(
-                    target: "nrr::tamper",
-                    msg_key = "svc-boot-tamper-blocking-alert",
-                    tampered = outcome.tampered_revision_ids.len(),
-                    key_reset = outcome.key_was_reset,
-                    backfilled = outcome.backfilled_rows,
-                    "DB-MAC tamper bootstrap raised blocking alert(s); \
-                     mutations gated until acknowledged",
-                );
-            } else {
-                tracing::info!(
-                    target: "nrr::tamper",
-                    msg_key = "svc-boot-tamper-clean",
-                    backfilled = outcome.backfilled_rows,
-                    "DB-MAC tamper bootstrap clean",
-                );
-            }
-            Some(outcome)
-        }
-        Err(e) => {
-            tracing::error!(
-                target: "nrr::tamper",
-                msg_key = "svc-boot-tamper-bootstrap-failed",
-                error = %e,
-                "DB-MAC tamper bootstrap failed; coordinator will run unsigned",
-            );
-            None
-        }
-    }
-}
-
 /// The DB-MAC key store. This whole module is `#![cfg(target_os = "windows")]`,
 /// so the DPAPI store is always available here.
 pub(super) fn production_key_store() -> Arc<dyn nrr_platform_api::key_store::KeyStore> {
     Arc::new(nrr_platform_windows::key_store::WindowsDpapiKeyStore::default_systemprofile())
-}
-
-/// Runs [`ActivationCoordinator::enforce_active_integrity_at_boot`] and, for
-/// every principal it rolled back or cleared, raises a (non-blocking)
-/// `security_alerts` row so the GUI surfaces it — same dedup mechanism
-/// as [`run_db_mac_tamper_bootstrap`]'s alerts, reused via
-/// `tamper_bootstrap::emit_alert`. Best effort: a sweep failure is
-/// logged and does not block startup, matching the tamper bootstrap's
-/// own failure posture.
-pub(super) fn run_active_integrity_enforcement(
-    coordinator: &ActivationCoordinator,
-    conn: &Arc<Mutex<Connection>>,
-    bootstrap: &nrr_service_runtime::tamper_bootstrap::TamperBootstrapOutcome,
-) {
-    use nrr_service_runtime::activation_coordinator::ActiveIntegrityOutcome;
-    use nrr_service_runtime::tamper_bootstrap::emit_alert;
-
-    let outcomes =
-        match coordinator.enforce_active_integrity_at_boot(bootstrap, "svc-boot-integrity-scan") {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(
-                    target: "nrr::tamper",
-                    msg_key = "svc-boot-integrity-sweep-failed",
-                    error = ?e,
-                    "active-revision integrity sweep failed",
-                );
-                return;
-            }
-        };
-    let rejected: Vec<_> = outcomes
-        .into_iter()
-        .filter(|(_, outcome)| {
-            matches!(
-                outcome,
-                ActiveIntegrityOutcome::RolledBack { .. }
-                    | ActiveIntegrityOutcome::ClearedNoTrustedFallback { .. }
-            )
-        })
-        .collect();
-    if rejected.is_empty() {
-        return;
-    }
-    let alerts_repo: Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository> =
-        Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(conn)));
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    for (principal, outcome) in rejected {
-        let rejected_revision_id = match &outcome {
-            ActiveIntegrityOutcome::RolledBack {
-                rejected_revision_id,
-                ..
-            }
-            | ActiveIntegrityOutcome::ClearedNoTrustedFallback {
-                rejected_revision_id,
-                ..
-            } => rejected_revision_id.clone(),
-            _ => continue,
-        };
-        tracing::warn!(
-            target: "nrr::tamper",
-            msg_key = "svc-boot-revision-integrity-rejected",
-            principal = %principal,
-            rejected_revision_id = %rejected_revision_id,
-            outcome = ?outcome,
-            "active revision failed the integrity gate; rolled back to last trusted revision",
-        );
-        if let Err(e) = emit_alert(
-            &alerts_repo,
-            format!("alt-revintegrity-{rejected_revision_id}"),
-            nrr_diagnostics::audit::AuditEventKind::UntrustedRevisionRejected.as_str(),
-            nrr_diagnostics::reason::integrity::UNTRUSTED_REVISION_REJECTED.as_str(),
-            now_ms,
-        ) {
-            tracing::error!(
-                target: "nrr::tamper",
-                msg_key = "svc-boot-revision-alert-failed",
-                error = ?e,
-                rejected_revision_id = %rejected_revision_id,
-                "failed to raise untrusted-revision-rejected alert",
-            );
-        }
-    }
-}
-
-/// Reads the persisted `service_stability_config` row
-/// and converts it into the runtime-side `ServiceStabilityConfig` the
-/// supervisor consumes. Returns `None` on any error so the caller can
-/// fall back to `ServiceStabilityConfig::default()` (canonical
-/// recoverable / 20 / 100ms / 5s — same as the GUI's default state).
-///
-/// The lock-acquire failure path uses `_ = ...` rather than `?` because
-/// poisoning is non-fatal: a poisoned mutex around the settings
-/// connection means another thread panicked mid-op; we still want the
-/// supervisor to start with defaults rather than refuse to boot.
-/// Read the persisted operational-log + audit
-/// retention config so the cleanup tasks enforce the operator's saved caps.
-/// `None` on lock/read failure → the caller falls back to documented defaults.
-pub(super) fn read_log_retention_config(
-    conn: &Arc<Mutex<Connection>>,
-) -> Option<nrr_storage::LogRetentionConfig> {
-    let guard = conn.lock().ok()?;
-    let repo = nrr_storage::LogRetentionConfigRepository::new(&guard);
-    match repo.get_or_default() {
-        Ok(cfg) => Some(cfg),
-        Err(e) => {
-            tracing::warn!(
-                target: "nrr::runtime",
-                msg_key = "svc-boot-log-retention-read-failed",
-                error = %e,
-                "log_retention_config read failed; using retention defaults",
-            );
-            None
-        }
-    }
-}
-
-pub(super) fn read_service_stability_config(
-    conn: &Arc<Mutex<Connection>>,
-) -> Option<nrr_service_runtime::service_stability::ServiceStabilityConfig> {
-    use nrr_service_runtime::service_stability::{IpcAcceptFailurePolicy, ServiceStabilityConfig};
-    use nrr_storage::service_stability_config::{
-        IpcAcceptPolicyRecord, ServiceStabilityConfigRepository,
-    };
-    use std::time::Duration;
-
-    let guard = conn.lock().ok()?;
-    let repo = ServiceStabilityConfigRepository::new(&guard);
-    let record = match repo.get_or_default() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                target: "nrr::runtime",
-                msg_key = "svc-boot-stability-config-read-failed",
-                error = %e,
-                "service_stability_config read failed; using runtime defaults",
-            );
-            return None;
-        }
-    };
-    let policy = match record.ipc_accept_policy {
-        IpcAcceptPolicyRecord::Critical => {
-            tracing::info!(
-                target: "nrr::stability",
-                msg_key = "svc-boot-stability-config-loaded-critical",
-                kind = "critical",
-                "service_stability_config loaded",
-            );
-            IpcAcceptFailurePolicy::Critical
-        }
-        IpcAcceptPolicyRecord::Recoverable {
-            max_restarts,
-            backoff_base_ms,
-            backoff_cap_ms,
-        } => {
-            // Emit the loaded numbers so an operator who saves new
-            // values in GUI Settings → Service stability can verify
-            // via NDJSON that the supervisor picked them up after
-            // restart. Without this, the only signal would be timing
-            // between `task_failed` events — useless when IPC is
-            // healthy.
-            tracing::info!(
-                target: "nrr::stability",
-                msg_key = "svc-boot-stability-config-loaded-recoverable",
-                kind = "recoverable",
-                max_restarts,
-                backoff_base_ms,
-                backoff_cap_ms,
-                "service_stability_config loaded",
-            );
-            IpcAcceptFailurePolicy::Recoverable {
-                max_restarts,
-                backoff_base: Duration::from_millis(u64::from(backoff_base_ms)),
-                backoff_cap: Duration::from_millis(u64::from(backoff_cap_ms)),
-            }
-        }
-    };
-    Some(ServiceStabilityConfig {
-        ipc_accept_policy: policy,
-    })
 }
 
 pub(super) use nrr_service_runtime::dns_stack::read_enforcement_mode;
@@ -507,8 +274,8 @@ pub(super) fn read_fake_ip_instant_rst(conn: &Arc<Mutex<Connection>>) -> bool {
 /// `NRR_CONN_TRACE` env var is set OR the sentinel file
 /// `%ProgramData%\NetRuleRouter\conn-trace.enabled` exists. The sentinel file
 /// is the service-friendly knob (SCM caches the env block at boot, so a new env
-/// var needs a reboot; a file just needs a service restart). Slice D replaces
-/// both with the persisted GUI settings toggle.
+/// var needs a reboot; a file just needs a service restart). Forces the NDJSON
+/// sink on for the life of the process, whatever the GUI toggle says.
 pub(super) fn conn_trace_requested() -> bool {
     if std::env::var_os("NRR_CONN_TRACE").is_some() {
         return true;
@@ -524,9 +291,8 @@ pub(super) fn conn_trace_requested() -> bool {
 
 /// Read the persisted connection-trace toggles (NDJSON sink, GUI stream) from
 /// `service_stability_config`. Returns `(false, false)` on any error — the
-/// trace stays off unless explicitly enabled. Read once at bootstrap; the GUI
-/// Save persists the row, so a toggle change takes effect on the next service
-/// start (consistent with the sibling `verbose_logging` flag).
+/// trace stays off unless explicitly enabled. Only the boot value: later saves
+/// reach the observer through the settings writer's live-apply hook.
 pub(super) fn read_conn_trace_flags(conn: Option<&Arc<Mutex<Connection>>>) -> (bool, bool) {
     use nrr_storage::service_stability_config::ServiceStabilityConfigRepository;
     let Some(conn) = conn else {

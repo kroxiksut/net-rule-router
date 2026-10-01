@@ -39,25 +39,29 @@ impl<'c> FakeIpHealExclusionsRepository<'c> {
         if hostname.is_empty() {
             return Ok(());
         }
-        self.conn
-            .execute(
-                "INSERT INTO fake_ip_heal_exclusions (hostname, learned_at)
+        // The eviction keeps the cap only if it commits with the insert.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| StorageError::Internal(format!("fake_ip_heal_exclusions tx: {e}")))?;
+        tx.execute(
+            "INSERT INTO fake_ip_heal_exclusions (hostname, learned_at)
                  VALUES (?1, ?2)
                  ON CONFLICT(hostname) DO UPDATE SET learned_at = excluded.learned_at",
-                params![hostname, now],
-            )
-            .map_err(|e| StorageError::Internal(format!("fake_ip_heal_exclusions upsert: {e}")))?;
-        self.conn
-            .execute(
-                "DELETE FROM fake_ip_heal_exclusions WHERE hostname IN (
+            params![hostname, now],
+        )
+        .map_err(|e| StorageError::Internal(format!("fake_ip_heal_exclusions upsert: {e}")))?;
+        tx.execute(
+            "DELETE FROM fake_ip_heal_exclusions WHERE hostname IN (
                      SELECT hostname FROM fake_ip_heal_exclusions
                      ORDER BY learned_at DESC, hostname ASC
                      LIMIT -1 OFFSET ?1
                  )",
-                params![MAX_EXCLUSIONS as i64],
-            )
-            .map_err(|e| StorageError::Internal(format!("fake_ip_heal_exclusions evict: {e}")))?;
-        Ok(())
+            params![MAX_EXCLUSIONS as i64],
+        )
+        .map_err(|e| StorageError::Internal(format!("fake_ip_heal_exclusions evict: {e}")))?;
+        tx.commit()
+            .map_err(|e| StorageError::Internal(format!("fake_ip_heal_exclusions commit: {e}")))
     }
 
     /// Load every persisted hostname, newest first.
@@ -136,6 +140,30 @@ mod tests {
             loaded.first().map(String::as_str),
             Some(format!("host{}.example", MAX_EXCLUSIONS + 4).as_str()),
             "newest row survives"
+        );
+    }
+
+    #[test]
+    fn a_failed_eviction_rolls_the_upsert_back_so_the_cap_holds() {
+        let conn = migrated_conn();
+        let repo = FakeIpHealExclusionsRepository::new(&conn);
+        for i in 0..MAX_EXCLUSIONS {
+            repo.upsert(&format!("host{i}.example"), i as i64)
+                .expect("fill to cap");
+        }
+        let before = repo.load().expect("load");
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_evict BEFORE DELETE ON fake_ip_heal_exclusions
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .expect("trigger");
+
+        assert!(repo.upsert("late.example", 10_000).is_err());
+
+        assert_eq!(
+            repo.load().expect("load"),
+            before,
+            "table unchanged, cap holds"
         );
     }
 }

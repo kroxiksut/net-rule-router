@@ -1,13 +1,14 @@
 #include "native_bridge.h"
 #include <QSaveFile>
 
-NrrNativeBridge::NrrNativeBridge(const QString &applicationDir, QObject *parent)
+NrrNativeBridge::NrrNativeBridge(const QString &applicationDir,
+                                 const QString &logsDirectory, QObject *parent)
     : QObject(parent),
       applicationDir_(applicationDir),
       mainGuiExecutable_(resolveMainGuiExecutable(applicationDir)),
       trayGuiExecutable_(resolveTrayGuiExecutable(applicationDir)),
       guiActivationRequestPath_(guiActivationRequestFilePath()),
-      logsDirectory_(resolveLogsDirectory()) {
+      logsDirectory_(logsDirectory) {
     watchSystemAppearance();
 }
 
@@ -166,25 +167,7 @@ QVariantMap NrrNativeBridge::trayNoticeScreenGeometry() const {
 }
 
 bool NrrNativeBridge::isElevated() {
-#ifdef Q_OS_WIN
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)
-            || token == nullptr) {
-        return true;
-    }
-    TOKEN_ELEVATION elevation{};
-    DWORD returned = 0;
-    const BOOL ok = GetTokenInformation(token, TokenElevation,
-                                        &elevation, sizeof(elevation),
-                                        &returned);
-    CloseHandle(token);
-    if (ok == FALSE) {
-        return true;
-    }
-    return elevation.TokenIsElevated != 0;
-#else
-    return true;
-#endif
+    return nrrProcessIsElevated();
 }
 
 void NrrNativeBridge::openContainingFolder(const QString &path) {

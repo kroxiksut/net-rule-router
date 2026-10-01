@@ -1,8 +1,8 @@
 use super::*;
 use crate::archive::request::DiagnosticArchiveRequest;
 use crate::facade::dto::{
-    CacheHealthCard, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
-    LogHealthCard, SecurityStatusCard, ServiceHealthCard,
+    CacheHealthCard, DiagnosticsDataOrigin, DiagnosticsStatusDto, LogHealthCard,
+    SecurityStatusCard, ServiceHealthCard,
 };
 use crate::logs::reader::RawLogFile;
 
@@ -20,6 +20,7 @@ fn sample_health() -> DiagnosticsStatusDto {
             audit_chain_ok: true,
             active_alert_count: 0,
             audit_write_healthy: true,
+            alerts_readable: true,
         },
         active_alerts: Vec::new(),
         cache_health: CacheHealthCard {
@@ -34,7 +35,6 @@ fn sample_health() -> DiagnosticsStatusDto {
             dropped_count: 0,
             last_cleanup_at: None,
         },
-        diagnostic_mode: DiagnosticModeStateDto::inactive(),
         stale: false,
         origin: DiagnosticsDataOrigin::Service,
     }
@@ -882,13 +882,13 @@ fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
     let row = InterfaceRowDto {
         persistent_id: "00-11-22-33-44-55".into(),
         adapter_name: "Ethernet".into(),
-        windows_name: "Ethernet".into(),
-        interface_description: "Realtek Gaming GbE".into(),
+        name: "Ethernet".into(),
+        interface_description: "Ethernet adapter".into(),
         interface_type: "ethernet".into(),
         is_bluetooth_like: false,
-        local_ip: "192.168.1.42".into(),
-        gateway: "192.168.1.1".into(),
-        dns_servers: "8.8.8.8, 1.1.1.1".into(),
+        local_ip: "192.0.2.42".into(),
+        gateway: "192.0.2.1".into(),
+        dns_servers: "198.51.100.53, 203.0.113.53".into(),
         has_default_route: true,
         has_forwarding_path: Some(true),
         runtime_data_unavailable: false,
@@ -915,7 +915,6 @@ fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
             class: "primary-candidate".into(),
             confidence: "high".into(),
             advisory_only: true,
-            summary: String::new(),
             key_signals: Vec::new(),
             excluded_alternatives: Vec::new(),
         },
@@ -927,8 +926,8 @@ fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
             adapter_name: "Ethernet".into(),
             ipv6_if_index: 12,
             physical_address: Some("00-11-22-33-44-55".into()),
-            windows_name: "Ethernet".into(),
-            interface_description: "Realtek Gaming GbE".into(),
+            name: "Ethernet".into(),
+            interface_description: "Ethernet adapter".into(),
             interface_type: "ethernet".into(),
             oper_status: "up".into(),
         }],
@@ -943,8 +942,8 @@ fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
         !health.contains("00-11-22-33-44-55"),
         "MAC leaked: {health}"
     );
-    assert!(!health.contains("192.168.1.42"), "local address leaked");
-    assert!(!health.contains("8.8.8.8"), "DNS server leaked");
+    assert!(!health.contains("192.0.2.42"), "local address leaked");
+    assert!(!health.contains("198.51.100.53"), "DNS server leaked");
 }
 
 fn read_zip_entry(archive: &Path, name: &str) -> String {
@@ -955,4 +954,114 @@ fn read_zip_entry(archive: &Path, name: &str) -> String {
     let mut text = String::new();
     entry.read_to_string(&mut text).expect("read entry");
     text
+}
+
+/// A line written while verbose logging was on, raw hostname and address in
+/// its payload, as the service would have left it in `service-logs/`.
+fn verbose_line(event_id: &str) -> String {
+    crate::event::LogEvent::new(
+        event_id,
+        1_745_000_000_000,
+        crate::taxonomy::EventLevel::Info,
+        crate::reason::service::STARTED,
+    )
+    .with_payload(serde_json::json!({
+        "message": "resolved",
+        "host": "private-host.example",
+        "remote_ip": "203.0.113.7",
+        "count": 3,
+    }))
+    .with_privacy(crate::taxonomy::PrivacyClass::Diagnostic)
+    .to_ndjson()
+    .expect("serialize")
+}
+
+fn export_with_verbose_history(request: DiagnosticArchiveRequest) -> String {
+    let dir = tempfile::tempdir().expect("temp");
+    let dest = dir.path().join("diag.zip");
+    let mut input = sample_input(request);
+    input.raw_log_files = vec![RawLogFile {
+        name: "nrr_service_20260907-1.ndjson".into(),
+        lines: vec![verbose_line("evt-verbose-1")],
+    }];
+    ArchiveBuilder::build(input, &dest).expect("build");
+    read_zip_entry(&dest, "service-logs/nrr_service_20260907-1.ndjson")
+}
+
+/// What a Default export may disclose is set by the EXPORT, not by the mode
+/// the line happened to be written in: an hour of verbose logging must not
+/// leave raw hostnames in every Default bundle for the next 90 days.
+#[test]
+fn a_default_export_caps_raw_log_lines_written_in_verbose_mode() {
+    let body = export_with_verbose_history(DiagnosticArchiveRequest::default_export("0.1.0"));
+    assert!(!body.contains("private-host.example"), "{body}");
+    assert!(!body.contains("203.0.113.7"), "{body}");
+    // The line itself stays: the timeline is what the log is for.
+    assert!(body.contains("evt-verbose-1"), "{body}");
+    assert!(body.contains("\"count\":3"), "{body}");
+    let line: crate::event::LogEvent =
+        serde_json::from_str(body.lines().next().expect("line")).expect("still a log event");
+    assert_eq!(
+        line.privacy_class,
+        crate::taxonomy::PrivacyClass::PublicSummary,
+        "the stamp describes the payload that shipped"
+    );
+}
+
+/// Positive control: the diagnostics tier is the one that may carry them.
+#[test]
+fn a_diagnostics_export_keeps_the_verbose_detail() {
+    let body = export_with_verbose_history(DiagnosticArchiveRequest::diagnostics_export("0.1.0"));
+    assert!(body.contains("private-host.example"), "{body}");
+    assert!(body.contains("203.0.113.7"), "{body}");
+}
+
+/// A line that is already within the export's ceiling ships byte for byte.
+#[test]
+fn a_line_within_the_ceiling_ships_verbatim() {
+    let dir = tempfile::tempdir().expect("temp");
+    let dest = dir.path().join("diag.zip");
+    let mut input = sample_input(DiagnosticArchiveRequest::default_export("0.1.0"));
+    let line = crate::event::LogEvent::new(
+        "evt-plain",
+        1_745_000_000_000,
+        crate::taxonomy::EventLevel::Info,
+        crate::reason::service::STARTED,
+    )
+    .with_payload(serde_json::json!({ "count": 3, "host": "<redacted>" }))
+    .to_ndjson()
+    .expect("serialize");
+    input.raw_log_files = vec![RawLogFile {
+        name: "nrr_service_20260907-1.ndjson".into(),
+        lines: vec![line.clone()],
+    }];
+    ArchiveBuilder::build(input, &dest).expect("build");
+    let body = read_zip_entry(&dest, "service-logs/nrr_service_20260907-1.ndjson");
+    assert_eq!(body, format!("{line}\n"));
+}
+
+fn export_listing_with_args(request: DiagnosticArchiveRequest) -> String {
+    let dir = tempfile::tempdir().expect("temp");
+    let dest = dir.path().join("diag.zip");
+    let mut input = sample_input(request);
+    input.log_entries[0].args = [
+        ("host".to_string(), "private-host.example".to_string()),
+        ("count".to_string(), "3".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    ArchiveBuilder::build(input, &dest).expect("build");
+    read_zip_entry(&dest, "logs.ndjson")
+}
+
+/// The listing's translation placeholders are the same payload by another
+/// route, and are capped at the same threshold.
+#[test]
+fn a_default_export_caps_the_listing_placeholders_too() {
+    let body = export_listing_with_args(DiagnosticArchiveRequest::default_export("0.1.0"));
+    assert!(!body.contains("private-host.example"), "{body}");
+    assert!(body.contains("\"count\":\"3\""), "{body}");
+
+    let body = export_listing_with_args(DiagnosticArchiveRequest::diagnostics_export("0.1.0"));
+    assert!(body.contains("private-host.example"), "{body}");
 }

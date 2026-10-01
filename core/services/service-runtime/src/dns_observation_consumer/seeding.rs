@@ -33,7 +33,7 @@ impl DnsObservationConsumer {
             Err(e) => {
                 tracing::debug!(
                     target: "nrr::dns-observe",
-                    error = ?e,
+                    error = %e,
                     "OS resolver-cache read failed — skipping seed this tick",
                 );
                 return summary;

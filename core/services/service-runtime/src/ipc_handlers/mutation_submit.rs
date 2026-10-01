@@ -36,7 +36,7 @@ use crate::ipc::{
     IpcRequestEnvelope,
 };
 use crate::ipc_handlers::mutation_token_store::{
-    ConsumeError, MutationTokenStore, StoredMutation, DEFAULT_MUTATION_TOKEN_TTL,
+    MutationTokenStore, StoredMutation, DEFAULT_MUTATION_TOKEN_TTL,
 };
 use crate::ipc_handlers::operation_status_store::OperationStatusStore;
 use crate::ipc_handlers::payloads::{
@@ -46,8 +46,12 @@ use crate::ipc_handlers::providers::{
     review_risk_level, rule_edits_allowed_for, MutationExecutor, MutationOutcome,
     ServiceStabilityConfigProvider, RULES_LOCKED_MESSAGE,
 };
-use crate::tamper_bootstrap::mutations_blocked_by_alert;
+use crate::tamper_bootstrap::{
+    is_blocking_alert_kind, mutation_refused_by_alert, mutations_blocked_by_alert,
+    SECURITY_ALERT_GATE_MESSAGE,
+};
 use nrr_diagnostics::audit::alert::SecurityAlertsRepository;
+use nrr_shared::ipc::IpcOperationName;
 
 /// Answers whether any principal OTHER than the caller (and the shared
 /// baseline) holds revisions.
@@ -138,27 +142,40 @@ impl IpcHandler for MutationSubmitHandler {
                 diagnostics_id: None,
             })?;
 
-        // Tamper gate. While an unacknowledged
-        // DB tamper / key-reset alert is active, refuse new mutations so
-        // the user can't push changes on top of a DB whose integrity is
-        // in question. The alert ack/resolve mutations are exempt —
-        // they're precisely how the user clears the gate. Applies to
-        // both the dry-run and confirm phases.
+        let is_alert_mutation = matches!(
+            body.mutation_kind,
+            MutationKind::SecurityAlertAck | MutationKind::SecurityAlertResolve
+        );
+        // The stand-in for other users' alerts is never stored: what it stands
+        // for only an administrator can clear, and they see the alerts proper.
+        if is_alert_mutation
+            && body
+                .payload
+                .get("alert-id")
+                .and_then(serde_json::Value::as_str)
+                == Some(crate::alert_audience::OTHER_PRINCIPAL_ALERT_ID)
+        {
+            return Err(IpcError {
+                code: IpcErrorCode::Forbidden,
+                message: "This alert concerns another user's rules — administrator rights required"
+                    .into(),
+                diagnostics_id: None,
+            });
+        }
+
+        // Tamper gate, answered here on both phases so the dry-run is refused
+        // too; the executor enforces the same predicate for every other writer.
         if let Some(repo) = self.alerts_repo.as_ref() {
-            let is_alert_mutation = matches!(
-                body.mutation_kind,
-                MutationKind::SecurityAlertAck | MutationKind::SecurityAlertResolve
-            );
-            if !is_alert_mutation && mutations_blocked_by_alert(repo.as_ref()) {
+            if mutation_refused_by_alert(body.mutation_kind, repo.as_ref()) {
                 return Err(IpcError {
-                    code: IpcErrorCode::Forbidden,
-                    message: "Verify rules and acknowledge security alert".into(),
+                    code: IpcErrorCode::SecurityAlertUnacknowledged,
+                    message: SECURITY_ALERT_GATE_MESSAGE.into(),
                     diagnostics_id: None,
                 });
             }
-            // Clearing a blocking alert re-signs EVERY revision row, adopting
-            // whatever each holds today as legitimate. Where the caller is the
-            // only user with revisions — the ordinary single-user machine —
+            // Clearing a blocking alert adopts the rows it lists as legitimate —
+            // after a key reset, every row the lost key signed. Where the caller
+            // is the only user with revisions — the ordinary single-user machine —
             // that statement is about their own data and needs no ceremony.
             // Where somebody else's rows would be adopted too, it is a decision
             // taken on another person's behalf, and that is what elevation is
@@ -166,9 +183,18 @@ impl IpcHandler for MutationSubmitHandler {
             // behind). Note the write path is already administrator-only, so
             // this is not what stops tampering; it is what stops one user
             // silently blessing another's rows.
+            // Resolving an already acknowledged tamper / key-reset alert adopts
+            // rows just the same, with no active alert left to trip the check.
+            let targets_blocking_alert = || {
+                body.payload
+                    .get("alert-id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| repo.find_by_id(id).ok().flatten())
+                    .is_some_and(|a| is_blocking_alert_kind(&a.kind))
+            };
             if is_alert_mutation
                 && !ctx.caller_is_elevated
-                && mutations_blocked_by_alert(repo.as_ref())
+                && (mutations_blocked_by_alert(repo.as_ref()) || targets_blocking_alert())
                 && self
                     .other_principals_hold_revisions
                     .as_ref()
@@ -176,7 +202,8 @@ impl IpcHandler for MutationSubmitHandler {
             {
                 return Err(IpcError {
                     code: IpcErrorCode::Forbidden,
-                    message: "Clearing this alert also adopts other users' rules —                               administrator rights required"
+                    message: "Clearing this alert also adopts other users' rules — \
+                              administrator rights required"
                         .into(),
                     diagnostics_id: None,
                 });
@@ -208,18 +235,15 @@ impl IpcHandler for MutationSubmitHandler {
     }
 }
 
-/// Resolve the storage principal a **confirm** mutation
-/// targets, from the envelope class plus the authenticated caller SID.
+/// The rules partition a confirmed rule-book write (an edit or a rollback)
+/// lands in, from its derived class and the authenticated caller.
 ///
-/// - [`IpcOperationClass::UserScopedMutation`] → the caller's own SID
-///   (per-principal rules / preset). A non-Windows transport or a
-///   harness that omits the SID has nobody to attribute the write to, so
-///   the mutation is refused as unauthenticated.
-/// - [`IpcOperationClass::MutationRequest`] → the admin baseline
-///   (`BASELINE_PRINCIPAL`). The router has already enforced elevation
-///   for this class; this is the global behaviour and also the admin
-///   "edit baseline" path.
-fn resolve_confirm_principal(
+/// - [`IpcOperationClass::UserScopedMutation`] → the caller's own SID. A
+///   transport or harness that omits the SID has nobody to attribute the
+///   write to, so it is refused as unauthenticated.
+/// - an elevation-gated class → the shared admin baseline; the router has
+///   already demanded the rights before the handler runs.
+pub(crate) fn resolve_confirm_principal(
     class: IpcOperationClass,
     caller_sid: &str,
 ) -> Result<String, IpcError> {
@@ -234,10 +258,12 @@ fn resolve_confirm_principal(
             }
             Ok(caller_sid.to_string())
         }
-        // MutationRequest (elevated baseline). The
-        // class gate in `handle_confirm` rejects any other class before
-        // we reach here.
-        _ => Ok(nrr_storage::BASELINE_PRINCIPAL.to_string()),
+        class if class.requires_elevation() => Ok(nrr_storage::BASELINE_PRINCIPAL.to_string()),
+        class => Err(IpcError {
+            code: IpcErrorCode::MalformedRequest,
+            message: format!("{} does not write a rules partition", class.slug()),
+            diagnostics_id: None,
+        }),
     }
 }
 
@@ -297,8 +323,15 @@ impl MutationSubmitHandler {
         let summary = self
             .executor
             .preview(body.mutation_kind, &body.payload, &principal);
+        let unverified_rows = match body.mutation_kind {
+            MutationKind::SecurityAlertAck | MutationKind::SecurityAlertResolve => self
+                .executor
+                .unverified_rows(body.mutation_kind, &body.payload),
+            _ => Vec::new(),
+        };
         let now = Instant::now();
         let token = self.token_store.issue(
+            IpcOperationName::MutationSubmit,
             StoredMutation::from_request(&body, ctx.caller_stored(), ctx.caller_is_elevated),
             now + self.token_ttl,
         );
@@ -307,6 +340,8 @@ impl MutationSubmitHandler {
             review_risk_level: review_risk_level(&summary),
             review_summary: summary,
             confirmation_token: token,
+            unverified_rows,
+            audit_chain: self.executor.audit_chain_preview(body.mutation_kind),
         };
         serde_json::to_value(resp).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
@@ -344,7 +379,13 @@ impl MutationSubmitHandler {
         // Derive the target principal from the class + authenticated
         // caller SID BEFORE consuming the token, so an unauthenticated
         // user-scoped confirm is refused without spending the token.
-        let principal = resolve_confirm_principal(request.operation_class, ctx.caller_stored())?;
+        let principal = if body.mutation_kind == MutationKind::AuditChainRestart {
+            // No partition to act on: the restart records the administrator
+            // who confirmed it, whoever ran the dry-run.
+            ctx.caller_stored().to_string()
+        } else {
+            resolve_confirm_principal(request.operation_class, ctx.caller_stored())?
+        };
 
         // Router has already verified the token is present and
         // non-empty (PreconditionFailed). Defensive check below
@@ -360,22 +401,10 @@ impl MutationSubmitHandler {
             })?;
 
         let now = Instant::now();
-        let stored = self.token_store.consume(token, now).map_err(|e| match e {
-            ConsumeError::NotFound => IpcError {
-                code: IpcErrorCode::PreconditionFailed,
-                message: "confirmation token unknown — re-run dry-run".into(),
-                diagnostics_id: None,
-            },
-            ConsumeError::Expired => IpcError {
-                // The catalogue does not yet have a dedicated
-                // `ConfirmationExpired` code; expiration is surfaced
-                // through `PreconditionFailed` with a distinguishing
-                // message that the GUI can match on.
-                code: IpcErrorCode::PreconditionFailed,
-                message: "confirmation token expired — re-run dry-run".into(),
-                diagnostics_id: None,
-            },
-        })?;
+        let stored = self
+            .token_store
+            .consume(token, IpcOperationName::MutationSubmit, now)
+            .map_err(IpcError::from)?;
 
         // Cross-principal token isolation, scoped to
         // `UserScopedMutation` only. The token was minted during a dry-run
@@ -636,8 +665,7 @@ mod tests {
                 &ctx(),
             )
             .expect_err("unknown token");
-        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
-        assert!(err.message.contains("unknown"));
+        assert_eq!(err.code, IpcErrorCode::ConfirmationUnknown);
     }
 
     #[test]
@@ -677,8 +705,7 @@ mod tests {
                 &ctx(),
             )
             .expect_err("expired");
-        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
-        assert!(err.message.contains("expired"));
+        assert_eq!(err.code, IpcErrorCode::ConfirmationExpired);
         assert_eq!(tokens.len(), 0, "expired token must still be removed");
     }
 
@@ -792,12 +819,12 @@ mod tests {
                 &ctx(),
             )
             .expect_err("must be blocked");
-        assert_eq!(err.code, IpcErrorCode::Forbidden);
+        assert_eq!(err.code, IpcErrorCode::SecurityAlertUnacknowledged);
         assert!(err.message.contains("acknowledge"));
     }
 
-    /// Clearing a blocking alert re-signs EVERY revision row, so on a machine
-    /// where someone else holds revisions it adopts their rules too. That is a
+    /// Clearing a key-reset alert adopts every row the lost key signed, so on a
+    /// machine where someone else holds revisions it adopts their rules too. That is a
     /// statement made on another person's behalf, and it costs elevation — the
     /// same line the shared baseline sits behind.
     ///
@@ -821,6 +848,80 @@ mod tests {
             .expect_err("an unelevated caller must not adopt another user's rows");
         assert_eq!(err.code, IpcErrorCode::Forbidden);
         assert!(err.message.contains("other users"), "{}", err.message);
+    }
+
+    /// Resolving an alert already acknowledged still adopts rows, so the same
+    /// line holds with no active alert left; a non-blocking kind stays open.
+    #[test]
+    fn resolving_an_acknowledged_blocking_alert_for_other_users_rows_needs_elevation() {
+        use nrr_diagnostics::audit::alert::{
+            InMemorySecurityAlertsRepository, SecurityAlert, SecurityAlertState,
+        };
+        let repo = InMemorySecurityAlertsRepository::new();
+        for (id, kind) in [
+            ("alt-keyreset-1", "key_reset_with_existing_data"),
+            ("alt-audit-1", "tamper_alert_raised"),
+        ] {
+            repo.insert(&SecurityAlert {
+                alert_id: id.into(),
+                kind: kind.into(),
+                state: SecurityAlertState::Acknowledged,
+                raised_event_seq: 0,
+                raised_file: "scan".into(),
+                ack_event_seq: None,
+                ack_file: None,
+                resolved_event_seq: None,
+                resolved_file: None,
+                created_at: 1,
+                updated_at: 1,
+                reason_code: "r".into(),
+            })
+            .expect("seed alert");
+        }
+        let (h, _t, _o, _e) = make_handler();
+        let h = h
+            .with_alerts_repo(Arc::new(repo))
+            .with_other_principals_reader(Arc::new(|_caller: &str| true));
+        let resolve = |id: &str| {
+            h.handle(
+                &dry_run_envelope(serde_json::json!({
+                    "mutation-kind": "security-alert-resolve",
+                    "payload": { "alert-id": id },
+                    "dry-run": true,
+                })),
+                &ctx_sid("S-1-5-21-1-2-3-1001"),
+            )
+        };
+        let err = resolve("alt-keyreset-1").expect_err("adopts other users' rows");
+        assert_eq!(err.code, IpcErrorCode::Forbidden);
+        assert!(
+            resolve("alt-audit-1").is_ok(),
+            "a kind that adopts nothing needs no elevation"
+        );
+    }
+
+    /// The entry standing in for another user's alerts names no stored alert;
+    /// acknowledging it says who can, rather than "not found".
+    #[test]
+    fn the_stand_in_for_other_users_alerts_cannot_be_acknowledged() {
+        let (h, _t, _o, _e) = make_handler();
+        let h = h
+            .with_alerts_repo(alerts_with_active_tamper())
+            .with_other_principals_reader(Arc::new(|_caller: &str| false));
+        for kind in ["security-alert-ack", "security-alert-resolve"] {
+            let err = h
+                .handle(
+                    &dry_run_envelope(serde_json::json!({
+                        "mutation-kind": kind,
+                        "payload": { "alert-id": crate::alert_audience::OTHER_PRINCIPAL_ALERT_ID },
+                        "dry-run": true,
+                    })),
+                    &ctx_sid("S-1-5-21-1-2-3-1001"),
+                )
+                .expect_err("nothing stored to acknowledge");
+            assert_eq!(err.code, IpcErrorCode::Forbidden, "{kind}");
+            assert!(err.message.contains("another user"), "{}", err.message);
+        }
     }
 
     /// The ordinary machine: one user, their own rules, no ceremony. Without
@@ -866,6 +967,81 @@ mod tests {
         assert!(
             resp.is_ok(),
             "alert-ack must be exempt from the tamper gate"
+        );
+    }
+
+    /// Answers every kind with one row, so the test shows the handler asks
+    /// only for alert kinds.
+    struct RowsExecutor(FakeMutationExecutor);
+
+    impl MutationExecutor for RowsExecutor {
+        fn preview(
+            &self,
+            kind: MutationKind,
+            payload: &serde_json::Value,
+            principal: &str,
+        ) -> crate::ipc_handlers::payloads::ReviewSummaryResponse {
+            self.0.preview(kind, payload, principal)
+        }
+        fn unverified_rows(
+            &self,
+            _kind: MutationKind,
+            _payload: &serde_json::Value,
+        ) -> Vec<nrr_shared::ipc_payloads::UnverifiedRowDto> {
+            vec![nrr_shared::ipc_payloads::UnverifiedRowDto {
+                row: nrr_shared::ipc_payloads::IntegrityRowRef {
+                    row_kind: nrr_shared::ipc_payloads::IntegrityRowKind::Revision,
+                    principal: nrr_storage::BASELINE_PRINCIPAL.into(),
+                    revision_id: "rev-1".into(),
+                    content_hash: "ab".into(),
+                },
+                baseline: true,
+                created_at: 1,
+                source: None,
+                status: None,
+                rule_count: None,
+            }]
+        }
+        fn execute(&self, payload: StoredMutation, principal: &str) -> MutationOutcome {
+            self.0.execute(payload, principal)
+        }
+        fn rollback(&self, principal: &str, target: Option<&str>) -> MutationOutcome {
+            self.0.rollback(principal, target)
+        }
+        fn safe_disable(&self, reason: &str) -> MutationOutcome {
+            self.0.safe_disable(reason)
+        }
+    }
+
+    #[test]
+    fn an_alert_dry_run_lists_the_rows_acknowledging_would_adopt() {
+        let h = MutationSubmitHandler::new(
+            Arc::new(RowsExecutor(FakeMutationExecutor::default())),
+            Arc::new(MutationTokenStore::new()),
+            Arc::new(OperationStatusStore::new()),
+        );
+        let ack: MutationDryRunResponse = serde_json::from_value(
+            h.handle(
+                &dry_run_envelope(serde_json::json!({
+                    "mutation-kind": "security-alert-ack",
+                    "payload": { "alert-id": "alt-1" },
+                    "dry-run": true,
+                })),
+                &ctx(),
+            )
+            .expect("alert dry-run"),
+        )
+        .unwrap();
+        assert_eq!(ack.unverified_rows.len(), 1);
+
+        let rules: MutationDryRunResponse = serde_json::from_value(
+            h.handle(&dry_run_envelope(rules_dry_run_body()), &ctx())
+                .expect("rules dry-run"),
+        )
+        .unwrap();
+        assert!(
+            rules.unverified_rows.is_empty(),
+            "a rules preview is not an integrity review"
         );
     }
 
@@ -1013,6 +1189,37 @@ mod tests {
         assert_eq!(exec.executed_count(), 1);
     }
 
+    /// A chain restart names the administrator who confirmed it, not the
+    /// baseline partition and not whoever ran the dry-run.
+    #[test]
+    fn a_chain_restart_acts_as_the_confirming_administrator() {
+        const USER: &str = "S-1-5-21-10-20-30-1001";
+        const ADMIN: &str = "S-1-5-21-10-20-30-500";
+        let (h, _tokens, _ops, exec) = make_handler();
+        let body = |dry_run: bool| {
+            serde_json::json!({
+                "mutation-kind": "audit-chain-restart",
+                "payload": { "breaks-digest": "d1" },
+                "dry-run": dry_run,
+            })
+        };
+        let dry: MutationDryRunResponse = serde_json::from_value(
+            h.handle(&dry_run_envelope(body(true)), &ctx_sid(USER))
+                .expect("dry-run"),
+        )
+        .unwrap();
+        let admin = IpcRequestContext {
+            caller_is_elevated: true,
+            ..ctx_sid(ADMIN)
+        };
+        h.handle(
+            &confirm_envelope(body(false), &dry.confirmation_token),
+            &admin,
+        )
+        .expect("confirm");
+        assert_eq!(exec.last_principal.lock().unwrap().as_deref(), Some(ADMIN));
+    }
+
     /// Use this to keep MutationKind exhaustive when new variants land.
     #[test]
     fn mutation_kind_serde_roundtrip_for_all_variants() {
@@ -1024,6 +1231,7 @@ mod tests {
             MutationKind::PresetExport,
             MutationKind::SettingsExport,
             MutationKind::RulesResetToBaseline,
+            MutationKind::AuditChainRestart,
         ];
         for k in all {
             let s = serde_json::to_string(&k).unwrap();

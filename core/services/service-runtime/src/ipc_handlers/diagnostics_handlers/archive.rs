@@ -220,7 +220,7 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
         // Collect data. We always include status; logs / audit are
         // gated on the request flags. Playbook inclusion lands as
         // optional sections inside `DiagnosticArchiveRequest`.
-        let health = self.diagnostics.get_status();
+        let health = self.diagnostics.get_status(&ctx.diagnostics_audience());
 
         // Build the diagnostic-archive request object FIRST — it carries the
         // log entry ceiling + byte budget that bound the log fetch below.
@@ -313,17 +313,12 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
         // diagnostics-tier export, where raw payload_summary_json is permitted.
         // `AuditChain` is in the diagnostics_export section set but NOT the
         // default set, so the redaction gate and the section gate agree.
-        // The RAW chain is machine-wide by construction: its value is that the
-        // hashes link every event, and a subset cannot be verified. So it ships
-        // only for a caller who may see the whole trail; everyone else gets the
-        // scoped summary above and no chain, rather than a chain that would
-        // fail its own verification.
-        let audit_chain_lines = if wants_diagnostics_detail
-            && req.include_audit_summary
-            && audience.is_machine_wide()
-        {
+        // The RAW chain is machine-wide by construction (a subset cannot be
+        // verified), so the reader hands it only to a machine-wide audience;
+        // everyone else gets the scoped summary above and no chain.
+        let audit_chain_lines = if wants_diagnostics_detail && req.include_audit_summary {
             self.diagnostics
-                .recent_audit_chain_lines(archive_request.max_audit_chain_bytes as usize)
+                .recent_audit_chain_lines(archive_request.max_audit_chain_bytes as usize, &audience)
                 .map_err(|e| internal(OP, format!("recent_audit_chain_lines: {e}")))?
         } else {
             Vec::new()

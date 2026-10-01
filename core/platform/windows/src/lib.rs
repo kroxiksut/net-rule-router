@@ -38,13 +38,20 @@
 //! | `interface_manager` | Adapter enumeration |
 
 pub mod adapters;
+#[cfg(test)]
+mod alloc_count;
 pub mod app_path_resolver;
 pub mod autostart;
+// Runs a system tool under a budget, draining its pipes while it runs.
+#[cfg(windows)]
+mod bounded_command;
 #[cfg(feature = "browser-stub")]
 pub mod browser_stub;
 pub mod conn_observe;
 pub mod constants;
 pub mod dns;
+// DHCP and VPN clients change DNS settings without a link or route event.
+pub mod dns_config_change;
 pub mod dns_observe;
 // Is an adapter absent, or here and refusing to start? The enumeration
 // reports both as nothing; the configuration manager can tell them apart.
@@ -53,6 +60,8 @@ pub mod dns_redirect;
 // Which connection claims which DNS namespace. Read from the per-interface
 // TCP/IP parameters, where a corporate VPN leaves it on connect.
 pub mod dns_scope;
+// System32 and the executable's directory only; called first in every `main`.
+pub mod dll_search;
 // One-shot UAC elevation of a single command, for the administrative console.
 // The session-long privileged channel the GUI uses is a different mechanism and
 // lives in `apps/desktop/broker`.
@@ -122,6 +131,8 @@ pub mod stale_flows;
 // Local civil-time offset (traffic ledger keys rows by the user's local day).
 pub mod local_time;
 pub mod system_info;
+/// Windows implementation of the system display-language probe.
+pub mod system_locale;
 #[cfg(windows)]
 pub mod system_shell;
 /// Windows implementation of the system light/dark probe.
@@ -193,10 +204,10 @@ pub use hosts_file::{
     OsHostsFileReader, StaticHostsFileReader,
 };
 pub use interface_rows::{
-    apply_external_probe, build_derived_assessment, build_observed_facts, collect_interfaces_rows,
-    external_probe_target, fallback_rows, unknown_recommendation, BasicAvailabilityStatus,
-    DerivedInterfaceAssessment, InterfaceRouteRow, InterfacesDataSource, ObservedInterfaceFacts,
-    RouteRoleRecommendation,
+    apply_external_probe, build_derived_assessment, build_observed_facts, external_probe_target,
+    fallback_rows, unknown_recommendation, BasicAvailabilityStatus, DerivedInterfaceAssessment,
+    InterfaceRouteRow, InterfaceRowsPort, InterfacesDataSource, ObservedInterfaceFacts,
+    RouteRoleRecommendation, WindowsInterfaceRows,
 };
 #[cfg(windows)]
 pub use key_store::WindowsDpapiKeyStore;

@@ -125,7 +125,7 @@ Window {
         id: loadListSecondaryDialog
         fileMode: FileDialog.OpenFile
         title: root.tr("dialog.load-list.pick-secondary-title",
-            "Choose secondary route preset file")
+            "Choose additional route preset file")
         nameFilters: [
             root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
@@ -312,7 +312,7 @@ Window {
             color: root.uiTheme.colorDanger
             visible: loadListWindow._sameFileConflict()
             text: root.tr("dialog.load-list.same-file-conflict",
-                "The same file cannot be selected for both the primary and the secondary route at the same time.")
+                "The same file cannot be selected for both the primary and the additional route at the same time.")
         }
 
         Item { Layout.fillHeight: true }

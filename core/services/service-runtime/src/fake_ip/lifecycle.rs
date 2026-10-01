@@ -464,7 +464,7 @@ impl FakeIpController {
                 tracing::warn!(
                     target: "nrr::fake-ip",
                     msg_key = "fakeip-run-loop-exited",
-                    error = ?e,
+                    error = %e,
                     "fake-IP stack run loop exited on a device error — relay is DOWN until restarted",
                 );
             }
@@ -502,7 +502,7 @@ impl FakeIpController {
             tracing::warn!(
                 target: "nrr::fake-ip",
                 msg_key = "fakeip-shutdown-signal-failed",
-                error = ?e,
+                error = %e,
                 "fake-IP stack shutdown signal failed — the reader may not wake promptly",
             );
         }

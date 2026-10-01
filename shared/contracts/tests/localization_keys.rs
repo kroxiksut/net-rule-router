@@ -1,6 +1,5 @@
-use nrr_shared::load_locale_map;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -109,7 +108,7 @@ fn locale_files_have_no_namespace_conflicts_or_invalid_leaf_types() {
 }
 
 #[test]
-fn locale_root_domains_use_fixed_block_3_5_allowlist() {
+fn locale_root_domains_use_fixed_allowlist() {
     let allowed = ALLOWED_TOP_LEVEL_DOMAINS
         .iter()
         .copied()
@@ -144,30 +143,24 @@ fn locale_root_domains_use_fixed_block_3_5_allowlist() {
     }
 }
 
+/// Checked against each bundled file as written: the loaded catalogue fills a
+/// missing RU key from EN, so it would hide exactly the gap this looks for.
 #[test]
 fn runtime_uses_known_localization_keys() {
-    let en_map = load_locale_map("en");
-    let known_keys = en_map.keys().cloned().collect::<HashSet<_>>();
     let runtime_keys = collect_runtime_locale_keys();
-    let mut unknown = Vec::new();
-
-    for key in runtime_keys {
-        if known_keys.contains(&key) {
-            continue;
-        }
-
-        if is_allowed_runtime_dynamic_key(&key) {
-            continue;
-        }
-
-        unknown.push(key);
+    for locale in BASELINE_LOCALES {
+        let known_keys = raw_locale_map(locale);
+        let unknown = runtime_keys
+            .iter()
+            .filter(|key| !known_keys.contains_key(*key) && !is_allowed_runtime_dynamic_key(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            unknown.is_empty(),
+            "locale '{locale}' lacks localization keys the runtime uses: {}",
+            unknown.join(", ")
+        );
     }
-
-    assert!(
-        unknown.is_empty(),
-        "runtime contains unknown localization keys: {}",
-        unknown.join(", ")
-    );
 
     let deprecated = collect_runtime_locale_keys()
         .into_iter()
@@ -208,8 +201,8 @@ fn every_service_message_key_is_translated() {
         tags.len()
     );
 
-    for locale in ["en", "ru"] {
-        let map = load_locale_map(locale);
+    for locale in BASELINE_LOCALES {
+        let map = raw_locale_map(locale);
         let missing: Vec<_> = tags
             .iter()
             .filter(|tag| {
@@ -221,6 +214,411 @@ fn every_service_message_key_is_translated() {
             "locale '{locale}' lacks diag.event.* for msg_key tags (or a tag is not kebab-case): {missing:?}"
         );
     }
+}
+
+/// The Logs view shows a tagged line's locale text, so a value spliced into the
+/// English text never reaches it: values travel as fields, and an `error` field
+/// has a `{error}` slot to land in.
+#[test]
+fn a_translated_log_line_keeps_its_values() {
+    let mut sources = Vec::new();
+    collect_files_with_extension(&workspace_root().join("core"), "rs", &mut sources);
+    let english = raw_locale_map("en");
+    let mut sites = 0;
+    let mut spliced = Vec::new();
+    let mut unshown = Vec::new();
+    for call in sources.iter().flat_map(|source| tagged_log_calls(source)) {
+        sites += 1;
+        if call.splices_values() {
+            spliced.push(format!("{}: {}", call.key, call.text));
+        }
+        let text = english.get(&format!("diag.event.{}", call.key));
+        if call.fields.iter().any(|field| field == "error")
+            && !text.is_some_and(|text| text.contains("{error}"))
+        {
+            unshown.push(call.key);
+        }
+    }
+    assert!(
+        sites >= 400,
+        "found only {sites} tagged log calls under core/ — the scan is not seeing them"
+    );
+    assert!(
+        spliced.is_empty(),
+        "tagged log lines splice values into their text instead of a field:\n{}",
+        spliced.join("\n")
+    );
+    assert!(
+        unshown.is_empty(),
+        "diag.event.* texts lack `{{error}}` although the line carries an `error` field: {unshown:?}"
+    );
+}
+
+#[test]
+fn log_call_scan_reads_fields_text_and_trailing_args() {
+    let source = r#"
+        tracing::warn!(
+            target: "nrr::x",
+            msg_key = "x-failed",
+            // a comment, with a comma
+            count = 3,
+            ?reason,
+            error = %e,
+            "could not do it: {}",
+            e,
+        );
+        tracing::info!(msg_key = "x-picked", "{reason}");
+    "#;
+    let calls = tagged_log_calls(source);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].key, "x-failed");
+    assert_eq!(calls[0].fields, ["msg_key", "count", "reason", "error"]);
+    assert!(calls[0].splices_values());
+    assert!(!calls[1].splices_values());
+}
+
+/// One `trace!`..`error!` call that carries a `msg_key`.
+struct TaggedLogCall {
+    key: String,
+    fields: Vec<String>,
+    text: String,
+    trailing_args: usize,
+}
+
+impl TaggedLogCall {
+    /// Whether the English text interpolates anything. A text that is one
+    /// capture and nothing else is picked whole from constants, so the
+    /// translation loses nothing.
+    fn splices_values(&self) -> bool {
+        let inner = self.text.trim_matches('"');
+        let captures = inner.replace("{{", "").matches('{').count();
+        let picked_whole = captures == 1
+            && inner.starts_with('{')
+            && inner.ends_with('}')
+            && inner[1..inner.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        self.trailing_args > 0 || (captures > 0 && !picked_whole)
+    }
+}
+
+fn tagged_log_calls(source: &str) -> Vec<TaggedLogCall> {
+    const MACROS: [&str; 5] = ["trace!(", "debug!(", "info!(", "warn!(", "error!("];
+    let mut calls = Vec::new();
+    let mut from = 0;
+    while let Some((at, len)) = MACROS
+        .iter()
+        .filter_map(|m| source[from..].find(m).map(|i| (from + i, m.len())))
+        .min()
+    {
+        from = at + len;
+        let line_start = source[..at].rfind('\n').map_or(0, |i| i + 1);
+        let is_word = source[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if is_word || source[line_start..at].trim_start().starts_with("//") {
+            continue;
+        }
+        let Some(args) = macro_args(&source[from..]) else {
+            continue;
+        };
+        let mut call = TaggedLogCall {
+            key: String::new(),
+            fields: Vec::new(),
+            text: String::new(),
+            trailing_args: 0,
+        };
+        for arg in args {
+            if !call.text.is_empty() {
+                call.trailing_args += 1;
+                continue;
+            }
+            if arg.starts_with('"') {
+                call.text = arg;
+                continue;
+            }
+            if ["target:", "parent:", "name:"]
+                .iter()
+                .any(|p| arg.starts_with(p))
+            {
+                continue;
+            }
+            if let Some((name, value)) = arg
+                .split_once('=')
+                .filter(|(name, value)| !name.contains(['(', '"']) && !value.starts_with('='))
+            {
+                let name = name.trim().to_string();
+                if name == "msg_key" {
+                    call.key = value.trim().trim_matches('"').to_string();
+                }
+                call.fields.push(name);
+            } else {
+                let path = arg.trim_start_matches(['%', '?']);
+                let name = path.rsplit(['.', ':']).next().unwrap_or(path);
+                call.fields.push(name.to_string());
+            }
+        }
+        if !call.key.is_empty() {
+            calls.push(call);
+        }
+    }
+    calls
+}
+
+/// The top-level arguments of a macro call, from just past its `(` to the
+/// matching `)`, with line comments dropped.
+fn macro_args(body: &str) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                current.push(c);
+                while let Some(s) = chars.next() {
+                    current.push(s);
+                    match s {
+                        '\\' => current.extend(chars.next()),
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for s in chars.by_ref() {
+                    if s == '\n' {
+                        break;
+                    }
+                }
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' if depth == 0 => {
+                let last = current.trim();
+                if !last.is_empty() {
+                    args.push(last.to_string());
+                }
+                return Some(args);
+            }
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                args.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    None
+}
+
+/// A translation that drops or renames a `{field}` / `%1` shows the raw token,
+/// or loses the value, in one language only.
+#[test]
+fn translations_keep_the_english_placeholders() {
+    let english = raw_locale_map("en");
+    for locale in BASELINE_LOCALES.iter().filter(|id| **id != "en") {
+        let mismatched = raw_locale_map(locale)
+            .iter()
+            .filter_map(|(key, text)| {
+                let expected = placeholders(english.get(key)?);
+                let found = placeholders(text);
+                (expected != found).then(|| format!("{key}: en {expected:?} vs {locale} {found:?}"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            mismatched.is_empty(),
+            "placeholders differ between en and {locale}:\n{}",
+            mismatched.join("\n")
+        );
+    }
+    let with_placeholders = english
+        .values()
+        .filter(|text| !placeholders(text).is_empty())
+        .count();
+    assert!(
+        with_placeholders >= 20,
+        "only {with_placeholders} English texts carry placeholders — the scan is not seeing them"
+    );
+}
+
+#[test]
+fn placeholder_scan_sees_named_and_positional_tokens() {
+    let found = placeholders("{count} of %1 in {adapter-name}; {not a token} 100% {}");
+    let expected = ["%1", "{adapter-name}", "{count}"]
+        .map(str::to_string)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(found, expected);
+}
+
+/// The RU UI spells this word «кэш», never «кеш» — including mid-word
+/// («закешировало», «некешированным»). Catches the spelling regressing key
+/// by key instead of relying on a one-off sweep.
+#[test]
+fn russian_locale_never_spells_cache_kesh() {
+    let offenders = raw_locale_map("ru")
+        .into_iter()
+        .filter(|(_, text)| text.to_lowercase().contains("кеш"))
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    assert!(
+        offenders.is_empty(),
+        "locale 'ru' uses the «кеш» spelling instead of «кэш» in: {}",
+        offenders.join(", ")
+    );
+}
+
+/// One word per concept in each language: leak protection, the additional
+/// route and VPN each had two or three spellings side by side. Placeholders
+/// and the rules file name are skipped: they name a value or a file, not the
+/// concept.
+#[test]
+fn retired_spellings_stay_out_of_the_locales() {
+    const RETIRED: [(&str, &[&str]); 2] = [
+        (
+            "en",
+            &[
+                "kill switch",
+                "kill-switch",
+                "killswitch",
+                "leak guard",
+                "leak-guard",
+                "emergency block",
+                "secondary",
+            ],
+        ),
+        (
+            "ru",
+            &[
+                "защита от утечек",
+                "защиты от утечек",
+                "защите от утечек",
+                "защиту от утечек",
+                "защитой от утечек",
+                "аварийная блокировка",
+                "аварийной блокировки",
+                "аварийное отключение",
+                "впн",
+                "запасн",
+                "вторичн",
+                "резервный маршрут",
+                "через резервный",
+            ],
+        ),
+    ];
+    for (locale, retired) in RETIRED {
+        let offenders = raw_locale_map(locale)
+            .into_iter()
+            .filter_map(|(key, text)| {
+                let text = without_placeholders(&text)
+                    .to_lowercase()
+                    .replace("rules_secondary.txt", "");
+                retired
+                    .iter()
+                    .find(|spelling| text.contains(**spelling))
+                    .map(|spelling| format!("{key} («{spelling}»)"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            offenders.is_empty(),
+            "locale '{locale}' uses a retired spelling in: {}",
+            offenders.join(", ")
+        );
+    }
+}
+
+fn without_placeholders(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '{' => depth += 1,
+            '}' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Locales every key must exist in, per the "both locale files" rule.
+const BASELINE_LOCALES: [&str; 2] = ["en", "ru"];
+
+/// `{name}` and `%N` tokens of one localized text.
+fn placeholders(text: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let bytes = text.as_bytes();
+    for (start, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'{' => {
+                let rest = &text[start + 1..];
+                if let Some(end) = rest.find('}') {
+                    let name = &rest[..end];
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        found.insert(format!("{{{name}}}"));
+                    }
+                }
+            }
+            b'%' => {
+                let digits = text[start + 1..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>();
+                if !digits.is_empty() {
+                    found.insert(format!("%{digits}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// One bundled locale file flattened to dotted keys, with no fallback merged in.
+fn raw_locale_map(locale: &str) -> BTreeMap<String, String> {
+    fn flatten(node: &Value, prefix: &str, out: &mut BTreeMap<String, String>) {
+        let Some(object) = node.as_object() else {
+            return;
+        };
+        for (key, child) in object {
+            if prefix.is_empty() && key == "metadata" {
+                continue;
+            }
+            let child_key = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            match child {
+                Value::String(text) => {
+                    out.insert(child_key, text.clone());
+                }
+                Value::Object(_) => flatten(child, &child_key, out),
+                _ => {}
+            }
+        }
+    }
+    let path = workspace_root()
+        .join("locales")
+        .join(format!("{locale}.json"));
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display()));
+    let parsed = serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}'))
+        .unwrap_or_else(|error| panic!("failed to parse '{}': {error}", path.display()));
+    let mut map = BTreeMap::new();
+    flatten(&parsed, "", &mut map);
+    map
 }
 
 fn collect_files_with_extension(dir: &Path, extension: &str, out: &mut Vec<String>) {

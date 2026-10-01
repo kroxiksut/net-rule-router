@@ -3,20 +3,26 @@ use super::*;
 // ── ServiceStabilityConfig ────────────────────────────────────────────────
 
 /// Wire shape for `nrr_service_runtime::service_stability::ServiceStabilityConfig`.
-/// Carries the IPC accept-failure policy as a tagged enum payload plus
-/// the verbose-logging toggle.
+/// Carries the IPC accept-failure policy as a tagged enum payload plus the
+/// service-wide switches beside it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ServiceStabilityConfigDto {
     pub ipc_accept_policy: IpcAcceptFailurePolicyDto,
-    /// When `true` the supervisor installs
-    /// `EnvFilter::new("nrr=debug,info")` instead of the canonical
-    /// `"nrr=info,info"`, so operational NDJSON captures `tracing::debug!`
-    /// events. `#[serde(default)]` keeps the field additive — older
-    /// GUI builds that omit it deserialise as `false`, matching the
-    /// previous server behaviour.
+    /// Verbose logging as the service runs it right now. Reported only: a Set
+    /// ignores it, because an echo of a window that has since ended would
+    /// otherwise switch it back on.
     #[serde(default)]
-    pub verbose_logging: bool,
+    pub verbose_logging_mode: VerboseLoggingMode,
+    /// UTC milliseconds at which a timed verbose window ends; `0` otherwise.
+    /// Reported only, like `verbose_logging_mode`.
+    #[serde(default)]
+    pub verbose_logging_until_ms: i64,
+    /// The one way to change verbosity: a request carried by the Set that
+    /// makes it. `None` leaves the running window alone, so saving an
+    /// unrelated setting can neither extend nor cut it short. Never echoed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbose_logging_change: Option<VerboseLoggingChange>,
     /// When `true` the opt-in connection-egress
     /// trace writes each observed connection to the operational NDJSON.
     /// `#[serde(default)]` keeps it additive (older GUIs deserialise `false`).
@@ -156,6 +162,53 @@ pub struct ServiceStabilityConfigDto {
     pub allow_user_rule_edits: Option<bool>,
 }
 
+/// How verbosely the service logs. Every verbose window ends by itself: at its
+/// deadline, or when the service restarts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VerboseLoggingMode {
+    #[default]
+    Off,
+    Timed,
+    UntilRestart,
+}
+
+impl VerboseLoggingMode {
+    /// The wire slug, for log lines.
+    #[must_use]
+    pub fn as_slug(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Timed => "timed",
+            Self::UntilRestart => "until-restart",
+        }
+    }
+}
+
+/// What a client may ask verbosity to become. The windows are a closed list
+/// so no client can leave verbose logging on for good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VerboseLoggingChange {
+    Off,
+    OneHour,
+    FourHours,
+    UntilRestart,
+}
+
+impl VerboseLoggingChange {
+    /// Length of a timed window; `None` for the two that have no deadline.
+    #[must_use]
+    pub fn window_ms(self) -> Option<i64> {
+        const HOUR_MS: i64 = 3_600_000;
+        match self {
+            Self::OneHour => Some(HOUR_MS),
+            Self::FourHours => Some(4 * HOUR_MS),
+            Self::Off | Self::UntilRestart => None,
+        }
+    }
+}
+
 /// Wire default for `ServiceStabilityConfigDto::dns_fast_answers`: `true`.
 /// See the field doc — answering immediately is the safe/default posture.
 fn dns_fast_answers_default() -> bool {
@@ -217,7 +270,9 @@ impl Default for ServiceStabilityConfigDto {
     fn default() -> Self {
         Self {
             ipc_accept_policy: IpcAcceptFailurePolicyDto::default(),
-            verbose_logging: false,
+            verbose_logging_mode: VerboseLoggingMode::Off,
+            verbose_logging_until_ms: 0,
+            verbose_logging_change: None,
             conn_trace_ndjson: false,
             conn_trace_gui: true,
             // Preserve the historical Rust-side default (`false`) for this
@@ -288,7 +343,7 @@ pub type ServiceStabilityConfigGetResponse = ServiceStabilityConfigDto;
 pub struct ServiceStabilityConfigSetRequest {
     pub config: ServiceStabilityConfigDto,
     /// Free-form writer attribution
-    /// (`"user:enforcement-mode"`, `"user:verbose-toggle"`,
+    /// (`"user:enforcement-mode"`, `"user:verbose-logging"`,
     /// `"offline-pending-apply"`, …), logged by the Set handler. Purely
     /// diagnostic: without it, a stability write of unknown provenance can
     /// clobber a user toggle and the NDJSON has no way to say WHICH GUI code

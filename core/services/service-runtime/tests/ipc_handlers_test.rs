@@ -15,9 +15,8 @@ use nrr_diagnostics::error::DiagnosticsResult;
 use nrr_diagnostics::explain::{ExplainQuery, ExplainResponse};
 use nrr_diagnostics::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
-    LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard,
-    ServiceHealthCard, SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticsDataOrigin, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
+    LogHealthCard, SecurityAlertDto, SecurityStatusCard, ServiceHealthCard,
 };
 use nrr_diagnostics::facade::pagination::{PageResult, PaginationParams};
 use nrr_diagnostics::facade::service::DiagnosticsFacade;
@@ -131,6 +130,39 @@ impl MutationExecutor for FakeExecutor {
     }
 }
 
+/// `FakeExecutor` that also records whose rules each rollback reached.
+#[derive(Default)]
+struct RollbackRecorder {
+    principals: Mutex<Vec<String>>,
+}
+
+impl RollbackRecorder {
+    fn principals(&self) -> Vec<String> {
+        self.principals.lock().unwrap().clone()
+    }
+}
+
+impl MutationExecutor for RollbackRecorder {
+    fn preview(
+        &self,
+        kind: nrr_service_runtime::ipc_handlers::payloads::MutationKind,
+        payload: &serde_json::Value,
+        principal: &str,
+    ) -> nrr_service_runtime::ipc_handlers::payloads::ReviewSummaryResponse {
+        FakeExecutor.preview(kind, payload, principal)
+    }
+    fn execute(&self, payload: StoredMutation, principal: &str) -> MutationOutcome {
+        FakeExecutor.execute(payload, principal)
+    }
+    fn rollback(&self, principal: &str, target: Option<&str>) -> MutationOutcome {
+        self.principals.lock().unwrap().push(principal.to_string());
+        FakeExecutor.rollback(principal, target)
+    }
+    fn safe_disable(&self, reason: &str) -> MutationOutcome {
+        FakeExecutor.safe_disable(reason)
+    }
+}
+
 struct FailingExecutor;
 
 impl MutationExecutor for FailingExecutor {
@@ -195,6 +227,7 @@ impl FakeDiagnostics {
                     audit_chain_ok: true,
                     active_alert_count: 0,
                     audit_write_healthy: true,
+                    alerts_readable: true,
                 },
                 active_alerts: Vec::new(),
                 cache_health: CacheHealthCard {
@@ -209,7 +242,6 @@ impl FakeDiagnostics {
                     dropped_count: 0,
                     last_cleanup_at: None,
                 },
-                diagnostic_mode: DiagnosticModeStateDto::inactive(),
                 stale: false,
                 origin: DiagnosticsDataOrigin::Service,
             }),
@@ -218,7 +250,10 @@ impl FakeDiagnostics {
 }
 
 impl DiagnosticsFacade for FakeDiagnostics {
-    fn get_status(&self) -> DiagnosticsStatusDto {
+    fn get_status(
+        &self,
+        _audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
+    ) -> DiagnosticsStatusDto {
         self.status.lock().unwrap().clone()
     }
     fn list_log_entries(
@@ -237,13 +272,14 @@ impl DiagnosticsFacade for FakeDiagnostics {
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>> {
         Ok(PageResult::single_page(Vec::new()))
     }
-    fn list_active_alerts(&self) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
+    fn list_alerts(
+        &self,
+        _filter: nrr_diagnostics::facade::service::AlertListFilter,
+        _audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
         Ok(Vec::new())
     }
     fn acknowledge_alert(&self, _req: &AcknowledgeAlertRequest) -> DiagnosticsResult<()> {
-        Ok(())
-    }
-    fn set_diagnostic_mode(&self, _req: &SetDiagnosticModeRequest) -> DiagnosticsResult<()> {
         Ok(())
     }
     fn clear_logs(&self, _req: &ClearLogsRequest) -> DiagnosticsResult<ClearLogsResult> {
@@ -325,7 +361,7 @@ fn deps_full(
                     adapter_name: "Wi-Fi".into(),
                     ipv6_if_index: 12,
                     physical_address: None,
-                    windows_name: "Wireless LAN".into(),
+                    name: "Wireless LAN".into(),
                     interface_description: "".into(),
                     interface_type: "ieee80211".into(),
                     oper_status: "up".into(),
@@ -721,7 +757,7 @@ fn production_handlers_register_every_operation_in_catalog() {
     /// them; their fully-wired path is exercised by `cross_cutting_4b4.rs`.
     /// `ExplainGet` stays in `REAL` (depends only on `deps.diagnostics`, always
     /// wired). `LogsClear` is real too (DiagnosticsFacade::clear_logs).
-    const REAL: [IpcOperationName; 34] = [
+    const REAL: [IpcOperationName; 33] = [
         // Always registered: with no inspector wired it reports the
         // attribution-only assets, which is a valid answer, not a degraded one.
         IpcOperationName::ThirdPartyComponentsList,
@@ -758,10 +794,6 @@ fn production_handlers_register_every_operation_in_catalog() {
         IpcOperationName::AutostartGet,
         IpcOperationName::AutostartToggle,
         IpcOperationName::ExplainGet,
-        // DiagnosticModeSet forwards to DiagnosticsFacade::set_diagnostic_mode
-        // (facade always wired in deps_default); a bare `{}` payload is a valid
-        // disable request, so it returns ok.
-        IpcOperationName::DiagnosticModeSet,
         // Log/audit retention config get/set (FakeLogRetention wired in
         // deps_default). Set gets a valid payload + UserScopedConfiguration
         // envelope below.
@@ -786,10 +818,8 @@ fn production_handlers_register_every_operation_in_catalog() {
             IpcOperationName::OperationStatusGet => {
                 (serde_json::json!({ "operation-id": "op-not-found" }), None)
             }
-            IpcOperationName::RollbackRequest => (
-                serde_json::json!({}),
-                Some((IpcOperationClass::RecoveryAction, Some("dummy-token"))),
-            ),
+            // The rollback itself needs a token only its dry-run mints.
+            IpcOperationName::RollbackRequest => (serde_json::json!({ "dry-run": true }), None),
             IpcOperationName::InterfacesRefreshRequest => (
                 serde_json::json!({}),
                 Some((IpcOperationClass::DiagnosticQuery, None)),
@@ -877,7 +907,7 @@ fn production_handlers_register_every_operation_in_catalog() {
         let mut env = read_envelope(op, payload);
         if let Some((class, token)) = envelope_overrides {
             env.operation_class = class;
-            env.confirmation_token = token.map(String::from);
+            env.confirmation_token = token.map(|t: &str| t.to_string());
         }
         let resp = router.dispatch(env, elevated_gui_ctx());
 
@@ -1211,25 +1241,316 @@ fn mutation_failure_surfaces_on_operation_status() {
     assert_eq!(err.code, "mutation.rejected.test");
 }
 
-#[test]
-fn rollback_request_requires_recovery_action_class_and_token() {
-    let router = make_router(deps_with_executor(Arc::new(FakeExecutor)));
-    let env = IpcRequestEnvelope {
+/// An envelope the way our client builds it: class derived from the payload.
+fn envelope_for(
+    op: IpcOperationName,
+    payload: serde_json::Value,
+    token: Option<&str>,
+) -> IpcRequestEnvelope {
+    IpcRequestEnvelope {
         protocol_version: IPC_PROTOCOL_VERSION,
-        request_id: "r-rb".into(),
+        request_id: format!("req-{}", op.slug()),
         correlation_id: None,
-        operation: IpcOperationName::RollbackRequest,
-        operation_class: canonical_operation_class(
+        operation: op,
+        operation_class: canonical_operation_class(op, &payload),
+        confirmation_token: token.map(str::to_string),
+        payload,
+    }
+}
+
+/// An elevated GUI session of the named principal.
+fn elevated_ctx_of(sid: &str) -> IpcRequestContext {
+    IpcRequestContext {
+        caller_principal: nrr_service_runtime::UserPrincipal::from_windows_sid(sid).ok(),
+        ..elevated_gui_ctx()
+    }
+}
+
+/// The confirmation token a dry-run of `op` hands out.
+fn dry_run_token(
+    router: &IpcRouter,
+    op: IpcOperationName,
+    payload: serde_json::Value,
+    ctx: IpcRequestContext,
+) -> String {
+    let resp = router.dispatch(envelope_for(op, payload, None), ctx);
+    assert!(resp.ok, "{op:?} dry-run: {:?}", resp.error);
+    resp.payload.unwrap()["confirmation-token"]
+        .as_str()
+        .expect("dry-run returns a token")
+        .to_string()
+}
+
+fn rollback_dry_run(router: &IpcRouter, ctx: IpcRequestContext) -> String {
+    dry_run_token(
+        router,
+        IpcOperationName::RollbackRequest,
+        serde_json::json!({ "dry-run": true }),
+        ctx,
+    )
+}
+
+fn rollback_with(
+    router: &IpcRouter,
+    token: &str,
+    ctx: IpcRequestContext,
+) -> nrr_service_runtime::IpcResponseEnvelope {
+    router.dispatch(
+        envelope_for(
             IpcOperationName::RollbackRequest,
-            &serde_json::json!({}),
+            serde_json::json!({}),
+            Some(token),
         ),
-        confirmation_token: Some("any-issued-token".into()),
-        payload: serde_json::json!({}),
-    };
-    let resp = router.dispatch(env, elevated_gui_ctx());
+        ctx,
+    )
+}
+
+fn error_code(resp: &nrr_service_runtime::IpcResponseEnvelope) -> IpcErrorCode {
+    resp.error.as_ref().expect("must be refused").code
+}
+
+#[test]
+fn rollback_runs_on_the_token_its_own_dry_run_issued() {
+    let router = make_router(deps_with_executor(Arc::new(FakeExecutor)));
+    let token = rollback_dry_run(&router, elevated_gui_ctx());
+    let resp = rollback_with(&router, &token, elevated_gui_ctx());
     assert!(resp.ok, "rollback should succeed: {:?}", resp.error);
     let parsed: RollbackResponse = serde_json::from_value(resp.payload.unwrap()).unwrap();
     assert!(parsed.operation_id.starts_with("op-"));
+    // One-shot: the same token does not roll back twice.
+    let again = rollback_with(&router, &token, elevated_gui_ctx());
+    assert_eq!(error_code(&again), IpcErrorCode::ConfirmationUnknown);
+}
+
+/// The router only checks that a token is present; the value is what the
+/// handler must hold to account.
+#[test]
+fn rollback_refuses_a_token_nobody_issued() {
+    let router = make_router(deps_with_executor(Arc::new(FakeExecutor)));
+    let resp = rollback_with(&router, "any-issued-token", elevated_gui_ctx());
+    assert_eq!(error_code(&resp), IpcErrorCode::ConfirmationUnknown);
+}
+
+#[test]
+fn rollback_refuses_a_token_issued_to_another_principal() {
+    let router = make_router(deps_with_executor(Arc::new(FakeExecutor)));
+    let token = rollback_dry_run(&router, elevated_ctx_of("S-1-5-21-test-alice"));
+    let resp = rollback_with(&router, &token, elevated_ctx_of("S-1-5-21-test-bob"));
+    assert_eq!(error_code(&resp), IpcErrorCode::ConfirmationUnknown);
+}
+
+#[test]
+fn rollback_refuses_an_expired_token() {
+    let deps = deps_with_executor(Arc::new(FakeExecutor));
+    let tokens = Arc::clone(&deps.mutation_tokens);
+    let router = make_router(deps);
+    let ctx = elevated_gui_ctx();
+    let token = tokens.issue(
+        IpcOperationName::RollbackRequest,
+        StoredMutation::confirmation_of(serde_json::json!({}), ctx.caller_stored(), true),
+        std::time::Instant::now() - std::time::Duration::from_secs(1),
+    );
+    let resp = rollback_with(&router, &token, ctx);
+    assert_eq!(error_code(&resp), IpcErrorCode::ConfirmationExpired);
+}
+
+const BASELINE_DRY_RUN: &str = r#"{ "dry-run": true, "admin-baseline": true }"#;
+const BASELINE_ROLLBACK: &str = r#"{ "admin-baseline": true }"#;
+
+fn json(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap()
+}
+
+fn recording_router() -> (IpcRouter, Arc<RollbackRecorder>) {
+    let recorder = Arc::new(RollbackRecorder::default());
+    let router = make_router(deps_with_executor(recorder.clone()));
+    (router, recorder)
+}
+
+/// The user's own rules roll back the way they are edited: no elevation, so
+/// the launcher never needs the broker for it.
+#[test]
+fn an_unelevated_user_rolls_back_their_own_rules() {
+    let (router, recorder) = recording_router();
+    let token = rollback_dry_run(&router, unprivileged_gui_ctx());
+    let resp = rollback_with(&router, &token, unprivileged_gui_ctx());
+    assert!(
+        resp.ok,
+        "own rollback must not need rights: {:?}",
+        resp.error
+    );
+    assert_eq!(recorder.principals(), ["S-1-5-21-test-unprivileged-gui"]);
+}
+
+#[test]
+fn an_unelevated_user_cannot_roll_back_the_baseline() {
+    let (router, recorder) = recording_router();
+    let token = dry_run_token(
+        &router,
+        IpcOperationName::RollbackRequest,
+        json(BASELINE_DRY_RUN),
+        unprivileged_gui_ctx(),
+    );
+    let resp = router.dispatch(
+        envelope_for(
+            IpcOperationName::RollbackRequest,
+            json(BASELINE_ROLLBACK),
+            Some(&token),
+        ),
+        unprivileged_gui_ctx(),
+    );
+    assert_eq!(error_code(&resp), IpcErrorCode::Forbidden);
+    assert!(recorder.principals().is_empty());
+}
+
+/// The partition follows the derived class: a baseline rollback labelled as
+/// the user's own, or the other way round, is refused at the door.
+#[test]
+fn a_rollback_mislabelling_its_partition_is_refused() {
+    let (router, recorder) = recording_router();
+    for (payload, label) in [
+        (
+            json(BASELINE_ROLLBACK),
+            IpcOperationClass::UserScopedMutation,
+        ),
+        (serde_json::json!({}), IpcOperationClass::MutationRequest),
+    ] {
+        let token = rollback_dry_run(&router, unprivileged_gui_ctx());
+        let mut env = envelope_for(IpcOperationName::RollbackRequest, payload, Some(&token));
+        env.operation_class = label;
+        let resp = router.dispatch(env, unprivileged_gui_ctx());
+        assert_eq!(
+            error_code(&resp),
+            IpcErrorCode::MalformedRequest,
+            "{label:?}"
+        );
+    }
+    assert!(recorder.principals().is_empty());
+}
+
+/// An administrator rolls back either partition, each on its own token.
+#[test]
+fn an_elevated_caller_rolls_back_their_own_rules_and_the_baseline() {
+    let (router, recorder) = recording_router();
+    let own = rollback_dry_run(&router, elevated_gui_ctx());
+    assert!(rollback_with(&router, &own, elevated_gui_ctx()).ok);
+    let base = dry_run_token(
+        &router,
+        IpcOperationName::RollbackRequest,
+        json(BASELINE_DRY_RUN),
+        elevated_gui_ctx(),
+    );
+    let resp = router.dispatch(
+        envelope_for(
+            IpcOperationName::RollbackRequest,
+            json(BASELINE_ROLLBACK),
+            Some(&base),
+        ),
+        elevated_gui_ctx(),
+    );
+    assert!(resp.ok, "baseline rollback: {:?}", resp.error);
+    assert_eq!(
+        recorder.principals(),
+        [
+            "S-1-5-21-test-elevated-gui".to_string(),
+            nrr_storage::BASELINE_PRINCIPAL.to_string()
+        ]
+    );
+}
+
+#[test]
+fn an_unelevated_rollback_refuses_another_users_token() {
+    let (router, recorder) = recording_router();
+    let token = rollback_dry_run(&router, elevated_ctx_of("S-1-5-21-test-alice"));
+    let resp = rollback_with(&router, &token, unprivileged_gui_ctx());
+    assert_eq!(error_code(&resp), IpcErrorCode::ConfirmationUnknown);
+    assert!(recorder.principals().is_empty());
+}
+
+/// Every two-phase operation mints into the same store. A token confirms the
+/// operation that issued it and nothing else, in either direction.
+#[test]
+fn no_operation_accepts_another_operations_token() {
+    let router = make_router(deps_with_executor(Arc::new(FakeExecutor)));
+    let ctx = elevated_gui_ctx;
+    let safe_disable_dry = serde_json::json!({ "reason": "r", "dry-run": true });
+    let safe_disable = serde_json::json!({ "reason": "r", "dry-run": false });
+    let restart_dry = serde_json::json!({
+        "mutation-kind": "audit-chain-restart",
+        "payload": { "breaks-digest": "d" },
+        "dry-run": true,
+    });
+    let restart = serde_json::json!({
+        "mutation-kind": "audit-chain-restart",
+        "payload": { "breaks-digest": "d" },
+        "dry-run": false,
+    });
+
+    // Safe-disable and audit-chain-restart tokens do not roll back.
+    for (op, dry) in [
+        (
+            IpcOperationName::ProductImpactDisableTemporary,
+            &safe_disable_dry,
+        ),
+        (IpcOperationName::MutationSubmit, &restart_dry),
+    ] {
+        let token = dry_run_token(&router, op, dry.clone(), ctx());
+        let resp = rollback_with(&router, &token, ctx());
+        assert_eq!(
+            error_code(&resp),
+            IpcErrorCode::ConfirmationUnknown,
+            "{op:?}"
+        );
+    }
+
+    // A rollback token neither disables protection nor restarts the chain.
+    for (op, confirm) in [
+        (
+            IpcOperationName::ProductImpactDisableTemporary,
+            &safe_disable,
+        ),
+        (IpcOperationName::MutationSubmit, &restart),
+    ] {
+        let token = rollback_dry_run(&router, ctx());
+        let resp = router.dispatch(envelope_for(op, confirm.clone(), Some(&token)), ctx());
+        assert_eq!(
+            error_code(&resp),
+            IpcErrorCode::ConfirmationUnknown,
+            "{op:?}"
+        );
+    }
+
+    // Nor does a safe-disable token restart the chain, or the other way round.
+    let token = dry_run_token(
+        &router,
+        IpcOperationName::ProductImpactDisableTemporary,
+        safe_disable_dry.clone(),
+        ctx(),
+    );
+    let resp = router.dispatch(
+        envelope_for(
+            IpcOperationName::MutationSubmit,
+            restart.clone(),
+            Some(&token),
+        ),
+        ctx(),
+    );
+    assert_eq!(error_code(&resp), IpcErrorCode::ConfirmationUnknown);
+    let token = dry_run_token(
+        &router,
+        IpcOperationName::MutationSubmit,
+        restart_dry,
+        ctx(),
+    );
+    let resp = router.dispatch(
+        envelope_for(
+            IpcOperationName::ProductImpactDisableTemporary,
+            safe_disable,
+            Some(&token),
+        ),
+        ctx(),
+    );
+    assert_eq!(error_code(&resp), IpcErrorCode::ConfirmationUnknown);
 }
 
 // ── Interfaces refresh / deprecation / safe-disable end-to-end ──────────────
@@ -1472,10 +1793,7 @@ fn status_updates_subscribe_replay_window_within_buffer() {
     bus.publish(StatusUpdateEvent::AdaptersChanged {
         data_source: "windows-live".into(),
     }); // 2
-    bus.publish(StatusUpdateEvent::AlertRaised {
-        alert_id: "a-1".into(),
-        kind: "tamper_alert_raised".into(),
-    }); // 3
+    bus.publish(StatusUpdateEvent::SecurityAlertsChanged); // 3
 
     let router = make_router(deps_with_event_bus(bus.clone()));
     let resp: StatusUpdatesSubscribeResponse = serde_json::from_value(

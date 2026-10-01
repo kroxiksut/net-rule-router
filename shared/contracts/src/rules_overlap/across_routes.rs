@@ -10,11 +10,13 @@
 //! under a name rule is a question of resolution, not of the rule book.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::rules_json::{AddressMatchDto, CanonicalRulesJsonV1, RuleAction, RuleDto};
+use super::{ancestors_in, index_by_name};
+use crate::rules_json::{
+    folded_rule_name, AddressMatchDto, CanonicalRulesJsonV1, RuleAction, RuleDto,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -68,8 +70,8 @@ pub fn find_route_overlaps(
     if primary.is_empty() || secondary.is_empty() {
         return Vec::new();
     }
-    let primary_by_name = index_by_name(&primary);
-    let secondary_by_name = index_by_name(&secondary);
+    let primary_by_name = index_by_name(&primary, |r| r.name.as_str());
+    let secondary_by_name = index_by_name(&secondary, |r| r.name.as_str());
 
     // A pair is found from the rule with the longer name, walking up its
     // labels; equal names are taken from the primary side only.
@@ -172,7 +174,8 @@ fn name_rules<'a>(
         .iter()
         .filter(|rule| rule.enabled && rule.app_match.is_none())
         .filter_map(|rule| {
-            let (written_type, value, kind) = match rule.address_match.as_ref()? {
+            let address = rule.address_match.as_ref()?;
+            let (written_type, value, kind) = match address {
                 // Under coverage `x` is enforced as `*.x`; comparing it as one
                 // keeps `x` against `*.x` a duplicate rather than a nesting.
                 AddressMatchDto::ExactFqdn { value } => (
@@ -190,11 +193,7 @@ fn name_rules<'a>(
                 AddressMatchDto::Zone { name } => ("zone", name.as_str(), NameKind::Zone),
                 _ => return None,
             };
-            let name = value
-                .trim()
-                .trim_start_matches("*.")
-                .trim_matches('.')
-                .to_ascii_lowercase();
+            let name = folded_rule_name(address)?;
             (!name.is_empty()).then_some(NameRule {
                 rule,
                 route,
@@ -205,30 +204,6 @@ fn name_rules<'a>(
             })
         })
         .collect()
-}
-
-fn index_by_name<'r, 'a>(rules: &'r [NameRule<'a>]) -> HashMap<&'r str, Vec<&'r NameRule<'a>>> {
-    let mut by_name: HashMap<&str, Vec<&NameRule<'a>>> = HashMap::new();
-    for rule in rules {
-        by_name.entry(rule.name.as_str()).or_default().push(rule);
-    }
-    by_name
-}
-
-/// Rules of the other route named `name` itself or one of its parent domains.
-fn ancestors_in<'r, 'a>(
-    name: &str,
-    by_name: &HashMap<&'r str, Vec<&'r NameRule<'a>>>,
-) -> Vec<&'r NameRule<'a>> {
-    let mut found = Vec::new();
-    let mut current = Some(name);
-    while let Some(candidate) = current {
-        if let Some(rules) = by_name.get(candidate) {
-            found.extend(rules.iter().copied());
-        }
-        current = candidate.split_once('.').map(|(_, parent)| parent);
-    }
-    found
 }
 
 fn push_if_overlapping(narrow: &NameRule<'_>, wide: &NameRule<'_>, found: &mut Vec<RouteOverlap>) {

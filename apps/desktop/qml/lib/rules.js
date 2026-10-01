@@ -16,7 +16,7 @@
 // enabled, comment }.
 
 // The preset format version this build writes. Mirrors
-// `nrr_domain::rules_file::CURRENT_PRESET_FORMAT_VERSION`; the Rust test
+// `nrr_domain::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION`; the Rust test
 // `the_gui_writes_the_current_preset_format_version` reads this line and fails
 // when the two drift.
 var CANONICAL_PRESET_FORMAT_VERSION = 4
@@ -182,7 +182,7 @@ function buildCanonicalRulesText(rulesModel, route, passthroughSections, include
     }
     var nameLabel = (route === "secondary") ? "Secondary Route" : "Primary Route"
     var lines = []
-    // Must match nrr_domain::rules_file::CURRENT_PRESET_FORMAT_VERSION — the
+    // Must match nrr_domain::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION — the
     // file may carry version-4 constructs (`--- Auto`, `+block`), and a header
     // that claims 1 tells the next reader they are not there. Pinned from the
     // Rust side by `the_gui_writes_the_current_preset_format_version`.

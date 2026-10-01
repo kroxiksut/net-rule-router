@@ -64,10 +64,8 @@ impl DiagnosticsAvailability {
     }
 }
 
-/// Runtime health snapshot of the diagnostics subsystem.
-///
-/// Returned by [`DiagnosticsQueryService::startup_health`] and included
-/// in the service health DTO exposed to GUI/tray.
+/// Runtime health snapshot of the diagnostics subsystem, included in the
+/// service health DTO exposed to GUI/tray.
 #[derive(Clone, Debug)]
 pub struct DiagnosticsStartupHealth {
     pub availability: DiagnosticsAvailability,

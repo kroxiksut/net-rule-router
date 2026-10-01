@@ -8,6 +8,27 @@
 #include <unistd.h>
 #endif
 
+// Whether THIS process holds an elevated token (root on POSIX). An elevated
+// process launches children without `runas`; the review flow warns when it is
+// not. Fail-closed: a token that cannot be read counts as not elevated, so the
+// warning shows and the broker handles the click.
+inline bool nrrProcessIsElevated() {
+#ifdef Q_OS_WIN
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) || token == nullptr) {
+        return false;
+    }
+    TOKEN_ELEVATION elevation{};
+    DWORD bytes = 0;
+    const BOOL ok =
+        GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &bytes);
+    CloseHandle(token);
+    return ok != FALSE && elevation.TokenIsElevated != 0;
+#else
+    return ::geteuid() == 0;
+#endif
+}
+
 struct LaunchOptions {
     QString qmlPath;
     QString appIconPath;
@@ -49,16 +70,6 @@ inline QStringList mainGuiExecutableNames() {
 #endif
 }
 
-inline bool isTrayProductExecutable(const QString &applicationFilePath) {
-    const QString baseName = QFileInfo(applicationFilePath).completeBaseName();
-    for (const QString &name : trayExecutableNames()) {
-        if (baseName.compare(QFileInfo(name).completeBaseName(), Qt::CaseInsensitive) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 inline LaunchOptions parseLaunchOptions(const QStringList &arguments) {
     LaunchOptions options;
 
@@ -89,16 +100,8 @@ inline LaunchOptions parseLaunchOptions(const QStringList &arguments) {
     return options;
 }
 
+// The launcher passes every path argument plain; a `file://` URL is not a path.
 inline QString normalizeLocalPath(const QString &rawValue) {
-    if (rawValue.isEmpty()) {
-        return {};
-    }
-
-    const QUrl asUrl(rawValue);
-    if (asUrl.isValid() && asUrl.isLocalFile()) {
-        return asUrl.toLocalFile();
-    }
-
     return QDir::fromNativeSeparators(rawValue);
 }
 
@@ -135,6 +138,98 @@ inline QString findProductExecutable(const QString &applicationDir, const QStrin
 #endif
     return {};
 }
+
+#ifdef Q_OS_WIN
+// A DLL named without a path is looked for in System32 and beside this
+// executable only: the default search also walks the current directory and
+// PATH, which whoever starts the process chooses. The Rust twin is
+// `nrr_platform_windows::dll_search`. Called first in `main`.
+inline bool restrictDllSearch() {
+    DWORD flags = LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR;
+#ifdef NRR_DEV_QT_BIN_DIR
+    flags |= LOAD_LIBRARY_SEARCH_USER_DIRS;
+#endif
+    if (!SetDefaultDllDirectories(flags)) {
+        return false;
+    }
+    // A load asking for the classic order bypasses the list above; this drops
+    // the current directory there.
+    if (!SetDllDirectoryW(L"")) {
+        return false;
+    }
+#ifdef NRR_DEV_QT_BIN_DIR
+    const std::wstring kitBin =
+        QDir::toNativeSeparators(QStringLiteral(NRR_DEV_QT_BIN_DIR)).toStdWString();
+    return AddDllDirectory(kitBin.c_str()) != nullptr;
+#else
+    return true;
+#endif
+}
+#endif
+
+// A shipped Windows host takes Qt plugins and QML modules from the package
+// only. Qt's defaults also follow environment variables, which reach even an
+// elevated host from the user's own registry, and adopt the package's PARENT
+// as the Qt prefix (`..\plugins`, `..\qml`) once `..\lib\Qt6Core.lib` exists.
+// A dev host keeps the defaults: it runs against the Qt kit.
+#if defined(Q_OS_WIN) && !defined(NRR_DEV_REPO_ROOT)
+#define NRR_QT_PINNED_TO_PACKAGE
+
+// Known before QApplication exists, unlike `applicationDirPath()`.
+inline QString executableDirectory() {
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD length =
+            GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            return {};
+        }
+        if (length < buffer.size()) {
+            buffer.resize(length);
+            break;
+        }
+        if (buffer.size() >= 32768) {
+            return {};
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+    return QFileInfo(QString::fromStdWString(buffer)).absolutePath();
+}
+
+// The variables that name a directory or a library Qt loads code from. Those
+// that only pick a plugin by name choose among what the pinned paths hold.
+inline void pinQtPluginPaths(const QString &applicationDir) {
+    for (const char *name : {"QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QML_IMPORT_PATH",
+                             "QML2_IMPORT_PATH", "QML_PLUGIN_PATH", "QT_OPENGL_DLL",
+                             "QT_VULKAN_LIB"}) {
+        qunsetenv(name);
+    }
+    if (!applicationDir.isEmpty()) {
+        QCoreApplication::setLibraryPaths({applicationDir});
+    }
+}
+
+// Keeps the modules compiled into our binaries and the package's own `qml`.
+inline QStringList pinnedQmlImportPaths(const QStringList &current, const QString &applicationDir) {
+    const QString package = QDir::cleanPath(applicationDir);
+    const QString bundled = QDir::cleanPath(QDir(applicationDir).filePath(QStringLiteral("qml")));
+    QStringList pinned;
+    for (const QString &path : current) {
+        const QString clean = QDir::cleanPath(path);
+        const bool compiledIn =
+            path.startsWith(QStringLiteral("qrc:")) || path.startsWith(QLatin1Char(':'));
+        const bool inPackage = clean.compare(package, Qt::CaseInsensitive) == 0
+                               || clean.compare(bundled, Qt::CaseInsensitive) == 0;
+        if (compiledIn || inPackage) {
+            pinned << path;
+        }
+    }
+    if (!pinned.contains(bundled, Qt::CaseInsensitive)) {
+        pinned << bundled;
+    }
+    return pinned;
+}
+#endif
 
 // Startup splash for the main GUI. Loading the QML shell takes long enough
 // (seconds in debug builds) that a user staring at nothing assumes the app
@@ -203,32 +298,26 @@ inline QString systemExplorerPath() {
     return QDir(root).filePath(QStringLiteral("explorer.exe"));
 }
 
-inline QString resolveDefaultQmlRelativePath(const QString &applicationFilePath) {
-    if (isTrayProductExecutable(applicationFilePath)) {
-        return QStringLiteral("apps/desktop/qml/Tray.qml");
-    }
+inline QString resolveDefaultQmlRelativePath() {
     return QStringLiteral("apps/desktop/qml/Main.qml");
 }
 
 inline QString resolveQmlPath(const LaunchOptions &options,
-                       const QString &applicationDir,
-                       const QString &applicationFilePath) {
+                       const QString &applicationDir) {
     const QString explicitPath = normalizeLocalPath(options.qmlPath);
     if (!explicitPath.isEmpty() && QFileInfo::exists(explicitPath)) {
         return explicitPath;
     }
 
-    const QString envVariable = isTrayProductExecutable(applicationFilePath)
-            ? QStringLiteral("NRR_QML_TRAY")
-            : QStringLiteral("NRR_QML_MAIN");
-    const QByteArray envVariableUtf8 = envVariable.toUtf8();
-    const QString envPath =
-        normalizeLocalPath(qEnvironmentVariable(envVariableUtf8.constData()));
+#ifdef NRR_DEV_REPO_ROOT
+    // Dev builds only: in a shipped host the environment must not choose the QML it runs.
+    const QString envPath = normalizeLocalPath(qEnvironmentVariable("NRR_QML_MAIN"));
     if (!envPath.isEmpty() && QFileInfo::exists(envPath)) {
         return envPath;
     }
+#endif
 
-    return findBundledFile(applicationDir, resolveDefaultQmlRelativePath(applicationFilePath));
+    return findBundledFile(applicationDir, resolveDefaultQmlRelativePath());
 }
 
 // Windows takes the multi-size `.ico` the shell also embeds; X11 and the
@@ -302,12 +391,6 @@ inline QString appRuntimeDirectoryPath() {
     return path;
 }
 
-inline QString productLockFilePath(bool trayProductExecutable) {
-    return QDir(appRuntimeDirectoryPath())
-        .filePath(trayProductExecutable ? QStringLiteral("tray-native.lock")
-                                        : QStringLiteral("gui-native.lock"));
-}
-
 inline QString guiActivationRequestFilePath() {
     return QDir(appRuntimeDirectoryPath()).filePath(QStringLiteral("gui-activation.json"));
 }
@@ -373,32 +456,17 @@ inline QString resolveTrayGuiExecutable(const QString &applicationDir) {
     return findProductExecutableNamed(applicationDir, trayExecutableNames());
 }
 
-inline QString resolveLogsDirectory() {
-    // QStandardPaths::AppLocalDataLocation on Windows returns
-    // `<LOCALAPPDATA>/<organization>/<application>`. Both organization and
-    // application are set to "NetRuleRouter", so the path comes out doubled
-    // (`AppData\Local\NetRuleRouter\NetRuleRouter\...`). Bypass that and
-    // build the canonical single-segment path manually so launcher (Rust) and
-    // host (C++) both write to one place: `AppData\Local\NetRuleRouter\logs`.
-    QStringList candidates;
-#ifdef Q_OS_WIN
-    const QString localAppData = qEnvironmentVariable("LOCALAPPDATA");
-    if (!localAppData.isEmpty()) {
-        candidates << QDir::cleanPath(
-            localAppData + QStringLiteral("/NetRuleRouter/logs"));
+// The service log folder as a local path, from the launch context: the
+// launcher resolves it (`ui_surface::logs_folder_url`) and puts it at
+// `about.logsFolderUrl` (main window) or `logsFolderUrl` (tray). Empty when
+// there is no such folder yet, so the host never opens one of its own.
+inline QString logsDirectoryFromContext(const QVariantMap &context) {
+    QString url = context.value(QStringLiteral("logsFolderUrl")).toString();
+    if (url.isEmpty()) {
+        url = context.value(QStringLiteral("about"))
+                  .toMap()
+                  .value(QStringLiteral("logsFolderUrl"))
+                  .toString();
     }
-#endif
-    const QString appLocalData =
-        QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-    if (!appLocalData.isEmpty()) {
-        candidates << QDir::cleanPath(appLocalData + QStringLiteral("/logs"));
-    }
-    candidates << QDir::cleanPath(QDir::tempPath() + QStringLiteral("/NetRuleRouter/logs"));
-
-    for (const QString &candidate : candidates) {
-        if (QDir().mkpath(candidate)) {
-            return candidate;
-        }
-    }
-    return {};
+    return url.isEmpty() ? QString() : QUrl(url).toLocalFile();
 }

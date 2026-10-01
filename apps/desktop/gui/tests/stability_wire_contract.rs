@@ -289,6 +289,287 @@ fn merge_never_downgrades_a_recorded_intent_to_the_wire_default() {
     );
 }
 
+/// A verbose-logging request is one-shot: the service never echoes it, and a
+/// recorded intent for it would re-open an ended window on every reconnect.
+#[test]
+fn a_verbose_logging_request_is_never_echoed_or_replayed() {
+    let mut dto: ServiceStabilityConfigDto =
+        serde_json::from_value(json!({ "ipc-accept-policy": accept_policy_at_defaults() }))
+            .unwrap_or_else(|e| panic!("minimal config: {e}"));
+    dto.verbose_logging_change = Some(nrr_shared::ipc_payloads::VerboseLoggingChange::OneHour);
+    let wire = serde_json::to_value(&dto).unwrap_or_else(|e| panic!("serialise: {e}"));
+    assert_eq!(wire["verbose-logging-change"], json!("one-hour"));
+    assert!(
+        !config_at_wire_defaults().contains_key("verbose-logging-change"),
+        "an answer without a request must not carry the key"
+    );
+
+    let harness = format!(
+        "{source}
+         console.log(JSON.stringify([stabilityIntentIsRecordable(\"verbose-logging-change\"), \
+           stabilityIntentIsRecordable(\"dns-via-secondary\"), \
+           stabilityIntentIsRecordable(\"allow-user-rule-edits\")]));
+",
+        source = qml_pure_js().replace(".pragma library", ""),
+    );
+    let Some(output) = run_node(&harness) else {
+        eprintln!("node not available — skipping the executable replay check");
+        return;
+    };
+    assert_eq!(
+        output.trim(),
+        "[false,true,false]",
+        "only declared config keys may be recorded as intent, and the administrator's rules \
+         lock never is"
+    );
+}
+
+/// Run `body` after the real `lib/pure.js` and parse what it prints as JSON.
+/// `None` when node is not installed.
+fn run_pure(body: &str) -> Option<Value> {
+    let harness = format!(
+        "{source}\n{body}\n",
+        source = qml_pure_js().replace(".pragma library", ""),
+    );
+    let output = run_node(&harness)?;
+    Some(
+        serde_json::from_str(output.trim())
+            .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {output}")),
+    )
+}
+
+/// The service keeps one stability row per machine and refuses an unelevated
+/// change of any field, so no key belongs to one user. A key moved to the
+/// per-user list without the service agreeing would be replayed by every
+/// unelevated GUI and refused every time.
+#[test]
+fn every_stability_key_is_machine_wide_as_the_service_treats_it() {
+    assert!(
+        qml_string_array("STABILITY_PER_USER_KEYS").is_empty(),
+        "service_stability_handlers.rs refuses an unelevated change of every field; declare a \
+         per-user key only together with the service change that makes it one"
+    );
+}
+
+/// No user gesture stands behind a connect-time replay, so no GUI — elevated
+/// or not — pushes a machine-wide value: that raised a UAC prompt at start and
+/// reverted another administrator's change at the next sign-in. It is shown.
+#[test]
+fn no_gui_replays_anything_machine_wide_and_shows_the_difference() {
+    let body = r#"
+        var intent = { "dns-via-secondary": true, "allow-user-rule-edits": true,
+                       "verbose-logging-change": "one-hour", "fake-ip-instant-rst": false,
+                       "dns-fast-answers": true };
+        var live = { "dns-via-secondary": false, "allow-user-rule-edits": false,
+                     "dns-fast-answers": true };
+        var parked = { "fake-ip-instant-rst": false };
+        console.log(JSON.stringify({
+            may: [stabilityIntentMayReplay("dns-via-secondary"),
+                  stabilityIntentMayReplay("allow-user-rule-edits"),
+                  stabilityIntentMayReplay("verbose-logging-change")],
+            divergent: stabilityIntentDivergence(intent, live, parked),
+            carried: stabilityReplayableIntent(intent, false),
+            carriedElevated: stabilityReplayableIntent(intent, true)
+        }));
+    "#;
+    let Some(out) = run_pure(body) else {
+        eprintln!("node not available — skipping the replay classification check");
+        return;
+    };
+    assert_eq!(out["may"], json!([false, false, false]));
+    assert_eq!(
+        out["divergent"],
+        json!({ "dns-via-secondary": { "mine": true, "service": false } }),
+        "a parked key belongs to the pending-changes flow and a matching one is no difference"
+    );
+    assert_eq!(out["carried"], json!({}));
+    assert_eq!(
+        out["carriedElevated"],
+        json!({}),
+        "a save about something else must not carry a machine-wide intent forward"
+    );
+
+    // The elevation state must not reach what decides a write-back at all.
+    let pure = qml_pure_js();
+    assert!(pure.contains("function stabilityIntentMayReplay(key)"));
+    assert!(pure.contains("function stabilityReplayableIntent(intent)"));
+    let controller = repo_file("apps/desktop/qml/flows/ServiceIntentController.qml");
+    assert!(
+        controller
+            .contains("divergence = Pure.stabilityIntentDivergence(intent, payload || {}, parked)"),
+        "the connect-time comparison goes through pure.js"
+    );
+    assert_eq!(
+        controller
+            .matches("root.applyServiceStabilityPatch(")
+            .count(),
+        1,
+        "the controller writes only on the user's click on the divergence line, never on connect"
+    );
+    let main_qml = repo_file("apps/desktop/qml/Main.qml");
+    let carry_call = main_qml
+        .find("Pure.stabilityReplayableIntent(")
+        .expect("the Set call site carries the replayable intent");
+    let carry_args = &main_qml[carry_call..];
+    let carry_args = &carry_args[..carry_args.find("var merged").unwrap_or(carry_args.len())];
+    assert!(
+        !carry_args.contains("_appElevated"),
+        "the carry-forward must not depend on whether the GUI runs elevated: {carry_args}"
+    );
+}
+
+/// The divergence line is where a machine-wide choice gets applied, by the
+/// user's own click: an ordinary user write the launcher may elevate. Keeping
+/// the service value forgets the recorded choice, so the line stays gone.
+#[test]
+fn the_divergence_line_applies_by_click_or_forgets_the_intent() {
+    let body = r#"
+        console.log(JSON.stringify({
+            kept: stabilityIntentWithout({ "dns-via-secondary": true, "fake-ip-enabled": false },
+                                         "dns-via-secondary"),
+            absent: stabilityIntentWithout({ "fake-ip-enabled": false }, "dns-via-secondary")
+        }));
+    "#;
+    if let Some(out) = run_pure(body) {
+        assert_eq!(out["kept"], json!({ "fake-ip-enabled": false }));
+        assert_eq!(
+            out["absent"],
+            Value::Null,
+            "nothing recorded, nothing to write"
+        );
+    } else {
+        eprintln!("node not available — skipping the forget-intent check");
+    }
+
+    let controller = repo_file("apps/desktop/qml/flows/ServiceIntentController.qml");
+    let apply_at = controller
+        .find("function applyMine(key)")
+        .expect("the controller applies a divergent choice");
+    let keep_at = controller
+        .find("function keepServiceValue(key)")
+        .expect("the controller forgets a divergent choice");
+    assert!(apply_at < keep_at);
+    let apply = &controller[apply_at..keep_at];
+    assert!(
+        apply.contains("root.applyServiceStabilityPatch(partial,"),
+        "applying goes through the single stability writer"
+    );
+    assert!(
+        apply.contains("}, \"user:intent-apply\")"),
+        "the click is a user write: a `user:` origin records the intent on success, so the \
+         launcher may ask for administrator approval"
+    );
+    let keep = &controller[keep_at..];
+    let keep = &keep[..keep.find("\n    }").unwrap_or(keep.len())];
+    assert!(keep.contains("Pure.stabilityIntentWithout(_readServiceIntent(), key)"));
+    assert!(keep.contains("root.prefs.serviceIntentJson ="));
+    assert!(keep.contains("_dropDivergence("));
+
+    let note = repo_file("apps/desktop/qml/components/ServiceIntentDivergenceNote.qml");
+    assert!(note.contains("serviceIntentController.applyMine(modelData.key)"));
+    assert!(note.contains("serviceIntentController.keepServiceValue(modelData.key)"));
+    assert_eq!(
+        (
+            note.matches("ThemedButton {").count(),
+            note.matches("Button {").count()
+        ),
+        (2, 2),
+        "the line's two buttons are ThemedButton, never a raw Button"
+    );
+}
+
+/// An intent is what the service CONFIRMED, and for a machine-wide key only
+/// what was carried out elevated: the GUI is, or the value really changed,
+/// which the service accepts from nobody else.
+#[test]
+fn an_intent_is_recorded_only_for_a_confirmed_elevated_write() {
+    let body = r#"
+        var before = { "dns-via-secondary": false, "fake-ip-enabled": false };
+        console.log(JSON.stringify({
+            echo: stabilityIntentAfterWrite({}, { "fake-ip-enabled": false }, before, false),
+            stale: stabilityIntentAfterWrite({ "fake-ip-enabled": true },
+                                             { "fake-ip-enabled": false }, before, false),
+            relayed: stabilityIntentAfterWrite({}, { "dns-via-secondary": true }, before, false),
+            elevated: stabilityIntentAfterWrite({}, { "fake-ip-enabled": false }, before, true),
+            never: stabilityIntentAfterWrite({}, { "allow-user-rule-edits": false,
+                                                   "verbose-logging-change": "one-hour" },
+                                             before, true)
+        }));
+    "#;
+    let Some(out) = run_pure(body) else {
+        eprintln!("node not available — skipping the record-after-write check");
+        return;
+    };
+    assert_eq!(
+        out["echo"],
+        Value::Null,
+        "an unelevated save that changed nothing is no administrator's decision"
+    );
+    assert_eq!(
+        out["stale"],
+        json!({}),
+        "the service now holds the user's latest choice, so the older record goes"
+    );
+    assert_eq!(out["relayed"], json!({ "dns-via-secondary": true }));
+    assert_eq!(out["elevated"], json!({ "fake-ip-enabled": false }));
+    assert_eq!(out["never"], Value::Null);
+}
+
+/// A declined prompt must not be recorded as a decision, or it comes back on
+/// every start.
+#[test]
+fn the_intent_is_recorded_after_the_set_answer() {
+    let main_qml = repo_file("apps/desktop/qml/Main.qml");
+    assert!(
+        !main_qml.contains("_recordServiceIntent("),
+        "nothing may record an intent before the service answered"
+    );
+    let set_call = main_qml
+        .find("rpcServiceStabilityConfigSet(merged,")
+        .expect("the Set call site");
+    let record = main_qml
+        .find("_recordServiceIntentAfterWrite(")
+        .expect("the intent is recorded from the Set answer");
+    assert!(
+        record > set_call,
+        "the intent must be recorded in the Set callback"
+    );
+}
+
+/// A difference the GUI may not write back is worth nothing unseen: every key
+/// a replay can hold back has a line in some settings panel.
+#[test]
+fn every_replayable_key_has_a_divergence_line_in_a_panel() {
+    let mut shown: BTreeSet<String> = BTreeSet::new();
+    for panel in [
+        "apps/desktop/qml/sections/settings/RoutingSettings.qml",
+        "apps/desktop/qml/sections/settings/DiagnosticsLogsSettings.qml",
+    ] {
+        let source = repo_file(panel);
+        for (at, _) in source.match_indices("ServiceIntentDivergenceNote {") {
+            let block = &source[at..];
+            let keys_at = block.find("keys: [").expect("the note names its keys") + "keys: ".len();
+            let end = block[keys_at..].find(']').expect("closed key list") + keys_at + 1;
+            let keys: Vec<String> = serde_json::from_str(&block[keys_at..end])
+                .unwrap_or_else(|e| panic!("{panel}: key list is not a JSON array: {e}"));
+            shown.extend(keys);
+        }
+    }
+    // Reported by the service, never written by it: nothing to diverge.
+    let reported_only = ["verbose-logging-mode", "verbose-logging-until-ms"];
+    let mut replayable: BTreeSet<String> = qml_object("STABILITY_FIELD_DEFAULTS")
+        .keys()
+        .filter(|key| !reported_only.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    replayable.extend(qml_string_array("STABILITY_STRUCTURED_KEYS"));
+    let missing: Vec<&String> = replayable.difference(&shown).collect();
+    assert!(
+        missing.is_empty(),
+        "no settings panel shows a divergence line for {missing:?}"
+    );
+}
+
 /// Feed a program to `node` on stdin. `None` when node is not installed.
 fn run_node(program: &str) -> Option<String> {
     let mut child = Command::new("node")

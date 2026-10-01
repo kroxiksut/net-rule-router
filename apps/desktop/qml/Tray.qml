@@ -71,6 +71,8 @@ SystemTrayIcon {
     // QtObject; the collector timer inside RpcTransport runs regardless.
     property var rpc: RpcTransport {
         bridge: nrrNativeBridge
+        answerDeadlines: (typeof nrrLaunchContext !== "undefined" && nrrLaunchContext)
+            ? (nrrLaunchContext.rpcAnswerDeadlines || null) : null
     }
     // Full reset / close-everything poll.
     property var shutdownPollTimer: null
@@ -405,7 +407,8 @@ SystemTrayIcon {
     /// candidates untouched instead of discarding them.
     property var _autoRulesModePendingIds: []
     property bool _autoRuleFetchInFlight: false
-    /// How many suggestions the service is holding — the menu row's count.
+    /// How many suggestions the main window's list shows by default, as the
+    /// service counts them — the menu row's count.
     property int _autoRulePendingCount: 0
     /// The user asked to see the offer, so the quiet windows that pace an
     /// UNSOLICITED notice do not apply. Only an explicit "never suggest this"
@@ -468,7 +471,7 @@ SystemTrayIcon {
                 return
             }
             var list = payload.candidates || payload["candidates"] || []
-            tray._autoRulePendingCount = list.length
+            tray._autoRulePendingCount = Number(payload["pending-count"] || 0)
             tray._presentAutoRulePrompt(list)
         })
     }
@@ -567,7 +570,9 @@ SystemTrayIcon {
         var appCount = 0
         // Group by site so rows of one site sit together; ties break on the
         // name, so the same set always lists in the same order.
-        var ordered = (candidates || []).slice().sort(function(a, b) {
+        // Only what the inbox lists by default: a row the list hides is not
+        // news, and offering it here made the popup disagree with the count.
+        var ordered = Pure.autoRuleRowsShownByDefault(candidates).sort(function(a, b) {
             var aa = String((a || {}).anchor || "")
             var bb = String((b || {}).anchor || "")
             if (aa === bb) return 0
@@ -714,7 +719,7 @@ SystemTrayIcon {
                 keepsOpen: true
             },
             tertiaryAction: {
-                label: tr("tray.auto-rules.action.details", "Details"),
+                label: tr("action.details", "Details"),
                 actionId: "auto-rules-details",
                 keepsOpen: true
             },
@@ -917,7 +922,7 @@ SystemTrayIcon {
                 actionId: "rules-drift-apply"
             },
             dismissAction: {
-                label: tr("notifications.dismiss", "Dismiss"),
+                label: tr("action.dismiss", "Dismiss"),
                 actionId: "rules-drift-dismiss"
             },
             autoRetireMs: _promptAutoRetireMs
@@ -1428,7 +1433,7 @@ SystemTrayIcon {
         var routeIsDown = (reason === "route-unavailable")
         var primary = _blockNoticeIsSwitchGoverned(reason)
             ? {
-                label: tr("notifications.strict-killswitch.action", "Open settings"),
+                label: tr("action.open-settings", "Open settings"),
                 actionId: "block-notice-open-settings",
                 accent: true
             }
@@ -1575,7 +1580,7 @@ SystemTrayIcon {
             ? _blockNoticeRouteAction()
             : switchGoverned
             ? {
-                label: tr("notifications.strict-killswitch.action", "Open settings"),
+                label: tr("action.open-settings", "Open settings"),
                 actionId: "block-notice-open-settings",
                 accent: true
             }
@@ -1613,8 +1618,8 @@ SystemTrayIcon {
         if (folded && !hideBlockNoticeAddresses) {
             config.dismissAction = {
                 label: detailsOpen
-                    ? tr("settings.routing.show-less", "Hide details")
-                    : tr("settings.routing.show-more", "Show details"),
+                    ? tr("action.hide-details", "Hide details")
+                    : tr("action.show-details", "Show details"),
                 actionId: "block-notice-details",
                 keepsOpen: true
             }
@@ -1782,7 +1787,7 @@ SystemTrayIcon {
                         "A local network was found"),
                     bodyText: body,
                     primaryAction: {
-                        label: tray.tr("notifications.local-networks.action", "Open settings"),
+                        label: tray.tr("action.open-settings", "Open settings"),
                         actionId: "block-notice-open-settings",
                         accent: true
                     },
@@ -2641,6 +2646,8 @@ SystemTrayIcon {
         if (cut <= 0) cut = _menuRowMaxChars
         return [t.substring(0, cut).trim(), _elideForMenu(t.substring(cut).trim())]
     }
+    /// Computed once per status change, so both header rows split the same text.
+    readonly property var _menuHeader: _menuHeaderLines(statusLine)
 
     /// Copy whatever is known, both lines when both are.
     function _takeExternalAddresses() {
@@ -2848,29 +2855,15 @@ SystemTrayIcon {
 
     function loadContext() {
         var args = Qt.application.arguments
-        var url = ""
         for (var i = 0; i < args.length; i += 1) {
-            if (args[i].indexOf("--nrr-context-file=") === 0) {
-                url = args[i].slice("--nrr-context-file=".length)
-            } else if (args[i].indexOf("--nrr-tray-context-file=") === 0) {
-                url = args[i].slice("--nrr-tray-context-file=".length)
-            }
             if (args[i].indexOf("--nrr-auto-close-ms=") === 0) {
                 autoCloseMs = Number(args[i].slice("--nrr-auto-close-ms=".length))
             }
         }
 
-        if (typeof nrrLaunchContext !== "undefined" && nrrLaunchContext) {
-            context = nrrLaunchContext
-        } else {
-            if (url === "" && typeof nrrContextFileUrl !== "undefined" && nrrContextFileUrl) url = nrrContextFileUrl
-            if (url === "") return
-            var xhr = new XMLHttpRequest()
-            xhr.open("GET", url, false)
-            xhr.send()
-            if (!(xhr.status === 0 || xhr.status === 200)) return
-            context = JSON.parse(xhr.responseText)
-        }
+        // The host parses the context file; when it could not, nothing here can.
+        if (typeof nrrLaunchContext === "undefined" || !nrrLaunchContext) return
+        context = nrrLaunchContext
         language = context.language || "en"
         localeCatalog = context.localeCatalog || {}
         statusKey = context.statusKey || ""
@@ -3254,12 +3247,12 @@ SystemTrayIcon {
         onAboutToShow: tray._refreshMenuState()
 
         MenuItem {
-            text: tray._menuHeaderLines(statusLine)[0]
+            text: tray._menuHeader[0]
             enabled: false
         }
         MenuItem {
-            visible: tray._menuHeaderLines(statusLine).length > 1
-            text: visible ? tray._menuHeaderLines(statusLine)[1] : ""
+            visible: tray._menuHeader.length > 1
+            text: visible ? tray._menuHeader[1] : ""
             enabled: false
         }
         // Clicking copies; with nothing known yet the same click goes and finds

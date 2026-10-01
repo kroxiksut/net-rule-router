@@ -156,13 +156,13 @@ mod tests {
             Some("host.tld".into())
         );
         assert_eq!(
-            hostname_from_history_url("dns.google"),
-            Some("dns.google".into())
+            hostname_from_history_url("resolver.example"),
+            Some("resolver.example".into())
         );
         // Trailing dot (FQDN root) stripped.
         assert_eq!(
-            hostname_from_history_url("https://ya.ru./"),
-            Some("ya.ru".into())
+            hostname_from_history_url("https://site.example./"),
+            Some("site.example".into())
         );
     }
 

@@ -90,14 +90,14 @@ impl crate::routing_pause::PauseDispatcher for OrchestratorPauseDispatcher {
         self.orchestrator
             .install_for_sid(sid)
             .map(|_count| ())
-            .map_err(|e| format!("install_for_sid failed: {e:?}"))
+            .map_err(|e| format!("install_for_sid failed: {e}"))
     }
 
     fn remove_for_sid(&self, sid: &str) -> Result<(), String> {
         self.orchestrator
             .remove_for_sid(sid)
             .map(|_count| ())
-            .map_err(|e| format!("remove_for_sid failed: {e:?}"))
+            .map_err(|e| format!("remove_for_sid failed: {e}"))
     }
 }
 
@@ -194,7 +194,7 @@ impl RetentionSettingsWriter for ProductionRetentionSettings {
     }
 }
 
-// ── Log/audit retention config (#20) ─────────────────────────────────────────
+// ── Log/audit retention config ───────────────────────────────────────────────
 
 /// Singleton `log_retention_config` provider + writer. No push event: the GUI
 /// re-fetches on demand (the settings panel loads it on open). Falls back to
@@ -371,7 +371,7 @@ fn parse_apply_failure_policy(
 
 /// Files measured by the storage-usage walk. Each entry is checked for
 /// existence; missing files report `None`. The probe runs synchronously
-/// in the IPC handler thread; spec'd 5-second timeout (`backend_facade_impl::timeout_for`)
+/// in the IPC handler thread; spec'd 5-second timeout (`nrr_ipc_client::ipc_operation_timeout`)
 /// is generous for typical `%ProgramData%` size.
 pub struct ProductionStorageUsage {
     state_db_path: PathBuf,
@@ -510,7 +510,7 @@ impl RoutingPauseWriter for ProductionRoutingPause {
         } else {
             self.coordinator.resume(sid)
         };
-        outcome.map_err(|e| SettingsWriteError::Storage(format!("{e:?}")))?;
+        outcome.map_err(|e| SettingsWriteError::Storage(e.to_string()))?;
         if let Some(bus) = self.event_bus.as_ref() {
             bus.publish_for(
                 sid,
@@ -576,13 +576,7 @@ where
     ) -> AutostartDto {
         use nrr_platform_api::autostart::AutostartCurrentState;
         let (last_known, overridden) = match observed {
-            AutostartCurrentState::Enabled { matches_ours, .. } => {
-                if matches_ours {
-                    ("enabled".to_string(), None)
-                } else {
-                    ("overridden-externally".to_string(), Some(String::new()))
-                }
-            }
+            AutostartCurrentState::Enabled { .. } => ("enabled".to_string(), None),
             AutostartCurrentState::Disabled => ("disabled".to_string(), None),
             AutostartCurrentState::OverriddenExternally { value } => {
                 ("overridden-externally".to_string(), Some(value))
@@ -654,17 +648,11 @@ where
         let observed = self
             .helper
             .get_state(&self.tray_binary_path)
-            .map_err(|e| SettingsWriteError::Storage(format!("autostart probe failed: {e:?}")))?;
+            .map_err(|e| SettingsWriteError::Storage(format!("autostart probe failed: {e}")))?;
         let now = now_secs();
         let last_known = match &observed {
-            nrr_platform_api::autostart::AutostartCurrentState::Enabled {
-                matches_ours, ..
-            } => {
-                if *matches_ours {
-                    Some(AutostartLastKnownState::Enabled)
-                } else {
-                    Some(AutostartLastKnownState::OverriddenExternally)
-                }
+            nrr_platform_api::autostart::AutostartCurrentState::Enabled { .. } => {
+                Some(AutostartLastKnownState::Enabled)
             }
             nrr_platform_api::autostart::AutostartCurrentState::Disabled => {
                 Some(AutostartLastKnownState::Disabled)
@@ -711,9 +699,8 @@ use nrr_storage::service_stability_config::{
 /// storage `IpcAcceptPolicyRecord` enum and the wire-shaped
 /// `IpcAcceptFailurePolicyDto`.
 ///
-/// Setting the config requires admin elevation per
-/// `IpcOperationSpec::requires_service_mutation_privilege` upstream, so
-/// the writer trusts the caller has already been gated.
+/// Setting the config is gated upstream (envelope class), so the writer
+/// trusts the caller has already been admitted.
 pub struct ProductionServiceStability {
     conn: Arc<Mutex<Connection>>,
     /// the shared liveness tracker whose window this
@@ -726,12 +713,10 @@ pub struct ProductionServiceStability {
     /// platform factory isn't wired (the mode still persists; takes effect next
     /// restart).
     resolver_controller: Option<Arc<crate::dns_resolver_service::DnsResolverController>>,
-    /// The boot-time tracing-reload seam. When `Some`,
-    /// a `set()` flips the running process's `EnvFilter` to match the new
-    /// `verbose_logging` value WITHOUT a service restart. `None` in tests /
-    /// on a degraded boot (the value still persists; takes effect next
-    /// restart).
-    verbosity_control: Option<Arc<dyn crate::verbosity_control::VerbosityControl>>,
+    /// The running verbose-logging window. Only the instance given the live
+    /// filter (`with_verbosity_control`) drives and times it; any other
+    /// instance reports timed windows from the stored deadline.
+    verbose: crate::verbose_logging::VerboseLogging,
     /// The fake-IP live-apply seam. When `Some`, a `set()`
     /// reconciles the fake-IP stack to `fake_ip_enabled && mode == Resolver`
     /// WITHOUT a service restart. The hook must be async/best-effort (driver
@@ -774,6 +759,10 @@ pub struct ProductionServiceStability {
     /// `dns_fast_answers_flag`. `None` in tests / unwired boots (the toggle
     /// still persists; takes effect next restart).
     instant_rst_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Receives the stored connection-trace NDJSON switch after every write,
+    /// so the observer starts or stops writing without a restart. `None` in
+    /// tests and unwired boots.
+    conn_trace_ndjson_apply: Option<Arc<dyn Fn(bool) + Send + Sync>>,
 }
 
 /// Argument to the fake-IP live-apply hook (`with_fake_ip_apply`).
@@ -799,13 +788,20 @@ impl ProductionServiceStability {
             conn,
             liveness_tracker: None,
             resolver_controller: None,
-            verbosity_control: None,
+            verbose: crate::verbose_logging::VerboseLogging::resume(None, 0, None),
             fake_ip_apply: None,
             dns_via_secondary_flag: None,
             dns_fast_answers_flag: None,
             udp_relay_apply: None,
             instant_rst_flag: None,
+            conn_trace_ndjson_apply: None,
         }
+    }
+
+    /// Attaches the connection-trace NDJSON live-apply hook. Chain after `new`.
+    pub fn with_conn_trace_ndjson_apply(mut self, apply: Arc<dyn Fn(bool) + Send + Sync>) -> Self {
+        self.conn_trace_ndjson_apply = Some(apply);
+        self
     }
 
     /// Attaches the DNS-over-secondary live gate so a toggle takes effect
@@ -869,14 +865,38 @@ impl ProductionServiceStability {
         self
     }
 
-    /// Attaches the live tracing-verbosity seam so a `verbose_logging`
-    /// change takes effect live (no restart). Chain after `new`.
+    /// Attaches the live tracing filter: a verbose-logging change applies
+    /// without a restart, and a stored window is resumed and ended on time.
+    /// Chain after `new`, once per process.
     pub fn with_verbosity_control(
         mut self,
         control: Arc<dyn crate::verbosity_control::VerbosityControl>,
     ) -> Self {
-        self.verbosity_control = Some(control);
+        let persisted = self
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| nrr_storage::service_stability_config::probe_verbose_until(&conn));
+        self.verbose = crate::verbose_logging::VerboseLogging::resume(
+            persisted,
+            crate::verbose_logging::now_ms(),
+            Some(control),
+        );
         self
+    }
+
+    /// "Until restart" lives only in the process; a timed window is whatever
+    /// the stored deadline says, which keeps every instance on one answer.
+    fn verbose_window(
+        &self,
+        persisted_until_ms: Option<i64>,
+        now_ms: i64,
+    ) -> crate::verbose_logging::VerboseWindow {
+        use crate::verbose_logging::VerboseWindow;
+        match self.verbose.window() {
+            VerboseWindow::UntilRestart => VerboseWindow::UntilRestart,
+            _ => VerboseWindow::resumed(persisted_until_ms, now_ms),
+        }
     }
 
     fn record_to_dto(rec: &IpcAcceptPolicyRecord) -> IpcAcceptFailurePolicyDto {
@@ -928,25 +948,33 @@ impl ServiceStabilityConfigProvider for ProductionServiceStability {
         };
         let repo = ServiceStabilityConfigRepository::new(&conn);
         match repo.get_or_default() {
-            Ok(rec) => ServiceStabilityConfigDto {
-                ipc_accept_policy: Self::record_to_dto(&rec.ipc_accept_policy),
-                verbose_logging: rec.verbose_logging,
-                conn_trace_ndjson: rec.conn_trace_ndjson,
-                conn_trace_gui: rec.conn_trace_gui,
-                rule_scope_service_driven: rec.rule_scope_service_driven,
-                routing_stop_policy: rec.routing_stop_policy.as_slug().to_string(),
-                cache_refresh_interval_secs: rec.cache_refresh_interval_secs,
-                enforcement_mode: rec.enforcement_mode.as_slug().to_string(),
-                secondary_liveness_window_secs: rec.secondary_liveness_window_secs,
-                fake_ip_enabled: rec.fake_ip_enabled,
-                dns_via_secondary: rec.dns_via_secondary,
-                dns_fast_answers: rec.dns_fast_answers,
-                fake_ip_udp_relay: rec.fake_ip_udp_relay,
-                fake_ip_instant_rst: rec.fake_ip_instant_rst,
-                // A Get always answers with an opinion; `None` on the wire is
-                // reserved for "a client is not asking to change this".
-                allow_user_rule_edits: Some(rec.allow_user_rule_edits),
-            },
+            Ok(rec) => {
+                let now_ms = crate::verbose_logging::now_ms();
+                let (verbose_logging_mode, verbose_logging_until_ms) = self
+                    .verbose_window(rec.verbose_until_ms, now_ms)
+                    .reported(now_ms);
+                ServiceStabilityConfigDto {
+                    ipc_accept_policy: Self::record_to_dto(&rec.ipc_accept_policy),
+                    verbose_logging_mode,
+                    verbose_logging_until_ms,
+                    verbose_logging_change: None,
+                    conn_trace_ndjson: rec.conn_trace_ndjson,
+                    conn_trace_gui: rec.conn_trace_gui,
+                    rule_scope_service_driven: rec.rule_scope_service_driven,
+                    routing_stop_policy: rec.routing_stop_policy.as_slug().to_string(),
+                    cache_refresh_interval_secs: rec.cache_refresh_interval_secs,
+                    enforcement_mode: rec.enforcement_mode.as_slug().to_string(),
+                    secondary_liveness_window_secs: rec.secondary_liveness_window_secs,
+                    fake_ip_enabled: rec.fake_ip_enabled,
+                    dns_via_secondary: rec.dns_via_secondary,
+                    dns_fast_answers: rec.dns_fast_answers,
+                    fake_ip_udp_relay: rec.fake_ip_udp_relay,
+                    fake_ip_instant_rst: rec.fake_ip_instant_rst,
+                    // A Get always answers with an opinion; `None` on the wire is
+                    // reserved for "a client is not asking to change this".
+                    allow_user_rule_edits: Some(rec.allow_user_rule_edits),
+                }
+            }
             Err(_) => default,
         }
     }
@@ -977,16 +1005,23 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         // one-line prior→written log makes "did my toggle reach the
         // service?" diagnosable from the NDJSON in one grep instead of only
         // answerable by querying the DB after the fact. Same rationale
-        // covers `verbose_logging` below (target `nrr::stability`).
+        // covers verbose logging below (target `nrr::stability`).
         let prior_record = repo.get_or_default().ok();
         let prior_mode = prior_record
             .as_ref()
             .map(|r| r.enforcement_mode)
             .unwrap_or_default();
-        let prior_verbose = prior_record
-            .as_ref()
-            .map(|r| r.verbose_logging)
-            .unwrap_or(false);
+        let now_ms = crate::verbose_logging::now_ms();
+        let prior_until = prior_record.as_ref().and_then(|r| r.verbose_until_ms);
+        let prior_verbose = self.verbose_window(prior_until, now_ms);
+        let verbose = dto.verbose_logging_change.map_or(prior_verbose, |change| {
+            crate::verbose_logging::VerboseWindow::requested(change, now_ms)
+        });
+        // No request leaves the stored deadline exactly as it is.
+        let verbose_until_ms = match dto.verbose_logging_change {
+            Some(_) => verbose.persisted_until_ms(),
+            None => prior_until,
+        };
         // Same rationale for the two routing-critical toggles: log
         // prior→written for both, always, so the NDJSON can confirm whether
         // a toggle write ever arrived even when the running stack does not
@@ -1023,16 +1058,9 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         let allow_user_rule_edits = dto
             .allow_user_rule_edits
             .unwrap_or(prior_allow_user_rule_edits);
-        // Convert seconds → milliseconds is not needed: schema column
-        // already stores milliseconds for both base+cap; seconds-only
-        // is the docs-side display unit, not the wire/storage unit.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
         repo.set(
             &write,
-            dto.verbose_logging,
+            verbose_until_ms,
             dto.conn_trace_ndjson,
             dto.conn_trace_gui,
             dto.rule_scope_service_driven,
@@ -1079,33 +1107,21 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
             resolver_live = self.resolver_controller.is_some(),
             "service-stability config written (enforcement mode)",
         );
-        // Same write, logged for the verbose-logging field. The EnvFilter is
-        // also reloaded live below when `self.verbosity_control` is wired
-        // (`live_reload = true`), so `changed = true` together with
-        // `live_reload = true` means the running process's log level just
-        // flipped, with no restart required. `live_reload = false` (control
-        // not wired — tests / degraded boot) means the preference persists
-        // and takes effect on the next service start.
+        // Only a request moves the window; a plain save must not restart or
+        // end the one running. `live_reload = false` means no live filter is
+        // attached (tests, a boot without a log writer).
+        if dto.verbose_logging_change.is_some() {
+            self.verbose.set(verbose, now_ms);
+        }
         tracing::info!(
             target: "nrr::stability",
             msg_key = "prod-settings-verbose-logging-written",
-            prior = prior_verbose,
-            written = written.verbose_logging,
-            changed = prior_verbose != written.verbose_logging,
-            live_reload = self.verbosity_control.is_some(),
+            prior = prior_verbose.reported(now_ms).0.as_slug(),
+            written = verbose.reported(now_ms).0.as_slug(),
+            changed = prior_verbose != verbose,
+            live_reload = self.verbose.is_live(),
             "service-stability config written (verbose logging)",
         );
-        // Flip the LIVE tracing filter to match the persisted
-        // value WITHOUT a service restart. Unconditional (not gated on
-        // `changed`) to mirror the resolver-controller call below: applying
-        // the current value is idempotent and keeps this call site simple,
-        // matching the established pattern for the other two live-apply
-        // fields on this struct. Best-effort by construction — see
-        // `TracingVerbosityHandle::set_verbose` doc — logging verbosity is
-        // never allowed to fail a settings write.
-        if let Some(control) = &self.verbosity_control {
-            control.set_verbose(written.verbose_logging);
-        }
         // start/stop the local DNS resolver to
         // match the persisted enforcement mode WITHOUT a service restart. The
         // controller is idempotent: a redundant Save with the same mode is a
@@ -1252,9 +1268,17 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        if let Some(apply) = &self.conn_trace_ndjson_apply {
+            apply(written.conn_trace_ndjson);
+        }
+        let (verbose_logging_mode, verbose_logging_until_ms) = self
+            .verbose_window(written.verbose_until_ms, now_ms)
+            .reported(now_ms);
         Ok(ServiceStabilityConfigDto {
             ipc_accept_policy: Self::record_to_dto(&written.ipc_accept_policy),
-            verbose_logging: written.verbose_logging,
+            verbose_logging_mode,
+            verbose_logging_until_ms,
+            verbose_logging_change: None,
             conn_trace_ndjson: written.conn_trace_ndjson,
             conn_trace_gui: written.conn_trace_gui,
             rule_scope_service_driven: written.rule_scope_service_driven,
@@ -1274,7 +1298,6 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 //
-// Regression coverage for the "verbose service logging" toggle chain:
 // `ServiceStabilityConfigSet` has no sparse-update wire shape (every Set
 // replaces the full row), so two panels each doing their own stale Get→Set
 // can clobber each other's field. The QML-side fix serialises every patch

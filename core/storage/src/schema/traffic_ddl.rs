@@ -1,4 +1,4 @@
-// ── SQL DDL — nrr_traffic_stats.db (Block T — traffic counter) ────────────────
+// ── SQL DDL — nrr_traffic_stats.db (traffic counter) ────────────────
 
 /// Per-day, per-adapter, per-**role** byte totals. `day` is an opaque epoch-day
 /// key computed by the caller in local time; `role` is a `TrafficCategory` slug
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS traffic_metadata (
     last_rebuild_at INTEGER
 )";
 
-/// Block T Feature 2 — last observed local + external address per adapter,
+/// Last observed local + external address per adapter,
 /// recorded only from a USER-REQUESTED external-IP probe
 /// (`interfaces.refresh`), never from the routine sampler tick. `adapter_key`
 /// is the OS friendly interface name (`GetIfTable2 Alias`), matching

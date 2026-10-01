@@ -19,8 +19,6 @@ pub const DEFAULT_LOG_MAX_AGE_DAYS: u32 = 90;
 pub const DEFAULT_LOG_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
 /// Default max number of log files (0 = unlimited by count).
 pub const DEFAULT_LOG_MAX_FILES: u32 = 0;
-/// Default max duration for explicit diagnostic mode (hours).
-pub const DEFAULT_DIAGNOSTIC_MODE_MAX_HOURS: u32 = 4;
 
 /// Default max age for audit NDJSON trail (365 days).
 pub const DEFAULT_AUDIT_MAX_AGE_DAYS: u32 = 365;
@@ -52,8 +50,6 @@ pub struct LogRetentionPolicy {
     pub max_total_size_bytes: u64,
     /// Keep at most this many log files total. `0` = no limit.
     pub max_files: u32,
-    /// Maximum duration (hours) for explicit diagnostic mode before auto-expiry.
-    pub diagnostic_mode_max_hours: u32,
 }
 
 impl Default for LogRetentionPolicy {
@@ -62,7 +58,6 @@ impl Default for LogRetentionPolicy {
             max_age_days: DEFAULT_LOG_MAX_AGE_DAYS,
             max_total_size_bytes: DEFAULT_LOG_MAX_SIZE_BYTES,
             max_files: DEFAULT_LOG_MAX_FILES,
-            diagnostic_mode_max_hours: DEFAULT_DIAGNOSTIC_MODE_MAX_HOURS,
         }
     }
 }
@@ -161,10 +156,6 @@ mod tests {
         assert_eq!(p.max_age_days, DEFAULT_LOG_MAX_AGE_DAYS);
         assert_eq!(p.max_total_size_bytes, DEFAULT_LOG_MAX_SIZE_BYTES);
         assert_eq!(p.max_files, DEFAULT_LOG_MAX_FILES);
-        assert_eq!(
-            p.diagnostic_mode_max_hours,
-            DEFAULT_DIAGNOSTIC_MODE_MAX_HOURS
-        );
         assert!(p.is_valid());
     }
 

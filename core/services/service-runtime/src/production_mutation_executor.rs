@@ -54,6 +54,9 @@ use crate::ipc_handlers::providers::{
     rule_edits_allowed_for, MutationExecutor, MutationOutcome, RoutePolicyApplyTrigger,
     ServiceStabilityConfigProvider, RULES_LOCKED_ERROR_CODE, RULES_LOCKED_MESSAGE,
 };
+use crate::tamper_bootstrap::{
+    mutation_refused_by_alert, SECURITY_ALERT_GATE_CODE, SECURITY_ALERT_GATE_MESSAGE,
+};
 use nrr_diagnostics::audit::alert::{SecurityAlertState, SecurityAlertsRepository};
 use nrr_domain::canonical::{CanonicalProfile, CanonicalRuleBook, CanonicalRuleSet};
 use nrr_domain::preset_canonicalize::{canonicalize_preset_rules, PresetRulesCanonicalizeOutcome};
@@ -61,6 +64,7 @@ use nrr_domain::preset_validation::{
     validate_preset_bytes, PresetFileValidationOutcome, PresetImportRejectedReason,
 };
 use nrr_domain::revision::RevisionId;
+use nrr_domain::rule_value_validation::RefusedRuleValue;
 use nrr_domain::rules_file::HostPlatform;
 use nrr_domain::rules_json_codec;
 use nrr_domain::rules_revision::{RevisionStatus, RulesRevisionContent, RulesRevisionSource};
@@ -96,9 +100,9 @@ pub struct ProductionMutationExecutor {
     /// safe-disable returns `audit-unavailable`. Wired by
     /// `runtime_deps.rs` once the production audit writer is present.
     recovery_audit_sink: Option<Arc<dyn RecoveryAuditSink>>,
-    /// Security alerts repository for ack/resolve
-    /// mutations. When `None`, the corresponding `MutationKind`
-    /// variants return `alerts-store-unavailable`.
+    /// Security alerts: read by the tamper gate, written by ack/resolve.
+    /// `None` leaves the gate open and makes ack/resolve answer
+    /// `alerts-store-unavailable`.
     alerts_repo: Option<Arc<dyn SecurityAlertsRepository>>,
     /// State DB connection used by the real
     /// risk-scoring path to load the previous active revision via
@@ -136,6 +140,9 @@ pub struct ProductionMutationExecutor {
     /// Whose application section incoming rules belong to, which decides how
     /// their names are spelled: always the host outside tests.
     host_platform: HostPlatform,
+    /// The audit trail an administrator's chain restart is written to. `None`
+    /// refuses the restart as `audit-unavailable`.
+    audit_writer: Option<Arc<nrr_diagnostics::AuditWriter>>,
 }
 
 impl ProductionMutationExecutor {
@@ -150,7 +157,14 @@ impl ProductionMutationExecutor {
             apply_trigger: None,
             pause_coordinator: None,
             stability: None,
+            audit_writer: None,
         }
+    }
+
+    /// Attach the audit trail so an administrator can restart its chain.
+    pub fn with_audit_writer(mut self, writer: Arc<nrr_diagnostics::AuditWriter>) -> Self {
+        self.audit_writer = Some(writer);
+        self
     }
 
     /// Attach the reader for the machine-wide administrative rules lock, so a
@@ -226,9 +240,8 @@ impl ProductionMutationExecutor {
         self
     }
 
-    /// Attaches the security alerts repository so
-    /// `SecurityAlertAck` and `SecurityAlertResolve` mutations can run.
-    /// Without it, the corresponding kinds return `alerts-store-unavailable`.
+    /// Attaches the security alerts repository: arms the tamper gate and lets
+    /// `SecurityAlertAck` / `SecurityAlertResolve` run.
     pub fn with_alerts_repo(mut self, repo: Arc<dyn SecurityAlertsRepository>) -> Self {
         self.alerts_repo = Some(repo);
         self
@@ -243,41 +256,95 @@ impl ProductionMutationExecutor {
         })
     }
 
-    /// The gates `submit_candidate` enforces (rule shape, control characters),
-    /// run early so a preview refuses the same rules the execute would.
-    fn enforce_submission_gates(rules_json: &str) -> Result<(), OperationError> {
+    /// The gates `submit_candidate` enforces (rule shape, control characters,
+    /// rule values), run early so a preview refuses the same rules the execute
+    /// would. `Some` is the summary the preview answers with.
+    fn submission_gate_refusal(
+        &self,
+        rules_json: &str,
+        principal: &str,
+    ) -> Option<ReviewSummaryResponse> {
+        let carried = self.coordinator.rules_json_in_force_for(principal);
         if let Some((rule_id, reason)) =
-            crate::activation_coordinator::unsupported_rule_shape(rules_json)
+            crate::activation_coordinator::unsupported_rule_shape(rules_json, carried.as_deref())
         {
-            return Err(unsupported_rule_shape_error(&rule_id, reason));
+            return Some(refused_summary(&unsupported_rule_shape_error(
+                &rule_id, reason,
+            )));
         }
-        match crate::activation_coordinator::control_character_in_rules(rules_json) {
-            Some(hit) => Err(control_character_error(&hit.rule_id, hit.field)),
-            None => Ok(()),
+        if let Some(hit) = crate::activation_coordinator::control_character_in_rules(rules_json) {
+            return Some(refused_summary(&control_character_error(
+                &hit.rule_id,
+                hit.field,
+            )));
         }
+        let refused = crate::activation_coordinator::rules_with_refused_values(
+            rules_json,
+            carried.as_deref(),
+        );
+        (!refused.is_empty()).then(|| invalid_rule_value_summary(&refused))
     }
 
-    /// Defense-in-depth Free-tier rule cap. The GUI already refuses to add past
-    /// `freeRulesMaxCount`, but a hand-edited preset file or a crafted IPC
-    /// payload could carry more; the service rejects those authoritatively here.
-    /// Uses `nrr_shared::rules_json` — the SAME canonical decoder the apply layer
-    /// uses — so the cap can't be dodged by malforming the payload (a string the
-    /// apply layer accepts is counted identically). Guards both `RulesUpdate` and
-    /// `PresetImport` before the candidate reaches the coordinator.
-    fn enforce_free_rule_cap(rules_json: &str) -> Result<(), OperationError> {
-        if nrr_shared::rules_json::exceeds_free_rule_cap(rules_json) {
-            // Report the number the cap actually counts, or the message names a
-            // total the user cannot reconcile with the limit they hit.
-            let count = nrr_shared::rules_json::user_rule_count(rules_json);
-            return Err(OperationError {
-                code: "rule-cap-exceeded".into(),
-                message: format!(
-                    "Up to {} active rules are allowed; this revision has {count}.",
-                    nrr_shared::rules_json::FREE_MAX_RULES
-                ),
-            });
+    /// Defense-in-depth rule caps on every write: the user's own rules up to
+    /// the Free cap, app-authored ones up to their allowance against the book
+    /// in force for `principal` — a crafted payload marking rules `auto` must
+    /// not escape both, and a book saved before the budget must stay editable.
+    /// Counted with the domain's one cap function over the SAME decoder the
+    /// apply layer uses; a string that does not decode is refused downstream,
+    /// never applied. Write path only: the activation integrity gate keeps its
+    /// own check so a stored revision is never refused after the fact.
+    fn enforce_free_rule_cap(
+        &self,
+        rules_json: &str,
+        principal: &str,
+    ) -> Result<(), OperationError> {
+        let Ok(dto) = nrr_shared::rules_json::from_canonical_string(rules_json) else {
+            return Ok(());
+        };
+        let flags = || {
+            dto.primary
+                .iter()
+                .chain(dto.secondary.iter())
+                .map(|rule| rule.origin.is_none())
+        };
+        let incoming_auto = flags().filter(|own| !own).count();
+        // Only a write that carries more than the budget pays for reading the
+        // book it replaces.
+        let auto_limit = if incoming_auto > nrr_domain::auto_rule_budget::MAX_AUTO_RULES {
+            let carried = self
+                .coordinator
+                .rules_json_in_force_for(principal)
+                .and_then(|json| nrr_shared::rules_json::from_canonical_string(&json).ok())
+                .map_or(0, |book| {
+                    book.primary
+                        .iter()
+                        .chain(book.secondary.iter())
+                        .filter(|rule| rule.origin.is_some())
+                        .count()
+                });
+            nrr_domain::auto_rule_budget::auto_rule_allowance(carried)
+        } else {
+            nrr_domain::auto_rule_budget::MAX_AUTO_RULES
+        };
+        match nrr_domain::validation::rule_cap_excess(flags(), Some(auto_limit)) {
+            None => Ok(()),
+            Some(nrr_domain::validation::RuleCapExcess::User { count, limit }) => {
+                Err(OperationError {
+                    code: "rule-cap-exceeded".into(),
+                    message: format!(
+                        "Up to {limit} active rules are allowed; this revision has {count}."
+                    ),
+                })
+            }
+            Some(nrr_domain::validation::RuleCapExcess::Auto { count, limit }) => {
+                Err(OperationError {
+                    code: "auto-rule-cap-exceeded".into(),
+                    message: format!(
+                        "Up to {limit} app-added rules are allowed; this revision has {count}."
+                    ),
+                })
+            }
         }
-        Ok(())
     }
 
     /// Re-spell the incoming rule book the one canonical way, and re-hash it.
@@ -345,15 +412,16 @@ impl ProductionMutationExecutor {
     ) -> ReviewSummaryResponse {
         let mut parsed = match Self::parse_rules_payload(payload) {
             Ok(p) => p,
-            Err(e) => return malformed_summary(&e.message),
+            Err(e) => return refused_summary(&e),
         };
         // Same spelling the execute path will store, so the preview scores and
         // dedupes against exactly what would be applied.
         Self::canonicalize_rules_payload(&mut parsed, self.host_platform);
-        if let Err(e) = Self::enforce_free_rule_cap(&parsed.rules_json)
-            .and_then(|()| Self::enforce_submission_gates(&parsed.rules_json))
-        {
-            return malformed_summary(&e.message);
+        if let Err(e) = self.enforce_free_rule_cap(&parsed.rules_json, principal) {
+            return refused_summary(&e);
+        }
+        if let Some(refusal) = self.submission_gate_refusal(&parsed.rules_json, principal) {
+            return refusal;
         }
         // The score is reflected back into the wire `ReviewSummaryResponse`.
         let scored = self.score_candidate_for_payload(&parsed.rules_json, principal);
@@ -424,9 +492,64 @@ impl ProductionMutationExecutor {
         })
     }
 
+    /// The administrative rules lock and the tamper gate, enforced where every
+    /// writer lands. The IPC handler refuses the same submissions earlier with
+    /// a typed wire code; the rule author reaches this executor without any
+    /// handler, so this is the gate that holds for it.
+    fn gate_refusal(&self, stored: &StoredMutation, principal: &str) -> Option<OperationError> {
+        if stored.kind.changes_rules()
+            && !rule_edits_allowed_for(self.stability.as_ref(), stored.caller_is_elevated)
+        {
+            tracing::warn!(
+                target: "nrr::mutation::execute",
+                msg_key = "prod-mutation-locked",
+                kind = ?stored.kind,
+                principal = %principal,
+                "mutation refused — rule changes are locked by the administrator",
+            );
+            return Some(OperationError {
+                code: RULES_LOCKED_ERROR_CODE.into(),
+                message: RULES_LOCKED_MESSAGE.into(),
+            });
+        }
+        let repo = self.alerts_repo.as_ref()?;
+        if !mutation_refused_by_alert(stored.kind, repo.as_ref()) {
+            return None;
+        }
+        tracing::warn!(
+            target: "nrr::mutation::execute",
+            msg_key = "prod-mutation-security-alert-active",
+            kind = ?stored.kind,
+            principal = %principal,
+            "mutation refused — a security alert must be acknowledged first",
+        );
+        Some(OperationError {
+            code: SECURITY_ALERT_GATE_CODE.into(),
+            message: SECURITY_ALERT_GATE_MESSAGE.into(),
+        })
+    }
+
     // Split across files, same inherent impl: alerts in `::alerts`, preset
     // import in `::preset_import`, driving a revision to active in
     // `::activation_drive`.
+}
+
+/// Who a mutation's progress is news for: the owner of the rules it changes.
+/// The baseline, which every un-diverged user runs, and the machine-wide kinds
+/// (alerts, the audit chain) reach every session.
+fn progress_addressee(kind: MutationKind, principal: &str) -> Option<String> {
+    (kind.changes_rules() && principal != nrr_storage::BASELINE_PRINCIPAL)
+        .then(|| principal.to_string())
+}
+
+/// The channel a rules change arrives through, named as the revision it
+/// writes will record it. `None` for kinds with no channel to name.
+fn review_provenance(kind: MutationKind) -> Option<&'static str> {
+    match kind {
+        MutationKind::RulesUpdate => Some(RulesRevisionSource::GuiRulesEdit.as_slug()),
+        MutationKind::PresetImport => Some(RulesRevisionSource::PresetImport.as_slug()),
+        _ => None,
+    }
 }
 
 /// Map `MutationKind` to its kebab-case wire slug. Mirrors the
@@ -443,6 +566,7 @@ fn mutation_kind_slug(kind: MutationKind) -> &'static str {
         MutationKind::SecurityAlertAck => "security-alert-ack",
         MutationKind::SecurityAlertResolve => "security-alert-resolve",
         MutationKind::RulesResetToBaseline => "rules-reset-to-baseline",
+        MutationKind::AuditChainRestart => "audit-chain-restart",
     }
 }
 
@@ -472,7 +596,7 @@ impl MutationExecutor for ProductionMutationExecutor {
                 .unwrap_or(""),
             "mutation preview requested",
         );
-        match kind {
+        let mut summary = match kind {
             MutationKind::RulesUpdate => self.preview_rules_update(payload, principal),
             // RouteBindingsUpdate goes through the dedicated
             // `RoutePolicyUpdate` IPC op — not routed via
@@ -491,6 +615,34 @@ impl MutationExecutor for ProductionMutationExecutor {
             MutationKind::SecurityAlertResolve => {
                 self.alert_review_summary(payload, SecurityAlertState::Resolved)
             }
+            MutationKind::AuditChainRestart => self.audit_chain_restart_summary(),
+        };
+        if let Some(provenance) = review_provenance(kind) {
+            summary.provenance = provenance.to_string();
+        }
+        summary
+    }
+
+    fn unverified_rows(
+        &self,
+        kind: MutationKind,
+        payload: &serde_json::Value,
+    ) -> Vec<nrr_shared::ipc_payloads::UnverifiedRowDto> {
+        match kind {
+            MutationKind::SecurityAlertAck | MutationKind::SecurityAlertResolve => {
+                self.alert_unverified_rows(payload)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn audit_chain_preview(
+        &self,
+        kind: MutationKind,
+    ) -> Option<nrr_shared::ipc_payloads::AuditChainRestartPreviewDto> {
+        match kind {
+            MutationKind::AuditChainRestart => self.audit_chain_restart_preview(),
+            _ => None,
         }
     }
 
@@ -509,28 +661,10 @@ impl MutationExecutor for ProductionMutationExecutor {
         // flight. Suppressed when correlation_id is None (older
         // clients / non-progress-aware payloads) or when no event
         // bus is wired.
-        self.emit_progress(&stored, "started", None);
+        self.emit_progress(&stored, principal, "started", None);
 
-        // Administrative rules lock, enforced at the point of application.
-        // The IPC handler refuses the same submission earlier with a typed
-        // wire code; this is the backstop for every other way into the
-        // executor (the companion-domain rule author) and the reason a
-        // hand-built client gains nothing by skipping the handler.
-        if stored.kind.changes_rules()
-            && !rule_edits_allowed_for(self.stability.as_ref(), stored.caller_is_elevated)
-        {
-            let error = OperationError {
-                code: RULES_LOCKED_ERROR_CODE.into(),
-                message: RULES_LOCKED_MESSAGE.into(),
-            };
-            tracing::warn!(
-                target: "nrr::mutation::execute",
-                msg_key = "prod-mutation-locked",
-                kind = ?stored.kind,
-                principal = %principal,
-                "mutation refused — rule changes are locked by the administrator",
-            );
-            self.emit_progress(&stored, "failed", Some(error.code.clone()));
+        if let Some(error) = self.gate_refusal(&stored, principal) {
+            self.emit_progress(&stored, principal, "failed", Some(error.code.clone()));
             return MutationOutcome::Failed(error);
         }
 
@@ -555,11 +689,18 @@ impl MutationExecutor for ProductionMutationExecutor {
                     ),
                 })
             }
-            MutationKind::SecurityAlertAck => {
-                self.execute_alert_state_change(&stored.payload, SecurityAlertState::Acknowledged)
-            }
-            MutationKind::SecurityAlertResolve => {
-                self.execute_alert_state_change(&stored.payload, SecurityAlertState::Resolved)
+            MutationKind::SecurityAlertAck => self.execute_alert_state_change(
+                &stored.payload,
+                SecurityAlertState::Acknowledged,
+                principal,
+            ),
+            MutationKind::SecurityAlertResolve => self.execute_alert_state_change(
+                &stored.payload,
+                SecurityAlertState::Resolved,
+                principal,
+            ),
+            MutationKind::AuditChainRestart => {
+                self.execute_audit_chain_restart(&stored.payload, principal)
             }
         };
 
@@ -575,7 +716,7 @@ impl MutationExecutor for ProductionMutationExecutor {
                     correlation_id = stored.correlation_id.as_deref().unwrap_or(""),
                     "mutation execute completed",
                 );
-                self.emit_progress(&stored, "completed", None);
+                self.emit_progress(&stored, principal, "completed", None);
             }
             MutationOutcome::Failed(err) => {
                 tracing::warn!(
@@ -587,7 +728,7 @@ impl MutationExecutor for ProductionMutationExecutor {
                     error_message = %err.message,
                     "mutation execute failed",
                 );
-                self.emit_progress(&stored, "failed", Some(err.code.clone()));
+                self.emit_progress(&stored, principal, "failed", Some(err.code.clone()));
             }
         }
         outcome
@@ -674,7 +815,7 @@ impl MutationExecutor for ProductionMutationExecutor {
                     })),
                     Err(e) => MutationOutcome::Failed(OperationError {
                         code: "safe-disable-teardown-failed".into(),
-                        message: format!("enforcement teardown failed after audit: {e:?}"),
+                        message: format!("enforcement teardown failed after audit: {e}"),
                     }),
                 }
             }
@@ -768,6 +909,16 @@ fn cross_set_duplicates_of(rules_json: &str, platform: HostPlatform) -> Vec<Cros
         .collect()
 }
 
+/// A preview the execute would refuse with `err`, marked so a client cannot
+/// read its empty diff as "nothing changes".
+fn refused_summary(err: &OperationError) -> ReviewSummaryResponse {
+    let mut summary = malformed_summary(&err.message);
+    summary.risk_signals.push(RiskSignalDto::ChangeRefused {
+        code: err.code.clone(),
+    });
+    summary
+}
+
 fn malformed_summary(message: &str) -> ReviewSummaryResponse {
     ReviewSummaryResponse {
         diff_summary: format!("malformed payload: {message}"),
@@ -819,27 +970,6 @@ fn preset_submission_from(
             .unwrap_or_else(|| fallback_correlation.to_string()),
         risk_level: None,
         review_summary_json: None,
-    }
-}
-
-/// Build a `ReviewSummaryResponse` describing a preset-import failure
-/// without touching the coordinator (the input never reached
-/// `submit_candidate`). Risk-level is Low because the candidate hash
-/// is unknown — the structural error is the actionable signal.
-fn preset_failure_summary(err: &OperationError) -> ReviewSummaryResponse {
-    ReviewSummaryResponse {
-        diff_summary: format!("{}: {}", err.code, err.message),
-        provenance: "service".into(),
-        risk_level: ReviewRiskLevel::Low,
-        requires_review: true,
-        changed_fields: vec![format!("error-code:{}", err.code)],
-        risk_signals: Vec::new(),
-        rules_added: Vec::new(),
-        rules_removed: Vec::new(),
-        rules_modified: Vec::new(),
-        rules_retargeted: Vec::new(),
-        extended_sections: Vec::new(),
-        cross_set_duplicates: Vec::new(),
     }
 }
 
@@ -915,6 +1045,18 @@ fn canonicalize_route_bytes(
     }
     let canonicalized =
         canonicalize_preset_rules(&parse_outcome, route, platform, include_child_processes);
+    let dropped = canonicalized
+        .warnings()
+        .iter()
+        .filter(|w| {
+            matches!(
+                w,
+                nrr_domain::validation::ValidationWarning::RuleOnNoDestinationDropped { .. }
+                    | nrr_domain::validation::ValidationWarning::AppPatternRefusedDropped { .. }
+            )
+        })
+        .count();
+    crate::production_rules_provider::report_dropped_rules(dropped, "preset-import");
     // "Import only active": drop rules disabled in the source preset
     // (commented recognizable lines — e.g. application rules left off pending
     // per-process routing) so they don't enter the revision at all. Filtering
@@ -1044,7 +1186,10 @@ fn load_active_book_or_empty(
         Ok(Some(r)) => r,
         _ => return CanonicalRuleBook::default(),
     };
-    let dto = match rules_json::from_canonical_string(&record.rules_json) {
+    let dto = match crate::production_rules_provider::read_stored_rules(
+        &record.rules_json,
+        &record.revision_id,
+    ) {
         Ok(d) => d,
         Err(_) => return CanonicalRuleBook::default(),
     };
@@ -1130,7 +1275,12 @@ fn load_active_rule_book(
     let guard = conn.lock().ok()?;
     let repo = nrr_storage::revisions::RevisionsRepository::new(&guard);
     let record = repo.get_active_for(principal).ok()??;
-    decode_rule_book(&record.rules_json, platform)
+    let dto = crate::production_rules_provider::read_stored_rules(
+        &record.rules_json,
+        &record.revision_id,
+    )
+    .ok()?;
+    Some(rules_json_codec::decode(dto, platform).ok()?.rule_book)
 }
 
 /// Wrap a rule book into the [`CanonicalProfile`] the risk scorer compares.
@@ -1272,15 +1422,12 @@ fn pre_flight_signals(warnings: &[PreFlightWarning]) -> Vec<RiskSignalDto> {
     let (mut adapter_missing, mut refused) = (false, false);
     for w in warnings {
         match w.category {
+            category if category.blocks_activation() => refused = true,
             PreFlightCategory::AppRuleUnenforceable => {
                 executables.extend(w.subjects.iter().cloned());
             }
             PreFlightCategory::BindingUnresolved => adapter_missing = true,
-            PreFlightCategory::SidLeftRegistry
-            | PreFlightCategory::FilterIdCollision
-            | PreFlightCategory::BatchOverflow
-            | PreFlightCategory::RoutingConflict
-            | PreFlightCategory::InvalidRulesContent => refused = true,
+            _ => {}
         }
     }
     executables.sort_unstable();
@@ -1372,7 +1519,7 @@ fn unsupported_rule_shape_error(
     OperationError {
         code: "unsupported-rule-shape".into(),
         message: format!(
-            "rule {rule_id} names both an application and an address ({reason});              enforcement cannot limit that address to the application, so the change was refused"
+            "rule {rule_id} names both an application and an address ({reason}); enforcement cannot limit that address to the application, so the change was refused"
         ),
     }
 }
@@ -1388,6 +1535,44 @@ fn control_character_error(rule_id: &str, field: &str) -> OperationError {
             "rule {rule_id:?}: {field} contains a line break or other control character"
         ),
     }
+}
+
+/// Rows whose value the rules table marks as an error, named by id. The values
+/// reach the GUI only through the preview: a mutation's outcome code is
+/// announced to every session.
+fn invalid_rule_value_error(rules: &[RefusedRuleValue]) -> OperationError {
+    let ids: Vec<&str> = rules.iter().map(|r| r.rule_id.as_str()).collect();
+    OperationError {
+        code: INVALID_RULE_VALUE_CODE.into(),
+        message: format!(
+            "rules {}: the value is not valid for the rule type, so the change was refused",
+            ids.join(", ")
+        ),
+    }
+}
+
+/// The GUI's `errors.<code>` for a revision refused over rule values; the
+/// preview signal naming the values carries the same kind.
+const INVALID_RULE_VALUE_CODE: &str = "invalid-rule-value";
+
+/// How many refused values the preview names; a longer list ends in `…`.
+const REFUSED_VALUES_SHOWN: usize = 10;
+
+/// The preview's answer to rules the execute would refuse over their values.
+fn invalid_rule_value_summary(rules: &[RefusedRuleValue]) -> ReviewSummaryResponse {
+    let mut shown: Vec<String> = rules
+        .iter()
+        .take(REFUSED_VALUES_SHOWN)
+        .map(|r| r.value.clone())
+        .collect();
+    if rules.len() > REFUSED_VALUES_SHOWN {
+        shown.push("…".into());
+    }
+    let mut summary = malformed_summary(&invalid_rule_value_error(rules).message);
+    summary
+        .risk_signals
+        .push(RiskSignalDto::InvalidRuleValue { rules: shown });
+    summary
 }
 
 fn policy_error_outcome(err: &PolicyError) -> MutationOutcome {
@@ -1407,19 +1592,29 @@ fn policy_error_outcome(err: &PolicyError) -> MutationOutcome {
             "token-revision-mismatch",
             "confirmation token was issued for a different revision".into(),
         ),
-        PolicyError::RevisionNotFound(_) => ("revision-not-found", format!("{err:?}")),
+        PolicyError::RevisionNotFound(_) => ("revision-not-found", err.to_string()),
         PolicyError::RevisionNotInExpectedStatus { .. } => {
-            ("revision-status-mismatch", format!("{err:?}"))
+            ("revision-status-mismatch", err.to_string())
         }
         PolicyError::NoLastKnownGood => (
             "no-last-known-good",
             "rollback to LKG requested but no last-known-good revision exists".into(),
         ),
-        PolicyError::StorageFailure { .. } => ("storage-failure", format!("{err:?}")),
-        PolicyError::MarkerWriteFailed(_) => ("marker-write-failed", format!("{err:?}")),
+        PolicyError::StorageFailure { .. } => ("storage-failure", err.to_string()),
+        PolicyError::MarkerWriteFailed(_) => ("marker-write-failed", err.to_string()),
         PolicyError::ActivationBusy => (
             "busy-conflict",
             "another rules change is still being applied".into(),
+        ),
+        PolicyError::ActivationNotRecorded {
+            revision_id,
+            detail,
+        } => (
+            "activation-not-recorded",
+            format!(
+                "revision {} was not activated and the previous rules were restored: {detail}",
+                revision_id.as_str()
+            ),
         ),
         PolicyError::RevisionIntegrityRejected {
             revision_id,
@@ -1436,6 +1631,9 @@ fn policy_error_outcome(err: &PolicyError) -> MutationOutcome {
         }
         PolicyError::ControlCharacterInRule { rule_id, field } => {
             return MutationOutcome::Failed(control_character_error(rule_id, field));
+        }
+        PolicyError::InvalidRuleValue { rules } => {
+            return MutationOutcome::Failed(invalid_rule_value_error(rules));
         }
     };
     MutationOutcome::Failed(OperationError {
@@ -1456,6 +1654,7 @@ fn _confirmation_token_unused(_: &ConfirmationToken) {}
 
 mod activation_drive;
 mod alerts;
+mod audit_chain;
 mod preset_import;
 #[cfg(test)]
 mod tests;

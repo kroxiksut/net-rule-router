@@ -82,17 +82,23 @@ impl<'c> BlockNoticeMutesRepository<'c> {
             return Ok(());
         }
         let until_ms = mute.until_ms.map(|u| u as i64);
-        self.conn
-            .execute(
-                "INSERT INTO block_notice_mutes (sid, scope_kind, scope_value, until_ms, updated_at)
+        // The eviction keeps the cap only if it commits with the insert.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| StorageError::Internal(format!("block_notice_mutes tx: {e}")))?;
+        tx.execute(
+            "INSERT INTO block_notice_mutes (sid, scope_kind, scope_value, until_ms, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(sid, scope_kind, scope_value) DO UPDATE SET
                      until_ms = excluded.until_ms,
                      updated_at = excluded.updated_at",
-                params![sid, kind, value, until_ms, now_ms],
-            )
-            .map_err(|e| StorageError::Internal(format!("block_notice_mutes upsert: {e}")))?;
-        self.evict_overflow(sid)
+            params![sid, kind, value, until_ms, now_ms],
+        )
+        .map_err(|e| StorageError::Internal(format!("block_notice_mutes upsert: {e}")))?;
+        self.evict_overflow(sid)?;
+        tx.commit()
+            .map_err(|e| StorageError::Internal(format!("block_notice_mutes commit: {e}")))
     }
 
     /// Every mute for `sid` still in force at `now_ms`. Lapsed rows (a
@@ -396,5 +402,40 @@ mod tests {
             "host-{}.example",
             MAX_MUTES_PER_SID + 7
         )))));
+    }
+
+    #[test]
+    fn a_failed_eviction_rolls_the_upsert_back_so_the_cap_holds() {
+        let conn = migrated_conn();
+        let repo = BlockNoticeMutesRepository::new(&conn);
+        for i in 0..MAX_MUTES_PER_SID {
+            repo.upsert(
+                "S-A",
+                &Mute::forever(MuteScope::Host(format!("host-{i}.example"))),
+                i as i64,
+            )
+            .expect("fill to cap");
+        }
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_evict BEFORE DELETE ON block_notice_mutes
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .expect("trigger");
+
+        let late = Mute::forever(MuteScope::Host("late.example".to_string()));
+        assert!(repo.upsert("S-A", &late, 10_000).is_err());
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM block_notice_mutes", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, MAX_MUTES_PER_SID as i64);
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM block_notice_mutes WHERE scope_value = 'late.example'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(stored, 0, "the failed upsert left no row");
     }
 }

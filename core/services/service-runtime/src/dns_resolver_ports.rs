@@ -95,10 +95,10 @@ impl UpstreamResolver for PortUpstreamResolver {
     fn resolve_within(
         &self,
         hostname: &str,
-        _family: AddressFamily,
+        family: AddressFamily,
         _budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
-        match self.resolver.resolve(hostname, AddressFamily::Ipv4) {
+        match self.resolver.resolve(hostname, family) {
             Ok(ResolvedRecord {
                 addresses,
                 ttl_seconds,
@@ -147,11 +147,25 @@ impl DnsResolverPort for UpstreamResolverPort {
                 // was not confirmed by anyone, and writing it to the cache would
                 // point the rule at nowhere — worse than having no address,
                 // because nothing would ever re-query it.
-                let answered = crate::dns_wire::only_v4(&resolved.addresses);
-                let addresses = match classify_answer(&answered) {
-                    AnswerSanity::Clean => answered,
-                    AnswerSanity::Sanitized { keep } => keep,
-                    AnswerSanity::Unusable => {
+                let usable: Option<Vec<IpAddr>> = match family {
+                    AddressFamily::Ipv4 => {
+                        let answered = crate::dns_wire::only_v4(&resolved.addresses);
+                        match classify_answer(&answered) {
+                            AnswerSanity::Clean => Some(answered),
+                            AnswerSanity::Sanitized { keep } => Some(keep),
+                            AnswerSanity::Unusable => None,
+                        }
+                        .map(|v4| v4.into_iter().map(IpAddr::V4).collect())
+                    }
+                    AddressFamily::Ipv6 => {
+                        let v6: Vec<IpAddr> =
+                            resolved.addresses.into_iter().filter(usable_v6).collect();
+                        (!v6.is_empty()).then_some(v6)
+                    }
+                };
+                let addresses = match usable {
+                    Some(addresses) => addresses,
+                    None => {
                         tracing::info!(
                             target: "nrr::dns-resolver",
                             msg_key = "dns-resolver-no-usable-address",
@@ -169,7 +183,7 @@ impl DnsResolverPort for UpstreamResolverPort {
                 };
                 Ok(ResolvedRecord {
                     canonical_hostname: hostname.to_ascii_lowercase(),
-                    addresses: addresses.into_iter().map(IpAddr::V4).collect(),
+                    addresses,
                     ttl_seconds: Some(resolved.ttl_seconds),
                 })
             }
@@ -548,7 +562,8 @@ impl UpstreamResolver for DirectUdpUpstreamResolver {
                             ResolveError::Unavailable(msg) => msg.as_str(),
                             ResolveError::NoRecords => "no records",
                         },
-                        "direct upstream A query attempt failed",
+                        family = family.as_str(),
+                        "direct upstream address query attempt failed",
                     );
                     last = e;
                 }
@@ -724,13 +739,27 @@ impl PoisonFallbackUpstreamResolver {
     }
 
     /// Why `resolved` needs a second source, or `None` when it stands alone.
-    fn suspicion(&self, hostname: &str, resolved: &ResolvedAddresses) -> Option<Suspicion> {
-        let answered = crate::dns_wire::only_v4(&resolved.addresses);
-        if matches!(classify_answer(&answered), AnswerSanity::Unusable) {
-            return Some(Suspicion::NoUsableAddress);
+    fn suspicion(
+        &self,
+        hostname: &str,
+        resolved: &ResolvedAddresses,
+        family: AddressFamily,
+    ) -> Option<Suspicion> {
+        match family {
+            AddressFamily::Ipv4 => {
+                let answered = crate::dns_wire::only_v4(&resolved.addresses);
+                if matches!(classify_answer(&answered), AnswerSanity::Unusable) {
+                    return Some(Suspicion::NoUsableAddress);
+                }
+                self.reused_by_another_host(hostname, &answered)
+                    .map(Suspicion::AlsoAnsweredFor)
+            }
+            // The reuse memory holds IPv4 fronts only. An empty AAAA answer is
+            // the ordinary one, so only a non-empty set of placeholders is a doubt.
+            AddressFamily::Ipv6 => (!resolved.addresses.is_empty()
+                && carries_nothing_to_pin(resolved, family))
+            .then_some(Suspicion::NoUsableAddress),
         }
-        self.reused_by_another_host(hostname, &answered)
-            .map(Suspicion::AlsoAnsweredFor)
     }
 
     /// How `candidate` settles `suspicion`, or `None` when it does not.
@@ -740,8 +769,9 @@ impl PoisonFallbackUpstreamResolver {
         suspicion: &Suspicion,
         primary: Option<&ResolvedAddresses>,
         candidate: &ResolvedAddresses,
+        family: AddressFamily,
     ) -> Option<Confirmation> {
-        if carries_nothing_to_pin(candidate) {
+        if carries_nothing_to_pin(candidate, family) {
             return None;
         }
         let agreed = matches!(suspicion, Suspicion::AlsoAnsweredFor(_))
@@ -749,24 +779,35 @@ impl PoisonFallbackUpstreamResolver {
         if agreed {
             return Some(Confirmation::Agreed);
         }
+        if family == AddressFamily::Ipv6 {
+            return Some(Confirmation::Replaced);
+        }
         self.reused_by_another_host(hostname, &crate::dns_wire::only_v4(&candidate.addresses))
             .is_none()
             .then_some(Confirmation::Replaced)
     }
 }
 
-/// Whether an answer holds no address that could ever be pinned — either it
-/// names none at all, or every one of them is a placeholder.
+/// An IPv6 address a route or a filter could name.
+fn usable_v6(ip: &IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(v6) if !crate::dns_address_sanity::is_unreachable_v6(v6))
+}
+
+/// Whether an answer holds no address of `family` that could ever be pinned —
+/// either it names none at all, or every one of them is a placeholder.
 ///
 /// The two are the same for the caller (there is nothing to enforce on) but
 /// they are NOT the same evidence, which is why the loop below asks who
 /// answered rather than only what they said.
-fn carries_nothing_to_pin(answer: &ResolvedAddresses) -> bool {
+fn carries_nothing_to_pin(answer: &ResolvedAddresses, family: AddressFamily) -> bool {
     answer.addresses.is_empty()
-        || matches!(
-            classify_answer(&crate::dns_wire::only_v4(&answer.addresses)),
-            AnswerSanity::Unusable
-        )
+        || match family {
+            AddressFamily::Ipv4 => matches!(
+                classify_answer(&crate::dns_wire::only_v4(&answer.addresses)),
+                AnswerSanity::Unusable
+            ),
+            AddressFamily::Ipv6 => !answer.addresses.iter().any(usable_v6),
+        }
 }
 
 /// Do two answers name the same addresses, order aside? Answer sets are a
@@ -779,16 +820,19 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
     fn resolve_within(
         &self,
         hostname: &str,
-        _family: AddressFamily,
+        family: AddressFamily,
         budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
         let call_started = std::time::Instant::now();
-        let primary = self
-            .inner
-            .resolve_within(hostname, AddressFamily::Ipv4, budget);
+        let primary = self.inner.resolve_within(hostname, family, budget);
         let suspicion = match &primary {
-            Ok(resolved) => self.suspicion(hostname, resolved),
-            Err(ResolveError::NoRecords) => Some(Suspicion::NoUsableAddress),
+            Ok(resolved) => self.suspicion(hostname, resolved, family),
+            // A filtering provider's refusal shows on the A answer, asked
+            // beside this one; a host without AAAA is the common case, and
+            // doubting it would put a second round-trip on nearly every one.
+            Err(ResolveError::NoRecords) => {
+                (family == AddressFamily::Ipv4).then_some(Suspicion::NoUsableAddress)
+            }
             // Transport failure: the egress policy / attempt rotation already
             // handles availability; adding more timeouts here would only stall
             // the client.
@@ -823,11 +867,17 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
             if left.is_zero() {
                 break;
             }
-            let Ok(candidate) = fallback.resolve_within(hostname, AddressFamily::Ipv4, left) else {
+            let Ok(candidate) = fallback.resolve_within(hostname, family, left) else {
                 continue;
             };
-            second_source_saw_nothing_either |= carries_nothing_to_pin(&candidate);
-            match self.confirmation(hostname, &suspicion, primary.as_ref().ok(), &candidate) {
+            second_source_saw_nothing_either |= carries_nothing_to_pin(&candidate, family);
+            match self.confirmation(
+                hostname,
+                &suspicion,
+                primary.as_ref().ok(),
+                &candidate,
+                family,
+            ) {
                 Some(Confirmation::Agreed) => {
                     tracing::info!(
                         target: "nrr::dns-resolver",

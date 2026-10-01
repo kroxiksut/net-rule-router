@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Adapter-monitor debounce, in milliseconds. Matches block-15.x default;
+/// Adapter-monitor debounce, in milliseconds. Matches the product default;
 /// short enough that a Wi-Fi flicker resolves before the GUI render
 /// settles, long enough to avoid double-firing on a normal cable plug.
 pub(crate) const ADAPTER_DEBOUNCE_MS: u64 = 500;

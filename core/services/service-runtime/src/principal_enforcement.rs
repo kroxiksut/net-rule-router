@@ -28,8 +28,16 @@
 //! installed without changing the plan at all. Re-applying is idempotent by
 //! construction on both platforms, which makes "apply every tick" the cheap and
 //! correct option, and change detection a matter of what gets LOGGED.
+//!
+//! ## Except after a refusal that cannot change on its own
+//!
+//! A refusal the platform calls persistent (a ruleset `nft` rejects, a missing
+//! privilege) meets the same plans the same way on every tick. Those plans are
+//! not handed over again until they change — new rules or a channel coming or
+//! going — or someone asks explicitly ([`PrincipalEnforcementCycle::request_retry`]).
+//! The event fixes the cause; a timer only repeats the refusal.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nrr_domain::user_principal::UserPrincipal;
@@ -106,7 +114,11 @@ pub enum CycleOutcome {
     AuthorityUnavailable { reason: String },
     /// The platform refused the plans. Whatever was installed before is still
     /// installed — the failure is reported, not silently absorbed.
-    EnforcementFailed { reason: String },
+    /// `persistent`: the same plans will not be tried again until they change.
+    EnforcementFailed { reason: String, persistent: bool },
+    /// These exact plans were refused persistently before, and nothing has
+    /// changed since; the platform was not asked again.
+    RefusalStands { reason: String },
     /// The cycle has been torn down and refuses to install anything more. A
     /// task that hung past the shutdown drain would otherwise reinstate the
     /// policy AFTER the stop removed it, leaving a stopped service's filters in
@@ -138,8 +150,17 @@ pub struct PrincipalEnforcementCycle {
     /// not treat a rule host as covered while it is armed — today the rule
     /// hostname seeder's retry pacing. `None` leaves them on calm pacing.
     fail_closed_posture: Option<crate::app_enforcement_status::FailClosedPostureStatus>,
+    /// Plans the platform refused persistently, with its reason. Only touched
+    /// under the pass lock.
+    refused: Mutex<Option<(Vec<EnforcementPlan>, String)>>,
+    /// Set by [`PrincipalEnforcementCycle::request_retry`]; consumed by the next
+    /// pass, which then hands refused plans over again.
+    retry_requested: AtomicBool,
     /// Latched by [`PrincipalEnforcementCycle::teardown`]; never cleared.
     stopped: AtomicBool,
+    /// Epoch seconds the last pass finished, whatever its outcome; starts at
+    /// construction so a first pass that never returns still goes stale.
+    last_pass_at: AtomicU64,
 }
 
 /// Whether this plan asks for something the packet layer will apply to the
@@ -170,7 +191,10 @@ impl PrincipalEnforcementCycle {
             events: None,
             fail_closed_posture: None,
             last_applied: Mutex::new(None),
+            refused: Mutex::new(None),
+            retry_requested: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            last_pass_at: AtomicU64::new(epoch_secs()),
         }
     }
 
@@ -209,6 +233,25 @@ impl PrincipalEnforcementCycle {
 
     /// Run one pass. Passes are serialised: see `last_applied`.
     pub fn tick(&self) -> CycleOutcome {
+        let outcome = self.run_pass();
+        self.last_pass_at.store(epoch_secs(), Ordering::Relaxed);
+        outcome
+    }
+
+    /// Let the next pass hand over plans refused before — for an explicit
+    /// request (an apply from the GUI), which may follow a fix the plans do not
+    /// show.
+    pub fn request_retry(&self) {
+        self.retry_requested.store(true, Ordering::Release);
+    }
+
+    /// When the last pass finished, in epoch seconds — a watchdog's evidence
+    /// that enforcement is not wedged (a hung `nft` holds the pass lock).
+    pub fn last_pass_epoch_secs(&self) -> u64 {
+        self.last_pass_at.load(Ordering::Relaxed)
+    }
+
+    fn run_pass(&self) -> CycleOutcome {
         let mut last = self.last_applied.lock().unwrap_or_else(|p| p.into_inner());
         // The cycle's own stop flag is set by `teardown`, which runs after the
         // tasks are drained; the process-wide latch flips the moment the stop
@@ -256,7 +299,22 @@ impl PrincipalEnforcementCycle {
         if crate::teardown_in_progress() {
             return CycleOutcome::Stopped;
         }
-        match self.enforcer.enforce(&plans) {
+        let mut refused = self.refused.lock().unwrap_or_else(|p| p.into_inner());
+        let retry_requested = self.retry_requested.swap(false, Ordering::AcqRel);
+        if let Some((refused_plans, reason)) = refused.as_ref() {
+            if !retry_requested && *refused_plans == plans {
+                return CycleOutcome::RefusalStands {
+                    reason: reason.clone(),
+                };
+            }
+        }
+        let result = self.enforcer.enforce(&plans);
+        *refused = match &result {
+            Err(e) if e.is_persistent() => Some((plans.clone(), e.to_string())),
+            _ => None,
+        };
+        drop(refused);
+        match result {
             Ok(report) => {
                 let principals = plans
                     .iter()
@@ -293,10 +351,11 @@ impl PrincipalEnforcementCycle {
                     routes,
                 }
             }
-            // Deliberately NOT recorded as applied: the next tick must try
-            // again rather than believe the kernel holds something it refused.
+            // Deliberately NOT recorded as applied: the kernel does not hold
+            // what it refused, whether or not the next tick tries again.
             Err(e) => CycleOutcome::EnforcementFailed {
-                reason: e.to_string(),
+                persistent: e.is_persistent(),
+                reason: e.reason,
             },
         }
     }
@@ -375,6 +434,12 @@ impl PrincipalEnforcementCycle {
             (Err(e), _) | (_, Err(e)) => Err(e),
         }
     }
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Report one pass. Shared by every caller so a pass provoked by a link change
@@ -477,12 +542,20 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
             reason = %reason,
             "could not determine who is logged in; policy left exactly as it was (this is NOT the same as nobody being present)",
         ),
-        CycleOutcome::EnforcementFailed { reason } => tracing::error!(
+        CycleOutcome::EnforcementFailed { reason, persistent } => tracing::error!(
             target: "nrr::enforcement",
             msg_key = "principal-enforcement-failed",
             trigger,
             reason = %reason,
+            persistent,
             "policy could NOT be applied — the rules on file are not in effect",
+        ),
+        // Already logged at error when it was refused; once per tick is noise.
+        CycleOutcome::RefusalStands { reason } => tracing::debug!(
+            target: "nrr::enforcement",
+            trigger,
+            reason = %reason,
+            "the same plans were refused before; waiting for a change to try again",
         ),
         CycleOutcome::Stopped => tracing::info!(
             target: "nrr::enforcement",
@@ -567,6 +640,28 @@ mod tests {
     }
     use super::*;
     use nrr_platform_api::active_principals::ActivePrincipalError;
+
+    /// The watchdog reads this; a failed pass still proves the loop turns.
+    #[test]
+    fn every_finished_pass_refreshes_the_heartbeat() {
+        let cycle = PrincipalEnforcementCycle::new(
+            std::sync::Arc::new(ScriptedPrincipals { answer: None }),
+            std::sync::Arc::new(PlanEveryone {
+                without_policy: Vec::new(),
+            }),
+            std::sync::Arc::new(RecordingEnforcer::new(false)),
+        );
+        assert!(
+            cycle.last_pass_epoch_secs() > 0,
+            "construction starts the clock"
+        );
+        cycle.last_pass_at.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            cycle.tick(),
+            CycleOutcome::AuthorityUnavailable { .. }
+        ));
+        assert!(cycle.last_pass_epoch_secs() > 0);
+    }
     use nrr_platform_api::enforcement::EnforcementFailure;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -617,7 +712,8 @@ mod tests {
 
     struct RecordingEnforcer {
         calls: Mutex<Vec<Vec<String>>>,
-        fail: bool,
+        /// `Some` = every call is refused this way.
+        fail: Mutex<Option<EnforcementFailure>>,
         /// How many passes are inside `enforce` right now, and how often that
         /// was more than one.
         inside: AtomicUsize,
@@ -626,9 +722,12 @@ mod tests {
     }
     impl RecordingEnforcer {
         fn new(fail: bool) -> Self {
+            Self::refusing(fail.then(|| EnforcementFailure::transient("nft hung")))
+        }
+        fn refusing(fail: Option<EnforcementFailure>) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
-                fail,
+                fail: Mutex::new(fail),
                 inside: AtomicUsize::new(0),
                 overlaps: AtomicUsize::new(0),
                 teardowns: AtomicUsize::new(0),
@@ -651,8 +750,8 @@ mod tests {
                     .map(|p| p.principal.as_stored().to_owned())
                     .collect(),
             );
-            if self.fail {
-                return Err(EnforcementFailure::new("nft rejected the batch"));
+            if let Some(failure) = self.fail.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+                return Err(failure);
             }
             Ok(ApplyReport {
                 applied: plans.len(),
@@ -771,16 +870,74 @@ mod tests {
         assert_eq!(enforcer.calls().len(), 2);
     }
 
-    /// A refused batch must not be remembered as applied, or the next tick would
-    /// call it unchanged and quietly stop retrying.
+    /// A transient failure must not be remembered as applied, or the next tick
+    /// would call it unchanged and quietly stop retrying.
     #[test]
-    fn a_refused_batch_is_retried_on_the_next_tick() {
+    fn a_transient_failure_is_retried_on_the_next_tick() {
         let enforcer = Arc::new(RecordingEnforcer::new(true));
         let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer));
 
-        assert!(matches!(c.tick(), CycleOutcome::EnforcementFailed { .. }));
-        assert!(matches!(c.tick(), CycleOutcome::EnforcementFailed { .. }));
+        for _ in 0..2 {
+            assert!(matches!(
+                c.tick(),
+                CycleOutcome::EnforcementFailed {
+                    persistent: false,
+                    ..
+                }
+            ));
+        }
         assert_eq!(enforcer.calls().len(), 2);
+    }
+
+    /// Handing the same plans to a platform that refused them for good only
+    /// spawns the same refusal every tick.
+    #[test]
+    fn a_persistent_refusal_waits_for_the_plans_to_change() {
+        let enforcer = Arc::new(RecordingEnforcer::refusing(Some(
+            EnforcementFailure::persistent("nft refused the ruleset"),
+        )));
+        let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer));
+
+        assert!(matches!(
+            c.tick(),
+            CycleOutcome::EnforcementFailed {
+                persistent: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            c.tick(),
+            CycleOutcome::RefusalStands { reason } if reason == "nft refused the ruleset"
+        ));
+        assert_eq!(enforcer.calls().len(), 1);
+
+        // A second user arriving changes the plans: that is worth an attempt.
+        let c2 = PrincipalEnforcementCycle {
+            principals: Arc::new(ScriptedPrincipals {
+                answer: Some(vec![uid(1000), uid(1001)]),
+            }),
+            ..c
+        };
+        assert!(matches!(c2.tick(), CycleOutcome::EnforcementFailed { .. }));
+        assert_eq!(enforcer.calls().len(), 2);
+    }
+
+    /// An explicit apply may follow a fix the plans cannot show (a package
+    /// installed, a privilege granted); a success clears the refusal.
+    #[test]
+    fn a_requested_retry_hands_refused_plans_over_again() {
+        let enforcer = Arc::new(RecordingEnforcer::refusing(Some(
+            EnforcementFailure::persistent("not permitted"),
+        )));
+        let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer));
+        c.tick();
+        assert!(matches!(c.tick(), CycleOutcome::RefusalStands { .. }));
+
+        *enforcer.fail.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        c.request_retry();
+        assert!(matches!(c.tick(), CycleOutcome::Applied { .. }));
+        assert!(matches!(c.tick(), CycleOutcome::Applied { .. }));
+        assert_eq!(enforcer.calls().len(), 3);
     }
 
     /// Three callers drive this cycle. Two of them planning against different

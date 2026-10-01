@@ -11,10 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nrr_platform_api::dns::SystemDnsServersPort;
+use nrr_platform_api::dns_config_change::DnsConfigChangeObserver;
 use nrr_platform_api::dns_redirect::{DnsNamespaceExemption, SystemDnsRedirectPort};
+use nrr_platform_api::dns_servers_cache::NetworkChangeCachedDnsServers;
+use nrr_platform_api::network_change::{NetworkChangeObserver, NetworkChangeSubscription};
 use rusqlite::Connection;
 
-use crate::dns_resolver_service::{DnsResolverFactory, DnsResolverService, NamespaceRecheck};
+use crate::dns_resolver_service::{
+    DnsResolverFactory, DnsResolverService, NamespaceRecheck, CLAIMS_SAFETY_RECHECK_INTERVAL,
+};
 use crate::dns_upstream::UpstreamDnsPool;
 use crate::production_rules_provider::ProductionRulesProvider;
 
@@ -25,6 +30,7 @@ type Flag = Arc<dyn Fn() -> bool + Send + Sync>;
 #[derive(Clone)]
 pub struct DnsStackPlatform {
     /// The machine's own resolvers, read before the redirect takes them over.
+    /// Read on the answer path: pass it through [`cached_system_dns`].
     pub system_dns: Arc<dyn SystemDnsServersPort>,
     /// The shared upstream choice; outlives resolver restarts.
     pub upstream_pool: Arc<UpstreamDnsPool>,
@@ -32,8 +38,14 @@ pub struct DnsStackPlatform {
     pub redirect: Arc<dyn SystemDnsRedirectPort>,
     /// Where the listener binds — the address the redirect points the OS at.
     pub listen_addr: SocketAddr,
-    /// Namespaces other connections claim, read fresh on every call.
+    /// Namespaces other connections claim, read fresh on every call. Called
+    /// on the arm, on a change the two feeds below report and once per safety
+    /// interval — never per query.
     pub claimed_namespaces: Arc<dyn Fn() -> Vec<DnsNamespaceExemption> + Send + Sync>,
+    /// Link and route changes.
+    pub network_changes: Arc<dyn NetworkChangeObserver>,
+    /// DNS settings changes that move no link or route.
+    pub dns_config_changes: Arc<dyn DnsConfigChangeObserver>,
 }
 
 /// The product-side inputs. Every optional one, when absent, leaves the
@@ -70,15 +82,64 @@ pub fn build_dns_resolver_factory(
     inputs: DnsStackInputs,
     platform: DnsStackPlatform,
 ) -> DnsResolverFactory {
-    Arc::new(move || build_dns_resolver_instance(&inputs, &platform))
+    let watch = watch_dns_changes(
+        platform.network_changes.as_ref(),
+        platform.dns_config_changes.as_ref(),
+        namespace_recheck(),
+    );
+    let fed = watch.is_some();
+    Arc::new(move || {
+        // Subscribed for as long as a resolver can be built on it.
+        let _subscribed = &watch;
+        build_dns_resolver_instance(&inputs, &platform, fed)
+    })
 }
 
-/// One process-wide fact — "the set of links just changed" — shared by the
-/// adapter monitor that observes it and the DNS guard that must act on it.
-/// A static because the two are built on paths that never meet.
+/// One process-wide fact — "what the DNS guard reads may have changed" —
+/// shared by the change feeds, the settings writer and the guard that acts on
+/// it. A static because they are built on paths that never meet.
 pub fn namespace_recheck() -> &'static NamespaceRecheck {
     static FLAG: std::sync::OnceLock<NamespaceRecheck> = std::sync::OnceLock::new();
     FLAG.get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+/// The subscriptions that raise the recheck flag; dropping it ends them.
+pub(crate) struct DnsChangeWatch {
+    _network: NetworkChangeSubscription,
+    _dns_config: NetworkChangeSubscription,
+}
+
+/// Raise `flag` on every link, route or DNS settings change. `None` when
+/// either feed cannot be subscribed: the guard then reads on every tick, as it
+/// must with nothing to say what changed.
+pub(crate) fn watch_dns_changes(
+    network: &dyn NetworkChangeObserver,
+    dns_config: &dyn DnsConfigChangeObserver,
+    flag: &NamespaceRecheck,
+) -> Option<DnsChangeWatch> {
+    let raise =
+        |flag: &NamespaceRecheck| -> nrr_platform_api::network_change::NetworkChangeCallback {
+            let flag = Arc::clone(flag);
+            Arc::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst))
+        };
+    let subscribed = network
+        .subscribe(raise(flag))
+        .and_then(|net| Ok((net, dns_config.subscribe(raise(flag))?)));
+    match subscribed {
+        Ok((network, dns_config)) => Some(DnsChangeWatch {
+            _network: network,
+            _dns_config: dns_config,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                target: "nrr::dns-resolver",
+                msg_key = "dns-stack-changes-unwatched",
+                error = %e,
+                "network or DNS settings changes cannot be watched; the local resolver re-reads the connections' DNS domains on every check",
+            );
+            None
+        }
+    }
 }
 
 /// Adapts the auto-rules engine to the resolver's companion-candidate port.
@@ -112,6 +173,7 @@ impl crate::dns_resolver::CompanionRescueObserver for RescuedCompanions {
 fn build_dns_resolver_instance(
     inputs: &DnsStackInputs,
     platform: &DnsStackPlatform,
+    fed: bool,
 ) -> Option<DnsResolverService> {
     use crate::dns_listener::DnsInterceptListener;
     use crate::dns_resolver_ports::{
@@ -203,20 +265,7 @@ fn build_dns_resolver_instance(
         )),
     ));
 
-    // A name one server calls non-existent is re-asked of the machine's
-    // private resolvers: a corporate host and a LAN machine stopped resolving
-    // once the whole system pointed at us.
-    let private_resolvers: crate::dns_listener::PrivateResolversFn = {
-        let system_dns = Arc::clone(&platform.system_dns);
-        Arc::new(move || {
-            system_dns
-                .upstream_candidates_v4()
-                .into_iter()
-                .map(|c| c.server)
-                .filter(|s| crate::local_namespace_fallback::is_private_resolver(*s))
-                .collect()
-        })
-    };
+    let private_resolvers = private_resolvers_from(Arc::clone(&platform.system_dns));
     let mut listener = DnsInterceptListener::new(
         oracle,
         upstream,
@@ -235,7 +284,22 @@ fn build_dns_resolver_instance(
         crate::dns_resolver_ports::ActiveSidEnforcedAddresses::new(Arc::clone(active_sid)),
     ));
     listener = listener.with_private_resolvers(private_resolvers);
-    let user_suffix = short_name_suffix(Arc::clone(&inputs.settings_conn), Arc::clone(active_sid));
+    let suffixes = crate::short_name_suffixes::global_user_short_name_suffixes();
+    {
+        let conn = inputs
+            .settings_conn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = suffixes.reload(&conn) {
+            tracing::warn!(
+                target: "nrr::dns-resolver",
+                msg_key = "dns-stack-short-name-suffixes-unread",
+                error = %e,
+                "the short-name domains could not be read; the ones read before stay in use",
+            );
+        }
+    }
+    let user_suffix = short_name_suffix(suffixes, Arc::clone(active_sid));
     listener = listener.with_short_name_suffix(Arc::clone(&user_suffix));
     listener = listener.with_ipv6_disposition({
         let sid = Arc::clone(active_sid);
@@ -312,39 +376,83 @@ fn build_dns_resolver_instance(
         listener = %platform.listen_addr,
         "Mode B armed: the local DNS resolver forwards non-rule queries to an upstream that answered a probe",
     );
-    Some(
-        DnsResolverService::new(
-            listener,
-            Arc::clone(&platform.redirect),
-            platform.listen_addr,
-        )
-        // A corporate VPN announces its domain and servers; the product stays
-        // out of names it has no business answering.
-        .with_namespace_exemptions(Arc::clone(&platform.claimed_namespaces))
-        // A VPN connecting mid-session claims its namespace the moment its link
-        // appears, not on the next guard tick.
-        .with_namespace_recheck(Arc::clone(namespace_recheck()))
-        // The OS completes a short name before it asks anyone, and the redirect
-        // can cost it the suffixes to complete with.
-        .with_short_name_suffixes(Arc::new(move || user_suffix().into_iter().collect())),
+    let service = DnsResolverService::new(
+        listener,
+        Arc::clone(&platform.redirect),
+        platform.listen_addr,
     )
+    // A corporate VPN announces its domain and servers; the product stays out
+    // of names it has no business answering.
+    .with_namespace_exemptions(Arc::clone(&platform.claimed_namespaces))
+    // The OS completes a short name before it asks anyone, and the redirect
+    // can cost it the suffixes to complete with.
+    .with_short_name_suffixes(Arc::new(move || user_suffix().into_iter().collect()));
+    // A VPN connecting mid-session claims its namespace the moment its link
+    // appears, and a quiet machine costs the guard no read at all.
+    Some(if fed {
+        service.with_change_feed(
+            Arc::clone(namespace_recheck()),
+            CLAIMS_SAFETY_RECHECK_INTERVAL,
+        )
+    } else {
+        service
+    })
 }
 
-/// The routing principal's short-name domain, read when a bare label comes
-/// back unanswered — rare enough that a settings read per lookup costs nothing.
+/// The routing principal's short-name domain, from the snapshot the settings
+/// writer publishes: asked on every unanswered bare label and, on a platform
+/// that writes it into the OS search list, whenever the guard reads the claims.
 fn short_name_suffix(
-    settings: Arc<Mutex<Connection>>,
+    suffixes: &'static crate::short_name_suffixes::UserShortNameSuffixes,
     active_sid: crate::supervised_runtime::ActiveRoutingSidFn,
 ) -> crate::dns_listener::ShortNameSuffixFn {
-    Arc::new(move || {
-        let sid = active_sid()?;
-        let conn = settings.lock().unwrap_or_else(|p| p.into_inner());
-        let policy = nrr_storage::route_bindings::RouteBindingsRepository::new(&conn)
-            .load_for_sid(&sid)
-            .ok()?;
-        (policy.short_name_completion && !policy.short_name_suffix.is_empty())
-            .then_some(policy.short_name_suffix)
+    Arc::new(move || suffixes.of(&active_sid()?))
+}
+
+/// A name one server calls non-existent is re-asked of the machine's private
+/// resolvers: a corporate host and a LAN machine stopped resolving once the
+/// whole system pointed at us. Asked per NXDOMAIN, so `system_dns` must not
+/// enumerate per call — see [`cached_system_dns`].
+pub(crate) fn private_resolvers_from(
+    system_dns: Arc<dyn SystemDnsServersPort>,
+) -> crate::dns_listener::PrivateResolversFn {
+    Arc::new(move |budget| {
+        system_dns
+            .upstream_candidates_v4_within(budget)
+            .into_iter()
+            .map(|c| c.server)
+            .filter(|s| crate::local_namespace_fallback::is_private_resolver(*s))
+            .collect()
     })
+}
+
+/// `servers`, enumerated once per network change or DNS-configuration change,
+/// for [`DnsStackPlatform::system_dns`]. The answer path reads it on every
+/// NXDOMAIN and one enumeration can be a child process, so either feed
+/// re-reads it in the background and an answer waits for that read only
+/// within its own budget. A DHCP-pushed domain or a VPN client's own
+/// namespace moves no link or route, which is why the DNS-config feed sits
+/// beside the network-change one rather than replacing it. Without the
+/// network-change feed a cached list could never refresh, so the port is then
+/// used as is; a DNS-config feed that cannot be watched just leaves the
+/// network-change-only cache in place.
+pub fn cached_system_dns(
+    servers: Arc<dyn SystemDnsServersPort>,
+    network: &dyn NetworkChangeObserver,
+    dns_config: &dyn DnsConfigChangeObserver,
+) -> Arc<dyn SystemDnsServersPort> {
+    match NetworkChangeCachedDnsServers::new(Arc::clone(&servers), network) {
+        Ok(cached) => Arc::new(cached.also_reading_on_dns_config_change(dns_config)),
+        Err(e) => {
+            tracing::warn!(
+                target: "nrr::dns-resolver",
+                msg_key = "dns-stack-servers-uncached",
+                error = %e,
+                "network changes cannot be watched; every unanswered name re-reads the machine's DNS servers",
+            );
+            servers
+        }
+    }
 }
 
 /// The persisted enforcement mode. The default on a lock or read failure, like
@@ -360,6 +468,14 @@ pub fn read_enforcement_mode(
         .get_or_default()
         .map(|record| record.enforcement_mode)
         .unwrap_or_default()
+}
+
+/// [`read_enforcement_mode`] at call time, so a later reader sees what the
+/// settings writer stored since boot. No database: the default, as at boot.
+pub fn persisted_enforcement_mode(
+    conn: Option<Arc<Mutex<Connection>>>,
+) -> crate::supervised_runtime::EnforcementModeSource {
+    Arc::new(move || conn.as_ref().map(read_enforcement_mode).unwrap_or_default())
 }
 
 /// How long one answer about who is signed in serves DNS queries. A query
@@ -395,6 +511,7 @@ pub fn routing_principal_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::short_name_suffixes::UserShortNameSuffixes;
     use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
     use nrr_storage::repository::MigrationRunner;
     use nrr_storage::route_bindings::{BindingSource, RouteBindingsRepository, RoutePolicyRecord};
@@ -420,20 +537,349 @@ mod tests {
         (dir, Arc::new(Mutex::new(conn)))
     }
 
-    fn suffix_for(conn: Arc<Mutex<Connection>>, sid: Option<&'static str>) -> Option<String> {
-        short_name_suffix(conn, Arc::new(move || sid.map(str::to_string)))()
+    /// A snapshot of its own, so no other test's writes reach it.
+    fn loaded_from(conn: &Arc<Mutex<Connection>>) -> &'static UserShortNameSuffixes {
+        let suffixes: &'static UserShortNameSuffixes = Box::leak(Box::default());
+        suffixes
+            .reload(&conn.lock().expect("settings"))
+            .expect("reload");
+        suffixes
+    }
+
+    fn suffix_for(
+        suffixes: &'static UserShortNameSuffixes,
+        sid: Option<&'static str>,
+    ) -> Option<String> {
+        short_name_suffix(suffixes, Arc::new(move || sid.map(str::to_string)))()
     }
 
     #[test]
     fn the_listener_reads_the_routing_users_short_name_domain() {
         let (_dir, conn) = settings_with(true, "corp.example");
+        let suffixes = loaded_from(&conn);
         assert_eq!(
-            suffix_for(Arc::clone(&conn), Some(SID)).as_deref(),
+            suffix_for(suffixes, Some(SID)).as_deref(),
             Some("corp.example")
         );
-        assert_eq!(suffix_for(conn, None), None, "nobody routed, nothing named");
+        assert_eq!(
+            suffix_for(suffixes, None),
+            None,
+            "nobody routed, nothing named"
+        );
 
         let (_dir, off) = settings_with(false, "corp.example");
-        assert_eq!(suffix_for(off, Some(SID)), None, "the switch is off");
+        assert_eq!(
+            suffix_for(loaded_from(&off), Some(SID)),
+            None,
+            "the switch is off"
+        );
+    }
+
+    #[test]
+    fn nothing_published_means_no_short_name_domain() {
+        let (_dir, _conn) = settings_with(true, "corp.example");
+        let unpublished: &'static UserShortNameSuffixes = Box::leak(Box::default());
+
+        assert_eq!(suffix_for(unpublished, Some(SID)), None);
+    }
+
+    /// The answer path never touches the settings database: a row changed
+    /// behind the snapshot's back is invisible to any number of answers.
+    #[test]
+    fn short_name_answers_read_no_settings() {
+        let (_dir, conn) = settings_with(true, "corp.example");
+        let suffixes = loaded_from(&conn);
+        let mut policy = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        policy.short_name_completion = true;
+        policy.short_name_suffix = "other.example".to_string();
+        RouteBindingsRepository::new(&conn.lock().expect("settings"))
+            .update_for_sid(SID, &policy, 1)
+            .expect("write behind the snapshot");
+
+        for _ in 0..100 {
+            assert_eq!(
+                suffix_for(suffixes, Some(SID)).as_deref(),
+                Some("corp.example")
+            );
+        }
+    }
+
+    /// Positive control for the one above: the service's own settings write
+    /// reaches the very next answer.
+    #[test]
+    fn a_settings_write_reaches_the_next_short_name_answer() {
+        use crate::ipc_handlers::providers::RoutePolicyWriter;
+        const WRITER_SID: &str = "S-1-5-21-0-0-0-1077";
+        let (_dir, conn) = settings_with(false, "");
+        let writer =
+            crate::production_handlers_misc::ProductionRoutePolicyWriter::new(Arc::clone(&conn));
+        let suffixes = crate::short_name_suffixes::global_user_short_name_suffixes();
+        let request = |completion: bool, suffix: &str| {
+            serde_json::from_value::<crate::ipc_handlers::payloads::RoutePolicyUpdateRequest>(
+                serde_json::json!({
+                    "mode": "prefer-primary",
+                    "block-secondary-when-unavailable": true,
+                    "kill-switch-block-all": false,
+                    "kill-switch-enabled": true,
+                    "doh-lockdown-enabled": false,
+                    "kill-switch-strict-shared-ips": false,
+                    "binding-source": "user-assigned",
+                    "short-name-completion": completion,
+                    "short-name-suffix": suffix,
+                }),
+            )
+            .expect("request")
+        };
+        assert_eq!(suffix_for(suffixes, Some(WRITER_SID)), None);
+
+        writer
+            .update_for_sid(WRITER_SID, &request(true, "corp.example"))
+            .expect("write");
+        assert_eq!(
+            suffix_for(suffixes, Some(WRITER_SID)).as_deref(),
+            Some("corp.example")
+        );
+
+        writer
+            .update_for_sid(WRITER_SID, &request(false, "corp.example"))
+            .expect("write");
+        assert_eq!(suffix_for(suffixes, Some(WRITER_SID)), None);
+    }
+
+    struct CountingServers {
+        calls: std::sync::atomic::AtomicUsize,
+        answer: Vec<nrr_platform_api::dns::UpstreamDnsCandidate>,
+    }
+
+    impl CountingServers {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SystemDnsServersPort for CountingServers {
+        fn upstream_candidates_v4(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsCandidate> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.answer.clone()
+        }
+    }
+
+    /// Hands the test the callback the OS would call.
+    #[derive(Default)]
+    struct ManualObserver(Mutex<Option<nrr_platform_api::network_change::NetworkChangeCallback>>);
+
+    impl ManualObserver {
+        fn fire(&self) {
+            let callback = self.0.lock().expect("observer").clone();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    }
+
+    impl NetworkChangeObserver for ManualObserver {
+        fn subscribe(
+            &self,
+            on_change: nrr_platform_api::network_change::NetworkChangeCallback,
+        ) -> Result<
+            nrr_platform_api::network_change::NetworkChangeSubscription,
+            nrr_platform_api::error::PlatformError,
+        > {
+            *self.0.lock().expect("observer") = Some(on_change);
+            Ok(nrr_platform_api::network_change::NetworkChangeSubscription::inert())
+        }
+    }
+
+    impl DnsConfigChangeObserver for ManualObserver {
+        fn subscribe(
+            &self,
+            on_change: nrr_platform_api::network_change::NetworkChangeCallback,
+        ) -> Result<
+            nrr_platform_api::network_change::NetworkChangeSubscription,
+            nrr_platform_api::error::PlatformError,
+        > {
+            NetworkChangeObserver::subscribe(self, on_change)
+        }
+    }
+
+    struct Refusing;
+
+    impl DnsConfigChangeObserver for Refusing {
+        fn subscribe(
+            &self,
+            _on_change: nrr_platform_api::network_change::NetworkChangeCallback,
+        ) -> Result<
+            nrr_platform_api::network_change::NetworkChangeSubscription,
+            nrr_platform_api::error::PlatformError,
+        > {
+            Err(nrr_platform_api::error::PlatformError::NotSupported {
+                reason: "no DNS settings notification",
+            })
+        }
+    }
+
+    /// A link change and a DNS settings change each tell the guard to read.
+    #[test]
+    fn either_feed_raises_the_recheck() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag: NamespaceRecheck = Arc::new(AtomicBool::new(false));
+        let (network, dns_config) = (ManualObserver::default(), ManualObserver::default());
+        let watch = watch_dns_changes(&network, &dns_config, &flag);
+        assert!(watch.is_some());
+        assert!(!flag.load(Ordering::SeqCst), "nothing happened yet");
+
+        network.fire();
+        assert!(flag.swap(false, Ordering::SeqCst), "a link change");
+        dns_config.fire();
+        assert!(flag.swap(false, Ordering::SeqCst), "a DNS settings change");
+    }
+
+    /// With either feed missing nothing could say what changed, so the
+    /// resolver is built without a feed and its guard reads on every tick.
+    #[test]
+    fn a_feed_that_cannot_be_watched_means_no_feed() {
+        use std::sync::atomic::AtomicBool;
+        let flag: NamespaceRecheck = Arc::new(AtomicBool::new(false));
+        assert!(watch_dns_changes(&ManualObserver::default(), &Refusing, &flag).is_none());
+    }
+
+    struct NoSuchName;
+
+    impl crate::dns_resolver::UpstreamResolver for NoSuchName {
+        fn resolve_within(
+            &self,
+            _hostname: &str,
+            _family: nrr_platform_api::dns::AddressFamily,
+            _budget: Duration,
+        ) -> Result<crate::dns_resolver::ResolvedAddresses, crate::dns_resolver::ResolveError>
+        {
+            Err(crate::dns_resolver::ResolveError::NoRecords)
+        }
+    }
+
+    /// Both answer-path readers of the machine's resolvers — the listener's
+    /// private-resolver list and the rule-host fallback — share one
+    /// enumeration per network change.
+    #[test]
+    fn nxdomain_answers_enumerate_the_resolvers_once_per_network_change() {
+        let inner = Arc::new(CountingServers {
+            calls: Default::default(),
+            // Public only: nothing to ask, so the loop measures the reads alone.
+            answer: vec![nrr_platform_api::dns::UpstreamDnsCandidate::new(
+                Some(2),
+                std::net::Ipv4Addr::new(192, 0, 2, 53),
+            )],
+        });
+        let observer = ManualObserver::default();
+        let servers = cached_system_dns(Arc::clone(&inner) as _, &observer, &observer);
+        let private = private_resolvers_from(Arc::clone(&servers));
+        let fallback = crate::local_namespace_fallback::LocalNamespaceFallbackResolver::new(
+            Arc::new(NoSuchName),
+            servers,
+            Duration::from_millis(50),
+        );
+        let answer_many = || {
+            for _ in 0..100 {
+                assert!(private(Duration::from_millis(50)).is_empty());
+                let nx = crate::dns_resolver::UpstreamResolver::resolve_within(
+                    &fallback,
+                    "host.corp.example",
+                    nrr_platform_api::dns::AddressFamily::Ipv4,
+                    Duration::from_millis(50),
+                );
+                assert!(matches!(
+                    nx,
+                    Err(crate::dns_resolver::ResolveError::NoRecords)
+                ));
+            }
+        };
+
+        answer_many();
+        assert_eq!(inner.calls(), 1, "one warm-up enumeration");
+
+        observer.fire();
+        answer_many();
+        assert_eq!(inner.calls(), 2, "one more after the network changed");
+    }
+
+    /// The same cache also answers to a DNS-configuration change on its own
+    /// feed — a DHCP-pushed domain or a VPN client's namespace reaches the
+    /// same warm-up worker without a link or route event, and a burst that
+    /// touches both feeds together still costs one enumeration.
+    #[test]
+    fn nxdomain_answers_enumerate_once_per_dns_config_change_and_once_per_burst() {
+        let inner = Arc::new(CountingServers {
+            calls: Default::default(),
+            answer: vec![nrr_platform_api::dns::UpstreamDnsCandidate::new(
+                Some(2),
+                std::net::Ipv4Addr::new(192, 0, 2, 53),
+            )],
+        });
+        let network = ManualObserver::default();
+        let dns_config = ManualObserver::default();
+        let servers = cached_system_dns(Arc::clone(&inner) as _, &network, &dns_config);
+        let private = private_resolvers_from(Arc::clone(&servers));
+        assert!(private(Duration::from_millis(50)).is_empty());
+        assert_eq!(inner.calls(), 1, "one warm-up enumeration");
+
+        dns_config.fire();
+        assert!(private(Duration::from_secs(2)).is_empty());
+        assert_eq!(inner.calls(), 2, "the DNS-config feed alone re-read it");
+
+        for _ in 0..5 {
+            network.fire();
+            dns_config.fire();
+        }
+        assert!(private(Duration::from_secs(2)).is_empty());
+        assert_eq!(inner.calls(), 3, "a burst on both feeds is one more read");
+    }
+
+    /// Enumerates as slowly as a PowerShell run.
+    struct SlowServers {
+        calls: std::sync::atomic::AtomicUsize,
+        took: Duration,
+    }
+
+    impl SystemDnsServersPort for SlowServers {
+        fn upstream_candidates_v4(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsCandidate> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.took);
+            vec![nrr_platform_api::dns::UpstreamDnsCandidate::new(
+                Some(2),
+                std::net::Ipv4Addr::new(10, 0, 0, 53),
+            )]
+        }
+    }
+
+    /// NXDOMAIN answers arriving while a change re-reads the resolvers keep to
+    /// their own budget and start no enumeration of their own; the next ones
+    /// find the list the change read.
+    #[test]
+    fn nxdomain_answers_during_a_re_read_keep_their_budget() {
+        let inner = Arc::new(SlowServers {
+            calls: Default::default(),
+            took: Duration::from_millis(600),
+        });
+        let observer = ManualObserver::default();
+        let servers = cached_system_dns(Arc::clone(&inner) as _, &observer, &observer);
+        let private = private_resolvers_from(servers);
+        let calls = || inner.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let wanted = vec![std::net::Ipv4Addr::new(10, 0, 0, 53)];
+        assert_eq!(private(Duration::from_secs(10)), wanted);
+
+        observer.fire();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            assert!(private(Duration::from_millis(20)).is_empty());
+            assert!(started.elapsed() < Duration::from_millis(400));
+        }
+        assert!(calls() <= 2, "the answers started no enumeration");
+
+        assert_eq!(private(Duration::from_secs(10)), wanted);
+        assert_eq!(calls(), 2);
+        for _ in 0..50 {
+            assert_eq!(private(Duration::ZERO), wanted);
+        }
+        assert_eq!(calls(), 2);
     }
 }

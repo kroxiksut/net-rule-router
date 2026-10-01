@@ -59,6 +59,7 @@ QString NrrNativeBridge::emitRpcRequest(const QString &operation, const QJsonObj
                 static_cast<size_t>(serialized.size()), stdout);
     std::fputc('\n', stdout);
     std::fflush(stdout);
+    emit rpcRequested(correlationId, operation);
     return correlationId;
 }
 
@@ -171,7 +172,7 @@ void NrrNativeBridge::launchMainGuiWithAction(const QString &section, bool about
 
 void NrrNativeBridge::openLogsFolder() {
     if (logsDirectory_.isEmpty()) {
-        qWarning() << "Logs directory was not resolved.";
+        qWarning() << "No logs folder in the launch context; nothing to open.";
         return;
     }
 #ifdef Q_OS_WIN

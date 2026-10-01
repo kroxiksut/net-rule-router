@@ -1,3 +1,9 @@
+# NetRuleRouter preset - version 1
+# name: RU Osnovnoy I Zarubezh - Secondary Route
+# description: Foreign social, messaging, AI, and developer services routed to secondary
+# author: NetRuleRouter contributors
+# preset_version: 1
+
 --- Domains
 account.jetbrains.com
 ai.google.dev
@@ -54,7 +60,6 @@ youtu.be
 *.linkedin.com
 *.mattermost.com
 *.medium.com
-*.meduza.io
 *.messenger.com
 *.midjourney.com
 *.mistral.ai
@@ -107,9 +112,6 @@ youtu.be
 *.z.ai
 *.zoom.us
 
-*.rutracker.org  # Torrent trackers
-*.rutracker.cc  # Torrent trackers
-
 *.coursera.org  # Developer and IT services measured as unreachable from this country
 *.gitlab.com  # Developer and IT services measured as unreachable from this country
 *.intel.com  # Developer and IT services measured as unreachable from this country
@@ -138,18 +140,18 @@ dataspell.exe
 dataspell64.exe
 discord.exe
 fleet.exe
-gateway.exe
-gateway64.exe
+# gateway.exe    # JetBrains Gateway: имя процесса слишком общее, проверьте у себя
+# gateway64.exe    # JetBrains Gateway: имя процесса слишком общее, проверьте у себя
 goland.exe
 goland64.exe
 idea.exe
 idea64.exe
 jetbrains-toolbox.exe
-line.exe
+# line.exe    # LINE: имя процесса слишком общее, проверьте у себя
 mps.exe
 phpstorm.exe
 phpstorm64.exe
-poe.exe
+# poe.exe    # Poe: имя процесса слишком общее, проверьте у себя
 pycharm.exe
 pycharm64.exe
 rider.exe
@@ -159,7 +161,7 @@ rubymine64.exe
 signal.exe
 skype.exe
 slack.exe
-teams.exe
+# teams.exe    # Microsoft Teams: имя процесса слишком общее, проверьте у себя
 telegram.exe
 viber.exe
 webstorm.exe

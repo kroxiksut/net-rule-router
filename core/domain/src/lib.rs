@@ -22,7 +22,6 @@ pub mod address_class;
 pub mod alert;
 pub mod app_offer;
 pub mod auto_rule_budget;
-pub mod block8_outputs;
 // Block notices: folds a stream of blocked attempts into readable episodes and
 // owns the mute rules, so every surface answers "show this?" the same way.
 pub mod block_notice;
@@ -62,8 +61,8 @@ pub mod rules_json_codec;
 pub mod rules_revision;
 pub mod shared_ip;
 pub mod storage_policy;
-// Block T (traffic counter) — pure accounting core: per-interface octet deltas
-// bucketed by route role, with reset detection and prime-on-first-sight.
+// Traffic-counter accounting core: per-interface octet deltas bucketed by
+// route role, with reset detection and prime-on-first-sight.
 pub mod traffic_accountant;
 pub mod user_principal;
 pub mod validation;
@@ -80,6 +79,8 @@ pub use canonical::RuleAction;
 // sets for comparison and has to fold names exactly as validation does.
 pub use nrr_shared::app_identity;
 pub use nrr_shared::auto_rule::{AutoRuleReason, RuleOrigin};
+// Storage re-reads a stored protocol mask with the same question the wire asks.
+pub use nrr_shared::ipc_payloads::{is_valid_kill_switch_protocols, KILL_SWITCH_PROTOCOLS_ALL};
 pub use nrr_shared::{BindingSource, RouteBehaviorMode, RouteRole};
 
 /// Stable identity reference for a network adapter.
@@ -190,8 +191,9 @@ impl fmt::Display for RuleId {
 ///
 /// # ExactIp semantics
 ///
-/// `ExactIp(addr)` matches only the exact IPv4 address. CIDR and IPv6 are
-/// unsupported. `IpAddr::V6` inputs are rejected at normalization time.
+/// `ExactIp(text)` matches one exact IPv4 or IPv6 address. It holds the value
+/// as written in the `--- IP` section; validation parses it, and a value that
+/// is not an address (a subnet, a range, a name) is refused there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AddressMatch {
     /// Matches the exact FQDN only (runtime priority tier 1 — highest).
@@ -204,9 +206,8 @@ pub enum AddressMatch {
     /// Zone name is the suffix label — e.g. `ru`, `com`, `intra`, `corp`.
     /// Runtime priority vs `ExactIp` is user-configurable (default: `ExactIp` wins).
     Zone(String),
-    /// Matches one exact IPv4 address (runtime priority tier 3 by default; configurable vs Zone).
-    /// No CIDR prefix matching — that is not supported.
-    ExactIp(std::net::IpAddr),
+    /// Matches one exact address (runtime priority tier 3 by default; configurable vs Zone).
+    ExactIp(String),
 }
 
 impl AddressMatch {
@@ -218,7 +219,7 @@ impl AddressMatch {
             Self::ExactFqdn(label) => label.clone(),
             Self::SuffixDomain(label) => format!("*.{label}"),
             Self::Zone(name) => name.clone(),
-            Self::ExactIp(addr) => addr.to_string(),
+            Self::ExactIp(text) => text.clone(),
         }
     }
 }
@@ -787,8 +788,7 @@ mod tests {
 
     #[test]
     fn address_match_exact_ip_display() {
-        let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));
-        let m = AddressMatch::ExactIp(addr);
+        let m = AddressMatch::ExactIp("203.0.113.7".to_string());
         assert_eq!(m.to_display_string(), "203.0.113.7");
     }
 

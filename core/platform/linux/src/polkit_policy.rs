@@ -10,20 +10,22 @@
 //! it. The action ids come from the contracts crate, so the names polkit
 //! registers and the names the service asks under cannot drift.
 //!
-//! ## Why four actions and not one
+//! ## Why three actions and not one
 //!
 //! An administrator writing a rule wants to distinguish "may edit the shared
-//! baseline everyone falls back to" from "may take the network apart to
-//! recover it" from "may switch protection off". One coarse action would force
-//! them to grant all three together or none.
+//! baseline everyone falls back to" (rolling it back included) from "may switch
+//! protection off" from "may erase shared history". One coarse action would
+//! force them to grant all three together or none.
 //!
 //! ## Defaults
 //!
-//! `auth_admin_keep` for all four: an ordinary user is asked for an
-//! administrator's password, and the grant is remembered for a short while so a
-//! multi-step flow does not prompt at every step. `allow_inactive` is `no` —
-//! a session that is not the one at the console does not get to reshape the
-//! machine's network.
+//! Only the active console session is asked (`auth_admin_keep`: an
+//! administrator's password, remembered briefly so a multi-step flow does not
+//! prompt at every step). Every other subject gets `no` — an inactive local
+//! session and a remote one (`allow_any`: SSH, cron) alike. A session not at the
+//! console does not reshape the machine's network, and a remote one must not be
+//! the more privileged of the two. No console verb needs these actions: an
+//! administrator over SSH acts as root, whom polkit answers without them.
 //!
 //! `#[cfg(target_os = "linux")]`: a Linux-only install artefact, kept next to
 //! `systemd`, which writes it as part of the install plan.
@@ -34,7 +36,6 @@ use std::path::{Path, PathBuf};
 
 use nrr_shared::ipc_transport::{
     ACTION_CLEAR_SHARED_DATA, ACTION_DISABLE_PROTECTION, ACTION_EDIT_BASELINE,
-    ACTION_RECOVER_NETWORK,
 };
 
 /// Where polkit reads action definitions from.
@@ -42,7 +43,7 @@ pub const POLKIT_ACTIONS_DIR: &str = "/usr/share/polkit-1/actions";
 
 /// Our action file. Named for the product like the unit and the logrotate
 /// drop-in, so an administrator finds every install artefact under one name.
-pub const POLKIT_ACTIONS_NAME: &str = "netrulerouter.policy";
+pub const POLKIT_ACTIONS_NAME: &str = nrr_shared::product_identity::POLKIT_ACTIONS_FILE_NAME;
 
 /// Absolute path of the installed action file.
 pub fn actions_file() -> PathBuf {
@@ -62,20 +63,13 @@ struct ActionSpec {
     message_ru: &'static str,
 }
 
-const ACTIONS: [ActionSpec; 4] = [
+const ACTIONS: [ActionSpec; 3] = [
     ActionSpec {
         id: ACTION_EDIT_BASELINE,
         label_en: "Edit the shared routing rules",
         label_ru: "Изменение общих правил маршрутизации",
         message_en: "Authentication is required to change the routing rules every user on this computer falls back to.",
         message_ru: "Требуется подтверждение, чтобы изменить правила маршрутизации, общие для всех пользователей компьютера.",
-    },
-    ActionSpec {
-        id: ACTION_RECOVER_NETWORK,
-        label_ru: "Восстановление сетевых настроек",
-        label_en: "Restore network settings",
-        message_en: "Authentication is required to restore this computer's network settings.",
-        message_ru: "Требуется подтверждение, чтобы восстановить сетевые настройки компьютера.",
     },
     ActionSpec {
         id: ACTION_DISABLE_PROTECTION,
@@ -92,6 +86,23 @@ const ACTIONS: [ActionSpec; 4] = [
         message_ru: "Требуется подтверждение, чтобы удалить данные, общие для всех пользователей компьютера.",
     },
 ];
+
+/// polkit's three implicit authorizations, by where the subject sits.
+struct ActionDefaults {
+    /// Any subject outside a local session: SSH, cron, a system service.
+    any: &'static str,
+    /// A local session that is not the one at the console.
+    inactive: &'static str,
+    /// The active local session.
+    active: &'static str,
+}
+
+/// The same for every action: see "Defaults" in the module doc.
+const DEFAULTS: ActionDefaults = ActionDefaults {
+    any: "no",
+    inactive: "no",
+    active: "auth_admin_keep",
+};
 
 /// Render the polkit action file.
 pub fn render_actions_file() -> String {
@@ -125,9 +136,15 @@ pub fn render_actions_file() -> String {
             escape(action.message_ru)
         ));
         s.push_str("    <defaults>\n");
-        s.push_str("      <allow_any>auth_admin_keep</allow_any>\n");
-        s.push_str("      <allow_inactive>no</allow_inactive>\n");
-        s.push_str("      <allow_active>auth_admin_keep</allow_active>\n");
+        s.push_str(&format!("      <allow_any>{}</allow_any>\n", DEFAULTS.any));
+        s.push_str(&format!(
+            "      <allow_inactive>{}</allow_inactive>\n",
+            DEFAULTS.inactive
+        ));
+        s.push_str(&format!(
+            "      <allow_active>{}</allow_active>\n",
+            DEFAULTS.active
+        ));
         s.push_str("    </defaults>\n");
         s.push_str("  </action>\n");
     }
@@ -200,6 +217,39 @@ mod tests {
             rendered.matches("xml:lang=\"ru\"").count(),
             ACTIONS.len() * 2
         );
+    }
+
+    /// A remote subject is never better placed than an inactive local session:
+    /// both are refused outright, only the console is asked. Read back from the
+    /// rendered file, per action, so a per-action override cannot slip past.
+    #[test]
+    fn only_the_active_console_session_is_ever_asked() {
+        let rendered = render_actions_file();
+        for action in ACTIONS.iter() {
+            let open = format!("<action id=\"{}\">", action.id);
+            let start = rendered.find(&open).expect("action is declared");
+            let block = &rendered[start..];
+            let block = &block[..block.find("</action>").expect("action is closed")];
+            let value = |tag: &str| {
+                let open = format!("<{tag}>");
+                let from = block.find(&open)? + open.len();
+                let to = block[from..].find(&format!("</{tag}>"))? + from;
+                Some(&block[from..to])
+            };
+            assert_eq!(value("allow_any"), Some("no"), "{}: allow_any", action.id);
+            assert_eq!(
+                value("allow_inactive"),
+                Some("no"),
+                "{}: allow_inactive",
+                action.id
+            );
+            assert_eq!(
+                value("allow_active"),
+                Some("auth_admin_keep"),
+                "{}: allow_active",
+                action.id
+            );
+        }
     }
 
     #[test]

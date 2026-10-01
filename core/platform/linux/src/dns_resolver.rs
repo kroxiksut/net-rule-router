@@ -78,6 +78,8 @@ pub struct LinuxDnsResolver {
     timeout: Duration,
     /// Ceiling on the whole call; the per-server wait is what is left of it.
     budget: Duration,
+    /// Always 53 outside tests, which cannot bind a privileged port.
+    port: u16,
     /// Transaction ids are sequential from a per-process starting point rather
     /// than random: the id is a check that a datagram answers OUR question, and
     /// the real defence against a forged answer is that we also compare the
@@ -107,8 +109,15 @@ impl LinuxDnsResolver {
             servers,
             timeout: QUERY_TIMEOUT,
             budget: RESOLVE_BUDGET,
+            port: 53,
             next_id: AtomicU16::new(seed),
         }
+    }
+
+    #[cfg(test)]
+    fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
     }
 
     /// Shorten or lengthen the per-server wait. Used by the live test, which
@@ -152,7 +161,7 @@ impl LinuxDnsResolver {
             encode_query(id, canonical, family).ok_or_else(|| DnsResolverError::InvalidName {
                 name: canonical.to_owned(),
             })?;
-        let target = SocketAddr::new(server.into(), 53);
+        let target = SocketAddr::new(server.into(), self.port);
 
         match self.ask_udp(target, &query, id, canonical, family, wait) {
             // The answer did not fit in a datagram. The protocol's own remedy is
@@ -339,14 +348,21 @@ impl DnsResolverPort for LinuxDnsResolver {
         let mut last = DnsResolverError::Timeout {
             hostname: canonical.clone(),
         };
+        // A server left unasked because the budget ran out counts as timed out.
+        let mut reached_a_server = false;
         let deadline = Instant::now() + self.budget;
-        for candidate in servers {
+        for candidate in &servers {
             // The budget covers the list, not each entry: a machine listing
             // three unreachable servers must not cost the caller three waits.
             if self.wait_left(deadline).is_none() {
                 break;
             }
-            match self.ask(candidate.server, &canonical, family, deadline) {
+            let outcome = self.ask(candidate.server, &canonical, family, deadline);
+            reached_a_server |= !matches!(
+                outcome,
+                Err(DnsResolverError::Network { .. } | DnsResolverError::Timeout { .. })
+            );
+            match outcome {
                 Ok(DnsAnswer::Addresses { addresses, min_ttl }) => {
                     return Ok(ResolvedRecord {
                         canonical_hostname: canonical,
@@ -376,6 +392,9 @@ impl DnsResolverPort for LinuxDnsResolver {
                 }
                 Err(e) => last = e,
             }
+        }
+        if !reached_a_server {
+            self.servers.report_all_unreachable(&servers);
         }
         Err(last)
     }
@@ -451,6 +470,95 @@ options edns0
             "two dead servers took {:?}, the budget was 400 ms",
             started.elapsed()
         );
+    }
+
+    type Reports = std::sync::Arc<std::sync::Mutex<Vec<Vec<UpstreamDnsCandidate>>>>;
+
+    /// A fixed server list that remembers every unreachable report.
+    struct ReportingServers {
+        servers: Vec<UpstreamDnsCandidate>,
+        reports: Reports,
+    }
+
+    impl SystemDnsServersPort for ReportingServers {
+        fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+            self.servers.clone()
+        }
+
+        fn report_all_unreachable(&self, servers: &[UpstreamDnsCandidate]) {
+            self.reports
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(servers.to_vec());
+        }
+    }
+
+    fn reporting_resolver(servers: &[Ipv4Addr], port: u16) -> (LinuxDnsResolver, Reports) {
+        let reports = Reports::default();
+        let port_servers = ReportingServers {
+            servers: servers
+                .iter()
+                .map(|ip| UpstreamDnsCandidate::new(None, *ip))
+                .collect(),
+            reports: std::sync::Arc::clone(&reports),
+        };
+        let resolver = LinuxDnsResolver::with_servers(Box::new(port_servers))
+            .with_port(port)
+            .with_timeout(Duration::from_millis(500))
+            .with_budget(Duration::from_secs(2));
+        (resolver, reports)
+    }
+
+    /// A port on loopback nobody listens on: a query there is refused at once.
+    fn closed_loopback_port() -> u16 {
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|s| s.local_addr())
+            .map(|a| a.port())
+            .expect("an ephemeral loopback port")
+    }
+
+    #[test]
+    fn a_lookup_that_reaches_no_server_reports_the_list_once() {
+        let port = closed_loopback_port();
+        let (resolver, reports) = reporting_resolver(
+            &[Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 3)],
+            port,
+        );
+
+        assert!(resolver
+            .resolve("example.com", AddressFamily::Ipv4)
+            .is_err());
+
+        let reports = reports.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].len(), 2);
+    }
+
+    /// One server answering, even with a refusal, proves the list is not stale.
+    #[test]
+    fn a_lookup_one_server_answered_reports_nothing() {
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback listener");
+        let port = listener.local_addr().expect("a bound address").port();
+        let answering = std::thread::spawn(move || {
+            let mut buffer = [0u8; MAX_DATAGRAM];
+            let (read, peer) = listener.recv_from(&mut buffer).expect("one query");
+            // Echo the question as a REFUSED response.
+            buffer[2] |= 0x80;
+            buffer[3] = (buffer[3] & 0xF0) | 5;
+            listener
+                .send_to(&buffer[..read], peer)
+                .expect("the answer is sent");
+        });
+        let (resolver, reports) =
+            reporting_resolver(&[Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::LOCALHOST], port);
+
+        assert!(matches!(
+            resolver.resolve("example.com", AddressFamily::Ipv4),
+            Err(DnsResolverError::Refused { code: 5, .. })
+        ));
+        answering.join().expect("the answering thread finishes");
+
+        assert!(reports.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
     }
 
     #[test]

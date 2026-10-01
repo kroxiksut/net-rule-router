@@ -236,8 +236,27 @@ fn client_bound_after_udp_datagrams(
     // EARLIER datagram, which is a reply this caller has already seen — the
     // stack then never gets the steps its last datagram needs.
     let mut depth_at_last_send: Option<usize> = None;
-    for _ in 0..1000 {
-        now_ms += 5;
+    // The dial and the reader run on worker threads. While the stack waits on
+    // one, the loop waits too, on a frozen clock and without spending a tick:
+    // a loaded machine then costs wall time, never the outcome.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut ticks = 0;
+    while ticks < 1000 {
+        let dial_pending = stack
+            .udp_binds
+            .values()
+            .any(|bind| !bind.pending.is_empty());
+        let next_held = sent > 0 && sent < datagrams && !ready_for_next(&stack);
+        if dial_pending || next_held {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relay's worker never reported back"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        } else {
+            now_ms += 5;
+            ticks += 1;
+        }
         let t = SmolInstant::from_millis(i64::try_from(now_ms).unwrap_or(i64::MAX));
         client.poll(t, &mut client_device, &mut client_sockets);
         if sent < datagrams && (sent == 0 || ready_for_next(&stack)) {
@@ -257,14 +276,6 @@ fn client_bound_after_udp_datagrams(
         }
         if depth_at_last_send.is_some_and(|depth| guard(&s2c).len() > depth) {
             break;
-        }
-        // The dial runs on a worker; give it the chance to land.
-        if stack
-            .udp_binds
-            .values()
-            .any(|bind| !bind.pending.is_empty())
-        {
-            std::thread::sleep(Duration::from_millis(1));
         }
     }
     let emitted: Vec<Vec<u8>> = guard(&s2c).iter().cloned().collect();

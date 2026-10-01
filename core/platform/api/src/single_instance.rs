@@ -1,16 +1,14 @@
 //! Neutral "only one of this surface may run per user session" port.
 //!
-//! The desktop surfaces used to decide this by creating a file in the runtime
-//! directory: whoever managed `CREATE_NEW` was the primary. A file makes a poor
-//! owner. Delete it — a user cleaning out `%TEMP%`, a disk cleaner, a support
-//! script — and the next launch claims primacy while the first process is still
-//! running, so the machine ends up with two trays and two GUIs. The same file
-//! also has to be *reclaimed* after a crash, which needs a liveness probe on a
-//! recorded PID, which Windows recycles.
+//! A file in the runtime directory (whoever manages `CREATE_NEW` is primary)
+//! makes a poor owner: delete it — a user cleaning out `%TEMP%`, a disk
+//! cleaner, a support script — and the next launch claims primacy while the
+//! first process is still running, so the machine ends up with two trays and
+//! two GUIs. It also has to be *reclaimed* after a crash, which needs a
+//! liveness probe on a recorded PID, which Windows recycles.
 //!
-//! A kernel object has neither problem: it cannot be deleted from a file
-//! manager, and the OS releases it when the owning process dies, however it
-//! died. That is the mechanism this port exposes — existence of the claim is
+//! A kernel object has neither problem: deleting a file does not end it, and
+//! the OS releases it when the owning process dies, however it died. That is the mechanism this port exposes — existence of the claim is
 //! the answer, and the OS maintains it.
 //!
 //! The claim is scoped to the user's session, not the machine: two users logged

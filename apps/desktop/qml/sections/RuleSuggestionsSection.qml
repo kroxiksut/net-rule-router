@@ -553,27 +553,6 @@ ColumnLayout {
         Accessible.name: text
     }
 
-    /// Nothing to act on because the main connection already reaches every
-    /// address here. Silence would be worse than a plain statement: the user is
-    /// looking at a browser error and came here for an answer. The sentence
-    /// states CONNECTIVITY and stops there — a refused certificate is checked
-    /// inside the browser and never reaches the network, so we do not observe
-    /// it and must not name it.
-    Label {
-        Layout.fillWidth: true
-        Layout.preferredWidth: 0
-        visible: root.uiRevision >= 0
-            && section.mainLinkFilteredGroups.length === 0
-            && section.servedByMainLinkCount > 0
-        wrapMode: Text.Wrap
-        color: root.mutedTextColor
-        text: root.tr("rules.suggestions.inbox.empty-served-by-main-link",
-                "Connections to these {n} address(es) complete over your main connection. If a site still refuses to open, what you are seeing is not a routing failure — the traffic gets through, so a rule here would not change it.")
-            .replace("{n}", String(section.servedByMainLinkCount))
-        Accessible.role: Accessible.StaticText
-        Accessible.name: text
-    }
-
     // Toolbar. A single RowLayout demanded the SUM of every control's width as
     // the page's minimum, so the filter chip and its long checkbox pushed the
     // whole section past the window edge. A Flow wraps to the next line
@@ -786,14 +765,34 @@ ColumnLayout {
             width: suggestionsScroll.availableWidth
             spacing: root.uiTheme.spacingSm
 
+            // Says why the frame is empty, and only when the reason is the
+            // user's own search or filter or the "main route handles it"
+            // toggle; otherwise the intro above already explains.
+            //
+            // The served case states CONNECTIVITY and stops there: the user is
+            // often looking at a browser error, and a refused certificate is
+            // checked inside the browser, never on the network, so we must not
+            // name it.
             Label {
+                id: emptyFrameNote
+                readonly property bool hiddenAsServed: section.mainLinkFilteredGroups.length === 0
+                    && section.servedByMainLinkCount > 0
+                readonly property bool narrowedByUser: section.searchQuery.trim() !== ""
+                    || section.consumerFilter !== ""
                 Layout.fillWidth: true
+                // Recipe 39: the served sentence is long enough to widen the page.
+                Layout.preferredWidth: 0
                 Layout.topMargin: root.uiTheme.spacingMd
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode: Text.Wrap
                 visible: section.displayGroups.length === 0
+                    && (emptyFrameNote.hiddenAsServed || emptyFrameNote.narrowedByUser)
                 color: root.mutedTextColor
-                text: root.tr("rules.suggestions.inbox.search-empty", "No addresses match your search.")
+                text: root.uiRevision >= 0 && emptyFrameNote.hiddenAsServed
+                    ? root.tr("rules.suggestions.inbox.empty-served-by-main-link",
+                        "Connections to these {n} address(es) complete over your main connection. If a site still refuses to open, what you are seeing is not a routing failure — the traffic gets through, so a rule here would not change it.")
+                        .replace("{n}", String(section.servedByMainLinkCount))
+                    : root.tr("rules.suggestions.inbox.search-empty", "No addresses match your search.")
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
             }
@@ -836,8 +835,8 @@ ColumnLayout {
                                 theme: root.uiTheme
                                 flat: true
                                 text: section._isExpanded(modelData.domain)
-                                    ? root.tr("settings.routing.show-less", "Hide details")
-                                    : root.tr("settings.routing.show-more", "Show details")
+                                    ? root.tr("action.hide-details", "Hide details")
+                                    : root.tr("action.show-details", "Show details")
                                 Accessible.role: Accessible.Button
                                 Accessible.name: text
                                 onClicked: section._toggleExpanded(modelData.domain)
@@ -863,9 +862,9 @@ ColumnLayout {
                                     color: root.mutedTextColor
                                     text: root.tr("rules.suggestions.table.group-hosts", "Hosts observed: {count}")
                                         .replace("{count}", String(modelData.hosts.length))
-                                        + (modelData.pendingIds.length > 0
+                                        + (Pure.countShownPendingAutoRuleHosts(modelData) > 0
                                             ? " · " + root.tr("rules.suggestions.table.status-pending", "Pending")
-                                                + " (" + modelData.pendingIds.length + ")"
+                                                + " (" + Pure.countShownPendingAutoRuleHosts(modelData) + ")"
                                             : "")
                                         + (modelData.dismissedIds.length > 0
                                             ? " · " + root.tr("rules.suggestions.table.status-dismissed", "Dismissed")
@@ -935,7 +934,7 @@ ColumnLayout {
                                             visible: (modelData.consumers || []).length
                                                 > section.consumersShownCollapsed
                                             text: section._consumersExpanded(modelData.domain)
-                                                ? root.tr("settings.routing.show-less", "Hide details")
+                                                ? root.tr("action.hide-details", "Hide details")
                                                 : root.tr("rules.suggestions.inbox.show-more-count",
                                                         "Show {count} more")
                                                     .replace("{count}",

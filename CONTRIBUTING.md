@@ -43,10 +43,10 @@ existing connections traffic leaves through. Tracker blocking, ad filtering,
 traffic obfuscation and anonymity are out of scope — not because they are bad
 ideas, but because they are a different product.
 
-**The scope is deliberately narrow.** Multiple saved profiles, three or more
-routes at once, automated switching and richer rule types are out of scope: the
-product keeps one active configuration per user. A patch that widens that scope
-cannot be merged, so please ask before writing one.
+**Two routes, one active configuration per user.** Traffic goes over your main
+connection or the additional one, and each user of the machine has one rule set.
+What is planned next is in [`ROADMAP.md`](ROADMAP.md); a patch that goes beyond
+it cannot be merged, so please ask before writing one.
 
 ## Building
 
@@ -103,7 +103,8 @@ numbers, block numbers, ticket ids or dates in comments — a hygiene check in
 ## Architectural rules a review will check
 
 These are the ones that reject otherwise-good patches, so they are worth knowing
-before you write code. [`ARCHITECTURE.md`](ARCHITECTURE.md) has the full map.
+before you write code. [`AGENTS.md`](AGENTS.md) has the full set, and
+[`STRUCTURE.md`](STRUCTURE.md) the repository layout.
 
 **Crate boundaries are enforced by tests, not by convention.** Business logic
 lives in `core/`, never in C++ or QML. The background service must not import
@@ -140,8 +141,8 @@ Diagnostic and log lines written from Rust are the exception: they stay English.
 ## Documentation
 
 Several documents exist as English and Russian pairs (`README.md` ↔
-`README_RU.md`, `ARCHITECTURE.md` ↔ `ARCHITECTURE_RU.md`). Edit both in one
-change, English first.
+`README_RU.md`, `ROADMAP.md` ↔ `ROADMAP_RU.md`, and pages under `docs/en/` with a
+twin under `docs/ru/`). Edit both in one change, English first.
 
 Two house rules: **no emoji** anywhere in documentation, and public docs
 describe **what the user gets**, not how a mechanism works internally. Algorithms,

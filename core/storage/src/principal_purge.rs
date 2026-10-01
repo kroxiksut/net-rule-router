@@ -291,12 +291,12 @@ mod tests {
         let mut conn = migrated_conn();
         for principal in ["S-A", "S-B"] {
             conn.execute(
-                "INSERT INTO revisions (principal, revision_id, content_hash, rules_json, status,                  source, correlation_id, created_at)                  VALUES (?1, ?2, 'hash', '{}', 'active', 'gui-rules-edit', 'corr', 1)",
+                "INSERT INTO revisions (principal, revision_id, content_hash, rules_json, status, source, correlation_id, created_at) VALUES (?1, ?2, 'hash', '{}', 'active', 'gui-rules-edit', 'corr', 1)",
                 params![principal, format!("rev-{principal}")],
             )
             .expect("revision");
             conn.execute(
-                "INSERT INTO active_revision_pointer (principal, revision_id, activated_at)                  VALUES (?1, ?2, 1)",
+                "INSERT INTO active_revision_pointer (principal, revision_id, activated_at) VALUES (?1, ?2, 1)",
                 params![principal, format!("rev-{principal}")],
             )
             .expect("pointer");

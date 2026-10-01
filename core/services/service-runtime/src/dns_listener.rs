@@ -32,8 +32,8 @@ use crate::dns_resolver::{
 };
 use crate::dns_wire::{
     build_a_response, build_error_response, build_negative_response, only_v4,
-    parse_address_response, parse_question, AddressResponseOutcome, QTYPE_A, QTYPE_AAAA,
-    RCODE_NOERROR, RCODE_NXDOMAIN, RCODE_SERVFAIL,
+    parse_address_response, parse_question, AddressResponseOutcome, ParsedQuestion, QTYPE_A,
+    QTYPE_AAAA, RCODE_NOERROR, RCODE_NXDOMAIN, RCODE_SERVFAIL,
 };
 
 /// TTL (seconds) stamped on resolver-built `A` responses. Deliberately SHORT so
@@ -99,16 +99,9 @@ pub enum ListenerAction {
     Drop,
 }
 
-/// The intercept listener. Holds the resolver ports plus the upstream DNS server
-/// to forward non-intercepted queries to (captured *before* the DNS redirect,
-/// so split-horizon keeps working).
-/// Lists the machine's private resolvers, newest answer each call.
-pub type PrivateResolversFn = Arc<dyn Fn() -> Vec<std::net::Ipv4Addr> + Send + Sync>;
-
-/// Lists the namespaces connections claim, with the servers that answer for
-/// them. The same source the redirect steps aside for, so the two cannot
-/// disagree about which namespaces exist.
-pub type ClaimedNamespacesFn = crate::dns_resolver_service::DnsNamespaceExemptionsFn;
+/// Lists the machine's private resolvers, newest answer each call; empty when
+/// the list is not known within the given budget.
+pub type PrivateResolversFn = Arc<dyn Fn(Duration) -> Vec<std::net::Ipv4Addr> + Send + Sync>;
 
 /// The network domain the user named for short names, for a connection that
 /// announces none. `None` when the setting is off.
@@ -168,6 +161,9 @@ impl Drop for RuleHostLanePermit<'_> {
     }
 }
 
+/// The intercept listener. Holds the resolver ports plus the upstream DNS server
+/// to forward non-intercepted queries to (captured *before* the DNS redirect,
+/// so split-horizon keeps working).
 pub struct DnsInterceptListener {
     oracle: Arc<dyn RuleHostOracle>,
     /// Keeps a slow upstream from holding every worker — see [`RuleHostLane`].
@@ -193,9 +189,10 @@ pub struct DnsInterceptListener {
     /// The machine's private resolvers, re-asked when one server calls a name
     /// non-existent. `None` keeps the single-server behaviour the listener had.
     private_resolvers: Option<PrivateResolversFn>,
-    /// Namespaces connections claim, used to complete a single-label name.
-    /// `None` leaves such names exactly as they arrive.
-    claimed_namespaces: Option<ClaimedNamespacesFn>,
+    /// Namespaces connections claim, as the resolver's guard last read them —
+    /// the set the redirect steps aside for, so the two cannot disagree.
+    /// `None` leaves single-label names exactly as they arrive.
+    claimed_namespaces: Option<crate::dns_resolver_service::ClaimsSnapshot>,
     short_name_suffix: Option<ShortNameSuffixFn>,
     /// Port the resolvers named by a connection listen on. Always 53 outside
     /// tests, which cannot bind it.
@@ -455,16 +452,19 @@ impl DnsInterceptListener {
 
     /// Wire the namespaces connections claim, so a single-label name can be
     /// completed the way the OS would have completed it. Crate-private: the
-    /// resolver service hands its own exemption source down, so no factory
-    /// can wire one and forget the other.
+    /// resolver service hands its own snapshot down, so no factory can wire
+    /// one and forget the other.
     #[must_use]
-    pub(crate) fn with_claimed_namespaces(mut self, namespaces: ClaimedNamespacesFn) -> Self {
+    pub(crate) fn with_claimed_namespaces(
+        mut self,
+        namespaces: crate::dns_resolver_service::ClaimsSnapshot,
+    ) -> Self {
         self.claimed_namespaces = Some(namespaces);
         self
     }
 
     /// Complete short names with a domain the user named, asked of the
-    /// resolvers every other name goes to.
+    /// machine's private resolvers first and the upstream last.
     #[must_use]
     pub fn with_short_name_suffix(mut self, suffix: ShortNameSuffixFn) -> Self {
         self.short_name_suffix = Some(suffix);
@@ -489,49 +489,57 @@ impl DnsInterceptListener {
     /// loopback carries none, so pointing every name at us took that away.
     /// The reply is rebuilt against the ORIGINAL question — a client discards
     /// an answer about a different name — and the completion is remembered so
-    /// an offer can name the full host.
-    fn complete_single_label(
+    /// an offer can name the full host. Only address questions are completed,
+    /// each probed with its own type: an answer of another type would be
+    /// cached by the client as a positive it never asked for.
+    pub(crate) fn complete_single_label(
         &self,
         query: &[u8],
         label: &str,
         budget: Duration,
     ) -> Option<Vec<u8>> {
+        let qtype = parse_question(query)?.qtype;
+        if qtype != QTYPE_A && qtype != QTYPE_AAAA {
+            return None;
+        }
+        // Before the server list: waiting for it spends this answer's budget.
+        let started = Instant::now();
         let mut attempts: Vec<(String, Vec<SocketAddr>)> = self
             .claimed_namespaces
             .as_ref()
             .map(|claims| {
-                claims()
-                    .into_iter()
+                claims
+                    .current()
+                    .iter()
                     .map(|claim| {
                         let servers = claim
                             .servers
-                            .into_iter()
-                            .map(|s| SocketAddr::from((s, self.resolver_port)))
+                            .iter()
+                            .map(|s| SocketAddr::from((*s, self.resolver_port)))
                             .collect();
-                        (claim.suffix, servers)
+                        (claim.suffix.clone(), servers)
                     })
                     .collect()
             })
             .unwrap_or_default();
-        // A domain the user named has no servers of its own: it is asked of
-        // the ones every other name goes to.
+        // A domain the user named has no servers of its own. Private resolvers
+        // go first: such a domain is usually internal, and on a split-horizon
+        // one the public upstream answers with the outside address.
         if let Some(suffix) = self.short_name_suffix.as_ref().and_then(|named| named()) {
             if !attempts.iter().any(|(claimed, _)| *claimed == suffix) {
-                let mut servers: Vec<SocketAddr> =
-                    self.upstream_dns.current().into_iter().collect();
+                let mut servers: Vec<SocketAddr> = Vec::new();
                 if let Some(private) = self.private_resolvers.as_ref() {
                     servers.extend(
-                        private()
+                        private(budget.saturating_sub(started.elapsed()))
                             .into_iter()
                             .take(MAX_PRIVATE_RETRIES)
                             .map(|s| SocketAddr::from((s, self.resolver_port))),
                     );
                 }
-                servers.dedup();
-                attempts.push((suffix, servers));
+                servers.extend(self.upstream_dns.current());
+                attempts.push((suffix, first_occurrences(servers)));
             }
         }
-        let started = Instant::now();
         for (suffix, servers) in attempts {
             let left = budget.saturating_sub(started.elapsed());
             if left.is_zero() {
@@ -539,7 +547,7 @@ impl DnsInterceptListener {
             }
             let full = format!("{label}.{suffix}");
             let id = crate::dns_resolver_ports::next_query_id();
-            let Some(probe) = crate::dns_wire::build_address_query(id, &full, QTYPE_A) else {
+            let Some(probe) = crate::dns_wire::build_address_query(id, &full, qtype) else {
                 continue;
             };
             for target in servers {
@@ -552,7 +560,7 @@ impl DnsInterceptListener {
                     continue;
                 };
                 if let crate::dns_wire::AddressResponseOutcome::Answers { addresses, min_ttl } =
-                    crate::dns_wire::parse_address_response(id, &full, QTYPE_A, &reply)
+                    crate::dns_wire::parse_address_response(id, &full, qtype, &reply)
                 {
                     if addresses.is_empty() {
                         continue;
@@ -567,7 +575,18 @@ impl DnsInterceptListener {
                     );
                     crate::short_name_completions::global_short_name_completions()
                         .record(label, &full);
-                    return build_a_response(query, &only_v4(&addresses), min_ttl.max(1));
+                    let ttl = min_ttl.max(1);
+                    if qtype == QTYPE_AAAA {
+                        let v6: Vec<std::net::Ipv6Addr> = addresses
+                            .iter()
+                            .filter_map(|a| match a {
+                                std::net::IpAddr::V6(v6) => Some(*v6),
+                                std::net::IpAddr::V4(_) => None,
+                            })
+                            .collect();
+                        return crate::dns_wire::build_aaaa_response(query, &v6, ttl);
+                    }
+                    return build_a_response(query, &only_v4(&addresses), ttl);
                 }
             }
         }
@@ -755,7 +774,10 @@ impl DnsInterceptListener {
     }
 
     pub fn answer_query(&self, query: &[u8]) -> ListenerAction {
-        self.answer_query_within(query, RULE_HOST_LANE_WAIT, QUERY_BUDGET)
+        let Some(q) = parse_question(query) else {
+            return ListenerAction::Forward; // unparseable → transparent proxy
+        };
+        self.answer_query_within(query, &q, RULE_HOST_LANE_WAIT, QUERY_BUDGET)
     }
 
     /// `lane_wait` is how long this caller may block for a rule-host slot. A
@@ -770,12 +792,10 @@ impl DnsInterceptListener {
     fn answer_query_within(
         &self,
         query: &[u8],
+        q: &ParsedQuestion,
         lane_wait: Duration,
         budget: Duration,
     ) -> ListenerAction {
-        let Some(q) = parse_question(query) else {
-            return ListenerAction::Forward; // unparseable → transparent proxy
-        };
         // answer the Firefox DoH canary with
         // NXDOMAIN for ANY qtype, BEFORE the rule-host gate (the canary is not a
         // rule host, so it would otherwise be forwarded raw and Firefox would keep
@@ -963,7 +983,13 @@ impl DnsInterceptListener {
     ) {
         let started = Instant::now();
         let left = || QUERY_BUDGET.saturating_sub(started.elapsed());
-        match self.answer_query_within(query, lane_wait, left()) {
+        // Parsed once: the direct path below reads the question at every step.
+        let question = parse_question(query);
+        let action = match &question {
+            Some(q) => self.answer_query_within(query, q, lane_wait, left()),
+            None => ListenerAction::Forward, // unparseable → transparent proxy
+        };
+        match action {
             ListenerAction::Respond(resp) => {
                 let _ = socket.send_to(&resp, src);
             }
@@ -978,58 +1004,73 @@ impl DnsInterceptListener {
             }
             ListenerAction::Drop => {}
             ListenerAction::ForwardFiltered => {
+                // Only a parsed question yields this action.
+                let Some(q) = question.as_ref() else {
+                    return;
+                };
                 let Some(resp) = self.forward_within(query, left()) else {
                     self.answer_servfail(socket, query, src);
                     return;
                 };
-                let (steered, still_pinned) = self.steer_direct_answer(query, resp, left());
-                // under the armed block-all with
-                // fake-IP active, hand the client a virtual address instead:
-                // the relay carries the flow out the primary, nothing is
-                // compiled on the answer path, no race to lose.
-                if let Some(fake) = self.fake_direct_response(query, &steered) {
-                    // Gate before answering: the app may already hold these
-                    // real addresses (own cache / in-app DoH) and will not
-                    // re-resolve, so the virtual answer never reaches it and
-                    // its first connect meets the armed block-all.
-                    self.gate_direct_answer(query, &steered);
-                    let _ = socket.send_to(&fake, src);
-                    return;
-                }
-                // Collateral rescue — steering could not produce a clean
-                // answer (every address is committed to the secondary
-                // link). With the fake-IP stack live, a virtual address
-                // routes the host by NAME out the primary; the old
-                // fail-open answer sent it out the VPN link instead
-                // (geo captcha / kill-switch block).
-                if still_pinned {
-                    // Reported here, not inside the rescue, so the evidence
-                    // is the same with or without the fake-IP stack.
-                    self.note_collateral_host(query);
-                    if !self.companion_is_pending(query) {
-                        if let Some(fake) = self.fake_collateral_response(query, &steered) {
-                            // Same reason as above: a cached real address
-                            // bypasses the virtual answer entirely.
-                            self.gate_direct_answer(query, &steered);
-                            let _ = socket.send_to(&fake, src);
-                            return;
-                        }
-                    }
-                }
-                // while the block-all is armed, install the
-                // known-direct exemption BEFORE the client learns these
-                // addresses (its first connect would otherwise race
-                // the catch-all and be dropped with no retry).
-                self.gate_direct_answer(query, &steered);
-                let _ = socket.send_to(&steered, src);
+                let reply = self.answer_direct(query, q, resp, left());
+                let _ = socket.send_to(&reply, src);
             }
         }
+    }
+
+    /// What a DIRECT host's client hears, given the upstream's reply to its
+    /// `A` question. `budget` pays for the one re-query steering may make.
+    fn answer_direct(
+        &self,
+        query: &[u8],
+        q: &ParsedQuestion,
+        upstream_reply: Vec<u8>,
+        budget: Duration,
+    ) -> Vec<u8> {
+        let (steered, still_pinned) = self.steer_direct_answer(query, q, upstream_reply, budget);
+        // under the armed block-all with
+        // fake-IP active, hand the client a virtual address instead:
+        // the relay carries the flow out the primary, nothing is
+        // compiled on the answer path, no race to lose.
+        if let Some(fake) = self.fake_direct_response(query, q, &steered) {
+            // Gate before answering: the app may already hold these
+            // real addresses (own cache / in-app DoH) and will not
+            // re-resolve, so the virtual answer never reaches it and
+            // its first connect meets the armed block-all.
+            self.gate_direct_answer(query, q, &steered);
+            return fake;
+        }
+        // Collateral rescue — steering could not produce a clean
+        // answer (every address is committed to the secondary
+        // link). With the fake-IP stack live, a virtual address
+        // routes the host by NAME out the primary; the old
+        // fail-open answer sent it out the VPN link instead
+        // (geo captcha / kill-switch block).
+        if still_pinned {
+            // Reported here, not inside the rescue, so the evidence
+            // is the same with or without the fake-IP stack.
+            self.note_collateral_host(q);
+            if !self.companion_is_pending(q) {
+                if let Some(fake) = self.fake_collateral_response(query, q, &steered) {
+                    // Same reason as above: a cached real address
+                    // bypasses the virtual answer entirely.
+                    self.gate_direct_answer(query, q, &steered);
+                    return fake;
+                }
+            }
+        }
+        // while the block-all is armed, install the
+        // known-direct exemption BEFORE the client learns these
+        // addresses (its first connect would otherwise race
+        // the catch-all and be dropped with no retry).
+        self.gate_direct_answer(query, q, &steered);
+        steered
     }
 
     /// steer one upstream reply for a DIRECT
     /// (non-rule) host: drop `A` records the kill-switch pins to the secondary
     /// so the client connects via addresses that stay on the primary/default
-    /// path. Google's front-end answers rotate over a large pool, so filtering
+    /// path. A CDN front-end's answers rotate over a large pool, so filtering
     /// usually leaves usable addresses; when the whole answer is pinned, ONE
     /// upstream re-query is tried (a fresh answer usually rotates), and if
     /// that is also fully pinned the ORIGINAL reply is returned unchanged —
@@ -1043,6 +1084,7 @@ impl DnsInterceptListener {
     fn steer_direct_answer(
         &self,
         query: &[u8],
+        q: &ParsedQuestion,
         reply: Vec<u8>,
         budget: Duration,
     ) -> (Vec<u8>, bool) {
@@ -1050,9 +1092,6 @@ impl DnsInterceptListener {
         if owned.is_empty() {
             return (reply, false);
         }
-        let Some(q) = parse_question(query) else {
-            return (reply, false);
-        };
         let id = u16::from_be_bytes([query[0], query[1]]);
         let AddressResponseOutcome::Answers { addresses, .. } =
             parse_address_response(id, &q.qname, QTYPE_A, &reply)
@@ -1120,10 +1159,7 @@ impl DnsInterceptListener {
     /// additionally subtracts secondary-destined IPs (defense in depth for the
     /// fully-pinned fail-open path). Parse failures are a silent no-op — the
     /// reply is relayed regardless.
-    fn gate_direct_answer(&self, query: &[u8], reply: &[u8]) {
-        let Some(q) = parse_question(query) else {
-            return;
-        };
+    fn gate_direct_answer(&self, query: &[u8], q: &ParsedQuestion, reply: &[u8]) {
         let id = u16::from_be_bytes([query[0], query[1]]);
         let AddressResponseOutcome::Answers { addresses, .. } =
             parse_address_response(id, &q.qname, QTYPE_A, reply)
@@ -1142,8 +1178,12 @@ impl DnsInterceptListener {
     /// response around the fake address. `None` on any parse failure or when
     /// the answerer declines (feature off / disarmed / exclusion / pool full)
     /// — the caller then falls back to the gate + steered-reply path.
-    fn fake_direct_response(&self, query: &[u8], reply: &[u8]) -> Option<Vec<u8>> {
-        let q = parse_question(query)?;
+    fn fake_direct_response(
+        &self,
+        query: &[u8],
+        q: &ParsedQuestion,
+        reply: &[u8],
+    ) -> Option<Vec<u8>> {
         let id = u16::from_be_bytes([query[0], query[1]]);
         let AddressResponseOutcome::Answers { addresses, .. } =
             parse_address_response(id, &q.qname, QTYPE_A, reply)
@@ -1181,17 +1221,11 @@ impl DnsInterceptListener {
     /// would have sent it anyway.
     /// Report a host whose whole answer belongs to the additional route. The
     /// name comes from the question — that is the point.
-    fn note_collateral_host(&self, query: &[u8]) {
-        let Some(q) = parse_question(query) else {
-            return;
-        };
+    fn note_collateral_host(&self, q: &ParsedQuestion) {
         self.companion_rescue.note_rescued_companion(&q.qname);
     }
 
-    fn companion_is_pending(&self, query: &[u8]) -> bool {
-        let Some(q) = parse_question(query) else {
-            return false;
-        };
+    fn companion_is_pending(&self, q: &ParsedQuestion) -> bool {
         if !self
             .companion_candidates
             .is_pending_secondary_companion(&q.qname)
@@ -1207,8 +1241,12 @@ impl DnsInterceptListener {
         true
     }
 
-    fn fake_collateral_response(&self, query: &[u8], reply: &[u8]) -> Option<Vec<u8>> {
-        let q = parse_question(query)?;
+    fn fake_collateral_response(
+        &self,
+        query: &[u8],
+        q: &ParsedQuestion,
+        reply: &[u8],
+    ) -> Option<Vec<u8>> {
         let id = u16::from_be_bytes([query[0], query[1]]);
         let AddressResponseOutcome::Answers { addresses, .. } =
             parse_address_response(id, &q.qname, QTYPE_A, reply)
@@ -1318,10 +1356,26 @@ impl DnsInterceptListener {
         already_asked: SocketAddr,
         budget: Duration,
     ) -> Option<Vec<u8>> {
+        self.ask_private_resolvers_via(already_asked, budget, Instant::now, |target, window| {
+            self.forward_to(query, target, window)
+        })
+    }
+
+    /// [`Self::ask_private_resolvers`] with the clock and the network passed
+    /// in, so a test can spend a budget without waiting it out.
+    fn ask_private_resolvers_via(
+        &self,
+        already_asked: SocketAddr,
+        budget: Duration,
+        now: impl Fn() -> Instant,
+        mut ask: impl FnMut(SocketAddr, Duration) -> Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
         let servers = self.private_resolvers.as_ref()?;
+        let started = now();
         let mut tried = 0usize;
-        for server in servers() {
-            if budget.is_zero() || tried >= MAX_PRIVATE_RETRIES {
+        for server in servers(budget) {
+            let left = budget.saturating_sub(now().saturating_duration_since(started));
+            if left.is_zero() || tried >= MAX_PRIVATE_RETRIES {
                 break;
             }
             let target = SocketAddr::from((server, self.resolver_port));
@@ -1329,7 +1383,10 @@ impl DnsInterceptListener {
                 continue;
             }
             tried += 1;
-            let reply = self.forward_to(query, target, self.forward_timeout.min(budget))?;
+            // A mute resolver costs its own window, not the rest of the list.
+            let Some(reply) = ask(target, self.forward_timeout.min(left)) else {
+                continue;
+            };
             if !reply_is_nxdomain(&reply) {
                 tracing::info!(
                     target: "nrr::dns-resolver",
@@ -1409,11 +1466,6 @@ fn reply_answers_query(query: &[u8], reply: &[u8]) -> bool {
     }
 }
 
-/// One "no such name" answer, carrying the SOA that lets the client remember it.
-///
-/// Every synthetic NXDOMAIN here goes through this: without the authority
-/// record a stub resolver cannot cache the negative answer and re-asks on every
-/// lookup — which for the DoH canary means a query per page load.
 /// The bare label of a single-label question, or `None` when the name has a
 /// dot (and is therefore already complete) or cannot be parsed.
 ///
@@ -1436,12 +1488,30 @@ fn single_label_of(query: &[u8]) -> Option<String> {
 fn reply_is_nxdomain(reply: &[u8]) -> bool {
     reply.len() >= 4 && (reply[3] & 0x0F) == RCODE_NXDOMAIN
 }
+
+/// One "no such name" answer, carrying the SOA that lets the client remember it.
+///
+/// Every synthetic NXDOMAIN here goes through this: without the authority
+/// record a stub resolver cannot cache the negative answer and re-asks on every
+/// lookup — which for the DoH canary means a query per page load.
 fn negative_answer(query: &[u8]) -> Option<Vec<u8>> {
     crate::dns_wire::build_negative_response(
         query,
         RCODE_NXDOMAIN,
         crate::dns_wire::NEGATIVE_TTL_SECS,
     )
+}
+
+/// `servers` without repeats, in the order given. A resolver list is a handful
+/// long, so a linear scan beats hashing.
+fn first_occurrences(servers: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut unique = Vec::with_capacity(servers.len());
+    for server in servers {
+        if !unique.contains(&server) {
+            unique.push(server);
+        }
+    }
+    unique
 }
 
 #[cfg(test)]

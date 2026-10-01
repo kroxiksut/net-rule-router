@@ -37,9 +37,9 @@ fn only_permitted_addresses_are_published_as_enforced() {
         remote_subnet_v6: None,
         ip_protocol: None,
     };
-    let permitted = Ipv4Addr::new(23, 10, 20, 158);
-    let packed = Ipv4Addr::new(23, 10, 20, 142);
-    let doh_blocked = Ipv4Addr::new(8, 8, 4, 4);
+    let permitted = Ipv4Addr::new(203, 0, 113, 158);
+    let packed = Ipv4Addr::new(203, 0, 113, 142);
+    let doh_blocked = Ipv4Addr::new(198, 51, 100, 4);
     let sid = "S-1-5-21-publish-test";
 
     PerSidApplyOrchestrator::publish_enforced_addresses(

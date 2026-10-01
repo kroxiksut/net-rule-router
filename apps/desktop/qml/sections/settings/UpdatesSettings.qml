@@ -24,17 +24,87 @@ GroupBox {
         }
     }
 
+    function _intervalLabel(days) {
+        return root.tr("settings.updates.auto-check.every-days", "Every {days} days")
+            .replace("{days}", String(days))
+    }
+
+    readonly property var _intervalChoices: (root.context && root.context.updateCheckIntervalChoices)
+        || [14]
+
     ColumnLayout {
         anchors.left: parent.left
         anchors.right: parent.right
         spacing: root.uiTheme.spacingSm
 
-        Label {
+        CheckBox {
+            id: updateCheckBox
             Layout.fillWidth: true
+            onToggled: root.updatePrefs({ updateCheckEnabled: checked })
+            // A `checked:` binding dies on the first click; this one keeps
+            // following prefs through Cancel and "restore defaults".
+            Binding {
+                target: updateCheckBox
+                property: "checked"
+                value: root.uiRevision >= 0 ? root.prefs.updateCheckEnabled !== false : true
+            }
+            text: root.tr("settings.updates.auto-check.label",
+                "Check for a new version automatically")
+            contentItem: Text {
+                text: updateCheckBox.text
+                leftPadding: updateCheckBox.indicator.width + updateCheckBox.spacing
+                verticalAlignment: Text.AlignVCenter
+                wrapMode: Text.WordWrap
+                color: root.textColor
+            }
+            Accessible.role: Accessible.CheckBox
+            Accessible.name: text
+            Accessible.description: updateCheckDescription.text
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.leftMargin: root.uiTheme.spacingLg
+            spacing: root.uiTheme.spacingSm
+            Label {
+                id: intervalLabel
+                text: root.tr("settings.updates.auto-check.interval", "How often")
+                color: updateCheckBox.checked ? root.textColor : root.mutedTextColor
+            }
+            ThemedComboBox {
+                id: intervalCombo
+                theme: root.uiTheme
+                Layout.fillWidth: true
+                enabled: updateCheckBox.checked
+                model: group._intervalChoices
+                labelResolver: function(item) { return group._intervalLabel(item) }
+                displayText: root.uiRevision >= 0 && currentIndex >= 0
+                    ? group._intervalLabel(model[currentIndex]) : ""
+                // Same as the checkbox: keeps following prefs through Cancel
+                // and "restore defaults" after the first pick.
+                Binding {
+                    target: intervalCombo
+                    property: "currentIndex"
+                    value: root.uiRevision >= 0
+                        ? Pure.optionIndexByValue(group._intervalChoices,
+                            Number(root.prefs.updateCheckIntervalDays),
+                            Math.max(0, group._intervalChoices.indexOf(14)))
+                        : 0
+                }
+                popup.width: root.comboPopupWidth(intervalCombo, intervalCombo.model, "",
+                    function(item) { return group._intervalLabel(item) })
+                onActivated: root.updatePrefs({ updateCheckIntervalDays: model[currentIndex] })
+                Accessible.name: intervalLabel.text
+            }
+        }
+        Label {
+            id: updateCheckDescription
+            Layout.fillWidth: true
+            Layout.leftMargin: root.uiTheme.spacingLg
+            color: root.mutedTextColor
             wrapMode: Text.WordWrap
-            text: root.tr("settings.updates.not-implemented",
-                "This feature is not yet implemented and will be available in a future release.")
-            color: root.textColor
+            font.pixelSize: root.uiTheme.baseFontSizePx - 1
+            text: root.tr("settings.updates.auto-check.description",
+                "The app asks the project's release page on GitHub whether a newer version is out and shows a notice if it is. Nothing is downloaded or installed, and routing is not touched. The count starts at the first start and restarts after every check, including one from the Help menu. Turned off, the app sends no such request. Takes effect at the next start.")
         }
 
         Rectangle {

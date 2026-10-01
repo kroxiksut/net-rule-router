@@ -103,20 +103,20 @@ mod tests {
     #[test]
     fn a_recorded_host_is_found_by_any_of_its_addresses() {
         let idx = ObservedHostNames::new();
-        let a = Ipv4Addr::new(23, 10, 20, 144);
-        let b = Ipv4Addr::new(23, 10, 20, 145);
+        let a = Ipv4Addr::new(203, 0, 113, 144);
+        let b = Ipv4Addr::new(203, 0, 113, 145);
         assert!(idx.is_empty());
         idx.record("forum.talk.example", &[a, b]);
         assert_eq!(idx.lookup(a).as_deref(), Some("forum.talk.example"));
         assert_eq!(idx.lookup(b).as_deref(), Some("forum.talk.example"));
         assert_eq!(idx.len(), 2);
-        assert_eq!(idx.lookup(Ipv4Addr::new(1, 1, 1, 1)), None);
+        assert_eq!(idx.lookup(Ipv4Addr::new(100, 64, 1, 1)), None);
     }
 
     #[test]
     fn an_empty_name_or_address_list_records_nothing() {
         let idx = ObservedHostNames::new();
-        idx.record("", &[Ipv4Addr::new(1, 2, 3, 4)]);
+        idx.record("", &[Ipv4Addr::new(100, 64, 1, 4)]);
         idx.record("host.example", &[]);
         assert!(idx.is_empty());
     }

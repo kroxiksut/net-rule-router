@@ -3,9 +3,7 @@
 //! Composes the existing `nrr-diagnostics` primitives (`LogReader`,
 //! `AuditReader`, `SecurityAlertsRepository`) and `nrr-storage`
 //! cache stats into the wire-shaped DTOs the GUI's Diagnostics
-//! section consumes. Replaces the long-standing
-//! [`MockDiagnosticsFacade::healthy()`](nrr_diagnostics::facade::mock::MockDiagnosticsFacade)
-//! placeholder in `runtime_deps.rs:316`.
+//! section consumes.
 //!
 //! # Method map
 //!
@@ -13,15 +11,14 @@
 //! |-------------------------|--------------------------------------------------------------------|
 //! | `get_status`            | `AuditReader` (chain), alerts repo (count), `SqliteCacheStore`     |
 //! |                         | (entry count + `last_rebuild_at`), `LogReader` (size+count),       |
-//! |                         | `RevisionsRepository` (active + pending), diagnostic-session state |
-//! | `list_log_entries`      | `LogReader::scan(filter)` + in-memory cursor pagination            |
+//! |                         | `RevisionsRepository` (active + pending)                           |
+//! | `list_log_entries`      | `LogReader::page_newest_first` over a per-file time-span index     |
 //! | `list_audit_entries`    | `AuditReader::scan(filter)` + in-memory cursor pagination          |
-//! | `list_active_alerts`    | `SecurityAlertsRepository::list_open`                              |
+//! | `list_alerts`           | alerts repo, scoped by `alert_audience`                            |
 //! | `acknowledge_alert`     | Returns `RecoveryAction` — canonical path is                       |
-//! |                         | `MutationKind::SecurityAlertAck` via the mutation queue (16.10).   |
+//! |                         | `MutationKind::SecurityAlertAck` via the mutation queue.           |
 //! |                         | This method is deliberately a non-mutating sentinel so the wire    |
 //! |                         | invariant "single writer = MutationDispatcher" holds.              |
-//! | `set_diagnostic_mode`   | Mutates internal [`DiagnosticSessionHandle`] (Arc<Mutex<...>>)     |
 //! | `clear_logs`            | Walks `LogReader::list_files`, deletes each (`dry_run` skips)      |
 //! | `get_explain`           | `Synthetic` runs the REAL rule engine (`match_sample`) against the |
 //! |                         | caller's per-SID active rule book + behavior mode and returns a    |
@@ -33,8 +30,7 @@
 //!
 //! All methods are `&self` synchronous. The facade is `Send + Sync` so
 //! the IPC handler can hold an `Arc<dyn DiagnosticsFacade>` across
-//! threads. Internal state (`DiagnosticSessionHandle`) uses
-//! `Arc<Mutex<...>>` for interior mutability.
+//! threads.
 //!
 //! # Pagination semantics
 //!
@@ -46,11 +42,10 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use nrr_diagnostics::audit::alert::{SecurityAlert, SecurityAlertsRepository};
+use nrr_diagnostics::audit::alert::{SecurityAlert, SecurityAlertState, SecurityAlertsRepository};
 use nrr_diagnostics::audit::anchor::AuditChainAnchorStore;
 use nrr_diagnostics::audit::reader::{AuditQueryFilter, AuditReader};
 use nrr_diagnostics::error::{DiagnosticsError, DiagnosticsResult};
@@ -58,59 +53,17 @@ use nrr_diagnostics::event::{AuditEvent, LogEvent};
 use nrr_diagnostics::explain::{ExplainDataAvailability, ExplainQuery, ExplainResponse};
 use nrr_diagnostics::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsAudience, DiagnosticsDataOrigin,
-    DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto,
-    SecurityStatusCard, ServiceHealthCard, SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticsAudience, DiagnosticsDataOrigin, DiagnosticsStatusDto, LogEntryDto,
+    LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard, ServiceHealthCard,
 };
 use nrr_diagnostics::facade::pagination::{PageCursor, PageResult, PaginationParams};
-use nrr_diagnostics::facade::service::DiagnosticsFacade;
-use nrr_diagnostics::logs::reader::{LogQueryFilter, LogReader};
+use nrr_diagnostics::facade::service::{AlertListFilter, DiagnosticsFacade};
+use nrr_diagnostics::logs::reader::{LogFileIndex, LogPage, LogQueryFilter, LogReader};
 use nrr_diagnostics::privacy::redact::redact_hostname;
-use nrr_diagnostics::privacy::{DiagnosticSession, DiagnosticSessionScope, RedactionMode};
+use nrr_diagnostics::privacy::RedactionMode;
 use nrr_diagnostics::redaction::ExplainDetailLevel;
 use nrr_diagnostics::retention::health::is_dir_writable;
 use nrr_diagnostics::taxonomy::{EventCategory, EventLevel};
-
-// ── DiagnosticSessionHandle ──────────────────────────────────────────────────
-
-/// Shared, mutable holder for the active [`DiagnosticSession`] (if
-/// any). Owned by [`ProductionDiagnosticsFacade`] but exposed as a
-/// distinct type so other components (the redaction-aware log
-/// projector, the explain handler) can read the current redaction
-/// mode via `Arc::clone`.
-#[derive(Clone, Default)]
-pub struct DiagnosticSessionHandle {
-    inner: Arc<Mutex<Option<DiagnosticSession>>>,
-}
-
-impl DiagnosticSessionHandle {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the current session if it's still active at `now_ms`.
-    /// Returns `None` for missing or expired sessions; expired ones
-    /// are NOT auto-evicted from the holder (the GUI may still want
-    /// to display the recent expiration timestamp).
-    pub fn current(&self, now_ms: i64) -> Option<DiagnosticSession> {
-        let guard = self.inner.lock().ok()?;
-        guard.as_ref().filter(|s| s.is_active(now_ms)).cloned()
-    }
-
-    /// Effective redaction mode at `now_ms`. Defaults to
-    /// [`RedactionMode::Default`] when no session is active.
-    pub fn redaction_mode(&self, now_ms: i64) -> RedactionMode {
-        self.current(now_ms)
-            .map(|s| s.redaction_mode())
-            .unwrap_or(RedactionMode::Default)
-    }
-
-    fn store(&self, session: Option<DiagnosticSession>) {
-        if let Ok(mut g) = self.inner.lock() {
-            *g = session;
-        }
-    }
-}
 
 // ── ProductionDiagnosticsFacade ──────────────────────────────────────────────
 
@@ -133,16 +86,16 @@ pub struct ProductionDiagnosticsFacade {
     /// reading the active revision id + pending revisions count from
     /// `RevisionsRepository`. `None` when storage is degraded.
     state_conn: Option<Arc<Mutex<Connection>>>,
-    diagnostic_session: DiagnosticSessionHandle,
     /// The operational log writer, when one is installed. Its drop counter is
     /// the only place that knows an event was lost, and `None` here is what a
     /// caller with no writer looks like — not "nothing was dropped".
     log_writer: Option<Arc<nrr_diagnostics::LogWriter>>,
-    /// Last chain verification, keyed by the newest audit file's
-    /// (path, length, mtime). The GUI polls `get_status` on a timer and each
-    /// call re-read the whole current audit file and re-hashed every line;
-    /// nothing about that answer changes until the file grows.
-    chain_cache: Mutex<Option<(ChainCacheKey, bool)>>,
+    /// Time span of each log file, so a "Logs" page parses only the files it
+    /// draws from instead of the whole retention window.
+    log_index: LogFileIndex,
+    /// Whole-chain verification, re-parsing only the audit files whose bytes
+    /// changed: every `get_status` asks, and the answer moves only with them.
+    chain_verifier: Mutex<nrr_diagnostics::AuditChainVerifier>,
     /// The host's operator log, read for one fact: when this boot reached the
     /// sign-in phase. `None` on a host with no such record, which the card
     /// reports as "cannot tell".
@@ -152,40 +105,21 @@ pub struct ProductionDiagnosticsFacade {
     started_at_ms: Option<u64>,
 }
 
-type ChainCacheKey = (PathBuf, u64, Option<std::time::SystemTime>);
-
 impl ProductionDiagnosticsFacade {
-    /// Whether the audit trail is intact, recomputed only when the newest
-    /// audit file has changed.
+    /// Whether the audit trail in the retention window is intact.
     ///
     /// `chain_ok` alone answers "was anything edited"; the anchor is what
     /// answers "is anything missing", and a cut tail passes the first check.
     fn audit_chain_ok(&self, reader: &AuditReader) -> bool {
-        let newest = reader.list_files().pop();
-        let key: Option<ChainCacheKey> = newest.map(|path| {
-            let meta = std::fs::metadata(&path).ok();
-            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let modified = meta.and_then(|m| m.modified().ok());
-            (path, len, modified)
-        });
-
-        // A poisoned lock only means a prior panic while holding it; the cache
-        // is an optimisation, so take the value and carry on.
-        let mut cache = match self.chain_cache.lock() {
+        let anchor = nrr_diagnostics::FileAnchorStore::in_dir(&self.audit_dir).load();
+        // A poisoned lock only means a prior panic while holding it; the
+        // verifier's cache is an optimisation, so carry on with it.
+        let mut verifier = match self.chain_verifier.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let (Some(key), Some((cached_key, cached))) = (key.as_ref(), cache.as_ref()) {
-            if cached_key == key {
-                return *cached;
-            }
-        }
-
-        let anchor = nrr_diagnostics::FileAnchorStore::in_dir(&self.audit_dir).load();
-        let chain = reader.verify_latest_chain_anchored(anchor.as_ref());
-        let ok = chain.chain_ok && chain.corrupt_lines == 0;
-        *cache = key.map(|key| (key, ok));
-        ok
+        let chain = verifier.verify(reader, anchor.as_ref());
+        chain.chain_ok && chain.corrupt_lines == 0
     }
 
     pub fn new(
@@ -201,9 +135,9 @@ impl ProductionDiagnosticsFacade {
             cache_conn,
             alerts_repo,
             state_conn,
-            diagnostic_session: DiagnosticSessionHandle::new(),
             log_writer: None,
-            chain_cache: Mutex::new(None),
+            log_index: LogFileIndex::new(),
+            chain_verifier: Mutex::new(nrr_diagnostics::AuditChainVerifier::new()),
             system_event_log: None,
             started_at_ms: None,
         }
@@ -234,17 +168,21 @@ impl ProductionDiagnosticsFacade {
         )
     }
 
+    /// Honour audit chain restarts sealed with `key`. Without it an old break
+    /// is reported until its file ages out, restart or not.
+    pub fn with_chain_restart_key(mut self, key: Option<nrr_diagnostics::AuditRestartKey>) -> Self {
+        if let Some(key) = key {
+            self.chain_verifier =
+                Mutex::new(nrr_diagnostics::AuditChainVerifier::with_restart_key(key));
+        }
+        self
+    }
+
     /// Attach the installed log writer so the health card can report events
     /// the service actually lost.
     pub fn with_log_writer(mut self, writer: Option<Arc<nrr_diagnostics::LogWriter>>) -> Self {
         self.log_writer = writer;
         self
-    }
-
-    /// Hand a clone of the shared diagnostic-session handle to other
-    /// components (explain projector, log redactor). Cheap clone.
-    pub fn diagnostic_session_handle(&self) -> DiagnosticSessionHandle {
-        self.diagnostic_session.clone()
     }
 }
 

@@ -21,12 +21,6 @@
 //! 5. Report `Stopping` → `supervisor.shutdown()` (drains tasks in
 //!    reverse start order with `STOP_TIMEOUT` budget) → `Stopped`.
 //!
-//! The function deliberately keeps `run_runtime_with_artifacts` (the
-//! legacy sleep-loop entry) intact — lifecycle unit tests still go
-//! through it and do not need the supervisor machinery. Production
-//! callers (`scm_service_main`, `run_console`) switch to the new
-//! function.
-//!
 //! ## Bootstrap-blocked path
 //!
 //! If `artifacts.is_ready_to_run()` returns `false` (a bootstrap phase
@@ -59,7 +53,7 @@ use crate::service_tasks::{
     build_route_reconcile_safety_task, build_secondary_liveness_task, TASK_ID_ADAPTER_MONITOR,
     TASK_ID_DIAGNOSTICS_CLEANUP, TASK_ID_IPC_ACCEPT_LOOP, TASK_ID_IPC_SHUTDOWN_WATCHER,
 };
-use crate::state::{ServiceHealthSeverity, ServiceRuntimeState, ServiceShutdownReason};
+use crate::state::{ServiceHealthSeverity, ServiceRuntimeState};
 
 // ── Teardown pacing ──────────────────────────────────────────────────────────
 
@@ -292,7 +286,7 @@ pub struct SupervisedRuntimeDeps {
         Option<crate::secondary_external_address::ExternalAddressWiring>,
     /// The runtime controller that starts/stops the local DNS resolver on
     /// demand (live re-arm). `run_supervised_runtime`
-    /// applies `dns_resolver_boot_mode` to it once tasks are up (arming the
+    /// applies `dns_resolver_mode` to it once tasks are up (arming the
     /// resolver iff the persisted mode is `Resolver`) and calls `stop()` on
     /// shutdown, so an ORDERLY exit restores the NRPT redirect - within a
     /// teardown budget, and only on that path. A kill leaves the redirect
@@ -301,9 +295,10 @@ pub struct SupervisedRuntimeDeps {
     /// enforcement mode in the GUI starts/stops the resolver WITHOUT a restart.
     /// `None` in test profiles / when the platform factory could not be wired.
     pub dns_resolver_controller: Option<Arc<crate::dns_resolver_service::DnsResolverController>>,
-    /// The persisted enforcement mode at boot. Applied to `dns_resolver_controller`
-    /// once tasks are up (Reactive = leave the resolver off; Resolver = arm it).
-    pub dns_resolver_boot_mode: nrr_domain::enforcement_mode::EnforcementMode,
+    /// The persisted enforcement mode, read when tasks come up and again on
+    /// every sign-in: the GUI may have changed it since boot, and a boot
+    /// snapshot re-applied on an RDP reconnect would silently undo that.
+    pub dns_resolver_mode: EnforcementModeSource,
     /// Push channel so the adapter monitor can notify
     /// subscribed GUIs that the adapter set changed (secondary up/down). The GUI then
     /// auto-refreshes the Interfaces page instead of showing a stale
@@ -328,7 +323,7 @@ pub struct SupervisedRuntimeDeps {
     /// still recovers from sleep — just a few seconds later.
     pub power_event_observer: Option<Arc<dyn nrr_platform_api::power::PowerEventObserver>>,
     /// OS interactive-logon observer. When present, a sign-in re-applies
-    /// `dns_resolver_boot_mode` — the arm is gated on a principal existing, so
+    /// `dns_resolver_mode` — the arm is gated on a principal existing, so
     /// on a cold boot it is this event that arms Mode B rather than the boot
     /// snapshot. `None` on a platform without an impl; the resolver then arms on
     /// the first later re-arm that finds a user.
@@ -374,6 +369,10 @@ pub type RouteRecomputeHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Returns the routing-active SID (Free single-active-user), or `None`.
 pub type ActiveRoutingSidFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Reads the enforcement mode as persisted right now.
+pub type EnforcementModeSource =
+    Arc<dyn Fn() -> nrr_domain::enforcement_mode::EnforcementMode + Send + Sync>;
 
 // ── Failure sink ─────────────────────────────────────────────────────────────
 
@@ -427,7 +426,8 @@ impl TaskFailureSink for HealthFailureSink {
             task = id.0.as_str(),
             attempt = attempt as u32,
             class = ?class,
-            "task failed: {message}",
+            error = %message,
+            "task failed",
         );
     }
 
@@ -476,7 +476,8 @@ impl TaskFailureSink for HealthFailureSink {
             target: "nrr::supervisor",
             msg_key = "supervised-task-retired-fatal",
             task = id.0.as_str(),
-            "task retired fatally: {message}",
+            error = %message,
+            "task retired fatally",
         );
         if let Some(component) = component_for_task(id.0.as_str()) {
             self.health.record(
@@ -510,15 +511,12 @@ fn component_for_task(id: &str) -> Option<HealthComponent> {
 ///
 /// On bootstrap-blocked path:
 /// `Starting → RecoveryRequired → Stopping → Stopped`.
-///
-/// Returns `ServiceShutdownReason::ScmStop` on stop-token-driven exit.
-/// Future work may add `IntegrityFailure` and friends.
 pub fn run_supervised_runtime(
     controller: &dyn ServiceController,
     stop: &StopToken,
     artifacts: BootstrapArtifacts,
     deps: SupervisedRuntimeDeps,
-) -> ServiceShutdownReason {
+) {
     // A second runtime in the same process (tests, console restart) must not be
     // born already tearing down.
     crate::lifecycle::clear_teardown();
@@ -549,7 +547,6 @@ pub fn run_supervised_runtime(
     // shutdown so the NRPT redirect + DNS restore complete before the service
     // exits (a dead `:53` must never outlive the service).
     let resolver_controller = deps.dns_resolver_controller.clone();
-    let resolver_boot_mode = deps.dns_resolver_boot_mode;
     // Holds the active network-change subscription + debounce thread;
     // dropped in the Stopping phase (cancels the OS callbacks and stops
     // the debounce thread before the rest of teardown).
@@ -572,6 +569,7 @@ pub fn run_supervised_runtime(
         // In the recovery-blocked path this never runs, so a half-functional
         // service never redirects system DNS. Idempotent → a no-op in Reactive.
         if let Some(controller) = resolver_controller.as_ref() {
+            let resolver_boot_mode = (deps.dns_resolver_mode)();
             // Log the boot enforcement mode unconditionally: without this the
             // NDJSON gives no way to tell which mode the service is actually
             // running (a GUI/service mode mismatch is otherwise invisible).
@@ -635,7 +633,8 @@ pub fn run_supervised_runtime(
                     tracing::warn!(
                         target: "nrr::route-coordinator",
                         msg_key = "supervised-network-change-observer-register-failed",
-                        "network-change observer registration failed ({e:?}); relying on the 1s/30s polling fallback",
+                        error = %e,
+                        "network-change observer registration failed; relying on the 1s/30s polling fallback",
                     );
                 }
             }
@@ -664,7 +663,8 @@ pub fn run_supervised_runtime(
                     tracing::warn!(
                         target: "nrr::route-coordinator",
                         msg_key = "supervised-power-event-observer-register-failed",
-                        "power-event observer registration failed ({e:?}); relying on the resume watchdog",
+                        error = %e,
+                        "power-event observer registration failed; relying on the resume watchdog",
                     );
                 }
             }
@@ -676,23 +676,13 @@ pub fn run_supervised_runtime(
         // waits for the same reason: it changes the machine's network for a
         // user who is not there yet, inside the OS's own sign-in phase.
         if let Some(observer) = deps.logon_session_observer.as_ref() {
-            let controller = resolver_controller.clone();
-            let gate = deps.sign_in_gate.clone();
             match crate::logon_rearm::LogonSessionRearm::start(
                 observer.as_ref(),
-                Arc::new(move || {
-                    tracing::info!(
-                        target: "nrr::dns-resolver",
-                        msg_key = "supervised-signed-in-apply-enforcement-mode",
-                        "user signed in — applying the persisted enforcement mode",
-                    );
-                    if let Some(controller) = controller.as_ref() {
-                        controller.apply(resolver_boot_mode);
-                    }
-                    if let Some(gate) = gate.as_ref() {
-                        gate.fire();
-                    }
-                }),
+                on_signed_in(
+                    resolver_controller.clone(),
+                    Arc::clone(&deps.dns_resolver_mode),
+                    deps.sign_in_gate.clone(),
+                ),
                 crate::logon_rearm::LOGON_DEBOUNCE,
             ) {
                 Ok(rearm) => {
@@ -707,7 +697,8 @@ pub fn run_supervised_runtime(
                     tracing::warn!(
                         target: "nrr::dns-resolver",
                         msg_key = "supervised-logon-observer-register-failed",
-                        "logon observer registration failed ({e:?}); Mode B will arm on a later re-arm instead",
+                        error = %e,
+                        "logon observer registration failed; Mode B will arm on a later re-arm instead",
                     );
                 }
             }
@@ -885,8 +876,30 @@ pub fn run_supervised_runtime(
     // (e.g. `Arc<LogWriter>` shared with the global tracing subscriber
     // installed by `install_ndjson_tracing`) outlive every task.
     drop(artifacts);
+}
 
-    ServiceShutdownReason::ScmStop
+/// The sign-in re-arm. The mode is read at fire time: a sign-in also means an
+/// RDP reconnect or a second user, long after the GUI may have changed it.
+fn on_signed_in(
+    controller: Option<Arc<crate::dns_resolver_service::DnsResolverController>>,
+    mode: EnforcementModeSource,
+    gate: Option<Arc<crate::logon_rearm::SignInGate>>,
+) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        if let Some(controller) = controller.as_ref() {
+            let mode = mode();
+            tracing::info!(
+                target: "nrr::dns-resolver",
+                msg_key = "supervised-signed-in-apply-enforcement-mode",
+                mode = mode.as_slug(),
+                "user signed in — applying the persisted enforcement mode",
+            );
+            controller.apply(mode);
+        }
+        if let Some(gate) = gate.as_ref() {
+            gate.fire();
+        }
+    })
 }
 
 /// Everyone whose rules are in force, from whichever source this platform has.
@@ -943,7 +956,8 @@ fn spawn_production_tasks(
         tracing::error!(
             target: "nrr::supervisor",
             msg_key = "supervised-spawn-adapter-monitor-failed",
-            "spawn adapter-monitor failed: {e}",
+            error = %e,
+            "spawn adapter-monitor failed",
         );
         health.record(
             HealthComponent::Adapters,
@@ -962,7 +976,8 @@ fn spawn_production_tasks(
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-route-reconcile-safety-failed",
-                "spawn route-reconcile-safety failed: {e}",
+                error = %e,
+                "spawn route-reconcile-safety failed",
             );
         }
     }
@@ -974,7 +989,8 @@ fn spawn_production_tasks(
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-secondary-liveness-failed",
-                "spawn secondary-liveness failed: {e}",
+                error = %e,
+                "spawn secondary-liveness failed",
             );
         }
     }
@@ -993,7 +1009,8 @@ fn spawn_production_tasks(
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-resume-watchdog-failed",
-                "spawn resume-watchdog failed: {e}",
+                error = %e,
+                "spawn resume-watchdog failed",
             );
         }
     }
@@ -1008,7 +1025,8 @@ fn spawn_production_tasks(
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-app-observation-failed",
-                "spawn app-observation failed: {e}",
+                error = %e,
+                "spawn app-observation failed",
             );
         }
     }
@@ -1022,7 +1040,8 @@ fn spawn_production_tasks(
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-live-connection-refresh-failed",
-                "spawn live-connection-refresh failed: {e}",
+                error = %e,
+                "spawn live-connection-refresh failed",
             );
         }
     }
@@ -1034,7 +1053,8 @@ fn spawn_production_tasks(
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-dns-observation-failed",
-                "spawn dns-observation failed: {e}",
+                error = %e,
+                "spawn dns-observation failed",
             );
         }
     }
@@ -1044,7 +1064,8 @@ fn spawn_production_tasks(
         tracing::error!(
             target: "nrr::supervisor",
             msg_key = "supervised-spawn-health-aggregator-failed",
-            "spawn health-aggregator failed: {e}",
+            error = %e,
+            "spawn health-aggregator failed",
         );
         // No dedicated health component for this task — log only.
     }
@@ -1060,7 +1081,8 @@ fn spawn_production_tasks(
                 tracing::error!(
                     target: "nrr::supervisor",
                     msg_key = "supervised-spawn-ipc-accept-loop-failed",
-                    "spawn ipc-accept-loop failed: {e}",
+                    error = %e,
+                    "spawn ipc-accept-loop failed",
                 );
                 health.record(
                     HealthComponent::Ipc,
@@ -1072,7 +1094,8 @@ fn spawn_production_tasks(
                 tracing::error!(
                     target: "nrr::supervisor",
                     msg_key = "supervised-spawn-ipc-shutdown-watcher-failed",
-                    "spawn ipc-shutdown-watcher failed: {e}",
+                    error = %e,
+                    "spawn ipc-shutdown-watcher failed",
                 );
             }
         }
@@ -1080,7 +1103,8 @@ fn spawn_production_tasks(
             tracing::error!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-ipc-bind-failed",
-                "ipc bind failed: {e}",
+                error = %e,
+                "ipc bind failed",
             );
             health.record(
                 HealthComponent::Ipc,
@@ -1093,7 +1117,7 @@ fn spawn_production_tasks(
 
 /// Optional housekeeping tasks — spawn only after `Running` is reported
 /// so a transient cleanup-task spawn failure never delays the SCM
-/// `Running` transition past `START_TIMEOUT`.
+/// `Running` transition.
 fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntimeDeps) {
     // 1. operation-results-gc.
     if let Err(e) = supervisor.spawn(build_operation_results_gc_task(
@@ -1103,7 +1127,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         tracing::warn!(
             target: "nrr::supervisor",
             msg_key = "supervised-spawn-operation-results-gc-failed",
-            "spawn operation-results-gc failed: {e}",
+            error = %e,
+            "spawn operation-results-gc failed",
         );
     }
 
@@ -1118,7 +1143,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         tracing::warn!(
             target: "nrr::supervisor",
             msg_key = "supervised-spawn-diagnostics-cleanup-failed",
-            "spawn diagnostics-cleanup failed: {e}",
+            error = %e,
+            "spawn diagnostics-cleanup failed",
         );
     }
 
@@ -1131,7 +1157,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         tracing::warn!(
             target: "nrr::supervisor",
             msg_key = "supervised-spawn-diagnostics-audit-cleanup-failed",
-            "spawn diagnostics-audit-cleanup failed: {e}",
+            error = %e,
+            "spawn diagnostics-audit-cleanup failed",
         );
     }
 
@@ -1143,14 +1170,16 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-revisions-retention-prune-failed",
-                "spawn revisions-retention-prune failed: {e}",
+                error = %e,
+                "spawn revisions-retention-prune failed",
             );
         }
     }
 
     // 3-bis. storage-wal-checkpoint. Same cadence as the pruners above: the
-    // journals of the databases held open for the whole uptime are folded back
-    // and truncated. Skipped when a degraded boot opened none of them.
+    // cache is swept, then the journals of the databases held open for the
+    // whole uptime are folded back and truncated. Skipped when a degraded boot
+    // opened none of them.
     {
         let checkpoints = crate::service_tasks::StorageCheckpointDeps {
             cache: deps
@@ -1167,7 +1196,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
                 tracing::warn!(
                     target: "nrr::supervisor",
                     msg_key = "supervised-spawn-storage-wal-checkpoint-failed",
-                    "spawn storage-wal-checkpoint failed: {e}",
+                    error = %e,
+                    "spawn storage-wal-checkpoint failed",
                 );
             }
         }
@@ -1182,7 +1212,7 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-principal-enforcement-failed",
-                error = ?e,
+                error = %e,
                 "principal-enforcement task could not be spawned; policy will NOT be applied",
             );
         }
@@ -1196,7 +1226,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-traffic-sample-tick-failed",
-                "spawn traffic-sample-tick failed: {e}",
+                error = %e,
+                "spawn traffic-sample-tick failed",
             );
         }
     }
@@ -1213,7 +1244,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-dns-refresh-tick-failed",
-                "spawn dns-refresh-tick failed: {e}",
+                error = %e,
+                "spawn dns-refresh-tick failed",
             );
         }
     }
@@ -1233,7 +1265,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-rule-hostname-seed-tick-failed",
-                "spawn rule-hostname-seed-tick failed: {e}",
+                error = %e,
+                "spawn rule-hostname-seed-tick failed",
             );
         }
     }
@@ -1255,7 +1288,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-dns-observe-tick-failed",
-                "spawn dns-observe-tick failed: {e}",
+                error = %e,
+                "spawn dns-observe-tick failed",
             );
         }
     }
@@ -1276,7 +1310,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-conn-observe-tick-failed",
-                "spawn conn-observe-tick failed: {e}",
+                error = %e,
+                "spawn conn-observe-tick failed",
             );
         }
     }
@@ -1297,7 +1332,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-auto-rules-tick-failed",
-                "spawn auto-rules-tick failed: {e}",
+                error = %e,
+                "spawn auto-rules-tick failed",
             );
         }
     }
@@ -1313,7 +1349,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-app-destination-flush-tick-failed",
-                "spawn app-destination-flush-tick failed: {e}",
+                error = %e,
+                "spawn app-destination-flush-tick failed",
             );
         }
     }
@@ -1328,7 +1365,8 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
             tracing::warn!(
                 target: "nrr::supervisor",
                 msg_key = "supervised-spawn-secondary-external-address-tick-failed",
-                "spawn secondary-external-address-tick failed: {e}",
+                error = %e,
+                "spawn secondary-external-address-tick failed",
             );
         }
     }

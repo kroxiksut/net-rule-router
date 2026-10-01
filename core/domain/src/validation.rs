@@ -31,6 +31,7 @@ use std::net::IpAddr;
 use nrr_shared::{RouteBehaviorMode, RouteRole};
 
 use crate::{
+    address_class::AddressClass,
     canonical::{
         CanonicalAddressMatch, CanonicalAppMatch, CanonicalAppPattern, CanonicalProfile,
         CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
@@ -79,33 +80,107 @@ pub enum ValidationError {
     /// address. The rule cannot be applied and must be corrected.
     InvalidIpAddress { rule_id: RuleId, value: String },
 
+    /// An address that is never a destination: "this host" (`0.0.0.0/8`,
+    /// `::`) or the limited broadcast. A rule on it would cut or reroute DHCP
+    /// and discovery, never a site.
+    IpAddressNotADestination {
+        rule_id: RuleId,
+        value: String,
+        class: AddressClass,
+    },
+
     /// A domain/zone rule's value is not a hostname: spaces, control bytes, a
-    /// path, an interior glob. Nothing it could ever match exists, so the rule
-    /// is refused rather than stored as a name no packet will carry.
+    /// path, an interior glob, more than 253 octets once punycoded. Nothing it
+    /// could ever match exists, so the rule is refused rather than stored as a
+    /// name no packet will carry.
     DomainInvalidValue { rule_id: RuleId, value: String },
 
     /// A `Zone` rule has an empty name after trimming.
     ZoneEmptyName { rule_id: RuleId },
 
-    /// An application glob pattern is bare `*`, which would match every running
-    /// process. This is rejected as too broad.
+    /// An application glob pattern that matches every running process: bare
+    /// `*`, or one the matcher reduces to it (`C:\Games\*`, `*.exe`).
     AppGlobTooWide { rule_id: RuleId },
+
+    /// An application value the rules file cannot hold: longer than a match
+    /// value may be, or carrying a line break or other control character.
+    AppNameInvalid { rule_id: RuleId, value: String },
+
+    /// More rules than a book may hold — see [`rule_cap_excess`].
+    TooManyRules { count: usize, limit: usize },
+}
+
+/// Which allowance a rule book overran, and by how much.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleCapExcess {
+    /// More of the user's own rules than
+    /// [`nrr_shared::rules_json::FREE_MAX_RULES`].
+    User { count: usize, limit: usize },
+    /// More app-authored rules than
+    /// [`crate::auto_rule_budget::MAX_AUTO_RULES`].
+    Auto { count: usize, limit: usize },
+}
+
+impl RuleCapExcess {
+    #[must_use]
+    pub const fn count_and_limit(self) -> (usize, usize) {
+        match self {
+            Self::User { count, limit } | Self::Auto { count, limit } => (count, limit),
+        }
+    }
+}
+
+/// The one rule count behind every write-side cap. `user_authored` holds one
+/// flag per rule; the user's own and the app's rules are capped separately,
+/// so neither can spend the other's allowance.
+///
+/// The user's cap is absolute. `auto_limit` is `None` where the book the
+/// rules land in is unknown — a file on its own: its app-authored count is
+/// only meaningful against that book, which the service's write checks with
+/// [`crate::auto_rule_budget::auto_rule_allowance`].
+pub fn rule_cap_excess(
+    user_authored: impl IntoIterator<Item = bool>,
+    auto_limit: Option<usize>,
+) -> Option<RuleCapExcess> {
+    const USER_LIMIT: usize = nrr_shared::rules_json::FREE_MAX_RULES;
+    let (mut user, mut auto) = (0usize, 0usize);
+    for own in user_authored {
+        if own {
+            user += 1;
+        } else {
+            auto += 1;
+        }
+    }
+    if user > USER_LIMIT {
+        Some(RuleCapExcess::User {
+            count: user,
+            limit: USER_LIMIT,
+        })
+    } else {
+        auto_limit
+            .filter(|&limit| auto > limit)
+            .map(|limit| RuleCapExcess::Auto { count: auto, limit })
+    }
 }
 
 impl ValidationError {
     /// The rule ID associated with this error, if applicable.
     pub fn rule_id(&self) -> Option<&RuleId> {
         match self {
-            Self::MissingPrimaryBinding | Self::SameAdapterBoundToBothRoles { .. } => None,
+            Self::MissingPrimaryBinding
+            | Self::SameAdapterBoundToBothRoles { .. }
+            | Self::TooManyRules { .. } => None,
             Self::RuleEmptyMatch { rule_id }
             | Self::DomainEmptyValue { rule_id }
             | Self::DomainInvalidIdn { rule_id, .. }
             | Self::CidrNotSupported { rule_id, .. }
             | Self::IpRangeNotSupported { rule_id, .. }
             | Self::InvalidIpAddress { rule_id, .. }
+            | Self::IpAddressNotADestination { rule_id, .. }
             | Self::DomainInvalidValue { rule_id, .. }
             | Self::ZoneEmptyName { rule_id }
-            | Self::AppGlobTooWide { rule_id } => Some(rule_id),
+            | Self::AppGlobTooWide { rule_id }
+            | Self::AppNameInvalid { rule_id, .. } => Some(rule_id),
         }
     }
 }
@@ -152,15 +227,31 @@ impl fmt::Display for ValidationError {
             Self::InvalidIpAddress { rule_id, value } => {
                 write!(f, "rule {rule_id}: '{value}' is not a valid IP address")
             }
+            Self::IpAddressNotADestination {
+                rule_id,
+                value,
+                class,
+            } => {
+                write!(
+                    f,
+                    "rule {rule_id}: '{value}' ({class:?}) is never a destination"
+                )
+            }
             Self::ZoneEmptyName { rule_id } => {
                 write!(f, "rule {rule_id}: zone name is empty")
             }
             Self::AppGlobTooWide { rule_id } => {
                 write!(
                     f,
-                    "rule {rule_id}: bare '*' as a glob pattern matches every process \
+                    "rule {rule_id}: this glob pattern matches every process \
                      and is not allowed — use a more specific pattern"
                 )
+            }
+            Self::TooManyRules { count, limit } => {
+                write!(f, "{count} rules exceed the limit of {limit}")
+            }
+            Self::AppNameInvalid { rule_id, value } => {
+                write!(f, "rule {rule_id}: {value:?} is not an application name")
             }
         }
     }
@@ -242,6 +333,25 @@ pub enum ValidationWarning {
         primary_rule_id: RuleId,
         secondary_rule_id: RuleId,
     },
+
+    /// An address rule on a loopback, multicast or link-local address: kept,
+    /// but it never names a site on the internet.
+    UnusualIpDestination {
+        rule_id: RuleId,
+        address: IpAddr,
+        class: AddressClass,
+    },
+
+    /// A stored rule on an address that is never a destination
+    /// ([`ValidationError::IpAddressNotADestination`]) was dropped on read;
+    /// the rest of the rules load.
+    RuleOnNoDestinationDropped { rule_id: RuleId, value: String },
+
+    /// A rule whose application pattern the pipeline refuses outright
+    /// ([`ValidationError::AppNameInvalid`], [`ValidationError::AppGlobTooWide`])
+    /// was dropped instead of blocking the rest of the file — the same policy
+    /// as an address that is never a destination.
+    AppPatternRefusedDropped { rule_id: RuleId, value: String },
 }
 
 impl fmt::Display for ValidationWarning {
@@ -329,6 +439,25 @@ impl fmt::Display for ValidationWarning {
                     f,
                     "rule '{primary_rule_id}' (primary) and '{secondary_rule_id}' (secondary) \
                      have identical match conditions — user should choose which list to keep it in"
+                )
+            }
+            Self::UnusualIpDestination {
+                rule_id,
+                address,
+                class,
+            } => {
+                write!(f, "rule {rule_id}: {address} is a {class:?} address")
+            }
+            Self::RuleOnNoDestinationDropped { rule_id, value } => {
+                write!(
+                    f,
+                    "rule {rule_id}: '{value}' is never a destination; the rule was dropped"
+                )
+            }
+            Self::AppPatternRefusedDropped { rule_id, value } => {
+                write!(
+                    f,
+                    "rule {rule_id}: application value '{value}' is refused; the rule was dropped"
                 )
             }
         }
@@ -442,6 +571,22 @@ pub fn validate_and_canonicalize(
     let naming = platform.executable_naming();
     let mut errors: Vec<ValidationError> = Vec::new();
     let mut warnings: Vec<ValidationWarning> = Vec::new();
+
+    // Counted before anything is normalized: an oversized file costs a count,
+    // not a canonicalization, a diff and an enforcement set.
+    let book = &config.rule_book;
+    if let Some(excess) = rule_cap_excess(
+        book.primary
+            .rules
+            .iter()
+            .chain(book.secondary.rules.iter())
+            .map(|rule| rule.origin.is_none()),
+        None,
+    ) {
+        let (count, limit) = excess.count_and_limit();
+        errors.push(ValidationError::TooManyRules { count, limit });
+        return ValidationOutcome::Rejected { errors, warnings };
+    }
 
     // ── 1. Binding validation ─────────────────────────────────────────────────
 
@@ -586,47 +731,16 @@ fn normalize_rule(
     let address_match = match &rule.address_match {
         None => None,
         Some(AddressMatch::Zone(name)) => {
-            // Normalize: strip optional `*.` prefix, trim, lowercase.
-            let trimmed = name.trim().to_lowercase();
-            let stripped = trimmed.strip_prefix("*.").unwrap_or(&trimmed);
-            if stripped.is_empty() {
-                errors.push(ValidationError::ZoneEmptyName {
-                    rule_id: rule.id.clone(),
-                });
-                return None;
-            }
-            // Canonicalize the zone labels through the same IDNA path as
-            // domains so every producer converges on punycode: the GUI encodes
-            // "рф" via QUrl::toAce to "xn--p1ai" before saving, and hostnames
-            // are punycode at decision time — a raw Unicode zone here would
-            // both never match and show up as a spurious removed+added pair in
-            // the rule diff.
-            //
-            // `.ru` is the spelling a user naturally writes for a TLD, and it
-            // folds to the same rule as `ru` everywhere else — the wire
-            // comparison key (`nrr_shared::rules_json::fold_suffix`) strips the
-            // dot, and the GUI's own validator rejects it outright. Only this
-            // canonicalizer used to keep it, and `match_zone` looks for
-            // `.{zone}`, so a dotted zone searched for `..ru` and matched
-            // nothing: the rule was accepted and silently inert.
-            let body = stripped.strip_prefix('.').unwrap_or(stripped);
-            if body.is_empty() {
-                errors.push(ValidationError::ZoneEmptyName {
-                    rule_id: rule.id.clone(),
-                });
-                return None;
-            }
-            let normalized = match normalize_domain_label(body, &rule.id, warnings) {
-                Ok(canonical) => canonical,
+            match canonical_host_name(HostNameKind::Zone, name, &rule.id, warnings) {
+                Ok(normalized) => Some(CanonicalAddressMatch::Zone(normalized)),
                 Err(e) => {
                     errors.push(e);
                     return None;
                 }
-            };
-            Some(CanonicalAddressMatch::Zone(normalized))
+            }
         }
         Some(AddressMatch::ExactFqdn(value)) => {
-            match normalize_domain_label(value, &rule.id, warnings) {
+            match canonical_host_name(HostNameKind::Domain, value, &rule.id, warnings) {
                 Ok(normalized) => Some(CanonicalAddressMatch::ExactFqdn(normalized)),
                 Err(e) => {
                     errors.push(e);
@@ -635,7 +749,7 @@ fn normalize_rule(
             }
         }
         Some(AddressMatch::SuffixDomain(value)) => {
-            match normalize_domain_label(value, &rule.id, warnings) {
+            match canonical_host_name(HostNameKind::Domain, value, &rule.id, warnings) {
                 Ok(normalized) => Some(CanonicalAddressMatch::SuffixDomain(normalized)),
                 Err(e) => {
                     errors.push(e);
@@ -643,9 +757,19 @@ fn normalize_rule(
                 }
             }
         }
-        Some(AddressMatch::ExactIp(addr)) => Some(CanonicalAddressMatch::ExactIp(
-            canonicalize_ip_addr(*addr, &rule.id, warnings),
-        )),
+        Some(AddressMatch::ExactIp(text)) => match canonical_ip_address(text, &rule.id, warnings) {
+            Ok(addr) => Some(CanonicalAddressMatch::ExactIp(addr)),
+            // A rules file is stored data: such a rule is dropped, the rest
+            // of the file still imports.
+            Err(ValidationError::IpAddressNotADestination { rule_id, value, .. }) => {
+                warnings.push(ValidationWarning::RuleOnNoDestinationDropped { rule_id, value });
+                return None;
+            }
+            Err(e) => {
+                errors.push(e);
+                return None;
+            }
+        },
     };
 
     // Normalize app_match.
@@ -653,6 +777,17 @@ fn normalize_rule(
         None => None,
         Some(a) => match normalize_app_match(a, naming, &rule.id, warnings) {
             Ok(canonical) => Some(canonical),
+            // A rules file is stored data: a value the pipeline refuses
+            // outright is dropped, the rest of the file still imports — same
+            // policy as an address that is never a destination.
+            Err(ValidationError::AppNameInvalid { rule_id, .. })
+            | Err(ValidationError::AppGlobTooWide { rule_id }) => {
+                warnings.push(ValidationWarning::AppPatternRefusedDropped {
+                    rule_id,
+                    value: a.pattern.as_str().to_string(),
+                });
+                return None;
+            }
             Err(e) => {
                 errors.push(e);
                 return None;
@@ -671,6 +806,47 @@ fn normalize_rule(
         // authorship, not a match value, so there is nothing to normalise.
         origin: rule.origin.clone(),
     })
+}
+
+/// Which host-name rule a value is written for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostNameKind {
+    /// `ru`, `.ru`, `*.ru` and `ru.` — spellings of one zone.
+    Zone,
+    /// An exact host, or what follows the `*.` of a suffix rule.
+    Domain,
+}
+
+/// The canonical spelling of a zone or domain rule value, or the error the
+/// rule pipeline refuses it with.
+///
+/// The one answer to "is this a zone / a domain": the import pipeline, the
+/// wire decoder and the GUI's per-row verdict all read it, so a value the GUI
+/// shows as valid is exactly one the service keeps as a live rule.
+pub(crate) fn canonical_host_name(
+    kind: HostNameKind,
+    value: &str,
+    rule_id: &RuleId,
+    warnings: &mut Vec<ValidationWarning>,
+) -> Result<String, ValidationError> {
+    match kind {
+        HostNameKind::Domain => normalize_domain_label(value, rule_id, warnings),
+        HostNameKind::Zone => {
+            // `.ru` is how a user naturally writes a TLD. Kept, `match_zone`
+            // would look for `..ru` and the rule would be accepted and inert.
+            let trimmed = value.trim().to_lowercase();
+            let stripped = trimmed.strip_prefix("*.").unwrap_or(&trimmed);
+            let body = stripped.strip_prefix('.').unwrap_or(stripped);
+            if body.is_empty() {
+                return Err(ValidationError::ZoneEmptyName {
+                    rule_id: rule_id.clone(),
+                });
+            }
+            // Same IDNA path as a domain: hostnames are punycode at decision
+            // time, so a Unicode zone would never match.
+            normalize_domain_label(body, rule_id, warnings)
+        }
+    }
 }
 
 /// Normalizes a domain label value (the content of `ExactFqdn` or
@@ -742,55 +918,32 @@ fn normalize_domain_label(
 
 /// Refuses a domain value that is not a hostname, naming WHAT it is when the
 /// shape is recognisable.
-///
-/// The three IP-shaped answers exist because the `--- IP` section passes an
-/// unparseable value through as a domain "so the semantic validator can produce
-/// a proper diagnostic" — and it never did: `192.168.1.0/24`,
-/// `10.0.0.1-10.0.0.9` and `not-an-ip` were all accepted as domain names,
-/// silently, with zero errors and zero warnings. Their variants existed and
-/// were constructed nowhere in the repository.
 fn reject_if_not_a_hostname(value: &str, rule_id: &RuleId) -> Result<(), ValidationError> {
-    // Address-shaped FIRST, because a hostname check would pass some of these:
-    // `10.0.0.1-10.0.0.9` is made of legal hostname characters, and calling it
-    // a valid name is how a range ended up stored as one. A value with no
-    // letter at all is not a name — no top-level domain is all digits.
-    if !value.is_empty() && !value.chars().any(|c| c.is_ascii_alphabetic()) {
-        if let Some((head, _)) = value.split_once('/') {
-            if head.parse::<std::net::IpAddr>().is_ok() {
-                return Err(ValidationError::CidrNotSupported {
-                    rule_id: rule_id.clone(),
-                    value: value.to_string(),
-                });
-            }
-        }
-        if let Some((from, to)) = value.split_once('-') {
-            if from.parse::<std::net::IpAddr>().is_ok() && to.parse::<std::net::IpAddr>().is_ok() {
-                return Err(ValidationError::IpRangeNotSupported {
-                    rule_id: rule_id.clone(),
-                    value: value.to_string(),
-                });
-            }
-        }
-        // A well-formed address in a DOMAIN rule is not a mistyped name — it is
-        // a value in the wrong section, and it would never match a host name.
-        if value.parse::<std::net::Ipv4Addr>().is_ok() {
-            return Err(ValidationError::DomainInvalidValue {
-                rule_id: rule_id.clone(),
-                value: value.to_string(),
-            });
-        }
-        return Err(ValidationError::InvalidIpAddress {
-            rule_id: rule_id.clone(),
-            value: value.to_string(),
-        });
+    // Address-shaped FIRST: `10.0.0.1-10.0.0.9` is made of legal hostname
+    // characters. No top-level domain is all digits, and an IPv6 literal is
+    // not a name either; the address check says what such a value is.
+    if !value.chars().any(|c| c.is_ascii_alphabetic())
+        || value.parse::<std::net::Ipv6Addr>().is_ok()
+    {
+        return Err(
+            match canonical_ip_address(value, rule_id, &mut Vec::new()) {
+                // A well-formed address is a value in the wrong section: it
+                // would never match a host name.
+                Ok(_) | Err(ValidationError::IpAddressNotADestination { .. }) => {
+                    ValidationError::DomainInvalidValue {
+                        rule_id: rule_id.clone(),
+                        value: value.to_string(),
+                    }
+                }
+                Err(refusal) => refusal,
+            },
+        );
     }
-    if value.parse::<std::net::Ipv6Addr>().is_ok() {
-        return Err(ValidationError::DomainInvalidValue {
-            rule_id: rule_id.clone(),
-            value: value.to_string(),
-        });
-    }
-    if crate::rule_value_validation::is_valid_hostname(value) {
+    // Length on the ASCII form: the matcher drops a longer host as malformed,
+    // so a rule naming one would be accepted and never match.
+    if value.len() <= crate::rule_value_validation::MAX_HOSTNAME_OCTETS
+        && crate::rule_value_validation::is_valid_hostname(value)
+    {
         return Ok(());
     }
     Err(ValidationError::DomainInvalidValue {
@@ -799,14 +952,40 @@ fn reject_if_not_a_hostname(value: &str, rule_id: &RuleId) -> Result<(), Validat
     })
 }
 
-/// The canonical form of a rule's address, warning when it was written as an
-/// IPv4-mapped IPv6 address.
-fn canonicalize_ip_addr(
-    addr: IpAddr,
+/// The address an exact-IP rule value names, or the error the rule pipeline
+/// refuses it with. The one answer to "is this an address rule": the import
+/// pipeline, the per-row verdict, the wire decoder and the service's acceptance
+/// of a revision all read it. An IPv4-mapped IPv6 address becomes the IPv4
+/// one; its class decides the rest: "this host" and the limited broadcast are
+/// refused, loopback, multicast and link-local kept with a warning.
+pub(crate) fn canonical_ip_address(
+    value: &str,
     rule_id: &RuleId,
     warnings: &mut Vec<ValidationWarning>,
-) -> IpAddr {
+) -> Result<IpAddr, ValidationError> {
+    let value = value.trim();
+    let Ok(addr) = value.parse::<IpAddr>() else {
+        return Err(address_refusal(value, rule_id));
+    };
     let canonical = crate::address_class::canonical_ip(addr);
+    let class = crate::address_class::classify(canonical);
+    match class {
+        AddressClass::Unspecified | AddressClass::ThisNetwork | AddressClass::Broadcast => {
+            return Err(ValidationError::IpAddressNotADestination {
+                rule_id: rule_id.clone(),
+                value: value.to_string(),
+                class,
+            });
+        }
+        AddressClass::Loopback | AddressClass::Multicast | AddressClass::LinkLocal => {
+            warnings.push(ValidationWarning::UnusualIpDestination {
+                rule_id: rule_id.clone(),
+                address: canonical,
+                class,
+            });
+        }
+        AddressClass::Routable => {}
+    }
     if canonical != addr {
         warnings.push(ValidationWarning::Ipv4MappedIpv6Normalized {
             rule_id: rule_id.clone(),
@@ -814,7 +993,33 @@ fn canonicalize_ip_addr(
             normalized: canonical.to_string(),
         });
     }
-    canonical
+    Ok(canonical)
+}
+
+/// Names what an unparseable address value is, when its shape says so.
+fn address_refusal(value: &str, rule_id: &RuleId) -> ValidationError {
+    let rule_id = rule_id.clone();
+    let value_owned = value.to_string();
+    if let Some((head, _)) = value.split_once('/') {
+        if head.parse::<IpAddr>().is_ok() {
+            return ValidationError::CidrNotSupported {
+                rule_id,
+                value: value_owned,
+            };
+        }
+    }
+    if let Some((from, to)) = value.split_once('-') {
+        if from.parse::<IpAddr>().is_ok() && to.parse::<IpAddr>().is_ok() {
+            return ValidationError::IpRangeNotSupported {
+                rule_id,
+                value: value_owned,
+            };
+        }
+    }
+    ValidationError::InvalidIpAddress {
+        rule_id,
+        value: value_owned,
+    }
 }
 
 /// Normalizes an [`AppMatch`]:
@@ -829,41 +1034,63 @@ fn normalize_app_match(
     rule_id: &RuleId,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Result<CanonicalAppMatch, ValidationError> {
-    let canonical_pattern = match &app.pattern {
-        AppMatchPattern::Exact(raw) => {
-            let (process_name, changes) =
-                crate::app_identity::canonical_exact_process_name(raw, naming);
-            if let Some(original) = changes.stripped_path_from {
-                warnings.push(ValidationWarning::ProcessNameContainedPath {
-                    rule_id: rule_id.clone(),
-                    original,
-                    normalized: process_name.clone(),
-                });
-            }
-            if let Some(original) = changes.appended_exe_to {
-                warnings.push(ValidationWarning::ProcessNameMissingExeSuffix {
-                    rule_id: rule_id.clone(),
-                    original,
-                    normalized: process_name.clone(),
-                });
-            }
-            CanonicalAppPattern::Exact(process_name)
-        }
-        AppMatchPattern::Glob(raw) => {
-            let lowercased = crate::app_identity::canonical_glob_process_pattern(raw);
-            if lowercased == "*" {
-                return Err(ValidationError::AppGlobTooWide {
-                    rule_id: rule_id.clone(),
-                });
-            }
-            CanonicalAppPattern::Glob(lowercased)
-        }
+    let (raw, glob) = match &app.pattern {
+        AppMatchPattern::Exact(raw) => (raw.as_str(), false),
+        AppMatchPattern::Glob(raw) => (raw.as_str(), true),
     };
-
     Ok(CanonicalAppMatch {
-        pattern: canonical_pattern,
+        pattern: canonical_app_pattern(raw, glob, naming, rule_id, warnings)?,
         include_child_processes: app.include_child_processes,
     })
+}
+
+/// The canonical pattern of an application rule value (`glob`: written as a
+/// pattern), or the error the rule pipeline refuses it with. The one answer to
+/// "is this an application rule": the import pipeline, the per-row verdict and
+/// the service's acceptance of a revision all read it.
+pub(crate) fn canonical_app_pattern(
+    raw: &str,
+    glob: bool,
+    naming: ExecutableNaming,
+    rule_id: &RuleId,
+    warnings: &mut Vec<ValidationWarning>,
+) -> Result<CanonicalAppPattern, ValidationError> {
+    if raw.len() > crate::preset_validation::MAX_MATCH_VALUE_LEN
+        || nrr_shared::preset_parser::first_forbidden_field_char(raw).is_some()
+    {
+        return Err(ValidationError::AppNameInvalid {
+            rule_id: rule_id.clone(),
+            value: raw.to_string(),
+        });
+    }
+    if glob {
+        let lowercased = crate::app_identity::canonical_glob_process_pattern(raw);
+        // Judged by the key the matcher compares, not the text: `C:\Games\*`,
+        // `/opt/*` and `*.exe` all reduce to `*` there and name every process.
+        let key = crate::app_identity::app_match_key(&lowercased);
+        if !key.is_empty() && key.bytes().all(|b| b == b'*') {
+            return Err(ValidationError::AppGlobTooWide {
+                rule_id: rule_id.clone(),
+            });
+        }
+        return Ok(CanonicalAppPattern::Glob(lowercased));
+    }
+    let (process_name, changes) = crate::app_identity::canonical_exact_process_name(raw, naming);
+    if let Some(original) = changes.stripped_path_from {
+        warnings.push(ValidationWarning::ProcessNameContainedPath {
+            rule_id: rule_id.clone(),
+            original,
+            normalized: process_name.clone(),
+        });
+    }
+    if let Some(original) = changes.appended_exe_to {
+        warnings.push(ValidationWarning::ProcessNameMissingExeSuffix {
+            rule_id: rule_id.clone(),
+            original,
+            normalized: process_name.clone(),
+        });
+    }
+    Ok(CanonicalAppPattern::Exact(process_name))
 }
 
 // ── Deduplication ─────────────────────────────────────────────────────────────
@@ -878,8 +1105,11 @@ fn normalize_app_match(
 /// instructions, and folding them left whichever came first while the other
 /// vanished behind a "duplicate removed" note. The same went for a disabled
 /// copy above an enabled one — the set kept the disabled line.
+///
+/// The merge and the review diff pair rules by this same key, so "these two
+/// rows are one rule" means one thing on every screen.
 #[derive(PartialEq, Eq, Hash)]
-struct MatchKey {
+pub(crate) struct MatchKey {
     address: Option<CanonicalAddressMatch>,
     app_pattern: Option<CanonicalAppPattern>,
     app_children: Option<bool>,
@@ -888,7 +1118,7 @@ struct MatchKey {
 }
 
 impl MatchKey {
-    fn from_rule(rule: &CanonicalRule) -> Self {
+    pub(crate) fn from_rule(rule: &CanonicalRule) -> Self {
         Self {
             address: rule.address_match.clone(),
             app_pattern: rule.app_match.as_ref().map(|a| a.pattern.clone()),

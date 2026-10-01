@@ -14,6 +14,8 @@ sample.rs:22
 sample.rs:25
 sample.rs:26
 sample.rs:27
+sample.rs:29
+sample.rs:33
 sample.sh:2
 sample.toml:2
 sample.toml:3

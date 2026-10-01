@@ -36,7 +36,7 @@ GroupBox {
         Label {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
-            text: root.tr("settings.field.route-secondary-label", "Secondary route name")
+            text: root.tr("settings.field.route-secondary-label", "Additional route name")
             color: root.textColor
         }
         ThemedTextField {

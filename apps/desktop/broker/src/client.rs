@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use crate::protocol::{build_broker_argv, derive_pipe_name, BrokerRequest, BROKER_SHUTDOWN};
 use crate::protocol::{client_answer_timeout, BrokerResponse, BROKER_PING};
+#[cfg(target_os = "windows")]
+use crate::windows_sys::NoFlush;
 
 /// How long the readiness ping waits for the freshly spawned broker to
 /// create its pipe (covers process startup after UAC was granted).
@@ -500,23 +502,6 @@ fn broker_impostor_reason(pipe: windows::Win32::Foundation::HANDLE) -> Option<St
         }
     }
     crate::server_identity::impostor_reason(&own_exe, &facts)
-}
-
-/// The request's writer. The connection stays open for the answer, so the
-/// flush that guards write-then-close is not needed — and `FlushFileBuffers`
-/// would wait, with no deadline, for a busy broker to read.
-#[cfg(target_os = "windows")]
-struct NoFlush<'a, W: std::io::Write>(&'a mut W);
-
-#[cfg(target_os = "windows")]
-impl<W: std::io::Write> std::io::Write for NoFlush<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Open a fresh connection, verify who serves it, send one request, read one

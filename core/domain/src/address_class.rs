@@ -76,6 +76,8 @@ pub enum AddressClass {
     Broadcast,
     /// `0.0.0.0` / `::`.
     Unspecified,
+    /// The rest of `0.0.0.0/8`: "this network", valid only as a source.
+    ThisNetwork,
 }
 
 impl AddressClass {
@@ -137,6 +139,8 @@ pub fn classify(ip: IpAddr) -> AddressClass {
 fn classify_v4(ip: Ipv4Addr) -> AddressClass {
     if ip.is_unspecified() {
         AddressClass::Unspecified
+    } else if ip.octets()[0] == 0 {
+        AddressClass::ThisNetwork
     } else if ip.is_loopback() {
         AddressClass::Loopback
     } else if ip.is_broadcast() {
@@ -371,8 +375,8 @@ mod tests {
     #[test]
     fn the_port_rule_does_not_quieten_anything_else() {
         for (addr, port) in [
-            ("8.8.8.8", 5353),       // public resolver, not our segment
-            ("23.10.20.138", 137),   // public host on a discovery port
+            ("198.51.100.8", 5353),  // public host on the mDNS port
+            ("203.0.113.138", 137),  // public host on a discovery port
             ("192.168.1.10", 443),   // private host, ordinary traffic
             ("192.168.1.255", 6771), // BitTorrent LPD — deliberately not ours
             ("100.64.0.1", 5353),    // CGNAT is not a private network
@@ -398,12 +402,23 @@ mod tests {
             Some("ws-discovery")
         );
         // A public address is still described by class alone — no invented label.
-        assert_eq!(well_known_purpose(ip("8.8.8.8"), 137), None);
+        assert_eq!(well_known_purpose(ip("198.51.100.8"), 137), None);
+    }
+
+    #[test]
+    fn this_host_and_this_network_are_told_apart() {
+        assert_eq!(classify(ip("0.0.0.0")), AddressClass::Unspecified);
+        assert_eq!(classify(ip("::")), AddressClass::Unspecified);
+        for addr in ["0.0.0.1", "0.1.2.3", "0.255.255.255"] {
+            assert_eq!(classify(ip(addr)), AddressClass::ThisNetwork, "{addr}");
+        }
+        assert_eq!(classify(ip("1.0.0.0")), AddressClass::Routable);
+        assert_eq!(classify(ip("255.255.255.255")), AddressClass::Broadcast);
     }
 
     #[test]
     fn ordinary_destinations_stay_routable() {
-        for addr in ["8.8.8.8", "192.168.0.10", "2606:4700::1111"] {
+        for addr in ["198.51.100.8", "192.168.0.10", "2001:db8::1111"] {
             assert_eq!(classify(ip(addr)), AddressClass::Routable, "{addr}");
         }
     }
@@ -443,8 +458,8 @@ mod tests {
 
     #[test]
     fn a_routable_destination_has_no_purpose_label() {
-        assert_eq!(well_known_purpose(ip("8.8.8.8"), 53), None);
-        assert_eq!(well_known_purpose(ip("2606:4700::1111"), 443), None);
+        assert_eq!(well_known_purpose(ip("198.51.100.8"), 53), None);
+        assert_eq!(well_known_purpose(ip("2001:db8::1111"), 443), None);
     }
 
     #[test]

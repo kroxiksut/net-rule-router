@@ -1,50 +1,91 @@
 //! How each program's connections fare on the main link, for the application
 //! offer (see [`nrr_domain::app_offer`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use nrr_domain::app_offer::{main_link_does_not_carry, AppMainLinkReach};
+use nrr_domain::app_offer::{main_link_carries_again, main_link_does_not_carry, AppMainLinkReach};
 
 /// A program quiet this long starts over: old failures say nothing about now.
 const WINDOW_MS: u64 = 10 * 60 * 1_000;
 const MAX_PROGRAMS: usize = 256;
-const MAX_ADDRESSES_PER_PROGRAM: usize = 16;
+/// Past this the address heard from longest ago makes room, so the counts
+/// always describe the program's latest addresses.
+const MAX_ADDRESSES_PER_PROGRAM: usize = 32;
+
+/// How the last connection to one address went.
+#[derive(Clone, Copy, Debug)]
+struct Outcome {
+    stalled: bool,
+    /// The stall had a host name, and so an offer of its own.
+    named: bool,
+    at_ms: u64,
+}
 
 #[derive(Debug, Default)]
 struct Tally {
-    stalled: HashSet<IpAddr>,
-    failing: HashSet<IpAddr>,
-    working: HashSet<IpAddr>,
+    /// Each address once, by its last outcome: one that stalled and then
+    /// answered counts as working, not as both.
+    addresses: HashMap<IpAddr, Outcome>,
     rides_additional_link: bool,
     last_ms: u64,
     judged: bool,
 }
 
 impl Tally {
-    fn reach(&self) -> AppMainLinkReach {
-        AppMainLinkReach {
-            stalled_addresses: self.stalled.len(),
-            failing_addresses: self.failing.len(),
-            working_addresses: self.working.len(),
-            rides_additional_link: self.rides_additional_link,
+    fn record(&mut self, remote: IpAddr, outcome: Outcome) {
+        if self.addresses.len() >= MAX_ADDRESSES_PER_PROGRAM
+            && !self.addresses.contains_key(&remote)
+        {
+            let oldest = self
+                .addresses
+                .iter()
+                .min_by_key(|(_, o)| o.at_ms)
+                .map(|(address, _)| *address);
+            if let Some(oldest) = oldest {
+                self.addresses.remove(&oldest);
+            }
         }
+        self.addresses.insert(remote, outcome);
+    }
+
+    fn reach(&self) -> AppMainLinkReach {
+        let mut reach = AppMainLinkReach {
+            rides_additional_link: self.rides_additional_link,
+            ..AppMainLinkReach::default()
+        };
+        for outcome in self.addresses.values() {
+            if !outcome.stalled {
+                reach.working_addresses += 1;
+                continue;
+            }
+            reach.failing_addresses += 1;
+            if !outcome.named {
+                reach.stalled_addresses += 1;
+            }
+        }
+        reach
+    }
+
+    fn unnamed_stalls(&self) -> Vec<IpAddr> {
+        let mut addresses: Vec<IpAddr> = self
+            .addresses
+            .iter()
+            .filter(|(_, o)| o.stalled && !o.named)
+            .map(|(address, _)| *address)
+            .collect();
+        addresses.sort();
+        addresses
     }
 
     /// `Carried` when an earlier "not carried" no longer holds.
     fn withdrawn(&mut self) -> Option<AppVerdict> {
-        if self.judged && !main_link_does_not_carry(self.reach()) {
+        if self.judged && main_link_carries_again(self.reach()) {
             self.judged = false;
             return Some(AppVerdict::Carried);
         }
         None
-    }
-}
-
-fn remember(set: &mut HashSet<IpAddr>, remote: IpAddr) {
-    if set.len() < MAX_ADDRESSES_PER_PROGRAM {
-        set.insert(remote);
     }
 }
 
@@ -77,21 +118,22 @@ impl AppMainLinkReachRegistry {
         at_ms: u64,
     ) -> Option<AppVerdict> {
         self.with_tally(program, at_ms, |tally| {
+            tally.record(
+                remote,
+                Outcome {
+                    stalled,
+                    named,
+                    at_ms,
+                },
+            );
             if !stalled {
-                remember(&mut tally.working, remote);
                 return tally.withdrawn();
-            }
-            remember(&mut tally.failing, remote);
-            if !named {
-                remember(&mut tally.stalled, remote);
             }
             if tally.judged || !main_link_does_not_carry(tally.reach()) {
                 return None;
             }
             tally.judged = true;
-            let mut addresses: Vec<IpAddr> = tally.stalled.iter().copied().collect();
-            addresses.sort();
-            Some(AppVerdict::NotCarried(addresses))
+            Some(AppVerdict::NotCarried(tally.unnamed_stalls()))
         })
     }
 
@@ -197,18 +239,68 @@ mod tests {
     }
 
     #[test]
-    fn the_offer_goes_once_most_addresses_work() {
+    fn the_offer_goes_once_most_addresses_work_by_the_margin() {
         let r = AppMainLinkReachRegistry::default();
         for last in 1..=3 {
             r.note("app.exe", addr(last), true, false, 1_000);
         }
-        for last in 7..=8 {
+        for last in 7..=10 {
             assert_eq!(r.note("app.exe", addr(last), false, false, 2_000), None);
         }
         assert_eq!(
-            r.note("app.exe", addr(9), false, false, 2_000),
+            r.note("app.exe", addr(11), false, false, 2_000),
             Some(AppVerdict::Carried)
         );
+    }
+
+    /// A full address book still lets failures outnumber the work: the oldest
+    /// addresses make room instead of both sides stopping at the same cap.
+    #[test]
+    fn failures_can_still_win_after_many_working_addresses() {
+        let r = AppMainLinkReachRegistry::default();
+        for last in 1..=40 {
+            r.note("app.exe", addr(last), false, false, u64::from(last));
+        }
+        let turned = (100..=140)
+            .filter_map(|last| r.note("app.exe", addr(last), true, false, 1_000 + u64::from(last)))
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(turned.as_slice(), [AppVerdict::NotCarried(_)]),
+            "{turned:?}"
+        );
+    }
+
+    /// An address that stalled and then answered is working, once: five of
+    /// them and one fresh stall are not a majority of failures.
+    #[test]
+    fn an_address_counts_by_its_last_outcome() {
+        let r = AppMainLinkReachRegistry::default();
+        for last in 1..=5 {
+            assert_eq!(r.note("app.exe", addr(last), true, false, 1_000), None);
+            assert_eq!(r.note("app.exe", addr(last), false, false, 1_500), None);
+        }
+        assert_eq!(r.note("app.exe", addr(6), true, false, 2_000), None);
+    }
+
+    /// One address flipping between a stall and a reply cannot flap the
+    /// verdict, and the verdict is not raised again while it stands.
+    #[test]
+    fn one_flipping_address_does_not_flap_the_verdict() {
+        let r = AppMainLinkReachRegistry::default();
+        for last in 10..=12 {
+            r.note("app.exe", addr(last), false, false, 500);
+        }
+        for last in 1..=3 {
+            r.note("app.exe", addr(last), true, false, 1_000);
+        }
+        assert!(matches!(
+            r.note("app.exe", addr(4), true, false, 1_000),
+            Some(AppVerdict::NotCarried(_))
+        ));
+        for at in 0..5 {
+            assert_eq!(r.note("app.exe", addr(4), false, false, 2_000 + at), None);
+            assert_eq!(r.note("app.exe", addr(4), true, false, 2_500 + at), None);
+        }
     }
 
     #[test]

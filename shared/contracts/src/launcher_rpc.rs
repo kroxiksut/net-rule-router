@@ -178,6 +178,21 @@ pub fn parse_response_line(line: &str) -> Option<Result<LauncherRpcResponse, ser
     Some(serde_json::from_str(body))
 }
 
+/// The QML context key both surfaces carry [`HostAnswerDeadlines`] under.
+pub const HOST_ANSWER_DEADLINES_CONTEXT_KEY: &str = "rpcAnswerDeadlines";
+
+/// How long the host waits for the launcher's answer to a request before it
+/// counts the request as lost. The launcher derives every value from its own
+/// budgets, so the host never gives up on an answer that is still coming.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostAnswerDeadlines {
+    /// For an operation `operations_ms` does not name.
+    pub default_ms: u64,
+    /// Keyed by operation slug.
+    pub operations_ms: std::collections::BTreeMap<String, u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

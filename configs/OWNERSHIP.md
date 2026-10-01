@@ -1,6 +1,6 @@
 # Ownership Matrix
 
-This document defines ownership for block 3 maintenance areas.
+This document defines ownership for the localization and theme maintenance areas.
 
 ## Matrix
 

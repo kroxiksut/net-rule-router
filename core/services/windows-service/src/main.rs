@@ -17,7 +17,7 @@
 //!
 //! This binary delegates bootstrap, policy load, IPC server, and apply
 //! control to the runtime body in
-//! `nrr-service-runtime::lifecycle::run_runtime`.
+//! `nrr-service-runtime::run_supervised_runtime`.
 
 use std::env;
 
@@ -82,6 +82,10 @@ pub(crate) fn lock_down_data_tree() -> Result<(), String> {
 }
 
 fn main() -> std::process::ExitCode {
+    #[cfg(windows)]
+    if let Err(err) = nrr_platform_windows::dll_search::restrict_dll_search() {
+        eprintln!("{err}");
+    }
     // Publish this binary's semver to the ContractNegotiate handler so
     // the GUI's compatibility banner can render "Service X.Y.Z" in its
     // diagnostic line. Called BEFORE any handler runs so the first
@@ -421,24 +425,11 @@ fn apply_start_mode(target: nrr_service_runtime::ServiceStartMode) -> std::proce
     }
 }
 
-/// Opens a short-lived read-only connection to the state DB and asks the
-/// storage layer whether the operator has saved
-/// `verbose_logging = true`. Any failure (DB missing, file locked,
-/// schema mismatch) degrades to `false` so the service falls back to
-/// the canonical info-only NDJSON profile. Called BEFORE
-/// `install_ndjson_tracing_*` so the initial `EnvFilter` directive
-/// already matches the saved preference — no restart-to-apply gap
-/// inside a single startup cycle.
+/// Whether a stored verbose-logging window is still open. Called before
+/// `install_ndjson_tracing_*` so the first event already meets the right
+/// filter; a window that ended while the service was down reads as normal.
 pub(crate) fn read_verbose_logging_flag(state_db_path: &std::path::Path) -> bool {
-    if !state_db_path.exists() {
-        return false;
-    }
-    // Through the storage factory, not a raw open: its `busy_timeout` is what
-    // keeps a momentary writer lock from reading as "the flag is off".
-    match nrr_storage::migration::open_connection(state_db_path) {
-        Ok(conn) => nrr_storage::service_stability_config::probe_verbose_logging(&conn),
-        Err(_) => false,
-    }
+    nrr_service_runtime::verbose_logging::verbose_at_boot(state_db_path)
 }
 
 fn print_status_banner() {
@@ -569,8 +560,7 @@ fn run_console() -> std::process::ExitCode {
     );
     eprintln!("[dbg] step=11 after-crash-recovery");
     eprintln!("[service] crash-recovery outcome: {recovery_outcome:?}");
-    // Mirror the SCM-mode info log from `scm.rs:195` so console-mode
-    // dev sessions get the same NDJSON anchor for "service started OK".
+    // Same key as SCM mode: one "service started OK" anchor for both entries.
     tracing::info!(
         target: "nrr::recovery",
         msg_key = "svc-boot-crash-recovery-complete",
@@ -604,7 +594,7 @@ fn run_console() -> std::process::ExitCode {
     #[cfg(windows)]
     {
         let deps = runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
-        let _reason = run_supervised_runtime(&ConsoleController, &stop, artifacts, deps);
+        run_supervised_runtime(&ConsoleController, &stop, artifacts, deps);
         std::process::ExitCode::SUCCESS
     }
     // Console mode drives the same supervised runtime the SCM path does, and

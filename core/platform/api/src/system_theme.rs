@@ -1,9 +1,9 @@
 //! System appearance (light / dark), behind a port.
 //!
 //! The probe is OS mechanism, so it belongs here as a trait with per-OS
-//! implementations rather than inside a neutral UI crate. The only real
-//! implementation used to sit under `#[cfg(windows)]` in `nrr-ui-support`, so
-//! every other OS silently received "light" — a guess presented as a fact.
+//! implementations rather than inside a neutral UI crate — a `#[cfg(windows)]`
+//! probe stranded in a UI crate would leave every other OS silently guessing
+//! "light" and presenting it as a fact.
 
 /// What the system says it wants to look like.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

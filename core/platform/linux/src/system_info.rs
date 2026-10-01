@@ -152,11 +152,11 @@ mod tests {
 
     #[test]
     fn cpu_model_reads_first_model_name() {
-        let sample = "processor\t: 0\nvendor_id\t: GenuineIntel\n\
-             model name\t: Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz\nprocessor\t: 1\n";
+        let sample = "processor\t: 0\nvendor_id\t: GenericVendor\n\
+             model name\t: Generic CPU @ 2.60GHz\nprocessor\t: 1\n";
         assert_eq!(
             parse_cpu_model(sample).as_deref(),
-            Some("Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz")
+            Some("Generic CPU @ 2.60GHz")
         );
     }
 

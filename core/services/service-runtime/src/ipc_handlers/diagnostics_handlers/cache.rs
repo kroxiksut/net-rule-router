@@ -1,5 +1,5 @@
 //! Reading and clearing what the service remembers about names and addresses,
-//! and the log/diagnostic-mode switches beside it.
+//! and clearing the operational logs beside it.
 //!
 //! Split out of `diagnostics_handlers`; the code is unchanged.
 
@@ -39,47 +39,6 @@ impl IpcHandler for LogsClearHandler {
             dry_run: result.dry_run,
         };
         serialise(OP, &response)
-    }
-}
-
-// ── DiagnosticModeSetHandler ──────────────────────────────────────────────
-
-/// Enable/disable extended diagnostics for a bounded
-/// in-memory session. Forwards to `DiagnosticsFacade::set_diagnostic_mode`
-/// and echoes back the resulting `diagnostic_mode` state so the panel
-/// renders authoritative data. Enabling immediately unredacts the cache +
-/// connection-trace viewers (they read the SAME shared facade). Facade
-/// always present → no dep gate.
-pub struct DiagnosticModeSetHandler {
-    diagnostics: Arc<dyn DiagnosticsFacade>,
-}
-
-impl DiagnosticModeSetHandler {
-    pub fn new(diagnostics: Arc<dyn DiagnosticsFacade>) -> Self {
-        Self { diagnostics }
-    }
-}
-
-impl IpcHandler for DiagnosticModeSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
-        const OP: &str = "diagnostics.mode.set";
-        let req: DiagnosticModeSetRequest = if request.payload.is_null() {
-            DiagnosticModeSetRequest::default()
-        } else {
-            serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?
-        };
-        let facade_req = SetDiagnosticModeRequest {
-            enabled: req.enabled,
-            duration_ms: req.duration_ms,
-            scope: req.scope,
-            until_restart: req.until_restart,
-        };
-        self.diagnostics
-            .set_diagnostic_mode(&facade_req)
-            .map_err(|e| internal(OP, format!("facade.set_diagnostic_mode: {e}")))?;
-        // Authoritative echo of the resulting session state.
-        let state = self.diagnostics.get_status().diagnostic_mode;
-        serialise(OP, &state)
     }
 }
 
@@ -184,15 +143,9 @@ impl IpcHandler for CacheClearHandler {
 /// `CacheRepository::list_resolutions` and projects the rows into
 /// [`CacheEntryDto`]s.
 ///
-/// **Redaction.** Detail is gated by the active diagnostic mode, read from
-/// `DiagnosticsFacade::get_status().diagnostic_mode.active` — the same
-/// signal that drives `DiagnosticRedactionLevel` elsewhere. When diagnostic
-/// mode is OFF (the compact tier, `RedactionMode::Default`) hostnames are
-/// reduced to their registrable domain (eTLD+1) and IPs are replaced with a
-/// `<private-ipv4>` / `<public-ipv4>` marker via the shared `redact_*`
-/// helpers — raw hostnames/IPs never leave the service. When diagnostic mode
-/// is ON the full values are surfaced. The `redacted` response flag lets the
-/// GUI show a "enable diagnostic mode for full detail" notice.
+/// **Redaction.** None: this is an on-screen inspector of the user's own
+/// machine, so full hostnames and addresses are shown and `redacted` is
+/// always `false`. Exports and archives keep their own redaction tier.
 ///
 /// Offset paging is carried through the shared cursor: the handler decodes
 /// the next offset from `pagination.cursor` and re-encodes `offset + limit`

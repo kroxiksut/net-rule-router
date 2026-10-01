@@ -884,7 +884,7 @@ ScrollView {
                         }
                         ToolTip.visible: connHdrEgressHover.hovered
                         ToolTip.text: root.tr("diag.conn-trace.col-egress-tip",
-                            "Which network link the connection actually left through: Primary (your main link), Additional (the VPN/secondary link), Loopback (local, never leaves the PC), Other (another adapter), Unknown (couldn't be determined). This is observation only — it never changes routing.")
+                            "Which network link the connection actually left through: Primary (your main link), Additional (the additional link, usually a VPN), Loopback (local, never leaves the PC), Other (another adapter), Unknown (couldn't be determined). This is observation only — it never changes routing.")
                     }
                     Label {
                         id: connHdrVerdict
@@ -1294,7 +1294,7 @@ ScrollView {
                     theme: root.uiTheme
                     visible: section._connTraceCursor !== ""
                     enabled: !section._connTraceLoading
-                    text: root.tr("diag.conn-trace.entries-load-more", "Load more")
+                    text: root.tr("action.load-more", "Load more")
                     onClicked: section._loadConnTraceEntries(false)
                 }
             }

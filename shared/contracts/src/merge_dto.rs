@@ -231,7 +231,7 @@ mod tests {
             service_only: Vec::new(),
             conflicts: vec![MergeConflictDto {
                 identity_key: "k".into(),
-                value: "1.2.3.4".into(),
+                value: "192.0.2.4".into(),
                 type_slug: "exact-ip".into(),
                 file: ConflictRuleDto {
                     route: RouteRole::Secondary,
@@ -249,7 +249,7 @@ mod tests {
             }],
             merged_rules_json: "{}".into(),
             normalized_duplicates: vec![crate::ipc_payloads::CrossSetDuplicateDto {
-                identity_key: "ip:1.1.1.1".into(),
+                identity_key: "ip:198.51.100.1".into(),
                 primary_rule_id: "r-0001".into(),
                 secondary_rule_id: "r-0002".into(),
                 match_summary: "example.com".into(),

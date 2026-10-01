@@ -16,9 +16,8 @@ presets/
 │       ├── README*.txt
 │       ├── rules_primary.txt  # optional
 │       └── rules_secondary.txt# optional
-├── abroad/                    # category: you live outside the country whose
-│   └── access-to-<cc>/        # services you need (same pack layout)
-└── COUNTRY_BACKLOG.md
+└── abroad/                    # category: you live outside the country whose
+    └── access-to-<cc>/        # services you need (same pack layout)
 ```
 
 ## Project policy
@@ -109,9 +108,10 @@ preserved but not applied to routing policy.
 
 | Limit | Value |
 |---|---|
-| Maximum file size | 1 MiB |
-| Maximum rules per file | 2,000 |
-| Maximum match value length | 260 characters |
+| Maximum file size | 756 KiB |
+| Maximum rules | 9,999 of your own across both route files, disabled rules and rules in unrecognised sections included |
+| Maximum rules in `--- Auto` | 2,000, counted separately from your own |
+| Maximum match value length | 260 bytes (UTF-8) |
 
 ## Importing a preset
 

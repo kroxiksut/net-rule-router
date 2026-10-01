@@ -41,13 +41,6 @@
 //! derives per-operation allowances. The runtime loop reads this before
 //! accepting IPC requests so that mutating operations are rejected when
 //! the service is in an unsafe state.
-//!
-//! ## Crash counter
-//!
-//! [`CrashCounter`] counts restarts within a reset window. When the count
-//! reaches the configured threshold, [`CrashCounter::is_threshold_exceeded`]
-//! returns `true` and the supervisor stops attempting auto-recovery,
-//! surfacing a `ManualActionRequired` state instead.
 
 // ── Apply attempt marker ──────────────────────────────────────────────────────
 
@@ -452,65 +445,6 @@ where
                 }
             }
         }
-    }
-}
-
-// ── Crash counter ─────────────────────────────────────────────────────────────
-
-/// Counts service crashes within a rolling time window.
-///
-/// When `crash_count >= threshold`, [`is_threshold_exceeded`] returns `true`
-/// and the SCM recovery policy should stop auto-restarting (the service
-/// stays stopped until an operator investigates).
-///
-/// [`record_crash`] automatically resets the counter if `now_secs -
-/// window_start_epoch_secs > reset_window_secs`, so a service that runs
-/// stably for a day before crashing does not inherit yesterday's count.
-///
-/// [`is_threshold_exceeded`]: CrashCounter::is_threshold_exceeded
-/// [`record_crash`]: CrashCounter::record_crash
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CrashCounter {
-    pub crash_count: u32,
-    /// Epoch seconds when the current window started.
-    pub window_start_epoch_secs: u64,
-    /// How many seconds before the counter resets.
-    pub reset_window_secs: u64,
-    /// Crash count at or above which auto-recovery stops.
-    pub threshold: u32,
-}
-
-impl CrashCounter {
-    pub fn new(threshold: u32, reset_window_secs: u64) -> Self {
-        Self {
-            crash_count: 0,
-            window_start_epoch_secs: 0,
-            reset_window_secs,
-            threshold,
-        }
-    }
-
-    /// Record one crash at `now_secs`. Returns `true` if the threshold is
-    /// now exceeded.
-    pub fn record_crash(&mut self, now_secs: u64) -> bool {
-        if now_secs.saturating_sub(self.window_start_epoch_secs) > self.reset_window_secs {
-            self.crash_count = 0;
-            self.window_start_epoch_secs = now_secs;
-        }
-        self.crash_count = self.crash_count.saturating_add(1);
-        self.is_threshold_exceeded()
-    }
-
-    /// Returns `true` when the crash count has reached the threshold.
-    /// Does NOT reset the window — call `record_crash` to do that.
-    pub fn is_threshold_exceeded(&self) -> bool {
-        self.crash_count >= self.threshold
-    }
-
-    /// Reset to zero (e.g., after a successful long-running session).
-    pub fn reset(&mut self, now_secs: u64) {
-        self.crash_count = 0;
-        self.window_start_epoch_secs = now_secs;
     }
 }
 
@@ -943,32 +877,6 @@ mod tests {
         ] {
             assert!(phase.is_incomplete(), "{phase:?} should be incomplete");
         }
-    }
-
-    #[test]
-    fn crash_counter_triggers_at_threshold() {
-        let mut counter = CrashCounter::new(3, 86400);
-        assert!(!counter.record_crash(1000));
-        assert!(!counter.record_crash(1001));
-        assert!(
-            counter.record_crash(1002),
-            "third crash should hit threshold"
-        );
-        assert!(counter.is_threshold_exceeded());
-    }
-
-    #[test]
-    fn crash_counter_resets_after_window() {
-        let mut counter = CrashCounter::new(2, 60);
-        counter.record_crash(0);
-        counter.record_crash(10);
-        assert!(counter.is_threshold_exceeded());
-        // After the reset window, a new crash should start a fresh count.
-        assert!(
-            !counter.record_crash(100),
-            "first crash in new window should not exceed"
-        );
-        assert!(!counter.is_threshold_exceeded());
     }
 
     #[test]

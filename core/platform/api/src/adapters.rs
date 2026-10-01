@@ -173,7 +173,7 @@ pub fn is_virtual_adapter(info: &AdapterInfo) -> bool {
 /// (Hyper-V / WSL / Docker / VMware / VirtualBox / …).
 ///
 /// Unlike [`is_virtual_adapter`], this does NOT treat loopback/tunnel *types* as
-/// virtual — the Block T traffic counter classifies loopback and tunnel via
+/// virtual — the traffic counter classifies loopback and tunnel via
 /// their own flags (`is_loopback` / `is_tunnel`) and needs the software-only
 /// signal for the `is_virtual` bucket.
 pub fn description_matches_virtual_software(description: &str) -> bool {
@@ -770,7 +770,7 @@ mod tests {
     fn an_adapter_that_keeps_its_name_and_changes_identity_is_reported() {
         let source = Arc::new(MockAdapterEventSource::new());
         let monitor = monitor_with(Arc::clone(&source));
-        source.set(vec![tun(30, "{OLD-GUID}", "swiftvpn")]);
+        source.set(vec![tun(30, "{OLD-GUID}", "examplevpn")]);
         assert!(
             monitor
                 .note_identity_drift(&source.enumerate_all().unwrap())
@@ -779,12 +779,12 @@ mod tests {
         );
 
         // Reconnect: same connection name, adapter recreated under a new GUID.
-        source.set(vec![tun(31, "{NEW-GUID}", "swiftvpn")]);
+        source.set(vec![tun(31, "{NEW-GUID}", "examplevpn")]);
         let drifts = monitor.note_identity_drift(&source.enumerate_all().unwrap());
         assert_eq!(
             drifts,
             vec![IdentityDrift::SameNameNewIdentity {
-                name: "swiftvpn".to_string(),
+                name: "examplevpn".to_string(),
                 was: "{OLD-GUID}".to_string(),
                 now: "{NEW-GUID}".to_string(),
             }]
@@ -795,17 +795,17 @@ mod tests {
     fn an_adapter_that_keeps_its_identity_and_is_renamed_is_reported() {
         let source = Arc::new(MockAdapterEventSource::new());
         let monitor = monitor_with(Arc::clone(&source));
-        source.set(vec![tun(30, "{SAME-GUID}", "swiftvpn v2")]);
+        source.set(vec![tun(30, "{SAME-GUID}", "examplevpn v2")]);
         monitor.note_identity_drift(&source.enumerate_all().unwrap());
 
-        source.set(vec![tun(30, "{SAME-GUID}", "swiftvpn v3")]);
+        source.set(vec![tun(30, "{SAME-GUID}", "examplevpn v3")]);
         let drifts = monitor.note_identity_drift(&source.enumerate_all().unwrap());
         assert_eq!(
             drifts,
             vec![IdentityDrift::SameIdentityNewName {
                 id: "{SAME-GUID}".to_string(),
-                was: "swiftvpn v2".to_string(),
-                now: "swiftvpn v3".to_string(),
+                was: "examplevpn v2".to_string(),
+                now: "examplevpn v3".to_string(),
             }]
         );
     }
@@ -816,7 +816,7 @@ mod tests {
         // the case that happens every tick, or its reports mean nothing.
         let source = Arc::new(MockAdapterEventSource::new());
         let monitor = monitor_with(Arc::clone(&source));
-        source.set(vec![tun(30, "{SAME-GUID}", "swiftvpn")]);
+        source.set(vec![tun(30, "{SAME-GUID}", "examplevpn")]);
         for _ in 0..5 {
             assert!(monitor
                 .note_identity_drift(&source.enumerate_all().unwrap())
@@ -842,7 +842,7 @@ mod tests {
         adapter(
             idx,
             &format!("{{{idx}}}"),
-            "Intel Ethernet",
+            "Ethernet Controller",
             InterfaceType::Ethernet,
             IfOperStatus::Up,
             vec![Ipv4Addr::new(192, 168, 1, idx as u8)],
@@ -854,7 +854,7 @@ mod tests {
         adapter(
             idx,
             &format!("{{{idx}}}"),
-            "Realtek WiFi",
+            "Wireless Adapter",
             InterfaceType::Ethernet,
             IfOperStatus::Up,
             vec![],
@@ -1077,7 +1077,7 @@ mod tests {
         assert_eq!(mon.availability_for(5), AdapterAvailability::Available);
     }
 
-    // ── text_indicates_vpn_tunnel (block T Feature 1 strengthening) ─────────
+    // ── text_indicates_vpn_tunnel ────────────────────────────────────────────
 
     #[test]
     fn recognizes_common_vpn_adapter_strings() {
@@ -1096,8 +1096,8 @@ mod tests {
 
     #[test]
     fn ordinary_adapter_text_is_not_flagged() {
-        assert!(!text_indicates_vpn_tunnel("Intel(R) Ethernet Connection"));
-        assert!(!text_indicates_vpn_tunnel("Realtek Wi-Fi 6E"));
+        assert!(!text_indicates_vpn_tunnel("Ethernet Connection"));
+        assert!(!text_indicates_vpn_tunnel("Wi-Fi 6E Adapter"));
         assert!(!text_indicates_vpn_tunnel(""));
     }
 
@@ -1124,7 +1124,7 @@ mod tests {
             "tunl0",
             "ip6gretap0",
             "Wintun Userspace",
-            "TAP-ProtonVPN Windows Adapter V9",
+            "TAP-ExampleVPN Windows Adapter V9",
         ] {
             assert!(text_indicates_vpn_tunnel(name), "{name}");
         }

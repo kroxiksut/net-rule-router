@@ -73,6 +73,13 @@ if(NRR_DEV_LAYOUT)
     target_compile_definitions(nrr_qt_native_host PRIVATE
         NRR_DEV_REPO_ROOT="${NRR_DEV_REPO_ROOT_ABS}"
     )
+    # A dev host runs against the Qt kit rather than DLLs copied beside it, so
+    # the plugins it loads need the kit's DLL directory in the search.
+    if(WIN32)
+        target_compile_definitions(nrr_qt_native_host PRIVATE
+            NRR_DEV_QT_BIN_DIR="${QT6_INSTALL_PREFIX}/${QT6_INSTALL_BINS}"
+        )
+    endif()
     if(NRR_DEV_BIN_DIR)
         file(TO_CMAKE_PATH "${NRR_DEV_BIN_DIR}" NRR_DEV_BIN_DIR_CMAKE)
         target_compile_definitions(nrr_qt_native_host PRIVATE

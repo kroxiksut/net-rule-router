@@ -259,6 +259,10 @@ pub struct ServiceStatusReport {
 pub enum ServiceControlError {
     /// The service is not registered with the service manager.
     NotInstalled,
+    /// The service manager itself cannot be reached — a container or WSL
+    /// distribution booted without systemd. Nothing about the service is known,
+    /// so it must not read as "not installed".
+    ManagerUnavailable { detail: String },
     /// The caller lacks the privilege the operation requires.
     AccessDenied,
     /// The service manager refused because the service is already in the
@@ -280,6 +284,9 @@ impl std::fmt::Display for ServiceControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotInstalled => write!(f, "service is not installed"),
+            Self::ManagerUnavailable { detail } => {
+                write!(f, "the service manager is not available: {detail}")
+            }
             Self::AccessDenied => write!(f, "access denied"),
             Self::InvalidState { detail } => write!(f, "invalid service state: {detail}"),
             Self::Timeout { operation, seconds } => {

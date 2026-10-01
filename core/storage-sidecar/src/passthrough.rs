@@ -13,12 +13,12 @@
 //! truth for its route, including the sections we don't read.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
 
 use rusqlite::params;
 
 use crate::db::SidecarDb;
 use crate::error::SidecarResult;
+use nrr_sqlite_support::unix_now_ms;
 
 /// Longest section name kept. A `--- <name>` header longer than this is not a
 /// section any producer writes; it is a way to grow the table on someone else's
@@ -59,12 +59,16 @@ impl SidecarDb {
     /// Passing an empty map clears all passthrough rows for `route`
     /// (used when the user imports a preset that has only known
     /// sections, dropping any previously-captured foreign-OS blocks).
+    ///
+    /// Returns the names of sections refused as oversized, so the caller can
+    /// report what the next export will be missing.
     pub fn write_passthrough(
         &self,
         route: &str,
         sections: &BTreeMap<String, String>,
-    ) -> SidecarResult<()> {
+    ) -> SidecarResult<Vec<String>> {
         let now = unix_now_ms();
+        let mut dropped = Vec::new();
         let mut conn = self.conn_mut();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM passthrough WHERE route = ?1", params![route])?;
@@ -79,13 +83,14 @@ impl SidecarDb {
                 // written back looks intact and is not, while a missing one is
                 // visible in the exported file.
                 if name.chars().count() > MAX_SECTION_NAME_CHARS || raw.len() > MAX_RAW_TEXT_BYTES {
+                    dropped.push(name.clone());
                     continue;
                 }
                 stmt.execute(params![route, name, normalize_raw_text(raw), now])?;
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(dropped)
     }
 
     /// Drop every passthrough row for `route`. No-op when the route
@@ -113,17 +118,6 @@ fn normalize_raw_text(raw: &str) -> String {
     } else {
         format!("{trimmed}\n")
     }
-}
-
-/// Current Unix epoch in milliseconds. Mirrors the helper in
-/// `rule_metadata`; kept here to avoid cross-module dependency on a
-/// private item.
-fn unix_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -216,10 +210,11 @@ b
             .to_string(),
         );
 
-        db.write_passthrough("primary", &input)?;
+        let dropped = db.write_passthrough("primary", &input)?;
         let got = db.read_passthrough("primary")?;
         assert_eq!(got.len(), 1, "only the legitimate section is kept");
         assert!(got.contains_key("Linux"));
+        assert_eq!(dropped, vec!["Huge".to_string(), long_name]);
         Ok(())
     }
 

@@ -1,5 +1,4 @@
-//! End-to-end test of the import → sidecar → export bridge — block
-//! 16.QoL+1 Phase 7.
+//! End-to-end test of the import → sidecar → export bridge.
 //!
 //! Verifies the path the GUI takes during a preset import:
 //!

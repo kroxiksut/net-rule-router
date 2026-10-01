@@ -25,7 +25,7 @@ impl ProductionMutationExecutor {
             Err(e) => return MutationOutcome::Failed(e),
         };
         Self::canonicalize_rules_payload(&mut parsed, self.host_platform);
-        if let Err(e) = Self::enforce_free_rule_cap(&parsed.rules_json) {
+        if let Err(e) = self.enforce_free_rule_cap(&parsed.rules_json, principal) {
             return MutationOutcome::Failed(e);
         }
         let correlation = parsed
@@ -68,6 +68,7 @@ impl ProductionMutationExecutor {
     pub(super) fn emit_progress(
         &self,
         stored: &StoredMutation,
+        principal: &str,
         phase: &str,
         error_code: Option<String>,
     ) {
@@ -81,6 +82,7 @@ impl ProductionMutationExecutor {
             mutation_kind: mutation_kind_slug(stored.kind).to_string(),
             phase: phase.to_string(),
             error_code,
+            sid: progress_addressee(stored.kind, principal),
         });
     }
 
@@ -196,7 +198,13 @@ impl ProductionMutationExecutor {
             .flatten();
         let discarded = own
             .as_ref()
-            .and_then(|rec| rules_json::from_canonical_string(&rec.rules_json).ok())
+            .and_then(|rec| {
+                crate::production_rules_provider::read_stored_rules(
+                    &rec.rules_json,
+                    &rec.revision_id,
+                )
+                .ok()
+            })
             .map(|dto| dto.primary.len() + dto.secondary.len());
         reset_review_summary(own.is_some(), discarded)
     }

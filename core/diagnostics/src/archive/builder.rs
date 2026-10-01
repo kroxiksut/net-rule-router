@@ -36,9 +36,9 @@ use crate::facade::dto::{
 
 /// Pre-collected data provided to the archive builder.
 ///
-/// The caller is responsible for applying redaction (using `RedactionMode`)
-/// before populating these fields.  The builder treats the data as already
-/// safe to include.
+/// The caller applies redaction (`RedactionMode`) before populating these
+/// fields, except for log lines and listing placeholders: those were redacted
+/// to the mode they were WRITTEN in, and the builder caps them to the export's.
 pub struct ArchiveInput {
     pub health: DiagnosticsStatusDto,
     /// Fields merged into `health.json` alongside `health` (behavior mode,
@@ -281,6 +281,7 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<StagedS
         let cap = crate::archive::request::MAX_ARCHIVE_SIZE_BYTES
             .saturating_sub(already_staged)
             .saturating_sub(TAIL_SECTION_HEADROOM_BYTES);
+        let ceiling = log_privacy_ceiling(input.request.redaction_mode);
         let mut used: u64 = 0;
         for file in input.raw_log_files.iter().rev() {
             let name = bare_file_name(&file.name);
@@ -288,9 +289,17 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<StagedS
                 continue;
             }
             let mut content = String::new();
+            let mut shipped: u32 = 0;
             for line in &file.lines {
-                content.push_str(line);
+                let Some(line) = crate::logs::privacy::cap_stored_line(line, ceiling) else {
+                    continue;
+                };
+                content.push_str(&line);
                 content.push('\n');
+                shipped += 1;
+            }
+            if shipped == 0 {
+                continue;
             }
             let size = content.len() as u64;
             // The newest file always ships whole: half a file is not evidence.
@@ -304,7 +313,7 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<StagedS
                 }
             })?;
             written.push(format!("{SERVICE_LOGS_DIRNAME}/{name}"));
-            staged.log_entries += file.lines.len() as u32;
+            staged.log_entries += shipped;
         }
     }
 
@@ -420,6 +429,7 @@ fn write_section(
             // way for completeness.
             let from = input.request.logs_from_ms;
             let to = input.request.logs_to_ms;
+            let ceiling = log_privacy_ceiling(input.request.redaction_mode);
             for entry in input
                 .log_entries
                 .iter()
@@ -427,7 +437,9 @@ fn write_section(
                 .filter(|entry| to.is_none_or(|ms| entry.created_at <= ms))
                 .take(input.request.max_log_entries as usize)
             {
-                let line = serde_json::to_string(entry).map_err(ser_err)?;
+                let mut entry = entry.clone();
+                crate::logs::privacy::redact_args_above(&mut entry.args, ceiling);
+                let line = serde_json::to_string(&entry).map_err(ser_err)?;
                 // Always allow the first line; then stop before overrunning the
                 // byte budget (accounting for the trailing newline).
                 if !content.is_empty() && content.len() + line.len() + 1 > budget {
@@ -584,7 +596,6 @@ fn write_redaction_report(
 
     let report = RedactionReport {
         redaction_mode: redaction_mode_slug(input.request.redaction_mode),
-        diagnostic_mode_active: input.health.diagnostic_mode.active,
         hostnames_redacted: counts.hostnames,
         ips_redacted: counts.ips,
         paths_redacted: counts.paths,
@@ -625,6 +636,12 @@ fn count_markers(dir: &Path) -> MarkerCounts {
         counts.paths += text.matches(MARKER_MASKED_PATH).count() as u32;
     }
     counts
+}
+
+/// The most a log payload may disclose in an export at `mode`: the threshold
+/// the writer applies when logging in the matching mode.
+fn log_privacy_ceiling(mode: crate::privacy::RedactionMode) -> crate::taxonomy::PrivacyClass {
+    crate::logs::filter::LoggingMode::from(mode).max_privacy()
 }
 
 fn redaction_mode_slug(mode: crate::privacy::RedactionMode) -> String {

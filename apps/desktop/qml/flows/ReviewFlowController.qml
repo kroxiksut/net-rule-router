@@ -156,6 +156,15 @@ QtObject {
             }
             var summary = (p && p["review-summary"]) || p || {}
             var token = (p && p["confirmation-token"]) || ""
+            // A refused preview has an empty diff; say why, or it reads as
+            // "nothing to apply".
+            var refusal = Pure.previewRefusal(summary)
+            if (refusal) {
+                root.statusLine = root.tr("status.rules-activate-failed",
+                    "Failed to activate rules: ") + root.previewRefusalText(refusal)
+                _resolveGuardRulesApply(false)
+                return
+            }
             // Nothing changed vs the active
             // revision: don't open an empty review dialog, tell the user
             // plainly there's nothing to apply and release the guard.
@@ -292,18 +301,10 @@ QtObject {
             }
             if (!ok) {
                 console.log("review-flow: activate failed:", code, msg)
-                // Rules now commit as a per-principal
-                // `user-scoped-mutation` (non-elevated), so a `forbidden`
-                // no longer means "needs administrator" — it means the
-                // mutation gate is closed (e.g. an unacknowledged security
-                // alert). Route every failure through
-                // the generic localized error label instead of the old
-                // "re-launch as Administrator" hint.
-                root.statusLine = root.tr("status.rules-activate-failed",
-                    "Failed to activate rules: ") +
-                    ((typeof root.ipcErrorLabel === "function")
-                        ? root.ipcErrorLabel(String(code || "unknown"))
-                        : String(code || "unknown"))
+                // A `forbidden` here is the mutation gate (e.g. an
+                // unacknowledged security alert), not missing rights: rules
+                // commit as a non-elevated `user-scoped-mutation`.
+                _announceRulesActivationFailed(code)
                 // Clear the dirty flag even on failure: the user has
                 // completed the Save-and-review gesture and can't
                 // recover from non-retryable errors (forbidden, etc.)
@@ -317,104 +318,129 @@ QtObject {
                 _resolveGuardRulesApply(false)
                 return
             }
-            console.log("review-flow: activate completed:", JSON.stringify(p))
-            root._lastRulesActivationMs = Date.now()
-            // A second review raised BEFORE this one landed now describes a
-            // revision that no longer exists: its diff renders empty and its
-            // token dies on "revision-status-mismatch". One activation, one
-            // live review — take the stale one down here.
-            if (root.reviewDiffDialog && root.reviewDiffDialog.opened) {
-                root.reviewDiffDialog.close()
-            }
-            if (root.pendingReviewState.adminBaseline) {
-                // Admin baseline edit succeeded.
-                root.statusLine = root.tr("status.baseline-activate-completed",
-                    "Baseline rules updated for all users on this computer.")
-                // This WAS an elevated mutation — a success while the GUI is
-                // non-elevated means the broker obtained admin approval.
-                if (!_isAppElevated()) root._brokerSessionElevated = true
-            } else {
-                root.statusLine = root.tr("status.rules-activate-completed",
-                    "Rules activated.")
-            }
-            // A normal (per-principal) rules apply is
-            // user-scoped (non-elevated): success does NOT imply the broker
-            // engaged, so we do NOT flip `_brokerSessionElevated` for it
-            // (only the admin-baseline branch above + genuinely elevated
-            // service ops via `onBrokerSessionEstablished` do).
-            // Successful submission of the
-            // current rules state means the in-memory model now
-            // matches what the service has. Drop the dirty flag so
-            // the next navigation/close doesn't re-prompt.
-            // And re-baseline so future edits compare against the
-            // just-activated content (also clears the dirty flag).
-            root._captureRulesDirtyBaseline()
-            // Mirror the count so the "no active rules" banner clears now,
-            // instead of waiting for a reconnect to re-fetch it.
-            root._serviceRuleCount = root.rulesModel ? root.rulesModel.count : 0
-            // Resume the pending navigation that the guard's
-            // "Apply" deferred (no-op when the apply wasn't guard-driven).
-            _resolveGuardRulesApply(true)
-            // Rules-update activation creates a new revision.
-            // Reconcile each route's dirty flag against the file on
-            // disk instead of blindly marking BOTH dirty: an activation that
-            // re-applies content already equal to the bound file must NOT raise the
-            // "Save to file" chip. The SaveBeforeCloseDialog then prompts only on a
-            // genuine divergence.
-            // A MERGE activates rules the merge preview built, not the rows on
-            // screen: exporting the model here wrote the pre-merge set straight
-            // back over the file the merge had just resolved, so the files came
-            // out of a merge diverged again. Pull the activated revision into
-            // the table first, then export from it.
-            if (root._mergeApplyPendingWrite) {
-                root._mergeApplyPendingWrite = false
-                root._refreshRulesFromService({ silent: true, onComplete: function() {
-                    // The refresh already re-captured the drift baseline off the
-                    // freshly loaded model.
-                    root.boundFilesController._reconcileBoundFileDirty()
-                    root.boundFilesController._persistBoundFilesAfterApply()
-                    Qt.callLater(root.driftController._driftRecheckNow)
-                } })
-            } else {
-                root.boundFilesController._reconcileBoundFileDirty()
-                // The linked .txt mirrors what is enforced: re-export the
-                // just-activated rules so it never goes stale and the next
-                // launch's auto-open is never a false-delete.
-                root.boundFilesController._persistBoundFilesAfterApply()
-            }
-            // Successful activation supersedes any
-            // parked changeset. Clear sidecar so the post-connect
-            // toast won't fire again on the next launch / reconnect.
-            // Best-effort: log on failure but don't surface the error
-            // (the activation itself already succeeded).
-            if (typeof nrrNativeBridge !== "undefined"
-                    && nrrNativeBridge
-                    && typeof nrrNativeBridge.rpcSidecarPendingApplyClear === "function") {
-                var clearCorr = nrrNativeBridge.rpcSidecarPendingApplyClear()
-                root.rpc.registerRpcCallback(clearCorr, function(ok2, p2, c2, m2) {
-                    if (!ok2) console.log("pending-apply.clear failed:", c2, m2)
+            // The confirm only accepts the change; its verdict is on the
+            // operation record.
+            root.rpc.readMutationOutcome(p, root.rpc.settleByPreview("rules-update", payload),
+                function(failure) {
+                    if (failure === "") {
+                        _completeRulesActivation(p)
+                        return
+                    }
+                    console.log("review-flow: activation refused:", failure)
+                    // Nothing was activated: the edits stay unsaved and the
+                    // bound files keep what is in force.
+                    _announceRulesActivationFailed(failure)
+                    _resolveGuardRulesApply(false)
                 })
-            }
-            // Parked offline import (if any) has been applied — lift the guard.
-            root._offlineRulesPendingPush = false
-            // Same for the "changes made while the service was stopped" offer:
-            // it stays open through "Preview" on purpose (a preview decides
-            // nothing), so nothing took it down once the preview turned into an
-            // apply — leaving the user with an offer whose "Apply all" then
-            // finds no changes at all.
-            if (root.offlineBacklogDialog && root.offlineBacklogDialog.opened) {
-                root.offlineBacklogDialog.close()
-            }
-            // The just-activated rulesModel IS now
-            // the service state, so refresh the service baseline
-            // hash. Drops any prior GUI-vs-service drift that the
-            // activation just resolved.
-            root.driftController._driftCaptureServiceBaseline()
-            // The service leg just moved. Re-read all three legs from their
-            // real sources so the amber banner clears (or stays, honestly) at
-            // once rather than on the next poll.
-            Qt.callLater(root.driftController._driftRecheckNow)
         })
+    }
+
+    function _announceRulesActivationFailed(code) {
+        root.statusLine = root.tr("status.rules-activate-failed",
+            "Failed to activate rules: ") +
+            ((typeof root.ipcErrorLabel === "function")
+                ? root.ipcErrorLabel(String(code || "unknown"))
+                : String(code || "unknown"))
+    }
+
+    function _completeRulesActivation(p) {
+        console.log("review-flow: activate completed:", JSON.stringify(p))
+        root._lastRulesActivationMs = Date.now()
+        // A second review raised BEFORE this one landed now describes a
+        // revision that no longer exists: its diff renders empty and its
+        // token dies on "revision-status-mismatch". One activation, one
+        // live review — take the stale one down here.
+        if (root.reviewDiffDialog && root.reviewDiffDialog.opened) {
+            root.reviewDiffDialog.close()
+        }
+        if (root.pendingReviewState.adminBaseline) {
+            // Admin baseline edit succeeded.
+            root.statusLine = root.tr("status.baseline-activate-completed",
+                "Baseline rules updated for all users on this computer.")
+            // This WAS an elevated mutation — a success while the GUI is
+            // non-elevated means the broker obtained admin approval.
+            if (!_isAppElevated()) root._brokerSessionElevated = true
+        } else {
+            root.statusLine = root.tr("status.rules-activate-completed",
+                "Rules activated.")
+        }
+        // A normal (per-principal) rules apply is
+        // user-scoped (non-elevated): success does NOT imply the broker
+        // engaged, so we do NOT flip `_brokerSessionElevated` for it
+        // (only the admin-baseline branch above + genuinely elevated
+        // service ops via `onBrokerSessionEstablished` do).
+        // Successful submission of the
+        // current rules state means the in-memory model now
+        // matches what the service has. Drop the dirty flag so
+        // the next navigation/close doesn't re-prompt.
+        // And re-baseline so future edits compare against the
+        // just-activated content (also clears the dirty flag).
+        root._captureRulesDirtyBaseline()
+        // Mirror the count so the "no active rules" banner clears now,
+        // instead of waiting for a reconnect to re-fetch it.
+        root._serviceRuleCount = root.rulesModel ? root.rulesModel.count : 0
+        // Resume the pending navigation that the guard's
+        // "Apply" deferred (no-op when the apply wasn't guard-driven).
+        _resolveGuardRulesApply(true)
+        // Rules-update activation creates a new revision.
+        // Reconcile each route's dirty flag against the file on
+        // disk instead of blindly marking BOTH dirty: an activation that
+        // re-applies content already equal to the bound file must NOT raise the
+        // "Save to file" chip. The SaveBeforeCloseDialog then prompts only on a
+        // genuine divergence.
+        // A MERGE activates rules the merge preview built, not the rows on
+        // screen: exporting the model here wrote the pre-merge set straight
+        // back over the file the merge had just resolved, so the files came
+        // out of a merge diverged again. Pull the activated revision into
+        // the table first, then export from it.
+        if (root._mergeApplyPendingWrite) {
+            root._mergeApplyPendingWrite = false
+            root._refreshRulesFromService({ silent: true, onComplete: function() {
+                // The refresh already re-captured the drift baseline off the
+                // freshly loaded model.
+                root.boundFilesController._reconcileBoundFileDirty()
+                root.boundFilesController._persistBoundFilesAfterApply()
+                Qt.callLater(root.driftController._driftRecheckNow)
+            } })
+        } else {
+            root.boundFilesController._reconcileBoundFileDirty()
+            // The linked .txt mirrors what is enforced: re-export the
+            // just-activated rules so it never goes stale and the next
+            // launch's auto-open is never a false-delete.
+            root.boundFilesController._persistBoundFilesAfterApply()
+        }
+        // Successful activation supersedes any
+        // parked changeset. Clear sidecar so the post-connect
+        // toast won't fire again on the next launch / reconnect.
+        // Best-effort: log on failure but don't surface the error
+        // (the activation itself already succeeded).
+        if (typeof nrrNativeBridge !== "undefined"
+                && nrrNativeBridge
+                && typeof nrrNativeBridge.rpcSidecarPendingApplyClear === "function") {
+            var clearCorr = nrrNativeBridge.rpcSidecarPendingApplyClear()
+            root.rpc.registerRpcCallback(clearCorr, function(ok2, p2, c2, m2) {
+                if (!ok2) console.log("pending-apply.clear failed:", c2, m2)
+            })
+        }
+        // Parked offline import (if any) has been applied — lift the guard.
+        root._offlineRulesPendingPush = false
+        // Same for the "changes made while the service was stopped" offer:
+        // it stays open through "Preview" on purpose (a preview decides
+        // nothing), so nothing took it down once the preview turned into an
+        // apply — leaving the user with an offer whose "Apply all" then
+        // finds no changes at all.
+        if (root.offlineBacklogDialog && root.offlineBacklogDialog.opened) {
+            root.offlineBacklogDialog.close()
+        }
+        // The just-activated rulesModel IS now
+        // the service state, so refresh the service baseline
+        // hash. Drops any prior GUI-vs-service drift that the
+        // activation just resolved.
+        root.driftController._driftCaptureServiceBaseline()
+        // The service leg just moved. Re-read all three legs from their
+        // real sources so the amber banner clears (or stays, honestly) at
+        // once rather than on the next poll.
+        Qt.callLater(root.driftController._driftRecheckNow)
     }
 
     /// "Reset to baseline" dry-run. Discards this user's
@@ -443,11 +469,7 @@ QtObject {
             "rules-reset-to-baseline", payload, true /* dryRun */, "")
         root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok) {
-                root.statusLine = root.tr("status.reset-baseline-failed",
-                    "Could not start reset to baseline: ") +
-                    ((typeof root.ipcErrorLabel === "function")
-                        ? root.ipcErrorLabel(String(code || "unknown"))
-                        : String(code || "unknown"))
+                _announceResetToBaselineFailed(code)
                 return
             }
             var summary = (p && p["review-summary"]) || p || {}
@@ -491,22 +513,40 @@ QtObject {
             }
             if (!ok) {
                 console.log("reset-flow: activate failed:", code, msg)
-                root.statusLine = root.tr("status.reset-baseline-failed",
-                    "Could not start reset to baseline: ") +
-                    ((typeof root.ipcErrorLabel === "function")
-                        ? root.ipcErrorLabel(String(code || "unknown"))
-                        : String(code || "unknown"))
+                _announceResetToBaselineFailed(code)
                 return
             }
-            console.log("reset-flow: completed:", JSON.stringify(p))
-            root.statusLine = root.tr("status.reset-baseline-completed",
-                "Reset to baseline rules. Reloading the active rules...")
-            // The reset changed the effective rules — pull the now-active
-            // (baseline) rules into the table so the user sees them.
-            if (typeof root.reloadActiveRulesFromService === "function") {
-                root.reloadActiveRulesFromService()
-            }
+            // Already on baseline is what a reset that took effect previews as.
+            var settle = root.rpc.settleByPreview("rules-reset-to-baseline", payload,
+                function(summary) { return !summary["requires-review"] })
+            root.rpc.readMutationOutcome(p, settle, function(failure) {
+                if (failure === "") {
+                    _completeResetToBaseline(p)
+                    return
+                }
+                console.log("reset-flow: reset refused:", failure)
+                _announceResetToBaselineFailed(failure)
+            })
         })
+    }
+
+    function _announceResetToBaselineFailed(code) {
+        root.statusLine = root.tr("status.reset-baseline-failed",
+            "Could not start reset to baseline: ") +
+            ((typeof root.ipcErrorLabel === "function")
+                ? root.ipcErrorLabel(String(code || "unknown"))
+                : String(code || "unknown"))
+    }
+
+    function _completeResetToBaseline(p) {
+        console.log("reset-flow: completed:", JSON.stringify(p))
+        root.statusLine = root.tr("status.reset-baseline-completed",
+            "Reset to baseline rules. Reloading the active rules...")
+        // The reset changed the effective rules — pull the now-active
+        // (baseline) rules into the table so the user sees them.
+        if (typeof root.reloadActiveRulesFromService === "function") {
+            root.reloadActiveRulesFromService()
+        }
     }
 
     /// ReviewExpiredDialog → Compare again → run a fresh dry-run

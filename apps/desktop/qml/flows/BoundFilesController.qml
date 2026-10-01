@@ -689,29 +689,38 @@ QtObject {
             })
     }
 
-    // Submit a Safe rollback (RollbackRequest recovery
-    // action) to the service: restore the last-known-good revision and re-apply
-    // it. Was a no-op "preview mode" toast. Recovery actions require a non-empty
-    // confirmation token (the router checks presence, not value — RollbackRequest
-    // has no dry-run step) and an elevated client; a non-elevated GUI gets a
-    // Forbidden error which we surface localized rather than silently swallow.
+    // Safe rollback: restore the user's own last-known-good revision and
+    // re-apply it, without elevation. The dry-run is silent — the
+    // user already confirmed in the dialog; it only fetches the token the
+    // service binds to this operation and user. Either phase failing lands on
+    // the same localized status line.
     function _performSafeRollback() {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.rpcRollbackRequest !== "function") {
             root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
             return
         }
-        var token = "gui-rollback-" + Date.now()
+        var fail = function(code) {
+            root.statusLine = root.tr("status.rollback-failed", "Safe rollback failed: ")
+                + root.ipcErrorLabel(code)
+        }
         root.statusLine = root.tr("status.rollback-submitting", "Submitting safe rollback…")
-        var corr = nrrNativeBridge.rpcRollbackRequest("", token)
-        root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
-            if (!ok) {
-                root.statusLine = root.tr("status.rollback-failed", "Safe rollback failed: ")
-                    + root.ipcErrorLabel(code)
+        var dryCorr = nrrNativeBridge.rpcRollbackRequest("", true, "")
+        root.rpc.registerRpcCallback(dryCorr, function(ok, p, code, msg) {
+            var token = ok ? String((p && p["confirmation-token"]) || "") : ""
+            if (token === "") {
+                fail(ok ? "bad-response" : code)
                 return
             }
-            root.statusLine = root.tr("status.rollback-submitted",
-                "Safe rollback submitted. The service is restoring the previous configuration.")
+            var corr = nrrNativeBridge.rpcRollbackRequest("", false, token)
+            root.rpc.registerRpcCallback(corr, function(ok2, p2, code2, msg2) {
+                if (!ok2) {
+                    fail(code2)
+                    return
+                }
+                root.statusLine = root.tr("status.rollback-submitted",
+                    "Safe rollback submitted. The service is restoring the previous configuration.")
+            })
         })
     }
 

@@ -103,8 +103,6 @@ impl DiagnosticArchiveManifest {
 pub struct RedactionReport {
     /// Redaction mode applied.
     pub redaction_mode: String,
-    /// Whether an active diagnostic session was in effect at export time.
-    pub diagnostic_mode_active: bool,
     /// Number of hostname fields that were redacted to eTLD+1.
     pub hostnames_redacted: u32,
     /// Number of IP addresses hidden behind markers.
@@ -240,7 +238,6 @@ mod tests {
     fn redaction_report_serializes() {
         let r = RedactionReport {
             redaction_mode: "default".into(),
-            diagnostic_mode_active: false,
             hostnames_redacted: 10,
             ips_redacted: 5,
             paths_redacted: 3,

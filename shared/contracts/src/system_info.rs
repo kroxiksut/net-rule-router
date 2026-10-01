@@ -31,7 +31,7 @@ pub struct SystemInfo {
     pub os_version: String,
     /// CPU architecture, e.g. `"AMD64"` / `"ARM64"` / `"x86_64"`.
     pub arch: String,
-    /// CPU model string, e.g. `"Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz"`.
+    /// CPU model string, e.g. `"Generic CPU @ 2.60GHz"`.
     /// [`UNKNOWN`] until a per-OS collector fills it.
     pub cpu_model: String,
     /// Number of logical processors (`std::thread::available_parallelism`).
@@ -85,7 +85,7 @@ mod tests {
             os: "windows".into(),
             os_version: "Windows 11 Pro 23H2 (build 22631)".into(),
             arch: "AMD64".into(),
-            cpu_model: "Intel(R) Core(TM) i7".into(),
+            cpu_model: "Generic CPU".into(),
             cpu_logical_cores: 12,
             total_ram_bytes: 34_359_738_368,
         };

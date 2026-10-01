@@ -16,7 +16,7 @@
 //!
 //! - **not a judgement about the site.** A connection that completes proves the
 //!   packet arrives, nothing more: a service can answer a main-link address with
-//!   a refusal (ChatGPT does exactly that). The verdict feeds the same
+//!   a refusal (an assistant service does exactly that). The verdict feeds the same
 //!   `PrimaryHealthEvent` channel the observed traffic feeds, and the wording in
 //!   the GUI stays a statement of connectivity.
 //! - **not on the data path.** It runs when the user asks (or on their opt-in),

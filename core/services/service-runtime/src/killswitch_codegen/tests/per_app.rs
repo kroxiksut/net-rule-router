@@ -2,7 +2,7 @@ use super::*;
 
 // ── Per-app kill-switch ────────────────────────────────────
 
-/// The 23.08 shape: one app routed over the tunnel, the tunnel drops, and
+/// One app routed over the tunnel, the tunnel drops, and
 /// the per-process block (which carries no destination condition) takes
 /// down sites the user had explicitly put on the MAIN link. The guard is
 /// the block's BAND: below the primary rule band, so every primary rule's
@@ -74,8 +74,10 @@ fn primary_app_exempt_emits_unconditional_permit_above_all_bands() {
     // one unconditional ALE Permit per pattern, at the exempt band, outranking
     // every block. No interface/IP condition so it permits egress over the
     // primary even while the secondary adapter is down and block-all is engaged.
-    let out =
-        primary_app_exempt_filters("S", &["SwiftVPN 3.0.exe".to_string(), "*vpn*".to_string()]);
+    let out = primary_app_exempt_filters(
+        "S",
+        &["ExampleVPN 3.0.exe".to_string(), "*vpn*".to_string()],
+    );
     assert_eq!(out.len(), 2, "one exempt permit per pattern, no block half");
     for f in &out {
         assert_eq!(f.action, WfpAction::Permit);
@@ -91,7 +93,7 @@ fn primary_app_exempt_emits_unconditional_permit_above_all_bands() {
             "exempt permit must sit in the top exempt band"
         );
     }
-    assert_eq!(out[0].app_pattern.as_deref(), Some("SwiftVPN 3.0.exe"));
+    assert_eq!(out[0].app_pattern.as_deref(), Some("ExampleVPN 3.0.exe"));
     assert_eq!(out[1].app_pattern.as_deref(), Some("*vpn*"));
 }
 
@@ -131,7 +133,7 @@ fn the_corporate_clients_without_vpn_in_their_name_are_exempt() {
 #[test]
 fn default_vpn_exempt_patterns_present_and_each_emits_an_exempt_permit() {
     // The built-in defaults must include the broad glob and each must produce
-    // a well-formed unconditional exempt permit (HW-0712 C4, out-of-the-box
+    // a well-formed unconditional exempt permit (out-of-the-box
     // VPN-bootstrap protection).
     assert!(DEFAULT_VPN_EXEMPT_PATTERNS.contains(&"*vpn*"));
     let pats: Vec<String> = DEFAULT_VPN_EXEMPT_PATTERNS
@@ -296,7 +298,7 @@ fn exempt_ips_are_skipped_while_others_are_kept() {
         KillSwitchProtocols::ALL,
     );
     // The one non-exempt IP → ALE pair + 4 named packet pairs = 10 filters
-    // (16.HW-0716: named-only packet layer), all for it.
+    // (named-only packet layer), all for it.
     assert_eq!(out.len(), 10);
     for f in &out {
         assert!(f.covers_v4(ip(203, 0, 113, 5)));
@@ -309,12 +311,12 @@ fn exempt_ips_are_skipped_while_others_are_kept() {
 fn ale_filters_carry_sid_packet_filters_do_not() {
     let out = kill_switch_filters(
         "S-1-5-21-XYZ",
-        &v4_pins([ip(1, 1, 1, 1), ip(2, 2, 2, 2)]),
+        &v4_pins([ip(198, 51, 100, 1), ip(198, 51, 100, 2)]),
         LUID,
         KillSwitchProtocols::ALL,
     );
     // Per CHUNK: 2 ALE + 4×2 named transport.
-    let chunks = pack_v4([ip(1, 1, 1, 1), ip(2, 2, 2, 2)]).len();
+    let chunks = pack_v4([ip(198, 51, 100, 1), ip(198, 51, 100, 2)]).len();
     assert_eq!(out.len(), chunks * 10);
     for f in &out {
         match f.layer {
@@ -334,7 +336,11 @@ fn ale_filters_carry_sid_packet_filters_do_not() {
 fn weights_do_not_collide_within_each_layer() {
     let out = kill_switch_filters(
         "S",
-        &v4_pins([ip(1, 1, 1, 1), ip(2, 2, 2, 2), ip(3, 3, 3, 3)]),
+        &v4_pins([
+            ip(198, 51, 100, 1),
+            ip(198, 51, 100, 2),
+            ip(198, 51, 100, 3),
+        ]),
         LUID,
         KillSwitchProtocols::ALL,
     );
@@ -362,13 +368,13 @@ fn weights_do_not_collide_within_each_layer() {
 fn filter_ids_are_deterministic_and_distinct() {
     let a = kill_switch_filters(
         "S",
-        &v4_pins([ip(1, 1, 1, 1), ip(2, 2, 2, 2)]),
+        &v4_pins([ip(198, 51, 100, 1), ip(198, 51, 100, 2)]),
         LUID,
         KillSwitchProtocols::ALL,
     );
     let b = kill_switch_filters(
         "S",
-        &v4_pins([ip(1, 1, 1, 1), ip(2, 2, 2, 2)]),
+        &v4_pins([ip(198, 51, 100, 1), ip(198, 51, 100, 2)]),
         LUID,
         KillSwitchProtocols::ALL,
     );
@@ -383,13 +389,13 @@ fn filter_ids_are_deterministic_and_distinct() {
 fn different_sids_produce_different_filter_ids() {
     let a = kill_switch_filters(
         "S-1-5-21-A",
-        &v4_pins([ip(1, 1, 1, 1)]),
+        &v4_pins([ip(198, 51, 100, 1)]),
         LUID,
         KillSwitchProtocols::ALL,
     );
     let b = kill_switch_filters(
         "S-1-5-21-B",
-        &v4_pins([ip(1, 1, 1, 1)]),
+        &v4_pins([ip(198, 51, 100, 1)]),
         LUID,
         KillSwitchProtocols::ALL,
     );
@@ -401,7 +407,7 @@ fn different_sids_produce_different_filter_ids() {
 fn filters_span_ale_and_packet_layers() {
     let out = kill_switch_filters(
         "S",
-        &v4_pins([ip(9, 9, 9, 9)]),
+        &v4_pins([ip(198, 51, 100, 9)]),
         LUID,
         KillSwitchProtocols::ALL,
     );

@@ -196,6 +196,15 @@ pub mod integrity {
     /// the last trusted revision.
     pub const UNTRUSTED_REVISION_REJECTED: ReasonCode =
         ReasonCode("integrity.untrusted_revision_rejected");
+    /// An administrator restarted the audit chain over breaks they were shown.
+    pub const AUDIT_CHAIN_RESTARTED: ReasonCode = ReasonCode("integrity.audit_chain_restarted");
+    /// The integrity check could not run; the service keeps routing without it.
+    pub const INTEGRITY_CHECK_UNAVAILABLE: ReasonCode =
+        ReasonCode("integrity.integrity_check_unavailable");
+    /// A user acknowledged a security alert.
+    pub const ALERT_ACKNOWLEDGED: ReasonCode = ReasonCode("integrity.alert_acknowledged");
+    /// A user marked a security alert resolved.
+    pub const ALERT_RESOLVED: ReasonCode = ReasonCode("integrity.alert_resolved");
 }
 
 /// Reason codes for Windows Service lifecycle events (`service.*`).
@@ -456,6 +465,30 @@ pub fn reason_code_meta(code: ReasonCode) -> Option<ReasonCodeMeta> {
             "diag.integrity.untrusted_revision_rejected.summary",
             true,
         ),
+        "integrity.audit_chain_restarted" => (
+            Lvl::Warn,
+            Cat::Security,
+            "diag.integrity.audit_chain_restarted.summary",
+            true,
+        ),
+        "integrity.integrity_check_unavailable" => (
+            Lvl::Error,
+            Cat::Security,
+            "diag.integrity.integrity_check_unavailable.summary",
+            true,
+        ),
+        "integrity.alert_acknowledged" => (
+            Lvl::Info,
+            Cat::Security,
+            "diag.integrity.alert_acknowledged.summary",
+            true,
+        ),
+        "integrity.alert_resolved" => (
+            Lvl::Info,
+            Cat::Security,
+            "diag.integrity.alert_resolved.summary",
+            true,
+        ),
         // service.*
         "service.started" => (
             Lvl::Info,
@@ -593,6 +626,10 @@ pub const ALL_REASON_CODES: &[ReasonCode] = &[
     integrity::DB_ROW_HMAC_MISMATCH,
     integrity::KEY_RESET_WITH_EXISTING_DATA,
     integrity::UNTRUSTED_REVISION_REJECTED,
+    integrity::AUDIT_CHAIN_RESTARTED,
+    integrity::INTEGRITY_CHECK_UNAVAILABLE,
+    integrity::ALERT_ACKNOWLEDGED,
+    integrity::ALERT_RESOLVED,
     service::STARTED,
     service::STOPPED,
     service::DEGRADED_MODE,

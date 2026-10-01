@@ -249,15 +249,15 @@ mod tests {
     #[test]
     fn map_replaces_on_record_and_touches_on_lookup() {
         let map = DirectRealIpMap::new();
-        map.record("gosuslugi.ru", &[ip(95, 173, 128, 10)]);
+        map.record("portal.example.ru", &[ip(198, 51, 100, 10)]);
         map.record(
-            "gosuslugi.ru",
-            &[ip(95, 173, 128, 20), ip(95, 173, 128, 21)],
+            "portal.example.ru",
+            &[ip(198, 51, 100, 20), ip(198, 51, 100, 21)],
         );
         // Latest answer wins wholesale — the client was just told THIS set.
         assert_eq!(
-            map.ips_for("gosuslugi.ru"),
-            vec![ip(95, 173, 128, 20), ip(95, 173, 128, 21)]
+            map.ips_for("portal.example.ru"),
+            vec![ip(198, 51, 100, 20), ip(198, 51, 100, 21)]
         );
         assert!(map.ips_for("unknown.example").is_empty());
     }
@@ -324,7 +324,7 @@ mod tests {
         map.record("blog.example", &[ip(203, 0, 113, 68)]);
         let inner = Arc::new(
             StaticUpstreamResolver::new()
-                .with("assistant.example", &[IpAddr::V4(ip(23, 10, 20, 140))]),
+                .with("assistant.example", &[IpAddr::V4(ip(203, 0, 113, 140))]),
         );
         let resolver = DirectAwareUpstreamResolver::new(map, inner);
         // Direct host → map.
@@ -335,7 +335,7 @@ mod tests {
         // Rule host → inner (FQDN cache in production).
         assert_eq!(
             resolver.addresses_for("assistant.example"),
-            vec![IpAddr::V4(ip(23, 10, 20, 140))]
+            vec![IpAddr::V4(ip(203, 0, 113, 140))]
         );
         assert!(resolver.addresses_for("nowhere.example").is_empty());
     }

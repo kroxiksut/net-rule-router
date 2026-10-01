@@ -13,25 +13,179 @@ fn fresh_conn() -> (TempDir, Arc<Mutex<Connection>>) {
     (dir, Arc::new(Mutex::new(runner.into_connection())))
 }
 
+use crate::verbose_logging::VerboseWindow;
+use crate::verbosity_control::VerbosityControl;
+use nrr_shared::ipc_payloads::{VerboseLoggingChange, VerboseLoggingMode};
+
+#[derive(Default)]
+struct RecordingVerbosity {
+    calls: Mutex<Vec<bool>>,
+}
+
+impl VerbosityControl for RecordingVerbosity {
+    fn set_verbose(&self, verbose: bool) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(verbose);
+    }
+}
+
+impl RecordingVerbosity {
+    fn calls(&self) -> Vec<bool> {
+        self.calls.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+fn request(
+    stab: &ProductionServiceStability,
+    change: VerboseLoggingChange,
+) -> ServiceStabilityConfigDto {
+    let mut dto = ServiceStabilityConfigProvider::get(stab);
+    dto.verbose_logging_change = Some(change);
+    ServiceStabilityConfigWriter::set(stab, &dto, Some("S-TEST")).expect("set must succeed")
+}
+
+fn stored_until(conn: &Arc<Mutex<Connection>>) -> Option<i64> {
+    let guard = conn.lock().expect("lock");
+    ServiceStabilityConfigRepository::new(&guard)
+        .get_or_default()
+        .expect("read")
+        .verbose_until_ms
+}
+
 #[test]
-fn verbose_logging_persists_through_production_writer() {
+fn a_timed_window_is_persisted_as_a_deadline_and_reported() {
     let (_dir, conn) = fresh_conn();
     let stab = ProductionServiceStability::new(Arc::clone(&conn));
-
     let base = ServiceStabilityConfigProvider::get(&stab);
-    assert!(!base.verbose_logging, "default must be off");
+    assert_eq!(base.verbose_logging_mode, VerboseLoggingMode::Off);
+    assert_eq!(base.verbose_logging_until_ms, 0);
 
-    let mut dto = base;
-    dto.verbose_logging = true;
-    let written =
-        ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set must succeed");
-    assert!(written.verbose_logging, "Set must echo verbose=true");
-
-    let readback = ServiceStabilityConfigProvider::get(&stab);
+    let before = crate::verbose_logging::now_ms();
+    let written = request(&stab, VerboseLoggingChange::OneHour);
+    assert_eq!(written.verbose_logging_mode, VerboseLoggingMode::Timed);
+    let deadline = stored_until(&conn).expect("a timed window stores its deadline");
     assert!(
-        readback.verbose_logging,
-        "verbose_logging must be durably persisted to service_stability_config"
+        deadline >= before + 3_600_000 && deadline <= crate::verbose_logging::now_ms() + 3_600_000
     );
+    assert_eq!(written.verbose_logging_until_ms, deadline);
+    assert!(
+        written.verbose_logging_change.is_none(),
+        "the request is never echoed"
+    );
+
+    // A fresh reader (another instance, or the service after a restart)
+    // resumes the same window from the stored deadline.
+    let reopened = ProductionServiceStability::new(Arc::clone(&conn));
+    let read = ServiceStabilityConfigProvider::get(&reopened);
+    assert_eq!(read.verbose_logging_mode, VerboseLoggingMode::Timed);
+    assert_eq!(read.verbose_logging_until_ms, deadline);
+}
+
+#[test]
+fn until_restart_is_not_persisted_so_a_restart_clears_it() {
+    let (_dir, conn) = fresh_conn();
+    let stab = ProductionServiceStability::new(Arc::clone(&conn));
+    let written = request(&stab, VerboseLoggingChange::UntilRestart);
+    assert_eq!(
+        written.verbose_logging_mode,
+        VerboseLoggingMode::UntilRestart
+    );
+    assert_eq!(
+        ServiceStabilityConfigProvider::get(&stab).verbose_logging_mode,
+        VerboseLoggingMode::UntilRestart
+    );
+    assert_eq!(stored_until(&conn), None, "nothing may outlive the process");
+
+    let restarted = ProductionServiceStability::new(Arc::clone(&conn))
+        .with_verbosity_control(Arc::new(RecordingVerbosity::default()));
+    assert_eq!(
+        ServiceStabilityConfigProvider::get(&restarted).verbose_logging_mode,
+        VerboseLoggingMode::Off
+    );
+}
+
+#[test]
+fn a_deadline_in_the_past_boots_to_normal_logging() {
+    let (_dir, conn) = fresh_conn();
+    {
+        let guard = conn.lock().expect("lock");
+        let repo = ServiceStabilityConfigRepository::new(&guard);
+        let r = repo.get_or_default().expect("read");
+        repo.set(
+            &IpcAcceptPolicyWrite::Critical,
+            Some(1_000),
+            r.conn_trace_ndjson,
+            r.conn_trace_gui,
+            r.rule_scope_service_driven,
+            r.routing_stop_policy,
+            r.cache_refresh_interval_secs,
+            r.enforcement_mode,
+            r.secondary_liveness_window_secs,
+            r.fake_ip_enabled,
+            r.dns_via_secondary,
+            r.dns_fast_answers,
+            r.fake_ip_udp_relay,
+            r.fake_ip_instant_rst,
+            r.allow_user_rule_edits,
+            None,
+            1,
+        )
+        .expect("store an expired deadline");
+    }
+    let control = Arc::new(RecordingVerbosity::default());
+    let stab = ProductionServiceStability::new(Arc::clone(&conn))
+        .with_verbosity_control(Arc::clone(&control) as Arc<dyn VerbosityControl>);
+    assert_eq!(
+        ServiceStabilityConfigProvider::get(&stab).verbose_logging_mode,
+        VerboseLoggingMode::Off
+    );
+    assert_eq!(
+        control.calls(),
+        vec![false],
+        "a window that ended while the service was down must not stay verbose"
+    );
+}
+
+#[test]
+fn a_request_drives_the_live_filter_and_a_plain_save_does_not() {
+    let (_dir, conn) = fresh_conn();
+    let control = Arc::new(RecordingVerbosity::default());
+    let stab = ProductionServiceStability::new(Arc::clone(&conn))
+        .with_verbosity_control(Arc::clone(&control) as Arc<dyn VerbosityControl>);
+    assert!(
+        control.calls().is_empty(),
+        "nothing stored: the boot filter stands"
+    );
+
+    request(&stab, VerboseLoggingChange::FourHours);
+    assert_eq!(control.calls(), vec![true]);
+
+    // An unrelated save echoes the reported state and carries no request.
+    let mut echo = ServiceStabilityConfigProvider::get(&stab);
+    echo.fake_ip_enabled = true;
+    let written = ServiceStabilityConfigWriter::set(&stab, &echo, Some("S-TEST")).expect("set");
+    assert_eq!(
+        control.calls(),
+        vec![true],
+        "a plain save leaves the window alone"
+    );
+    assert_eq!(written.verbose_logging_mode, VerboseLoggingMode::Timed);
+    assert!(stored_until(&conn).is_some());
+
+    request(&stab, VerboseLoggingChange::Off);
+    assert_eq!(control.calls(), vec![true, false]);
+    assert_eq!(stored_until(&conn), None);
+    assert_eq!(stab.verbose.window(), VerboseWindow::Off);
+}
+
+#[test]
+fn a_request_succeeds_without_a_live_filter() {
+    let (_dir, conn) = fresh_conn();
+    let stab = ProductionServiceStability::new(Arc::clone(&conn));
+    let written = request(&stab, VerboseLoggingChange::OneHour);
+    assert_eq!(written.verbose_logging_mode, VerboseLoggingMode::Timed);
 }
 
 /// Proves the get-merge-set contract the QML patch queue relies on: as
@@ -43,110 +197,30 @@ fn sequential_get_merge_set_round_trips_do_not_clobber_each_other() {
     let (_dir, conn) = fresh_conn();
     let stab = ProductionServiceStability::new(Arc::clone(&conn));
 
-    // "Diagnostics" panel: Get → flip verbose_logging only → Set.
+    // "Diagnostics" panel: Get → flip conn_trace_ndjson only → Set.
     let mut after_diag = ServiceStabilityConfigProvider::get(&stab);
-    after_diag.verbose_logging = true;
+    after_diag.conn_trace_ndjson = true;
     let written_diag = ServiceStabilityConfigWriter::set(&stab, &after_diag, Some("S-DIAG"))
         .expect("diagnostics set");
-    assert!(written_diag.verbose_logging);
+    assert!(written_diag.conn_trace_ndjson);
     assert_eq!(written_diag.enforcement_mode, "resolver");
 
     // "Routing" panel: Get (must observe the diagnostics write) → flip
-    // enforcement_mode only → Set.
+    // enforcement_mode only → Set. Away from the default: writing the value
+    // the row already holds would pass even if the write were dropped.
     let mut after_routing = ServiceStabilityConfigProvider::get(&stab);
-    assert!(
-        after_routing.verbose_logging,
-        "routing panel's Get must see the diagnostics panel's prior Set"
-    );
-    // Flip AWAY from the default: writing the value the row already holds
-    // would pass even if the write were dropped entirely.
+    assert!(after_routing.conn_trace_ndjson);
     after_routing.enforcement_mode = "reactive".to_string();
     let written_routing = ServiceStabilityConfigWriter::set(&stab, &after_routing, Some("S-ROUTE"))
         .expect("routing set");
     assert!(
-        written_routing.verbose_logging,
-        "routing panel's Set must not clobber the diagnostics panel's verbose flag"
+        written_routing.conn_trace_ndjson,
+        "routing panel's Set must not clobber the diagnostics panel's field"
     );
-    assert_eq!(written_routing.enforcement_mode, "reactive");
 
     let final_state = ServiceStabilityConfigProvider::get(&stab);
-    assert!(final_state.verbose_logging);
+    assert!(final_state.conn_trace_ndjson);
     assert_eq!(final_state.enforcement_mode, "reactive");
-}
-
-/// P3 — proves `set()` drives the live tracing-reload
-/// seam through `VerbosityControl::set_verbose`, using a fake recorder
-/// instead of a real `tracing_subscriber` reload handle (that path is
-/// covered separately in `nrr_diagnostics::logs::tracing_layer`'s own
-/// tests). Records every call so both the "turn on" and "turn off"
-/// directions — and the exact value forwarded — are asserted, not just
-/// "was called at least once".
-#[test]
-fn verbose_logging_set_drives_live_reload() {
-    use crate::verbosity_control::VerbosityControl;
-    use std::sync::Mutex as StdMutex;
-
-    #[derive(Default)]
-    struct FakeVerbosityControl {
-        calls: StdMutex<Vec<bool>>,
-    }
-
-    impl VerbosityControl for FakeVerbosityControl {
-        fn set_verbose(&self, verbose: bool) {
-            self.calls
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(verbose);
-        }
-    }
-
-    let (_dir, conn) = fresh_conn();
-    let fake = Arc::new(FakeVerbosityControl::default());
-    let stab = ProductionServiceStability::new(Arc::clone(&conn))
-        .with_verbosity_control(Arc::clone(&fake) as Arc<dyn VerbosityControl>);
-
-    let mut dto = ServiceStabilityConfigProvider::get(&stab);
-    assert!(!dto.verbose_logging, "default must be off");
-
-    // Flip on.
-    dto.verbose_logging = true;
-    ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set on must succeed");
-    assert_eq!(
-        *fake.calls.lock().unwrap(),
-        vec![true],
-        "set(verbose=true) must drive VerbosityControl::set_verbose(true)"
-    );
-
-    // A redundant Save with the SAME value still drives the (idempotent)
-    // live-apply call — mirrors the unconditional resolver-controller
-    // pattern this seam was modelled on.
-    ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST"))
-        .expect("redundant set must succeed");
-    assert_eq!(*fake.calls.lock().unwrap(), vec![true, true]);
-
-    // Flip off.
-    dto.verbose_logging = false;
-    ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set off must succeed");
-    assert_eq!(
-        *fake.calls.lock().unwrap(),
-        vec![true, true, false],
-        "set(verbose=false) must drive VerbosityControl::set_verbose(false)"
-    );
-}
-
-/// Without a wired `VerbosityControl` (tests / degraded boot), `set()`
-/// must still succeed and persist — the live-apply seam is additive,
-/// never a precondition for the settings write itself.
-#[test]
-fn verbose_logging_set_succeeds_without_verbosity_control_wired() {
-    let (_dir, conn) = fresh_conn();
-    let stab = ProductionServiceStability::new(Arc::clone(&conn));
-
-    let mut dto = ServiceStabilityConfigProvider::get(&stab);
-    dto.verbose_logging = true;
-    let written = ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST"))
-        .expect("set must succeed with no VerbosityControl wired");
-    assert!(written.verbose_logging);
 }
 
 /// Fake-IP UDP relay — proves `set()` drives the live-apply
@@ -236,10 +310,13 @@ fn a_set_that_omits_the_rules_lock_preserves_it() {
     // A different panel saves an unrelated toggle with no opinion on the
     // lock (the shape an older client sends).
     dto.allow_user_rule_edits = None;
-    dto.verbose_logging = true;
+    dto.conn_trace_ndjson = true;
     let written =
         ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-OTHER")).expect("unrelated set");
-    assert!(written.verbose_logging, "the unrelated field must be saved");
+    assert!(
+        written.conn_trace_ndjson,
+        "the unrelated field must be saved"
+    );
     assert_eq!(
         written.allow_user_rule_edits,
         Some(false),
@@ -300,6 +377,27 @@ fn instant_rst_set_drives_live_flag_with_persisted_value() {
 
     let readback = ServiceStabilityConfigProvider::get(&stab);
     assert!(readback.fake_ip_instant_rst, "on must be durably persisted");
+}
+
+/// The trace-to-log switch reaches the running observer on save, in both
+/// directions, carrying the stored value rather than the requested one.
+#[test]
+fn conn_trace_ndjson_set_reaches_the_running_observer() {
+    let (_dir, conn) = fresh_conn();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stab = ProductionServiceStability::new(Arc::clone(&conn)).with_conn_trace_ndjson_apply({
+        let seen = Arc::clone(&seen);
+        Arc::new(move |on: bool| seen.lock().expect("lock").push(on))
+    });
+
+    let mut dto = ServiceStabilityConfigProvider::get(&stab);
+    assert!(!dto.conn_trace_ndjson, "the disk sink stays opt-in");
+    dto.conn_trace_ndjson = true;
+    ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set on");
+    dto.conn_trace_ndjson = false;
+    ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set off");
+
+    assert_eq!(*seen.lock().expect("lock"), vec![true, false]);
 }
 
 /// Without a wired live-flag seam (tests / degraded boot), `set()` must

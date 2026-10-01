@@ -78,7 +78,7 @@
 //!
 //! 1. **Brand relation** — the candidate carries the anchor's brand token or
 //!    vice versa (`web.chatapp.example` and `static.chatapp.test`, `ab.example` and
-//!    `login.ab.test`, `tiktok.com` and `tiktokv.com`). Shared branding is a
+//!    `login.ab.test`, `clipfeed.test` and `clipfeedv.test`). Shared branding is a
 //!    statement of ownership, so a single co-occurrence is enough and no
 //!    temporal threshold applies.
 //! 2. **Delivery name** — the name matches a delivery-endpoint mask

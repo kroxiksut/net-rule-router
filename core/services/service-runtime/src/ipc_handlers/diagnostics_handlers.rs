@@ -38,9 +38,7 @@ use nrr_diagnostics::archive::{
     request::DiagnosticArchiveRequest,
 };
 use nrr_diagnostics::explain::{ExplainQuery, ExplainResponse, RuntimeInputSample};
-use nrr_diagnostics::facade::dto::{
-    ClearLogsRequest, DiagnosticArchiveHealthEnrichmentDto, SetDiagnosticModeRequest,
-};
+use nrr_diagnostics::facade::dto::{ClearLogsRequest, DiagnosticArchiveHealthEnrichmentDto};
 use nrr_diagnostics::facade::pagination::{PaginationParams, MAX_PAGE_SIZE};
 use nrr_diagnostics::facade::service::DiagnosticsFacade;
 use nrr_diagnostics::privacy::mode::RedactionMode;
@@ -50,9 +48,8 @@ use nrr_domain::decision_explain::DecisionId;
 use nrr_shared::ipc_payloads::{
     CacheClearRequest, CacheClearResponse, CacheEntriesListRequest, CacheEntriesListResponse,
     CacheEntryDto, ConnTraceEntriesListRequest, ConnTraceEntriesListResponse, ConnTraceEntryDto,
-    DiagnosticModeSetRequest, DiagnosticsExportArchiveRequest, DiagnosticsExportArchiveResponse,
-    ExplainCompactViewDto, ExplainGetRequest, ExplainGetResponse, LogsClearRequest,
-    LogsClearResponse,
+    DiagnosticsExportArchiveRequest, DiagnosticsExportArchiveResponse, ExplainCompactViewDto,
+    ExplainGetRequest, ExplainGetResponse, LogsClearRequest, LogsClearResponse,
 };
 use nrr_shared::pagination::{PageCursor, PageResult};
 use nrr_storage::dto::CacheResetReason;

@@ -154,7 +154,7 @@ pub(super) fn brand_token(hostname: &str) -> &str {
 
 /// The candidate carries the anchor's brand, or the anchor carries the
 /// candidate's: `web.chatapp.example` and `static.chatapp.test`, `ab.example` and
-/// `login.ab.test`, `tiktok.com` and `tiktokv.com`, `feed.example` and
+/// `login.ab.test`, `clipfeed.test` and `clipfeedv.test`, `feed.example` and
 /// `static.feedinfra.example`.
 ///
 /// Containment (not equality) is what catches the last two shapes: operators
@@ -169,7 +169,7 @@ pub(super) fn is_brand_related(anchor: &str, candidate: &str) -> bool {
 /// The equality branch has no length floor, and it must not get one: `ab.example`
 /// and `login.ab.test` are kin precisely because their token matches exactly,
 /// and `ab` is below the length containment demands. But the same branch makes
-/// `q.test`/`q.example`, `x.com`/`x.ai` and `ok.ru`/`ok.com` kin as well, and a token
+/// `q.test`/`q.example`, `k.test`/`k.example` kin as well, and a token
 /// that short is one registrar away from coincidence. So the relation stands
 /// and its REACH does not: weak evidence buys the exact host, never the apex.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,7 +198,7 @@ pub(super) fn brand_relation(anchor: &str, candidate: &str) -> BrandRelation {
 }
 
 /// Whether `name` carries `brand` as a label, a label's prefix, or a label's
-/// suffix — the shapes branding actually takes (`feedinfra`, `tiktokv`,
+/// suffix — the shapes branding actually takes (`feedinfra`, `clipfeedv`,
 /// `cdninsta`).
 ///
 /// Anchored on purpose. A brand found anywhere INSIDE a label is a collision,
@@ -206,11 +206,11 @@ pub(super) fn brand_relation(anchor: &str, candidate: &str) -> BrandRelation {
 /// kinship proposed an unrelated domain as a companion of the AI studio host.
 ///
 /// Only the REGISTRABLE domain is searched. A brand sitting in a subdomain of
-/// somebody else's apex names the customer, not the owner: `mozilla.map.fastly.net`
-/// is a Fastly machine, and treating it as kin proposed moving all of
-/// `mozilla.org` onto the additional link. Ownership shapes survive, because
+/// somebody else's apex names the customer, not the owner:
+/// `brandname.map.tenantnet.test` is a CDN machine, and treating it as kin
+/// proposed moving all of `brandname.test` onto the additional link. Ownership shapes survive, because
 /// they put the brand in the registrable domain itself (`feedinfra.example`,
-/// `githubusercontent.com`).
+/// `codehostcontent.example`).
 pub(super) fn carries_brand(name: &str, brand: &str) -> bool {
     brand.len() >= MIN_BRAND_TOKEN_LEN
         && registrable_domain(name)
@@ -236,8 +236,8 @@ pub(super) fn is_sharded_delivery_label(hostname: &str) -> bool {
 }
 
 /// The hostname spells out an IPv4 address, so it names one machine rather
-/// than a service: `a23-45-67-89.deploy.static.akamaitechnologies.com`,
-/// `ec2-18-97-36-79.compute-1.amazonaws.com`, `140.206.0.34.bc.googleusercontent.com`.
+/// than a service: `a198-51-100-89.deploy.static.cdn.example.net`,
+/// `vm2-198-51-100-79.compute-1.cloud.example.com`, `203.0.113.34.bc.cloud.example.com`.
 ///
 /// These reach the ledger through the reverse-lookup learner, which exists to
 /// name companions the DNS path never sees (browser cache, DoH). What it can
@@ -246,7 +246,7 @@ pub(super) fn is_sharded_delivery_label(hostname: &str) -> bool {
 /// infrastructure apex for the tunnel, which is a rule over somebody else's
 /// traffic.
 pub(super) fn names_one_machine(hostname: &str) -> bool {
-    // The leading octet often wears a prefix (`a23-`, `ec2-`), so a token is
+    // The leading octet often wears a prefix (`a23-`, `vm2-`), so a token is
     // read as its trailing digits. Demanding that three of the four be bare
     // numbers keeps ordinary names such as `a1-b2-c3-d4` out.
     let octet_of = |token: &str| -> Option<bool> {

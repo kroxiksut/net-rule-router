@@ -93,6 +93,7 @@ use crate::active_sid_registry::ActiveSidRegistry;
 use crate::app_observation_lookup::{AppObservationLookup, AppObservationStore};
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::killswitch_codegen::{FailClosedExemptions, KillSwitchResolution};
+use crate::machine_reading::MachineReading;
 use crate::wfp_codegen::{generate_filters, CodegenInput};
 
 mod types;
@@ -110,7 +111,7 @@ mod state;
 use state::*;
 pub use state::{
     FailClosedExemptionsResolver, FakeIpContextProvider, FilterFailureModeSource,
-    Ipv6GuardResolver, KillSwitchResolver, PerSidApplyOrchestrator, RouteSyncHook,
+    Ipv6GuardResolver, KillSwitchResolver, MachineReader, PerSidApplyOrchestrator, RouteSyncHook,
     UnresolvedHostsSink, VpnClientAppsProvider,
 };
 

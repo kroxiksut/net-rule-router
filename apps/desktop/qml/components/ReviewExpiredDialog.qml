@@ -70,7 +70,7 @@ Dialog {
             ThemedButton {
                 id: cancelButton
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("dialog.review-expired.cancel", "Cancel")
+                text: root.tr("action.cancel", "Cancel")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: root.tr(

@@ -8,3 +8,4 @@ Cấu trúc dự kiến:
 - vn/<pack-name>/rules_secondary.txt
 
 Tác giả: những người đóng góp kho mã
+Kiểm tra: tháng 9 năm 2026

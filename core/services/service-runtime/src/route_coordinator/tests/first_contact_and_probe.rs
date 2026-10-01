@@ -61,7 +61,7 @@ fn fail_closed_exemptions_seed_persisted_server_ips_before_reconnect() {
             Arc::new(|_ips: &[Ipv4Addr]| {}),
             Arc::new(move || vec![persisted]),
         );
-    let ex = coord.fail_closed_exemptions("S-1-5-21-A");
+    let ex = coord.fail_closed_exemptions("S-1-5-21-A", &coord.read_machine());
     assert!(
         ex.bootstrap_server_ips.contains(&persisted),
         "persisted server IP seeds the fail-closed exemption before any live observation",
@@ -73,7 +73,7 @@ fn fail_closed_exemptions_without_persistence_is_unchanged() {
     // No persistence wired → empty exemption server set.
     let api = Arc::new(MockWindowsApi::new());
     let coord = coordinator(api, Arc::new(FakeRules::new()));
-    let ex = coord.fail_closed_exemptions("S-1-5-21-A");
+    let ex = coord.fail_closed_exemptions("S-1-5-21-A", &coord.read_machine());
     assert!(ex.bootstrap_server_ips.is_empty());
     assert!(ex.probe_target_ips.is_empty());
 }
@@ -90,7 +90,7 @@ fn fail_closed_exemptions_carry_probe_target_even_when_liveness_dead() {
     let sid = "S-1-5-21-A";
     let gw = Ipv4Addr::new(10, 0, 0, 1);
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let vpn_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     let policy = Arc::new(FakePolicy::new());
@@ -103,7 +103,12 @@ fn fail_closed_exemptions_carry_probe_target_even_when_liveness_dead() {
         Arc::new(FakeRules::new()),
         Arc::clone(&policy),
     );
-    assert_eq!(coord.fail_closed_exemptions(sid).probe_target_ips, vec![gw]);
+    assert_eq!(
+        coord
+            .fail_closed_exemptions(sid, &coord.read_machine())
+            .probe_target_ips,
+        vec![gw]
+    );
 
     // Probe-DEAD tunnel: a failure run older than the whole window makes
     // `is_dead` true, the gated resolution loses the secondary, and the
@@ -127,7 +132,9 @@ fn fail_closed_exemptions_carry_probe_target_even_when_liveness_dead() {
             Arc::new(nrr_platform_api::reachability::AlwaysReachableProbe),
         );
     assert_eq!(
-        coord_dead.fail_closed_exemptions(sid).probe_target_ips,
+        coord_dead
+            .fail_closed_exemptions(sid, &coord_dead.read_machine())
+            .probe_target_ips,
         vec![gw],
         "DEAD verdict must not drop the probe-target exemption",
     );
@@ -143,7 +150,7 @@ fn probe_tick_forgets_the_failing_run_when_the_binding_stops_resolving() {
     // reconnected, working tunnel.
     let sid = "S-1-5-21-A";
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 60, true, true, Some([10, 88, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 60, true, true, Some([10, 88, 0, 1]));
     let vpn_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     let policy = Arc::new(FakePolicy::new());
@@ -161,7 +168,7 @@ fn probe_tick_forgets_the_failing_run_when_the_binding_stops_resolving() {
         "a failed probe starts a failing run"
     );
     // The adapter drops (VPN mid-reconnect) → the binding stops resolving.
-    api.set_adapter_infos(vec![adapter("swiftvpnvpn", 60, false, false, None)]);
+    api.set_adapter_infos(vec![adapter("examplevpnvpn", 60, false, false, None)]);
     coord.probe_active_secondaries(&sids);
     assert!(
         !tracker.in_failing_run(60),
@@ -178,7 +185,7 @@ fn probe_tick_forgets_the_failing_run_when_the_adapter_comes_back_under_a_new_if
     // declare a healthy tunnel dead on its first probe.
     let sid = "S-1-5-21-A";
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("swiftvpnvpn", 60, true, true, Some([10, 88, 0, 1]));
+    let vpn = adapter("examplevpnvpn", 60, true, true, Some([10, 88, 0, 1]));
     let vpn_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     let policy = Arc::new(FakePolicy::new());
@@ -198,7 +205,7 @@ fn probe_tick_forgets_the_failing_run_when_the_adapter_comes_back_under_a_new_if
     tracker.record(61, false, Instant::now());
     assert!(tracker.in_failing_run(61));
     api.set_adapter_infos(vec![adapter(
-        "swiftvpnvpn",
+        "examplevpnvpn",
         61,
         true,
         true,

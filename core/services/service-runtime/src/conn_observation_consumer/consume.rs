@@ -29,6 +29,7 @@ impl ConnectionObservationConsumer {
             unicast = build_unicast_table(&self.api.get_adapter_infos().unwrap_or_default());
         }
         let active_sid_now = (self.active_sid)();
+        let log_ndjson = self.log_ndjson.load(Ordering::Relaxed);
         // Once per batch: the collateral check consults it for every observation
         // and a rule edit must land without a restart.
         let routed_apps: Vec<String> = self
@@ -237,7 +238,7 @@ impl ConnectionObservationConsumer {
             // app-scoped exemption so the next block-all arming permits the
             // whole process up front — its egress IS the tunnel's transport —
             // instead of chasing one rotated endpoint IP per drop (the
-            // swiftvpn-over-rotating-Google-IPs failure mode). Not gated on
+            // examplevpn-over-rotating-CDN-IPs failure mode). Not gated on
             // the remote IP being a learnable endpoint: the client's role is
             // proven by the drop regardless of which address the check targeted.
             if let Some(learner) = self.vpn_client_app_learner.as_ref() {
@@ -347,7 +348,11 @@ impl ConnectionObservationConsumer {
                     .last_secondary_at
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
-                self.note_app_additional_link(&rec);
+                // Same outcome filter as the main-link half: only what the stack
+                // established went over the link.
+                if establishes {
+                    self.note_app_additional_link(&rec);
+                }
             }
             if rec.egress.role == EgressRole::Primary {
                 self.note_companion_in_use(rec.remote.ip());
@@ -370,7 +375,7 @@ impl ConnectionObservationConsumer {
                 EgressRole::Other => summary.other += 1,
                 EgressRole::Unknown => summary.unknown += 1,
             }
-            if self.log_ndjson {
+            if log_ndjson {
                 tracing::info!(
                     target: "nrr::conn-trace",
                     msg_key = "connobs-outbound-connection-observed",

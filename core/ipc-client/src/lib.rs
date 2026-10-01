@@ -26,14 +26,11 @@
 //! )?;
 //! ```
 //!
-//! ## Crate boundaries (CLAUDE.md)
+//! ## Crate boundaries
 //!
-//! Allowed: `nrr-shared`, `nrr-application`.
-//!
-//! Forbidden: `nrr-service-runtime`, `nrr-windows-service`,
-//! `nrr-platform-windows`, `nrr-storage`, `nrr-diagnostics`, any UI crate,
-//! `nrr-mock-backend`. The client must round-trip through the wire
-//! protocol only — no shortcut into service internals.
+//! Depends on `nrr-shared` only. Everything above the transport — the GUI's
+//! backend facade, preview snapshots — lives in the crates that use it, so the
+//! console and the broker link the client without the desktop layers.
 
 pub mod connection;
 /// Transport-neutral IPC protocol layer: envelope building, operation-class
@@ -80,18 +77,15 @@ mod client_unix;
 #[cfg(unix)]
 pub use client_unix::UnixIpcClient;
 
-/// The `BackendFacade` the GUI talks to. Neutral: it drives whatever
-/// [`IpcClient`] it is handed, so the same cache-fallback policy serves the
-/// named pipe on Windows and the `AF_UNIX` socket on Linux.
-pub mod backend_facade_impl;
+mod timeouts;
 
-pub use backend_facade_impl::{ipc_operation_timeout, IpcBackendFacade};
 #[cfg(target_os = "windows")]
 pub use client::NamedPipeIpcClient;
+pub use timeouts::ipc_operation_timeout;
 
 /// The transport this OS talks to the service over. One name for the two
-/// implementations, so callers that only need "the client" — the launcher, the
-/// facade's production constructor — name this and carry no `cfg` of their own.
+/// implementations, so callers that only need "the client" name this and carry
+/// no `cfg` of their own.
 /// Both sides expose the same surface (`start`, `call`, `connection_status`,
 /// `force_reconnect`, `subscribe_push`, `negotiate_info`, `shutdown`).
 #[cfg(target_os = "windows")]

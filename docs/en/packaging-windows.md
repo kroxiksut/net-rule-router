@@ -17,7 +17,7 @@ puts an archive of it beside the folder.
 |---|---|
 | `-OutputRoot <path>` | Where the package folder is created. Default `C:\temp\NetRuleRouter\dist`. |
 | `-SkipBuild` | Package the release binaries already present instead of building. |
-| `-QtBin <path>` | Qt `bin` directory holding `windeployqt.exe`. Autodetected under `C:\Qt` otherwise. |
+| `-QtBin <path>` | Qt `bin` directory holding `windeployqt.exe`. By default the kit the Qt host was built with is used; a different kit is refused. |
 | `-Full` | Ship the complete Qt runtime instead of the trimmed one. |
 | `-Zip` | Also produce `NetRuleRouter-windows-x64-<version>+<commit>.zip`. |
 | `-Force` | Replace a package folder left by a previous run. |
@@ -102,6 +102,7 @@ to compare against.
 
 - Rust toolchain and `cargo` on `PATH`
 - Qt 6 with an **x64** desktop kit (an arm64 kit cannot run on an x64 host)
+- An x64 Windows machine: packaging on any other architecture stops with an explanation rather than mixing in mismatched components
 - Visual Studio with the C++ workload — its redistributable DLLs are copied
   into the package
 - `git`, to stamp the revision. Without it the package still builds and records
@@ -113,8 +114,9 @@ to compare against.
   `windeployqt`, no wintun — so it will be written alongside the Linux build
   rather than translated from this script.
 - **The binaries are unsigned**, so SmartScreen warns on first run.
-- **Scripts under `scripts\` that expect a build tree** (`install-service.ps1`,
-  `build.ps1`, `run.ps1`) do not work from the package. The ones worth having
-  there are `reset-network.ps1`, `service-status.ps1` and `service-smoke.ps1`,
-  and `uninstall-service.ps1` and `purge-data.ps1` work too: they remove the
-  service that is installed, wherever it was registered from.
+- **`scripts\` holds only what a user of the package needs:**
+  `reset-network.ps1`, `service-status.ps1`, `uninstall-service.ps1` and
+  `purge-data.ps1`. Build, check and development scripts stay in the checkout.
+  For everyday checks and network recovery use the console beside the
+  application: `nrr-cli status`, `nrr-cli diag doctor`,
+  `nrr-cli reset-network --confirm`. See [the console](cli.md).

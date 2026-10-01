@@ -113,7 +113,10 @@ impl TunAdapterConfig {
 
 impl Default for TunAdapterConfig {
     fn default() -> Self {
-        Self::for_pool("NetRuleRouter", &FakeIpPoolConfig::default())
+        Self::for_pool(
+            nrr_shared::product_identity::TUN_ADAPTER_NAME,
+            &FakeIpPoolConfig::default(),
+        )
     }
 }
 

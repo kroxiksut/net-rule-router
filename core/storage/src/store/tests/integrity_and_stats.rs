@@ -47,8 +47,7 @@ fn state_store_check_integrity_ok_with_signed_rows() {
         seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-valid-001", "active");
         seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-valid-000", "superseded");
     }
-    let rev = RevisionId::from_prefixed_string("rev-valid-001".to_string()).expect("rev");
-    store.set_active_revision(&rev).expect("set active");
+    point_baseline(&store, "rev-valid-001").expect("set active");
 
     let (result, action) = store.check_integrity().expect("check");
     assert_eq!(result, IntegrityCheckResult::Ok);
@@ -70,8 +69,7 @@ fn state_store_check_integrity_detects_a_tampered_active_row() {
         )
         .expect("tamper");
     }
-    let rev = RevisionId::from_prefixed_string("rev-tamper-001".to_string()).expect("rev");
-    store.set_active_revision(&rev).expect("set active");
+    point_baseline(&store, "rev-tamper-001").expect("set active");
 
     let (result, action) = store.check_integrity().expect("check");
     assert!(
@@ -95,8 +93,7 @@ fn state_store_check_integrity_detects_a_tampered_rollback_target() {
         )
         .expect("tamper lkg");
     }
-    let rev = RevisionId::from_prefixed_string("rev-active-002".to_string()).expect("rev");
-    store.set_active_revision(&rev).expect("set active");
+    point_baseline(&store, "rev-active-002").expect("set active");
 
     let (result, action) = store.check_integrity().expect("check");
     assert!(
@@ -118,8 +115,7 @@ fn state_store_check_integrity_fails_on_a_pointer_to_a_deleted_revision() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = migrated_state_store(&dir);
     seed_revision(&store, "rev-deleted", "active");
-    let rev = RevisionId::from_prefixed_string("rev-deleted".to_string()).expect("rev");
-    store.set_active_revision(&rev).expect("set active");
+    point_baseline(&store, "rev-deleted").expect("set active");
     {
         let conn = store.conn.borrow();
         conn.execute_batch(
@@ -149,8 +145,7 @@ fn state_store_check_integrity_detects_a_redirected_pointer() {
         seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-old-001", "superseded");
         seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-new-002", "active");
     }
-    let rev = RevisionId::from_prefixed_string("rev-new-002".to_string()).expect("rev");
-    store.set_active_revision(&rev).expect("set active");
+    point_baseline(&store, "rev-new-002").expect("set active");
     {
         let conn = store.conn.borrow();
         conn.execute(
@@ -168,25 +163,72 @@ fn state_store_check_integrity_detects_a_redirected_pointer() {
 }
 
 #[test]
-fn state_store_check_integrity_missing_lkg_returns_ok_on_first_start() {
+fn state_store_check_integrity_is_ok_with_nothing_to_roll_back_to() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = migrated_state_store(&dir);
-    let rev = RevisionId::from_prefixed_string("rev-no-lkg".to_string()).expect("rev");
     seed_revision(&store, "rev-no-lkg", "active");
-
-    // The very first revision: active, and nothing superseded behind it,
-    // so there is no rollback target yet.
-    store.set_active_revision(&rev).expect("set active");
-    assert!(store.get_last_known_good().expect("lkg").is_none());
+    // The very first revision: nothing superseded behind it.
+    point_baseline(&store, "rev-no-lkg").expect("set active");
 
     let (result, action) = store.check_integrity().expect("check");
-    // Not a failure — just means rollback is unsafe until LKG is promoted.
-    assert_eq!(
-        result,
-        IntegrityCheckResult::OkNoRollbackTarget,
-        "reported as its own state, not as an indistinguishable Ok"
-    );
+    assert_eq!(result, IntegrityCheckResult::Ok);
     assert_eq!(action, RecoveryAction::None);
+}
+
+/// Every principal's rollback target is checked, not only the baseline's.
+#[test]
+fn state_store_check_integrity_checks_the_rollback_target_of_every_principal() {
+    const OTHER: &str = "S-1-5-21-1000-1000-1000-1001";
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_state_store(&dir).with_signing_key(TEST_SIGNING_KEY.to_vec());
+    {
+        let conn = store.conn.borrow();
+        seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-base-001", "active");
+        let repo = crate::revisions::RevisionsRepository::with_signing_key(
+            &conn,
+            TEST_SIGNING_KEY.to_vec(),
+        );
+        for (id, status) in [("rev-other-old", "superseded"), ("rev-other-new", "active")] {
+            conn.execute(
+                "INSERT INTO revisions (principal, revision_id, content_hash, rules_json,
+                                        status, source, correlation_id, created_at, superseded_at)
+                 VALUES (?1, ?2, ?2, '{}', ?3, 'gui-rules-edit', 'c', 0, 1)",
+                params![OTHER, id, status],
+            )
+            .expect("seed other principal");
+            repo.re_sign_row(id).expect("sign");
+        }
+        repo.set_active_pointer_for(
+            OTHER,
+            &crate::revisions::ActiveRevisionPointer {
+                revision_id: "rev-other-new".to_string(),
+                activated_at: 1,
+                apply_attempt_id: None,
+            },
+        )
+        .expect("point other");
+    }
+    point_baseline(&store, "rev-base-001").expect("set active");
+    assert_eq!(
+        store.check_integrity().expect("check").0,
+        IntegrityCheckResult::Ok,
+        "positive control: both principals clean"
+    );
+
+    store
+        .conn
+        .borrow()
+        .execute(
+            "UPDATE revisions SET rules_json = '{\"tampered\":true}' WHERE revision_id = 'rev-other-old'",
+            [],
+        )
+        .expect("tamper");
+    let (result, action) = store.check_integrity().expect("check");
+    assert!(
+        matches!(result, IntegrityCheckResult::PolicyIntegrityFailed { .. }),
+        "got {result:?}"
+    );
+    assert!(matches!(action, RecoveryAction::RequireUserAction(_)));
 }
 
 #[test]
@@ -260,8 +302,8 @@ fn get_cache_stats_counts_all_entities() {
             canonical_hostname: "alpha.test".into(),
             raw_hostname_sample: None,
             resolved_ips: vec![
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             ],
             ttl_seconds: Some(300),
             source: StorageResolutionSource::Dns,
@@ -274,7 +316,7 @@ fn get_cache_stats_counts_all_entities() {
         .upsert_resolution(ResolutionEntry {
             canonical_hostname: "beta.test".into(),
             raw_hostname_sample: None,
-            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))],
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))],
             ttl_seconds: Some(60),
             source: StorageResolutionSource::Dns,
             resolved_at: now,
@@ -297,7 +339,7 @@ fn get_cache_stats_counts_all_entities() {
 }
 
 #[test]
-fn get_cache_stats_stale_count_after_revision_change() {
+fn get_cache_stats_counts_stale_entries() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = migrated_cache_store(&dir);
     let now = SystemTime::now();
@@ -306,7 +348,7 @@ fn get_cache_stats_stale_count_after_revision_change() {
         .upsert_resolution(ResolutionEntry {
             canonical_hostname: "example.test".into(),
             raw_hostname_sample: None,
-            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(5, 5, 5, 5))],
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
             ttl_seconds: Some(300),
             source: StorageResolutionSource::Dns,
             resolved_at: now,
@@ -314,8 +356,15 @@ fn get_cache_stats_stale_count_after_revision_change() {
         })
         .expect("upsert");
 
-    let staled = store.mark_revision_stale("rev-002").expect("mark stale");
-    assert_eq!(staled, 1);
+    // Entries written under an older revision, as the cache marks them.
+    store
+        .conn
+        .borrow()
+        .execute(
+            "UPDATE hostname_ip_resolutions SET freshness_state = 'stale_usable'",
+            [],
+        )
+        .expect("mark stale");
 
     let stats = store.get_cache_stats().expect("stats");
     assert_eq!(stats.resolution_count, 1, "entry still exists");
@@ -335,8 +384,8 @@ fn list_resolutions_orders_and_respects_offset_limit_and_has_more() {
             canonical_hostname: "alpha.test".into(),
             raw_hostname_sample: None,
             resolved_ips: vec![
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             ],
             ttl_seconds: Some(300),
             source: StorageResolutionSource::Dns,
@@ -348,7 +397,7 @@ fn list_resolutions_orders_and_respects_offset_limit_and_has_more() {
         .upsert_resolution(ResolutionEntry {
             canonical_hostname: "beta.test".into(),
             raw_hostname_sample: None,
-            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))],
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))],
             ttl_seconds: Some(60),
             source: StorageResolutionSource::Dns,
             resolved_at: now,
@@ -357,25 +406,25 @@ fn list_resolutions_orders_and_respects_offset_limit_and_has_more() {
         .expect("upsert beta");
 
     // Full window: fetches limit+1 but only 3 rows exist. Ordered by
-    // (canonical_host, canonical_ip): 1.0.0.1 sorts before 1.1.1.1.
+    // (canonical_host, canonical_ip): 192.0.2.1 sorts before 198.51.100.1.
     let all = store.list_resolutions(0, 10, "").expect("list all");
     assert_eq!(all.len(), 3, "three resolution rows exist");
     assert_eq!(all[0].canonical_hostname, "alpha.test");
-    assert_eq!(all[0].canonical_ip, "1.0.0.1");
+    assert_eq!(all[0].canonical_ip, "192.0.2.1");
     assert_eq!(all[0].freshness_state, "fresh");
     assert_eq!(all[0].source, "dns");
     assert_eq!(all[1].canonical_hostname, "alpha.test");
-    assert_eq!(all[1].canonical_ip, "1.1.1.1");
+    assert_eq!(all[1].canonical_ip, "198.51.100.1");
     assert_eq!(all[2].canonical_hostname, "beta.test");
-    assert_eq!(all[2].canonical_ip, "2.2.2.2");
+    assert_eq!(all[2].canonical_ip, "198.51.100.2");
 
     // First page of size 2: fetches 3 (limit+1) so the caller sees a
     // "has more" probe row beyond the requested two.
     let page1 = store.list_resolutions(0, 2, "").expect("page 1");
     assert_eq!(page1.len(), 3, "limit+1 fetched → caller detects more");
     assert!(page1.len() as u32 > 2, "more pages available");
-    assert_eq!(page1[0].canonical_ip, "1.0.0.1");
-    assert_eq!(page1[1].canonical_ip, "1.1.1.1");
+    assert_eq!(page1[0].canonical_ip, "192.0.2.1");
+    assert_eq!(page1[1].canonical_ip, "198.51.100.1");
 
     // Second page (offset 2): only the last row remains, no probe row.
     let page2 = store.list_resolutions(2, 2, "").expect("page 2");
@@ -411,7 +460,7 @@ fn list_resolutions_filters_by_query_on_host_or_ip() {
         .upsert_resolution(ResolutionEntry {
             canonical_hostname: "beta.test".into(),
             raw_hostname_sample: None,
-            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(20, 0, 0, 2))],
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2))],
             ttl_seconds: Some(60),
             source: StorageResolutionSource::Dns,
             resolved_at: now,
@@ -443,11 +492,11 @@ fn list_resolutions_filters_by_query_on_host_or_ip() {
     assert_eq!(by_suffix.len(), 2, "alpha.test + beta.test");
 
     // Exact IP match; a bare IP fragment does not match.
-    let by_ip = store.list_resolutions(0, 10, "20.0.0.2").expect("by ip");
+    let by_ip = store.list_resolutions(0, 10, "203.0.113.2").expect("by ip");
     assert_eq!(by_ip.len(), 1);
     assert_eq!(by_ip[0].canonical_hostname, "beta.test");
     assert!(store
-        .list_resolutions(0, 10, "20.0.0")
+        .list_resolutions(0, 10, "203.0.113")
         .expect("ip fragment")
         .is_empty());
 

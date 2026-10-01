@@ -24,14 +24,13 @@ use nrr_domain::revision::RevisionId;
 
 use crate::dto::{
     CacheEntryRow, CacheLookupRequest, CacheLookupResult, CacheResetReason, CacheResetSummary,
-    CacheStats, CachedIpEntry, CleanupPolicy, CleanupSummary, DbHealthStatus, DbIntegrityState,
-    ExpiredHostname, IntegrityCheckResult, IntegrityStatus, LookupEventEntry, NegativeCacheEntry,
-    NegativeCacheReason, OverallHealthState, RecoveryAction, ResolutionEntry, StorageHealthStatus,
+    CacheStats, CachedIpEntry, CleanupPolicy, CleanupSummary, ExpiredHostname,
+    IntegrityCheckResult, NegativeCacheEntry, NegativeCacheReason, RecoveryAction, ResolutionEntry,
 };
 use crate::error::{StorageError, StorageResult};
-use crate::repository::{CacheRepository, RevisionMetadataRepository, StorageHealthChecker};
+use crate::repository::{CacheRepository, RevisionMetadataRepository};
 use crate::resolution_source::{CachePriorityStrategy, StorageResolutionSource};
-use crate::schema::{lookup_direction_as_str, FreshnessStateDb};
+use crate::schema::FreshnessStateDb;
 
 // ── SqliteCacheStore ──────────────────────────────────────────────────────────
 
@@ -512,13 +511,13 @@ impl CacheRepository for SqliteCacheStore {
                  WHERE primary_ruled = 1",
             )
             .map_err(db_err)?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, i64>(0))
-            .map_err(db_err)?
-            .filter_map(|r| r.ok())
-            .map(|packed| Ipv4Addr::from(packed as u32))
-            .collect();
-        Ok(rows)
+        // Same contract as `shared_ip_census_ips`: a dropped row would let the
+        // kill-switch pin a primary-ruled address with nothing logged.
+        let mut out = Vec::new();
+        for row in stmt.query_map([], |r| r.get::<_, i64>(0)).map_err(db_err)? {
+            out.push(Ipv4Addr::from(row.map_err(db_err)? as u32));
+        }
+        Ok(out)
     }
 
     fn upsert_negative_cache(&self, entry: NegativeCacheEntry) -> StorageResult<()> {
@@ -565,25 +564,6 @@ impl CacheRepository for SqliteCacheStore {
             expires_at: retry_after,
             source,
         })
-    }
-
-    fn record_lookup_event(&self, event: LookupEventEntry) -> StorageResult<()> {
-        let conn = self.conn.borrow();
-        conn.execute(
-            "INSERT INTO lookup_events
-             (direction, result_state, error_code, duration_ms, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                lookup_direction_as_str(&event.direction),
-                event.result_state.as_str(),
-                event.error_code,
-                event.duration_ms as i64,
-                system_time_to_ms(event.created_at),
-                system_time_to_ms(event.expires_at),
-            ],
-        )
-        .map_err(db_err)?;
-        Ok(())
     }
 
     // ── DNS refresh ──────────────────────────────────────────────────────────
@@ -784,22 +764,6 @@ impl CacheRepository for SqliteCacheStore {
         Ok(out)
     }
 
-    // ── Revision lifecycle ────────────────────────────────────────────────────
-
-    fn mark_revision_stale(&self, new_active_revision_id: &str) -> StorageResult<u64> {
-        let conn = self.conn.borrow();
-        let rows = conn
-            .execute(
-                "UPDATE hostname_ip_resolutions
-                 SET freshness_state = 'stale_usable'
-                 WHERE freshness_state = 'fresh'
-                   AND (active_revision_id IS NULL OR active_revision_id != ?1)",
-                params![new_active_revision_id],
-            )
-            .map_err(db_err)?;
-        Ok(rows as u64)
-    }
-
     // ── Maintenance ───────────────────────────────────────────────────────────
 
     fn cleanup_expired(
@@ -811,8 +775,14 @@ impl CacheRepository for SqliteCacheStore {
         let batch = policy.batch_size as i64;
         let neg_cutoff_ms = now_ms - policy.max_negative_cache_age_secs as i64 * 1_000;
         let evt_cutoff_ms = now_ms - policy.max_lookup_event_age_secs as i64 * 1_000;
+        let tenant_cutoff_ms = now_ms - policy.max_shared_ip_direct_host_age_secs as i64 * 1_000;
 
-        let (expired_resolutions_removed, negative_cache_entries_removed, lookup_events_removed) = {
+        let (
+            expired_resolutions_removed,
+            negative_cache_entries_removed,
+            lookup_events_removed,
+            shared_ip_direct_hosts_removed,
+        ) = {
             let mut conn = self.conn.borrow_mut();
             let tx = conn.transaction().map_err(db_err)?;
 
@@ -886,12 +856,23 @@ impl CacheRepository for SqliteCacheStore {
             )
             .map_err(db_err)?;
 
+            let shared_ip_direct_hosts_removed: u64 = tx
+                .execute(
+                    "DELETE FROM shared_ip_direct_hosts WHERE rowid IN (
+                         SELECT rowid FROM shared_ip_direct_hosts
+                         WHERE last_seen < ?1
+                         LIMIT ?2)",
+                    params![tenant_cutoff_ms, batch],
+                )
+                .map_err(db_err)? as u64;
+
             tx.commit().map_err(db_err)?;
 
             (
                 expired_resolutions_removed,
                 negative_cache_entries_removed,
                 lookup_events_removed,
+                shared_ip_direct_hosts_removed,
             )
             // `conn` (borrow_mut) is dropped here, before periodic_vacuum borrows immutably.
         };
@@ -906,6 +887,7 @@ impl CacheRepository for SqliteCacheStore {
             expired_resolutions_removed,
             negative_cache_entries_removed,
             lookup_events_removed,
+            shared_ip_direct_hosts_removed,
             vacuumed,
         })
     }
@@ -928,6 +910,9 @@ impl CacheRepository for SqliteCacheStore {
         let lookup_events_removed: u64 = tx
             .execute("DELETE FROM lookup_events", [])
             .map_err(db_err)? as u64;
+        let shared_ip_direct_hosts_removed: u64 = tx
+            .execute("DELETE FROM shared_ip_direct_hosts", [])
+            .map_err(db_err)? as u64;
 
         // Update metadata singleton (may not yet exist on very first clear).
         tx.execute(
@@ -947,6 +932,7 @@ impl CacheRepository for SqliteCacheStore {
             resolutions_removed,
             negative_cache_removed,
             lookup_events_removed,
+            shared_ip_direct_hosts_removed,
             completed_at: SystemTime::now(),
         })
     }
@@ -1165,7 +1151,6 @@ pub struct SqliteStateStore {
     signing_key: Option<Vec<u8>>,
 }
 
-mod health;
 mod state_store;
 // ── Private helpers ───────────────────────────────────────────────────────────
 
@@ -1243,14 +1228,13 @@ fn effective_freshness(
     }
 }
 
-/// Selects the best IP from resolved cache entries for ExactIp matching.
-///
-/// Preference order: Fresh > StaleUsable; Dns/ManualRefresh > ObservedFromTraffic.
-fn select_best_ip(
+/// The usable entry `ExactIp` matching and explain both report: freshness
+/// first, then the user's cache-priority strategy on the source.
+pub(crate) fn best_usable_entry(
     entries: &[CachedIpEntry],
     strategy: CachePriorityStrategy,
-) -> Option<ResolvedAddressEntry> {
-    let best = entries
+) -> Option<&CachedIpEntry> {
+    entries
         .iter()
         .filter(|e| e.cache_state.is_usable_for_matching())
         .max_by_key(|e| {
@@ -1259,14 +1243,15 @@ fn select_best_ip(
                 CacheEntryState::StaleUsable => 1,
                 _ => 0,
             };
-            // Freshness dominates; the user's cache-priority strategy decides
-            // the source tie-break. `FreshestFirst` (default) reproduces the
-            // pre-0719 ordering.
-            let s = strategy.selection_rank(&e.source);
-            (f, s)
-        });
+            (f, strategy.selection_rank(&e.source))
+        })
+}
 
-    best.map(|e| ResolvedAddressEntry {
+fn select_best_ip(
+    entries: &[CachedIpEntry],
+    strategy: CachePriorityStrategy,
+) -> Option<ResolvedAddressEntry> {
+    best_usable_entry(entries, strategy).map(|e| ResolvedAddressEntry {
         addr: e.addr,
         cache_state: e.cache_state.clone(),
         source: e.source.to_lookup_source(),
@@ -1302,27 +1287,6 @@ fn best_source_of(
         .iter()
         .max_by_key(|e| strategy.report_rank(&e.source))
         .map(|e| e.source.clone())
-}
-
-/// Converts an `IntegrityCheckResult` to a `(result_text, detail)` pair for
-/// storage in `integrity_log`.
-fn integrity_result_text(result: &IntegrityCheckResult) -> (&'static str, Option<String>) {
-    match result {
-        IntegrityCheckResult::Ok => ("ok", None),
-        IntegrityCheckResult::OkNoRollbackTarget => ("ok", Some("no rollback target".to_string())),
-        IntegrityCheckResult::CacheCorruptRebuildable => ("cache_corrupt", None),
-        IntegrityCheckResult::PolicyIntegrityFailed { details } => {
-            ("policy_failed", Some(details.clone()))
-        }
-        IntegrityCheckResult::UnsupportedSchemaVersion {
-            found,
-            max_supported,
-        } => (
-            "unsupported",
-            Some(format!("found={found} max={max_supported}")),
-        ),
-        IntegrityCheckResult::StorageUnavailable(msg) => ("unavailable", Some(msg.clone())),
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

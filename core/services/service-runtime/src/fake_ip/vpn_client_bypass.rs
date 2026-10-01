@@ -145,7 +145,7 @@ mod tests {
     use super::*;
     use nrr_platform_api::MockFlowOwnerLookup;
 
-    const VPN_CLIENT: &str = r"C:\Program Files\SwiftVPN 3.0\swiftvpn 3.0.exe";
+    const VPN_CLIENT: &str = r"C:\Program Files\ExampleVPN 3.0\examplevpn 3.0.exe";
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().expect("addr")
@@ -163,7 +163,7 @@ mod tests {
         let client = addr("10.88.1.41:51000");
         let fake = addr("198.18.0.7:443");
         let owner = MockFlowOwnerLookup::new();
-        owner.set_owner(client, fake, "swiftvpn 3.0.exe");
+        owner.set_owner(client, fake, "examplevpn 3.0.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
 
@@ -229,7 +229,7 @@ mod tests {
         let client = addr("10.88.1.41:51005");
         let fake = addr("198.18.0.12:443");
         let owner = MockFlowOwnerLookup::new();
-        owner.set_owner(client, fake, "swiftvpn 3.0.exe");
+        owner.set_owner(client, fake, "examplevpn 3.0.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
         // A very long floor makes the second call deterministically declined.

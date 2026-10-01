@@ -145,6 +145,11 @@ Dialog {
             for (var i = 0; i < signal.executables.length; i += 1) names.push(String(signal.executables[i]))
             text = text.replace("{executables}", names.join(", "))
         }
+        if (signal.rules !== undefined) {
+            var values = []
+            for (var j = 0; j < signal.rules.length; j += 1) values.push(String(signal.rules[j]))
+            text = text.replace("{rules}", values.join(", "))
+        }
         return text
     }
 
@@ -163,6 +168,19 @@ Dialog {
     function _count(key) {
         var list = summary && summary[key]
         return list && typeof list.length === "number" ? list.length : 0
+    }
+
+    /// Where the change came from, as the service labels the request. Empty
+    /// for kinds that have no channel to name.
+    function provenanceText() {
+        var slug = summary && summary.provenance ? String(summary.provenance) : ""
+        if (slug === "gui-rules-edit")
+            return tr("dialog.review-diff.provenance.gui-rules-edit",
+                "Source: rules edited in this app.")
+        if (slug === "preset-import")
+            return tr("dialog.review-diff.provenance.preset-import",
+                "Source: an imported rules file.")
+        return ""
     }
 
     function diffSummaryText() {
@@ -288,6 +306,18 @@ Dialog {
             }
         }
 
+        Label {
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            visible: text !== ""
+            text: root.provenanceText()
+            wrapMode: Text.Wrap
+            font.pixelSize: 12
+            color: root.ownerRoot ? root.ownerRoot.mutedTextColor : palette.text
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+
         // ── Risk signals ─────────────────────────────────────────
         Label {
             text: root.tr("dialog.review-diff.signals-heading", "Detected signals")
@@ -395,7 +425,7 @@ Dialog {
                     theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                     text: root.ownerRoot
                         ? root.ownerRoot.routeLabel("secondary")
-                        : root.tr("label.secondary", "Secondary")
+                        : root.tr("label.secondary", "Additional")
                     onClicked: root.duplicateResolved(
                         String(modelData["primary-rule-id"] || ""),
                         String(modelData["secondary-rule-id"] || ""),
@@ -456,8 +486,7 @@ Dialog {
         // or any other unknown section, the wire field
         // `extended-sections` lists them. The server currently always
         // returns empty (active revision doesn't persist unknown
-        // sections — see project_block16_14_a_complete landmine #4),
-        // so this block stays hidden until a future
+        // sections), so this block stays hidden until a future
         // schema-bump adds an `unknown_sections_json` column.
         ColumnLayout {
             Layout.fillWidth: true
@@ -549,8 +578,8 @@ Dialog {
                 id: cancelButton
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 text: root.readOnly
-                    ? root.tr("dialog.review-diff.close", "Close")
-                    : root.tr("dialog.review-diff.cancel", "Cancel")
+                    ? root.tr("action.close", "Close")
+                    : root.tr("action.cancel", "Cancel")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: root.readOnly

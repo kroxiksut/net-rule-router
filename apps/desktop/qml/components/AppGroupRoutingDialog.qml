@@ -477,8 +477,8 @@ Window {
                         wrapMode: Text.WordWrap
                         color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
                         text: root.tr("app-groups.p2p-note",
-                            "These programs are not blocked unless emergency block "
-                            + "(kill switch) is on. The assigned route applies to their "
+                            "These programs are not blocked unless leak protection "
+                            + "is on. The assigned route applies to their "
                             + "bulk connections; their peers are not added to zone rules.")
                     }
                     Repeater {
@@ -515,7 +515,7 @@ Window {
             Item { Layout.fillWidth: true }
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("app-groups.cancel", "Cancel")
+                text: root.tr("action.cancel", "Cancel")
                 onClicked: {
                     root.close()
                     root.skipped()

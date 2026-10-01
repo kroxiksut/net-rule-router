@@ -40,7 +40,7 @@ fn the_catch_all_spares_what_its_twin_spares() {
     let direct = Ipv4Addr::new(203, 0, 113, 40);
     let primary = Ipv4Addr::new(198, 51, 100, 50);
     let exemptions = FailClosedExemptions {
-        bootstrap_server_ips: vec![Ipv4Addr::new(9, 9, 9, 9)],
+        bootstrap_server_ips: vec![Ipv4Addr::new(198, 51, 100, 9)],
         bootstrap_server_ips_v6: Vec::new(),
         local_subnets: Vec::new(),
         local_subnets_v6: Vec::new(),
@@ -209,7 +209,7 @@ fn zero_luid_disables_kill_switch() {
 fn single_destination_emits_ale_pair_plus_packet_pair() {
     // All protocols: 1 dest → ALE permit+block (TCP/UDP) + one packet
     // egress-permit + block per NAMED packet protocol (ICMP/IGMP/GRE/ESP;
-    // 16.HW-0716: "Other" no longer adds an agnostic pair) = 2 + 4×2 = 10.
+    // "Other" no longer adds an agnostic pair) = 2 + 4×2 = 10.
     let out = kill_switch_filters(
         "S",
         &v4_pins([ip(203, 0, 113, 5)]),
@@ -249,7 +249,7 @@ fn single_destination_emits_ale_pair_plus_packet_pair() {
         .iter()
         .any(|f| f.action == WfpAction::Permit && f.local_interface_luid == Some(LUID)));
     assert!(pkt.iter().any(|f| f.action == WfpAction::Block));
-    // 16.HW-0716 — every packet filter is narrowed to a named protocol;
+    // Every packet filter is narrowed to a named protocol;
     // the protocol-agnostic block-all is gone.
     assert!(pkt.iter().all(|f| f.ip_protocol.is_some()));
 }
@@ -266,7 +266,7 @@ fn icmp_only_emits_packet_pair_no_ale() {
         esp: false,
         other: false,
     };
-    let out = kill_switch_filters("S", &v4_pins([ip(8, 8, 8, 8)]), LUID, protos);
+    let out = kill_switch_filters("S", &v4_pins([ip(198, 51, 100, 8)]), LUID, protos);
     // No ALE pair (no TCP/UDP selected) — only the ICMP packet pair.
     assert_eq!(out.len(), 2);
     assert!(out
@@ -284,7 +284,7 @@ fn icmp_only_emits_packet_pair_no_ale() {
 fn ale_permit_outranks_ale_block_outranks_rule_band() {
     let out = kill_switch_filters(
         "S",
-        &v4_pins([ip(8, 8, 8, 8)]),
+        &v4_pins([ip(198, 51, 100, 8)]),
         LUID,
         KillSwitchProtocols::ALL,
     );
@@ -295,6 +295,20 @@ fn ale_permit_outranks_ale_block_outranks_rule_band() {
         block.weight > RULE_PRIMARY_BAND,
         "kill-switch block must outrank the rule primary band"
     );
+}
+
+/// The shared validity rule and the codegen agree on which masks block
+/// something, so no accepted mask arms a block that cuts nothing.
+#[test]
+fn a_valid_protocol_mask_is_exactly_one_the_codegen_enforces() {
+    for bits in 0..=nrr_shared::ipc_payloads::KILL_SWITCH_PROTOCOLS_ALL {
+        let p = KillSwitchProtocols::from_bits(bits);
+        assert_eq!(
+            nrr_shared::ipc_payloads::is_valid_kill_switch_protocols(bits),
+            p.wants_ale_block() || p.wants_packet_layer(),
+            "{bits:#x}"
+        );
+    }
 }
 
 // ── Fixtures shared by more than one theme ───────────────────────────────

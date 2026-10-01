@@ -42,7 +42,7 @@
 //! | IPv4-mapped IPv6 address | IPv4                    | Yes      |
 //! | `C:\path\chrome.exe`     | `chrome.exe`            | Yes      |
 //! | `chrome` in `--- Windows` | `chrome.exe`           | Yes      |
-//! | `Telegram` in `--- Linux` | `telegram`             | No       |
+//! | `Messenger` in `--- Linux`| `messenger`            | No       |
 //! | Duplicate rule (same set)| First occurrence kept   | Yes      |
 //!
 //! # Discarded after canonicalization
@@ -186,10 +186,18 @@ pub fn canonicalize_preset_rules(
         }
         crate::validation::ValidationOutcome::Rejected { errors, warnings } => {
             // Filter out any stub-binding errors — they can never fire with our
-            // well-formed stub, but be defensive.
+            // well-formed stub, but be defensive. Anything else refuses the
+            // file: reading a refusal as "accepted, empty" would turn every
+            // service rule into a removal.
             let rule_errors: Vec<_> = errors
                 .into_iter()
-                .filter(|e| e.rule_id().is_some())
+                .filter(|e| {
+                    !matches!(
+                        e,
+                        ValidationError::MissingPrimaryBinding
+                            | ValidationError::SameAdapterBoundToBothRoles { .. }
+                    )
+                })
                 .collect();
 
             if rule_errors.is_empty() {
@@ -489,7 +497,7 @@ mod tests {
             (HostPlatform::MacOS, "MacOS"),
         ] {
             let parsed = parse_rules_file(&format!(
-                "--- {section}\ntelegram-desktop\nsignal-desktop\ncodex*\n--- Windows\nbrowser\n"
+                "--- {section}\nmessenger-desktop\nchat-desktop\ncodex*\n--- Windows\nbrowser\n"
             ));
             let outcome = canonicalize_preset_rules(&parsed, RouteRole::Secondary, platform, false);
             assert!(
@@ -501,7 +509,7 @@ mod tests {
             values.sort();
             assert_eq!(
                 values,
-                ["codex*", "signal-desktop", "telegram-desktop"],
+                ["chat-desktop", "codex*", "messenger-desktop"],
                 "{platform:?}"
             );
         }
@@ -555,16 +563,22 @@ mod tests {
         assert!(set.is_empty());
     }
 
-    // ── Blocking semantic errors ──────────────────────────────────────────────
+    // ── Discarded: refused-outright rows ──────────────────────────────────────
 
+    /// A bare `*` glob is refused the same way a no-destination address is:
+    /// dropped with a warning, not a whole-file rejection.
     #[test]
-    fn bare_glob_star_is_rejected() {
+    fn bare_glob_star_is_dropped_with_a_warning() {
         let outcome = canonicalize("--- Windows\n*\n", RouteRole::Primary);
-        assert!(matches!(
-            outcome,
-            PresetRulesCanonicalizeOutcome::Rejected { .. }
-        ));
+        assert!(outcome.is_accepted());
+        assert_eq!(outcome.rule_set().unwrap().len(), 0);
+        assert!(outcome
+            .warnings()
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::AppPatternRefusedDropped { value, .. } if value == "*")));
     }
+
+    // ── Blocking semantic errors ──────────────────────────────────────────────
 
     #[test]
     fn an_ipv6_address_is_an_exact_ip_rule() {
@@ -576,6 +590,33 @@ mod tests {
                 std::net::IpAddr::V6(_)
             ))
         ));
+    }
+
+    /// The IP section holds addresses only: a name there is an error, never
+    /// silently a domain rule.
+    #[test]
+    fn a_name_in_the_ip_section_is_refused() {
+        for value in ["abc.def", "example.com", "192.168.1.0/24"] {
+            let outcome = canonicalize(
+                &format!(
+                    "--- IP
+{value}
+"
+                ),
+                RouteRole::Primary,
+            );
+            match outcome {
+                PresetRulesCanonicalizeOutcome::Rejected { errors } => assert!(
+                    errors.iter().all(|e| matches!(
+                        e,
+                        ValidationError::InvalidIpAddress { .. }
+                            | ValidationError::CidrNotSupported { .. }
+                    )),
+                    "{value}: {errors:?}"
+                ),
+                other => panic!("{value}: accepted as {other:?}"),
+            }
+        }
     }
 
     // ── `include_child_processes` propagation ─────────────────────────────────
@@ -600,5 +641,26 @@ mod tests {
 
         assert_eq!(icp_value(&with_icp), Some(true));
         assert_eq!(icp_value(&without_icp), Some(false));
+    }
+
+    /// A refusal that is not about a rule must still refuse the file: read as
+    /// "accepted, empty", a linked file past the cap would merge as the removal
+    /// of every rule the service holds.
+    #[test]
+    fn a_file_past_the_rule_cap_is_refused_not_read_as_empty() {
+        let cap = nrr_shared::rules_json::FREE_MAX_RULES;
+        let text = |n: usize| {
+            let mut text = String::from("--- Domains\n");
+            for i in 0..n {
+                text.push_str(&format!("h{i}.test\n"));
+            }
+            text
+        };
+        assert!(canonicalize(&text(cap), RouteRole::Primary).is_accepted());
+        assert!(matches!(
+            canonicalize(&text(cap + 1), RouteRole::Primary),
+            PresetRulesCanonicalizeOutcome::Rejected { errors }
+                if matches!(errors.as_slice(), [ValidationError::TooManyRules { .. }])
+        ));
     }
 }

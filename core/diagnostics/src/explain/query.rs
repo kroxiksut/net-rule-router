@@ -110,8 +110,6 @@ pub enum ExplainDataAvailability {
     Available,
     /// The requested decision id was not found (may have expired or never existed).
     DecisionNotFound,
-    /// The requested detail level requires diagnostic mode to be enabled.
-    DiagnosticModeRequired,
     /// Cache/lookup metadata is unavailable for the lookup section.
     LookupUnavailable,
     /// The service is not running; explain is not available.
@@ -130,7 +128,6 @@ impl ExplainDataAvailability {
         match self {
             Self::Available => "diag.explain.availability.available",
             Self::DecisionNotFound => "diag.explain.availability.decision-not-found",
-            Self::DiagnosticModeRequired => "diag.explain.availability.diagnostic-mode-required",
             Self::LookupUnavailable => "diag.explain.availability.lookup-unavailable",
             Self::ServiceUnavailable => "diag.explain.availability.service-unavailable",
         }
@@ -164,10 +161,10 @@ mod tests {
     fn runtime_input_sample_builder() {
         let s = RuntimeInputSample::new()
             .with_hostname("example.com")
-            .with_ip("1.2.3.4")
+            .with_ip("192.0.2.4")
             .with_process("chrome.exe");
         assert_eq!(s.hostname.as_deref(), Some("example.com"));
-        assert_eq!(s.observed_ip.as_deref(), Some("1.2.3.4"));
+        assert_eq!(s.observed_ip.as_deref(), Some("192.0.2.4"));
         assert_eq!(s.process_name.as_deref(), Some("chrome.exe"));
     }
 
@@ -185,10 +182,6 @@ mod tests {
         assert_eq!(
             ExplainDataAvailability::DecisionNotFound.ui_key(),
             "diag.explain.availability.decision-not-found"
-        );
-        assert_eq!(
-            ExplainDataAvailability::DiagnosticModeRequired.ui_key(),
-            "diag.explain.availability.diagnostic-mode-required"
         );
         assert_eq!(
             ExplainDataAvailability::LookupUnavailable.ui_key(),

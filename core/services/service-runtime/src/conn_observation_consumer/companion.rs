@@ -61,8 +61,6 @@ impl ConnectionObservationConsumer {
 
     /// Which program opened this connection, for the application measure: the
     /// stack's resends and closes carry only a pid, and by then it may be gone.
-    /// The operating system's own programs, tunnel clients and peer-to-peer
-    /// programs are never offered, so they are not remembered.
     pub(super) fn remember_program(&self, rec: &super::ConnectionTraceRecord, at_ms: u64) {
         const MAX_REMEMBERED: usize = 4096;
         const REMEMBERED_MS: u64 = 120_000;
@@ -72,10 +70,7 @@ impl ConnectionObservationConsumer {
         let Some(path) = rec.process_path.as_deref() else {
             return;
         };
-        if nrr_domain::app_offer::is_os_program(path)
-            || super::connection_facts::process_name_matches_vpn(Some(path))
-            || super::connection_facts::process_is_peer_to_peer(Some(path))
-        {
+        if !super::connection_facts::offerable_program(path) {
             return;
         }
         let program = nrr_domain::app_offer::program_name(path);
@@ -95,9 +90,9 @@ impl ConnectionObservationConsumer {
         programs.insert((rec.local, rec.remote), (program, at_ms));
     }
 
-    /// A connection that left over the additional link, attributed to its
-    /// program. Tunnel clients and the OS's own programs are skipped, as they
-    /// are never offered.
+    /// A connection the stack established over the additional link, attributed
+    /// to its program. The caller passes only establishments: a drop or a
+    /// filter classify carried nothing, so it says nothing about a split.
     pub(super) fn note_app_additional_link(&self, rec: &super::ConnectionTraceRecord) {
         let Some(sink) = self.app_additional_link.as_ref() else {
             return;
@@ -105,9 +100,7 @@ impl ConnectionObservationConsumer {
         let Some(path) = rec.process_path.as_deref() else {
             return;
         };
-        if nrr_domain::app_offer::is_os_program(path)
-            || super::connection_facts::process_name_matches_vpn(Some(path))
-        {
+        if !super::connection_facts::offerable_program(path) {
             return;
         }
         let program = nrr_domain::app_offer::program_name(path);

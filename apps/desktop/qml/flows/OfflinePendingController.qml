@@ -38,20 +38,18 @@ QtObject {
     }
 
     function _offlineProtocolsLabel(mask) {
-        var m = (mask | 0) & 0x7F
-        if (m === 0x7F) return root.tr("dialog.offline-pending.protocols-all", "All protocols")
+        var m = (mask | 0) & 0x3F
+        if (m === 0x3F) return root.tr("dialog.offline-pending.protocols-all", "All protocols")
         if (m === 0) return root.tr("dialog.offline-pending.protocols-none", "None")
         var defs = [
             { bit: 1, slug: "tcp" }, { bit: 2, slug: "udp" }, { bit: 4, slug: "icmp" },
-            { bit: 8, slug: "igmp" }, { bit: 16, slug: "gre" }, { bit: 32, slug: "esp" },
-            { bit: 64, slug: "other" }
+            { bit: 8, slug: "igmp" }, { bit: 16, slug: "gre" }, { bit: 32, slug: "esp" }
         ]
         var names = []
         for (var i = 0; i < defs.length; i += 1) {
             if ((m & defs[i].bit) !== 0) {
                 names.push(root.tr("settings.routing.kill-switch.protocols." + defs[i].slug,
-                    defs[i].slug === "icmp" ? "ICMP (ping)"
-                        : (defs[i].slug === "other" ? "Other" : defs[i].slug.toUpperCase())))
+                    defs[i].slug === "icmp" ? "ICMP (ping)" : defs[i].slug.toUpperCase()))
             }
         }
         return names.join(", ")
@@ -66,7 +64,7 @@ QtObject {
             case "block-secondary-when-unavailable":
                 return root.tr("settings.routing.kill-switch.title", "Leak protection")
             case "kill-switch-enabled":
-                return root.tr("settings.routing.kill-switch.enable-label", "Enable the kill-switch")
+                return root.tr("settings.routing.kill-switch.enable-label", "Enable leak protection")
             case "kill-switch-fail-closed":
                 return root.tr("settings.routing.kill-switch.failure-mode.label",
                     "If the additional adapter can't be found")
@@ -116,13 +114,13 @@ QtObject {
             case "enforcement-mode":
                 return root.tr("settings.routing.enforcement-mode.label", "How routed traffic is enforced")
             case "secondary-liveness-window-secs":
-                return root.tr("settings.routing.liveness-window.label", "Secondary tunnel liveness window")
+                return root.tr("settings.routing.liveness-window.label", "Additional tunnel liveness window")
             case "rule-scope-service-driven":
                 return root.tr("settings.diagnostics.rule-scope.heading", "When routing rules are enforced")
             case "routing-stop-policy":
                 return root.tr("settings.diagnostics.routing-stop.heading",
                     "When routing is paused or the service stops")
-            case "verbose-logging":
+            case "verbose-logging-change":
                 return root.tr("settings.diagnostics.service-stability.verbose.label",
                     "Verbose service logging")
             case "conn-trace-ndjson":
@@ -179,6 +177,9 @@ QtObject {
             case "cache-refresh-interval-secs":
                 return String(Math.round((value | 0) / 60)) + " "
                     + root.tr("settings.diagnostics.cache-refresh.unit", "min")
+            case "verbose-logging-change":
+                return root.tr("settings.diagnostics.service-stability.verbose.option-" + String(value),
+                    String(value))
             case "ipc-accept-policy": {
                 var kind = String((value && (value["kind"] || value.kind)) || "recoverable")
                 return (kind === "critical")

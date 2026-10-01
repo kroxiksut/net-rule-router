@@ -3,9 +3,8 @@
 //! # Data flow
 //!
 //! 1. [`compute_diff`]`(prev, candidate)` → [`StructuralDiff`]
-//! 2. [`StructuralDiff::to_revision_summary`] → [`RevisionDiffSummary`] (stored on [`PolicyRevision`])
-//! 3. [`StructuralDiff::to_review_summary`] → [`ReviewSummary`] (shown in the review UI)
-//! 4. [`check_confirmation`]`(token, ...)` → [`ConfirmationResult`]
+//! 2. [`StructuralDiff::to_review_summary`] → [`ReviewSummary`] (shown in the review UI)
+//! 3. [`check_confirmation`]`(token, ...)` → [`ConfirmationResult`]
 //!
 //! [`StructuralDiff`] is the machine-level representation: every per-rule change
 //! is enumerated and preserved for audit/debug purposes. [`ReviewSummary`] is the
@@ -24,11 +23,11 @@
 //! - A different candidate is now pending → [`ConfirmationResult::Superseded`]:
 //!   the reviewed candidate was displaced and cannot be confirmed.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::{
     canonical::{CanonicalAddressMatch, CanonicalProfile, CanonicalRule},
-    revision::{ContentHash, RevisionDiffSummary, RevisionId, UnixTimestamp},
+    revision::{ContentHash, RevisionId, UnixTimestamp},
     RouteBehaviorMode, RouteRole, RuleId,
 };
 
@@ -67,12 +66,15 @@ pub enum RuleChange {
 }
 
 impl RuleChange {
+    #[cfg(test)]
     fn is_added(&self) -> bool {
         matches!(self, Self::Added { .. })
     }
+    #[cfg(test)]
     fn is_removed(&self) -> bool {
         matches!(self, Self::Removed { .. })
     }
+    #[cfg(test)]
     fn is_modified_or_retargeted(&self) -> bool {
         matches!(self, Self::Modified { .. } | Self::Retargeted { .. })
     }
@@ -119,8 +121,7 @@ impl RuleChange {
 /// within each group.
 ///
 /// Produce with [`compute_diff`]. Convert to the presentation layer with
-/// [`to_review_summary`](Self::to_review_summary) or to the compact revision
-/// metadata with [`to_revision_summary`](Self::to_revision_summary).
+/// [`to_review_summary`](Self::to_review_summary).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructuralDiff {
     /// At least one route adapter binding (primary or secondary) changed.
@@ -161,23 +162,6 @@ impl StructuralDiff {
     /// via content-hash comparison, but this helper guards against accidents.
     pub fn is_empty(&self) -> bool {
         !self.binding_changed && !self.behavior_mode_changed && self.rule_changes.is_empty()
-    }
-
-    /// Converts this diff to the compact [`RevisionDiffSummary`] stored on
-    /// [`PolicyRevision`](crate::revision::PolicyRevision).
-    pub fn to_revision_summary(&self) -> RevisionDiffSummary {
-        RevisionDiffSummary {
-            changed_interface_bindings: self.binding_changed,
-            changed_default_behavior: self.behavior_mode_changed,
-            changed_rules: !self.rule_changes.is_empty(),
-            rules_added: self.rule_changes.iter().filter(|c| c.is_added()).count() as u32,
-            rules_removed: self.rule_changes.iter().filter(|c| c.is_removed()).count() as u32,
-            rules_modified: self
-                .rule_changes
-                .iter()
-                .filter(|c| c.is_modified_or_retargeted())
-                .count() as u32,
-        }
     }
 
     /// Converts this diff to the user-facing [`ReviewSummary`] for the review UI.
@@ -427,8 +411,8 @@ pub fn compute_diff(
 
     let RuleChanges {
         mut changes,
-        prev_distinct,
-        next_distinct,
+        prev_rules,
+        next_rules,
     } = compute_rule_changes(prev, candidate);
     let rule_changes = &mut changes;
     rule_changes.sort_by(|a, b| {
@@ -438,13 +422,10 @@ pub fn compute_diff(
             .then_with(|| a.rule_id().0.as_str().cmp(b.rule_id().0.as_str()))
     });
 
-    // Counted the same way `rule_changes` is — by distinct rule identity, not by
-    // raw set length. The risk scorer divides one by the other, and a book with
-    // two copies of a rule inflated the denominator only, so a removal that
-    // cleared half the rules scored below the threshold and the warning the
-    // user needed never appeared.
-    let prev_total_rules = prev_distinct as u32;
-    let next_total_rules = next_distinct as u32;
+    // Counted the way `rule_changes` is — every rule accounts for itself — so
+    // the risk scorer's removal ratio divides like by like.
+    let prev_total_rules = prev_rules as u32;
+    let next_total_rules = next_rules as u32;
 
     let overlapping_apexes = collect_overlapping_apexes(candidate, rule_changes);
     let rule_changes = changes;
@@ -544,6 +525,9 @@ fn collect_overlapping_apexes(candidate: &CanonicalProfile, changes: &[RuleChang
 /// route role is *not* part of the key so that moving a rule between
 /// routes surfaces as `Retargeted` rather than Removed+Added.
 ///
+/// It names a group, not a rule: `x` and `x +block` share it, and
+/// [`pair_identity_group`] decides which rule of the group is which.
+///
 /// `{:?}` over the two match `Option`s is a faithful, deterministic
 /// content key: `CanonicalAddressMatch` / `CanonicalAppMatch` derive
 /// `Eq`, so equal debug output ⟺ equal value within this crate.
@@ -592,84 +576,143 @@ pub(crate) fn rule_attributes_differ(prev: &CanonicalRule, next: &CanonicalRule)
     prev.enabled != next.enabled || prev.comment != next.comment || prev.action != next.action
 }
 
-fn build_identity_map(
-    profile: Option<&CanonicalProfile>,
-) -> HashMap<String, (CanonicalRule, RouteRole)> {
-    profile
-        .map(|p| {
-            p.rule_book
-                .primary
-                .rules()
-                .iter()
-                .map(|r| (rule_identity_key(r), (r.clone(), RouteRole::Primary)))
-                .chain(
-                    p.rule_book
-                        .secondary
-                        .rules()
-                        .iter()
-                        .map(|r| (rule_identity_key(r), (r.clone(), RouteRole::Secondary))),
-                )
-                .collect()
-        })
-        .unwrap_or_default()
+/// Pairs the rules of one identity group (same [`rule_identity_key`]) across
+/// two books; returns `(left, right)` indexes, `None` where a rule has no
+/// counterpart.
+///
+/// A group can hold several rules — `x` next to `x +block`, or `x` next to
+/// `*.x` under coverage — and each must survive as itself. The closest pair is
+/// taken first: the same [`MatchKey`](crate::validation::MatchKey), then the
+/// same route, action and enabled state, in that order. A group of one on each
+/// side always pairs, which is what keeps a toggle a `Modified` rather than an
+/// `Added` plus a `Removed`.
+pub(crate) fn pair_identity_group(
+    left: &[(&CanonicalRule, RouteRole)],
+    right: &[(&CanonicalRule, RouteRole)],
+) -> Vec<(Option<usize>, Option<usize>)> {
+    use crate::validation::MatchKey;
+    let affinity = |(l, lr): (&CanonicalRule, RouteRole), (r, rr): (&CanonicalRule, RouteRole)| {
+        (u8::from(MatchKey::from_rule(l) == MatchKey::from_rule(r)) << 3)
+            | (u8::from(lr == rr) << 2)
+            | (u8::from(l.action == r.action) << 1)
+            | u8::from(l.enabled == r.enabled)
+    };
+
+    let mut left_free = vec![true; left.len()];
+    let mut right_free = vec![true; right.len()];
+    let mut pairs = Vec::with_capacity(left.len().max(right.len()));
+    loop {
+        let mut best: Option<(u8, usize, usize)> = None;
+        for (i, l) in left.iter().enumerate().filter(|(i, _)| left_free[*i]) {
+            for (j, r) in right.iter().enumerate().filter(|(j, _)| right_free[*j]) {
+                let score = affinity(*l, *r);
+                if best.is_none_or(|(top, _, _)| score > top) {
+                    best = Some((score, i, j));
+                }
+            }
+        }
+        let Some((_, i, j)) = best else { break };
+        left_free[i] = false;
+        right_free[j] = false;
+        pairs.push((Some(i), Some(j)));
+    }
+    pairs.sort_unstable();
+    pairs.extend(
+        (0..left.len())
+            .filter(|i| left_free[*i])
+            .map(|i| (Some(i), None)),
+    );
+    pairs.extend(
+        (0..right.len())
+            .filter(|j| right_free[*j])
+            .map(|j| (None, Some(j))),
+    );
+    pairs
 }
 
-/// The diff, plus the two counts it was computed over. They travel together
-/// because the risk scorer forms a ratio out of them: taken from anywhere else
-/// the numerator and the denominator count different things.
+/// Every rule of a profile grouped by [`rule_identity_key`], in canonical
+/// order within each group.
+fn identity_groups(
+    profile: Option<&CanonicalProfile>,
+) -> BTreeMap<String, Vec<(&CanonicalRule, RouteRole)>> {
+    let mut groups: BTreeMap<String, Vec<(&CanonicalRule, RouteRole)>> = BTreeMap::new();
+    if let Some(p) = profile {
+        for (set, route) in [
+            (&p.rule_book.primary, RouteRole::Primary),
+            (&p.rule_book.secondary, RouteRole::Secondary),
+        ] {
+            for rule in set.rules() {
+                groups
+                    .entry(rule_identity_key(rule))
+                    .or_default()
+                    .push((rule, route));
+            }
+        }
+    }
+    groups
+}
+
+/// The diff, plus the two rule counts it was computed over. They travel
+/// together because the risk scorer forms a ratio out of them: taken from
+/// anywhere else the numerator and the denominator count different things.
 struct RuleChanges {
     changes: Vec<RuleChange>,
-    prev_distinct: usize,
-    next_distinct: usize,
+    prev_rules: usize,
+    next_rules: usize,
 }
 
 fn compute_rule_changes(
     prev: Option<&CanonicalProfile>,
     candidate: &CanonicalProfile,
 ) -> RuleChanges {
-    let prev_map = build_identity_map(prev);
-    let next_map = build_identity_map(Some(candidate));
-    let (prev_distinct, next_distinct) = (prev_map.len(), next_map.len());
+    let prev_groups = identity_groups(prev);
+    let next_groups = identity_groups(Some(candidate));
+    let count = |groups: &BTreeMap<String, Vec<_>>| groups.values().map(Vec::len).sum();
+    let (prev_rules, next_rules) = (count(&prev_groups), count(&next_groups));
+
+    let mut keys: Vec<&String> = prev_groups.keys().chain(next_groups.keys()).collect();
+    keys.sort();
+    keys.dedup();
 
     let mut changes = Vec::new();
-
-    for (key, (next_rule, next_route)) in &next_map {
-        match prev_map.get(key) {
-            None => changes.push(RuleChange::Added {
-                rule: next_rule.clone(),
-                route: *next_route,
-            }),
-            Some((_prev_rule, prev_route)) if prev_route != next_route => {
-                changes.push(RuleChange::Retargeted {
-                    rule: next_rule.clone(),
-                    from: *prev_route,
-                    to: *next_route,
-                });
+    for key in keys {
+        let before = prev_groups.get(key).map(Vec::as_slice).unwrap_or_default();
+        let after = next_groups.get(key).map(Vec::as_slice).unwrap_or_default();
+        for pair in pair_identity_group(before, after) {
+            match pair {
+                (Some(i), Some(j)) => {
+                    let ((prev_rule, prev_route), (next_rule, next_route)) = (before[i], after[j]);
+                    if prev_route != next_route {
+                        changes.push(RuleChange::Retargeted {
+                            rule: next_rule.clone(),
+                            from: prev_route,
+                            to: next_route,
+                        });
+                    } else if rule_attributes_differ(prev_rule, next_rule) {
+                        changes.push(RuleChange::Modified {
+                            prev: prev_rule.clone(),
+                            next: next_rule.clone(),
+                            route: next_route,
+                        });
+                    }
+                }
+                (Some(i), None) => changes.push(RuleChange::Removed {
+                    rule: before[i].0.clone(),
+                    route: before[i].1,
+                }),
+                (None, Some(j)) => changes.push(RuleChange::Added {
+                    rule: after[j].0.clone(),
+                    route: after[j].1,
+                }),
+                (None, None) => {}
             }
-            Some((prev_rule, _)) if rule_attributes_differ(prev_rule, next_rule) => {
-                changes.push(RuleChange::Modified {
-                    prev: prev_rule.clone(),
-                    next: next_rule.clone(),
-                    route: *next_route,
-                });
-            }
-            Some(_) => {} // identical content + route — no change
-        }
-    }
-
-    for (key, (rule, route)) in &prev_map {
-        if !next_map.contains_key(key) {
-            changes.push(RuleChange::Removed {
-                rule: rule.clone(),
-                route: *route,
-            });
         }
     }
 
     RuleChanges {
         changes,
-        prev_distinct,
-        next_distinct,
+        prev_rules,
+        next_rules,
     }
 }
 
@@ -686,6 +729,16 @@ mod tests {
     };
 
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Added, removed, and modified-or-retargeted changes.
+    fn counts(diff: &StructuralDiff) -> (usize, usize, usize) {
+        let count = |f: fn(&RuleChange) -> bool| diff.rule_changes.iter().filter(|c| f(c)).count();
+        (
+            count(RuleChange::is_added),
+            count(RuleChange::is_removed),
+            count(RuleChange::is_modified_or_retargeted),
+        )
+    }
 
     fn fqdn_rule(id: &str, fqdn: &str) -> CanonicalRule {
         CanonicalRule {
@@ -755,12 +808,9 @@ mod tests {
 
     // ── compute_diff ─────────────────────────────────────────────────────────
 
-    /// The risk scorer divides removed entries by `prev_total_rules`. The
-    /// entries are counted by rule IDENTITY (one per match, whichever route it
-    /// sits on), so the denominator has to be counted the same way — a raw set
-    /// length counts a match named on both routes twice and shrinks the ratio,
-    /// which is precisely how a removal that cleared half the rules stayed
-    /// under the threshold and warned nobody.
+    /// The risk scorer divides removed entries by `prev_total_rules`, so both
+    /// count the same thing: rules. A copy named on the other route is a rule
+    /// of its own, and removing it is a removal.
     #[test]
     fn the_rule_totals_are_counted_the_way_the_changes_are() {
         let shared = fqdn_rule("r-1", "corp.example.com");
@@ -768,15 +818,9 @@ mod tests {
             vec![shared.clone(), fqdn_rule("r-2", "other.example.com")],
             vec![shared],
         );
-        assert_eq!(
-            prev.rule_book.primary.rules().len() + prev.rule_book.secondary.rules().len(),
-            3,
-            "three rules in the book…",
-        );
-
         let candidate = make_profile(vec![fqdn_rule("r-1", "corp.example.com")], vec![]);
         let diff = compute_diff(Some(&prev), &candidate);
-        assert_eq!(diff.prev_total_rules, 2, "…but two distinct matches");
+        assert_eq!(diff.prev_total_rules, 3);
         assert_eq!(diff.next_total_rules, 1);
 
         let removed = diff
@@ -784,11 +828,77 @@ mod tests {
             .iter()
             .filter(|c| matches!(c, RuleChange::Removed { .. }))
             .count();
-        assert_eq!(removed, 1);
-        assert!(
-            removed as u32 * 100 / diff.prev_total_rules >= 50,
-            "half the distinct rules are gone — the ratio must say so",
+        assert_eq!(removed, 2, "the other host and the secondary copy");
+        assert_eq!(diff.rule_changes.len(), 2, "the primary copy is unchanged");
+        assert!(removed as u32 * 100 / diff.prev_total_rules >= 50);
+    }
+
+    /// `x` and `x +block` are two rules; the diff used to key both on the
+    /// address and lose one of them.
+    #[test]
+    fn adding_a_block_rule_beside_a_route_rule_for_the_same_host_is_one_addition() {
+        let prev = make_profile(vec![fqdn_rule("r-1", "shop.test")], vec![]);
+        let mut block = fqdn_rule("r-2", "shop.test");
+        block.action = crate::canonical::RuleAction::Block;
+        let next = make_profile(vec![fqdn_rule("r-1", "shop.test"), block], vec![]);
+
+        let diff = compute_diff(Some(&prev), &next);
+        assert_eq!(diff.rule_changes.len(), 1, "{:?}", diff.rule_changes);
+        assert!(matches!(
+            &diff.rule_changes[0],
+            RuleChange::Added { rule, .. } if rule.action == crate::canonical::RuleAction::Block
+        ));
+
+        let back = compute_diff(Some(&next), &prev);
+        assert_eq!(back.rule_changes.len(), 1);
+        assert!(back.rule_changes[0].is_removed());
+    }
+
+    /// With two rules under one address each change lands on its own rule: a
+    /// toggled block rule is a `Modified`, and its route twin is untouched.
+    #[test]
+    fn toggling_one_of_two_rules_for_a_host_modifies_only_that_rule() {
+        let mut block = fqdn_rule("r-2", "shop.test");
+        block.action = crate::canonical::RuleAction::Block;
+        let prev = make_profile(vec![fqdn_rule("r-1", "shop.test"), block.clone()], vec![]);
+        block.enabled = false;
+        let next = make_profile(vec![fqdn_rule("r-1", "shop.test"), block], vec![]);
+
+        let diff = compute_diff(Some(&prev), &next);
+        assert_eq!(diff.rule_changes.len(), 1, "{:?}", diff.rule_changes);
+        assert!(matches!(
+            &diff.rule_changes[0],
+            RuleChange::Modified { next, .. }
+                if next.action == crate::canonical::RuleAction::Block && !next.enabled
+        ));
+    }
+
+    /// A single rule toggled between route and block is still one `Modified`,
+    /// never an `Added` plus a `Removed`.
+    #[test]
+    fn a_route_to_block_toggle_stays_a_modification() {
+        let prev = make_profile(vec![fqdn_rule("r-1", "shop.test")], vec![]);
+        let mut block = fqdn_rule("r-1", "shop.test");
+        block.action = crate::canonical::RuleAction::Block;
+        let next = make_profile(vec![block], vec![]);
+        assert_eq!(counts(&compute_diff(Some(&prev), &next)), (0, 0, 1));
+    }
+
+    /// The diff reads spellings literally: adding `*.x` next to `x` is one
+    /// addition and leaves `x` alone.
+    #[test]
+    fn adding_the_wildcard_beside_the_apex_is_one_addition() {
+        let prev = make_profile(vec![fqdn_rule("r-1", "proflcdn.test")], vec![]);
+        let next = make_profile(
+            vec![
+                fqdn_rule("r-1", "proflcdn.test"),
+                suffix_rule("r-2", "proflcdn.test"),
+            ],
+            vec![],
         );
+        let diff = compute_diff(Some(&prev), &next);
+        assert_eq!(diff.rule_changes.len(), 1);
+        assert!(diff.rule_changes[0].is_added());
     }
 
     #[test]
@@ -853,10 +963,7 @@ mod tests {
         let mut modified = fqdn_rule("r-77", "a.com");
         modified.enabled = false;
         let next = make_profile(vec![modified], vec![]);
-        let summary = compute_diff(Some(&prev), &next).to_revision_summary();
-        assert_eq!(summary.rules_modified, 1);
-        assert_eq!(summary.rules_added, 0);
-        assert_eq!(summary.rules_removed, 0);
+        assert_eq!(counts(&compute_diff(Some(&prev), &next)), (0, 0, 1));
     }
 
     #[test]
@@ -886,11 +993,7 @@ mod tests {
             vec![fqdn_rule("r-1", "a.com"), fqdn_rule("r-2", "b.com")],
             vec![],
         );
-        let diff = compute_diff(Some(&prev), &next);
-        let summary = diff.to_revision_summary();
-        assert_eq!(summary.rules_added, 1);
-        assert_eq!(summary.rules_removed, 0);
-        assert_eq!(summary.rules_modified, 0);
+        assert_eq!(counts(&compute_diff(Some(&prev), &next)), (1, 0, 0));
     }
 
     #[test]
@@ -900,11 +1003,7 @@ mod tests {
             vec![],
         );
         let next = make_profile(vec![fqdn_rule("r-1", "a.com")], vec![]);
-        let diff = compute_diff(Some(&prev), &next);
-        let summary = diff.to_revision_summary();
-        assert_eq!(summary.rules_added, 0);
-        assert_eq!(summary.rules_removed, 1);
-        assert_eq!(summary.rules_modified, 0);
+        assert_eq!(counts(&compute_diff(Some(&prev), &next)), (0, 1, 0));
     }
 
     #[test]
@@ -913,11 +1012,7 @@ mod tests {
         let mut modified = fqdn_rule("r-1", "a.com");
         modified.enabled = false; // toggle enabled state
         let next = make_profile(vec![modified], vec![]);
-        let diff = compute_diff(Some(&prev), &next);
-        let summary = diff.to_revision_summary();
-        assert_eq!(summary.rules_modified, 1);
-        assert_eq!(summary.rules_added, 0);
-        assert_eq!(summary.rules_removed, 0);
+        assert_eq!(counts(&compute_diff(Some(&prev), &next)), (0, 0, 1));
     }
 
     #[test]
@@ -925,11 +1020,7 @@ mod tests {
         let prev = make_profile(vec![fqdn_rule("r-1", "corp.example.net")], vec![]);
         let next = make_profile(vec![], vec![fqdn_rule("r-1", "corp.example.net")]);
         let diff = compute_diff(Some(&prev), &next);
-        let summary = diff.to_revision_summary();
-        // retargeted counts as modified
-        assert_eq!(summary.rules_modified, 1);
-        assert_eq!(summary.rules_added, 0);
-        assert_eq!(summary.rules_removed, 0);
+        assert_eq!(counts(&diff), (0, 0, 1));
         assert!(matches!(
             diff.rule_changes.first(),
             Some(RuleChange::Retargeted {
@@ -1014,17 +1105,6 @@ mod tests {
         };
         assert!(entry("r-on").enabled);
         assert!(!entry("r-off").enabled);
-    }
-
-    #[test]
-    fn diff_to_revision_summary_changed_rules_flag() {
-        let prev = make_profile(vec![], vec![]);
-        let next = make_profile(vec![fqdn_rule("r-1", "a.com")], vec![]);
-        let diff = compute_diff(Some(&prev), &next);
-        let summary = diff.to_revision_summary();
-        assert!(summary.changed_rules);
-        assert!(summary.changed_interface_bindings == diff.binding_changed);
-        assert!(summary.changed_default_behavior == diff.behavior_mode_changed);
     }
 
     #[test]

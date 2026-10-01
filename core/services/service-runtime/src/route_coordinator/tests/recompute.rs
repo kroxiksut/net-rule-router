@@ -6,7 +6,10 @@ fn recompute_applies_active_users_secondary_routes() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 1, 1, 1, 1), ip_rule("r2", 2, 2, 2, 2)]),
+        CanonicalRuleSet::from_rules(vec![
+            ip_rule("r1", 198, 51, 100, 1),
+            ip_rule("r2", 198, 51, 100, 2),
+        ]),
     );
     let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
 
@@ -16,7 +19,10 @@ fn recompute_applies_active_users_secondary_routes() {
     assert_eq!(delta.added, 2);
     assert_eq!(
         table_dests(&api),
-        HashSet::from([Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(2, 2, 2, 2)])
+        HashSet::from([
+            Ipv4Addr::new(198, 51, 100, 1),
+            Ipv4Addr::new(198, 51, 100, 2)
+        ])
     );
 }
 
@@ -26,11 +32,11 @@ fn switching_active_user_replaces_the_route_table() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 1, 1, 1, 1)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 198, 51, 100, 1)]),
     );
     rules.set_secondary(
         "S-PETROV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r2", 2, 2, 2, 2)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r2", 198, 51, 100, 2)]),
     );
     let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
 
@@ -39,7 +45,7 @@ fn switching_active_user_replaces_the_route_table() {
         .unwrap();
     assert_eq!(
         table_dests(&api),
-        HashSet::from([Ipv4Addr::new(1, 1, 1, 1)])
+        HashSet::from([Ipv4Addr::new(198, 51, 100, 1)])
     );
 
     // Petrov logs in (becomes active) → Ivanov's routes torn down,
@@ -49,7 +55,7 @@ fn switching_active_user_replaces_the_route_table() {
         .unwrap();
     assert_eq!(
         table_dests(&api),
-        HashSet::from([Ipv4Addr::new(2, 2, 2, 2)])
+        HashSet::from([Ipv4Addr::new(198, 51, 100, 2)])
     );
 }
 
@@ -59,7 +65,7 @@ fn no_secondary_target_tears_down_routes() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 1, 1, 1, 1)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 198, 51, 100, 1)]),
     );
     let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
     coord
@@ -95,7 +101,7 @@ fn a_baseline_edit_re_drives_routes_with_a_tray_connected() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 1, 1, 1, 1)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 198, 51, 100, 1)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &bind_id);
@@ -123,7 +129,7 @@ fn a_baseline_edit_re_drives_routes_with_a_tray_connected() {
 
     assert_eq!(
         table_dests(&api),
-        HashSet::from([Ipv4Addr::new(1, 1, 1, 1)]),
+        HashSet::from([Ipv4Addr::new(198, 51, 100, 1)]),
         "the baseline edit must reach the route table, not stop at the filters"
     );
     assert_eq!(inner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -146,7 +152,7 @@ fn recompute_active_tears_down_when_effective_sid_paused() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 1, 1, 1, 1)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 198, 51, 100, 1)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &bind_id);
@@ -167,7 +173,7 @@ fn recompute_active_tears_down_when_effective_sid_paused() {
     assert_eq!(coord.owned_count(), 1);
     assert_eq!(
         table_dests(&api),
-        HashSet::from([Ipv4Addr::new(1, 1, 1, 1)])
+        HashSet::from([Ipv4Addr::new(198, 51, 100, 1)])
     );
 
     // Pause the effective routing user (teardown policy) → the next recompute
@@ -197,7 +203,7 @@ fn recompute_active_keeps_slash32_when_paused_persist() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 1, 1, 1, 1)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 198, 51, 100, 1)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &bind_id);
@@ -227,7 +233,7 @@ fn recompute_active_keeps_slash32_when_paused_persist() {
     );
     assert_eq!(
         table_dests(&api),
-        HashSet::from([Ipv4Addr::new(1, 1, 1, 1)]),
+        HashSet::from([Ipv4Addr::new(198, 51, 100, 1)]),
         "the matched host still egresses the secondary under Persist pause"
     );
 }

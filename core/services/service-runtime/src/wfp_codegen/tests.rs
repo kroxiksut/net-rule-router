@@ -105,8 +105,8 @@ fn book(primary: Vec<CanonicalRule>, secondary: Vec<CanonicalRule>) -> Canonical
 /// other — which is how a destination ends up dead for every process.
 #[test]
 fn a_shared_address_gets_no_secondary_filter() {
-    let shared = Ipv4Addr::new(23, 10, 20, 161);
-    let only_theirs = Ipv4Addr::new(23, 10, 20, 150);
+    let shared = Ipv4Addr::new(203, 0, 113, 161);
+    let only_theirs = Ipv4Addr::new(203, 0, 113, 150);
     let cache = MockFqdnCacheLookup::new();
     cache.set_ips("translate.search.example", vec![shared]);
     cache.set_ips("docs.search.example", vec![shared, only_theirs]);
@@ -324,10 +324,13 @@ fn exact_fqdn_rule_with_cold_cache_emits_diagnostic_no_filter() {
 #[test]
 fn suffix_domain_fans_out_over_cached_subdomains_and_their_ips() {
     let cache = MockFqdnCacheLookup::new();
-    cache.set_ips("api.example.com", vec![Ipv4Addr::new(1, 1, 1, 1)]);
+    cache.set_ips("api.example.com", vec![Ipv4Addr::new(198, 51, 100, 1)]);
     cache.set_ips(
         "www.example.com",
-        vec![Ipv4Addr::new(2, 2, 2, 2), Ipv4Addr::new(2, 2, 2, 3)],
+        vec![
+            Ipv4Addr::new(198, 51, 100, 2),
+            Ipv4Addr::new(198, 51, 100, 22),
+        ],
     );
     let rule_book = book(vec![suffix_rule("r-suf", "example.com")], vec![]);
     let out = generate_filters(CodegenInput {
@@ -344,9 +347,9 @@ fn suffix_domain_fans_out_over_cached_subdomains_and_their_ips() {
     // 1 (api) + 2 (www) = 3 filters
     assert_eq!(out.filters.len(), 3);
     let ips: Vec<_> = out.filters.iter().flat_map(destination_ips).collect();
-    assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
-    assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
-    assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 3))));
+    assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))));
+    assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))));
+    assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(198, 51, 100, 22))));
 }
 
 #[test]
@@ -356,8 +359,8 @@ fn suffix_domain_fan_out_includes_the_apex() {
     // here: a matched host with no filter is exactly the silent leak apex
     // coverage exists to close.
     let cache = MockFqdnCacheLookup::new();
-    cache.set_ips("example.com", vec![Ipv4Addr::new(9, 9, 9, 9)]);
-    cache.set_ips("www.example.com", vec![Ipv4Addr::new(2, 2, 2, 2)]);
+    cache.set_ips("example.com", vec![Ipv4Addr::new(198, 51, 100, 9)]);
+    cache.set_ips("www.example.com", vec![Ipv4Addr::new(198, 51, 100, 2)]);
     let rule_book = book(vec![suffix_rule("r-suf", "example.com")], vec![]);
     let out = generate_filters(CodegenInput {
         sid: "S",
@@ -372,10 +375,10 @@ fn suffix_domain_fan_out_includes_the_apex() {
     });
     let ips: Vec<_> = out.filters.iter().flat_map(destination_ips).collect();
     assert!(
-        ips.contains(&IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))),
+        ips.contains(&IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))),
         "apex IP: {ips:?}"
     );
-    assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))));
+    assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))));
 }
 
 #[test]
@@ -383,8 +386,8 @@ fn zone_fan_out_still_excludes_the_bare_zone_label() {
     // Zone semantics are untouched: a host literally named "test" is not a
     // member of the zone "test".
     let cache = MockFqdnCacheLookup::new();
-    cache.set_ips("test", vec![Ipv4Addr::new(9, 9, 9, 9)]);
-    cache.set_ips("a.test", vec![Ipv4Addr::new(2, 2, 2, 2)]);
+    cache.set_ips("test", vec![Ipv4Addr::new(198, 51, 100, 9)]);
+    cache.set_ips("a.test", vec![Ipv4Addr::new(198, 51, 100, 2)]);
     let rule_book = book(vec![zone_rule("r-zone", "test")], vec![]);
     let out = generate_filters(CodegenInput {
         sid: "S",
@@ -398,13 +401,13 @@ fn zone_fan_out_still_excludes_the_bare_zone_label() {
         families: crate::enforcement_planner::FamilyScope::V4Only,
     });
     let ips: Vec<_> = out.filters.iter().flat_map(destination_ips).collect();
-    assert_eq!(ips, vec![Ipv4Addr::new(2, 2, 2, 2)]);
+    assert_eq!(ips, vec![Ipv4Addr::new(198, 51, 100, 2)]);
 }
 
 #[test]
 fn suffix_domain_with_only_a_cached_apex_still_emits_a_filter() {
     let cache = MockFqdnCacheLookup::new();
-    cache.set_ips("example.com", vec![Ipv4Addr::new(9, 9, 9, 9)]);
+    cache.set_ips("example.com", vec![Ipv4Addr::new(198, 51, 100, 9)]);
     let rule_book = book(vec![suffix_rule("r-suf", "example.com")], vec![]);
     let out = generate_filters(CodegenInput {
         sid: "S",
@@ -607,8 +610,8 @@ fn suffix_domain_at_backstop_emits_truncated_diagnostic() {
 #[test]
 fn zone_fans_out_over_cached_hosts_under_tld() {
     let cache = MockFqdnCacheLookup::new();
-    cache.set_ips("ab.example", vec![Ipv4Addr::new(23, 10, 20, 136)]);
-    cache.set_ips("cd.example", vec![Ipv4Addr::new(23, 10, 20, 137)]);
+    cache.set_ips("ab.example", vec![Ipv4Addr::new(203, 0, 113, 136)]);
+    cache.set_ips("cd.example", vec![Ipv4Addr::new(203, 0, 113, 137)]);
     let rule_book = book(vec![zone_rule("r-zone", "example")], vec![]);
     let out = generate_filters(CodegenInput {
         sid: "S",
@@ -1008,7 +1011,7 @@ fn prefer_secondary_when_available_does_not_emit_default_block() {
 fn disabled_rule_is_skipped_with_diagnostic() {
     let cache = MockFqdnCacheLookup::new();
     let rule_book = book(
-        vec![disabled_rule("r-off", Ipv4Addr::new(1, 1, 1, 1))],
+        vec![disabled_rule("r-off", Ipv4Addr::new(198, 51, 100, 1))],
         vec![],
     );
     let out = generate_filters(CodegenInput {
@@ -1036,11 +1039,11 @@ fn disabled_rule_is_skipped_with_diagnostic() {
 #[test]
 fn repeated_generation_produces_identical_filter_ids() {
     let cache = MockFqdnCacheLookup::new();
-    cache.set_ips("a.test", vec![Ipv4Addr::new(1, 1, 1, 1)]);
+    cache.set_ips("a.test", vec![Ipv4Addr::new(198, 51, 100, 1)]);
     let rule_book = book(
         vec![
             exact_fqdn_rule("r-1", "a.test"),
-            exact_ip_rule("r-2", Ipv4Addr::new(2, 2, 2, 2)),
+            exact_ip_rule("r-2", Ipv4Addr::new(198, 51, 100, 2)),
         ],
         vec![app_rule("r-3", "chrome.exe", false)],
     );
@@ -1094,8 +1097,8 @@ fn a_rule_position_past_the_band_shares_the_last_slot_instead_of_leaving_the_ban
 fn primary_filters_outrank_secondary_filters_by_weight() {
     let cache = MockFqdnCacheLookup::new();
     let rule_book = book(
-        vec![exact_ip_rule("r-p", Ipv4Addr::new(1, 1, 1, 1))],
-        vec![exact_ip_rule("r-s", Ipv4Addr::new(2, 2, 2, 2))],
+        vec![exact_ip_rule("r-p", Ipv4Addr::new(198, 51, 100, 1))],
+        vec![exact_ip_rule("r-s", Ipv4Addr::new(198, 51, 100, 2))],
     );
     let out = generate_filters(CodegenInput {
         sid: "S",
@@ -1111,13 +1114,13 @@ fn primary_filters_outrank_secondary_filters_by_weight() {
     let primary_weight = out
         .filters
         .iter()
-        .find(|f| f.covers_v4(Ipv4Addr::new(1, 1, 1, 1)))
+        .find(|f| f.covers_v4(Ipv4Addr::new(198, 51, 100, 1)))
         .unwrap()
         .weight;
     let secondary_weight = out
         .filters
         .iter()
-        .find(|f| f.covers_v4(Ipv4Addr::new(2, 2, 2, 2)))
+        .find(|f| f.covers_v4(Ipv4Addr::new(198, 51, 100, 2)))
         .unwrap()
         .weight;
     assert!(
@@ -1130,8 +1133,8 @@ fn primary_filters_outrank_secondary_filters_by_weight() {
 fn per_sid_user_sid_stamped_on_every_filter() {
     let cache = MockFqdnCacheLookup::new();
     let rule_book = book(
-        vec![exact_ip_rule("r-1", Ipv4Addr::new(1, 1, 1, 1))],
-        vec![exact_ip_rule("r-2", Ipv4Addr::new(2, 2, 2, 2))],
+        vec![exact_ip_rule("r-1", Ipv4Addr::new(198, 51, 100, 1))],
+        vec![exact_ip_rule("r-2", Ipv4Addr::new(198, 51, 100, 2))],
     );
     let out = generate_filters(CodegenInput {
         sid: "S-1-5-21-XYZ",
@@ -1153,7 +1156,7 @@ fn per_sid_user_sid_stamped_on_every_filter() {
 fn different_sids_produce_different_filter_ids() {
     let cache = MockFqdnCacheLookup::new();
     let rule_book = book(
-        vec![exact_ip_rule("r-1", Ipv4Addr::new(1, 1, 1, 1))],
+        vec![exact_ip_rule("r-1", Ipv4Addr::new(198, 51, 100, 1))],
         vec![],
     );
     let a = generate_filters(CodegenInput {
@@ -1187,8 +1190,8 @@ fn primary_and_secondary_rule_with_same_id_produce_different_filter_ids() {
     // Same id "r-1" in both lists is legal — they're separate
     // namespaces per role. Filter ids must still differ.
     let rule_book = book(
-        vec![exact_ip_rule("r-1", Ipv4Addr::new(1, 1, 1, 1))],
-        vec![exact_ip_rule("r-1", Ipv4Addr::new(2, 2, 2, 2))],
+        vec![exact_ip_rule("r-1", Ipv4Addr::new(198, 51, 100, 1))],
+        vec![exact_ip_rule("r-1", Ipv4Addr::new(198, 51, 100, 2))],
     );
     let out = generate_filters(CodegenInput {
         sid: "S",
@@ -1212,9 +1215,9 @@ fn fanout_idx_keeps_filter_ids_unique_for_multi_ip_hostname() {
     cache.set_ips(
         "x.test",
         vec![
-            Ipv4Addr::new(1, 1, 1, 1),
-            Ipv4Addr::new(1, 1, 1, 2),
-            Ipv4Addr::new(1, 1, 1, 3),
+            Ipv4Addr::new(198, 51, 100, 1),
+            Ipv4Addr::new(198, 51, 100, 12),
+            Ipv4Addr::new(198, 51, 100, 13),
         ],
     );
     let rule_book = book(vec![exact_fqdn_rule("r-1", "x.test")], vec![]);
@@ -1252,7 +1255,7 @@ fn no_rule_no_strict_mode_yields_empty_output() {
     assert!(out.diagnostics.is_empty());
 }
 
-// ── secondary_dest_ips (block 16.18.vpn kill-switch) ────────────────────
+// ── secondary_dest_ips (kill-switch) ────────────────────
 
 #[test]
 fn secondary_dest_ips_collects_only_secondary_rule_ips() {
@@ -1282,14 +1285,14 @@ fn secondary_dest_ips_collects_only_secondary_rule_ips() {
 #[test]
 fn secondary_dest_ips_dedupes_across_rules_and_fanout() {
     let cache = MockFqdnCacheLookup::new();
-    cache.set_ips("a.test", vec![Ipv4Addr::new(5, 5, 5, 5)]);
-    cache.set_ips("b.test", vec![Ipv4Addr::new(5, 5, 5, 5)]); // same IP
+    cache.set_ips("a.test", vec![Ipv4Addr::new(198, 51, 100, 5)]);
+    cache.set_ips("b.test", vec![Ipv4Addr::new(198, 51, 100, 5)]); // same IP
     let rule_book = book(
         vec![],
         vec![
             exact_fqdn_rule("r-1", "a.test"),
             exact_fqdn_rule("r-2", "b.test"),
-            exact_ip_rule("r-3", Ipv4Addr::new(5, 5, 5, 5)), // same IP again
+            exact_ip_rule("r-3", Ipv4Addr::new(198, 51, 100, 5)), // same IP again
         ],
     );
     let out = generate_filters(CodegenInput {
@@ -1305,7 +1308,7 @@ fn secondary_dest_ips_dedupes_across_rules_and_fanout() {
     });
     assert_eq!(
         out.secondary_dest_ips,
-        vec![Ipv4Addr::new(5, 5, 5, 5)],
+        vec![Ipv4Addr::new(198, 51, 100, 5)],
         "the same resolved IP across three secondary rules collapses to one"
     );
 }
@@ -1344,7 +1347,7 @@ fn an_app_rule_does_not_take_over_an_address_a_main_route_rule_names() {
 
     assert!(
             !out.secondary_dest_ips.contains(&IpAddr::V4(shared)),
-            "the app rule took over an address the main-route rule names; the kill-switch              would then block it for every process",
+            "the app rule took over an address the main-route rule names; the kill-switch would then block it for every process",
         );
     assert!(
         out.primary_dest_ips.contains(&IpAddr::V4(shared)),

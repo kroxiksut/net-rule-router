@@ -204,6 +204,6 @@ fn file_watcher_module_is_gone() {
     assert!(
         !path.exists(),
         "source_watcher.rs is back at {path:?} — it MUST stay deleted; \
-         see TASKS_RU.md §16.QoL+6 for the rationale"
+         a file-watching second mutation channel was deliberately removed"
     );
 }

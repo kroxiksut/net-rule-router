@@ -683,27 +683,42 @@ fn token_is_elevated(token: HANDLE) -> Result<bool, WinError> {
 pub struct PipeIo {
     handle: HANDLE,
     event: HANDLE,
-    /// Budget for one overlapped operation. `None` waits forever — which is
-    /// what every read used to do, so a broker that stopped answering left the
-    /// caller blocked with no way back.
-    deadline: Option<Duration>,
+    /// `None` waits forever, so a peer that stopped talking holds the caller
+    /// with no way back.
+    budget: Option<IoBudget>,
+}
+
+#[derive(Clone, Copy)]
+enum IoBudget {
+    PerOperation(Duration),
+    Until(Instant),
 }
 
 impl PipeIo {
-    /// Bounds every subsequent read and write. On expiry the pending operation
-    /// is cancelled and the call returns `TimedOut`.
+    /// Bounds each subsequent read and write on its own. On expiry the pending
+    /// operation is cancelled and the call returns `TimedOut`.
     pub fn set_timeout(&mut self, timeout: Duration) {
-        self.deadline = Some(timeout);
+        self.budget = Some(IoBudget::PerOperation(timeout));
     }
 
-    /// Waits for the pending overlapped operation, honouring [`set_timeout`].
+    /// Bounds all subsequent reads and writes together: a peer trickling one
+    /// byte at a time cannot stretch them past `deadline`.
+    pub fn set_deadline(&mut self, deadline: Instant) {
+        self.budget = Some(IoBudget::Until(deadline));
+    }
+
+    /// Waits for the pending overlapped operation, honouring the budget.
     fn wait_for_completion(&self, overlapped: &OVERLAPPED, bytes: &mut u32) -> io::Result<()> {
-        let Some(timeout) = self.deadline else {
+        let Some(budget) = self.budget else {
             // SAFETY: overlapped is live for this call; blocking wait.
             return unsafe {
                 GetOverlappedResult(self.handle, overlapped, bytes, true)
                     .map_err(|e| io::Error::from_raw_os_error(e.code().0))
             };
+        };
+        let timeout = match budget {
+            IoBudget::PerOperation(timeout) => timeout,
+            IoBudget::Until(deadline) => deadline.saturating_duration_since(Instant::now()),
         };
         let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
         // SAFETY: our own auto-reset event, signalled by the completed I/O.
@@ -738,7 +753,7 @@ impl PipeIo {
         Ok(Self {
             handle,
             event,
-            deadline: None,
+            budget: None,
         })
     }
 }
@@ -817,6 +832,21 @@ impl Write for PipeIo {
         // SAFETY: handle is valid.
         unsafe { FlushFileBuffers(self.handle) }
             .map_err(|e: windows::core::Error| io::Error::from_raw_os_error(e.code().0))
+    }
+}
+
+/// A writer whose `flush` does nothing. `FlushFileBuffers` waits, with no
+/// deadline, for the peer to read everything; both ends keep the connection
+/// open until the other side is done instead.
+pub struct NoFlush<'a, W: Write>(pub &'a mut W);
+
+impl<W: Write> Write for NoFlush<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

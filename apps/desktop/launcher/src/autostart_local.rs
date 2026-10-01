@@ -8,25 +8,26 @@
 //! user's session never reads, and read back a state that cannot be true for
 //! the user.
 //!
-//! The launcher therefore answers `autostart.get` / `autostart.toggle` locally
-//! and patches the `autostart` field of the `snapshot.initial.get` response so
-//! the GUI's initial display reflects the real user-context state. This mirrors
-//! [`crate::archive_localize`]: the launcher fixes up a service response with
-//! user-context data the service cannot see. The service-side autostart
-//! handlers/provider stay compiled but are shadowed for these ops (the
-//! dispatcher intercepts them before the pipe hop).
+//! The launcher therefore answers `autostart.toggle` locally and patches the
+//! `autostart` field of the `snapshot.initial.get` response so the GUI's
+//! initial display reflects the real user-context state (`autostart.get` has
+//! no QML/bridge caller — the field is always seeded from the snapshot patch
+//! instead). This mirrors [`crate::archive_localize`]: the launcher fixes up
+//! a service response with user-context data the service cannot see. The
+//! service-side autostart handlers/provider stay compiled but are shadowed
+//! for this op (the dispatcher intercepts it before the pipe hop).
 //!
 //! macOS is deliberately out: the launchd mechanism does not exist yet, so
-//! these ops fall through to the service rather than failing locally.
+//! this op falls through to the service rather than failing locally.
 
 use serde_json::Value;
 
-/// `true` for the two autostart ops the launcher answers locally — on every OS
+/// `true` for the autostart op the launcher answers locally — on every OS
 /// where a user-context mechanism exists. See the module docs for why this is
 /// the launcher's job rather than the service's.
 #[cfg(any(windows, target_os = "linux"))]
 pub fn is_local_autostart_op(operation: &str) -> bool {
-    operation == "autostart.get" || operation == "autostart.toggle"
+    operation == "autostart.toggle"
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -34,14 +35,12 @@ pub fn is_local_autostart_op(_operation: &str) -> bool {
     false
 }
 
-/// Handle `autostart.get` / `autostart.toggle` against the user's own context.
-/// Returns the `AutostartDto` JSON on success, or an error string mapped to a
-/// wire response by the caller. Only call when [`is_local_autostart_op`] is
-/// true.
+/// Handle `autostart.toggle` against the user's own context. Returns the
+/// `AutostartDto` JSON on success, or an error string mapped to a wire
+/// response by the caller. Only call when [`is_local_autostart_op`] is true.
 #[cfg(any(windows, target_os = "linux"))]
 pub fn handle_local_autostart(operation: &str, payload: &Value) -> Result<Value, String> {
     match operation {
-        "autostart.get" => imp::get(),
         "autostart.toggle" => {
             let enabled = payload
                 .get("enabled")
@@ -121,7 +120,7 @@ mod imp {
     fn helper(
     ) -> Result<AutostartHelper<nrr_platform_linux::autostart::XdgAutostartRegistry>, String> {
         let registry = nrr_platform_linux::autostart::XdgAutostartRegistry::new()
-            .map_err(|e| format!("cannot resolve the autostart directory: {e:?}"))?;
+            .map_err(|e| format!("cannot resolve the autostart directory: {e}"))?;
         Ok(AutostartHelper::new(registry))
     }
 
@@ -144,23 +143,12 @@ mod imp {
     /// override) → not enabled.
     fn state_to_dto(state: &AutostartCurrentState) -> Value {
         let dto = match state {
-            AutostartCurrentState::Enabled { matches_ours, .. } => {
-                if *matches_ours {
-                    AutostartDto {
-                        enabled: true,
-                        last_known_state: "enabled".to_string(),
-                        overridden_value: None,
-                        updated_at: now_secs(),
-                    }
-                } else {
-                    AutostartDto {
-                        enabled: false,
-                        last_known_state: "overridden-externally".to_string(),
-                        overridden_value: Some(String::new()),
-                        updated_at: now_secs(),
-                    }
-                }
-            }
+            AutostartCurrentState::Enabled { .. } => AutostartDto {
+                enabled: true,
+                last_known_state: "enabled".to_string(),
+                overridden_value: None,
+                updated_at: now_secs(),
+            },
             AutostartCurrentState::Disabled => AutostartDto {
                 enabled: false,
                 last_known_state: "disabled".to_string(),
@@ -184,7 +172,7 @@ mod imp {
             tray_binary_path().ok_or_else(|| "cannot resolve tray binary path".to_string())?;
         let state = helper()?
             .get_state(&tray)
-            .map_err(|e| format!("autostart probe failed: {e:?}"))?;
+            .map_err(|e| format!("autostart probe failed: {e}"))?;
         Ok(state_to_dto(&state))
     }
 
@@ -197,10 +185,10 @@ mod imp {
         } else {
             h.clear()
         };
-        outcome.map_err(|e| format!("autostart write failed: {e:?}"))?;
+        outcome.map_err(|e| format!("autostart write failed: {e}"))?;
         let state = h
             .get_state(&tray)
-            .map_err(|e| format!("autostart re-probe failed: {e:?}"))?;
+            .map_err(|e| format!("autostart re-probe failed: {e}"))?;
         Ok(state_to_dto(&state))
     }
 }
@@ -211,14 +199,14 @@ mod tests {
 
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
-    fn recognises_the_two_local_autostart_ops() {
-        assert!(is_local_autostart_op("autostart.get"));
+    fn recognises_the_local_autostart_op() {
         assert!(is_local_autostart_op("autostart.toggle"));
+        assert!(!is_local_autostart_op("autostart.get"));
         assert!(!is_local_autostart_op("autostart.something-else"));
         assert!(!is_local_autostart_op("route.policy.update"));
     }
 
-    /// Where no user-context mechanism is implemented the ops travel to the
+    /// Where no user-context mechanism is implemented the op travels to the
     /// service unchanged rather than failing locally.
     #[cfg(not(any(windows, target_os = "linux")))]
     #[test]

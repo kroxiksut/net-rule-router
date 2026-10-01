@@ -57,6 +57,7 @@
 pub mod activation_coordinator;
 pub mod active_sid_registry;
 pub mod address_ownership;
+pub mod alert_audience;
 pub mod app_destination_memory;
 pub mod app_enforcement_status;
 pub mod app_main_link_reach;
@@ -66,6 +67,8 @@ pub mod auto_rules;
 pub mod block_notice_center;
 pub mod block_notice_journal_store;
 pub mod block_notice_mute_store;
+pub mod boot_integrity;
+pub mod boot_settings;
 pub mod bootstrap;
 pub mod bounded_set;
 pub mod browser_history_seeder;
@@ -92,6 +95,7 @@ pub mod fake_ip;
 pub mod fcrdns_learner;
 pub mod fqdn_cache_lookup;
 pub mod health;
+pub mod integrity_review;
 pub mod ipc;
 pub mod ipc_handlers;
 pub mod ipc_push;
@@ -104,6 +108,7 @@ pub mod lifecycle;
 pub mod lifecycle_journal;
 pub mod local_namespace_fallback;
 pub mod logon_rearm;
+pub mod machine_reading;
 pub mod machine_scoped;
 pub mod main_route_verdicts;
 pub mod managers;
@@ -156,10 +161,12 @@ pub mod service_lifecycle;
 pub mod service_stability;
 pub mod service_tasks;
 pub mod short_name_completions;
+pub mod short_name_suffixes;
 pub mod state;
 pub mod supervised_runtime;
 pub mod tamper_bootstrap;
 pub mod traffic_sampler;
+pub mod verbose_logging;
 pub mod verbosity_control;
 pub mod vpn_client_registry;
 pub mod vpn_endpoint_learning;
@@ -280,7 +287,7 @@ pub use production_coordinator::{
     ProductionActivationAuditEmitter, ProductionApplyMarkerStore, ProductionIdGenerator,
     ProductionRecoveryAuditSink, ProductionRulesApplyDispatcher,
 };
-pub use production_diagnostics::{DiagnosticSessionHandle, ProductionDiagnosticsFacade};
+pub use production_diagnostics::ProductionDiagnosticsFacade;
 pub use production_handlers_misc::{
     AdapterAddressRecorder, MonitoredAdaptersSnapshotProvider, NoopMutationExecutor,
     ProductionFailClosedProbe, ProductionMigrationCompletionWriter,
@@ -294,15 +301,13 @@ pub use production_security_alerts::ProductionSecurityAlertsRepository;
 
 pub use crash_recovery::{
     decide_recovery, execute_safe_disable, ApplyAttemptMarker, ApplyMarkerStore, ApplyPhase,
-    CrashCounter, DegradedMode, DegradedModeStatus, NoopRecoveryAuditSink, RecoveryAuditRecord,
+    DegradedMode, DegradedModeStatus, NoopRecoveryAuditSink, RecoveryAuditRecord,
     RecoveryAuditSink, RecoveryDecision, RecoveryExecutionResult, SafeDisableOutcome,
     SafeDisableRequest, StartupRecoveryCoordinator, StartupRecoveryState,
 };
 pub use lifecycle::{
-    begin_teardown, clear_teardown, run_runtime, run_runtime_with_artifacts,
-    run_runtime_with_bootstrap, teardown_in_progress, LifecycleEvent, ServiceController, StopToken,
-    AUTOSTART_POLICY, EVENT_SOURCE_NAME, SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME,
-    START_TIMEOUT, STOP_TIMEOUT,
+    begin_teardown, clear_teardown, teardown_in_progress, ServiceController, StopToken,
+    EVENT_SOURCE_NAME, SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME, STOP_TIMEOUT,
 };
 pub use managers::{
     AcceptError, AcceptErrorCategory, AcceptOutcome, ApplyController, ApplyOutcome,
@@ -310,11 +315,8 @@ pub use managers::{
     IpcBindError, IpcServer, PolicyManager, ServiceManagers, StorageManager,
 };
 pub use service_lifecycle::{
-    required_service_identity, IdentityRequirement, InstallConfig, InstallOutcome,
-    PrivilegeMatrixEntry, RecoveryPolicy, SecurityChecklist, ServiceDirectory,
-    ServiceIdentityDecision, ServiceStartMode, UninstallConfig, UninstallOutcome, UpdateConfig,
-    UpdateOutcome, NT_LOCAL_SERVICE_ACCOUNT, PRELIMINARY_IDENTITY, PRIVILEGE_MATRIX,
-    SERVICE_DIRECTORIES,
+    InstallConfig, InstallOutcome, RecoveryPolicy, ServiceStartMode, UninstallConfig,
+    UninstallOutcome, UpdateConfig, UpdateOutcome,
 };
 // Re-export the neutral cross-OS principal type so the transport
 // (nrr-windows-service) and integration tests can name the `IpcRequestContext`
@@ -322,7 +324,6 @@ pub use service_lifecycle::{
 pub use nrr_domain::user_principal::UserPrincipal;
 pub use state::{
     ActiveRevisionState, ServiceHealthSeverity, ServicePolicyState, ServiceRuntimeState,
-    ServiceShutdownReason,
 };
 
 /// What stage a given runtime dimension is at, as one short slug. Printed by

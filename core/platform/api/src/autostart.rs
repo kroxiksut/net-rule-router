@@ -25,14 +25,9 @@ use std::sync::Mutex;
 /// What the registry probe found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AutostartCurrentState {
-    /// Registry value present and points at a binary that matches our
-    /// binary path (`matches_ours = true`) or at our binary verbatim.
-    /// `binary_path` is the parsed value with surrounding quotes
-    /// stripped.
-    Enabled {
-        binary_path: PathBuf,
-        matches_ours: bool,
-    },
+    /// Registry value present and points at our binary. `binary_path` is
+    /// the parsed value with surrounding quotes stripped.
+    Enabled { binary_path: PathBuf },
     /// Registry value absent. Default state on a clean install.
     Disabled,
     /// Registry value present but parses to a path other than ours
@@ -53,6 +48,23 @@ pub enum AutostartError {
     /// Caller-supplied path is not absolute or is empty.
     InvalidPath,
 }
+
+impl std::fmt::Display for AutostartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RegistryAccess { code: 0, message } => {
+                write!(f, "the autostart entry could not be reached: {message}")
+            }
+            Self::RegistryAccess { code, message } => write!(
+                f,
+                "the autostart entry could not be reached (code {code}): {message}"
+            ),
+            Self::InvalidPath => f.write_str("the autostart path is empty or not absolute"),
+        }
+    }
+}
+
+impl std::error::Error for AutostartError {}
 
 // ── Port trait ────────────────────────────────────────────────────────────────
 
@@ -110,7 +122,6 @@ impl<P: AutostartRegistryPort> AutostartHelper<P> {
         if paths_match(&parsed, our_binary_path) {
             Ok(AutostartCurrentState::Enabled {
                 binary_path: parsed,
-                matches_ours: true,
             })
         } else {
             Ok(AutostartCurrentState::OverriddenExternally { value: raw })
@@ -353,30 +364,26 @@ mod tests {
     }
 
     #[test]
-    fn get_state_enabled_matches_ours() {
+    fn get_state_enabled_when_the_entry_is_ours() {
         let reg = MockAutostartRegistry::with_value(
             r#""C:\Program Files\NetRuleRouter\NetRuleRouterTray.exe""#,
         );
         let h = helper(reg);
         match h.get_state(&ours()).expect("get") {
-            AutostartCurrentState::Enabled { matches_ours, .. } => {
-                assert!(matches_ours);
-            }
+            AutostartCurrentState::Enabled { .. } => {}
             other => panic!("expected Enabled, got {other:?}"),
         }
     }
 
     #[test]
-    fn get_state_enabled_matches_ours_case_insensitive() {
+    fn get_state_enabled_when_the_entry_is_ours_case_insensitive() {
         let reg = MockAutostartRegistry::with_value(
             r#""C:\PROGRAM FILES\netrulerouter\netrulerOuterTray.exe""#,
         );
         let h = helper(reg);
         match h.get_state(&ours()).expect("get") {
-            AutostartCurrentState::Enabled {
-                matches_ours: true, ..
-            } => {}
-            other => panic!("expected Enabled+matches_ours, got {other:?}"),
+            AutostartCurrentState::Enabled { .. } => {}
+            other => panic!("expected Enabled, got {other:?}"),
         }
     }
 

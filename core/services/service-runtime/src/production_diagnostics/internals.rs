@@ -6,37 +6,30 @@ use super::*;
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 impl ProductionDiagnosticsFacade {
-    /// Scans + filters + sorts (ascending `(created_at, event_id)`) the
-    /// operational log events for `filter`. Shared by `list_log_entries`
-    /// (paginated) and `recent_log_entries` (newest-first tail selection).
-    /// Scan, ordered, and narrowed to what `audience` may see.
+    /// The newest `limit` log events before `before` that match `filter` and
+    /// that `audience` may see, newest first.
     ///
     /// The operational log is ONE machine-wide stream: a line about routing
     /// carries the principal it was done for, everything else (boot, adapters,
     /// service lifecycle) belongs to the machine. So a principal-scoped reader
     /// keeps the machine lines and its own, and nothing of anybody else's.
-    pub(super) fn scan_sorted_log_events_for(
+    pub(super) fn log_page_for(
         &self,
         filter: &LogEntryFilter,
         audience: &DiagnosticsAudience,
-    ) -> Vec<LogEvent> {
-        let reader = LogReader::new(self.logs_dir.clone());
-        let query_filter = log_filter_to_query(filter);
-        let mut events: Vec<LogEvent> = reader.scan(&query_filter);
-        if let Some(principal) = audience.principal() {
-            events.retain(|event| match event.principal.as_deref() {
-                None => true,
-                Some(owner) => owner == principal,
-            });
-        }
-
-        // Stable order: ascending (created_at_ms, event_id).
-        events.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.event_id.cmp(&b.event_id))
-        });
-        events
+        before: Option<(i64, &str)>,
+        limit: usize,
+    ) -> LogPage {
+        let Some(query_filter) = log_filter_to_query(filter) else {
+            return LogPage::default();
+        };
+        LogReader::new(self.logs_dir.clone()).page_newest_first(
+            &query_filter,
+            audience,
+            before,
+            limit,
+            &self.log_index,
+        )
     }
 
     /// Minimal synthetic-probe explain.
@@ -88,8 +81,8 @@ impl ProductionDiagnosticsFacade {
         // The routing-check must model ENFORCEMENT, not the
         // bare stored rules. `ProductionRulesProvider::active_rules_for` applies
         // subdomain coverage before the WFP/route codegen and the DNS seeder ever
-        // see the rules, so a probe for a subdomain (e.g. `www.whatismyip.com`)
-        // of a bare-domain rule (`whatismyip.com`) must expand the SAME way here —
+        // see the rules, so a probe for a subdomain (e.g. `www.site.example`)
+        // of a bare-domain rule (`site.example`) must expand the SAME way here —
         // otherwise the routing-check reports `primary` while enforcement actually
         // routes it `secondary`, and the "cover subdomains" toggle looks broken.
         // Read for the caller's own policy, mirroring the provider. Enforcement-
@@ -341,7 +334,11 @@ impl ProductionDiagnosticsFacade {
                 .flatten()
                 .or_else(|| repo.get_active().ok().flatten())?
         };
-        let dto = nrr_shared::rules_json::from_canonical_string(&active.rules_json).ok()?;
+        let dto = crate::production_rules_provider::read_stored_rules(
+            &active.rules_json,
+            &active.revision_id,
+        )
+        .ok()?;
         nrr_domain::rules_json_codec::decode(dto, nrr_domain::rules_file::HostPlatform::compiled())
             .ok()
     }
@@ -486,43 +483,61 @@ impl ProductionDiagnosticsFacade {
         }
     }
 
-    pub(super) fn read_revision_summary(&self) -> (Option<String>, u32) {
-        let Some(conn_arc) = self.state_conn.as_ref() else {
+    /// Whose revision `revision_id` is; `None` when the row or the store is gone.
+    pub(super) fn principal_of_revision(&self, revision_id: &str) -> Option<String> {
+        let conn = self.state_conn.as_ref()?.lock().ok()?;
+        nrr_storage::revisions::RevisionsRepository::new(&conn)
+            .principal_of(revision_id)
+            .ok()
+            .flatten()
+    }
+
+    /// The active revision id and the candidate count `audience` may see.
+    ///
+    /// A principal gets its own: its active revision, else the baseline it
+    /// reads through to (what `service.health` answers too), and only its own
+    /// candidates. The machine gets the latest activation and every candidate.
+    pub(super) fn read_revision_summary(
+        &self,
+        audience: &DiagnosticsAudience,
+    ) -> (Option<String>, u32) {
+        let Some(Ok(conn)) = self.state_conn.as_ref().map(|c| c.lock()) else {
             return (None, 0);
         };
-        let conn = match conn_arc.lock() {
-            Ok(c) => c,
-            Err(_) => return (None, 0),
-        };
-        // The facade has no caller-principal context, so report the most
-        // recently activated revision across principals: exact for the Free
-        // single-console-user model, and still honest (any non-null id means
-        // "some principal has active rules").
-        let active: Option<String> = conn
-            .query_row(
-                "SELECT revision_id FROM revisions WHERE status = 'active'
-                 ORDER BY activated_at DESC LIMIT 1",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        // "pending_changes" counts revisions in
-        // `Candidate` status. RevisionsRepository doesn't expose a
-        // `list_by_status` API today; raw count via SQL keeps the
-        // surface tight and matches the singleton-row read pattern
-        // used in `get_status` elsewhere. Status slug must match
-        // `RevisionStatus::Candidate.as_slug()` = "candidate".
-        let pending: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM revisions WHERE status = 'candidate'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n.max(0) as u32)
-            .unwrap_or(0);
-        (active, pending)
+        match audience.principal() {
+            Some(principal) => {
+                let repo = nrr_storage::revisions::RevisionsRepository::new(&conn);
+                let active = [principal, nrr_storage::BASELINE_PRINCIPAL]
+                    .into_iter()
+                    .find_map(|p| repo.active_identity_for(p).ok().flatten())
+                    .map(|(revision_id, _)| revision_id);
+                let pending = count_candidates(
+                    &conn,
+                    "SELECT COUNT(*) FROM revisions
+                     WHERE status = 'candidate' AND principal = ?1",
+                    rusqlite::params![principal],
+                );
+                (active, pending)
+            }
+            None => {
+                let active = conn
+                    .query_row(
+                        "SELECT revision_id FROM revisions WHERE status = 'active'
+                         ORDER BY activated_at DESC LIMIT 1",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                let pending = count_candidates(
+                    &conn,
+                    "SELECT COUNT(*) FROM revisions WHERE status = 'candidate'",
+                    [],
+                );
+                (active, pending)
+            }
+        }
     }
 
     pub(super) fn compute_cache_health(&self) -> CacheHealthCard {
@@ -686,29 +701,6 @@ pub(super) fn default_route_explain_projection(
     }
 }
 
-pub(super) fn millis_since_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-pub(super) fn scope_slug(scope: DiagnosticSessionScope) -> &'static str {
-    match scope {
-        DiagnosticSessionScope::All => "all",
-        DiagnosticSessionScope::DecisionAndCache => "decision_and_cache",
-        DiagnosticSessionScope::ProcessAndAdapter => "process_and_adapter",
-    }
-}
-
-pub(super) fn slug_to_scope(slug: &str) -> DiagnosticSessionScope {
-    match slug {
-        "decision_and_cache" => DiagnosticSessionScope::DecisionAndCache,
-        "process_and_adapter" => DiagnosticSessionScope::ProcessAndAdapter,
-        _ => DiagnosticSessionScope::All,
-    }
-}
-
 pub(super) fn level_from_str(s: &str) -> Option<EventLevel> {
     match s {
         "trace" => Some(EventLevel::Trace),
@@ -734,4 +726,10 @@ pub(super) fn category_from_str(s: &str) -> Option<EventCategory> {
         "user_action" => Some(EventCategory::UserAction),
         _ => None,
     }
+}
+
+/// `COUNT(*)` of candidate revisions; the slug is `RevisionStatus::Candidate`'s.
+fn count_candidates(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> u32 {
+    conn.query_row(sql, params, |r| r.get::<_, i64>(0))
+        .map_or(0, |n| u32::try_from(n.max(0)).unwrap_or(u32::MAX))
 }

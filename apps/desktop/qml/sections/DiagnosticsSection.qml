@@ -19,17 +19,25 @@ ScrollView {
     // nothing to its right. Mirrors SettingsSection.qml.
     contentWidth: availableWidth
 
-    readonly property var diag: root.context.diagnostics || ({})
+    readonly property var diag: root.diagnosticsSnapshot || ({})
     readonly property var serviceHealth: diag.serviceHealth || ({})
     readonly property var securityStatus: diag.securityStatus || ({})
     readonly property var cacheHealth: diag.cacheHealth || ({})
     readonly property var logHealth: diag.logHealth || ({})
-    readonly property var modeState: diag.diagnosticMode || ({})
+    // The service could not be asked: every card is a placeholder, and a
+    // placeholder's `false` is not a verdict.
+    readonly property bool statusUnknown: diag.origin === "unavailable"
+    readonly property string noDataText: root.tr("diag.status.no-data",
+        "No data from the service yet")
 
     // The mutable alert list lives on the window so the integrity banner
     // and this section read one state: an Acknowledge here must take the
     // banner down too.
     readonly property var alertItems: root.securityAlertItems
+
+    // The service's stand-in for alerts about another user's rules: only an
+    // administrator can clear those, so it is refused and gets no button.
+    readonly property string otherPrincipalAlertId: "alt-other-principal"
 
     // Count of alerts still demanding attention (active = not yet acked).
     readonly property int unreadAlertCount: {
@@ -62,12 +70,15 @@ ScrollView {
         return root.tr("diag.alert.kind-detail." + slug, "")
     }
 
-    // Two-phase MutationSubmit acknowledge. The dry-run mints a
-    // confirmation token; the confirm executes the ack, which the
-    // service's handler turns into a full revision re-sign —
-    // healing the DB so the next load verifies clean and the mutation
-    // gate lifts.
-    function _acknowledgeAlert(alertId) {
+    // Tamper and key-reset alerts trust rule sets when acknowledged, so the
+    // rows the service's dry-run lists are shown first and sent back.
+    function _adoptsRows(kind) {
+        return kind === "db_tamper_detected" || kind === "key_reset_with_existing_data"
+    }
+
+    // Two-phase MutationSubmit acknowledge: the dry-run mints a
+    // confirmation token, the confirm executes the ack.
+    function _acknowledgeAlert(alertId, kind) {
         if (!root.bridgeAvailable
                 || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
@@ -80,23 +91,92 @@ ScrollView {
         var corr = nrrNativeBridge.rpcMutationSubmit("security-alert-ack", payload, true, "")
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok) {
-                root.statusLine = root.tr("diag.alert.ack-failed",
-                    "Failed to acknowledge alert: ") + String(code || "unknown")
+                section._announceAlertAckFailed(code)
                 return
             }
-            var token = String((p && p["confirmation-token"]) || "")
-            var corr2 = nrrNativeBridge.rpcMutationSubmit("security-alert-ack", payload, false, token)
-            root.rpc.registerRpcCallback(corr2, function(ok2, p2, code2, msg2) {
-                if (!ok2) {
-                    root.statusLine = root.tr("diag.alert.ack-failed",
-                        "Failed to acknowledge alert: ") + String(code2 || "unknown")
-                    return
-                }
-                root.markSecurityAlertAcknowledged(alertId)
-                root.statusLine = root.tr("diag.alert.ack-completed",
-                    "Security alert acknowledged.")
-            })
+            if (section._adoptsRows(kind)) {
+                alertAckDialog.alertId = String(alertId)
+                alertAckDialog.alertKind = String(kind)
+                alertAckDialog.rows = (p && p["unverified-rows"]) || []
+                alertAckDialog.open()
+                return
+            }
+            section._confirmAlertAck(alertId, payload,
+                String((p && p["confirmation-token"]) || ""))
         })
+    }
+
+    // The listed rows go back unchanged; the service trusts only those whose
+    // content still matches. The token is minted for this exact payload.
+    function _acknowledgeShownRows(alertId, rows) {
+        var refs = []
+        for (var i = 0; i < rows.length; i++) {
+            var r = rows[i]
+            refs.push({
+                "row-kind": r["row-kind"],
+                "principal": r["principal"],
+                "revision-id": r["revision-id"],
+                "content-hash": r["content-hash"]
+            })
+        }
+        var payload = { "alert-id": String(alertId), "adopt-rows": refs }
+        var corr = nrrNativeBridge.rpcMutationSubmit("security-alert-ack", payload, true, "")
+        root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+            if (!ok) {
+                section._announceAlertAckFailed(code)
+                return
+            }
+            section._confirmAlertAck(alertId, payload,
+                String((p && p["confirmation-token"]) || ""))
+        })
+    }
+
+    readonly property bool _auditChainBroken: !statusUnknown && securityStatus.auditChainOk === false
+    readonly property bool _auditChainUnknown: statusUnknown
+
+    function _confirmAlertAck(alertId, payload, token) {
+        var corr2 = nrrNativeBridge.rpcMutationSubmit("security-alert-ack", payload, false, token)
+        root.rpc.registerRpcCallback(corr2, function(ok2, p2, code2, msg2) {
+            if (!ok2) {
+                section._announceAlertAckFailed(code2)
+                return
+            }
+            // The confirm only accepts the acknowledgement; its verdict is on
+            // the operation record. On success the list and cards already come
+            // from the read that settled it, alerts it raised included.
+            var read = { fresh: false }
+            root.rpc.readMutationOutcome(p2, section._alertAckSettledByState(alertId, read),
+                function(failure) {
+                    if (failure !== "") {
+                        section._announceAlertAckFailed(failure, read.fresh)
+                        return
+                    }
+                    root.statusLine = root.tr("diag.alert.ack-completed",
+                        "Security alert acknowledged.")
+                })
+        })
+    }
+
+    // A refusal usually means the list on screen is stale (the alert was
+    // already handled elsewhere, or replaced) — unless it was just re-read.
+    function _announceAlertAckFailed(code, snapshotFresh) {
+        root.statusLine = root.tr("diag.alert.ack-failed",
+            "Failed to acknowledge alert: ") + root.ipcErrorLabel(code)
+        if (snapshotFresh !== true)
+            root.refreshDiagnosticsSnapshot()
+    }
+
+    // Acknowledged exactly when the service no longer lists the alert as
+    // active. Judged on the window's own forced re-read, so the verdict and
+    // what the page shows come from one answer; `read.fresh` records whether
+    // that answer was applied.
+    function _alertAckSettledByState(alertId, read) {
+        return function(done) {
+            root.refreshDiagnosticsSnapshot(true, function(live, status, code) {
+                read.fresh = live
+                done(Pure.alertAckOutcome(status, alertId, code))
+            })
+        }
     }
 
     // Wire real service
@@ -211,12 +291,24 @@ ScrollView {
     Component.onCompleted: {
         _refreshServiceHealth()
         _consumePendingExplainHost()
+        root.refreshDiagnosticsOnPageOpen()
     }
     // A block notice deep-links the host to probe, consumed once: coming back
     // later must not re-run what the user already saw.
     onVisibleChanged: {
-        if (visible)
+        if (visible) {
             section._consumePendingExplainHost()
+            root.refreshDiagnosticsOnPageOpen()
+        }
+    }
+    // Asked while this page is already open. Deferred: the host is assigned
+    // before its address and program, which must travel with it.
+    Connections {
+        target: root.notificationsController
+        function onPendingExplainHostChanged() {
+            if (section.visible)
+                Qt.callLater(section._consumePendingExplainHost)
+        }
     }
     function serviceStateLabel(state) {
         if (state === "running") return root.tr("diag.status.service-running", "Service running")
@@ -228,6 +320,7 @@ ScrollView {
         return root.tr("diag.status.service-unavailable", "Service unavailable")
     }
     function cacheStateLabel() {
+        if (statusUnknown) return noDataText
         if (cacheHealth.healthy === false)
             return root.tr("diag.status.cache-stale", "Cache entries stale")
         return root.tr("diag.status.cache-healthy", "Cache healthy")
@@ -434,8 +527,10 @@ ScrollView {
                 anchors.fill: parent
                 spacing: root.uiTheme.spacingSm
                 Label {
-                    text: root.tr("diag.status.stale-data-warning", "Status data may be outdated")
-                    color: root.uiTheme.colorAccent
+                    text: section.statusUnknown
+                        ? section.noDataText
+                        : root.tr("diag.status.stale-data-warning", "Status data may be outdated")
+                    color: section.statusUnknown ? root.mutedTextColor : root.uiTheme.colorAccent
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
                 }
@@ -726,10 +821,26 @@ ScrollView {
                         font.bold: true
                     }
                     Label {
-                        text: securityStatus.auditChainOk === false
+                        text: section._auditChainBroken
                             ? root.tr("diag.status.audit-chain-mismatch", "Audit chain mismatch detected")
-                            : root.tr("diag.status.audit-chain-ok", "Audit chain intact")
-                        color: securityStatus.auditChainOk === false ? root.uiTheme.colorAccent : root.mutedTextColor
+                            : section._auditChainUnknown
+                                ? section.noDataText
+                                : root.tr("diag.status.audit-chain-ok", "Audit chain intact")
+                        color: section._auditChainBroken ? root.uiTheme.colorAccent : root.mutedTextColor
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        visible: section._auditChainBroken && root.supports("auditChainRestart")
+                        text: root.tr("diag.audit.restart.open", "Restart audit chain…")
+                        Accessible.name: text
+                        onClicked: auditChainRestartDialog.start()
+                    }
+                    HelpButton {
+                        theme: root.uiTheme
+                        visible: section._auditChainBroken && root.supports("auditChainRestart")
+                        helpText: root.tr("diag.audit.restart.help",
+                            "The audit journal is a tamper-evident record of every privileged change. If a record was altered or lost, the check keeps reporting it until an administrator acknowledges it. Restarting records that acknowledgement in the journal itself and continues checking from that point: the old break stays visible in the history, and any new break is reported again.")
+                        accessibleLabel: root.tr("label.help", "Help")
                     }
                 }
 
@@ -745,10 +856,23 @@ ScrollView {
                     wrapMode: Text.WordWrap
                 }
 
+                // Shown whatever the list holds: what is listed may be out of date.
                 Label {
                     Layout.fillWidth: true
-                    visible: section.alertItems.length === 0
-                    text: root.tr("diag.alert.no-active-alerts", "No active alerts")
+                    Layout.preferredWidth: 0
+                    visible: root.securityAlertsUnreadable
+                    text: root.tr("diag.alert.unreadable",
+                        "The service could not read its security alerts, so this list may be incomplete or out of date.")
+                    color: root.uiTheme.colorWarning
+                    wrapMode: Text.WordWrap
+                }
+
+                Label {
+                    Layout.fillWidth: true
+                    visible: section.alertItems.length === 0 && !root.securityAlertsUnreadable
+                    text: root.securityAlertsKnown
+                        ? root.tr("diag.alert.no-active-alerts", "No active alerts")
+                        : section.noDataText
                     color: root.mutedTextColor
                 }
 
@@ -775,8 +899,9 @@ ScrollView {
                                 ThemedButton {
                                     theme: root.uiTheme
                                     visible: modelData.state === "active"
+                                        && modelData.alertId !== section.otherPrincipalAlertId
                                     text: root.tr("diag.alert.action-acknowledge", "Acknowledge")
-                                    onClicked: section._acknowledgeAlert(modelData.alertId)
+                                    onClicked: section._acknowledgeAlert(modelData.alertId, modelData.kind)
                                 }
                             }
                             Label {
@@ -820,7 +945,7 @@ ScrollView {
                 }
                 Label {
                     text: cacheStateLabel()
-                    color: cacheHealth.healthy === false
+                    color: !section.statusUnknown && cacheHealth.healthy === false
                         ? root.uiTheme.colorAccent
                         : root.mutedTextColor
                 }
@@ -906,7 +1031,7 @@ ScrollView {
                     color: root.uiTheme.colorAccent
                 }
                 Label {
-                    visible: logHealth.dirWritable === false
+                    visible: !section.statusUnknown && logHealth.dirWritable === false
                     text: root.tr("diag.storage-health.dir-not-writable", "Log directory is not writable")
                     color: root.uiTheme.colorAccent
                 }
@@ -923,6 +1048,20 @@ ScrollView {
         RuleDiagnosticsPanel {
             id: explainPanel
             root: section.root
+        }
+
+        SecurityAlertAckDialog {
+            id: alertAckDialog
+            property string alertId: ""
+            ownerRoot: section.root
+            onConfirmed: section._acknowledgeShownRows(alertId, rows)
+        }
+
+        AuditChainRestartDialog {
+            id: auditChainRestartDialog
+            ownerRoot: section.root
+            // The chain verdict on the card is the snapshot's; a restart changes it.
+            onClosed: section.root.refreshDiagnosticsSnapshot()
         }
 
         Item { Layout.fillHeight: true }

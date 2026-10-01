@@ -48,7 +48,7 @@ pub const AUDIT_EVENT_SCHEMA_VERSION: u16 = 1;
 ///
 /// The `payload` field carries event-specific detail filtered through the
 /// privacy redaction layer before serialisation.  Callers must
-/// not include `SecretNeverLog` data in `payload`.
+/// not put secrets in `payload`.
 ///
 /// # Default mode
 ///
@@ -115,8 +115,8 @@ pub struct LogEvent {
 
     /// Structured event payload after redaction.
     ///
-    /// `None` means no additional detail is available.  Must not contain
-    /// `SecretNeverLog` fields; the redaction layer enforces this.
+    /// `None` means no additional detail is available. An event classed
+    /// `PrivacyClass::SecretNeverLog` is dropped by the redaction layer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
 }
@@ -234,11 +234,10 @@ impl LogEvent {
 ///
 /// # Tamper detection
 ///
-/// `event_hash = FNV-1a(prev_hash + canonical_payload_json)`
+/// `event_hash = SHA-256(prev_hash || canonical_payload_json)`
 ///
-/// On startup the audit reader verifies the chain for the most recent file.
-/// A mismatch raises `integrity.audit_chain_mismatch` and sets the service
-/// health to degraded.
+/// A mismatch anywhere in the retention window reports the audit chain as
+/// broken until an administrator restarts it (`audit_chain_restarted`).
 ///
 /// # Actor identity
 ///
@@ -289,6 +288,13 @@ pub struct AuditEvent {
     /// Compact JSON summary of the event payload after redaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_summary_json: Option<String>,
+
+    /// The service's keyed MAC over this event, on a chain restart only.
+    ///
+    /// Omitted when `None`, so every event without one hashes to the same
+    /// canonical bytes as before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<String>,
 
     /// Hash of the previous audit event in this file's chain.
     /// `None` only for the very first event in a new file.
@@ -482,6 +488,7 @@ mod tests {
             result: "success".into(),
             reason_code: reason::review::APPROVED.as_str().to_string(),
             payload_summary_json: None,
+            seal: None,
             prev_hash: None,
             event_hash: "deadbeef".into(),
         };
@@ -508,6 +515,7 @@ mod tests {
             result: "success".into(),
             reason_code: reason::review::AUTO_ACTIVATED.as_str().to_string(),
             payload_summary_json: None,
+            seal: None,
             prev_hash: None,
             event_hash: "cafebabe".into(),
         };
@@ -534,6 +542,7 @@ mod tests {
             result: "failure".into(),
             reason_code: reason::integrity::AUDIT_CHAIN_MISMATCH.as_str().to_string(),
             payload_summary_json: Some(r#"{"details":"chain broken at seq 4"}"#.into()),
+            seal: None,
             prev_hash: Some("prev123".into()),
             event_hash: "newhash456".into(),
         };

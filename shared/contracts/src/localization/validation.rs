@@ -209,7 +209,7 @@ pub(super) fn flatten_locale_object_validated(
                 .any(|reserved| reserved == &key.as_str())
         {
             candidate.warnings.push(format!(
-                "reserved namespace '{key}' is not allowed in locale translation payload;                  the namespace is ignored"
+                "reserved namespace '{key}' is not allowed in locale translation payload; the namespace is ignored"
             ));
             continue;
         }
@@ -240,10 +240,13 @@ pub(super) fn flatten_locale_object_validated(
         }
 
         if let Some(text) = nested.as_str() {
+            // Kept, a blank value would shadow the fallback and draw an empty
+            // label; dropped, the key falls back per key like a missing one.
             if text.trim().is_empty() {
                 candidate.warnings.push(format!(
-                    "translation key '{merged_key}' contains an empty string"
+                    "translation key '{merged_key}' contains an empty string; the key is ignored"
                 ));
+                continue;
             }
             if text.chars().count() > MAX_RECOMMENDED_LOCALE_VALUE_LEN {
                 candidate.warnings.push(format!(
@@ -269,7 +272,7 @@ pub(super) fn flatten_locale_object_validated(
         }
 
         candidate.warnings.push(format!(
-            "translation key '{merged_key}' has invalid value type; only string/object are              allowed, so the key is ignored"
+            "translation key '{merged_key}' has invalid value type; only string/object are allowed, so the key is ignored"
         ));
     }
 }

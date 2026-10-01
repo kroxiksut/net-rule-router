@@ -30,7 +30,7 @@ pub use filter::{
     LogFilter, LoggingMode, RATE_LIMITED_CATEGORIES, RATE_LIMIT_MAX_DEFAULT,
     RATE_LIMIT_MAX_DIAGNOSTIC, RATE_LIMIT_WINDOW_SECS,
 };
-pub use reader::{LogQueryFilter, LogReader};
+pub use reader::{LogFileIndex, LogPage, LogQueryFilter, LogReader};
 pub use tracing_layer::{
     install_ndjson_tracing, install_ndjson_tracing_with_console,
     install_ndjson_tracing_with_console_and_verbose, install_ndjson_tracing_with_verbose,

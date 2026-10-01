@@ -11,12 +11,12 @@
 //! comment when they never wrote one.
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::SystemTime;
 
 use rusqlite::{params, OptionalExtension};
 
 use crate::db::SidecarDb;
 use crate::error::SidecarResult;
+use nrr_sqlite_support::unix_now_ms;
 
 /// Stable identifier for a rule, used as the primary key in
 /// `rule_metadata`. Constructed by lowercasing the match value and
@@ -233,16 +233,6 @@ impl SidecarDb {
         tx.commit()?;
         Ok(removed)
     }
-}
-
-/// Current Unix epoch in milliseconds. A clock before the epoch yields
-/// zero rather than panicking — the timestamps are informational only.
-fn unix_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

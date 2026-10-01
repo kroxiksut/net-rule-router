@@ -31,7 +31,7 @@ pub trait AppPathResolver: Send + Sync {
     /// Every executable that ships INSIDE the install directory of `exe`,
     /// `exe` itself excluded.
     ///
-    /// A tunnel client is rarely one binary. `swiftvpn 3.0.exe` carries
+    /// A tunnel client is rarely one binary. `examplevpn 3.0.exe` carries
     /// its transports in subdirectories — `OpenVPN\openvpn.exe`,
     /// `XRay\ExternalBinaries\xray.exe` — and it is those processes, not the
     /// GUI, that perform the handshake. A kill-switch exemption naming only the
@@ -281,7 +281,7 @@ mod tests {
         assert!(glob_match("ab.exe", "ab.exe"));
         assert!(glob_match("AB.EXE", "ab.exe"));
         assert!(glob_match("ab.exe", "AB.EXE"));
-        assert!(!glob_match("ab.exe", "vkontakte.exe"));
+        assert!(!glob_match("ab.exe", "socialapp.exe"));
     }
 
     #[test]

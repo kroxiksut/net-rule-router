@@ -7,6 +7,7 @@
 //! unguarded `explorer.exe` and three hard-coded product names, which read as
 //! supported code.
 
+use nrr_shared::launcher_rpc::HostAnswerDeadlines;
 use nrr_shared::{load_locale_catalog, resolve_catalog_text, AppAction, SetupActionAvailability};
 use nrr_ui_support::theme::resolve_theme;
 use nrr_ui_support::tray::{TrayActionRuntime, TrayRuntimeSnapshot, TrayStatusKind};
@@ -14,12 +15,20 @@ use nrr_ui_support::ui_preferences::UiPreferences;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrayLaunchOptions {
     first_run_completed_override: Option<bool>,
     status_override: Option<TrayStatusKind>,
+}
+
+impl TrayLaunchOptions {
+    /// Status painted instead of the live one on the first frame (`--status=`).
+    pub fn status_override(&self) -> Option<TrayStatusKind> {
+        self.status_override
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,7 +68,7 @@ where
             match value.parse::<TrayStatusKind>() {
                 Ok(status) => options.status_override = Some(status),
                 Err(_) => eprintln!(
-                    "Unknown --status value '{}'. Use preview-mode|no-active-policy|service-unavailable.",
+                    "Unknown --status value '{}'. Use preview-mode|checking-status|no-active-policy|service-unavailable.",
                     value
                 ),
             }
@@ -93,6 +102,9 @@ struct TrayContextPayload {
     route_primary_label: String,
     route_secondary_label: String,
     icon_file_url: Option<String>,
+    /// The service log folder (`ui_surface::logs_folder_url`). The C++ host
+    /// opens this rather than resolving a path of its own.
+    logs_folder_url: Option<String>,
     /// Mirrors the user's "show notifications" preference. The tray is the only
     /// surface that raises unsolicited windows, so it has to honour the toggle;
     /// it is a launch-time snapshot like `language` and `theme`, so a change
@@ -120,6 +132,8 @@ struct TrayContextPayload {
     /// OS capability descriptor, mirrored from the main GUI context so the
     /// tray can degrade capability-driven if it ever needs to.
     platform_profile: nrr_shared::platform_profile::PlatformProfile,
+    /// How long `RpcTransport.qml` waits for each answer; the launcher owns the budgets.
+    rpc_answer_deadlines: HostAnswerDeadlines,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,11 +145,19 @@ struct TrayThemeContext {
     system_mode_detected: bool,
 }
 
+/// Locations the tray context carries as `file://` URLs, resolved by the caller.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrayContextUrls {
+    pub icon_file_url: Option<String>,
+    pub logs_folder_url: Option<String>,
+}
+
 pub fn write_qt_tray_context_file(
     runtime: &TrayRuntimeSnapshot,
     language: &str,
     preferences: &UiPreferences,
-    icon_file_url: Option<String>,
+    urls: TrayContextUrls,
+    rpc_answer_deadlines: HostAnswerDeadlines,
 ) -> Result<PathBuf, String> {
     let locale_catalog = load_locale_catalog();
     let status_slug = runtime.status_kind.slug();
@@ -159,7 +181,8 @@ pub fn write_qt_tray_context_file(
         ),
         route_primary_label: preferences.route_primary_label.clone(),
         route_secondary_label: preferences.route_secondary_label.clone(),
-        icon_file_url,
+        icon_file_url: urls.icon_file_url,
+        logs_folder_url: urls.logs_folder_url,
         show_notifications: preferences.show_notifications,
         notify_suggestion_changes: preferences.notify_suggestion_changes,
         notify_block_notices: preferences.notify_block_notices,
@@ -175,6 +198,7 @@ pub fn write_qt_tray_context_file(
         primary_actions: to_action_context(&runtime.primary_actions, &locale_catalog, language),
         quick_actions: to_action_context(&runtime.quick_actions, &locale_catalog, language),
         platform_profile: nrr_shared::platform_profile::PlatformProfile::current(),
+        rpc_answer_deadlines,
     };
 
     let timestamp = SystemTime::now()
@@ -185,8 +209,11 @@ pub fn write_qt_tray_context_file(
     // every local user's, and this file is this user's settings.
     let dir = nrr_platform_api::paths::ensure_user_runtime_dir()
         .map_err(|error| format!("Failed to prepare the runtime directory: {error}"))?;
+    // Pid and millisecond alone collide for two writes in one millisecond.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let file_path = dir.join(format!(
-        "nrr-tray-context-{}-{timestamp}.json",
+        "nrr-tray-context-{}-{timestamp}-{sequence}.json",
         std::process::id()
     ));
 
@@ -358,7 +385,8 @@ mod tests {
                 &runtime,
                 &preferences.language,
                 &preferences,
-                None,
+                super::TrayContextUrls::default(),
+                super::HostAnswerDeadlines::default(),
             )
             .expect("context file is written to the temp dir");
             let raw = std::fs::read_to_string(&path).expect("context file is readable");
@@ -370,5 +398,46 @@ mod tests {
                 Some(wanted),
             );
         }
+    }
+
+    /// `RpcTransport.qml` reads its answer deadlines from here; without them
+    /// every request falls back to the transport's own guess.
+    #[test]
+    fn tray_context_carries_the_answer_deadlines() {
+        use nrr_shared::launcher_rpc::HOST_ANSWER_DEADLINES_CONTEXT_KEY;
+        use nrr_ui_support::theme::resolve_theme;
+        use nrr_ui_support::tray::tray_runtime_snapshot;
+        use nrr_ui_support::ui_preferences::UiPreferences;
+
+        let shell = nrr_shared::gui_shell_v1();
+        let preferences = UiPreferences::default();
+        let theme = resolve_theme(preferences.theme_mode);
+        let runtime = tray_runtime_snapshot(
+            &shell,
+            true,
+            None,
+            theme.effective_mode,
+            nrr_ui_support::tray::TrayServiceLink::Unknown,
+        );
+        let deadlines = super::HostAnswerDeadlines {
+            default_ms: 1234,
+            operations_ms: [("mutation.submit".to_string(), 5678)]
+                .into_iter()
+                .collect(),
+        };
+        let path = super::write_qt_tray_context_file(
+            &runtime,
+            &preferences.language,
+            &preferences,
+            super::TrayContextUrls::default(),
+            deadlines,
+        )
+        .expect("context file is written to the temp dir");
+        let raw = std::fs::read_to_string(&path).expect("context file is readable");
+        let _ = std::fs::remove_file(&path);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("context file is JSON");
+        let carried = &parsed[HOST_ANSWER_DEADLINES_CONTEXT_KEY];
+        assert_eq!(carried["defaultMs"], 1234);
+        assert_eq!(carried["operationsMs"]["mutation.submit"], 5678);
     }
 }

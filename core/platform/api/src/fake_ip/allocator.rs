@@ -763,7 +763,7 @@ mod tests {
         assert!(!FakeIpPoolConfig::is_default_pool_addr(ip(
             "198.17.255.255"
         )));
-        assert!(!FakeIpPoolConfig::is_default_pool_addr(ip("8.8.8.8")));
+        assert!(!FakeIpPoolConfig::is_default_pool_addr(ip("198.51.100.8")));
     }
 
     #[test]
@@ -848,9 +848,9 @@ mod tests {
     fn addresses_outside_the_pool_are_not_fake() {
         let mut alloc = FakeIpAllocator::default();
         assert!(alloc.is_fake_address(ip("198.19.255.254")));
-        assert!(!alloc.is_fake_address(ip("23.10.20.78")));
+        assert!(!alloc.is_fake_address(ip("203.0.113.78")));
         assert!(!alloc.is_fake_address(ip("198.20.0.1")));
-        assert_eq!(alloc.domain_for_ip(ip("23.10.20.78")), None);
+        assert_eq!(alloc.domain_for_ip(ip("203.0.113.78")), None);
     }
 
     #[test]

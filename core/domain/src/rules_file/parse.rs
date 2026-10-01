@@ -175,10 +175,10 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                 if let Some(v) = parse_preset_header(trimmed) {
                     file_format_version = Some(v);
                     is_preset_file = true;
-                    if v > CURRENT_PRESET_FORMAT_VERSION {
+                    if v > CURRENT_RULES_FILE_FORMAT_VERSION {
                         warnings.push(ParseWarning::UnknownFormatVersion {
                             found: v,
-                            supported: CURRENT_PRESET_FORMAT_VERSION,
+                            supported: CURRENT_RULES_FILE_FORMAT_VERSION,
                         });
                     }
                     continue;

@@ -113,7 +113,7 @@ fn risk_of(request: &IpcRequestEnvelope) -> Option<String> {
 }
 
 /// `adt-<nanos>-<counter>`, matching what the other audit paths emit.
-fn next_audit_event_id() -> String {
+pub(crate) fn next_audit_event_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()

@@ -1,4 +1,32 @@
 #include "native_bridge.h"
+#include <QSaveFile>
+
+// Temp file plus rename, reported written only once `commit()` has flushed it:
+// a full disk or an AV lock fails here instead of leaving an empty rules file
+// whose hash the GUI already recorded as synced.
+static bool saveFileContents(const char *op, const QString &path,
+                             const QByteArray &bytes) {
+    QSaveFile file(path);
+    // A folder the user may write in but not create files in stays writable
+    // in place, still checked at commit.
+    file.setDirectWriteFallback(true);
+    if (!file.open(QIODevice::WriteOnly)) {
+        qWarning() << op << "open failed:" << path << "error=" << file.errorString();
+        return false;
+    }
+    const qint64 written = file.write(bytes);
+    if (written != bytes.size()) {
+        qWarning() << op << "short write to" << path << "wrote=" << written
+                   << "of" << bytes.size() << "error=" << file.errorString();
+        file.cancelWriting();
+        return false;
+    }
+    if (!file.commit()) {
+        qWarning() << op << "commit failed:" << path << "error=" << file.errorString();
+        return false;
+    }
+    return true;
+}
 
 QString NrrNativeBridge::readFileBytes(const QString &path) {
     constexpr qint64 MAX_BYTES = 1024 * 1024;
@@ -57,6 +85,13 @@ QString NrrNativeBridge::rpcRulesOverlaps(const QString &rulesJson, bool include
     return emitRpcRequest(QStringLiteral("local.rules-overlaps"), obj);
 }
 
+QString NrrNativeBridge::rpcRuleValueVerdict(const QString &ruleType, const QString &matchValue) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("rule-type"), ruleType);
+    obj.insert(QStringLiteral("match-value"), matchValue);
+    return emitRpcRequest(QStringLiteral("local.rule-value-verdict"), obj);
+}
+
 QString NrrNativeBridge::rpcVpnDiscover() {
     return emitRpcRequest(QStringLiteral("local.vpn.discover"),
                           QJsonObject());
@@ -88,6 +123,11 @@ QString NrrNativeBridge::rpcSystemTheme() {
 
 QString NrrNativeBridge::rpcServiceInfo() {
     return emitRpcRequest(QStringLiteral("local.service-info"),
+                          QJsonObject());
+}
+
+QString NrrNativeBridge::rpcUpdateCheckRun() {
+    return emitRpcRequest(QStringLiteral("local.update-check.run"),
                           QJsonObject());
 }
 
@@ -307,15 +347,7 @@ bool NrrNativeBridge::writeTextFile(const QString &path, const QString &text) {
                    << "size=" << utf8.size();
         return false;
     }
-    QFile f(path);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        qWarning() << "writeTextFile: open failed:" << path
-                   << "error=" << f.errorString();
-        return false;
-    }
-    const qint64 written = f.write(utf8);
-    f.close();
-    return written == utf8.size();
+    return saveFileContents("writeTextFile:", path, utf8);
 }
 
 QString NrrNativeBridge::bundledPresetsRoot() {
@@ -399,17 +431,5 @@ bool NrrNativeBridge::writeFileBytes(const QString &path,
                    << path << "size=" << bytes.size();
         return false;
     }
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        qWarning() << "writeFileBytes: open failed:" << path
-                   << "reason=" << file.errorString();
-        return false;
-    }
-    const qint64 written = file.write(bytes);
-    if (written != bytes.size()) {
-        qWarning() << "writeFileBytes: short write to" << path
-                   << "wrote=" << written << "of" << bytes.size();
-        return false;
-    }
-    return true;
+    return saveFileContents("writeFileBytes:", path, bytes);
 }

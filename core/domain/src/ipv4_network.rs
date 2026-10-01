@@ -99,9 +99,9 @@ mod tests {
 
     #[test]
     fn the_edges_of_the_prefix_range_work() {
-        let all = Ipv4Network::parse("1.2.3.4/0").expect("parse");
+        let all = Ipv4Network::parse("192.0.2.4/0").expect("parse");
         assert_eq!(all.to_cidr_string(), "0.0.0.0/0");
-        let host = Ipv4Network::parse("1.2.3.4/32").expect("parse");
-        assert_eq!(host.to_cidr_string(), "1.2.3.4/32");
+        let host = Ipv4Network::parse("192.0.2.4/32").expect("parse");
+        assert_eq!(host.to_cidr_string(), "192.0.2.4/32");
     }
 }

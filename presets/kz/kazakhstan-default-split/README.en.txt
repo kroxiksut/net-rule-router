@@ -1,9 +1,15 @@
 ﻿Name: Kazakhstan Default Split
 Country: KZ
-Use case: Local traffic via primary, foreign services via secondary
+Use case: Local traffic via primary; platforms whose websites are blocked in
+Kazakhstan via secondary
 Author: NetRuleRouter contributors
-Tested on: NOT VERIFIED
+Checked: September 2026 (secondary route list, against public reports)
+Tested on: NOT VERIFIED on a live connection in Kazakhstan
+
+Secondary route:
+- Pinterest (website) and Pikabu: blocked nationwide.
+- The list is short on purpose: AI, developer and social services serve
+  Kazakhstan directly. Add a service yourself if your provider fails to reach it.
 
 IMPORTANT:
-- This preset has not been fully manually validated.
 - Please review and adapt it before use.

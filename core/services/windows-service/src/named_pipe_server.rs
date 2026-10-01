@@ -85,7 +85,7 @@ use crate::named_pipe_identity::{classify_pipe_client, ClientRejectReason};
 use nrr_shared::ipc_wire::{read_frame, write_frame, WireError};
 
 /// Canonical pipe path. Derived from the cross-OS endpoint SSOT in
-/// `nrr-shared::ipc_transport` (block 19.2) so the server and the client
+/// `nrr-shared::ipc_transport` so the server and the client
 /// (`nrr-ipc-client`) can never drift. This module is `#[cfg(windows)]`, so
 /// the SSOT resolves to the named-pipe address here. The versioned `-v1`
 /// suffix lets us migrate the protocol without breaking running clients.
@@ -526,9 +526,7 @@ fn write_busy_response(pipe: HANDLE) -> Result<(), WireError> {
     write_frame(&mut writer, &env)
 }
 
-/// Worker per-connection loop. Identical to the original 16.1
-/// implementation — wire format, identity check, and dispatch contract
-/// are unchanged.
+/// Worker per-connection loop: identity check, then frame-by-frame dispatch.
 fn handle_connection(
     pipe: SendableHandle,
     router: Arc<IpcRouter>,
@@ -539,10 +537,9 @@ fn handle_connection(
     per_sid: &Arc<PerPrincipalSlots<String>>,
 ) {
     let pipe = pipe.0;
-    let _ = audit; // audit hooks fire inside IpcRouter::dispatch via the
-                   // router's own audit emitter; the per-connection one
-                   // is reserved for transport-level auth events when 16.3
-                   // wires them.
+    // TODO: `audit` is unused; a rejected client (svc-ipc-client-rejected) is
+    // only logged, and a transport-level emitter would put it in the audit trail.
+    let _ = audit;
 
     // Step 1: identity check. On reject, write a Forbidden response and close.
     let identity = match classify_pipe_client(pipe) {

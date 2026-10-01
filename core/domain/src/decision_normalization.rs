@@ -18,8 +18,8 @@
 //! # Normalization errors are match-class–scoped, not pipeline-fatal
 //!
 //! A normalization error blocks the **match class** it affects, not the entire
-//! pipeline.  For example, a native IPv6 destination blocks `ExactIp` matching
-//! but hostname and application matching continue normally.  All errors are
+//! pipeline.  For example, an invalid hostname blocks the name classes, while
+//! `ExactIp` and application matching continue normally.  All errors are
 //! recorded in [`MatchClassAvailability`] and surfaced in explain output.
 //!
 //! When all address-based match classes are blocked **and** no app identity is
@@ -38,18 +38,6 @@
 //! The normalization stage reads only `RuntimeInput` and produces
 //! `NormalizedDecisionInput`.  It must not access the active rule book,
 //! adapter state, or UI preferences.
-//!
-//! # `AddressMatch::ExactIp(IpAddr::V6)` in saved rules
-//!
-//! If the active rule book contains a rule with `AddressMatch::ExactIp(V6)`,
-//! that rule is treated as unsupported in the Free edition:
-//! - The rule is preserved in storage and exported unchanged.
-//! - The GUI marks it with the extended-section badge.
-//! - The rule does **not** participate in `ExactIp` matching.
-//!
-//! This check is performed at rule-matching time rather than during
-//! `RuntimeInput` normalization.  It is documented here because it follows
-//! from the same "IPv6 = unsupported" invariant.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -461,7 +449,7 @@ mod tests {
         // Simulates a direct-IP connection (no hostname, IPv4, no process context)
         let input = NormalizedDecisionInput {
             hostname: NormalizedHostname::Unavailable,
-            ip: NormalizedIp::ValidIpv4(Ipv4Addr::new(8, 8, 8, 8)),
+            ip: NormalizedIp::ValidIpv4(Ipv4Addr::new(198, 51, 100, 8)),
             app_identity: None,
             match_class_availability: MatchClassAvailability {
                 exact_fqdn: Some(NormalizationError::DomainEmpty),
@@ -489,7 +477,7 @@ mod tests {
         // Simulates a full connection: hostname + IPv4 + process context
         let input = NormalizedDecisionInput {
             hostname: NormalizedHostname::Valid("example.com".to_owned()),
-            ip: NormalizedIp::ValidIpv4(Ipv4Addr::new(23, 10, 20, 138)),
+            ip: NormalizedIp::ValidIpv4(Ipv4Addr::new(203, 0, 113, 138)),
             app_identity: Some(NormalizedAppIdentity {
                 process_name: "firefox.exe".to_owned(),
                 original_path: Some(r"C:\Program Files\Mozilla Firefox\firefox.exe".to_owned()),

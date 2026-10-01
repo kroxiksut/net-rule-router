@@ -29,7 +29,7 @@ QtObject {
         one[key] = value
         _applyRoutePolicyKeys(one, {
             onApplied: function() { if (o.onApplied) o.onApplied(value) },
-            ok: o.ok, uac: o.uac, failPrefix: o.failPrefix
+            ok: o.ok, uac: o.uac, failPrefix: o.failPrefix, onFailed: o.onFailed
         })
     }
 
@@ -37,7 +37,8 @@ QtObject {
     ///
     /// Not a loop over the single-key form: that would read the policy once per
     /// key, ask for approval once per key, and let two writes race over the
-    /// snapshot each of them read.
+    /// snapshot each of them read. `o.onFailed` runs when the service refused
+    /// the write (a parked intent is not a failure: it is sent again).
     function _applyRoutePolicyKeys(changes, o) {
         o = o || {}
         var keys = Object.keys(changes || {})
@@ -109,6 +110,7 @@ QtObject {
                         ? root.ipcErrorLabel(c) : c
                     root.statusLine = o.failPrefix + label
                 }
+                if (o.onFailed) o.onFailed(c)
             })
         })
     }
@@ -199,11 +201,11 @@ QtObject {
         root.emitPrefs()
         _applyRoutePolicyKey("mode-a-coverage-strategy", want, {
             ok: root.tr("status.mode-a-coverage-set",
-                "Fallback blocking behavior updated."),
+                "Leak protection behavior updated."),
             uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.mode-a-coverage-failed",
-                "Could not update the fallback blocking behavior: ")
+                "Could not update the leak protection behavior: ")
         })
     }
     /// "Resolve rule domains bypassing the hosts file". ON (default) resolves
@@ -263,13 +265,13 @@ QtObject {
             onApplied: function(v) { root.updateRoutingState({ killSwitchStrictSharedIps: v }) },
             ok: want
                 ? root.tr("status.kill-switch-shared-strict-on",
-                    "Strict kill switch: addresses shared with regular sites are blocked too.")
+                    "Strict leak protection: addresses shared with regular sites are blocked too.")
                 : root.tr("status.kill-switch-shared-strict-off",
-                    "Smart kill switch: addresses shared with regular sites are not blocked."),
+                    "Smart leak protection: addresses shared with regular sites are not blocked."),
             uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.kill-switch-shared-strict-failed",
-                "Could not update the kill-switch shared-address mode: ")
+                "Could not update the leak protection shared-address mode: ")
         })
     }
     /// Auto-rules mode: what happens to the companion domains found for a routed
@@ -381,7 +383,7 @@ QtObject {
     /// Complete short names with `suffix` for a connection that announces no
     /// domain. One write for both keys, so the domain is never stored switched
     /// on but empty. The service validates the domain.
-    function applyShortNames(enabled, suffix, onApplied) {
+    function applyShortNames(enabled, suffix, onApplied, onFailed) {
         var want = enabled === true
         var domain = String(suffix || "")
         _applyRoutePolicyKeys({
@@ -392,6 +394,7 @@ QtObject {
                 root.updateRoutingState({ shortNameCompletion: want, shortNameSuffix: domain })
                 if (onApplied) onApplied(want, domain)
             },
+            onFailed: onFailed,
             ok: want
                 ? root.tr("status.short-names-on",
                     "Short names will be completed with {domain}.").replace("{domain}", domain)
@@ -450,10 +453,12 @@ QtObject {
         })
     }
     /// Kill-switch PROTOCOL bitmask (which IP protocols the emergency block cuts:
-    /// TCP=1, UDP=2, ICMP=4, IGMP=8, GRE=16, ESP=32, Other=64). Persisted locally
-    /// first so the selection (incl. ICMP) survives a service-DB wipe.
+    /// TCP=1, UDP=2, ICMP=4, IGMP=8, GRE=16, ESP=32; bit 64 has no box, the caller keeps it as stored). Persisted locally
+    /// first so the selection (incl. ICMP) survives a service-DB wipe. A mask
+    /// that selects nothing is not sent: the service refuses it.
     function applyKillSwitchProtocols(bitmask) {
-        var want = (bitmask | 0) & 0x7F
+        var want = bitmask | 0
+        if (Pure.routePolicyCoerce("kill-switch-protocols", want) !== want) return
         root.prefs.routeKillSwitchProtocols = want
         root.emitPrefs()
         _applyRoutePolicyKey("kill-switch-protocols", want, {
@@ -479,13 +484,13 @@ QtObject {
         _applyRoutePolicyKey("kill-switch-block-all", want, {
             ok: want
                 ? root.tr("status.kill-switch-block-all-on",
-                    "Kill-switch: while the additional adapter is down, all traffic is now blocked except your primary-routed sites.")
+                    "Block-all on: while the additional adapter is down, all traffic is blocked except your local network and already-known primary sites.")
                 : root.tr("status.kill-switch-block-all-off",
-                    "Kill-switch: while the additional adapter is down, only its routed sites are blocked now."),
+                    "Block-all off: while the additional adapter is down, only its routed sites are blocked now."),
             uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.kill-switch-block-all-failed",
-                "Could not update the kill-switch setting: ")
+                "Could not update the block-all setting: ")
         })
     }
     /// MASTER kill-switch toggle (the explicit opt-in). When OFF (default) the

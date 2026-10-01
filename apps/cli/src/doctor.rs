@@ -21,6 +21,7 @@ use nrr_shared::platform_profile::PlatformProfile;
 use nrr_shared::product_identity::{BinaryRole, PRODUCT_NAME};
 
 use crate::exit;
+use crate::link::Link;
 
 /// How bad a single finding is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -179,6 +180,9 @@ pub enum ServiceAnswer {
     Answered { service_version: String },
     /// It did not answer within the probe budget.
     Silent,
+    /// It answered and turned this console away: another protocol version, or
+    /// no admission. Waiting longer cannot change that.
+    Refused { reason: String },
 }
 
 /// Judge gathered facts. Pure: no I/O, no privilege, no clock.
@@ -324,6 +328,12 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
                 "Either its request channel is not serving, or the running service is an older build that does not admit this console. Restart it from this directory and repeat the check.",
             )),
             (ServiceAnswer::Silent, false) => {}
+            // Only a running service can refuse, whatever the manager says.
+            (ServiceAnswer::Refused { reason }, _) => findings.push(Finding::fail(
+                "service answered",
+                format!("it refused this console: {reason}"),
+                "Console and service come from different builds, or the service does not admit this console. Reinstall the service from this directory and repeat the check.",
+            )),
         }
     }
 
@@ -539,37 +549,25 @@ fn probe_service(registration: &Registration) -> Option<ServiceAnswer> {
     if !matches!(registration, Registration::Installed { .. }) {
         return None;
     }
-    nrr_ipc_client::declare_client_kind(
-        nrr_shared::ipc_payloads::ContractNegotiateClientKind::Console,
-    );
-    let client = nrr_ipc_client::ServiceIpcClient::start();
-    let deadline = std::time::Instant::now() + PROBE_BUDGET;
-    loop {
-        match client.connection_status() {
-            nrr_ipc_client::ConnectionStatus::Connected => {
-                return Some(match client.negotiate_info() {
-                    Some(info) if !info.service_version.is_empty() => ServiceAnswer::Answered {
-                        service_version: info.service_version,
-                    },
-                    // Connected but the handshake carried no version: report the
-                    // connection, not a version we do not have.
-                    _ => ServiceAnswer::Answered {
-                        service_version: "unreported".to_string(),
-                    },
-                });
-            }
-            nrr_ipc_client::ConnectionStatus::NotInstalled
-            | nrr_ipc_client::ConnectionStatus::ServiceStopped
-            // A refusal is an answer, and waiting out the budget cannot change it.
-            | nrr_ipc_client::ConnectionStatus::Refused { .. } => {
-                return Some(ServiceAnswer::Silent)
-            }
-            _ => {}
-        }
-        if std::time::Instant::now() >= deadline {
-            return Some(ServiceAnswer::Silent);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let (client, link) = crate::link::open_within(PROBE_BUDGET);
+    Some(service_answer(link, || {
+        client.negotiate_info().map(|info| info.service_version)
+    }))
+}
+
+/// Turn the link outcome into the fact [`assess`] judges. The version is asked
+/// for only once connected.
+fn service_answer(link: Link, version: impl FnOnce() -> Option<String>) -> ServiceAnswer {
+    match link {
+        Link::Connected => ServiceAnswer::Answered {
+            // Connected but the handshake carried no version: report the
+            // connection, not a version we do not have.
+            service_version: version()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "unreported".to_string()),
+        },
+        Link::NotRunning | Link::NotAnswering => ServiceAnswer::Silent,
+        Link::Refused(reason) => ServiceAnswer::Refused { reason },
     }
 }
 
@@ -905,6 +903,57 @@ mod tests {
         });
         let findings = assess(&facts);
         assert_eq!(find(&findings, "service answered").level, Level::Pass);
+    }
+
+    /// A service on another protocol version has answered; reporting it as
+    /// silent sent the operator to `status` after waiting out the budget.
+    #[test]
+    fn a_refusal_is_reported_as_one_not_as_silence() {
+        let refused = service_answer(Link::Refused("it speaks protocol 2".into()), || {
+            panic!("a refused link has no version to ask for")
+        });
+        assert_eq!(
+            refused,
+            ServiceAnswer::Refused {
+                reason: "it speaks protocol 2".into()
+            }
+        );
+
+        // Even when the manager's view lags behind and says stopped.
+        let mut facts = facts(installed(
+            Some(installed_binary(BinaryRole::Service)),
+            "stopped",
+        ));
+        facts.service_answer = Some(refused);
+        let findings = assess(&facts);
+        let finding = find(&findings, "service answered");
+        assert_eq!(finding.level, Level::Fail);
+        assert!(finding.detail.contains("protocol 2"), "{}", finding.detail);
+    }
+
+    #[test]
+    fn the_link_outcome_maps_onto_the_answer() {
+        let no_version = || -> Option<String> { None };
+        assert_eq!(
+            service_answer(Link::NotRunning, no_version),
+            ServiceAnswer::Silent
+        );
+        assert_eq!(
+            service_answer(Link::NotAnswering, no_version),
+            ServiceAnswer::Silent
+        );
+        assert_eq!(
+            service_answer(Link::Connected, no_version),
+            ServiceAnswer::Answered {
+                service_version: "unreported".into()
+            }
+        );
+        assert_eq!(
+            service_answer(Link::Connected, || Some("1.2.3".into())),
+            ServiceAnswer::Answered {
+                service_version: "1.2.3".into()
+            }
+        );
     }
 
     #[test]

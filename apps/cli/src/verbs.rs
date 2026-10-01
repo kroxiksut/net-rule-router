@@ -149,8 +149,7 @@ pub static VERBS: &[VerbSpec] = &[
         subverbs: &[],
     },
     // What `doctor` tells the operator to do when the registered service is a
-    // different copy than the one next to this console — until now there was no
-    // single command for it.
+    // different copy than the one next to this console.
     VerbSpec {
         name: "reinstall",
         summary: "Re-register the service from this directory and start it",
@@ -377,56 +376,45 @@ mod tests {
         }
     }
 
+    /// The whole surface, spelled out. A deny-list only catches the names
+    /// somebody thought of — `set-rules` or `--porcelain` walk straight past
+    /// one — so the accepted set is pinned instead, and growing it is an edit
+    /// here, made on purpose.
+    ///
+    /// What stays out whatever it is called: verbs that edit or apply policy,
+    /// machine-readable output, config files and remote targets (the pieces of
+    /// an automation API), and putting this console on the user's `PATH` — that
+    /// is an explicit, undoable action in the application, never a verb a script
+    /// can run quietly.
     #[test]
-    fn the_console_declares_no_policy_verb() {
-        // The Free console manages the service; it never edits or applies
-        // policy. If one of these ever appears in the table, the boundary was
-        // crossed by accident rather than by decision.
-        const FORBIDDEN: &[&str] = &["apply", "rules", "switch", "pause", "resume", "profile"];
-        for verb in all_specs() {
-            assert!(
-                !FORBIDDEN.contains(&verb.name),
-                "`{}` mutates policy and does not belong in this console",
-                verb.name
-            );
-        }
-    }
-
-    #[test]
-    fn the_console_does_not_put_itself_on_the_users_path() {
-        // Making this console reachable by name changes the environment every
-        // future shell of that user inherits. It is offered as an explicit
-        // action in the application, where the user can see what it will change
-        // and undo it, and it is deliberately NOT a verb here: a console that
-        // can install itself into the environment is a console a script can
-        // invoke to do so quietly. The capability itself lives behind
-        // `nrr_platform_api::path_registration`.
-        const FORBIDDEN: &[&str] = &["path", "register", "setup"];
-        for verb in all_specs() {
-            assert!(
-                !FORBIDDEN.contains(&verb.name),
-                "`{}` changes the caller's environment and belongs to the explicit \
-                 in-app action, not to this console",
-                verb.name
-            );
-        }
-    }
-
-    #[test]
-    fn the_console_declares_no_machine_output_or_remoting_flag() {
-        // Machine-readable output, config files and remote targets are what
-        // turn a console into an automation API. Their absence is a decision.
-        const FORBIDDEN: &[&str] = &["json", "config", "host", "watch", "token"];
-        for verb in all_specs() {
-            for flag in verb.flags {
-                assert!(
-                    !FORBIDDEN.contains(&flag.name),
-                    "`--{}` on `{}` is an automation surface",
-                    flag.name,
-                    verb.name
-                );
-            }
-        }
+    fn the_console_accepts_exactly_this_surface() {
+        const SURFACE: &[(&str, &[&str])] = &[
+            ("install", &["start-mode", "elevate"]),
+            ("uninstall", &["purge", "elevate"]),
+            ("start", &["elevate"]),
+            ("stop", &["elevate"]),
+            ("restart", &["elevate"]),
+            ("reinstall", &["elevate"]),
+            ("status", &[]),
+            ("diag doctor", &[]),
+            ("diag logs", &["tail"]),
+            ("diag export", &[]),
+            ("reset-network", &["confirm", "elevate"]),
+            ("version", &[]),
+            ("help", &[]),
+        ];
+        let declared: Vec<(String, Vec<&str>)> = invocable()
+            .into_iter()
+            .map(|(spelling, verb)| (spelling, verb.flags.iter().map(|f| f.name).collect()))
+            .collect();
+        let pinned: Vec<(String, Vec<&str>)> = SURFACE
+            .iter()
+            .map(|(spelling, flags)| (spelling.to_string(), flags.to_vec()))
+            .collect();
+        assert_eq!(
+            declared, pinned,
+            "the console's verbs or flags changed; widening them is a decision"
+        );
     }
 
     #[test]

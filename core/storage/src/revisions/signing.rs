@@ -185,58 +185,6 @@ impl<'c> RevisionsRepository<'c> {
         Ok(Some(before))
     }
 
-    /// Walk every row in `revisions` and rewrite `row_hmac` with a
-    /// fresh HMAC. Driven by the
-    /// `SecurityAlert::DbTamperDetected` ack flow (the user says
-    /// "I've reviewed the rules and accept the current state") and
-    /// the first-boot upgrade path that finds existing rows but no
-    /// HMACs (lazy backfill).
-    ///
-    /// Returns the number of rows re-signed. No-op when the
-    /// repository has no signing key (and returns 0).
-    pub fn re_sign_all(&self) -> StorageResult<ReSignReport> {
-        if self.key().is_none() {
-            return Ok(ReSignReport::default());
-        }
-        let mut stmt = self
-            .conn
-            .prepare("SELECT revision_id FROM revisions ORDER BY created_at ASC")
-            .map_err(|e| StorageError::Internal(format!("revisions re_sign_all prepare: {e}")))?;
-        let ids: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| StorageError::Internal(format!("revisions re_sign_all query: {e}")))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StorageError::Internal(format!("revisions re_sign_all collect: {e}")))?;
-        drop(stmt);
-        let mut report = ReSignReport::default();
-        for id in &ids {
-            let before = self.re_sign_row(id)?;
-            report.re_signed += 1;
-            if matches!(
-                before,
-                Some(crate::revision_hmac::HmacVerification::Tampered)
-            ) {
-                // Adopted, not repaired: this row did not match its signature
-                // before we wrote a new one. The caller has to say so out loud.
-                report.adopted_tampered.push(id.clone());
-            }
-        }
-        // The pointer decides which of those revisions is ENFORCED, so an
-        // acknowledgement that left it unsigned would raise the same alert on
-        // the next start.
-        for (principal, _) in self.verify_all_pointers()? {
-            let before = self.re_sign_pointer_for(&principal)?;
-            report.re_signed += 1;
-            if matches!(
-                before,
-                Some(crate::revision_hmac::HmacVerification::Tampered)
-            ) {
-                report.adopted_tampered.push(format!("pointer:{principal}"));
-            }
-        }
-        Ok(report)
-    }
-
     /// Verify every row's stored `row_hmac` against a fresh
     /// recomputation, returning `(revision_id, outcome)` pairs in
     /// `created_at` order. Driven by the service-runtime tamper

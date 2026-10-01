@@ -325,8 +325,8 @@ mod tests {
         // The provider's generated reverse name forward-confirms perfectly and
         // sits under a wide rule — adopting it would hand the whole fleet to
         // that rule.
-        let ip = Ipv4Addr::new(23, 10, 20, 132);
-        let name = "132.20.10.23.bc.hosting.example";
+        let ip = Ipv4Addr::new(100, 64, 0, 132);
+        let name = "132.0.64.100.bc.hosting.example";
         let l = learner(&[(ip, &[name])], &[(name, &[ip])], "hosting.example", 64);
         assert_eq!(l.learn(ip), LearnOutcome::NotConfirmed);
         assert!(l.sink.kept.lock().unwrap().is_empty());
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn a_service_name_under_the_same_zone_is_still_learned() {
-        let ip = Ipv4Addr::new(23, 10, 20, 148);
+        let ip = Ipv4Addr::new(100, 64, 0, 148);
         let name = "lh3.hosting.example";
         let l = learner(&[(ip, &[name])], &[(name, &[ip])], "hosting.example", 64);
         assert_eq!(l.learn(ip), LearnOutcome::Learned);
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn confirmed_but_non_rule_host_is_not_kept() {
-        let ip = Ipv4Addr::new(23, 10, 20, 138);
+        let ip = Ipv4Addr::new(100, 64, 0, 138);
         let l = learner(
             &[(ip, &["example.com"])],
             &[("example.com", &[ip])],
@@ -476,8 +476,8 @@ mod tests {
         // The memory is a window, not a ceiling: a new destination is always
         // attempted, and one that falls out of the window can be tried again,
         // which is how a transient failure heals.
-        let a = Ipv4Addr::new(1, 1, 1, 1);
-        let b = Ipv4Addr::new(2, 2, 2, 2);
+        let a = Ipv4Addr::new(100, 64, 1, 1);
+        let b = Ipv4Addr::new(100, 64, 2, 2);
         let l = learner(&[], &[], ".example", 1);
         assert_eq!(l.learn(a), LearnOutcome::NotConfirmed);
         assert_eq!(
@@ -522,7 +522,7 @@ mod tests {
     fn a_lookup_that_answered_nothing_is_retried_once_the_delay_passes() {
         // The failure most likely to happen here is the block-all that caused
         // the drop; a permanent record would disable the address until restart.
-        let ip = Ipv4Addr::new(1, 1, 1, 1);
+        let ip = Ipv4Addr::new(100, 64, 1, 1);
         let l = learner(&[], &[], ".example", 8);
         assert_eq!(l.learn(ip), LearnOutcome::NotConfirmed);
         assert_eq!(l.learn(ip), LearnOutcome::Skipped, "still deduped");
@@ -546,7 +546,7 @@ mod tests {
     fn a_remembered_attempt_is_not_repeated() {
         // The window is still a dedup: while an address is in it, a drop storm
         // against the same destination costs one lookup, not one per packet.
-        let a = Ipv4Addr::new(1, 1, 1, 1);
+        let a = Ipv4Addr::new(100, 64, 1, 1);
         let l = learner(&[], &[], ".example", 8);
         assert_eq!(l.learn(a), LearnOutcome::NotConfirmed);
         assert_eq!(l.learn(a), LearnOutcome::Skipped);
@@ -558,7 +558,7 @@ mod tests {
         let l = learner(
             &[(ip, &["decoy.test", "feed.example"])],
             &[
-                ("decoy.test", &[Ipv4Addr::new(9, 9, 9, 9)]),
+                ("decoy.test", &[Ipv4Addr::new(100, 64, 9, 9)]),
                 ("feed.example", &[ip]),
             ],
             ".example",

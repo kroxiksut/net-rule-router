@@ -94,10 +94,7 @@ impl ConnectionObservationSource for ProcfsConnectionObserver {
                 let Ok(text) = std::fs::read_to_string(path) else {
                     continue;
                 };
-                for socket in parse_socket_table(&text, v6) {
-                    if !is_outbound(&socket, protocol) {
-                        continue;
-                    }
+                for socket in outbound_sockets(&text, v6, protocol) {
                     current.insert(socket.inode);
                     if !seen.contains(&socket.inode) {
                         fresh.push((socket, protocol));
@@ -300,6 +297,29 @@ fn is_outbound(socket: &ProcSocket, protocol: TransportProtocol) -> bool {
     }
 }
 
+/// The outbound rows of one table, a dual-stack socket's v4-mapped endpoints
+/// unmapped: every consumer routes IPv4 and would drop them as IPv6.
+fn outbound_sockets(text: &str, v6: bool, protocol: TransportProtocol) -> Vec<ProcSocket> {
+    parse_socket_table(text, v6)
+        .into_iter()
+        .map(|mut socket| {
+            socket.local = unmapped(socket.local);
+            socket.remote = unmapped(socket.remote);
+            socket
+        })
+        .filter(|socket| is_outbound(socket, protocol))
+        .collect()
+}
+
+fn unmapped(endpoint: SocketAddr) -> SocketAddr {
+    match endpoint.ip() {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(endpoint, |v4| {
+            SocketAddr::new(IpAddr::V4(v4), endpoint.port())
+        }),
+        IpAddr::V4(_) => endpoint,
+    }
+}
+
 /// Parse a `/proc/net/{tcp,udp}[6]` table. Pure over the text, so its tests run
 /// on every host.
 #[must_use]
@@ -411,6 +431,22 @@ mod tests {
         assert_eq!(sockets[0].remote.port(), 443);
     }
 
+    /// A dual-stack program (Java, .NET) connects to an IPv4 host through a v6
+    /// socket; the row must reach the consumers as the IPv4 peer it is.
+    #[test]
+    fn a_v4_mapped_peer_in_tcp6_is_reported_as_ipv4() {
+        let table = "  sl  local_address remote_address st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0000000000000000FFFF00000F02000A:C9B2 0000000000000000FFFF0000330200C0:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 51223 1 0000000000000000
+   1: 000080FE00000000FF67B4FE7B8B3902:C9B3 0D0C0B0A0908070605040302010000FF:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 51224 1 0000000000000000
+";
+        let sockets = outbound_sockets(table, true, TransportProtocol::Tcp);
+
+        assert_eq!(sockets.len(), 2);
+        assert_eq!(sockets[0].local, addr("10.0.2.15:51634"));
+        assert_eq!(sockets[0].remote, addr("192.0.2.51:443"));
+        assert!(sockets[1].remote.is_ipv6(), "a real v6 peer stays v6");
+    }
+
     #[test]
     fn a_socket_descriptor_yields_its_inode() {
         assert_eq!(socket_inode("socket:[44551]"), Some(44551));
@@ -423,12 +459,12 @@ mod tests {
     #[test]
     fn a_connected_udp_socket_counts_even_though_it_has_no_state() {
         let table = "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
-   0: 0F02000A:E5B4 08080808:0035 07 00000000:00000000 00:00000000 00000000  1000        0 51000 2 0000000000000000 0
+   0: 0F02000A:E5B4 086433C6:0035 07 00000000:00000000 00:00000000 00000000  1000        0 51000 2 0000000000000000 0
 ";
         let sockets = parse_socket_table(table, false);
 
         assert!(is_outbound(&sockets[0], TransportProtocol::Udp));
-        assert_eq!(sockets[0].remote, addr("8.8.8.8:53"));
+        assert_eq!(sockets[0].remote, addr("198.51.100.8:53"));
     }
 
     /// A truncated or unexpected row is skipped, never guessed at: procfs

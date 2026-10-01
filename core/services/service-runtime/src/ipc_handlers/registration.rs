@@ -88,8 +88,11 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 registry.register(op, OperationStatusHandler::new(deps.operations.clone()));
             }
             IpcOperationName::RollbackRequest => {
-                let mut handler =
-                    RollbackHandler::new(deps.mutation_executor.clone(), deps.operations.clone());
+                let mut handler = RollbackHandler::new(
+                    deps.mutation_executor.clone(),
+                    deps.mutation_tokens.clone(),
+                    deps.operations.clone(),
+                );
                 // Re-activating an older revision is a rule change too.
                 if let Some(stability) = deps.service_stability_provider.clone() {
                     handler = handler.with_stability_provider(stability);
@@ -125,7 +128,7 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 registry.register(op, AuditListHandler::new(deps.diagnostics.clone()));
             }
             IpcOperationName::SecurityAlertsList => {
-                registry.register(op, SecurityAlertsHandler::new(deps.alerts_repo.clone()));
+                registry.register(op, SecurityAlertsHandler::new(deps.diagnostics.clone()));
             }
             IpcOperationName::RulesList => {
                 registry.register(op, RulesListHandler::new(deps.rules.clone()));
@@ -347,14 +350,6 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 registry.register(
                     op,
                     diagnostics_handlers::LogsClearHandler::new(deps.diagnostics.clone()),
-                );
-            }
-            // DiagnosticModeSet: the facade is always present, so register
-            // the real handler unconditionally (like LogsClear).
-            IpcOperationName::DiagnosticModeSet => {
-                registry.register(
-                    op,
-                    diagnostics_handlers::DiagnosticModeSetHandler::new(deps.diagnostics.clone()),
                 );
             }
             // CacheClear handler. The FQDN/IP cache DB may

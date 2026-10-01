@@ -58,7 +58,7 @@ impl SecondaryRouteCoordinator {
             let Some(binding) = policy.secondary.as_ref() else {
                 continue;
             };
-            match self.resolve_binding_target(sid, binding, &infos, "secondary") {
+            match self.resolve_binding_target(sid, binding, &infos, "secondary", None) {
                 Some(t) => {
                     // A tunnel adapter that is recreated comes back under a NEW
                     // ifindex, and the liveness window is keyed by index. Left
@@ -211,7 +211,7 @@ impl SecondaryRouteCoordinator {
                     target: "nrr::route-coordinator",
                     msg_key = "route-first-contact-install-failed",
                     sid = %sid,
-                    error = ?e,
+                    error = %e,
                     "first-contact routes did not install — the next recompute adds them",
                 );
                 0

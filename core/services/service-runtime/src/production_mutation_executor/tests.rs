@@ -88,15 +88,15 @@ fn two_spellings_of_one_app_rule_become_one_payload() {
         p
     }
 
-    let typed = payload("SwiftVPN 3.0.exe");
-    let stored = payload("swiftvpn 3.0.exe");
+    let typed = payload("ExampleVPN 3.0.exe");
+    let stored = payload("examplevpn 3.0.exe");
     assert_eq!(typed.rules_json, stored.rules_json);
     assert_eq!(typed.content_hash, stored.content_hash);
     assert_ne!(
         typed.content_hash, "client-supplied",
         "the hash must be recomputed from the canonical form, not trusted"
     );
-    assert!(typed.rules_json.contains("swiftvpn 3.0.exe"));
+    assert!(typed.rules_json.contains("examplevpn 3.0.exe"));
 }
 
 /// The GUI table re-sorted is the same rule book: rules sharing one address
@@ -162,7 +162,7 @@ fn a_linux_service_re_spells_an_app_rule_without_the_windows_suffix() {
             "primary": [{
                 "id": "r-1",
                 "enabled": true,
-                "app-match": { "pattern": { "kind": "exact", "value": "Telegram-Desktop" },
+                "app-match": { "pattern": { "kind": "exact", "value": "Messenger-Desktop" },
                                "include-child-processes": false },
                 "comment": "",
                 "action": "route",
@@ -175,7 +175,7 @@ fn a_linux_service_re_spells_an_app_rule_without_the_windows_suffix() {
     };
     ProductionMutationExecutor::canonicalize_rules_payload(&mut p, HostPlatform::Linux);
     assert!(
-        p.rules_json.contains("\"telegram-desktop\""),
+        p.rules_json.contains("\"messenger-desktop\""),
         "{}",
         p.rules_json
     );
@@ -250,6 +250,31 @@ fn pre_flight_findings_reach_the_review_as_one_signal_per_kind() {
         ]
     );
     assert!(pre_flight_signals(&[]).is_empty());
+}
+
+/// The review promises a refusal for exactly the findings the coordinator
+/// refuses on.
+#[test]
+fn the_review_says_refused_for_exactly_the_blocking_categories() {
+    for category in [
+        PreFlightCategory::FilterIdCollision,
+        PreFlightCategory::BatchOverflow,
+        PreFlightCategory::InvalidRulesContent,
+        PreFlightCategory::AppRuleUnenforceable,
+        PreFlightCategory::BindingUnresolved,
+    ] {
+        let signals = pre_flight_signals(&[PreFlightWarning {
+            sid: "S".into(),
+            category,
+            subjects: Vec::new(),
+            message: String::new(),
+        }]);
+        assert_eq!(
+            signals.contains(&RiskSignalDto::ApplyWillBeRefused),
+            category.blocks_activation(),
+            "{category:?}"
+        );
+    }
 }
 
 // ── Real risk-scoring path ────────────────────────────────────────────
@@ -405,7 +430,7 @@ fn build_test_coordinator_opt(
 }
 
 #[test]
-fn ack_of_tamper_alert_re_signs_rows_and_lifts_gate() {
+fn ack_of_tamper_alert_re_signs_the_shown_row_and_lifts_gate() {
     use crate::tamper_bootstrap::mutations_blocked_by_alert;
     use nrr_diagnostics::audit::alert::{
         InMemorySecurityAlertsRepository, SecurityAlert, SecurityAlertState,
@@ -456,12 +481,22 @@ fn ack_of_tamper_alert_re_signs_rows_and_lifts_gate() {
         );
     }
 
+    let alert_id = {
+        let g = state_conn.lock().unwrap();
+        let scan = RevisionsRepository::with_signing_key(&g, key.clone())
+            .integrity_scan()
+            .unwrap();
+        crate::integrity_review::tamper_alert_id(
+            scan.iter().find(|r| r.revision_id() == "rev-1").unwrap(),
+        )
+    };
+
     let coord = build_test_coordinator_signed(Arc::clone(&state_conn), key.clone());
     let alerts: Arc<dyn SecurityAlertsRepository> =
         Arc::new(InMemorySecurityAlertsRepository::new());
     alerts
         .insert(&SecurityAlert {
-            alert_id: "alt-dbtamper-rev-1".into(),
+            alert_id: alert_id.clone(),
             kind: "db_tamper_detected".into(),
             state: SecurityAlertState::Active,
             raised_event_seq: 0,
@@ -483,10 +518,17 @@ fn ack_of_tamper_alert_re_signs_rows_and_lifts_gate() {
     let exec =
         ProductionMutationExecutor::new(Arc::clone(&coord)).with_alerts_repo(Arc::clone(&alerts));
 
-    // Acknowledge through the real execute() path.
+    // Acknowledge through the real dry-run + execute() path.
+    let payload = serde_json::json!({ "alert-id": alert_id });
+    let shown: Vec<_> = exec
+        .unverified_rows(MutationKind::SecurityAlertAck, &payload)
+        .into_iter()
+        .map(|r| r.row)
+        .collect();
+    assert_eq!(shown.len(), 1, "the dialog lists the tampered row");
     let stored = StoredMutation {
         kind: MutationKind::SecurityAlertAck,
-        payload: serde_json::json!({ "alert-id": "alt-dbtamper-rev-1" }),
+        payload: serde_json::json!({ "alert-id": alert_id, "adopt-rows": shown }),
         correlation_id: None,
         issuer_sid: String::new(),
         caller_is_elevated: false,
@@ -508,7 +550,7 @@ fn ack_of_tamper_alert_re_signs_rows_and_lifts_gate() {
         );
     }
     // Alert moved to Acknowledged → the live gate lifts.
-    let alert = alerts.find_by_id("alt-dbtamper-rev-1").unwrap().unwrap();
+    let alert = alerts.find_by_id(&alert_id).unwrap().unwrap();
     assert_eq!(alert.state, SecurityAlertState::Acknowledged);
     assert!(
         !mutations_blocked_by_alert(alerts.as_ref()),
@@ -665,6 +707,234 @@ fn reset_to_baseline_clears_principal_divergence() {
         coord.current_active_for(SID_A).unwrap().is_none(),
         "after reset A has no own revision → provider read-through to baseline"
     );
+}
+
+/// A user's rules change is that user's news; the baseline's reaches every
+/// session, since every un-diverged user runs it.
+#[test]
+fn mutation_progress_reaches_only_the_owner_of_the_changed_rules() {
+    const SID_A: &str = "S-1-5-21-9000-1";
+    const SID_B: &str = "S-1-5-21-9000-2";
+    let (exec, _conn) = build_test_executor();
+    let bus = Arc::new(EventBus::new());
+    let exec = exec.with_event_bus(Arc::clone(&bus));
+    let a = bus.subscribe_as("gui-a".into(), Some(SID_A.into()), None);
+    let b = bus.subscribe_as("gui-b".into(), Some(SID_B.into()), None);
+    let update = |correlation: &str| StoredMutation {
+        kind: MutationKind::RulesUpdate,
+        payload: serde_json::json!({
+            "rules-json": r#"{"schema-version":1,"primary":[],"secondary":[]}"#,
+            "content-hash": "h",
+        }),
+        correlation_id: Some(correlation.into()),
+        issuer_sid: SID_A.to_string(),
+        caller_is_elevated: true,
+    };
+    let progress = |sub: &str| -> Vec<String> {
+        bus.peek_pending_for(sub, 64)
+            .into_iter()
+            .filter_map(|e| match e.event {
+                StatusUpdateEvent::MutationProgress {
+                    correlation_id,
+                    phase,
+                    ..
+                } => Some(format!("{correlation_id}:{phase}")),
+                _ => None,
+            })
+            .collect()
+    };
+
+    exec.execute(update("corr-own"), SID_A);
+    assert_eq!(progress(&a.subscription_id).len(), 2, "started + terminal");
+    assert!(
+        progress(&b.subscription_id).is_empty(),
+        "another user must not see this user's rules change"
+    );
+
+    exec.execute(update("corr-baseline"), nrr_storage::BASELINE_PRINCIPAL);
+    for sub in [&a.subscription_id, &b.subscription_id] {
+        assert_eq!(
+            progress(sub)
+                .iter()
+                .filter(|p| p.starts_with("corr-baseline:"))
+                .count(),
+            2,
+            "the baseline change reaches every session"
+        );
+    }
+}
+
+/// Alerts and the audit chain are the machine's, whoever confirmed them.
+#[test]
+fn machine_wide_mutations_are_not_addressed_to_their_confirmer() {
+    const SID_A: &str = "S-1-5-21-9000-1";
+    assert_eq!(
+        progress_addressee(MutationKind::RulesUpdate, SID_A).as_deref(),
+        Some(SID_A)
+    );
+    for kind in [
+        MutationKind::AuditChainRestart,
+        MutationKind::SecurityAlertAck,
+    ] {
+        assert_eq!(progress_addressee(kind, SID_A), None, "{kind:?}");
+    }
+}
+
+/// An acknowledgement changes the alert list every session shows, and only a
+/// change does: a refused transition announces nothing.
+#[test]
+fn an_alert_state_change_tells_every_session_to_reread_the_list() {
+    use nrr_diagnostics::audit::alert::{InMemorySecurityAlertsRepository, SecurityAlert};
+
+    const SID_A: &str = "S-1-5-21-9000-1";
+    const SID_B: &str = "S-1-5-21-9000-2";
+    let alerts: Arc<dyn SecurityAlertsRepository> =
+        Arc::new(InMemorySecurityAlertsRepository::new());
+    alerts
+        .insert(&SecurityAlert {
+            alert_id: "alt-audit-1".into(),
+            kind: "tamper_alert_raised".into(),
+            state: SecurityAlertState::Active,
+            raised_event_seq: 0,
+            raised_file: "scan".into(),
+            ack_event_seq: None,
+            ack_file: None,
+            resolved_event_seq: None,
+            resolved_file: None,
+            created_at: 1,
+            updated_at: 1,
+            reason_code: "r".into(),
+        })
+        .unwrap();
+    let (exec, _conn) = build_test_executor();
+    let bus = Arc::new(EventBus::new());
+    let exec = exec
+        .with_alerts_repo(Arc::clone(&alerts))
+        .with_event_bus(Arc::clone(&bus));
+    let a = bus.subscribe_as("gui-a".into(), Some(SID_A.into()), None);
+    let b = bus.subscribe_as("gui-b".into(), Some(SID_B.into()), None);
+    let announced = |sub: &str| {
+        bus.peek_pending_for(sub, 64)
+            .into_iter()
+            .filter(|e| matches!(e.event, StatusUpdateEvent::SecurityAlertsChanged))
+            .count()
+    };
+    let ack = || StoredMutation {
+        kind: MutationKind::SecurityAlertAck,
+        payload: serde_json::json!({ "alert-id": "alt-audit-1" }),
+        correlation_id: None,
+        issuer_sid: SID_A.to_string(),
+        caller_is_elevated: false,
+    };
+
+    assert!(matches!(
+        exec.execute(ack(), SID_A),
+        MutationOutcome::Completed(_)
+    ));
+    for sub in [&a.subscription_id, &b.subscription_id] {
+        assert_eq!(announced(sub), 1, "{sub}");
+    }
+
+    assert!(matches!(
+        exec.execute(ack(), SID_A),
+        MutationOutcome::Failed(_)
+    ));
+    assert_eq!(
+        announced(&a.subscription_id),
+        1,
+        "a refused ack changed nothing"
+    );
+}
+
+/// Acknowledging and resolving an alert each leave their own event in the
+/// audit trail, and the alert points at that exact line.
+#[test]
+fn an_alert_state_change_is_audited_and_the_alert_points_at_the_line() {
+    use nrr_diagnostics::audit::alert::{InMemorySecurityAlertsRepository, SecurityAlert};
+    use nrr_diagnostics::audit::AuditReader;
+    use nrr_diagnostics::facade::dto::DiagnosticsAudience;
+    use nrr_diagnostics::{AuditWriter, AuditWriterConfig};
+
+    const SID_A: &str = "S-1-5-21-9000-1";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alerts: Arc<dyn SecurityAlertsRepository> =
+        Arc::new(InMemorySecurityAlertsRepository::new());
+    alerts
+        .insert(&SecurityAlert {
+            alert_id: "alt-audit-2".into(),
+            kind: "tamper_alert_raised".into(),
+            state: SecurityAlertState::Active,
+            raised_event_seq: 0,
+            raised_file: "scan".into(),
+            ack_event_seq: None,
+            ack_file: None,
+            resolved_event_seq: None,
+            resolved_file: None,
+            created_at: 1,
+            updated_at: 1,
+            reason_code: "r".into(),
+        })
+        .unwrap();
+    let (exec, _conn) = build_test_executor();
+    let exec = exec
+        .with_alerts_repo(Arc::clone(&alerts))
+        .with_audit_writer(Arc::new(AuditWriter::open(AuditWriterConfig::new(
+            dir.path(),
+        ))));
+    let change = |kind| StoredMutation {
+        kind,
+        payload: serde_json::json!({ "alert-id": "alt-audit-2" }),
+        correlation_id: None,
+        issuer_sid: SID_A.to_string(),
+        caller_is_elevated: false,
+    };
+
+    for kind in [
+        MutationKind::SecurityAlertAck,
+        MutationKind::SecurityAlertResolve,
+    ] {
+        assert!(matches!(
+            exec.execute(change(kind), SID_A),
+            MutationOutcome::Completed(_)
+        ));
+    }
+
+    let events = AuditReader::new(dir.path()).scan(
+        &nrr_diagnostics::audit::AuditQueryFilter::new(),
+        &DiagnosticsAudience::Machine,
+    );
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["tamper_alert_acknowledged", "tamper_alert_resolved"]
+    );
+    assert!(events.iter().all(|e| e.actor_kind == "user"));
+    let alert = alerts
+        .find_by_id("alt-audit-2")
+        .unwrap()
+        .expect("alert kept");
+    let kind_at = |seq: Option<u64>| {
+        events
+            .iter()
+            .find(|e| Some(e.seq) == seq)
+            .map(|e| e.kind.as_str())
+    };
+    assert_eq!(
+        kind_at(alert.ack_event_seq),
+        Some("tamper_alert_acknowledged")
+    );
+    assert_eq!(
+        kind_at(alert.resolved_event_seq),
+        Some("tamper_alert_resolved")
+    );
+    let files = AuditReader::new(dir.path()).list_files();
+    let file_name = files[0]
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("file name")
+        .to_string();
+    assert_eq!(alert.ack_file.as_deref(), Some(file_name.as_str()));
+    assert_eq!(alert.resolved_file.as_deref(), Some(file_name.as_str()));
 }
 
 struct TestActivationAuditEmitter;
@@ -873,6 +1143,29 @@ fn preset_import_rejects_invalid_utf8_bytes() {
     assert_eq!(err.code, "file-encoding");
 }
 
+/// A preset the service cannot read previews as a refusal under the code its
+/// execute fails with, not as a change set the window could offer to apply.
+#[test]
+fn an_unreadable_preset_previews_as_a_refusal() {
+    let (exec, _conn) = build_test_executor();
+    let payload = serde_json::json!({
+        "primary-bytes-b64": BASE64_STANDARD.encode(b"\xFF\xFE--- Domains\n"),
+        "include-child-processes": false,
+    });
+    let review = exec.preview_preset_import(&payload, nrr_storage::BASELINE_PRINCIPAL);
+    assert_eq!(
+        review.risk_signals,
+        vec![RiskSignalDto::ChangeRefused {
+            code: "file-encoding".into()
+        }]
+    );
+    assert!(
+        review.changed_fields.is_empty(),
+        "a refusal carries nothing to review: {:?}",
+        review.changed_fields
+    );
+}
+
 #[test]
 fn preset_import_rejects_inline_comment_over_limit() {
     let (exec, _conn) = build_test_executor();
@@ -904,6 +1197,13 @@ fn preset_and_rules_payload_refuse_a_control_character_alike() {
         panic!("expected Failed");
     };
     assert_eq!(err.code, "control-character");
+    let review = exec.preview_preset_import(&payload, nrr_storage::BASELINE_PRINCIPAL);
+    assert_eq!(
+        review.risk_signals,
+        vec![RiskSignalDto::ChangeRefused {
+            code: "control-character".into()
+        }]
+    );
 
     let rules_json = serde_json::json!({
         "schema-version": 1,
@@ -924,6 +1224,68 @@ fn preset_and_rules_payload_refuse_a_control_character_alike() {
     };
     assert_eq!(err.code, "control-character");
     assert!(err.message.contains("r-1"), "{}", err.message);
+    let review = exec.preview_rules_update(&payload, nrr_storage::BASELINE_PRINCIPAL);
+    assert_eq!(
+        review.risk_signals,
+        vec![RiskSignalDto::ChangeRefused {
+            code: "control-character".into()
+        }]
+    );
+}
+
+/// A value the rules table marks as an error is refused under its own code;
+/// the preview names the values (in canonical rule order), so the user learns
+/// which rows to fix.
+#[test]
+fn a_refused_rule_value_has_its_own_code_and_the_preview_names_the_values() {
+    let (exec, _conn) = build_test_executor();
+    let rules_json = serde_json::json!({
+        "schema-version": 1,
+        "primary": [
+            { "id": "r-1", "enabled": true,
+              "address-match": { "kind": "zone", "name": "123" } },
+            { "id": "r-2", "enabled": true,
+              "address-match": { "kind": "exact-fqdn", "value": "example.com" } },
+            { "id": "r-3", "enabled": true,
+              "address-match": { "kind": "exact-fqdn", "value": "192.0.2.1" } },
+        ],
+        "secondary": [],
+    })
+    .to_string();
+    let payload = serde_json::json!({ "rules-json": rules_json, "content-hash": "h" });
+
+    let review = exec.preview_rules_update(&payload, nrr_storage::BASELINE_PRINCIPAL);
+    assert_eq!(
+        review.risk_signals,
+        vec![RiskSignalDto::InvalidRuleValue {
+            rules: vec!["192.0.2.1".into(), "123".into()],
+        }]
+    );
+
+    let MutationOutcome::Failed(err) =
+        exec.execute_rules_update(&payload, nrr_storage::BASELINE_PRINCIPAL)
+    else {
+        panic!("expected Failed");
+    };
+    assert_eq!(err.code, "invalid-rule-value");
+    assert!(err.message.contains("r-3, r-1"), "{}", err.message);
+}
+
+/// A long list stops at the cap and says there is more.
+#[test]
+fn the_preview_names_a_bounded_number_of_refused_values() {
+    let refused: Vec<RefusedRuleValue> = (0..REFUSED_VALUES_SHOWN + 3)
+        .map(|i| RefusedRuleValue {
+            rule_id: format!("r-{i}"),
+            value: format!("{i}"),
+        })
+        .collect();
+    let summary = invalid_rule_value_summary(&refused);
+    let [RiskSignalDto::InvalidRuleValue { rules }] = summary.risk_signals.as_slice() else {
+        panic!("one signal expected: {:?}", summary.risk_signals);
+    };
+    assert_eq!(rules.len(), REFUSED_VALUES_SHOWN + 1);
+    assert_eq!(rules.last().map(String::as_str), Some("…"));
 }
 
 #[test]
@@ -1133,7 +1495,7 @@ fn a_linux_service_stores_app_names_without_the_windows_suffix() {
             .rules_json
     };
 
-    let preset = "--- Linux\ntelegram-desktop\nCodex*\n--- Windows\nbrowser\n";
+    let preset = "--- Linux\nmessenger-desktop\nCodex*\n--- Windows\nbrowser\n";
     let import = serde_json::json!({
         "secondary-bytes-b64": b64(preset),
         "include-child-processes": false,
@@ -1144,7 +1506,7 @@ fn a_linux_service_stores_app_names_without_the_windows_suffix() {
         MutationOutcome::Completed(_)
     ));
     let stored = active_rules_json();
-    assert!(stored.contains("\"telegram-desktop\""), "{stored}");
+    assert!(stored.contains("\"messenger-desktop\""), "{stored}");
     assert!(stored.contains("\"codex*\""), "{stored}");
     assert!(
         !stored.contains(".exe") && !stored.contains("browser"),
@@ -1177,7 +1539,7 @@ fn a_linux_service_stores_app_names_without_the_windows_suffix() {
     ));
     let stored = active_rules_json();
     assert!(stored.contains("\"signal-desktop\""), "{stored}");
-    assert!(stored.contains("\"telegram-desktop\""), "{stored}");
+    assert!(stored.contains("\"messenger-desktop\""), "{stored}");
     assert!(!stored.contains(".exe"), "{stored}");
 }
 
@@ -1266,6 +1628,130 @@ fn executor_without_a_stability_provider_leaves_the_gate_open() {
     ));
 }
 
+// ── Tamper gate at the executor ──────────────────────────────────────
+
+/// Any principal's rule book is empty: enough for the author to append to.
+struct EmptyBook;
+
+impl crate::per_sid_orchestrator::RulesProvider for EmptyBook {
+    fn active_rules(&self) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+        Some(crate::per_sid_orchestrator::ActiveRulesSnapshot {
+            rule_book: CanonicalRuleBook::default(),
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+        })
+    }
+}
+
+/// The tray's "route this blocked host" and companion-domain acceptance reach
+/// the executor through the rule author, never through the IPC handler, so an
+/// unacknowledged tamper or key-reset alert must stop them here.
+#[test]
+fn an_active_blocking_alert_refuses_auto_authored_rules_until_acknowledged() {
+    use crate::auto_rules::{AuthoredMatchKind, AuthoredRule, AutoRuleAuthor};
+    use crate::tamper_bootstrap::SECURITY_ALERT_GATE_CODE;
+    use nrr_diagnostics::audit::alert::{InMemorySecurityAlertsRepository, SecurityAlert};
+    use nrr_diagnostics::audit::kind::AuditEventKind;
+    use nrr_shared::AutoRuleReason;
+    use nrr_storage::migration::SqliteMigrationRunner;
+    use nrr_storage::repository::MigrationRunner;
+
+    const SID_A: &str = "S-1-5-21-9000-9";
+
+    let rule = |host: &str| AuthoredRule {
+        route: RouteRole::Secondary,
+        match_kind: AuthoredMatchKind::SuffixDomain,
+        value: host.to_string(),
+        anchor: host.to_string(),
+    };
+    for kind in [
+        AuditEventKind::DbTamperDetected,
+        AuditEventKind::KeyResetWithExistingData,
+    ] {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().unwrap();
+        let state_conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+        let coord = build_test_coordinator(Arc::clone(&state_conn));
+        let alerts: Arc<dyn SecurityAlertsRepository> =
+            Arc::new(InMemorySecurityAlertsRepository::new());
+        alerts
+            .insert(&SecurityAlert {
+                alert_id: "alt-1".into(),
+                kind: kind.as_str().into(),
+                state: SecurityAlertState::Active,
+                raised_event_seq: 0,
+                raised_file: "scan".into(),
+                ack_event_seq: None,
+                ack_file: None,
+                resolved_event_seq: None,
+                resolved_file: None,
+                created_at: 1,
+                updated_at: 1,
+                reason_code: "r".into(),
+            })
+            .unwrap();
+        let exec = ProductionMutationExecutor::new(Arc::clone(&coord))
+            .with_alerts_repo(Arc::clone(&alerts));
+        let author = crate::auto_rules::ProductionAutoRuleAuthor::new(
+            Arc::new(EmptyBook),
+            Arc::new(exec) as Arc<dyn MutationExecutor>,
+        );
+        let now = SystemTime::now();
+
+        let routed = author
+            .author(
+                SID_A,
+                &AutoRuleReason::BlockNoticeRouted,
+                &[rule("blocked.example")],
+                now,
+                "c-route",
+            )
+            .expect_err("route-blocked-host must be refused");
+        assert_eq!(routed.code, SECURITY_ALERT_GATE_CODE, "{kind:?}");
+        let accepted = author
+            .author_with_outcome(
+                SID_A,
+                &AutoRuleReason::UserConfirmed,
+                &[rule("cdn.example")],
+                now,
+                "c-accept",
+            )
+            .expect_err("companion acceptance must be refused");
+        assert_eq!(accepted.code, SECURITY_ALERT_GATE_CODE, "{kind:?}");
+        assert!(
+            coord.current_active_for(SID_A).unwrap().is_none(),
+            "no revision may be created while the alert is active ({kind:?})"
+        );
+
+        alerts
+            .update_state("alt-1", SecurityAlertState::Acknowledged, 1, "ack", 2)
+            .unwrap();
+        assert_eq!(
+            author
+                .author(
+                    SID_A,
+                    &AutoRuleReason::BlockNoticeRouted,
+                    &[rule("blocked.example")],
+                    now,
+                    "c-route-2",
+                )
+                .expect("route-blocked-host after acknowledgement"),
+            1
+        );
+        let accepted = author
+            .author_with_outcome(
+                SID_A,
+                &AutoRuleReason::UserConfirmed,
+                &[rule("cdn.example")],
+                now,
+                "c-accept-2",
+            )
+            .expect("companion acceptance after acknowledgement");
+        assert_eq!(accepted.authored, 1);
+        assert!(coord.current_active_for(SID_A).unwrap().is_some());
+    }
+}
+
 /// One rule with the given conditions, as a submitted `rules-update` payload.
 fn shaped_rules_update(
     address: bool,
@@ -1333,6 +1819,13 @@ fn a_rule_naming_both_an_app_and_an_address_is_refused_at_submission() {
             "{}",
             review.diff_summary
         );
+        assert_eq!(
+            review.risk_signals,
+            vec![RiskSignalDto::ChangeRefused {
+                code: "unsupported-rule-shape".into()
+            }],
+            "the refused preview must not read as an unchanged rule set"
+        );
     }
     let rows: i64 = conn
         .lock()
@@ -1359,4 +1852,384 @@ fn address_only_and_app_only_rules_are_accepted() {
             );
         }
     }
+}
+
+/// An old audit break is reported until an administrator restarts the chain;
+/// the restart covers exactly the breaks it was shown, clears the status, and
+/// names the administrator. A reader without the service's key still sees the
+/// break: nothing but the key makes a restart count.
+#[test]
+fn an_administrator_restarts_a_broken_audit_chain_and_the_status_clears() {
+    use crate::production_diagnostics::ProductionDiagnosticsFacade;
+    use nrr_diagnostics::audit::alert::InMemorySecurityAlertsRepository;
+    use nrr_diagnostics::audit::{
+        ActorKind, AuditEventKind, AuditEventResult, AuditQueryFilter, AuditReader,
+    };
+    use nrr_diagnostics::facade::dto::DiagnosticsAudience;
+    use nrr_diagnostics::facade::service::DiagnosticsFacade;
+    use nrr_diagnostics::sink::AuditSink;
+    use nrr_diagnostics::{AuditEventInput, AuditWriter, AuditWriterConfig};
+    use nrr_storage::migration::SqliteMigrationRunner;
+    use nrr_storage::repository::MigrationRunner;
+
+    const ADMIN: &str = "S-1-5-21-10-20-30-500";
+    let dir = tempfile::tempdir().expect("temp");
+    let audit_dir = dir.path().join("audit");
+    let logs_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&logs_dir).expect("logs dir");
+    for n in 0..3 {
+        AuditWriter::open(AuditWriterConfig::new(&audit_dir))
+            .append(AuditEventInput {
+                event_id: format!("adt-{n}"),
+                kind: AuditEventKind::RevisionActivated,
+                created_at: 1_700_000_000_000,
+                actor_kind: ActorKind::Service,
+                actor_id_hash: None,
+                revision_id: Some("rev-1".into()),
+                risk_level: None,
+                result: AuditEventResult::Success,
+                reason_code: nrr_diagnostics::reason::review::APPROVED,
+                payload_summary_json: None,
+            })
+            .expect("append");
+    }
+    let oldest = AuditReader::new(&audit_dir).list_files()[0].clone();
+    let content = std::fs::read_to_string(&oldest).expect("read");
+    std::fs::write(&oldest, content.replace("rev-1", "rev-9")).expect("tamper");
+
+    let runner =
+        SqliteMigrationRunner::for_state_db(rusqlite::Connection::open_in_memory().unwrap());
+    runner.run_pending_migrations().unwrap();
+    let state_conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+    let coordinator = build_test_coordinator_signed(state_conn, vec![0x5Cu8; 32]);
+    let exec = ProductionMutationExecutor::new(Arc::clone(&coordinator)).with_audit_writer(
+        Arc::new(AuditWriter::open(AuditWriterConfig::new(&audit_dir))),
+    );
+    let facade = |key| {
+        ProductionDiagnosticsFacade::new(
+            &logs_dir,
+            &audit_dir,
+            None,
+            Arc::new(InMemorySecurityAlertsRepository::new()),
+            None,
+        )
+        .with_chain_restart_key(key)
+    };
+    let chain_ok = |key| {
+        facade(key)
+            .get_status(&DiagnosticsAudience::Machine)
+            .security_status
+            .audit_chain_ok
+    };
+    assert!(
+        !chain_ok(coordinator.audit_restart_key()),
+        "positive control"
+    );
+
+    let preview = exec
+        .audit_chain_preview(MutationKind::AuditChainRestart)
+        .expect("preview");
+    assert_eq!(preview.break_count, 1);
+    assert_eq!(preview.breaks[0].kind, "hash-mismatch");
+    let restart = |digest: &str| StoredMutation {
+        kind: MutationKind::AuditChainRestart,
+        payload: serde_json::json!({ "breaks-digest": digest }),
+        correlation_id: None,
+        issuer_sid: String::new(),
+        caller_is_elevated: true,
+    };
+    match exec.execute(restart("not what was shown"), ADMIN) {
+        MutationOutcome::Failed(e) => assert_eq!(e.code, "audit-chain-changed"),
+        other => panic!("a stale digest restarts nothing: {other:?}"),
+    }
+    assert!(matches!(
+        exec.execute(restart(&preview.breaks_digest), ADMIN),
+        MutationOutcome::Completed(_)
+    ));
+
+    assert!(chain_ok(coordinator.audit_restart_key()));
+    assert!(!chain_ok(None), "without the key the break still shows");
+    let restarts = AuditReader::new(&audit_dir).scan(
+        &AuditQueryFilter::new().kind("audit_chain_restarted"),
+        &DiagnosticsAudience::Principal(ADMIN.into()),
+    );
+    assert_eq!(restarts.len(), 1, "the administrator's own record");
+}
+
+// ── Rule caps on the write path ─────────────────────────────────────────
+
+fn book_json(user: usize, auto: usize) -> String {
+    use nrr_shared::rules_json::{
+        to_canonical_string, AddressMatchDto, CanonicalRulesJsonV1, RuleDto, RuleOriginDto,
+        RULES_JSON_SCHEMA_VERSION,
+    };
+    let rule = |id: String, value: String, origin: Option<RuleOriginDto>| RuleDto {
+        id,
+        enabled: true,
+        address_match: Some(AddressMatchDto::ExactFqdn { value }),
+        app_match: None,
+        comment: String::new(),
+        action: nrr_shared::rules_json::RuleAction::Route,
+        origin,
+    };
+    let primary = (0..user)
+        .map(|i| rule(format!("R-{i}"), format!("host{i}.example.com"), None))
+        .collect();
+    let secondary = (0..auto)
+        .map(|i| {
+            rule(
+                format!("auto-{i}"),
+                format!("cdn{i}.example.net"),
+                Some(RuleOriginDto::auto(
+                    nrr_shared::AutoRuleReason::SiteCompanion,
+                    "example.com",
+                    "2026-07-31",
+                )),
+            )
+        })
+        .collect();
+    to_canonical_string(&CanonicalRulesJsonV1 {
+        schema_version: RULES_JSON_SCHEMA_VERSION,
+        primary,
+        secondary,
+    })
+    .unwrap()
+}
+
+/// Marking rules `auto` must not take a crafted payload past both caps: the
+/// app's rules have a budget of their own on every write.
+#[test]
+fn a_rules_update_past_the_app_rule_budget_is_refused() {
+    let (exec, _conn) = build_test_executor();
+    let auto_cap = nrr_domain::auto_rule_budget::MAX_AUTO_RULES;
+    let payload = |body: String| {
+        serde_json::json!({
+            "rules-json": body,
+            "content-hash": "h-cap",
+        })
+    };
+    let update = |body: String| StoredMutation {
+        kind: MutationKind::RulesUpdate,
+        payload: payload(body),
+        correlation_id: None,
+        issuer_sid: String::new(),
+        caller_is_elevated: false,
+    };
+
+    let over = book_json(10, auto_cap + 1);
+    let preview = exec.preview(
+        MutationKind::RulesUpdate,
+        &payload(over.clone()),
+        nrr_storage::BASELINE_PRINCIPAL,
+    );
+    assert!(
+        preview
+            .risk_signals
+            .contains(&RiskSignalDto::ChangeRefused {
+                code: "auto-rule-cap-exceeded".into()
+            }),
+        "{:?}",
+        preview.risk_signals
+    );
+    match exec.execute(update(over), nrr_storage::BASELINE_PRINCIPAL) {
+        MutationOutcome::Failed(e) => {
+            assert_eq!(e.code, "auto-rule-cap-exceeded");
+            assert!(
+                e.message.contains(&(auto_cap + 1).to_string()),
+                "{}",
+                e.message
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    let at_budget = exec.execute(
+        update(book_json(10, auto_cap)),
+        nrr_storage::BASELINE_PRINCIPAL,
+    );
+    assert!(
+        matches!(at_budget, MutationOutcome::Completed(_)),
+        "{at_budget:?}"
+    );
+}
+
+/// Stores `rules_json` as `principal`'s active book past the executor's write
+/// cap, the way a book saved before the app's budget existed got there.
+fn seed_active_book(exec: &ProductionMutationExecutor, principal: &str, rules_json: String) {
+    let mut hasher = Sha256::new();
+    hasher.update(rules_json.as_bytes());
+    let id = exec
+        .coordinator
+        .submit_candidate(CandidateSubmission {
+            principal: principal.to_string(),
+            rules_json,
+            content_hash: format!("{:x}", hasher.finalize()),
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "seed".into(),
+            risk_level: None,
+            review_summary_json: None,
+        })
+        .expect("seed submit");
+    let token = exec
+        .coordinator
+        .issue_confirmation_token(&id, COORDINATOR_TOKEN_TTL_SECS)
+        .expect("seed token");
+    exec.coordinator
+        .activate(&id, &token, "seed")
+        .expect("seed activate");
+}
+
+fn rules_update(body: String) -> StoredMutation {
+    StoredMutation {
+        kind: MutationKind::RulesUpdate,
+        payload: serde_json::json!({ "rules-json": body, "content-hash": "h-cap" }),
+        correlation_id: None,
+        issuer_sid: String::new(),
+        caller_is_elevated: false,
+    }
+}
+
+fn refusal_code(outcome: MutationOutcome) -> String {
+    match outcome {
+        MutationOutcome::Failed(e) => e.code,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A book saved before the app's budget stays editable: the user's own edit
+/// goes through, and so does dropping app rules, but the app's share cannot
+/// grow past what the book already held.
+#[test]
+fn a_book_past_the_app_budget_stays_editable_but_cannot_grow() {
+    const SID: &str = "S-1-5-21-1000-1000-1000-1001";
+    let (exec, _conn) = build_test_executor();
+    seed_active_book(&exec, SID, book_json(10, 2_500));
+
+    let own_edit = exec.execute(rules_update(book_json(11, 2_500)), SID);
+    assert!(
+        matches!(own_edit, MutationOutcome::Completed(_)),
+        "{own_edit:?}"
+    );
+    assert_eq!(
+        refusal_code(exec.execute(rules_update(book_json(11, 2_501)), SID)),
+        "auto-rule-cap-exceeded"
+    );
+    let preview = exec.preview(
+        MutationKind::RulesUpdate,
+        &rules_update(book_json(11, 2_501)).payload,
+        SID,
+    );
+    assert!(
+        preview
+            .risk_signals
+            .contains(&RiskSignalDto::ChangeRefused {
+                code: "auto-rule-cap-exceeded".into()
+            }),
+        "{:?}",
+        preview.risk_signals
+    );
+
+    let shrunk = exec.execute(rules_update(book_json(11, 2_400)), SID);
+    assert!(
+        matches!(shrunk, MutationOutcome::Completed(_)),
+        "{shrunk:?}"
+    );
+    assert_eq!(
+        refusal_code(exec.execute(rules_update(book_json(11, 2_450)), SID)),
+        "auto-rule-cap-exceeded",
+        "the allowance follows the book down, never back up"
+    );
+}
+
+/// Under the budget, the budget is the ceiling — however close the book was.
+#[test]
+fn a_book_under_the_app_budget_cannot_cross_it() {
+    const SID: &str = "S-1-5-21-1000-1000-1000-1002";
+    let (exec, _conn) = build_test_executor();
+    seed_active_book(&exec, SID, book_json(10, 1_999));
+    assert_eq!(
+        refusal_code(exec.execute(rules_update(book_json(10, 2_001)), SID)),
+        "auto-rule-cap-exceeded"
+    );
+}
+
+/// The allowance is the caller's own book's: another user's pre-budget book
+/// lends nothing.
+#[test]
+fn another_users_large_book_lends_no_allowance() {
+    const OWNER: &str = "S-1-5-21-1000-1000-1000-1003";
+    const OTHER: &str = "S-1-5-21-1000-1000-1000-1004";
+    let (exec, _conn) = build_test_executor();
+    seed_active_book(&exec, OWNER, book_json(10, 2_500));
+    seed_active_book(&exec, OTHER, book_json(10, 5));
+    assert_eq!(
+        refusal_code(exec.execute(rules_update(book_json(10, 2_500)), OTHER)),
+        "auto-rule-cap-exceeded"
+    );
+}
+
+/// An export of a pre-budget book imports back into that book; the user's
+/// own cap still holds on the same path.
+#[test]
+fn an_exported_pre_budget_book_imports_back() {
+    const SID: &str = "S-1-5-21-1000-1000-1000-1005";
+    let (exec, _conn) = build_test_executor();
+    seed_active_book(&exec, SID, book_json(10, 2_500));
+    let file = |user: usize, auto: usize| {
+        let mut text = String::from("--- Domains\n");
+        for i in 0..user {
+            text.push_str(&format!("host{i}.example.com\n"));
+        }
+        text.push_str("--- Auto\n");
+        for i in 0..auto {
+            text.push_str(&format!(
+                "cdn{i}.example.net  # auto:site-companion anchor:example.com added:2026-07-31\n"
+            ));
+        }
+        text
+    };
+    let import = |text: String| {
+        serde_json::json!({
+            "secondary-bytes-b64": b64(&text),
+            "include-child-processes": false,
+        })
+    };
+    let back = exec.execute_preset_import(&import(file(0, 2_500)), SID);
+    assert!(matches!(back, MutationOutcome::Completed(_)), "{back:?}");
+    assert_eq!(
+        refusal_code(exec.execute_preset_import(&import(file(0, 2_501)), SID)),
+        "auto-rule-cap-exceeded"
+    );
+}
+
+/// The review names the channel a rules change came through, in the words its
+/// revision will record; a kind with no channel keeps the service's own label.
+#[test]
+fn the_review_names_where_a_rules_change_came_from() {
+    let (exec, _conn) = build_test_executor();
+    let sid = nrr_storage::BASELINE_PRINCIPAL;
+    let edit = exec.preview(
+        MutationKind::RulesUpdate,
+        &serde_json::json!({ "rules-json": "{}", "content-hash": "h" }),
+        sid,
+    );
+    assert_eq!(edit.provenance, RulesRevisionSource::GuiRulesEdit.as_slug());
+    let import = exec.preview(
+        MutationKind::PresetImport,
+        &serde_json::json!({
+            "primary-bytes-b64": b64(SAMPLE_PRESET),
+            "include-child-processes": false,
+        }),
+        sid,
+    );
+    assert_eq!(
+        import.provenance,
+        RulesRevisionSource::PresetImport.as_slug()
+    );
+    let reset = exec.preview(
+        MutationKind::RulesResetToBaseline,
+        &serde_json::json!({}),
+        sid,
+    );
+    assert_eq!(reset.provenance, "service");
 }

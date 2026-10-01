@@ -1,38 +1,23 @@
-//! Diagnostics mock backend.
-//!
-//! Re-exports the mock facade from `nrr-diagnostics` and exposes
-//! synchronous preview wrappers so the GUI/tray shell can fetch a snapshot
-//! without holding a long-lived `MockDiagnosticsFacade` handle.
-//!
-//! These scaffold exports will be replaced with the real service-backed
-//! implementation via IPC.
+//! Diagnostics preview: the healthy snapshot a mock or preview backend shows.
+//! The live GUI reads diagnostics from the service over IPC instead.
 
+use nrr_diagnostics::facade::dto::DiagnosticsAudience;
+use nrr_diagnostics::facade::MockDiagnosticsFacade;
 pub use nrr_diagnostics::facade::{
-    DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsFacade, DiagnosticsStatusDto,
-    MockDiagnosticsFacade, MockScenario, SecurityAlertDto, SecurityAlertsView,
+    AlertListFilter, DiagnosticsDataOrigin, DiagnosticsFacade, DiagnosticsStatusDto,
+    SecurityAlertDto, SecurityAlertsView,
 };
 
-/// Returns the default mock facade (healthy scenario) for preview mode.
-pub fn preview_diagnostics_facade() -> MockDiagnosticsFacade {
-    MockDiagnosticsFacade::healthy()
-}
-
-/// Returns a one-shot preview of the diagnostics status snapshot.
-///
-/// Uses the `Healthy` scenario. Callers that need other scenarios should
-/// construct a [`MockDiagnosticsFacade`] directly.
+/// A one-shot healthy diagnostics status.
 pub fn preview_diagnostics_status() -> DiagnosticsStatusDto {
-    MockDiagnosticsFacade::healthy().get_status()
+    MockDiagnosticsFacade::healthy().get_status(&DiagnosticsAudience::Machine)
 }
 
-/// Returns a one-shot preview of the active security alerts list.
-///
-/// Uses the `Healthy` scenario (empty list). For alert-rich scenarios, build
-/// a [`MockDiagnosticsFacade`] with [`MockScenario::ActiveTamperAlert`].
+/// A one-shot healthy (empty) list of active security alerts.
 pub fn preview_active_security_alerts() -> SecurityAlertsView {
     SecurityAlertsView::fresh(
         MockDiagnosticsFacade::healthy()
-            .list_active_alerts()
+            .list_alerts(AlertListFilter::Open, &DiagnosticsAudience::Machine)
             .unwrap_or_default(),
     )
 }
@@ -52,7 +37,6 @@ mod tests {
         assert_eq!(status.security_status.active_alert_count, 0);
         assert!(status.cache_health.healthy);
         assert!(status.log_health.dir_writable);
-        assert!(!status.diagnostic_mode.active);
     }
 
     #[test]
@@ -60,11 +44,5 @@ mod tests {
         let alerts = preview_active_security_alerts();
         assert!(alerts.alerts.is_empty());
         assert!(!alerts.stale);
-    }
-
-    #[test]
-    fn preview_diagnostics_facade_is_healthy_scenario() {
-        let facade = preview_diagnostics_facade();
-        assert_eq!(facade.scenario, MockScenario::Healthy);
     }
 }

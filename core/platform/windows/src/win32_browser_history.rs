@@ -22,10 +22,12 @@
 //! are best-effort — vendors ship layout changes faster than docs; the
 //! discovery-summary log line below is what lets users report gaps.
 //!
-//! The browser holds its History DB open, so we COPY it to a temp file first and
-//! open the copy read-only — a direct open would race the browser's writer and
-//! fail "database is locked". Copy + read is best-effort per profile: any browser
-//! that is absent or unreadable is skipped, and partial results are valid.
+//! The browser holds its History DB open, so we COPY it, with its WAL and
+//! rollback journal, to private temp files and read the copy — a direct open
+//! would race the browser's writer and fail "database is locked", and the
+//! main file alone lacks everything not yet checkpointed. Copy + read is
+//! best-effort per profile: any browser that is absent or unreadable is
+//! skipped, and partial results are valid.
 //!
 //! Everything under a profile is writable by its user while this runs as
 //! LocalSystem, so a source is read only through a handle proven to be the
@@ -361,16 +363,11 @@ fn discover_history_sources(roots: &AppDataRoots) -> Vec<HistorySource> {
 /// well-understood calls beat destabilising a load-bearing module).
 #[cfg(target_os = "windows")]
 mod profile_root {
-    #![allow(unsafe_code)]
-
     use std::path::PathBuf;
 
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::ERROR_SUCCESS;
-    use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
-        REG_SAM_FLAGS, REG_VALUE_TYPE,
-    };
+    use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+
+    use crate::win32_ffi::registry;
 
     /// `ProfileImagePath` of `sid` (e.g. `C:\Users\name`), or `None` when the
     /// SID has no local profile, the value carries an unexpanded `%…%`
@@ -381,89 +378,12 @@ mod profile_root {
             return None;
         }
         let subkey = format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}");
-        let value = read_named_value(HKEY_LOCAL_MACHINE, &subkey, "ProfileImagePath")?;
+        let value = registry::read_string(HKEY_LOCAL_MACHINE, &subkey, Some("ProfileImagePath"))?;
         if value.is_empty() || value.contains('%') {
             return None;
         }
         let path = PathBuf::from(value);
         path.is_dir().then_some(path)
-    }
-
-    fn open_key(hive: HKEY, subkey: &str, access: u32) -> Option<HKEY> {
-        let wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut hkey = HKEY::default();
-        // SAFETY: `wide` is NUL-terminated UTF-16 outliving the call; `hkey` is
-        // a fresh out-param; the hive is a Win32 pseudo-handle.
-        let rc = unsafe {
-            RegOpenKeyExW(
-                hive,
-                PCWSTR(wide.as_ptr()),
-                0,
-                REG_SAM_FLAGS(access),
-                &mut hkey,
-            )
-        };
-        (rc == ERROR_SUCCESS).then_some(hkey)
-    }
-
-    fn close_key(hkey: HKEY) {
-        // SAFETY: `hkey` came from `RegOpenKeyExW`; closing a valid handle is
-        // sound. A close failure is non-actionable at this layer.
-        unsafe {
-            let _ = RegCloseKey(hkey);
-        }
-    }
-
-    /// Read a NAMED `REG_SZ`/`REG_EXPAND_SZ` value of `hive\subkey`.
-    fn read_named_value(hive: HKEY, subkey: &str, value_name: &str) -> Option<String> {
-        let hkey = open_key(hive, subkey, KEY_QUERY_VALUE.0)?;
-        let name_wide: Vec<u16> = value_name
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let mut size: u32 = 0;
-        let mut value_type = REG_VALUE_TYPE::default();
-        // SAFETY: `name_wide` is NUL-terminated and outlives the call; the size
-        // out-param probes the byte length first.
-        let rc = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(name_wide.as_ptr()),
-                None,
-                Some(&mut value_type),
-                None,
-                Some(&mut size),
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            close_key(hkey);
-            return None;
-        }
-        let mut buf: Vec<u16> = vec![0u16; (size as usize) / 2 + 1];
-        let mut read: u32 = (buf.len() * 2) as u32;
-        // SAFETY: `buf` is sized from the probe; `read` carries its byte length.
-        let rc = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(name_wide.as_ptr()),
-                None,
-                Some(&mut value_type),
-                Some(buf.as_mut_ptr().cast()),
-                Some(&mut read),
-            )
-        };
-        close_key(hkey);
-        if rc != ERROR_SUCCESS {
-            return None;
-        }
-        let chars = (read as usize) / 2;
-        let slice = &buf[..chars.min(buf.len())];
-        Some(
-            String::from_utf16_lossy(slice)
-                .trim_end_matches('\0')
-                .to_string(),
-        )
     }
 }
 
@@ -524,8 +444,16 @@ const MAX_HISTORY_BYTES: u64 = 1024 * 1024 * 1024;
 /// Upper bound on URL rows read from one source.
 const MAX_HISTORY_ROWS: usize = 2_000_000;
 
-/// Copy `src.db_path` to a private temp file and read its URL column into
-/// hostnames.
+/// SQLite's side files, in the order the copy creates them. The WAL holds
+/// every commit since the last checkpoint and a hot rollback journal the
+/// undo of an interrupted one, so both are copied; the `-shm` index is not,
+/// because SQLite rebuilds it from the WAL when the first connection opens.
+const SIDE_FILES: [&str; 3] = ["-wal", "-journal", "-shm"];
+const COPIED_SIDE_FILES: [&str; 2] = ["-wal", "-journal"];
+
+/// Copy `src.db_path` and its side files to private temp files and read the
+/// URL column into hostnames, replaying what SQLite has not yet folded into
+/// the main file.
 fn read_source_hostnames(
     src: &HistorySource,
     principal: &str,
@@ -535,12 +463,63 @@ fn read_source_hostnames(
     let mut copy = TempCopy::create_in(copy_dirs, src.label)?;
     // Read through the verified handle: re-opening the path would reopen the
     // race the checks just closed.
-    let copied = copy.fill_from(&source, MAX_HISTORY_BYTES)?;
+    let mut budget = MAX_HISTORY_BYTES;
+    let copied = copy.fill_from(&source, budget)?;
     drop(source);
-    if copied > MAX_HISTORY_BYTES {
+    if copied > budget {
         return Err("source exceeds the size cap".into());
     }
-    read_hostnames_from_db(copy.path(), src.query)
+    budget -= copied;
+    // After the main file: SQLite drops WAL frames cut off mid-write, and a
+    // WAL that no longer fits the main file falls back below.
+    for suffix in COPIED_SIDE_FILES {
+        let Some(side) = open_side_file(src, suffix, principal, budget)? else {
+            continue;
+        };
+        let copied = copy.fill_side_from(suffix, &side, budget)?;
+        if copied > budget {
+            return Err("source exceeds the size cap".into());
+        }
+        budget -= copied;
+    }
+    copy.close_all();
+    read_hostnames_replaying_journals(copy.path(), src.query).or_else(|replay_error| {
+        // A WAL copied across a checkpoint may not fit the main file; the
+        // checkpointed history alone is still worth having.
+        read_hostnames_from_db(copy.path(), src.query).map_err(|_| replay_error)
+    })
+}
+
+/// The source's `suffix` side file through the same checks as the database,
+/// `None` when it does not exist — or stopped existing, as a WAL does when
+/// its browser closes.
+fn open_side_file(
+    src: &HistorySource,
+    suffix: &str,
+    principal: &str,
+    max_bytes: u64,
+) -> Result<Option<File>, String> {
+    let path = with_suffix(&src.db_path, suffix);
+    let absent = || {
+        matches!(
+            std::fs::symlink_metadata(&path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+    };
+    if absent() {
+        return Ok(None);
+    }
+    match open_verified(&src.anchor, &path, principal, max_bytes) {
+        Ok(file) => Ok(Some(file)),
+        Err(_) if absent() => Ok(None),
+        Err(e) => Err(format!("{suffix}: {e}")),
+    }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 /// Directories the copy may be written to, most private first: the service's
@@ -556,49 +535,73 @@ fn copy_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// A uniquely named copy that is removed however the read ends.
+/// A uniquely named copy, with every side file SQLite may open beside it,
+/// all removed however the read ends.
 struct TempCopy {
     path: PathBuf,
     file: Option<File>,
+    /// One per [`SIDE_FILES`] entry, in that order; created empty.
+    sides: Vec<(PathBuf, Option<File>)>,
 }
 
 impl TempCopy {
-    /// Create an unpredictable, not-yet-existing file in the first usable
-    /// directory. `create_new` refuses an existing name, including a planted
-    /// link, so the name can be neither guessed nor pre-empted.
+    /// Create an unpredictable, not-yet-existing file and its side files in
+    /// the first usable directory. `create_new` refuses an existing name,
+    /// including a planted link, so no name SQLite will open — the side files
+    /// included — can be guessed or pre-empted.
     fn create_in(dirs: &[PathBuf], label: &str) -> Result<Self, String> {
         let mut last = String::from("no temp directory");
         for dir in dirs {
             let mut nonce = [0u8; 16];
             getrandom::fill(&mut nonce).map_err(|e| format!("temp name: {e}"))?;
             let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
-            let path = dir.join(format!("nrr-bh-{label}-{hex}.sqlite"));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => {
-                    return Ok(Self {
-                        path,
-                        file: Some(file),
-                    })
-                }
+            match Self::create_at(dir.join(format!("nrr-bh-{label}-{hex}.sqlite"))) {
+                Ok(copy) => return Ok(copy),
                 Err(e) => last = format!("create temp copy: {e}"),
             }
         }
         Err(last)
     }
 
+    /// `path` and its side files, all new; on failure nothing is left behind.
+    fn create_at(path: PathBuf) -> std::io::Result<Self> {
+        let file = create_new(&path)?;
+        let mut copy = Self {
+            path,
+            file: Some(file),
+            sides: Vec::with_capacity(SIDE_FILES.len()),
+        };
+        for suffix in SIDE_FILES {
+            let side = with_suffix(&copy.path, suffix);
+            // On error `copy` drops, removing only what it created.
+            let file = create_new(&side)?;
+            copy.sides.push((side, Some(file)));
+        }
+        Ok(copy)
+    }
+
     /// Copy at most `cap + 1` bytes from `source`, returning how many were
-    /// written; the file handle is closed before SQLite opens the path.
+    /// written.
     fn fill_from(&mut self, source: &File, cap: u64) -> Result<u64, String> {
-        let mut out = self
-            .file
-            .take()
-            .ok_or_else(|| String::from("temp copy already filled"))?;
-        let mut limited = source.take(cap.saturating_add(1));
-        std::io::copy(&mut limited, &mut out).map_err(|e| format!("copy: {e}"))
+        fill(&mut self.file, source, cap)
+    }
+
+    /// As [`Self::fill_from`], into the side file named by `suffix`.
+    fn fill_side_from(&mut self, suffix: &str, source: &File, cap: u64) -> Result<u64, String> {
+        let slot = SIDE_FILES
+            .iter()
+            .position(|s| *s == suffix)
+            .and_then(|i| self.sides.get_mut(i))
+            .ok_or_else(|| format!("no temp side file {suffix}"))?;
+        fill(&mut slot.1, source, cap)
+    }
+
+    /// Close every handle before SQLite opens the paths.
+    fn close_all(&mut self) {
+        self.file = None;
+        for (_, file) in &mut self.sides {
+            *file = None;
+        }
     }
 
     fn path(&self) -> &Path {
@@ -608,9 +611,29 @@ impl TempCopy {
 
 impl Drop for TempCopy {
     fn drop(&mut self) {
-        self.file = None;
+        self.close_all();
+        for (side, _) in &self.sides {
+            let _ = std::fs::remove_file(side);
+        }
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+fn create_new(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Copy at most `cap + 1` bytes from `source` into the still-open `slot`,
+/// then close it.
+fn fill(slot: &mut Option<File>, source: &File, cap: u64) -> Result<u64, String> {
+    let mut out = slot
+        .take()
+        .ok_or_else(|| String::from("temp copy already filled"))?;
+    let mut limited = source.take(cap.saturating_add(1));
+    std::io::copy(&mut limited, &mut out).map_err(|e| format!("copy: {e}"))
 }
 
 /// Open `path` for reading only once it is proven to be the principal's own
@@ -894,22 +917,46 @@ mod os {
     }
 }
 
-/// Open `db` READ-ONLY and project `query`'s single URL column into distinct
-/// hostnames. Testable in isolation against a synthetic DB. `immutable=1` lets us
-/// read even a copy that still carries a stale WAL/lock header. The file is
-/// user-supplied, so SQLite's defensive mode is on and the schema untrusted.
+/// Open `db` READ-ONLY as it stands and project `query`'s single URL column
+/// into distinct hostnames. `immutable=1` ignores the side files, so only
+/// checkpointed history is seen.
 pub fn read_hostnames_from_db(db: &Path, query: &str) -> Result<Vec<String>, String> {
-    use rusqlite::config::DbConfig;
     use rusqlite::OpenFlags;
-    let uri = format!(
-        "file:{}?mode=ro&immutable=1",
-        db.to_string_lossy().replace('?', "%3f")
-    );
     let conn = rusqlite::Connection::open_with_flags(
-        &uri,
+        db_uri(db, "?mode=ro&immutable=1"),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|e| format!("open: {e}"))?;
+    hostnames_from(&conn, query)
+}
+
+/// As [`read_hostnames_from_db`], but SQLite first replays the WAL and rolls
+/// back a hot journal found beside `copy`. Both write, so the connection is
+/// read-write: `copy` must be a private copy, never a browser's live file.
+fn read_hostnames_replaying_journals(copy: &Path, query: &str) -> Result<Vec<String>, String> {
+    use rusqlite::config::DbConfig;
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        db_uri(copy, ""),
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| format!("open: {e}"))?;
+    // The copy is about to be deleted; folding the WAL into it is wasted I/O.
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .map_err(|e| format!("harden: {e}"))?;
+    conn.execute_batch("PRAGMA query_only = ON;")
+        .map_err(|e| format!("harden: {e}"))?;
+    hostnames_from(&conn, query)
+}
+
+fn db_uri(db: &Path, params: &str) -> String {
+    format!("file:{}{params}", db.to_string_lossy().replace('?', "%3f"))
+}
+
+/// The file is user-supplied, so SQLite's defensive mode is on and the
+/// schema untrusted.
+fn hostnames_from(conn: &rusqlite::Connection, query: &str) -> Result<Vec<String>, String> {
+    use rusqlite::config::DbConfig;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
         .map_err(|e| format!("harden: {e}"))?;
     conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;")
@@ -1151,6 +1198,181 @@ user_pref("network.dns.disableIPv6", true);
         std::fs::write(&db, b"not a database").unwrap();
         assert!(read_source_hostnames(&src, &me, &copy_dirs).is_err());
         assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
+    }
+
+    fn history_source(profile: &Path, db: &Path) -> HistorySource {
+        HistorySource {
+            db_path: db.to_path_buf(),
+            anchor: profile.to_path_buf(),
+            query: "SELECT url FROM urls",
+            label: "firefox",
+        }
+    }
+
+    #[test]
+    fn rows_not_yet_checkpointed_from_the_wal_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let copies = dir.path().join("copies");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(&copies).unwrap();
+        let db = profile.join("places.sqlite");
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT);
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 INSERT INTO urls (url) VALUES ('https://checkpointed.example/');
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 INSERT INTO urls (url) VALUES ('https://in-wal.example/');
+                 INSERT INTO urls (url) VALUES ('https://also-in-wal.example/');",
+            )
+            .unwrap();
+        // The writer stays open, as a running browser does: nothing is
+        // checkpointed on close.
+        assert!(with_suffix(&db, "-wal").metadata().unwrap().len() > 0);
+        let me = test_principal(dir.path());
+        let src = history_source(&profile, &db);
+
+        let hosts = read_source_hostnames(&src, &me, std::slice::from_ref(&copies)).unwrap();
+        assert_eq!(
+            hosts,
+            [
+                "also-in-wal.example",
+                "checkpointed.example",
+                "in-wal.example"
+            ]
+        );
+        // Positive control: the main file alone holds only the checkpointed row.
+        assert_eq!(
+            read_hostnames_from_db(&db, "SELECT url FROM urls").unwrap(),
+            ["checkpointed.example"]
+        );
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
+        // The live WAL was read, not replayed into the browser's file.
+        drop(writer);
+    }
+
+    #[test]
+    fn a_hot_journal_is_rolled_back_in_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let copies = dir.path().join("copies");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(&copies).unwrap();
+        let db = profile.join("History");
+        let padding = "x".repeat(2_000);
+        let committed: Vec<String> = (0..200)
+            .map(|i| format!("https://c{i}.committed.example/{padding}"))
+            .collect();
+        make_db(
+            &db,
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT)",
+            &committed.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        // A tiny cache makes the open transaction spill rewritten pages into
+        // the main file, leaving it inconsistent without the journal — as
+        // after a crash.
+        writer
+            .execute_batch(
+                "PRAGMA cache_size = 2; BEGIN;
+                 UPDATE urls SET url = 'https://uncommitted.example/' || id;",
+            )
+            .unwrap();
+        let journal = with_suffix(&db, "-journal");
+        assert!(journal.metadata().unwrap().len() > 0, "the journal is hot");
+        // Positive control: the main file alone does not read as committed.
+        let main_only = dir.path().join("main-only.sqlite");
+        std::fs::copy(&db, &main_only).unwrap();
+        let main_only = read_hostnames_from_db(&main_only, "SELECT url FROM urls");
+        assert!(
+            main_only
+                .as_ref()
+                .map_or(true, |h| h.iter().any(|h| h == "uncommitted.example")),
+            "{main_only:?}"
+        );
+        let me = test_principal(dir.path());
+        let src = history_source(&profile, &db);
+
+        let hosts = read_source_hostnames(&src, &me, std::slice::from_ref(&copies)).unwrap();
+        assert_eq!(hosts.len(), committed.len());
+        assert!(hosts.iter().all(|h| h.ends_with(".committed.example")));
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
+        writer.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn a_wal_that_does_not_replay_still_leaves_the_checkpointed_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let copies = dir.path().join("copies");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(&copies).unwrap();
+        let db = profile.join("places.sqlite");
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT);
+                 INSERT INTO urls (url) VALUES ('https://checkpointed.example/');",
+            )
+            .unwrap();
+        drop(writer);
+        std::fs::write(with_suffix(&db, "-wal"), vec![0xA5; 64 * 1024]).unwrap();
+        let me = test_principal(dir.path());
+        let src = history_source(&profile, &db);
+
+        let hosts = read_source_hostnames(&src, &me, std::slice::from_ref(&copies)).unwrap();
+        assert_eq!(hosts, ["checkpointed.example"]);
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_side_file_through_a_link_fails_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let foreign = dir.path().join("foreign");
+        let copies = dir.path().join("copies");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::create_dir_all(&copies).unwrap();
+        let db = profile.join("places.sqlite");
+        make_db(
+            &db,
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT)",
+            &["https://feed.example/"],
+        );
+        let me = test_principal(dir.path());
+        let src = history_source(&profile, &db);
+        if !make_dir_link(&foreign, &with_suffix(&db, "-wal")) {
+            eprintln!("skipping: cannot create a directory link here");
+            return;
+        }
+        let error = read_source_hostnames(&src, &me, std::slice::from_ref(&copies)).unwrap_err();
+        assert!(error.starts_with("-wal:"), "{error}");
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn every_side_file_name_is_taken_up_front_and_removed_with_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = TempCopy::create_in(&[dir.path().to_path_buf()], "chrome").unwrap();
+        let names: Vec<PathBuf> = std::iter::once(copy.path().to_path_buf())
+            .chain(SIDE_FILES.iter().map(|s| with_suffix(copy.path(), s)))
+            .collect();
+        assert!(names.iter().all(|p| p.is_file()));
+        drop(copy);
+        assert!(names.iter().all(|p| !p.exists()), "all removed");
+
+        // A planted side file refuses the whole copy and removes only ours.
+        let path = dir.path().join("copy.sqlite");
+        let planted = with_suffix(&path, "-journal");
+        std::fs::write(&planted, b"planted").unwrap();
+        assert!(TempCopy::create_at(path.clone()).is_err());
+        assert!(!path.exists() && !with_suffix(&path, "-wal").exists());
+        assert_eq!(std::fs::read(&planted).unwrap(), b"planted");
     }
 
     #[test]

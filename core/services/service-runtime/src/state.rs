@@ -27,22 +27,6 @@ pub enum ServiceRuntimeState {
     Stopped,
 }
 
-/// Reason the service stopped, so the `Stopped` state carries enough
-/// context to write a single audit event on exit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ServiceShutdownReason {
-    /// SCM "stop" control code.
-    ScmStop,
-    /// Windows session shutdown.
-    SystemShutdown,
-    /// Bootstrap encountered a blocking failure that cannot be recovered
-    /// in-process. The service exits so SCM recovery actions can apply.
-    BootstrapBlocking,
-    /// Internal panic / unrecoverable error caught at the runtime
-    /// boundary.
-    UnhandledError,
-}
-
 /// Coarse health severity used by the aggregator (`HealthReporter`) and
 /// by every individual component manager when reporting status. The
 /// monotonic ordering — `Ok < Warning < Degraded < Blocking` — lets the
@@ -73,10 +57,9 @@ pub enum ServicePolicyState {
     LoadingActive,
     /// Active revision validated and ready for apply attempts.
     ActiveReady,
-    /// Active revision failed integrity; LKG fallback in progress.
+    /// The keyless boot check found corruption; the keyed per-principal
+    /// sweep recovers.
     ActiveInvalid,
-    /// LKG loaded and ready as the effective active revision.
-    LkgReady,
     /// Neither active nor LKG is usable. User intervention required.
     RecoveryRequired,
     /// Product disabled by user.

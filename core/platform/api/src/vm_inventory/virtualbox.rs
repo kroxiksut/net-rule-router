@@ -19,6 +19,12 @@ pub const TRAFFIC_PROCESS_STEMS: &[&str] = &["VirtualBoxVM", "VBoxHeadless"];
 /// VirtualBox's command-line tool, as a file stem.
 pub const COMMAND_LINE_TOOL_STEM: &str = "VBoxManage";
 
+/// Longest one tool call may take before it is killed. A `VBoxSVC` wedged
+/// after a machine crash never answers, and the call runs on the thread that
+/// serves every other local request of the GUI. Generous, because a cold
+/// `VBoxSVC` start takes seconds.
+pub const COMMAND_LINE_TOOL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The settings version of VirtualBox 7.0, from which a NAT adapter keeps the
 /// guest off the host's loopback unless its file says otherwise.
 const LOOPBACK_CLOSED_BY_DEFAULT_FROM: (u32, u32) = (1, 19);

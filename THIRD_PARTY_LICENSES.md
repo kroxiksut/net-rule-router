@@ -4,11 +4,17 @@ NetRuleRouter is distributed under the Mozilla Public License 2.0. It also
 includes components owned by third parties, listed here with their publishers
 and licences. This notice must be kept with any distribution of the product.
 
-Rust library dependencies are pulled from crates.io at build time under
-permissive licences (MIT / Apache-2.0 / BSD / Unicode-3.0 / CDLA-Permissive-2.0);
-the authoritative allow-list is enforced by `cargo deny check licenses` against
-`deny.toml`. The section below covers components that are **shipped as binaries**
-alongside the product, which carry obligations beyond the crate licences.
+Rust library dependencies are pulled from crates.io at build time. The
+licences `deny.toml` lets through are: MIT, Apache-2.0 (including the
+LLVM-exception form), BSD-2-Clause, BSD-3-Clause, ISC, Zlib, 0BSD, CC0-1.0,
+Unicode-3.0, CDLA-Permissive-2.0 and MPL-2.0. All except MPL-2.0 are
+permissive. MPL-2.0 is a weak copyleft licence: changes to an MPL-covered
+file must stay under MPL-2.0, while the rest of the product is unaffected.
+Dependencies are checked by `cargo deny check licenses` against the Windows,
+Linux and macOS targets listed in `deny.toml`; a licence outside the list
+fails the check. This is a build-time policy check, not a legal opinion. The
+section below covers components that are **shipped as binaries** alongside the
+product, which carry obligations beyond the crate licences.
 
 Both components below are also listed inside the application, in
 **Help → Licenses → Third-party components**, together with a live check of the

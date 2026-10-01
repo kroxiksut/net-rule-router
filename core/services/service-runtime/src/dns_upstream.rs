@@ -331,7 +331,8 @@ impl UpstreamDnsPool {
             tracing::warn!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-upstream-worker-spawn-failed",
-                "could not start the upstream DNS re-selection worker: {e}",
+                error = %e,
+                "could not start the upstream DNS re-selection worker",
             );
         }
     }

@@ -9,9 +9,9 @@
 //! 1. `RevisionsRepository::get_active` → returns the row whose
 //!    `status='active'` (at most one — partial unique index on
 //!    `revisions.status` enforces the invariant at the SQL layer).
-//! 2. Parse the row's `rules_json` blob via
-//!    [`nrr_shared::rules_json::from_canonical_string`] — wire-shape
-//!    sanity check (schema version, structural validity).
+//! 2. Parse the row's `rules_json` blob via [`read_stored_rules`] — wire-shape
+//!    sanity check, and a rule on an address that is never a destination is
+//!    dropped (every service reader of a stored book reads through it).
 //! 3. Decode the wire DTO into a domain
 //!    [`RulesRevisionContent`](nrr_domain::rules_revision::RulesRevisionContent)
 //!    via [`nrr_domain::rules_json_codec::decode`] — applies the
@@ -24,6 +24,10 @@
 //!    effectively cosmetic — nothing yet gives a revision its own
 //!    default mode.
 //!
+//! Steps 2–4 run once per source: each read checks only the source's identity
+//! (overlay blob or active revision id + hash) and the subdomain flag, and
+//! serves the kept decode while they are unchanged.
+//!
 //! ## Error handling
 //!
 //! Every storage error or codec error degrades to `None` + a
@@ -32,7 +36,9 @@
 //! rather than crashing. This matches the trait contract documented
 //! in [`crate::per_sid_orchestrator::RulesProvider`].
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use nrr_domain::rules_json_codec;
 use nrr_shared::rules_json;
@@ -52,11 +58,86 @@ use crate::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider};
 /// adds during orchestrator install/recompile passes.
 pub struct ProductionRulesProvider {
     conn: Arc<Mutex<Connection>>,
+    // Every DNS query reads the book; decoding it each time is on the traffic
+    // path, so the decoded book is kept per principal until its source changes.
+    decoded: Mutex<HashMap<String, DecodedRead>>,
+    decodes: AtomicU64,
+}
+
+/// What a decoded book was built from; any change forces a fresh decode.
+#[derive(Clone)]
+struct ReadKey {
+    source: Source,
+    include_subdomains: bool,
+}
+
+#[derive(Clone)]
+enum Source {
+    /// Identity is the published blob itself: every publish allocates anew.
+    Applying {
+        principal: String,
+        rules_json: Arc<str>,
+    },
+    Stored {
+        principal: String,
+        revision_id: String,
+        content_hash: String,
+    },
+}
+
+impl PartialEq for Source {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Applying {
+                    principal: a,
+                    rules_json: x,
+                },
+                Self::Applying {
+                    principal: b,
+                    rules_json: y,
+                },
+            ) => a == b && Arc::ptr_eq(x, y),
+            (
+                Self::Stored {
+                    principal: a,
+                    revision_id: r1,
+                    content_hash: h1,
+                },
+                Self::Stored {
+                    principal: b,
+                    revision_id: r2,
+                    content_hash: h2,
+                },
+            ) => a == b && r1 == r2 && h1 == h2,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq for ReadKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source && self.include_subdomains == other.include_subdomains
+    }
+}
+
+struct DecodedRead {
+    key: ReadKey,
+    snapshot: Option<ActiveRulesSnapshot>,
 }
 
 impl ProductionRulesProvider {
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            decoded: Mutex::new(HashMap::new()),
+            decodes: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn decode_count(&self) -> u64 {
+        self.decodes.load(Ordering::Relaxed)
     }
 
     /// Decode one active `revisions` row into an [`ActiveRulesSnapshot`].
@@ -76,7 +157,7 @@ impl ProductionRulesProvider {
 pub fn decode_rules_snapshot(rules_json: &str, origin: &str) -> Option<ActiveRulesSnapshot> {
     // Wire-layer parse: the JSON string must be a canonical-wire
     // `CanonicalRulesJsonV1`.
-    let dto = match rules_json::from_canonical_string(rules_json) {
+    let dto = match read_stored_rules(rules_json, origin) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(
@@ -116,6 +197,52 @@ pub fn decode_rules_snapshot(rules_json: &str, origin: &str) -> Option<ActiveRul
     })
 }
 
+/// A stored rule book as every service reader reads it: a rule no book may hold
+/// (an address never a destination, an application value the pipeline refuses)
+/// is dropped and the rest loads, so saving what was read leaves it out for good.
+pub(crate) fn read_stored_rules(
+    rules_json: &str,
+    origin: &str,
+) -> Result<rules_json::CanonicalRulesJsonV1, rules_json::RulesJsonCodecError> {
+    let mut dto = rules_json::from_canonical_string(rules_json)?;
+    let dropped = nrr_domain::rule_value_validation::drop_rules_refused_outright(&mut dto);
+    if !dropped.is_empty() && first_report_of(rules_json) {
+        report_dropped_rules(dropped.len(), origin);
+    }
+    Ok(dto)
+}
+
+/// The one line saying stored rules no book may hold were dropped on read.
+pub(crate) fn report_dropped_rules(dropped: usize, origin: &str) {
+    if dropped == 0 {
+        return;
+    }
+    tracing::warn!(
+        target: "nrr::rules-provider",
+        msg_key = "stored-rules-dropped",
+        dropped,
+        origin = %origin,
+        "dropped stored rules no rule set may hold",
+    );
+}
+
+/// Every reader of one stored book would repeat the line: once per book per run.
+fn first_report_of(rules_json: &str) -> bool {
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+    static REPORTED: std::sync::OnceLock<Mutex<HashSet<u64>>> = std::sync::OnceLock::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rules_json.hash(&mut hasher);
+    let mut reported = REPORTED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if reported.len() >= 64 {
+        reported.clear();
+    }
+    reported.insert(hasher.finish())
+}
+
 impl RulesProvider for ProductionRulesProvider {
     fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
         // Back-compat: the no-principal entry point reads the baseline
@@ -144,49 +271,101 @@ impl RulesProvider for ProductionRulesProvider {
             }
         };
         let repo = RevisionsRepository::new(&guard);
-        let lookup = |p: &str| match repo.get_active_for(p) {
-            Ok(found) => Ok(found),
-            Err(e) => {
-                tracing::warn!(
-                    target: "nrr::rules-provider",
-                    msg_key = "prod-rules-get-active-failed",
-                    error = %e,
-                    principal = %p,
-                    "revisions.get_active_for failed; treating as no active rules",
-                );
-                Err(())
-            }
+        let warn = |p: &str, e: &dyn std::fmt::Display| {
+            tracing::warn!(
+                target: "nrr::rules-provider",
+                msg_key = "prod-rules-get-active-failed",
+                error = %e,
+                principal = %p,
+                "revisions.get_active_for failed; treating as no active rules",
+            );
         };
         // A revision mid-activation wins over the stored pointer, which still
         // names the previous one until phase 3a commits.
-        let resolve = |p: &str| match applying_revision_overlay::applying_for(&guard, p) {
-            Some(rules_json) => Ok(Some(decode_rules_snapshot(
-                &rules_json,
-                "applying-revision",
-            ))),
-            None => lookup(p).map(|found| found.map(|r| Self::snapshot_from_record(&r))),
+        let resolve = |p: &str| -> Result<Option<Source>, ()> {
+            if let Some(rules_json) = applying_revision_overlay::applying_for(&guard, p) {
+                return Ok(Some(Source::Applying {
+                    principal: p.to_owned(),
+                    rules_json,
+                }));
+            }
+            match repo.active_identity_for(p) {
+                Ok(found) => Ok(found.map(|(revision_id, content_hash)| Source::Stored {
+                    principal: p.to_owned(),
+                    revision_id,
+                    content_hash,
+                })),
+                Err(e) => {
+                    warn(p, &e);
+                    Err(())
+                }
+            }
         };
-        let decoded = match resolve(principal) {
+        let source = match resolve(principal) {
             Ok(Some(s)) => s,
             // No own revision → read through to the baseline principal.
             Ok(None) if principal != BASELINE_PRINCIPAL => match resolve(BASELINE_PRINCIPAL) {
                 Ok(Some(s)) => s,
                 _ => return None,
             },
-            Ok(None) => return None,
-            Err(()) => return None,
+            Ok(None) | Err(()) => return None,
         };
-        let mut snapshot = decoded?;
-        // Subdomain coverage (ON by default) is applied HERE, at the
-        // enforcement-read layer feeding the WFP codegen, the route codegen and
-        // the DNS-observation seeder — NEVER to the stored/hashed rule book,
-        // which the drift detector must keep hashing bare. Read for the CALLING
-        // principal even when the rules read through to the baseline; a storage
-        // error degrades to OFF (the narrow rule book, never a guess).
-        if Self::reads_include_subdomains(&guard, principal) {
-            snapshot.rule_book = snapshot.rule_book.with_subdomain_coverage();
+        // Subdomain coverage is read for the CALLING principal even when the
+        // rules read through to the baseline.
+        let key = ReadKey {
+            source,
+            include_subdomains: Self::reads_include_subdomains(&guard, principal),
+        };
+        let mut decoded = self.decoded.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = decoded.get(principal).filter(|d| d.key == key) {
+            return hit.snapshot.clone();
         }
-        Some(snapshot)
+        self.decodes.fetch_add(1, Ordering::Relaxed);
+        let (key, bare) = match key.source {
+            Source::Applying { ref rules_json, .. } => {
+                let bare = decode_rules_snapshot(rules_json, "applying-revision");
+                (key, bare)
+            }
+            Source::Stored {
+                principal: ref p, ..
+            } => match repo.get_active_for(p) {
+                // Keyed by the row actually decoded: another connection may
+                // have switched the active revision since the identity read.
+                Ok(Some(record)) => (
+                    ReadKey {
+                        source: Source::Stored {
+                            principal: p.clone(),
+                            revision_id: record.revision_id.clone(),
+                            content_hash: record.content_hash.clone(),
+                        },
+                        include_subdomains: key.include_subdomains,
+                    },
+                    Self::snapshot_from_record(&record),
+                ),
+                Ok(None) => return None,
+                Err(e) => {
+                    warn(p, &e);
+                    return None;
+                }
+            },
+        };
+        // Subdomain coverage (ON by default) widens only this enforcement read,
+        // NEVER the stored/hashed rule book the drift detector hashes bare; a
+        // storage error reads as OFF (the narrow book, never a guess).
+        let snapshot = bare.map(|mut s| {
+            if key.include_subdomains {
+                s.rule_book = s.rule_book.with_subdomain_coverage();
+            }
+            s
+        });
+        decoded.insert(
+            principal.to_owned(),
+            DecodedRead {
+                key,
+                snapshot: snapshot.clone(),
+            },
+        );
+        snapshot
     }
 }
 
@@ -292,6 +471,182 @@ mod tests {
         assert_eq!(snap.behavior_mode, RouteBehaviorMode::PreferPrimary);
     }
 
+    /// A book stored before the service refused bad rule values still loads:
+    /// the valid rules are enforced, the refused value stays as it was stored.
+    #[test]
+    fn a_stored_book_with_a_refused_value_still_serves_its_valid_rules() {
+        use nrr_domain::canonical::CanonicalAddressMatch;
+        use nrr_shared::rules_json::{
+            AddressMatchDto, CanonicalRulesJsonV1, RuleDto, RULES_JSON_SCHEMA_VERSION,
+        };
+        let rule = |id: &str, address_match: AddressMatchDto| RuleDto {
+            id: id.into(),
+            enabled: true,
+            address_match: Some(address_match),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        };
+        let dto = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![
+                rule(
+                    "r-1",
+                    AddressMatchDto::ExactFqdn {
+                        value: "192.168.1.1".into(),
+                    },
+                ),
+                rule("r-2", AddressMatchDto::Zone { name: "123".into() }),
+                rule(
+                    "r-3",
+                    AddressMatchDto::ExactFqdn {
+                        value: "example.com".into(),
+                    },
+                ),
+                rule(
+                    "r-4",
+                    AddressMatchDto::ExactIpv4 {
+                        address: "203.0.113.5".into(),
+                    },
+                ),
+            ],
+            secondary: vec![],
+        };
+        let conn = make_state_conn();
+        insert_active_revision(&conn, &rules_json::to_canonical_string(&dto).expect("json"));
+
+        let snap = ProductionRulesProvider::new(conn)
+            .active_rules()
+            .expect("the stored book loads");
+        let held: Vec<_> = snap
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .filter_map(|r| r.address_match.clone())
+            .collect();
+        assert!(held.contains(&CanonicalAddressMatch::ExactFqdn("example.com".into())));
+        assert!(held.contains(&CanonicalAddressMatch::ExactIp(
+            std::net::Ipv4Addr::new(203, 0, 113, 5).into()
+        )));
+        assert!(held.contains(&CanonicalAddressMatch::Zone("123".into())));
+    }
+
+    /// A stored rule on an address that is never a destination is gone once
+    /// read: enforcement and the rules table both get the rest of the book, and
+    /// what they would save no longer holds it.
+    #[test]
+    fn a_stored_rule_on_no_destination_is_dropped_on_read() {
+        use crate::ipc_handlers::providers::RulesSnapshotProvider as _;
+        use nrr_shared::ipc_payloads::RulesRouteFilter;
+        use nrr_shared::rules_json::{
+            AddressMatchDto, CanonicalRulesJsonV1, RuleDto, RULES_JSON_SCHEMA_VERSION,
+        };
+        let rule = |id: &str, address: &str| RuleDto {
+            id: id.into(),
+            enabled: true,
+            address_match: Some(AddressMatchDto::ExactIpv4 {
+                address: address.into(),
+            }),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        };
+        let dto = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![rule("r-1", "203.0.113.5"), rule("r-2", "255.255.255.255")],
+            secondary: vec![rule("r-3", "0.0.0.0"), rule("r-4", "198.51.100.9")],
+        };
+        let conn = make_state_conn();
+        insert_active_revision(&conn, &rules_json::to_canonical_string(&dto).expect("json"));
+
+        let snap = ProductionRulesProvider::new(Arc::clone(&conn))
+            .active_rules()
+            .expect("the rest of the book loads");
+        let ids = |set: &nrr_domain::canonical::CanonicalRuleSet| -> Vec<String> {
+            set.rules()
+                .iter()
+                .map(|r| r.id.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(ids(&snap.rule_book.primary), ["r-1"]);
+        assert_eq!(ids(&snap.rule_book.secondary), ["r-4"]);
+
+        let rows = crate::production_handlers_misc::ProductionRulesSnapshotProvider::new(conn)
+            .rules_snapshot(RulesRouteFilter::All)
+            .rows;
+        let row_ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(row_ids, ["r-1", "r-4"]);
+
+        let saved = rules_json_codec::encode(&nrr_domain::rules_revision::RulesRevisionContent {
+            rule_book: snap.rule_book,
+            format_version: nrr_domain::rules_revision::RULES_REVISION_FORMAT_VERSION,
+        });
+        let saved = rules_json::to_canonical_string(&saved).expect("json");
+        assert!(!saved.contains("255.255.255.255") && !saved.contains("0.0.0.0"));
+    }
+
+    /// An application row the pipeline refuses — too long, a control
+    /// character, the bare `*` — stored before the check is dropped on read the
+    /// same way; the rest of the book is in force and saving it leaves them out.
+    #[test]
+    fn a_stored_application_the_pipeline_refuses_is_dropped_on_read() {
+        use nrr_shared::rules_json::{
+            AppMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleDto, RULES_JSON_SCHEMA_VERSION,
+        };
+        let rule = |id: &str, value: &str| RuleDto {
+            id: id.into(),
+            enabled: true,
+            address_match: None,
+            app_match: Some(AppMatchDto {
+                pattern: AppPatternDto::Exact {
+                    value: value.into(),
+                },
+                include_child_processes: false,
+            }),
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        };
+        let long = format!("{}.exe", "a".repeat(300));
+        let dto = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![
+                rule("r-1", "chrome.exe"),
+                rule("r-2", &long),
+                rule("r-3", "bell\u{7}.exe"),
+            ],
+            secondary: vec![rule("r-4", "*"), rule("r-5", "tab\tname.exe")],
+        };
+        let conn = make_state_conn();
+        insert_active_revision(&conn, &rules_json::to_canonical_string(&dto).expect("json"));
+
+        let snap = ProductionRulesProvider::new(conn)
+            .active_rules()
+            .expect("the rest of the book loads");
+        let ids = |set: &nrr_domain::canonical::CanonicalRuleSet| -> Vec<String> {
+            set.rules()
+                .iter()
+                .map(|r| r.id.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(ids(&snap.rule_book.primary), ["r-1"]);
+        assert_eq!(ids(&snap.rule_book.secondary), ["r-5"]);
+
+        let saved = rules_json_codec::encode(&nrr_domain::rules_revision::RulesRevisionContent {
+            rule_book: snap.rule_book,
+            format_version: nrr_domain::rules_revision::RULES_REVISION_FORMAT_VERSION,
+        });
+        let saved = rules_json::to_canonical_string(&saved).expect("json");
+        let mut reread = read_stored_rules(&saved, "test").expect("read");
+        assert!(
+            nrr_domain::rule_value_validation::drop_rules_refused_outright(&mut reread).is_empty()
+        );
+        assert_eq!(reread.primary.len() + reread.secondary.len(), 2);
+    }
+
     #[test]
     fn malformed_rules_json_degrades_to_none() {
         let conn = make_state_conn();
@@ -326,7 +681,7 @@ mod tests {
                 id: "r-fqdn".into(),
                 enabled: true,
                 address_match: Some(AddressMatchDto::ExactFqdn {
-                    value: "whatismyip.com".into(),
+                    value: "site.example".into(),
                 }),
                 app_match: None,
                 comment: String::new(),
@@ -344,7 +699,7 @@ mod tests {
             snap.rule_book.secondary.rules().iter().any(|r| {
                 matches!(
                     &r.address_match,
-                    Some(CanonicalAddressMatch::SuffixDomain(d)) if d == "whatismyip.com"
+                    Some(CanonicalAddressMatch::SuffixDomain(d)) if d == "site.example"
                 )
             })
         };
@@ -509,6 +864,72 @@ mod tests {
         drop(guard);
         let after = provider.active_rules_for(user).expect("rules");
         assert!(names(&after, "203.0.113.5"), "the stored revision is back");
+    }
+
+    #[test]
+    fn an_unchanged_source_is_decoded_once_and_any_change_is_seen_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = make_file_state_conn(&dir);
+        let user = "S-1-5-21-CACHED";
+        insert_active_revision_for(&conn, user, &single_rule_json("203.0.113.5"));
+        let provider = ProductionRulesProvider::new(Arc::clone(&conn));
+
+        for _ in 0..5 {
+            let snap = provider.active_rules_for(user).expect("rules");
+            assert!(names(&snap, "203.0.113.5"));
+        }
+        assert_eq!(provider.decode_count(), 1, "unchanged revision: one decode");
+
+        // Activation of a new revision: served on the very next read.
+        {
+            let g = conn.lock().unwrap();
+            g.execute(
+                "UPDATE revisions SET status = 'superseded' WHERE principal = ?1",
+                rusqlite::params![user],
+            )
+            .expect("supersede");
+            g.execute(
+                "INSERT INTO revisions (
+                    principal, revision_id, content_hash, rules_json, status, source,
+                    correlation_id, created_at, activated_at
+                 ) VALUES (?1, 'rev-2', 'hash-2', ?2, 'active', 'gui-rules-edit', 'c2', 2, 2)",
+                rusqlite::params![user, single_rule_json("198.51.100.9")],
+            )
+            .expect("insert");
+        }
+        let next = provider.active_rules_for(user).expect("rules");
+        assert!(names(&next, "198.51.100.9"), "new revision seen at once");
+        provider.active_rules_for(user).expect("rules");
+        assert_eq!(provider.decode_count(), 2);
+
+        // The applying overlay and its withdrawal are both seen at once.
+        let guard = {
+            let g = conn.lock().unwrap();
+            applying_revision_overlay::publish(&g, user, &single_rule_json("192.0.2.7"))
+        };
+        let during = provider.active_rules_for(user).expect("rules");
+        assert!(names(&during, "192.0.2.7"));
+        provider.active_rules_for(user).expect("rules");
+        assert_eq!(provider.decode_count(), 3);
+        drop(guard);
+        let after = provider.active_rules_for(user).expect("rules");
+        assert!(names(&after, "198.51.100.9"));
+
+        // A subdomain-setting flip is a new source too.
+        let before_flip = provider.decode_count();
+        {
+            let g = conn.lock().unwrap();
+            g.execute(
+                "INSERT INTO secondary_block_policy
+                    (sid, block_secondary_when_unavailable, kill_switch_fail_closed,
+                     kill_switch_protocols, include_subdomains, updated_at)
+                 VALUES (?1, 1, 1, 127, 0, 1)",
+                rusqlite::params![user],
+            )
+            .expect("seed policy");
+        }
+        provider.active_rules_for(user).expect("rules");
+        assert_eq!(provider.decode_count(), before_flip + 1);
     }
 
     #[test]

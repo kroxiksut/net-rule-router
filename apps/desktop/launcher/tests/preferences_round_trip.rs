@@ -375,6 +375,28 @@ fn unenforced_apps_ack_signature_round_trips_through_payload() {
     );
 }
 
+/// A dismissed "new version" notice stays dismissed across restarts: the
+/// version travels through the payload and the file, and a payload without the
+/// key keeps it.
+#[test]
+fn the_dismissed_update_version_survives_a_restart() {
+    let baseline = UiPreferences::default();
+    assert!(baseline.dismissed_update_version.is_empty());
+    let dismissed = apply_qt_preferences_payload(
+        &baseline,
+        &payload_with(&[("dismissedUpdateVersion", "2.4.0".into())]),
+    )
+    .expect("payload must parse");
+    assert_eq!(dismissed.dismissed_update_version, "2.4.0");
+    assert_eq!(
+        through_the_file(&dismissed).dismissed_update_version,
+        "2.4.0"
+    );
+    let kept = apply_qt_preferences_payload(&dismissed, &payload_with_theme("dark", false))
+        .expect("payload without the key must parse");
+    assert_eq!(kept.dismissed_update_version, "2.4.0");
+}
+
 #[test]
 fn diagnostics_archive_options_round_trip_through_payload() {
     // The support-archive detail level and the "current session only" scope are
@@ -425,8 +447,7 @@ fn diagnostics_archive_options_round_trip_through_payload() {
         "an unknown tier must be rejected rather than stored"
     );
 
-    // Key omitted → the detail level survives; the scope flag falls back to its
-    // `true` default rather than silently widening the archive.
+    // Keys omitted → both keep what the user picked.
     let kept = apply_qt_preferences_payload(&updated, &payload_with_theme("dark", false))
         .expect("payload without the keys must parse");
     assert_eq!(
@@ -434,8 +455,8 @@ fn diagnostics_archive_options_round_trip_through_payload() {
         "a payload omitting the key must not reset the stored detail level"
     );
     assert!(
-        kept.diagnostics_archive_session_only,
-        "an omitted scope key must resolve to the narrow default"
+        !kept.diagnostics_archive_session_only,
+        "a payload omitting the key must not reset the stored scope"
     );
 }
 
@@ -501,6 +522,57 @@ fn user_presets_dir_round_trips_through_payload() {
     assert_eq!(
         guarded.user_presets_dir, r"D:\My Rule Sets",
         "a multi-line path must be rejected rather than stored"
+    );
+}
+
+/// The frequency from the GUI is snapped to an offered choice, and a payload
+/// without it keeps the stored one.
+#[test]
+fn update_check_interval_is_clamped_and_survives_an_omitted_key() {
+    let with_interval = |days: serde_json::Value| {
+        let mut object: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&payload_with_theme("dark", false)).expect("base payload parses");
+        object.insert("updateCheckIntervalDays".into(), days);
+        serde_json::Value::Object(object).to_string()
+    };
+    let baseline = UiPreferences::default();
+    assert_eq!(baseline.update_check_interval_days, 14);
+
+    let monthly =
+        apply_qt_preferences_payload(&baseline, &with_interval(30.into())).expect("payload parses");
+    assert_eq!(monthly.update_check_interval_days, 30);
+    let too_often =
+        apply_qt_preferences_payload(&baseline, &with_interval(1.into())).expect("payload parses");
+    assert_eq!(
+        too_often.update_check_interval_days, 7,
+        "never more often than the floor"
+    );
+
+    let kept = apply_qt_preferences_payload(&monthly, &payload_with_theme("dark", false))
+        .expect("payload without the key parses");
+    assert_eq!(kept.update_check_interval_days, 30);
+}
+
+/// The scheduled release check is on for a fresh install, a declined check
+/// stays declined, and a payload that omits the key cannot switch it back on.
+#[test]
+fn update_check_switch_round_trips_and_survives_an_omitted_key() {
+    let baseline = UiPreferences::default();
+    assert!(baseline.update_check_enabled, "on for a fresh install");
+
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&payload_with_theme("dark", false)).expect("base payload parses");
+    object.insert("updateCheckEnabled".into(), false.into());
+    let declined =
+        apply_qt_preferences_payload(&baseline, &serde_json::Value::Object(object).to_string())
+            .expect("payload parses");
+    assert!(!declined.update_check_enabled);
+
+    let kept = apply_qt_preferences_payload(&declined, &payload_with_theme("dark", false))
+        .expect("payload without the key parses");
+    assert!(
+        !kept.update_check_enabled,
+        "an omitted key must not re-enable the check"
     );
 }
 
@@ -656,5 +728,296 @@ fn stopping_the_install_offer_round_trips_and_an_older_build_keeps_the_offer() {
     assert!(
         !silent.service_install_prompt_suppressed,
         "an absent key must not silence the offer"
+    );
+}
+
+fn payload_with(extra: &[(&str, serde_json::Value)]) -> String {
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&payload_with_theme("dark", false)).expect("base payload parses");
+    for (key, value) in extra {
+        object.insert((*key).into(), value.clone());
+    }
+    serde_json::Value::Object(object).to_string()
+}
+
+/// What the file hands back after a save — what a wiped service is reseeded
+/// from on the next start.
+fn through_the_file(preferences: &UiPreferences) -> UiPreferences {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let store = nrr_ui_support::ui_preferences::UiPreferencesStore::for_path(
+        dir.path().join("ui-preferences.conf"),
+    );
+    store.save(preferences).expect("save");
+    store.load().expect("load")
+}
+
+/// The payload side and the file side answer "is this mask a selection?" the
+/// same way, so the value the session kept is the value reseeded later.
+#[test]
+fn the_protocol_mask_the_session_keeps_is_the_one_the_file_reseeds() {
+    let baseline = UiPreferences {
+        route_kill_switch_protocols: 5,
+        ..Default::default()
+    };
+    for mask in [1u32, 5, 127] {
+        let kept = apply_qt_preferences_payload(
+            &baseline,
+            &payload_with(&[("routeKillSwitchProtocols", mask.into())]),
+        )
+        .expect("payload must parse");
+        assert_eq!(kept.route_kill_switch_protocols, mask);
+        assert_eq!(through_the_file(&kept).route_kill_switch_protocols, mask);
+    }
+    // A mask that blocks nothing ("Other" alone included), or a bit outside
+    // the mask, keeps the stored selection instead of being masked into one
+    // nobody made (`128 & 0x7F` is 0). Switching leak protection off is its
+    // own toggle.
+    for damaged in [0u32, 64, 128, 0x85, 256, u32::MAX] {
+        let kept = apply_qt_preferences_payload(
+            &baseline,
+            &payload_with(&[("routeKillSwitchProtocols", damaged.into())]),
+        )
+        .expect("payload must parse");
+        assert_eq!(kept.route_kill_switch_protocols, 5, "{damaged}");
+        assert_eq!(through_the_file(&kept).route_kill_switch_protocols, 5);
+    }
+}
+
+/// A payload that omits the consent or a binding id reports nothing about it;
+/// reading the absence as `0` / `""` revoked the EULA and left the adapter's
+/// name without its id.
+#[test]
+fn a_payload_without_the_key_keeps_consent_and_binding() {
+    let baseline = UiPreferences {
+        accepted_eula_version: 3,
+        selected_primary_interface_id: "primary-id".into(),
+        selected_primary_interface_name: "Primary adapter".into(),
+        selected_secondary_interface_id: "secondary-id".into(),
+        selected_secondary_interface_name: "Secondary adapter".into(),
+        ..Default::default()
+    };
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&payload_with_theme("dark", false)).expect("base payload parses");
+    object.remove("selectedPrimaryInterfaceName");
+    object.remove("selectedSecondaryInterfaceName");
+    let silent =
+        apply_qt_preferences_payload(&baseline, &serde_json::Value::Object(object).to_string())
+            .expect("payload must parse");
+    assert_eq!(silent.accepted_eula_version, 3);
+    assert_eq!(silent.selected_primary_interface_id, "primary-id");
+    assert_eq!(silent.selected_primary_interface_name, "Primary adapter");
+    assert_eq!(silent.selected_secondary_interface_id, "secondary-id");
+    assert_eq!(
+        silent.selected_secondary_interface_name,
+        "Secondary adapter"
+    );
+
+    // A key that IS sent still wins, the explicit reset included.
+    let reset = apply_qt_preferences_payload(
+        &baseline,
+        &payload_with(&[
+            ("acceptedEulaVersion", 0.into()),
+            ("selectedPrimaryInterfaceId", "".into()),
+            ("selectedSecondaryInterfaceId", "other-id".into()),
+        ]),
+    )
+    .expect("payload must parse");
+    assert_eq!(reset.accepted_eula_version, 0);
+    assert_eq!(reset.selected_primary_interface_id, "");
+    assert_eq!(reset.selected_secondary_interface_id, "other-id");
+}
+
+/// A shared-IP slug off the wire list reached `route.policy.update` on the
+/// reseed and was refused there; a period off the list lived until restart.
+#[test]
+fn policy_and_period_slugs_off_their_lists_keep_the_stored_value() {
+    let baseline = UiPreferences {
+        route_shared_ip_policy: "any-rule-domain".into(),
+        traffic_stats_period: "session".into(),
+        ..Default::default()
+    };
+    let refused = apply_qt_preferences_payload(
+        &baseline,
+        &payload_with(&[
+            ("routeSharedIpPolicy", "majority_of_ip".into()),
+            ("trafficStatsPeriod", "yesterday".into()),
+        ]),
+    )
+    .expect("payload must parse");
+    assert_eq!(refused.route_shared_ip_policy, "any-rule-domain");
+    assert_eq!(refused.traffic_stats_period, "session");
+
+    let taken = apply_qt_preferences_payload(
+        &baseline,
+        &payload_with(&[
+            ("routeSharedIpPolicy", "majority-of-rules".into()),
+            ("trafficStatsPeriod", "all-time".into()),
+        ]),
+    )
+    .expect("payload must parse");
+    let reloaded = through_the_file(&taken);
+    assert_eq!(reloaded.route_shared_ip_policy, "majority-of-rules");
+    assert_eq!(reloaded.traffic_stats_period, "all-time");
+}
+
+/// A setting whose default is ON used to read an absent key as that default,
+/// so a payload that simply did not mention it switched the user's OFF back ON.
+#[test]
+fn a_payload_without_the_key_keeps_every_default_on_setting_and_the_protocol_mask() {
+    let baseline = UiPreferences {
+        notify_suggestion_changes: false,
+        notify_block_notices: false,
+        notify_rule_duplicates: false,
+        show_remembered_adapters: false,
+        auto_confirm_adapter_id_change: false,
+        warn_kill_switch_block_all: false,
+        diagnostics_archive_session_only: false,
+        route_include_subdomains: false,
+        route_kill_switch_fail_closed: false,
+        route_allow_dns_over_primary: false,
+        route_resolve_hosts_bypass: false,
+        auto_load_rules_on_launch: false,
+        export_include_comments: false,
+        import_only_active: false,
+        show_bundled_presets: false,
+        route_kill_switch_protocols: 5,
+        ..Default::default()
+    };
+    let silent = apply_qt_preferences_payload(&baseline, &payload_with_theme("dark", false))
+        .expect("payload must parse");
+    let reloaded = through_the_file(&silent);
+    for kept in [&silent, &reloaded] {
+        assert!(!kept.notify_suggestion_changes);
+        assert!(!kept.notify_block_notices);
+        assert!(!kept.notify_rule_duplicates);
+        assert!(!kept.show_remembered_adapters);
+        assert!(!kept.auto_confirm_adapter_id_change);
+        assert!(!kept.warn_kill_switch_block_all);
+        assert!(!kept.diagnostics_archive_session_only);
+        assert!(!kept.route_include_subdomains);
+        assert!(!kept.route_kill_switch_fail_closed);
+        assert!(!kept.route_allow_dns_over_primary);
+        assert!(!kept.route_resolve_hosts_bypass);
+        assert!(!kept.auto_load_rules_on_launch);
+        assert!(!kept.export_include_comments);
+        assert!(!kept.import_only_active);
+        assert!(!kept.show_bundled_presets);
+        assert_eq!(kept.route_kill_switch_protocols, 5);
+    }
+
+    // A key that IS sent still wins.
+    let sent = apply_qt_preferences_payload(
+        &baseline,
+        &payload_with(&[
+            ("notifySuggestionChanges", true.into()),
+            ("notifyBlockNotices", true.into()),
+            ("notifyRuleDuplicates", true.into()),
+            ("showRememberedAdapters", true.into()),
+            ("autoConfirmAdapterIdChange", true.into()),
+            ("warnKillSwitchBlockAll", true.into()),
+            ("diagnosticsArchiveSessionOnly", true.into()),
+            ("routeIncludeSubdomains", true.into()),
+            ("routeKillSwitchFailClosed", true.into()),
+            ("routeAllowDnsOverPrimary", true.into()),
+            ("routeResolveHostsBypass", true.into()),
+            ("autoLoadRulesOnLaunch", true.into()),
+            ("exportIncludeComments", true.into()),
+            ("importOnlyActive", true.into()),
+            ("showBundledPresets", true.into()),
+            ("routeKillSwitchProtocols", 127.into()),
+        ]),
+    )
+    .expect("payload must parse");
+    assert!(sent.notify_suggestion_changes);
+    assert!(sent.notify_block_notices);
+    assert!(sent.notify_rule_duplicates);
+    assert!(sent.show_remembered_adapters);
+    assert!(sent.auto_confirm_adapter_id_change);
+    assert!(sent.warn_kill_switch_block_all);
+    assert!(sent.diagnostics_archive_session_only);
+    assert!(sent.route_include_subdomains);
+    assert!(sent.route_kill_switch_fail_closed);
+    assert!(sent.route_allow_dns_over_primary);
+    assert!(sent.route_resolve_hosts_bypass);
+    assert!(sent.auto_load_rules_on_launch);
+    assert!(sent.export_include_comments);
+    assert!(sent.import_only_active);
+    assert!(sent.show_bundled_presets);
+    assert_eq!(sent.route_kill_switch_protocols, 127);
+}
+
+/// A payload that reports nothing changes nothing. Every field used to have a
+/// serde default, so an absent key silently switched off the leak-protection
+/// mirror, forgot banner answers and reset slugs to their defaults.
+#[test]
+fn an_empty_payload_leaves_every_stored_setting_as_it_was() {
+    let baseline = UiPreferences {
+        hide_block_notice_addresses: true,
+        tray_notice_opacity_percent: 60,
+        primary_role_user_confirmed: true,
+        secondary_role_user_confirmed: true,
+        show_bluetooth_adapters: true,
+        show_audit_tab: true,
+        settings_autosave_secs: 120,
+        admin_auto_revoke_disabled: true,
+        admin_auto_revoke_minutes: 30,
+        allow_mode_a_killswitch: true,
+        routing_detailed_mode: true,
+        show_virtual_machines_section: true,
+        app_groups_offer_dismissed: true,
+        kill_switch_banner_acknowledged: true,
+        missing_secondary_banner_acknowledged: true,
+        traffic_stats_period: "all-time".into(),
+        traffic_export_unit: "gb".into(),
+        diagnostics_archive_redaction_level: "diagnostics".into(),
+        route_shared_ip_policy: "any-rule-domain".into(),
+        route_kill_switch_block_all: true,
+        route_kill_switch_enabled: true,
+        route_kill_switch_protocols: 5,
+        route_mode_a_coverage_strategy: "zone-widening".into(),
+        route_enforcement_mode: "reactive".into(),
+        route_liveness_window_secs: 30,
+        route_pending_offline_json: r#"{"route-policy":{}}"#.into(),
+        cache_table_column_widths: r#"{"host":120}"#.into(),
+        service_backed_mirror_json: r#"{"stability":{}}"#.into(),
+        service_intent_json: r#"{"stability":{}}"#.into(),
+        last_saved_path_primary: Some("primary.txt".into()),
+        last_loaded_path_secondary: Some("secondary.txt".into()),
+        service_install_uac_declined_at_epoch: Some(1_700_000_000),
+        service_install_uac_declined_count: 2,
+        service_install_prompt_suppressed: true,
+        compat_banner_mode: "never".into(),
+        update_page_url: "https://updates.example/".into(),
+        allow_saving_into_bundled_presets: true,
+        rules_folder_suggestion_dismissed: true,
+        merge_conflict_policy: "file-wins".into(),
+        secondary_split_ack_adapter_name: "Tunnel".into(),
+        ..Default::default()
+    };
+    let silent = apply_qt_preferences_payload(&baseline, "{}").expect("an empty payload parses");
+    assert_eq!(silent, baseline);
+
+    // A reported value still wins, and an explicit `null` still clears an
+    // optional one.
+    let sent = apply_qt_preferences_payload(
+        &baseline,
+        &serde_json::json!({
+            "routeKillSwitchEnabled": false,
+            "trayNoticeOpacityPercent": 80,
+            "compatBannerMode": "always",
+            "lastSavedPathPrimary": null,
+            "serviceInstallUacDeclinedAtEpoch": null,
+        })
+        .to_string(),
+    )
+    .expect("payload must parse");
+    assert!(!sent.route_kill_switch_enabled);
+    assert_eq!(sent.tray_notice_opacity_percent, 80);
+    assert_eq!(sent.compat_banner_mode, "always");
+    assert_eq!(sent.last_saved_path_primary, None);
+    assert_eq!(sent.service_install_uac_declined_at_epoch, None);
+    assert_eq!(
+        sent.last_loaded_path_secondary.as_deref(),
+        Some("secondary.txt")
     );
 }

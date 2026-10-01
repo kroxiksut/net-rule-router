@@ -26,15 +26,13 @@
 //! | File | Kind | On corruption |
 //! |------|------|---------------|
 //! | `nrr_fqdn_ip_cache.db` | Rebuildable | Delete + rebuild |
-//! | `nrr_service_state.db` | Service-critical | LKG fallback |
+//! | `nrr_service_state.db` | Service-critical | Reported at boot, then rolled back to a trusted earlier revision |
 //!
 //! See [`profile`] for path resolution and [`repository`] for the trait
 //! interfaces.
 
-pub mod access;
 pub mod app_destinations;
 pub mod app_pattern_resolutions;
-pub mod apply_snapshot;
 pub mod auto_rule_dismissals;
 pub mod auto_rule_evidence;
 pub mod auto_rule_pending;
@@ -49,7 +47,6 @@ pub mod dto;
 pub mod error;
 pub mod explain;
 pub mod explain_snapshots;
-pub mod integrity;
 pub mod local_network_rules;
 pub mod log_retention_config;
 pub mod migration;
@@ -58,8 +55,6 @@ pub mod pause_state;
 pub mod policy_settings;
 pub mod principal_purge;
 pub mod profile;
-pub mod query;
-pub mod rebuild;
 pub mod refusing_anchors;
 pub mod repository;
 pub mod resolution_source;
@@ -83,28 +78,19 @@ pub mod vpn_bootstrap_endpoints;
 // Learned VPN client apps — persisted exe paths of role-verified
 // VPN client processes; pre-seeds the proactive kill-switch app exemption.
 pub mod vpn_client_apps;
-pub mod write;
 
 // Re-export the most commonly used types so callers can write
 // `use nrr_storage::{StorageError, StorageProfile, StorageResolutionSource}`
 // without needing to navigate sub-modules.
-pub use access::{
-    verify_storage_access, DatabaseAccessReport, StorageAccessReport, StorageAccessStatus,
-};
 pub use app_pattern_resolutions::{AppPatternResolutionsRepository, MAX_PATHS_PER_PATTERN};
-pub use apply_snapshot::{ApplySnapshotRepository, StoredSnapshot};
 pub use autostart_state::{
     AutostartLastKnownState, AutostartStateRecord, AutostartStateRepository,
 };
-pub use backup::{backup_database, BackupPolicy, BackupReason};
+pub use backup::{backup_database, BackupReason};
 pub use bootstrap::{bootstrap_storage_directories, StorageBootstrapResult};
 pub use dto::CacheStats;
 pub use error::{IntegrityFailureKind, StorageError, StorageResult};
-pub use explain::{
-    build_cache_diagnostic_summary, build_explain_summary, CacheDiagnosticSummary,
-    DiagnosticRedactionLevel, LookupExplainSummary, RetentionKnobs,
-};
-pub use integrity::{compute_revision_hash, verify_revision_hash, IntegrityEvent, IntegrityTarget};
+pub use explain::DiagnosticRedactionLevel;
 pub use log_retention_config::{LogRetentionConfig, LogRetentionConfigRepository};
 pub use migration::{
     open_connection, open_traffic_connection_or_rebuild, read_schema_version,
@@ -120,14 +106,6 @@ pub use principal_purge::{
     principals_with_state, purge_principal_data, purge_principal_rules, PrincipalPurgeSummary,
 };
 pub use profile::{resolve_storage_topology, StorageProfile, StorageTopology};
-pub use query::{
-    classify_ambiguity, classify_observed_ip, compute_refresh_hint, derive_event_state,
-    AmbiguityKind, ObservedIpClassification, RefreshHint,
-};
-pub use rebuild::{
-    CacheAuditEvent, InvalidationCause, RebuildFailurePolicy, RebuildGuard, RebuildLock,
-    RebuildOutcome, RebuildResult,
-};
 pub use resolution_source::StorageResolutionSource;
 pub use retention_settings::{RetentionSettings, RetentionSettingsRepository};
 pub use revisions::{
@@ -152,10 +130,6 @@ pub use traffic_stats::{
 pub use traffic_stats_settings::{TrafficStatsSettings, TrafficStatsSettingsRepository};
 pub use vpn_bootstrap_endpoints::VpnBootstrapEndpointsRepository;
 pub use vpn_client_apps::VpnClientAppsRepository;
-pub use write::{
-    apply_ttl_policy, build_negative_entry, compute_refresh_policy, compute_refresh_schedule,
-    CacheOnlyReason, RefreshPolicy, RefreshSchedule, TtlPolicy,
-};
 
 // Re-export the domain types that appear in our public API so callers do not
 // have to add a separate `nrr-domain` dependency just to construct requests.

@@ -117,11 +117,7 @@ pub(super) fn resolve_managed_locales_dir() -> Option<PathBuf> {
     // second location that happens to be writable.
     crate::user_paths::user_app_roots()
         .into_iter()
-        .map(|root| {
-            root.path
-                .join(MANAGED_SUBFOLDER)
-                .join(USER_LOCALES_SUBFOLDER)
-        })
+        .map(|root| root.join(MANAGED_SUBFOLDER).join(USER_LOCALES_SUBFOLDER))
         .find(|candidate| fs::create_dir_all(candidate).is_ok())
 }
 

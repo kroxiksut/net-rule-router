@@ -334,6 +334,12 @@ fn one_visit_at(engine: &AutoRulesEngine, at_ms: u64, companions: &[&str]) {
     );
 }
 
+/// Offers parked for [`SID`], whether or not the inbox shows them — the set a
+/// restart restores and the badge must not be confused with.
+fn parked(engine: &AutoRulesEngine) -> usize {
+    engine.pending.lock().unwrap().get(SID).map_or(0, Vec::len)
+}
+
 fn later() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_millis(150_000)
 }

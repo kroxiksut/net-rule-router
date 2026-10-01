@@ -70,6 +70,10 @@ Window {
     property bool wantDohLockdown: true
     property bool wantFakeIp: true
     property bool wantDiagnosticLogs: false
+    // Duration for the verbose-logging window `wantDiagnosticLogs` requests —
+    // one of `Pure.VERBOSE_LOGGING_CHANGES` minus "off" (the checkbox is the
+    // on/off control). Same default as Settings -> Diagnostics and logs.
+    property string diagnosticLogsDuration: "four-hours"
     property bool wantBlockNoticesMuted: false
 
     // Which adapter currently holds the primary role, read back from the same
@@ -123,7 +127,7 @@ Window {
         if (typeof root.applyServiceStabilityPatch !== "function") return
         var patch = { "fake-ip-enabled": wantFakeIp }
         if (wantDiagnosticLogs) {
-            patch["verbose-logging"] = true
+            patch["verbose-logging-change"] = diagnosticLogsDuration
             patch["conn-trace-ndjson"] = true
             patch["conn-trace-gui"] = true
         }
@@ -400,7 +404,7 @@ Window {
         id: firstRunOpenSecondaryDialog
         fileMode: FileDialog.OpenFile
         title: root.tr("dialog.first-run-wizard.pick-secondary-title",
-            "Choose secondary route preset file")
+            "Choose additional route preset file")
         nameFilters: [
             root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
@@ -719,6 +723,30 @@ Window {
                     }
                     onToggled: firstRunWindow.wantDiagnosticLogs = checked
                 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: firstRunDiagLogsCheck.indicator.width + firstRunDiagLogsCheck.spacing
+                    visible: root.serviceStabilitySupported
+                    spacing: root.uiTheme.spacingSm
+                    VerboseLoggingDurationCombo {
+                        id: firstRunDiagLogsDurationCombo
+                        root: firstRunWindow.root
+                        theme: firstRunWindow.root.uiTheme
+                        enabled: firstRunWindow.wantDiagnosticLogs
+                        Layout.preferredWidth: 240
+                        // No "off" here: the checkbox above is the on/off control.
+                        options: ["one-hour", "four-hours", "until-restart"]
+                        currentIndex: options.indexOf(firstRunWindow.diagnosticLogsDuration)
+                        displayText: firstRunWindow.root.verboseLoggingChangeLabel(firstRunWindow.diagnosticLogsDuration)
+                        onActivated: function(index) {
+                            firstRunWindow.diagnosticLogsDuration = options[index]
+                        }
+                        Accessible.name: firstRunWindow.root.tr(
+                            "settings.diagnostics.service-stability.verbose.label",
+                            "Verbose service logging") + ": " + displayText
+                    }
+                    Item { Layout.fillWidth: true }
+                }
                 CheckBox {
                     id: firstRunMuteBlockNoticesCheck
                     Layout.fillWidth: true
@@ -881,7 +909,7 @@ Window {
                         theme: root.uiTheme
                         text: firstRunWindow.pickedPrimaryPath
                             ? root.tr("dialog.first-run-wizard.change-button", "Change...")
-                            : root.tr("dialog.first-run-wizard.browse-button", "Browse...")
+                            : root.tr("action.browse", "Browse...")
                         onClicked: root.openRulesDialog(firstRunOpenPrimaryDialog)
                     }
                     ThemedButton {
@@ -918,7 +946,7 @@ Window {
                         theme: root.uiTheme
                         text: firstRunWindow.pickedSecondaryPath
                             ? root.tr("dialog.first-run-wizard.change-button", "Change...")
-                            : root.tr("dialog.first-run-wizard.browse-button", "Browse...")
+                            : root.tr("action.browse", "Browse...")
                         onClicked: root.openRulesDialog(firstRunOpenSecondaryDialog)
                     }
                     ThemedButton {

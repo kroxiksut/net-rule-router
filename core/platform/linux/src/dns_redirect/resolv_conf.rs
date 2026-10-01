@@ -56,17 +56,24 @@ pub(crate) fn nameservers(text: &str) -> Vec<Ipv4Addr> {
 /// the budget runs out on every query.
 pub(crate) fn forwardable(servers: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let before = servers.len();
-    let kept: Vec<Ipv4Addr> = servers.into_iter().filter(|s| !s.is_loopback()).collect();
-    if kept.len() < before && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    let (kept, dropped) = without_loopback(servers);
+    if dropped > 0 && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
             target: "nrr::dns-resolver",
-            dropped = before - kept.len(),
+            dropped,
             "the machine's DNS names a local resolver on loopback; it forwards to this service \
              once redirected, so it is not used as an upstream",
         );
     }
     kept
+}
+
+/// The non-loopback servers and how many were dropped — the warning's trigger.
+pub(crate) fn without_loopback(servers: Vec<Ipv4Addr>) -> (Vec<Ipv4Addr>, usize) {
+    let before = servers.len();
+    let kept: Vec<Ipv4Addr> = servers.into_iter().filter(|s| !s.is_loopback()).collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
 }
 
 /// The `search` and `domain` suffixes, lower-cased, without dots at the ends.

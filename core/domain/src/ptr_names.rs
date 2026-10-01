@@ -2,10 +2,10 @@
 //!
 //! Reverse DNS answers two different kinds of names. `feed.example` names a service:
 //! learning it from a dropped packet is exactly the point of reverse-learning.
-//! `1.80.190.35.bc.googleusercontent.com` names a machine — the operator
+//! `198.51.100.35.bc.cloud.example.com` names a machine — the operator
 //! generated it from the address, it forward-confirms just as well, and it says
 //! nothing about who the address serves. Treating the second kind as a service
-//! name lets one wide rule (`*.googleusercontent.com`) adopt every machine in
+//! name lets one wide rule (`*.cloud.example.com`) adopt every machine in
 //! the provider's fleet and drag unrelated traffic with it.
 //!
 //! The tell is that the name spells the address out. Pure and total: no I/O.
@@ -14,8 +14,8 @@ use std::net::Ipv4Addr;
 
 /// True when `hostname` embeds `ip`'s four octets as consecutive labels or
 /// dash-separated tokens, in either order — the shape every cloud operator uses
-/// to auto-generate reverse records (`ec2-3-5-7-9.compute.amazonaws.com`,
-/// `95-108-213-1.spider.example.com`, `1.80.190.35.bc.example.com`).
+/// to auto-generate reverse records (`vm2-198-51-100-9.compute.cloud.example.com`,
+/// `203-0-113-1.spider.example.com`, `198.51.100.35.bc.example.com`).
 ///
 /// Deliberately anchored on the address the lookup started from: a name that
 /// merely contains four numbers is not suspicious, a name that recites *this*
@@ -65,20 +65,20 @@ mod tests {
     #[test]
     fn a_dashed_forward_prefix_is_address_derived() {
         assert!(is_address_derived(
-            "ec2-3-5-7-9.eu-west-1.compute.amazonaws.com",
-            ip(3, 5, 7, 9)
+            "vm2-198-51-100-9.eu-west-1.compute.cloud.example.com",
+            ip(198, 51, 100, 9)
         ));
         assert!(is_address_derived(
-            "95-108-213-1.spider.example.com",
-            ip(95, 108, 213, 1)
+            "203-0-113-1.spider.example.com",
+            ip(203, 0, 113, 1)
         ));
     }
 
     #[test]
     fn padded_octets_still_read_as_the_address() {
         assert!(is_address_derived(
-            "static.003.005.007.009.clients.example.net",
-            ip(3, 5, 7, 9)
+            "static.198.051.100.009.clients.example.net",
+            ip(198, 51, 100, 9)
         ));
     }
 
@@ -86,24 +86,24 @@ mod tests {
     fn a_service_name_is_not_address_derived() {
         assert!(!is_address_derived("feed.example", ip(203, 0, 113, 242)));
         assert!(!is_address_derived(
-            "lh3.googleusercontent.com",
-            ip(23, 10, 20, 148)
+            "img.cdn.example.com",
+            ip(203, 0, 113, 148)
         ));
     }
 
     #[test]
     fn numbers_belonging_to_another_address_do_not_count() {
         assert!(!is_address_derived(
-            "1.2.3.4.example.com",
-            ip(23, 10, 20, 132)
+            "192.0.2.4.example.com",
+            ip(203, 0, 113, 132)
         ));
     }
 
     #[test]
     fn octets_must_be_consecutive() {
         assert!(!is_address_derived(
-            "3.5.host.7.9.example.com",
-            ip(3, 5, 7, 9)
+            "198.51.host.100.9.example.com",
+            ip(198, 51, 100, 9)
         ));
     }
 }

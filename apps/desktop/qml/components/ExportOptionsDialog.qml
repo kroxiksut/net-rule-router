@@ -108,7 +108,7 @@ Dialog {
             Item { Layout.fillWidth: true }
             ThemedButton {
                 theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.export-options.cancel", "Cancel")
+                text: dialog.tr("action.cancel", "Cancel")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 onClicked: { dialog.cancelled(); dialog.close() }

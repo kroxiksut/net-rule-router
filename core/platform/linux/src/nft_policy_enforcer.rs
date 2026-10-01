@@ -29,7 +29,7 @@ use nrr_platform_api::enforcement::{
 };
 
 use crate::lower_linux::{lower_scoped, EgressNames, ScopedPlan};
-use crate::nft_apply::NftCliEnforcement;
+use crate::nft_apply::{NftApplyError, NftCliEnforcement};
 
 pub struct NftPolicyEnforcer {
     bindings: Arc<dyn EgressBindingSource>,
@@ -90,9 +90,18 @@ impl NftPolicyEnforcer {
     /// `nftables` package is a clear refusal rather than a failure on the first
     /// rule the user expects to be applied.
     pub fn probe(&self) -> Result<(), EnforcementFailure> {
-        self.cli
-            .probe()
-            .map_err(|e| EnforcementFailure::new(e.to_string()))
+        self.cli.probe().map_err(failure)
+    }
+}
+
+/// Only a hung `nft` may go through on the next pass unchanged; a refusal, a
+/// missing privilege or a missing tool meets the same plans the same way.
+fn failure(e: NftApplyError) -> EnforcementFailure {
+    match e {
+        NftApplyError::TimedOut { .. } => EnforcementFailure::transient(e.to_string()),
+        NftApplyError::NftUnavailable { .. }
+        | NftApplyError::NotPermitted { .. }
+        | NftApplyError::Rejected { .. } => EnforcementFailure::persistent(e.to_string()),
     }
 }
 
@@ -117,10 +126,9 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         // Read the links ONCE for the pass: every plan is resolved against the
         // same snapshot, so two users cannot be enforced against two different
         // states of the machine.
-        let adapters = self
-            .adapters
-            .enumerate_all()
-            .map_err(|e| EnforcementFailure::new(format!("adapters could not be read: {e}")))?;
+        let adapters = self.adapters.enumerate_all().map_err(|e| {
+            EnforcementFailure::transient(format!("adapters could not be read: {e}"))
+        })?;
 
         let resolved: Vec<EgressNames> = plans
             .iter()
@@ -141,7 +149,7 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         let outcome = self
             .cli
             .apply_best_effort(&lowered.ruleset)
-            .map_err(|e| EnforcementFailure::new(e.to_string()))?;
+            .map_err(failure)?;
 
         let mut notes: Vec<String> = lowered
             .unsupported
@@ -192,8 +200,24 @@ impl PolicyEnforcer for NftPolicyEnforcer {
     }
 
     fn teardown(&self) -> Result<(), EnforcementFailure> {
-        self.cli
-            .teardown(&self.table)
-            .map_err(|e| EnforcementFailure::new(e.to_string()))
+        self.cli.teardown(&self.table).map_err(failure)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_hung_nft_is_worth_retrying_unchanged() {
+        let detail = || "x".to_owned();
+        assert!(!failure(NftApplyError::TimedOut { detail: detail() }).is_persistent());
+        for refusal in [
+            NftApplyError::NftUnavailable { detail: detail() },
+            NftApplyError::NotPermitted { detail: detail() },
+            NftApplyError::Rejected { detail: detail() },
+        ] {
+            assert!(failure(refusal).is_persistent());
+        }
     }
 }

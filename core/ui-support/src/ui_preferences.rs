@@ -5,29 +5,14 @@ use nrr_shared::{
 use std::env;
 use std::fs;
 use std::io;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::Command;
 use std::sync::OnceLock;
 
-/// The managed-configuration root beside the product name it is named after.
-/// Two independent copies of this path existed in this file alone, and a third
-/// in `nrr-shared::localization`; all three now read the identity SSOT.
-const MANAGED_ROOT_FOLDER: &str = nrr_shared::product_identity::PRODUCT_NAME;
 const MANAGED_SUBFOLDER: &str = "managed";
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-pub const MANAGED_STORAGE_POLICY_NOTE: &str =
-    "UI preferences are application-managed local state. Policy-affecting data remains service-owned.";
 const STABLE_PREFERENCES_FILE_NAME: &str = "ui-preferences.conf";
 /// Distinguishes two saves from the same process, so their scratch files
 /// cannot collide either.
 static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-const LEGACY_PREFERENCES_FILE_NAMES: [&str; 1] = ["ui-preferences-v1.conf"];
 
 /// Schema version written by this build into every saved preferences file.
 ///
@@ -38,21 +23,17 @@ const LEGACY_PREFERENCES_FILE_NAMES: [&str; 1] = ["ui-preferences-v1.conf"];
 ///   schema version on the next save. No silent reset of any field.
 /// - **Equal to `CURRENT_UI_PREFS_SCHEMA_VERSION`**: normal load path.
 /// - **Greater than `CURRENT_UI_PREFS_SCHEMA_VERSION`** (future version):
-///   file was written by a newer build. Known fields are loaded; keys this
-///   build has no field for are carried verbatim in
-///   [`UiPreferences::forward_compat`] and written back on save, and the
-///   version stamp is never lowered. So the file is not downgraded, and a
-///   user who starts an older build once does not lose the settings only the
-///   newer one knows about. A diagnostic is emitted to stderr.
-pub const CURRENT_UI_PREFS_SCHEMA_VERSION: u32 = 11;
+///   file was written by a newer build. Known fields are loaded, the version
+///   stamp is never lowered, and a diagnostic is emitted to stderr.
+///
+/// Adding a key does NOT bump the version; removing or re-meaning one does. So
+/// in a file of our version or newer, a key this build has no field for belongs
+/// to a build that knows it: it is carried verbatim in
+/// [`UiPreferences::forward_compat`] and written back, and starting an older
+/// build once does not erase it. In an older file it is the residue of a
+/// removed key and is dropped.
+pub const CURRENT_UI_PREFS_SCHEMA_VERSION: u32 = 12;
 
-/// Bounds and default for [`UiPreferences::settings_autosave_secs`]. This is the
-/// authoritative range: the spin box in the settings UI mirrors it, but any
-/// value arriving from a hand-edited file or an older build is clamped here.
-/// Ceiling for every opaque JSON blob the preferences file stores
-/// (`route_pending_offline_json`, `cache_table_column_widths`,
-/// `service_backed_mirror_json`, `service_intent_json`). One declaration: the
-/// parse side and the QML payload side both gate against it.
 /// Ceiling for the free-form string fields that GROW on their own: the
 /// acknowledgement signatures (a `|`-join of every unenforced app / kept
 /// overlap pair) and the confirmed-VPN executable list. Every other string here
@@ -92,10 +73,9 @@ pub const MERGE_CONFLICT_POLICY_DEFAULT: &str = "union";
 
 /// `value` when it is one of `allowed`, otherwise `fallback`.
 ///
-/// The two sides of the round-trip filtered differently: the QML payload wrote
-/// a slug verbatim while the parser dropped anything off the list, so a value
-/// the app honoured all session quietly reverted at the next start. One
-/// resolver, called by both, is what keeps that from coming back.
+/// Both sides of the round-trip call this one resolver: if the QML payload and
+/// the parser filtered differently, a value honoured all session would quietly
+/// revert at the next start.
 pub fn allowed_slug_or(value: &str, allowed: &[&str], fallback: &str) -> String {
     if allowed.contains(&value) {
         value.to_string()
@@ -104,9 +84,27 @@ pub fn allowed_slug_or(value: &str, allowed: &[&str], fallback: &str) -> String 
     }
 }
 
+/// Accepted slugs for [`UiPreferences::route_shared_ip_policy`]: the wire list
+/// itself, so the mirror cannot hold a slug `route.policy.update` refuses.
+pub const SHARED_IP_POLICIES: [&str; 3] = nrr_shared::ipc_payloads::SHARED_IP_POLICY_SLUGS;
+pub const SHARED_IP_POLICY_DEFAULT: &str = "majority-of-ip";
+
+/// Accepted periods for the traffic-statistics panel, and the default.
+pub const TRAFFIC_STATS_PERIODS: [&str; 3] = ["today", "session", "all-time"];
+pub const TRAFFIC_STATS_PERIOD_DEFAULT: &str = "today";
+
+/// Ceiling for every opaque JSON blob the preferences file stores
+/// (`route_pending_offline_json`, `cache_table_column_widths`,
+/// `service_backed_mirror_json`, `service_intent_json`). One declaration: the
+/// parse side and the QML payload side both gate against it.
 pub const MAX_STORED_JSON_BLOB_BYTES: usize = 8 * 1024;
 
+/// Bounds and default for [`UiPreferences::settings_autosave_secs`]. This is the
+/// authoritative range: the spin box in the settings UI mirrors it, but any
+/// value arriving from a hand-edited file or an older build is clamped here.
 pub const SETTINGS_AUTOSAVE_MIN_SECS: u32 = 15;
+pub const SETTINGS_AUTOSAVE_MAX_SECS: u32 = 600;
+pub const SETTINGS_AUTOSAVE_DEFAULT_SECS: u32 = 60;
 
 /// Bounds and default for [`UiPreferences::admin_auto_revoke_minutes`] — how
 /// long the elevated broker session may sit UNUSED before the launcher
@@ -116,14 +114,24 @@ pub const SETTINGS_AUTOSAVE_MIN_SECS: u32 = 15;
 pub const ADMIN_AUTO_REVOKE_MIN_MINUTES: u32 = 1;
 pub const ADMIN_AUTO_REVOKE_MAX_MINUTES: u32 = 180;
 pub const ADMIN_AUTO_REVOKE_DEFAULT_MINUTES: u32 = 15;
-/// Bounds and default for [`UiPreferences::tray_notice_opacity_percent`]. SSOT
-/// for the four places that used to spell `40` and `100` out: this parser, the
-/// `apply_over` clamp, the QML binding and the settings SpinBox.
+/// Bounds for [`UiPreferences::tray_notice_opacity_percent`]: this parser, the
+/// `apply_over` clamp, the QML binding and the settings SpinBox all read them.
 pub const TRAY_NOTICE_OPACITY_MIN_PERCENT: u16 = 40;
 pub const TRAY_NOTICE_OPACITY_MAX_PERCENT: u16 = 100;
 
-pub const SETTINGS_AUTOSAVE_MAX_SECS: u32 = 600;
-pub const SETTINGS_AUTOSAVE_DEFAULT_SECS: u32 = 60;
+/// Frequencies the scheduled release check offers, in days, and the default.
+/// The shortest is the floor: nothing asks the network more often.
+pub const UPDATE_CHECK_INTERVAL_DAYS_CHOICES: [u32; 3] = [7, 14, 30];
+pub const UPDATE_CHECK_INTERVAL_DEFAULT_DAYS: u32 = 14;
+
+/// The offered choice at or below `days`, the shortest one below the floor.
+pub fn clamp_update_check_interval_days(days: u32) -> u32 {
+    UPDATE_CHECK_INTERVAL_DAYS_CHOICES
+        .into_iter()
+        .rev()
+        .find(|&choice| choice <= days)
+        .unwrap_or(UPDATE_CHECK_INTERVAL_DAYS_CHOICES[0])
+}
 
 /// Accepted byte units for the traffic CSV export, and the default. Megabytes
 /// read best for a monthly report; the exporter still accepts every slug here.
@@ -260,9 +268,8 @@ pub struct UiPreferences {
     /// resolves again, so a later disappearance shows the banner anew. Pure
     /// device-local display state, never exported.
     pub missing_secondary_banner_acknowledged: bool,
-    /// Selected period for the traffic-statistics panel: `"today"` (default)
-    /// or `"session"`. Pure device-local UI display state; the GUI normalizes
-    /// any other value back to `"today"`.
+    /// Selected period for the traffic-statistics panel, one of
+    /// [`TRAFFIC_STATS_PERIODS`]. Pure device-local UI display state.
     pub traffic_stats_period: String,
     /// Byte unit the traffic CSV export was last written in: `"bytes"`,
     /// `"kb"`, `"mb"` (default) or `"gb"`. Remembered so a user who works in
@@ -341,9 +348,8 @@ pub struct UiPreferences {
     /// subdomains. See the block comment above for the seed-on-default
     /// semantics.
     pub route_include_subdomains: bool,
-    /// Mirror of the per-SID service toggle `route_shared_ip_policy` (slug,
-    /// default `"majority-of-ip"`). See the block comment above for the
-    /// seed-on-default semantics.
+    /// Mirror of the per-SID service toggle `route_shared_ip_policy`, one of
+    /// [`SHARED_IP_POLICIES`]. See the block comment above.
     pub route_shared_ip_policy: String,
     /// Mirror of the per-SID service toggle `route_kill_switch_block_all`.
     /// Default `false`. See the block comment above for the seed-on-default
@@ -354,8 +360,8 @@ pub struct UiPreferences {
     /// comment above for the seed-on-default semantics.
     pub route_kill_switch_fail_closed: bool,
     /// Mirror of the per-SID service toggle `route_kill_switch_protocols`
-    /// (IP-protocol bitmask the emergency block cuts: TCP=1 … Other=64).
-    /// Default `127` (all). See the block comment above.
+    /// (IP-protocol bitmask the emergency block cuts), valid per
+    /// [`nrr_shared::ipc_payloads::is_valid_kill_switch_protocols`]. Default all.
     pub route_kill_switch_protocols: u32,
     /// Mirror of the per-SID MASTER toggle `route_kill_switch_enabled`.
     /// `false` (default) = kill-switch OFF, so NO fail-closed blocking
@@ -377,10 +383,9 @@ pub struct UiPreferences {
     pub route_resolve_hosts_bypass: bool,
     /// Mirror of the GLOBAL service enforcement mode (service-stability config,
     /// not per-SID): `"reactive"` (Mode A) | `"resolver"` (Mode B, default).
-    /// The default is taken from `nrr_shared::ipc_payloads::
-    /// ENFORCEMENT_MODE_DEFAULT`, not retyped: this doc used to name the other
-    /// mode, and a mirror that disagrees with the wire is how a user ends up in
-    /// a mode nobody chose. See the block comment above for the seed-on-default
+    /// The default is `nrr_shared::ipc_payloads::ENFORCEMENT_MODE_DEFAULT`, not
+    /// retyped: a mirror that disagrees with the wire puts a user in a mode
+    /// nobody chose. See the block comment above for the seed-on-default
     /// semantics.
     pub route_enforcement_mode: String,
     /// Mirror of the GLOBAL service "secondary tunnel liveness window"
@@ -477,15 +482,6 @@ pub struct UiPreferences {
     /// Persisted per device.
     pub rules_file_change_behavior: RulesFileChangeBehavior,
 
-    // Tracks the GUI's "last-known" sync state between the active rules
-    // revision (service-owned) and the user's on-disk preset files
-    // (device-local). Drives:
-    //   - The SaveBeforeCloseDialog (divergence detection per route)
-    //   - Auto-open-on-launch (file vs active hash comparison)
-    //   - Discard & rollback (last_file_synced_revision_id_<role>)
-    //
-    // All four pairs default to None; v1 preference files load with all
-    // four as None (schema-tolerant migration via missing-key → default).
     /// Most recent on-disk path the primary route's preset was written to,
     /// or `None` if the user has never exported / imported primary rules
     /// on this device. Used as the default Save target for divergence.
@@ -509,22 +505,6 @@ pub struct UiPreferences {
     pub auto_open_on_launch_path_primary: Option<String>,
     /// Same as [`auto_open_on_launch_path_primary`] but for secondary.
     pub auto_open_on_launch_path_secondary: Option<String>,
-
-    /// Revision ID that was active at the time the primary file was last
-    /// written (or imported). `Discard & rollback` in SaveBeforeCloseDialog
-    /// calls `RollbackRequest` with this ID; `None` ⇒ rollback to empty
-    /// revision (service creates an empty `RulesRevisionContent`).
-    pub last_file_synced_revision_id_primary: Option<String>,
-    /// Same for secondary.
-    pub last_file_synced_revision_id_secondary: Option<String>,
-
-    /// SHA-256 hex of the primary file content at the time of last sync.
-    /// Used at close-time to detect "active revision ≠ on-disk file" → the
-    /// SaveBeforeCloseDialog asks the user whether to write back, save as,
-    /// discard, or cancel. `None` ⇒ no recorded sync; fresh state.
-    pub last_file_synced_hash_primary: Option<String>,
-    /// Same for secondary.
-    pub last_file_synced_hash_secondary: Option<String>,
 
     // The first-launch install dialog (and the connection-banner "Install
     // Service" action) trigger UAC. When the user clicks "No" the GUI must
@@ -556,8 +536,7 @@ pub struct UiPreferences {
     pub auto_load_rules_on_launch: bool,
 
     /// Persisted default for the "Include rule comments" checkbox in the
-    /// export dialog. Default `true`. Promotes the former session-only
-    /// stickiness to a real preference that survives restarts.
+    /// export dialog. Default `true`.
     pub export_include_comments: bool,
 
     /// Persisted default for the "Import only active rules" checkbox in the
@@ -576,6 +555,15 @@ pub struct UiPreferences {
     /// page" button opens. Empty ⇒ fall back to the bundled project
     /// releases URL.
     pub update_page_url: String,
+    /// The scheduled release check. `false` means no request leaves the
+    /// machine for it and no "new version" notice is shown. Default `true`.
+    pub update_check_enabled: bool,
+    /// Days between two scheduled checks, one of
+    /// [`UPDATE_CHECK_INTERVAL_DAYS_CHOICES`]; clamped on every read.
+    pub update_check_interval_days: u32,
+    /// The release whose "new version" notice the user dismissed. That notice
+    /// stays hidden until a different (newer) release is offered. Empty: none.
+    pub dismissed_update_version: String,
 
     /// When `false`, the Rules section hides the bundled-preset quick-load
     /// row. The "Hide" button on that row sets this `false`; a "Show bundled
@@ -639,10 +627,8 @@ pub struct UiPreferences {
 
 /// The part of a preferences file this build does not understand.
 ///
-/// Only populated when the file declares a schema version ABOVE
-/// [`CURRENT_UI_PREFS_SCHEMA_VERSION`]: an unknown key in a file of our own
-/// version is a leftover of a key we removed, and re-writing those forever is
-/// how a settings file never shrinks.
+/// Populated only when the file declares [`CURRENT_UI_PREFS_SCHEMA_VERSION`] or
+/// above; see its compatibility policy for why an older file's unknown keys go.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ForwardCompat {
     /// Version the file declared, when it was newer than ours.

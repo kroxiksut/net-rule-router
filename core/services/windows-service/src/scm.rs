@@ -12,8 +12,7 @@
 //! - `service_dispatcher::start` connects this binary to SCM.
 //! - `define_windows_service!` generates the FFI shim that SCM calls.
 //! - `service_control_handler::register` installs our handler; we map
-//!   SCM control codes onto `LifecycleEvent` and flip the
-//!   `StopToken` accordingly.
+//!   SCM control codes onto the `StopToken`.
 //! - `ServiceStatusHandle::set_service_status` is the status reporter
 //!   the runtime sees through the `ServiceController` trait.
 //!
@@ -31,7 +30,6 @@
 //! machine has no coherent "paused" state.
 
 use std::ffi::OsString;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use nrr_platform_api::service_control::{ServiceControlError, ServiceControlPort};
@@ -40,8 +38,8 @@ use nrr_platform_windows::service_control::WindowsServiceControl;
 use nrr_service_runtime::lifecycle_journal::LifecycleJournal;
 use nrr_service_runtime::{
     run_bootstrap, run_supervised_runtime, BootstrapConfig, InstallConfig, InstallOutcome,
-    LifecycleEvent, ServiceController, ServiceRuntimeState, StopToken, UninstallConfig,
-    UninstallOutcome, UpdateConfig, UpdateOutcome, SERVICE_NAME,
+    ServiceController, ServiceRuntimeState, StopToken, UninstallConfig, UninstallOutcome,
+    UpdateConfig, UpdateOutcome, SERVICE_NAME,
 };
 use nrr_storage::StorageProfile;
 use windows_service::{
@@ -161,7 +159,6 @@ fn running_controls() -> ServiceControlAccept {
 fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
     let stop = StopToken::new();
     let stop_for_handler = stop.clone();
-    let (tx, rx) = mpsc::channel::<LifecycleEvent>();
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
@@ -169,13 +166,11 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
             // is indistinguishable from a process that died on its own.
             ServiceControl::Stop => {
                 tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "stop", "SCM control received");
-                let _ = tx.send(LifecycleEvent::Stop);
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Shutdown => {
                 tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "shutdown", "SCM control received");
-                let _ = tx.send(LifecycleEvent::Shutdown);
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
             }
@@ -185,7 +180,6 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
             // halfway it leaves the OS resolving through a listener that is gone.
             ServiceControl::Preshutdown => {
                 tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "preshutdown", "SCM control received");
-                let _ = tx.send(LifecycleEvent::Shutdown);
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
             }
@@ -317,7 +311,7 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
         verbosity_handle = Some(handle);
         tracing::info!(
             target: "nrr::stability",
-            msg_key = "svc-scm-verbose-logging",
+            msg_key = "svc-boot-ndjson-verbosity",
             verbose,
             "operational NDJSON verbosity",
         );
@@ -331,7 +325,7 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
     );
     tracing::info!(
         target: "nrr::recovery",
-        msg_key = "svc-scm-crash-recovery-complete",
+        msg_key = "svc-boot-crash-recovery-complete",
         outcome = ?recovery_outcome,
         "crash recovery probe complete",
     );
@@ -366,13 +360,13 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
         ),
     }
 
-    tracing::info!(target: "nrr::boot", msg_key = "svc-scm-boot-stage-entered", stage = "strip-orphaned-filters", "boot stage entered");
+    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "strip-orphaned-filters", "boot stage entered");
     crate::runtime_deps::strip_orphaned_block_filters_standalone();
 
-    tracing::info!(target: "nrr::boot", msg_key = "svc-scm-boot-stage-entered", stage = "build-deps", "boot stage entered");
+    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "build-deps", "boot stage entered");
     let deps = crate::runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
-    tracing::info!(target: "nrr::boot", msg_key = "svc-scm-boot-stage-entered", stage = "run-runtime", "boot stage entered");
-    let _ = run_supervised_runtime(&controller, &stop, artifacts, deps);
+    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "run-runtime", "boot stage entered");
+    run_supervised_runtime(&controller, &stop, artifacts, deps);
 
     // Net-event collection is a MACHINE-WIDE Base Filtering Engine setting, not
     // a property of our handle: left on, BFE goes on recording every classify
@@ -381,10 +375,6 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
     // consumer threads still reference is never dropped.
     #[cfg(target_os = "windows")]
     nrr_platform_windows::conn_observe::wfp_events::restore_engine_options();
-
-    // Drain any control events that arrived after Stop so we don't
-    // leave them dangling in the channel.
-    while rx.try_recv().is_ok() {}
 
     Ok(())
 }

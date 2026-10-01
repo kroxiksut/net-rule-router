@@ -167,7 +167,7 @@ fn run_state_migrations_empty_db() {
     // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
     // + v49 (block_notice_mutes table — durable "do not show" choices)
     // + v50 (isp_block_candidates_enabled on service_stability_config)
-    assert_eq!(s.to_version, 65);
+    assert_eq!(s.to_version, 67);
     assert_eq!(
         s.migrations_applied,
         [
@@ -236,6 +236,8 @@ fn run_state_migrations_empty_db() {
             "drop_isp_block_candidates_enabled",
             "add_short_name_suffix",
             "add_block_notice_launched_by",
+            "drop_integrity_log_and_apply_snapshots",
+            "verbose_logging_deadline",
         ]
     );
 }
@@ -247,8 +249,8 @@ fn state_migration_idempotent() {
 
     runner.run_pending_migrations().expect("first run");
     let s = runner.run_pending_migrations().expect("second run");
-    assert_eq!(s.from_version, 65);
-    assert_eq!(s.to_version, 65);
+    assert_eq!(s.from_version, 67);
+    assert_eq!(s.to_version, 67);
     assert!(s.migrations_applied.is_empty());
 }
 
@@ -262,7 +264,7 @@ fn state_runner_stopped_at(dir: &tempfile::TempDir, count: usize) -> SqliteMigra
         migrations: &STATE_MIGRATIONS[..count],
         required_tables: STATE_REQUIRED_TABLES,
         required_indexes: STATE_REQUIRED_INDEXES,
-        backup_policy: None,
+        snapshot_first: false,
     }
 }
 
@@ -341,8 +343,8 @@ fn verify_state_schema_after_migration() {
 
     let v = runner.verify_schema().expect("verify");
     assert!(v.is_ok(), "state schema verification failed: {v:?}");
-    // through v50 (isp_block_candidates_enabled on service_stability_config)
-    assert_eq!(v.version, 65);
+    // through v67 (verbose_logging_deadline)
+    assert_eq!(v.version, 67);
 }
 
 #[test]
@@ -364,7 +366,7 @@ fn unsupported_future_schema_returns_error() {
     // Seed a "future" version directly.
     {
         let conn = open_connection(&path).expect("open");
-        conn.execute_batch(CREATE_SCHEMA_MIGRATIONS).expect("setup");
+        nrr_sqlite_support::ensure_migrations_table(&conn).expect("setup");
         conn.execute(
             "INSERT INTO schema_migrations
                  (version, name, applied_at, checksum, app_version)
@@ -426,33 +428,120 @@ fn migration_record_has_correct_version_and_name() {
     assert!(!checksum.is_empty());
 }
 
-// ── checksum ─────────────────────────────────────────────────────────────
+// ── shipped checksums ─────────────────────────────────────────────────────
 
-#[test]
-fn checksum_is_deterministic() {
-    let stmts: &[&str] = &["CREATE TABLE foo (id INTEGER)", "CREATE INDEX i ON foo(id)"];
-    assert_eq!(checksum_of(stmts), checksum_of(stmts));
+/// Every installed database stores these; a changed value is a database that
+/// no longer opens. Pinned from the runner that wrote them.
+fn assert_checksums(catalogue: &[MigrationDef], want: &[(u32, &str)]) {
+    let got: Vec<(u32, String)> = catalogue
+        .iter()
+        .map(|m| (m.version, nrr_sqlite_support::checksum(m.stmts)))
+        .collect();
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "a shipped migration was added or removed"
+    );
+    for ((v, c), (wv, wc)) in got.iter().zip(want) {
+        assert_eq!((*v, c.as_str()), (*wv, *wc), "checksum of v{wv} changed");
+    }
 }
 
 #[test]
-fn checksum_is_16_hex_chars() {
-    let c = checksum_of(&["SELECT 1"]);
-    assert_eq!(c.len(), 16, "FNV-64 hex must be 16 chars");
-    assert!(c.chars().all(|c| c.is_ascii_hexdigit()));
+fn shipped_state_checksums_are_unchanged() {
+    assert_checksums(
+        STATE_MIGRATIONS,
+        &[
+            (1, "5c7d6449810d10e8"),
+            (2, "cb90763b4b17ae7f"),
+            (3, "7ef719581a403d7b"),
+            (4, "9921e2fb67fcaffc"),
+            (5, "1b837fc6f68832ae"),
+            (6, "2564c9074e48ff63"),
+            (7, "04d78a425b65a806"),
+            (8, "e7c634ae6a103ecc"),
+            (9, "116ff333a9712fa1"),
+            (10, "d893265cf829eb9f"),
+            (11, "f1cd4ef8ec8531aa"),
+            (12, "829c15dcc565b81b"),
+            (13, "8234ed4971bb8491"),
+            (14, "1426b2f3de4f00f2"),
+            (15, "380e2cf700ec172d"),
+            (16, "33c9961b31f0ae80"),
+            (17, "c8211d3ff026a3dd"),
+            (18, "02df205307726d7e"),
+            (19, "b84bdf70cbc3d648"),
+            (20, "e17517faed453c4a"),
+            (21, "6e71e7371d213e78"),
+            (22, "fa9a9ac69dd9fe96"),
+            (23, "ea21ea75c0f31a26"),
+            (24, "642342d310f39e97"),
+            (25, "f866411b8d0a5c98"),
+            (26, "f6e1d0ea4185eb22"),
+            (27, "4149585e359877ae"),
+            (28, "a8151ad3e6410a36"),
+            (29, "77036d6c3f65b22a"),
+            (30, "026a40e2e6cc8a1f"),
+            (31, "c7604d77909da151"),
+            (32, "eb612dd0d4656842"),
+            (33, "c10875aca697f928"),
+            (34, "2e488179d03aa0d3"),
+            (35, "12c5eaeb4cf51d63"),
+            (36, "dfdd4da51b126be3"),
+            (37, "a111a0953c4afa38"),
+            (38, "790c71a3d08ccb82"),
+            (39, "0c78522c1ffb7843"),
+            (40, "b7d01c57015397f0"),
+            (41, "eb3fba6ba1fd499b"),
+            (42, "e8811a4d2a89945e"),
+            (43, "c94d4749163da454"),
+            (44, "ff2086cbe0e73269"),
+            (45, "ba83f12a4eed81d2"),
+            (46, "02e50a760fd324b0"),
+            (47, "6dd0c383e220009f"),
+            (48, "e4093884f984f269"),
+            (49, "40afe93c350f4998"),
+            (50, "dbd67552a373ad73"),
+            (51, "447a881a85a6f369"),
+            (52, "2c36af736aa47a81"),
+            (53, "e7f7ddbe4e276a2d"),
+            (54, "4041ce40884476d5"),
+            (55, "25dc3445c3e52a98"),
+            (56, "31be14ea3dfc9a91"),
+            (57, "c1cdf11cfb4a9be7"),
+            (58, "ed5c9e41bcaf0042"),
+            (59, "575ce79a1a54bf54"),
+            (60, "77f222e8c2ac9893"),
+            (61, "537bf93c7f29504a"),
+            (62, "6ae8cb07648df3e0"),
+            (63, "41eb0ff19deaef86"),
+            (64, "e7f3a008c82a5b09"),
+            (65, "05750f96e61bd967"),
+            (66, "9ad42c4782705cc2"),
+            (67, "64cae489eb8a64b4"),
+        ],
+    );
 }
 
 #[test]
-fn checksum_differs_for_different_sql() {
-    let a = checksum_of(&["CREATE TABLE foo (id INTEGER)"]);
-    let b = checksum_of(&["CREATE TABLE bar (id INTEGER)"]);
-    assert_ne!(a, b);
+fn shipped_cache_checksums_are_unchanged() {
+    assert_checksums(
+        CACHE_MIGRATIONS,
+        &[
+            (1, "aa93411d21c86bf4"),
+            (2, "3391406fc5c00490"),
+            (3, "041490419242ec35"),
+            (4, "a160c37c152a7687"),
+        ],
+    );
 }
 
 #[test]
-fn checksum_order_sensitive() {
-    let s1: &[&str] = &["AAA", "BBB"];
-    let s2: &[&str] = &["BBB", "AAA"];
-    assert_ne!(checksum_of(s1), checksum_of(s2));
+fn shipped_traffic_checksums_are_unchanged() {
+    assert_checksums(
+        TRAFFIC_MIGRATIONS,
+        &[(1, "2ead989d39a16a24"), (2, "b6b6152a152ea077")],
+    );
 }
 
 // ── busy_timeout ──────────────────────────────────────────────────────────
@@ -517,7 +606,7 @@ fn a_rebuildable_database_is_not_snapshotted() {
     let path = dir.path().join("nrr_fqdn_ip_cache.db");
     let conn = open_connection(&path).expect("open");
     let runner = SqliteMigrationRunner::for_cache_db(conn);
-    assert!(runner.backup_policy.is_none());
+    assert!(!runner.snapshot_first);
     runner.run_pending_migrations().expect("migrate");
     assert_eq!(migration_backups(&path), 0);
 }
@@ -529,36 +618,33 @@ fn interrupted_migration_leaves_db_unchanged() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("t.db");
     let mut conn = open_connection(&path).expect("open");
-    ensure_migrations_table(&conn).expect("bootstrap");
 
-    // A migration whose second statement contains invalid SQL.
-    // The first statement must be rolled back together with the second.
-    let bad = MigrationDef {
-        version: 1,
-        name: "bad",
-        stmts: &[
-            "CREATE TABLE valid_table (id INTEGER)",
-            "THIS IS NOT VALID SQL;;;",
-        ],
-    };
-    let result = apply_migration(&mut conn, &bad);
-    assert!(result.is_err(), "bad DDL must fail");
+    // The second step's second statement is invalid: the whole run, the good
+    // first step included, must roll back.
+    let steps = [
+        MigrationDef {
+            version: 1,
+            name: "good",
+            stmts: &["CREATE TABLE good_table (id INTEGER)"],
+        },
+        MigrationDef {
+            version: 2,
+            name: "bad",
+            stmts: &[
+                "CREATE TABLE valid_table (id INTEGER)",
+                "THIS IS NOT VALID SQL;;;",
+            ],
+        },
+    ];
+    assert!(nrr_sqlite_support::migrate(&mut conn, &steps).is_err());
 
-    // Transaction must have been rolled back: version is still 0.
-    assert_eq!(current_version(&conn).expect("version"), 0);
-
-    // The first DDL statement must also be rolled back.
-    let table_present: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='valid_table'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("query");
-    assert_eq!(
-        table_present, 0,
-        "partial DDL must be rolled back by transaction"
-    );
+    assert_eq!(read_schema_version(&conn).expect("version"), 0);
+    for table in ["good_table", "valid_table"] {
+        assert!(
+            !relation_exists(&conn, "table", table),
+            "{table} must be rolled back with the failed run"
+        );
+    }
 }
 
 // ── checksum mismatch detection ───────────────────────────────────────────
@@ -773,8 +859,7 @@ fn upgrade_traffic_db_from_v1_keeps_the_ledger() {
     // A database an older binary left behind, with a day of history in it.
     {
         let mut conn = open_connection(&path).expect("open");
-        ensure_migrations_table(&conn).expect("bootstrap");
-        apply_migration(&mut conn, &TRAFFIC_MIGRATIONS[0]).expect("apply v1");
+        nrr_sqlite_support::migrate(&mut conn, &TRAFFIC_MIGRATIONS[..1]).expect("apply v1");
         conn.execute(
             "INSERT INTO interface_daily_traffic (day, adapter_key, role, in_bytes, out_bytes)
                  VALUES (1, 'eth0', 'primary', 111, 222)",
@@ -812,8 +897,7 @@ fn upgrade_state_db_from_v1_to_v2() {
     // Simulate a DB created by an older binary: only v1 applied.
     {
         let mut conn = open_connection(&path).expect("open");
-        ensure_migrations_table(&conn).expect("bootstrap");
-        apply_migration(&mut conn, &STATE_MIGRATIONS[0]).expect("apply v1");
+        nrr_sqlite_support::migrate(&mut conn, &STATE_MIGRATIONS[..1]).expect("apply v1");
     }
 
     // New binary: runner must detect v1 and apply v2 + v3.
@@ -824,7 +908,7 @@ fn upgrade_state_db_from_v1_to_v2() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
     assert_eq!(summary.from_version, 1);
-    assert_eq!(summary.to_version, 65);
+    assert_eq!(summary.to_version, 67);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -892,6 +976,8 @@ fn upgrade_state_db_from_v1_to_v2() {
             "drop_isp_block_candidates_enabled",
             "add_short_name_suffix",
             "add_block_notice_launched_by",
+            "drop_integrity_log_and_apply_snapshots",
+            "verbose_logging_deadline",
         ]
     );
 
@@ -919,9 +1005,7 @@ fn upgrade_state_db_from_v2_to_v3() {
     // Simulate a DB at v2.
     {
         let mut conn = open_connection(&path).expect("open");
-        ensure_migrations_table(&conn).expect("bootstrap");
-        apply_migration(&mut conn, &STATE_MIGRATIONS[0]).expect("apply v1");
-        apply_migration(&mut conn, &STATE_MIGRATIONS[1]).expect("apply v2");
+        nrr_sqlite_support::migrate(&mut conn, &STATE_MIGRATIONS[..2]).expect("apply v1, v2");
     }
 
     let conn = open_connection(&path).expect("reopen");
@@ -931,7 +1015,7 @@ fn upgrade_state_db_from_v2_to_v3() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
     assert_eq!(summary.from_version, 2);
-    assert_eq!(summary.to_version, 65);
+    assert_eq!(summary.to_version, 67);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -998,6 +1082,8 @@ fn upgrade_state_db_from_v2_to_v3() {
             "drop_isp_block_candidates_enabled",
             "add_short_name_suffix",
             "add_block_notice_launched_by",
+            "drop_integrity_log_and_apply_snapshots",
+            "verbose_logging_deadline",
         ]
     );
 

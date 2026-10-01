@@ -36,7 +36,8 @@ use windows::Win32::System::Threading::{
 
 use crate::error::PlatformError;
 use crate::etw_session::{
-    callback_context, user_data, ProviderEnable, RealtimeSession, SessionClock, SessionConfig,
+    callback_context, user_data, BufferSizing, ProviderEnable, RealtimeSession, SessionClock,
+    SessionConfig,
 };
 
 /// `Microsoft-Windows-Kernel-Process` provider GUID.
@@ -48,6 +49,18 @@ const KEYWORD_PROCESS: u64 = 0x10;
 
 const EVENT_ID_PROCESS_START: u16 = 1;
 const EVENT_ID_PROCESS_STOP: u16 = 2;
+
+/// Every event the recorder consumes. Both the session's event-id filter and
+/// the callback read this one table.
+const SUBSCRIBED_EVENT_IDS: [u16; 2] = [EVENT_ID_PROCESS_START, EVENT_ID_PROCESS_STOP];
+
+/// A start is a few hundred bytes; 16 KiB buffers, at most 256 KiB of
+/// nonpaged memory, hold a process storm of about a thousand.
+const SESSION_BUFFERS: BufferSizing = BufferSizing {
+    buffer_kb: 16,
+    min_buffers: 2,
+    max_buffers: 16,
+};
 
 /// The Unix epoch as a FILETIME (100 ns ticks since 1601).
 const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
@@ -74,12 +87,14 @@ impl EtwProcessLineage {
                 // A notice is built seconds after the drop; a start still sitting
                 // in a half-full buffer would miss it.
                 flush_timer_secs: 1,
+                buffers: Some(SESSION_BUFFERS),
             },
             &ProviderEnable {
                 guid: KERNEL_PROCESS_PROVIDER,
                 level: TRACE_LEVEL_INFORMATION as u8,
                 keywords: KEYWORD_PROCESS,
                 enable_property: EVENT_ENABLE_PROPERTY_SID,
+                event_ids: &SUBSCRIBED_EVENT_IDS,
             },
             event_record_callback,
             Arc::clone(&ring),
@@ -90,6 +105,27 @@ impl EtwProcessLineage {
         );
         Ok(Self { ring, session })
     }
+
+    /// Reported when an answer is asked for, the only moment a lost start can
+    /// matter: the ancestry may then stop short. Rate-limited.
+    fn report_losses(&self) {
+        let Some(lost) = self.session.losses_to_report() else {
+            return;
+        };
+        tracing::warn!(
+            target: "nrr::block-notice",
+            msg_key = "win-etw-process-events-lost",
+            events = lost.events,
+            buffers = lost.realtime_buffers,
+            "Kernel-Process ETW session lost events; some process ancestry may be incomplete",
+        );
+    }
+}
+
+/// Whether the callback consumes this event id; anything else reaches it
+/// only when the provider refused the filter.
+fn is_subscribed(event_id: u16) -> bool {
+    SUBSCRIBED_EVENT_IDS.contains(&event_id)
 }
 
 impl ProcessLineagePort for EtwProcessLineage {
@@ -98,6 +134,7 @@ impl ProcessLineagePort for EtwProcessLineage {
     }
 
     fn ancestry_of(&self, image_path: &str, sid: Option<&str>, at: SystemTime) -> Vec<String> {
+        self.report_losses();
         let mut live = ToolhelpTable::default();
         // The recorder waits on this lock for the length of one walk — a
         // snapshot at worst — once per notice.
@@ -123,7 +160,7 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
     }
     let rec = &*record;
     let id = rec.EventHeader.EventDescriptor.Id;
-    if id != EVENT_ID_PROCESS_START && id != EVENT_ID_PROCESS_STOP {
+    if !is_subscribed(id) {
         return;
     }
     let Some(ring) = callback_context::<Ring>(rec) else {
@@ -384,6 +421,17 @@ fn creation_ms(pid: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_filter_admits_exactly_what_the_callback_consumes() {
+        let consumed: Vec<u16> = (0..=u16::MAX).filter(|&id| is_subscribed(id)).collect();
+        assert_eq!(consumed, SUBSCRIBED_EVENT_IDS.to_vec());
+        assert_eq!(
+            consumed,
+            vec![EVENT_ID_PROCESS_START, EVENT_ID_PROCESS_STOP],
+            "thread and image events stay out"
+        );
+    }
 
     fn utf16z(s: &str) -> Vec<u8> {
         s.encode_utf16()

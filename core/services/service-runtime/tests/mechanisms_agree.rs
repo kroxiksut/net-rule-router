@@ -301,7 +301,7 @@ fn an_address_rule_wins_over_an_app_rule_on_either_link() {
     );
     assert!(
         !filters.primary_dest_ips.contains(&IpAddr::V4(CONTESTED)),
-        "the app rule on the main link took an address the tunnel's own rule names — that host          would leave over the open link whenever this program touched it",
+        "the app rule on the main link took an address the tunnel's own rule names — that host would leave over the open link whenever this program touched it",
     );
     // And what only the program knows about is still the program's.
     assert!(filters.primary_dest_ips.contains(&IpAddr::V4(APP_ONLY)));
@@ -347,7 +347,7 @@ fn a_destination_another_process_uses_is_pinned_by_neither_mechanism() {
 
     assert!(
         !filters.secondary_dest_ips.contains(&IpAddr::V4(APP_ONLY)),
-        "the filter side pinned a destination another process is using; the kill-switch would          cut that process off too",
+        "the filter side pinned a destination another process is using; the kill-switch would cut that process off too",
     );
     assert!(
         !routes.routes.iter().any(|r| r.destination == APP_ONLY),
@@ -490,7 +490,7 @@ fn only_the_arbiter_reads_the_observation_store() {
     );
     assert!(
         offenders.is_empty(),
-        "these read the observation store without going through AppDestinationGate, so nothing          forces them to apply both ownership and the census: {offenders:?}",
+        "these read the observation store without going through AppDestinationGate, so nothing forces them to apply both ownership and the census: {offenders:?}",
     );
 }
 

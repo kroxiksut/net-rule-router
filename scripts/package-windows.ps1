@@ -16,7 +16,7 @@
           qml\                  Qt's own modules, written by windeployqt
           apps\desktop\qml\     the app's own QML
           locales\  presets\  configs\  assets\
-          scripts\              maintenance scripts
+          scripts\              recovery and uninstall scripts
 
     Two QML trees under one name would collide, which is why the app's own tree
     keeps the `apps\desktop\qml` path it has in the checkout. That depth is
@@ -34,8 +34,9 @@
     Package the release binaries already in the target directory.
 
 .PARAMETER QtBin
-    Qt's bin directory holding windeployqt.exe. Autodetected under C:\Qt when
-    omitted.
+    Qt's bin directory holding windeployqt.exe. When omitted, the kit the Qt
+    host was built with is used; the newest x64 kit under C:\Qt is the fallback.
+    A kit that differs from the host's is refused.
 
 .PARAMETER Full
     Deploy the complete Qt runtime. The default trims the pieces this app never
@@ -69,6 +70,14 @@ $packageRoot = Join-Path $OutputRoot 'NetRuleRouter'
 # windeployqt owns `qml\` for its modules while the app's own QML sits
 # under `apps\desktop\qml\`, which is also the depth its icon paths expect.
 $binDir = $packageRoot
+# Everything below (kit, CRT, wintun, archive name) is x64. Fail on any other
+# build machine instead of shipping x64 pieces beside a foreign binary.
+$hostArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$wintunArchByHost = @{ AMD64 = 'amd64' }
+if (-not $wintunArchByHost.ContainsKey($hostArch)) {
+    throw "Packaging is supported on x64 Windows only (this machine reports '$hostArch'): the Qt kit, the Visual C++ runtime and wintun.dll would not match the binaries."
+}
+$wintunArch = $wintunArchByHost[$hostArch]
 # Written into the package so a later run can tell its own output apart from a
 # folder the user picked by mistake, and refuse to delete the latter.
 $markerName = '.nrr-package'
@@ -78,9 +87,34 @@ function Write-Step {
     Write-Host "[package] $Message" -ForegroundColor Cyan
 }
 
+# Windows PowerShell 5.1 turns a native command's stderr into a terminating
+# error under `Stop`, so a cargo warning or git's "not a repository" would kill
+# the run. Native calls go through here: stderr dropped, success judged by the
+# exit code alone. Returns stdout lines, or $null when the tool failed or is absent.
+function Invoke-Native {
+    param([string]$Tool, [string[]]$Arguments)
+
+    if (-not (Get-Command $Tool -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $Tool @Arguments 2>$null
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($exitCode -ne 0) {
+        return $null
+    }
+    return , @($output)
+}
+
 function Resolve-CargoMetadata {
-    $metadata = & cargo metadata --format-version 1 --no-deps 2>$null | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or -not $metadata) {
+    $lines = Invoke-Native 'cargo' @('metadata', '--format-version', '1', '--no-deps')
+    $metadata = if ($lines) { ($lines -join "`n") | ConvertFrom-Json } else { $null }
+    if (-not $metadata) {
         throw 'cargo metadata failed - run this from a checkout with cargo on PATH.'
     }
     return $metadata
@@ -106,43 +140,78 @@ function Resolve-SourceRevision {
         commit_date = 'unknown'
         dirty       = $null
     }
-    $commit = & git -C $repoRoot rev-parse --short HEAD 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $commit) {
+    $commit = Invoke-Native 'git' @('-C', $repoRoot, 'rev-parse', '--short', 'HEAD')
+    if (-not $commit) {
         return $revision
     }
-    $revision.commit = $commit.Trim()
-    $commitDate = & git -C $repoRoot log -1 --format=%cI 2>$null
-    if ($LASTEXITCODE -eq 0 -and $commitDate) {
-        $revision.commit_date = $commitDate.Trim()
+    $revision.commit = ($commit -join '').Trim()
+    $commitDate = Invoke-Native 'git' @('-C', $repoRoot, 'log', '-1', '--format=%cI')
+    if ($commitDate) {
+        $revision.commit_date = ($commitDate -join '').Trim()
     }
     # Uncommitted work is the norm here, and a package built from it must say
     # so: otherwise a bug report names a commit that never held this code.
-    $status = & git -C $repoRoot status --porcelain 2>$null
+    $status = Invoke-Native 'git' @('-C', $repoRoot, 'status', '--porcelain')
     $revision.dirty = [bool]$status
     return $revision
 }
 
+# The kit the Qt host was linked against, read from its CMake cache. Packaging
+# any other kit ships a runtime that does not match the host binary.
+function Resolve-HostQtKit {
+    param([string]$HostExe)
+
+    $dir = Split-Path -Parent $HostExe
+    for ($depth = 0; $depth -lt 4 -and $dir; $depth++) {
+        $cache = Join-Path $dir 'CMakeCache.txt'
+        if (Test-Path -LiteralPath $cache) {
+            $line = Select-String -LiteralPath $cache -Pattern '^Qt6_DIR:PATH=(.+)$' | Select-Object -First 1
+            if ($line) {
+                # <kit>/lib/cmake/Qt6
+                $cmakeDir = $line.Matches[0].Groups[1].Value
+                return [System.IO.Path]::GetFullPath((Join-Path $cmakeDir '..\..\..'))
+            }
+            return $null
+        }
+        $dir = Split-Path -Parent $dir
+    }
+    return $null
+}
+
 function Resolve-WindeployQt {
-    param([string]$Explicit)
+    param([string]$Explicit, [string]$HostKit)
 
     if ($Explicit) {
         $candidate = Join-Path $Explicit 'windeployqt.exe'
         if (-not (Test-Path $candidate)) {
             throw "windeployqt.exe not found in -QtBin '$Explicit'."
         }
+        $explicitBin = [System.IO.Path]::GetFullPath($Explicit).TrimEnd('\')
+        if ($HostKit -and $explicitBin -ne (Join-Path $HostKit 'bin')) {
+            throw "-QtBin '$Explicit' is not the kit the Qt host was built with ('$HostKit'). Deploying another Qt beside this host breaks it at start-up."
+        }
         return $candidate
     }
 
-    # A Qt installation commonly carries several ABIs side by side, and an
-    # arm64 windeployqt cannot even start on an x64 host - match the desktop
-    # x64 kit explicitly rather than taking whichever sorts first.
-    $found = Get-ChildItem -Path 'C:\Qt' -Filter 'windeployqt.exe' -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -match '\\msvc\d+_64\\bin\\' } |
-        Sort-Object FullName -Descending
-    if (-not $found) {
-        throw 'No x64 windeployqt.exe found under C:\Qt (looked for msvc*_64). Pass -QtBin <path to Qt bin>.'
+    if ($HostKit) {
+        $candidate = Join-Path $HostKit 'bin\windeployqt.exe'
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
     }
-    return $found[0].FullName
+
+    # No cache to read: pick the newest x64 desktop kit by version number,
+    # the same rule the host's build script applies. String order would put
+    # 6.9 before 6.11.
+    $kits = Get-ChildItem -Path 'C:\Qt' -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        ForEach-Object { Join-Path $_.FullName 'msvc2022_64\bin\windeployqt.exe' } |
+        Where-Object { Test-Path -LiteralPath $_ }
+    if (-not $kits) {
+        throw 'No x64 windeployqt.exe found under C:\Qt\<version>\msvc2022_64\bin. Pass -QtBin <path to Qt bin>.'
+    }
+    return @($kits)[0]
 }
 
 function Resolve-NativeHost {
@@ -158,6 +227,30 @@ function Resolve-NativeHost {
         throw "nrr_qt_native_host.exe not found under '$ReleaseDir\build'. Build without -SkipBuild first."
     }
     return $hostExe.FullName
+}
+
+# Scripts a user of the package can run. Anything else under scripts\ (build,
+# check, dev tooling) needs a checkout and stays out; scripts\dev never ships.
+$userScripts = @(
+    'reset-network.ps1',
+    'service-status.ps1',
+    'uninstall-service.ps1',
+    'purge-data.ps1',
+    'lib\service-paths.ps1'
+)
+
+function Copy-UserScripts {
+    param([string]$Destination)
+
+    foreach ($script in $userScripts) {
+        $source = Join-Path $repoRoot "scripts\$script"
+        if (-not (Test-Path -LiteralPath $source)) {
+            throw "User script 'scripts\$script' is missing from the checkout."
+        }
+        $target = Join-Path $Destination $script
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        Copy-Item -LiteralPath $source -Destination $target -Force
+    }
 }
 
 function Copy-Payload {
@@ -234,7 +327,7 @@ Write-Step "copied the Qt host from '$nativeHost'"
 
 # Without it fake-IP silently switches itself off, and the failure is invisible
 # in the UI - so a missing DLL fails the packaging instead.
-$wintun = Join-Path $repoRoot 'third_party\wintun\bin\amd64\wintun.dll'
+$wintun = Join-Path $repoRoot "third_party\wintun\bin\$wintunArch\wintun.dll"
 if (-not (Test-Path $wintun)) {
     throw "wintun.dll not found at '$wintun'."
 }
@@ -284,7 +377,7 @@ Write-Step ("copied the Visual C++ runtime ({0:N1} MB)" -f ($crtBytes / 1MB))
 
 # ── Qt runtime ───────────────────────────────────────────────────────────────
 
-$windeployqt = Resolve-WindeployQt -Explicit $QtBin
+$windeployqt = Resolve-WindeployQt -Explicit $QtBin -HostKit (Resolve-HostQtKit -HostExe $nativeHost)
 $deployArguments = @(
     '--release',
     '--qmldir', (Join-Path $repoRoot 'apps\desktop\qml')
@@ -356,8 +449,8 @@ Copy-Payload 'assets\icons' (Join-Path $packageRoot 'assets\icons')
 # The startup splash paints the logo lockup before the QML engine loads; left out
 # of the package, it silently does not appear.
 Copy-Payload 'assets\images' (Join-Path $packageRoot 'assets\images')
-Copy-Payload 'scripts' (Join-Path $packageRoot 'scripts')
-Write-Step 'copied the QML, locales, presets, configs, icons, images and scripts'
+Copy-UserScripts (Join-Path $packageRoot 'scripts')
+Write-Step 'copied the QML, locales, presets, configs, icons, images and user scripts'
 
 # ── Build identity ───────────────────────────────────────────────────────────
 
@@ -430,11 +523,14 @@ What is inside
     presets\    ready-made rule sets
     configs\    schemas and configuration
     assets\     icons and the logo
-    scripts\    maintenance scripts
+    scripts\    recovery and uninstall scripts
 
-Some scripts under scripts\ expect a source tree and will not work on another
-machine. The useful ones here are reset-network.ps1 (emergency network
-recovery), service-status.ps1 and service-smoke.ps1.
+Day-to-day checks use the console beside the app, run from a terminal in this
+folder: nrr-cli.exe status, nrr-cli.exe diag doctor. If the service left the
+machine without network: nrr-cli.exe reset-network --confirm (administrator).
+scripts\reset-network.ps1 does the same recovery and also works when the
+console cannot start. scripts\uninstall-service.ps1 and scripts\purge-data.ps1
+remove the service and the data it left.
 
 If nothing happens when you start it
 ------------------------------------
@@ -486,11 +582,14 @@ English: см. README.txt.
     presets\    готовые наборы правил
     configs\    схемы и конфигурация
     assets\     значки и логотип
-    scripts\    вспомогательные сценарии
+    scripts\    сценарии восстановления и удаления
 
-Часть сценариев в scripts\ рассчитана на дерево исходного кода и на другом
-компьютере работать не будет. Здесь пригодятся прежде всего reset-network.ps1
-(аварийное восстановление сети), service-status.ps1 и service-smoke.ps1.
+Повседневные проверки делает консоль рядом с программой, из терминала в этой
+папке: nrr-cli.exe status, nrr-cli.exe diag doctor. Если служба оставила машину
+без сети: nrr-cli.exe reset-network --confirm (от администратора).
+scripts\reset-network.ps1 делает то же восстановление и работает, даже когда
+консоль не запускается. scripts\uninstall-service.ps1 и scripts\purge-data.ps1
+удаляют службу и оставленные ею данные.
 
 Если ничего не происходит при запуске
 -------------------------------------

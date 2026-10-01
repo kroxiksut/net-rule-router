@@ -1,4 +1,4 @@
-# Accessibility Localization Policy (Block 3.8)
+# Accessibility Localization Policy
 
 This document defines mandatory localization coverage for accessibility-oriented strings.
 

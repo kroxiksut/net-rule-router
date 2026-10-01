@@ -15,7 +15,7 @@ impl<'c> RevisionsRepository<'c> {
     /// activation coordinator may move a revision out of `Candidate`.
     ///
     /// Signed with the repository's key; without one the row stays
-    /// `Unsigned` until the boot backfill or [`Self::re_sign_all`].
+    /// `Unsigned` until the boot backfill or [`Self::re_sign_row`].
     pub fn insert_candidate(&self, record: &RevisionRecord) -> StorageResult<()> {
         self.insert_candidate_for(BASELINE_PRINCIPAL, record)
     }

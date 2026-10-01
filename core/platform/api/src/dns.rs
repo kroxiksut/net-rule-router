@@ -32,6 +32,7 @@
 pub use nrr_domain::address_class::AddressFamily;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
+use std::time::Duration;
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
 
@@ -117,6 +118,22 @@ pub enum DnsCacheFlushError {
     /// mechanism is not implemented for this OS yet).
     Unsupported { reason: &'static str },
 }
+
+impl std::fmt::Display for DnsCacheFlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed { code: 0 } => f.write_str("the OS refused to flush its DNS cache"),
+            Self::Failed { code } => {
+                write!(f, "the OS refused to flush its DNS cache (code {code})")
+            }
+            Self::Unsupported { reason } => {
+                write!(f, "the OS DNS cache cannot be flushed here: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DnsCacheFlushError {}
 
 /// Control surface over the **OS-level** DNS resolver cache.
 ///
@@ -211,6 +228,22 @@ pub enum DnsCacheReadError {
     /// not implemented for this OS yet).
     Unsupported { reason: &'static str },
 }
+
+impl std::fmt::Display for DnsCacheReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed { code: 0 } => f.write_str("the OS refused to list its DNS cache"),
+            Self::Failed { code } => {
+                write!(f, "the OS refused to list its DNS cache (code {code})")
+            }
+            Self::Unsupported { reason } => {
+                write!(f, "the OS DNS cache cannot be read here: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DnsCacheReadError {}
 
 /// Read surface over the **OS-level** DNS resolver cache.
 ///
@@ -332,6 +365,36 @@ pub trait SystemDnsServersPort: Send + Sync {
     /// Candidate upstream servers, most-preferred first. Empty when none can
     /// be determined — the caller MUST then leave the system resolver alone.
     fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate>;
+
+    /// [`Self::upstream_candidates_v4`] for a caller that must answer within
+    /// `budget`: empty when the list is not known in time. An implementation
+    /// that enumerates in place cannot stop a running command, so the default
+    /// ignores the budget.
+    fn upstream_candidates_v4_within(&self, _budget: Duration) -> Vec<UpstreamDnsCandidate> {
+        self.upstream_candidates_v4()
+    }
+
+    /// A lookup reached none of `servers` — every one ended in a network error
+    /// or a timeout. An implementation that keeps a list may take this as the
+    /// sign that its list is stale; a server that answered, even with an
+    /// error, is not reported.
+    fn report_all_unreachable(&self, _servers: &[UpstreamDnsCandidate]) {}
+}
+
+/// A shared port is the port: one list read by several owners needs no
+/// forwarding wrapper of its own.
+impl<T: SystemDnsServersPort + ?Sized> SystemDnsServersPort for std::sync::Arc<T> {
+    fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+        (**self).upstream_candidates_v4()
+    }
+
+    fn upstream_candidates_v4_within(&self, budget: Duration) -> Vec<UpstreamDnsCandidate> {
+        (**self).upstream_candidates_v4_within(budget)
+    }
+
+    fn report_all_unreachable(&self, servers: &[UpstreamDnsCandidate]) {
+        (**self).report_all_unreachable(servers);
+    }
 }
 
 /// Fixed candidate list. Production-usable as a manual override and the
@@ -547,12 +610,12 @@ mod tests {
         let r = MockDnsResolver::new();
         let first = ResolvedRecord {
             canonical_hostname: "x.test".into(),
-            addresses: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))],
             ttl_seconds: Some(60),
         };
         let second = ResolvedRecord {
             canonical_hostname: "x.test".into(),
-            addresses: vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))],
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))],
             ttl_seconds: Some(120),
         };
         r.set_response("x.test", first);
@@ -570,7 +633,7 @@ mod tests {
             "x.test",
             ResolvedRecord {
                 canonical_hostname: "x.test".into(),
-                addresses: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))],
                 ttl_seconds: Some(60),
             },
         );
@@ -626,7 +689,7 @@ mod tests {
         assert_eq!(r.read_resolver_cache(), Ok(Vec::new()));
         let entries = vec![OsCachedResolution {
             canonical_hostname: "shop.example".into(),
-            addresses: vec![Ipv4Addr::new(1, 2, 3, 4)],
+            addresses: vec![Ipv4Addr::new(192, 0, 2, 4)],
         }];
         r.set_entries(entries.clone());
         assert_eq!(r.read_resolver_cache(), Ok(entries));

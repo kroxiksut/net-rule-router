@@ -114,7 +114,7 @@ pub(super) fn process_name_matches_vpn(process_path: Option<&str>) -> bool {
 
 /// Does the drop's process belong to a peer-to-peer group
 /// whose peers must be kept OUT of the FCrDNS rule-host learner? A P2P peer's
-/// ISP hostname (`host.corbina.ru`) forward-confirms and matches a broad zone
+/// ISP hostname (`host.isp.example`) forward-confirms and matches a broad zone
 /// rule (`.ru`), so learning it inflates the zone permit cap with thousands of
 /// junk peers. The neutral [`nrr_platform_api::classify_app`]
 /// dictionary + `suppresses_fcrdns_learning()` is the single source of truth for
@@ -133,6 +133,15 @@ pub(super) fn process_is_p2p_fcrdns_suppressed(process_path: Option<&str>) -> bo
 pub(super) fn process_is_peer_to_peer(process_path: Option<&str>) -> bool {
     process_group(process_path)
         .is_some_and(|kind| kind.tab() == nrr_platform_api::AppGroupTab::PeerToPeer)
+}
+
+/// Can this program ever be offered for the tunnel? The operating system's
+/// own programs, tunnel clients and peer-to-peer programs never are, so both
+/// halves of the application measure leave them out alike.
+pub(super) fn offerable_program(path: &str) -> bool {
+    !(nrr_domain::app_offer::is_os_program(path)
+        || process_name_matches_vpn(Some(path))
+        || process_is_peer_to_peer(Some(path)))
 }
 
 fn process_group(process_path: Option<&str>) -> Option<nrr_platform_api::AppGroupKind> {

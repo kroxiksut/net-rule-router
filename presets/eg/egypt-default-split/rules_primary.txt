@@ -21,7 +21,7 @@ eg              # Arab Republic of Egypt (.eg)
 *.amazon.eg  # Regional commerce/services commonly used
 *.jumia.com.eg  # Regional commerce/services commonly used
 
-*.google.com  # Google services stay on the main route; the AI hosts are routed separately
+*.google.com  # Google services stay on the main route
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets

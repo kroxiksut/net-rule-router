@@ -61,8 +61,8 @@ fn observed_traffic_does_not_promote_a_host_this_site_does_not_own() {
 
 /// The defect this criterion exists for, four times reported: the user
 /// searches on a rule host, follows a link to an unrelated site, and that
-/// site's CDN is offered under the rule host — `ypncdn.com` under
-/// `www.search.test`, `cdninsta.test` under `cdn.openai.com`.
+/// site's CDN is offered under the rule host — `tubecdn.test` under
+/// `www.search.test`, `cdninsta.test` under `cdn.assistant.example`.
 #[test]
 fn a_cdn_fetched_by_another_sites_page_is_not_offered_under_the_open_anchor() {
     let mut ledger = defaults();
@@ -158,7 +158,7 @@ fn a_companion_raised_by_the_look_back_is_not_blamed_on_the_previous_page() {
 }
 
 /// Equal brand tokens below the length containment demands (`q.test`/`q.example`,
-/// `x.com`/`x.ai`) are kinship one registrar away from coincidence. They
+/// `k.test`/`k.example`) are kinship one registrar away from coincidence. They
 /// still earn the host they name; they must not earn the apex.
 #[test]
 fn a_short_brand_token_earns_the_host_but_not_the_apex() {
@@ -397,7 +397,7 @@ fn a_hostname_that_spells_out_an_address_is_not_a_companion() {
     // apex serves the whole internet, so proposing it routes strangers.
     ledger.observe(
         1_000,
-        "a23-213-41-17.deploy.static.akamaitechnologies.com",
+        "a198-51-100-17.deploy.static.cdn.example.net",
         CoActivityKind::CandidateInUse,
     );
 
@@ -414,10 +414,10 @@ fn machine_names_are_told_apart_from_service_names() {
     // Every shape here was observed in the wild, reaching the ledger
     // through the reverse-lookup learner.
     for machine in [
-        "a23-213-41-17.deploy.static.akamaitechnologies.com",
-        "ec2-18-97-36-79.compute-1.amazonaws.com",
-        "ec2-3-233-36-186.compute-1.amazonaws.com",
-        "140.206.0.34.bc.googleusercontent.com",
+        "a198-51-100-17.deploy.static.cdn.example.net",
+        "vm2-198-51-100-79.compute-1.cloud.example.com",
+        "vm2-203-0-113-186.compute-1.cloud.example.com",
+        "203.0.113.34.bc.cloud.example.com",
         "server-13-32-45-67.fra6.r.example.net",
     ] {
         assert!(names_one_machine(machine), "{machine}");
@@ -426,7 +426,7 @@ fn machine_names_are_told_apart_from_service_names() {
         "static.cdninsta.test",
         "xx-socialcdn-shv-02-fra3.socialcdn.test",
         "rr5---sn-2o25g5-55.videocdn.test",
-        "ei.phncdn.com",
+        "ei.cdn.example.org",
         // Four groups, but 2026 is no octet.
         "build-2026-01-02-03.example.com",
     ] {
@@ -453,14 +453,20 @@ fn a_delivery_name_under_a_services_own_domain_stays_exact() {
     // sign-in included — onto the additional link.
     let mut ledger = defaults();
     for at in [0_u64, 100_000] {
-        page_load(&mut ledger, at, "site.test", SECONDARY, &["cdn.auth0.com"]);
+        page_load(
+            &mut ledger,
+            at,
+            "site.test",
+            SECONDARY,
+            &["cdn.accounts.test"],
+        );
     }
 
     let proposals = ledger.proposals(150_000, &NoExclusions);
     assert_eq!(proposals.len(), 1);
     assert_eq!(
         proposals[0].proposed.value(),
-        "cdn.auth0.com",
+        "cdn.accounts.test",
         "an asset host under a service's own apex is evidence about itself only"
     );
 }

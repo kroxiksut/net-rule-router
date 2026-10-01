@@ -128,7 +128,7 @@ impl crate::dns_resolver::FakeIpAnswerer for CarriesOnV4 {
 fn aaaa_for_a_rule_host_is_answered_nodata_when_ipv4_can_carry_it() {
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_fake_ip(std::sync::Arc::new(CarriesOnV4(true)));
     match l.answer_query(&query("assistant.example", QTYPE_AAAA)) {
@@ -147,7 +147,7 @@ fn aaaa_for_a_rule_host_is_answered_nodata_when_ipv4_can_carry_it() {
 fn aaaa_is_forwarded_when_ipv4_cannot_carry_the_name() {
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_fake_ip(std::sync::Arc::new(CarriesOnV4(false)));
     assert_eq!(
@@ -163,7 +163,7 @@ fn aaaa_is_forwarded_when_ipv4_cannot_carry_the_name() {
 fn a_rule_host_leaving_over_ipv6_is_reported_once() {
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_fake_ip(std::sync::Arc::new(CarriesOnV4(false)));
     for _ in 0..3 {
@@ -252,7 +252,7 @@ fn a_fake_ip_host_keeps_its_aaaa_suppressed_when_the_tunnel_carries_ipv6() {
 fn aaaa_for_a_non_rule_host_is_forwarded() {
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_fake_ip(std::sync::Arc::new(CarriesOnV4(true)));
     assert_eq!(
@@ -273,6 +273,10 @@ fn query(name: &str, qtype: u16) -> Vec<u8> {
     p
 }
 
+fn question(packet: &[u8]) -> crate::dns_wire::ParsedQuestion {
+    parse_question(packet).expect("a well-formed question")
+}
+
 fn resolved(ips: &[Ipv4Addr]) -> ResolvedAddresses {
     ResolvedAddresses {
         addresses: ips.iter().copied().map(IpAddr::V4).collect(),
@@ -284,7 +288,7 @@ fn resolved(ips: &[Ipv4Addr]) -> ResolvedAddresses {
 fn intercepts_a_rule_host_and_builds_answer() {
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(23, 10, 20, 159)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 0, 159)])),
     );
     match l.answer_query(&query("assistant.example", QTYPE_A)) {
         ListenerAction::Respond(resp) => {
@@ -293,7 +297,7 @@ fn intercepts_a_rule_host_and_builds_answer() {
             assert_eq!(resp[2] & 0x80, 0x80, "QR set");
             assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "one answer");
             // RDATA is the resolved IP.
-            assert_eq!(&resp[resp.len() - 4..], &[23, 10, 20, 159]);
+            assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 159]);
         }
         other => panic!("expected Respond, got {other:?}"),
     }
@@ -303,7 +307,7 @@ fn intercepts_a_rule_host_and_builds_answer() {
 fn forwards_aaaa_and_steers_non_rule_a() {
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     );
     // AAAA for a rule host with the default fake-IP port: `carries_on_v4`
     // is false, so IPv4 cannot carry the name and its AAAA is forwarded
@@ -312,7 +316,7 @@ fn forwards_aaaa_and_steers_non_rule_a() {
         l.answer_query(&query("assistant.example", 28)),
         ListenerAction::Forward
     );
-    // A for a non-rule host → forward WITH direct-answer steering (П0-D).
+    // A for a non-rule host → forward WITH direct-answer steering.
     assert_eq!(
         l.answer_query(&query("example.com", QTYPE_A)),
         ListenerAction::ForwardFiltered
@@ -323,11 +327,11 @@ fn forwards_aaaa_and_steers_non_rule_a() {
 fn https_rr_is_forwarded_raw_for_rule_and_direct_hosts() {
     // Pins today's behaviour, which is a known hole rather than a decision:
     // an HTTPS answer's `ipv4hint` carries real addresses past both the
-    // rule-host interception and the direct-answer steering. Cloudflare-fronted
+    // rule-host interception and the direct-answer steering. CDN-fronted
     // names populate that hint in practice.
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     );
     assert_eq!(
         l.answer_query(&query("assistant.example", QTYPE_HTTPS)),
@@ -341,7 +345,7 @@ fn https_rr_is_forwarded_raw_for_rule_and_direct_hosts() {
     );
 }
 
-// ── П0-D — direct-answer steering ────────────────────────────────────────
+// ── direct-answer steering ────────────────────────────────────────
 
 struct OwnedSet(Arc<std::collections::HashSet<Ipv4Addr>>);
 impl crate::dns_resolver::SecondaryOwnedIps for OwnedSet {
@@ -353,7 +357,7 @@ impl crate::dns_resolver::SecondaryOwnedIps for OwnedSet {
 fn steering_listener(owned: &[Ipv4Addr]) -> DnsInterceptListener {
     listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_direct_answer_steering(Arc::new(OwnedSet(Arc::new(
         owned.iter().copied().collect(),
@@ -367,23 +371,23 @@ fn reply_for(name: &str, ips: &[Ipv4Addr]) -> Vec<u8> {
 
 #[test]
 fn steering_passes_clean_answers_through_untouched() {
-    let l = steering_listener(&[Ipv4Addr::new(9, 9, 9, 9)]);
+    let l = steering_listener(&[Ipv4Addr::new(100, 64, 9, 9)]);
     let q = query("www.search.example", QTYPE_A);
-    let reply = reply_for("www.search.example", &[Ipv4Addr::new(23, 10, 20, 147)]);
+    let reply = reply_for("www.search.example", &[Ipv4Addr::new(100, 64, 0, 147)]);
     assert_eq!(
-        l.steer_direct_answer(&q, reply.clone(), QUERY_BUDGET),
+        l.steer_direct_answer(&q, &question(&q), reply.clone(), QUERY_BUDGET),
         (reply, false)
     );
 }
 
 #[test]
 fn steering_drops_secondary_pinned_addresses() {
-    let pinned = Ipv4Addr::new(23, 10, 20, 151);
-    let clean = Ipv4Addr::new(23, 10, 20, 134);
+    let pinned = Ipv4Addr::new(100, 64, 0, 151);
+    let clean = Ipv4Addr::new(100, 64, 0, 134);
     let l = steering_listener(&[pinned]);
     let q = query("www.search.example", QTYPE_A);
     let reply = reply_for("www.search.example", &[pinned, clean]);
-    let (steered, still_pinned) = l.steer_direct_answer(&q, reply, QUERY_BUDGET);
+    let (steered, still_pinned) = l.steer_direct_answer(&q, &question(&q), reply, QUERY_BUDGET);
     assert!(!still_pinned, "a partially clean answer is not pinned");
     let out =
         crate::dns_wire::parse_address_response(0x1234, "www.search.example", QTYPE_A, &steered);
@@ -399,21 +403,21 @@ fn steering_drops_secondary_pinned_addresses() {
 fn steering_with_empty_owned_set_is_a_no_op() {
     let l = steering_listener(&[]);
     let q = query("www.search.example", QTYPE_A);
-    let pinned = Ipv4Addr::new(23, 10, 20, 151);
+    let pinned = Ipv4Addr::new(100, 64, 0, 151);
     let reply = reply_for("www.search.example", &[pinned]);
     assert_eq!(
-        l.steer_direct_answer(&q, reply.clone(), QUERY_BUDGET),
+        l.steer_direct_answer(&q, &question(&q), reply.clone(), QUERY_BUDGET),
         (reply, false)
     );
 }
 
 #[test]
 fn steering_relays_error_replies_unchanged() {
-    let l = steering_listener(&[Ipv4Addr::new(1, 1, 1, 1)]);
+    let l = steering_listener(&[Ipv4Addr::new(100, 64, 1, 1)]);
     let q = query("www.search.example", QTYPE_A);
     let nx = crate::dns_wire::build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
     assert_eq!(
-        l.steer_direct_answer(&q, nx.clone(), QUERY_BUDGET),
+        l.steer_direct_answer(&q, &question(&q), nx.clone(), QUERY_BUDGET),
         (nx, false)
     );
 }
@@ -424,12 +428,12 @@ fn steering_reports_a_fully_pinned_reply() {
     // with a 150 ms budget) cannot produce a clean re-query → the terminal
     // fail-open path must hand the reply back flagged, so the caller can
     // offer it to the collateral fake-IP rescue.
-    let pinned = Ipv4Addr::new(23, 10, 20, 133);
+    let pinned = Ipv4Addr::new(100, 64, 0, 133);
     let l = steering_listener(&[pinned]);
     let q = query("workspace.search.example", QTYPE_A);
     let reply = reply_for("workspace.search.example", &[pinned]);
     assert_eq!(
-        l.steer_direct_answer(&q, reply.clone(), QUERY_BUDGET),
+        l.steer_direct_answer(&q, &question(&q), reply.clone(), QUERY_BUDGET),
         (reply, true)
     );
 }
@@ -441,7 +445,7 @@ fn doh_canary_gets_nxdomain_before_rule_gate_for_any_qtype() {
     // both A and HTTPS (type 65) qtypes and a subdomain.
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     );
     for (name, qtype) in [
         ("use-application-dns.net", QTYPE_A),
@@ -487,7 +491,7 @@ fn rule_host_upstream_unavailable_fails_open_to_forward() {
 fn unparseable_datagram_is_forwarded() {
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     );
     assert_eq!(l.answer_query(&[0u8; 3]), ListenerAction::Forward);
 }
@@ -519,13 +523,15 @@ fn direct_fake_rewrites_the_reply_and_sees_the_steered_addresses() {
     });
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_direct_fake_ip(Arc::clone(&claiming) as Arc<dyn DirectFakeIpAnswerer>);
     let q = query("blog.example", QTYPE_A);
     let real = Ipv4Addr::new(203, 0, 113, 68);
     let reply = reply_for("blog.example", &[real]);
-    let out = l.fake_direct_response(&q, &reply).expect("claimed");
+    let out = l
+        .fake_direct_response(&q, &question(&q), &reply)
+        .expect("claimed");
     match crate::dns_wire::parse_address_response(0x1234, "blog.example", QTYPE_A, &out) {
         crate::dns_wire::AddressResponseOutcome::Answers { addresses, .. } => {
             assert_eq!(
@@ -547,11 +553,11 @@ fn direct_fake_declines_leave_the_gate_path_in_charge() {
     // gate + steered-reply path.
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     );
     let q = query("blog.example", QTYPE_A);
     let reply = reply_for("blog.example", &[Ipv4Addr::new(203, 0, 113, 68)]);
-    assert_eq!(l.fake_direct_response(&q, &reply), None);
+    assert_eq!(l.fake_direct_response(&q, &question(&q), &reply), None);
     // Even a claiming answerer must not rewrite an NXDOMAIN / error reply.
     let claiming = Arc::new(ClaimingFake {
         fake: Ipv4Addr::new(198, 18, 0, 7),
@@ -559,11 +565,11 @@ fn direct_fake_declines_leave_the_gate_path_in_charge() {
     });
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_direct_fake_ip(claiming as Arc<dyn DirectFakeIpAnswerer>);
     let nx = crate::dns_wire::build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
-    assert_eq!(l.fake_direct_response(&q, &nx), None);
+    assert_eq!(l.fake_direct_response(&q, &question(&q), &nx), None);
 }
 
 // ── Collateral rescue — fully pinned direct host → virtual address ───────
@@ -579,14 +585,14 @@ impl CompanionCandidateLookup for StubCompanions {
 fn a_parked_companion_suggestion_vetoes_the_collateral_rescue() {
     let l = listener(
         &["insta.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_companion_candidates(Arc::new(StubCompanions("static.cdninsta.test")));
     // The CDN of a site routed over the additional link: it belongs there,
     // not on the primary, whatever addresses it shares.
-    assert!(l.companion_is_pending(&query("static.cdninsta.test", QTYPE_A)));
+    assert!(l.companion_is_pending(&question(&query("static.cdninsta.test", QTYPE_A))));
     // An unrelated direct host stays collateral.
-    assert!(!l.companion_is_pending(&query("blog.example", QTYPE_A)));
+    assert!(!l.companion_is_pending(&question(&query("blog.example", QTYPE_A))));
 }
 
 #[test]
@@ -598,13 +604,15 @@ fn collateral_fake_rewrites_a_fully_pinned_reply() {
     });
     let l = listener(
         &["aistudio.search.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_collateral_fake_ip(Arc::clone(&claiming) as Arc<dyn DirectFakeIpAnswerer>);
     let q = query("workspace.search.example", QTYPE_A);
-    let pinned = Ipv4Addr::new(23, 10, 20, 133);
+    let pinned = Ipv4Addr::new(100, 64, 0, 133);
     let reply = reply_for("workspace.search.example", &[pinned]);
-    let out = l.fake_collateral_response(&q, &reply).expect("claimed");
+    let out = l
+        .fake_collateral_response(&q, &question(&q), &reply)
+        .expect("claimed");
     match crate::dns_wire::parse_address_response(0x1234, "workspace.search.example", QTYPE_A, &out)
     {
         crate::dns_wire::AddressResponseOutcome::Answers { addresses, .. } => {
@@ -626,14 +634,14 @@ fn collateral_fake_defaults_to_noop_and_skips_error_replies() {
     // Default (Noop) → never claims → the old fail-open path stands.
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     );
     let q = query("workspace.search.example", QTYPE_A);
     let reply = reply_for(
         "workspace.search.example",
-        &[Ipv4Addr::new(23, 10, 20, 133)],
+        &[Ipv4Addr::new(100, 64, 0, 133)],
     );
-    assert_eq!(l.fake_collateral_response(&q, &reply), None);
+    assert_eq!(l.fake_collateral_response(&q, &question(&q), &reply), None);
     // A claiming answerer must not rewrite an NXDOMAIN / error reply.
     let claiming = Arc::new(ClaimingFake {
         fake: Ipv4Addr::new(198, 18, 0, 9),
@@ -641,11 +649,11 @@ fn collateral_fake_defaults_to_noop_and_skips_error_replies() {
     });
     let l = listener(
         &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_collateral_fake_ip(claiming as Arc<dyn DirectFakeIpAnswerer>);
     let nx = crate::dns_wire::build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
-    assert_eq!(l.fake_collateral_response(&q, &nx), None);
+    assert_eq!(l.fake_collateral_response(&q, &question(&q), &nx), None);
 }
 // ── Per-datagram budget ──────────────────────────────────────────────────
 
@@ -711,6 +719,69 @@ fn a_failed_forward_answers_servfail_instead_of_saying_nothing() {
     assert_eq!(buf[3] & 0x0F, RCODE_SERVFAIL);
 }
 
+// ── Direct path ───────────────────────────────────────────────────────────
+
+const DIRECT_PINNED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+const DIRECT_CLEAN: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 20);
+
+/// Pins what a direct (non-rule) host hears for each query type: an `A`
+/// answer loses only the addresses the additional route owns, anything else
+/// is relayed as the upstream gave it.
+#[test]
+fn the_direct_path_answers_each_query_type_as_before() {
+    let l = steering_listener(&[DIRECT_PINNED]);
+
+    let a = query("shared.example", QTYPE_A);
+    assert_eq!(l.answer_query(&a), ListenerAction::ForwardFiltered);
+    let heard = l.answer_direct(
+        &a,
+        &question(&a),
+        reply_for("shared.example", &[DIRECT_PINNED, DIRECT_CLEAN]),
+        QUERY_BUDGET,
+    );
+    match crate::dns_wire::parse_address_response(0x1234, "shared.example", QTYPE_A, &heard) {
+        crate::dns_wire::AddressResponseOutcome::Answers { addresses, .. } => {
+            assert_eq!(addresses, vec![IpAddr::V4(DIRECT_CLEAN)]);
+        }
+        other => panic!("expected the steered answer, got {other:?}"),
+    }
+    let clean = reply_for("shared.example", &[DIRECT_CLEAN]);
+    assert_eq!(
+        l.answer_direct(&a, &question(&a), clean.clone(), QUERY_BUDGET),
+        clean,
+        "a clean answer is relayed byte for byte"
+    );
+
+    for qtype in [QTYPE_AAAA, QTYPE_HTTPS] {
+        assert_eq!(
+            l.answer_query(&query("shared.example", qtype)),
+            ListenerAction::Forward,
+            "qtype {qtype} is relayed untouched"
+        );
+    }
+}
+
+#[test]
+fn the_doh_canary_matches_without_regard_to_case_or_root_dot() {
+    use crate::dns_resolver::is_doh_canary;
+    for name in [
+        "use-application-dns.net",
+        "USE-Application-DNS.net.",
+        "x.use-application-dns.net",
+        ".use-application-dns.net",
+    ] {
+        assert!(is_doh_canary(name), "{name}");
+    }
+    for name in [
+        "xuse-application-dns.net",
+        "application-dns.net",
+        "use-application-dns.net.example",
+        "",
+    ] {
+        assert!(!is_doh_canary(name), "{name}");
+    }
+}
+
 // ── Short-name completion ─────────────────────────────────────────────────
 
 /// Answers every question from `answer`; stops after two quiet seconds.
@@ -735,12 +806,22 @@ fn fake_resolver(answer: fn(&[u8], &str) -> Option<Vec<u8>>) -> SocketAddr {
     addr
 }
 
+/// Knows the printer's IPv4 only, and answers every question about it with it.
+fn v4_only_printer(q: &[u8], name: &str) -> Option<Vec<u8>> {
+    (name == "printer.branch.corp.example")
+        .then(|| build_a_response(q, &[Ipv4Addr::new(192, 0, 2, 31)], 60))
+        .flatten()
+}
+
 fn short_name_listener(namespaces: bool) -> DnsInterceptListener {
-    let corporate = fake_resolver(|q, name| {
-        (name == "printer.branch.corp.example")
-            .then(|| build_a_response(q, &[Ipv4Addr::new(192, 0, 2, 31)], 60))
-            .flatten()
-    });
+    short_name_listener_answering(namespaces, v4_only_printer)
+}
+
+fn short_name_listener_answering(
+    namespaces: bool,
+    answer: fn(&[u8], &str) -> Option<Vec<u8>>,
+) -> DnsInterceptListener {
+    let corporate = fake_resolver(answer);
     let l = DnsInterceptListener::new(
         Arc::new(Oracle(Vec::new())),
         Arc::new(Upstream(Ok(resolved(&[])))),
@@ -754,12 +835,14 @@ fn short_name_listener(namespaces: bool) -> DnsInterceptListener {
     if !namespaces {
         return l;
     }
-    l.with_claimed_namespaces(Arc::new(|| {
-        vec![nrr_platform_api::dns_redirect::DnsNamespaceExemption {
+    let claims = crate::dns_resolver_service::ClaimsSnapshot::default();
+    claims.publish(Arc::new([
+        nrr_platform_api::dns_redirect::DnsNamespaceExemption {
             suffix: "branch.corp.example".to_string(),
             servers: vec![Ipv4Addr::LOCALHOST],
-        }]
-    }))
+        },
+    ]));
+    l.with_claimed_namespaces(claims)
 }
 
 /// The field case: a corporate host reached by its bare name, which the
@@ -794,13 +877,13 @@ fn a_short_name_is_completed_with_the_namespace_its_connection_claims() {
 }
 
 /// A connection that announces no domain: the user named it, and the name is
-/// asked of the resolvers every other name goes to.
+/// asked of the machine's private resolvers and the upstream.
 #[test]
 fn a_short_name_is_completed_with_the_domain_the_user_named() {
     let q = query("printer", QTYPE_A);
     let budget = Duration::from_secs(2);
     let asks_this_machine =
-        |l: DnsInterceptListener| l.with_private_resolvers(Arc::new(|| vec![Ipv4Addr::LOCALHOST]));
+        |l: DnsInterceptListener| l.with_private_resolvers(Arc::new(|_| vec![Ipv4Addr::LOCALHOST]));
     let named = asks_this_machine(short_name_listener(false))
         .with_short_name_suffix(Arc::new(|| Some("branch.corp.example".to_string())));
     assert!(named.complete_single_label(&q, "printer", budget).is_some());
@@ -809,6 +892,274 @@ fn a_short_name_is_completed_with_the_domain_the_user_named() {
     let unnamed =
         asks_this_machine(short_name_listener(false)).with_short_name_suffix(Arc::new(|| None));
     assert_eq!(unnamed.complete_single_label(&q, "printer", budget), None);
+}
+
+/// On a split-horizon domain the public upstream knows the name too, with
+/// its outside address. The domain the user named is asked of the private
+/// resolvers first, so the inside answer wins.
+#[test]
+fn a_short_name_under_the_named_domain_takes_the_private_answer_over_the_upstream() {
+    fn outside_view(q: &[u8], name: &str) -> Option<Vec<u8>> {
+        (name == "printer.branch.corp.example")
+            .then(|| build_a_response(q, &[Ipv4Addr::new(100, 64, 0, 31)], 60))
+            .flatten()
+    }
+    let public = fake_resolver(outside_view);
+    let inside = fake_resolver(v4_only_printer);
+    let listener = DnsInterceptListener::new(
+        Arc::new(Oracle(Vec::new())),
+        Arc::new(Upstream(Ok(resolved(&[])))),
+        Arc::new(NoopSink),
+        Arc::new(OkReconciler),
+        public,
+        Duration::from_millis(150),
+        Duration::from_millis(500),
+    )
+    .with_resolver_port(inside.port())
+    .with_private_resolvers(Arc::new(|_| vec![Ipv4Addr::LOCALHOST]))
+    .with_short_name_suffix(Arc::new(|| Some("branch.corp.example".to_string())));
+
+    let q = query("printer", QTYPE_A);
+    let reply = listener
+        .complete_single_label(&q, "printer", Duration::from_secs(2))
+        .expect("the completed answer");
+    assert_eq!(
+        parse_address_response(0x1234, "printer", QTYPE_A, &reply),
+        AddressResponseOutcome::Answers {
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 31))],
+            min_ttl: 60,
+        }
+    );
+}
+
+/// A completed name is answered with records of the type the client asked
+/// for: an A record under an AAAA question is a positive the client caches
+/// for a question it never got an answer to.
+#[test]
+fn a_short_name_is_completed_only_with_records_of_the_type_asked() {
+    const PRINTER_V6: std::net::Ipv6Addr =
+        std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x31);
+    fn dual_stack_printer(q: &[u8], name: &str) -> Option<Vec<u8>> {
+        if name != "printer.branch.corp.example" {
+            return None;
+        }
+        match parse_question(q)?.qtype {
+            QTYPE_AAAA => crate::dns_wire::build_aaaa_response(q, &[PRINTER_V6], 60),
+            _ => v4_only_printer(q, name),
+        }
+    }
+    let budget = Duration::from_secs(2);
+    let dual = short_name_listener_answering(true, dual_stack_printer);
+
+    let a = query("printer", QTYPE_A);
+    let reply = dual
+        .complete_single_label(&a, "printer", budget)
+        .expect("A completed");
+    assert_eq!(
+        parse_address_response(0x1234, "printer", QTYPE_A, &reply),
+        AddressResponseOutcome::Answers {
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 31))],
+            min_ttl: 60,
+        }
+    );
+
+    let aaaa = query("printer", QTYPE_AAAA);
+    let reply = dual
+        .complete_single_label(&aaaa, "printer", budget)
+        .expect("AAAA completed");
+    assert_eq!(
+        parse_address_response(0x1234, "printer", QTYPE_AAAA, &reply),
+        AddressResponseOutcome::Answers {
+            addresses: vec![IpAddr::V6(PRINTER_V6)],
+            min_ttl: 60,
+        }
+    );
+    // A name with no IPv6 is not completed for an AAAA question at all.
+    assert_eq!(
+        short_name_listener(true).complete_single_label(&aaaa, "printer", budget),
+        None
+    );
+
+    const QTYPE_TXT: u16 = 16;
+    for qtype in [QTYPE_TXT, crate::dns_wire::QTYPE_HTTPS] {
+        assert_eq!(
+            dual.complete_single_label(&query("printer", qtype), "printer", budget),
+            None,
+            "qtype {qtype} is not an address question"
+        );
+    }
+}
+
+// ── Private resolvers ─────────────────────────────────────────────────────
+
+const FIRST_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
+const SECOND_RESOLVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 54);
+
+fn two_private_resolvers_listener(forward_timeout: Duration) -> DnsInterceptListener {
+    DnsInterceptListener::new(
+        Arc::new(Oracle(Vec::new())),
+        Arc::new(Upstream(Ok(resolved(&[])))),
+        Arc::new(NoopSink),
+        Arc::new(OkReconciler),
+        "192.0.2.1:53".parse().expect("test-net address"),
+        Duration::from_millis(150),
+        forward_timeout,
+    )
+    .with_private_resolvers(Arc::new(|_| vec![FIRST_RESOLVER, SECOND_RESOLVER]))
+}
+
+/// Asks on a clock only `script` moves: it gets each question's server,
+/// window and bytes and returns the time the question took and the reply.
+/// Returns the reply and every question as (server, window).
+fn ask_on_a_manual_clock(
+    listener: &DnsInterceptListener,
+    budget: Duration,
+    script: impl Fn(Ipv4Addr, Duration, &[u8]) -> (Duration, Option<Vec<u8>>),
+) -> (Option<Vec<u8>>, Vec<(Ipv4Addr, Duration)>) {
+    let q = query("host.corp.example", QTYPE_A);
+    let start = Instant::now();
+    let spent = std::cell::Cell::new(Duration::ZERO);
+    let mut asked = Vec::new();
+    let reply = listener.ask_private_resolvers_via(
+        "192.0.2.1:53".parse().expect("addr"),
+        budget,
+        || start + spent.get(),
+        |target, window| {
+            assert_eq!(target.port(), 53);
+            let std::net::IpAddr::V4(server) = target.ip() else {
+                panic!("private resolvers are IPv4");
+            };
+            asked.push((server, window));
+            let (took, reply) = script(server, window, &q);
+            spent.set(spent.get() + took);
+            reply
+        },
+    );
+    (reply, asked)
+}
+
+/// Every private resolver shares one budget. Before, each retry got the whole
+/// of it again, and the worker sat on an answer the client had given up on.
+#[test]
+fn asking_the_private_resolvers_spends_one_budget_between_them() {
+    // Longer than the budget: only the budget can bound the windows.
+    let listener = two_private_resolvers_listener(Duration::from_secs(2));
+    let budget = Duration::from_millis(400);
+    let first_answer_after = Duration::from_millis(250);
+    // A slow "no such name" from the first, silence from the second.
+    let (reply, asked) = ask_on_a_manual_clock(&listener, budget, |server, window, q| {
+        if server == FIRST_RESOLVER {
+            (first_answer_after, build_error_response(q, RCODE_NXDOMAIN))
+        } else {
+            (window, None)
+        }
+    });
+    assert_eq!(reply, None);
+    assert_eq!(
+        asked,
+        vec![
+            (FIRST_RESOLVER, budget),
+            (SECOND_RESOLVER, budget - first_answer_after),
+        ]
+    );
+}
+
+/// The first resolver is mute and spends its whole window; the second answers.
+fn mute_then_answering(
+    server: Ipv4Addr,
+    window: Duration,
+    q: &[u8],
+) -> (Duration, Option<Vec<u8>>) {
+    if server == FIRST_RESOLVER {
+        (window, None)
+    } else {
+        (
+            Duration::ZERO,
+            build_a_response(q, &[Ipv4Addr::new(192, 0, 2, 44)], 60),
+        )
+    }
+}
+
+/// One mute resolver is not the verdict of all of them: the next one is still
+/// asked while the budget lasts.
+#[test]
+fn a_mute_private_resolver_hands_the_question_to_the_next_one() {
+    let window = Duration::from_millis(150);
+    let listener = two_private_resolvers_listener(window);
+    let (reply, asked) =
+        ask_on_a_manual_clock(&listener, Duration::from_secs(2), mute_then_answering);
+    let reply = reply.expect("the second resolver answered");
+    assert!(!reply_is_nxdomain(&reply));
+    assert_eq!(
+        asked,
+        vec![(FIRST_RESOLVER, window), (SECOND_RESOLVER, window)]
+    );
+}
+
+/// Positive control for the one above: a budget the first mute resolver
+/// spends whole leaves nothing to ask the second with.
+#[test]
+fn a_spent_budget_asks_no_further_private_resolver() {
+    // Longer than the budget: only the budget can stop the second ask.
+    let listener = two_private_resolvers_listener(Duration::from_secs(2));
+    let budget = Duration::from_millis(200);
+    let (reply, asked) = ask_on_a_manual_clock(&listener, budget, mute_then_answering);
+    assert_eq!(reply, None);
+    assert_eq!(asked, vec![(FIRST_RESOLVER, budget)]);
+}
+
+/// A resolver on loopback that answers every question after `delay`.
+fn udp_resolver_answering_after(delay: Duration) -> SocketAddr {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("resolver socket");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("resolver timeout");
+    let addr = socket.local_addr().expect("resolver addr");
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            std::thread::sleep(delay);
+            if let Some(reply) = build_a_response(&buf[..n], &[Ipv4Addr::new(192, 0, 2, 44)], 60) {
+                let _ = socket.send_to(&reply, from);
+            }
+        }
+    });
+    addr
+}
+
+/// The real socket path: an answer inside the window is relayed, and one that
+/// comes after it is not waited for. Only lower bounds on time, which load
+/// cannot break; a read the window failed to bound gets the late answer.
+#[test]
+fn a_forward_relays_an_answer_and_gives_up_at_the_window() {
+    let listener = two_private_resolvers_listener(Duration::from_secs(2));
+    let q = query("host.corp.example", QTYPE_A);
+
+    let prompt = udp_resolver_answering_after(Duration::ZERO);
+    let reply = listener
+        .forward_to(&q, prompt, Duration::from_secs(30))
+        .expect("an answer inside the window");
+    assert!(reply_answers_query(&q, &reply));
+
+    let late = udp_resolver_answering_after(Duration::from_secs(10));
+    let window = Duration::from_millis(200);
+    let started = Instant::now();
+    let reply = listener.forward_to(&q, late, window);
+    let took = started.elapsed();
+    assert_eq!(reply, None);
+    // Slack for a timer that fires a tick early.
+    assert!(
+        took + Duration::from_millis(50) >= window,
+        "gave up after {took:?} of a {window:?} window"
+    );
+}
+
+#[test]
+fn a_server_list_keeps_the_first_occurrence_of_each_resolver() {
+    let a: SocketAddr = "192.0.2.1:53".parse().expect("addr");
+    let b: SocketAddr = "192.0.2.2:53".parse().expect("addr");
+    let c: SocketAddr = "192.0.2.3:53".parse().expect("addr");
+    assert_eq!(first_occurrences(vec![b, a, b, c, a]), vec![b, a, c]);
 }
 
 // ── Rule-host admission control ───────────────────────────────────────────
@@ -866,8 +1217,10 @@ fn the_rule_host_branch_answers_inside_the_budget_it_was_given() {
         Duration::from_millis(150),
     );
     let started = Instant::now();
+    let q = query("routed.example", QTYPE_A);
     let action = l.answer_query_within(
-        &query("routed.example", QTYPE_A),
+        &q,
+        &question(&q),
         Duration::ZERO,
         Duration::from_millis(200),
     );
@@ -1054,4 +1407,149 @@ fn an_oversized_datagram_leaves_the_socket_serving() {
         }
     }
     assert!(next_seen, "the query after the oversized one is still read");
+}
+
+// ── AAAA through the production resolver chain ───────────────────────────
+
+/// Answers each family from its own list and remembers what it was asked. The
+/// listener tests above use a family-blind upstream, which is how decorators
+/// that quietly asked for `A` kept every AAAA at NODATA.
+struct FamilyUpstream {
+    v4: Vec<Ipv4Addr>,
+    v6: Vec<std::net::Ipv6Addr>,
+    asked: std::sync::Mutex<Vec<AddressFamily>>,
+}
+impl UpstreamResolver for FamilyUpstream {
+    fn resolve_within(
+        &self,
+        _h: &str,
+        family: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.asked.lock().unwrap().push(family);
+        let addresses: Vec<IpAddr> = match family {
+            AddressFamily::Ipv4 => self.v4.iter().copied().map(IpAddr::V4).collect(),
+            AddressFamily::Ipv6 => self.v6.iter().copied().map(IpAddr::V6).collect(),
+        };
+        if addresses.is_empty() {
+            return Err(ResolveError::NoRecords);
+        }
+        Ok(ResolvedAddresses {
+            addresses,
+            ttl_seconds: 300,
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecordingSink(std::sync::Mutex<Vec<IpAddr>>);
+impl FactSink for RecordingSink {
+    fn record(&self, _h: &str, r: &ResolvedAddresses) {
+        self.0.lock().unwrap().extend(r.addresses.iter().copied());
+    }
+}
+
+struct NoSystemServers;
+impl nrr_platform_api::dns::SystemDnsServersPort for NoSystemServers {
+    fn upstream_candidates_v4(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsCandidate> {
+        Vec::new()
+    }
+}
+
+/// The listener over the decorators production stacks on the raw upstream.
+fn chained_listener(
+    upstream: Arc<FamilyUpstream>,
+    sink: Arc<RecordingSink>,
+    guard: crate::enforcement_planner::Ipv6Guard,
+) -> DnsInterceptListener {
+    let poison = crate::dns_resolver_ports::PoisonFallbackUpstreamResolver::new(
+        upstream as Arc<dyn UpstreamResolver>,
+    )
+    .with_fallbacks(Vec::new());
+    let chain = crate::local_namespace_fallback::LocalNamespaceFallbackResolver::new(
+        Arc::new(poison),
+        Arc::new(NoSystemServers),
+        Duration::from_millis(1),
+    );
+    DnsInterceptListener::new(
+        Arc::new(Oracle(vec!["assistant.example".to_string()])),
+        Arc::new(chain),
+        sink,
+        Arc::new(OkReconciler),
+        "192.0.2.1:53".parse().unwrap(),
+        Duration::from_millis(150),
+        Duration::from_millis(150),
+    )
+    .with_ipv6_disposition(carried(guard))
+}
+
+fn family_upstream() -> Arc<FamilyUpstream> {
+    Arc::new(FamilyUpstream {
+        v4: vec![Ipv4Addr::new(100, 64, 0, 78)],
+        v6: vec!["2001:db8::7".parse().expect("v6")],
+        asked: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+/// The tunnel carries IPv6: the AAAA is asked upstream as an AAAA, answered,
+/// and its address recorded so enforcement is built for it like for a v4 one.
+#[test]
+fn aaaa_through_the_resolver_chain_is_answered_and_recorded() {
+    let upstream = family_upstream();
+    let sink = Arc::new(RecordingSink::default());
+    let l = chained_listener(
+        Arc::clone(&upstream),
+        Arc::clone(&sink),
+        crate::enforcement_planner::Ipv6Guard::FiltersAndRoutes,
+    );
+    match l.answer_query(&query("assistant.example", QTYPE_AAAA)) {
+        ListenerAction::Respond(bytes) => {
+            assert_eq!(bytes[3] & 0x0f, RCODE_NOERROR);
+            assert_eq!(&bytes[6..8], &[0, 1], "one AAAA record");
+        }
+        other => panic!("expected an AAAA answer, got {other:?}"),
+    }
+    let v6: std::net::Ipv6Addr = "2001:db8::7".parse().expect("v6");
+    assert_eq!(*sink.0.lock().unwrap(), vec![IpAddr::V6(v6)]);
+    assert_eq!(*upstream.asked.lock().unwrap(), vec![AddressFamily::Ipv6]);
+}
+
+/// Only the main link carries IPv6: the policy still says NODATA, and the
+/// upstream is not asked at all.
+#[test]
+fn aaaa_through_the_resolver_chain_stays_nodata_when_the_tunnel_cannot_carry_it() {
+    let upstream = family_upstream();
+    let sink = Arc::new(RecordingSink::default());
+    let l = chained_listener(
+        Arc::clone(&upstream),
+        Arc::clone(&sink),
+        crate::enforcement_planner::Ipv6Guard::FiltersOnly,
+    );
+    match l.answer_query(&query("assistant.example", QTYPE_AAAA)) {
+        ListenerAction::Respond(bytes) => assert_eq!(&bytes[6..8], &[0, 0], "NODATA"),
+        other => panic!("expected a NODATA response, got {other:?}"),
+    }
+    assert!(upstream.asked.lock().unwrap().is_empty());
+    assert!(sink.0.lock().unwrap().is_empty());
+}
+
+/// The A path through the same chain: one upstream question, of its family.
+#[test]
+fn a_through_the_resolver_chain_asks_once_for_a() {
+    let upstream = family_upstream();
+    let sink = Arc::new(RecordingSink::default());
+    let l = chained_listener(
+        Arc::clone(&upstream),
+        Arc::clone(&sink),
+        crate::enforcement_planner::Ipv6Guard::FiltersAndRoutes,
+    );
+    match l.answer_query(&query("assistant.example", QTYPE_A)) {
+        ListenerAction::Respond(bytes) => assert_eq!(&bytes[6..8], &[0, 1], "one A record"),
+        other => panic!("expected an A answer, got {other:?}"),
+    }
+    assert_eq!(*upstream.asked.lock().unwrap(), vec![AddressFamily::Ipv4]);
+    assert_eq!(
+        *sink.0.lock().unwrap(),
+        vec![IpAddr::V4(Ipv4Addr::new(100, 64, 0, 78))]
+    );
 }

@@ -177,11 +177,12 @@ fn normalize_ip_value(raw: Option<IpAddr>) -> (NormalizedIp, Vec<NormalizationWa
 /// Limits are RFC 1035: 63 octets per label, 253 for the name. Checked on the
 /// ASCII form, which is what punycode leaves behind and what the wire carries.
 fn dns_labels_are_well_formed(host: &str) -> bool {
-    if host.is_empty() || host.len() > 253 {
+    use crate::rule_value_validation::{MAX_HOSTNAME_OCTETS, MAX_LABEL_OCTETS};
+    if host.is_empty() || host.len() > MAX_HOSTNAME_OCTETS {
         return false;
     }
     host.split('.')
-        .all(|label| !label.is_empty() && label.len() <= 63)
+        .all(|label| !label.is_empty() && label.len() <= MAX_LABEL_OCTETS)
 }
 
 fn normalize_app_identity_value(
@@ -753,9 +754,9 @@ mod tests {
 
     #[test]
     fn ip_v4_passes_through() {
-        let addr = IpAddr::V4(Ipv4Addr::new(23, 10, 20, 138));
+        let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 138));
         let (ip, w) = normalize_ip_value(Some(addr));
-        assert_eq!(ip, NormalizedIp::ValidIpv4(Ipv4Addr::new(23, 10, 20, 138)));
+        assert_eq!(ip, NormalizedIp::ValidIpv4(Ipv4Addr::new(203, 0, 113, 138)));
         assert!(w.is_empty());
     }
 
@@ -857,7 +858,7 @@ mod tests {
     fn full_connection_all_classes_available() {
         let input = make_runtime_input(
             Some("example.com"),
-            Some(IpAddr::V4(Ipv4Addr::new(23, 10, 20, 138))),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 138))),
             Some("firefox.exe"),
         );
         let n = normalize_runtime_input(&input);
@@ -870,7 +871,8 @@ mod tests {
 
     #[test]
     fn ip_only_blocks_hostname_match_classes() {
-        let input = make_runtime_input(None, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))), None);
+        let input =
+            make_runtime_input(None, Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8))), None);
         let n = normalize_runtime_input(&input);
         assert!(n.match_class_availability.exact_fqdn.is_some());
         assert!(n.match_class_availability.suffix_domain.is_some());

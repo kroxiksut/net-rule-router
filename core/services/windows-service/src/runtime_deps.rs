@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use nrr_diagnostics::facade::service::DiagnosticsFacade;
-use nrr_diagnostics::{AuditRetentionPolicy, LogRetentionPolicy, ManualCleanupScope};
+use nrr_diagnostics::ManualCleanupScope;
 use nrr_domain::decision_lookup::FreshnessThresholds;
 use nrr_platform_windows::dns::WindowsDnsResolver;
 use nrr_platform_windows::wfp::{FilterFailureMode, WfpSession};
@@ -45,8 +45,6 @@ use nrr_service_runtime::{
     production_rules_provider::ProductionRulesProvider,
     register_production_handlers,
     routing_pause::{NoopRoutingPauseAudit, PauseDispatcher, RoutingPauseCoordinator},
-    service_stability::ServiceStabilityConfig,
-    tamper_bootstrap::run_tamper_bootstrap,
     AdaptersSnapshotProvider, ApplyFailurePolicyProvider, ApplyFailurePolicyWriter,
     AutostartProvider, AutostartWriter, CoordinatorPolicyManager, FakeIpApplyRequest,
     IpcAuditEmitter, IpcHandlerDeps, IpcHandlerRegistry, IpcRouter, IpcServer,

@@ -30,6 +30,10 @@
 //! treats SID as an opaque identifier; it only enforces non-empty
 //! through schema `NOT NULL` plus a Rust-side guard in `update_for_sid`.
 
+use std::collections::BTreeSet;
+use std::sync::{Mutex, PoisonError};
+
+use nrr_domain::is_valid_kill_switch_protocols;
 use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
 use nrr_domain::shared_ip::SharedIpPolicy;
 
@@ -104,17 +108,9 @@ impl BehaviorMode {
     }
 }
 
-/// Single (primary, secondary, mode, block-flag) snapshot for one SID.
-///
-/// `primary` and `secondary` are independently optional — a user may have
-/// bound only a primary, or neither. `update_for_sid` validates that
-/// `mode == StrictSecondaryFailClosed` requires `secondary.is_some()`
-/// before writing.
-/// Bitmask of IP protocols the multi-protocol kill-switch blocks:
-/// TCP=1, UDP=2, ICMP=4, IGMP=8, GRE=16, ESP=32, Other=64.
-/// `0x7F` = all (the default and the v16 `kill_switch_protocols` column
-/// default — a true kill-switch that also cuts ICMP/ping).
-pub const KILL_SWITCH_PROTOCOLS_ALL: u16 = 0x7F;
+/// Bitmask of IP protocols the kill-switch blocks; all of them is the default
+/// and the column default.
+pub use nrr_domain::KILL_SWITCH_PROTOCOLS_ALL;
 
 /// Column defaults for the auto-probe knobs, mirrored from the schema DDL so a
 /// value that cannot be represented falls back to what a fresh row would hold.
@@ -122,6 +118,12 @@ pub const DEFAULT_PRIMARY_PROBE_TIMEOUT_MS: u32 = 1500;
 pub const DEFAULT_PRIMARY_PROBE_MAX_TARGETS: u32 = 8;
 pub const DEFAULT_PRIMARY_PROBE_REPEAT_SECS: u32 = 300;
 
+/// Single (primary, secondary, mode, block-flag) snapshot for one SID.
+///
+/// `primary` and `secondary` are independently optional — a user may have
+/// bound only a primary, or neither. `update_for_sid` validates that
+/// `mode == StrictSecondaryFailClosed` requires `secondary.is_some()`
+/// before writing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutePolicyRecord {
     pub primary: Option<RouteBindingRecord>,
@@ -187,8 +189,8 @@ pub struct RoutePolicyRecord {
     /// "Treat a domain as `domain` + `*.domain`". When `true`, the
     /// enforcement layer expands every bare-domain (`ExactFqdn`) rule with a
     /// `SuffixDomain` sibling so it also covers subdomains (apex kept).
-    /// Default `true`: a user who adds `mysite.com` expects
-    /// `cdn.mysite.com` to take the same route, and the widening only ever adds
+    /// Default `true`: a user who adds `site.example` expects
+    /// `cdn.site.example` to take the same route, and the widening only ever adds
     /// coverage TOWARDS the route the rule already names — it cannot send
     /// anything to a route the user did not choose. Opting out is the toggle
     /// (or a narrower rule). Never affects the canonical/stored rule hash.
@@ -279,8 +281,8 @@ impl RoutePolicyRecord {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
-            // Default ON: adding `mysite.com` and silently losing
-            // `cdn.mysite.com` to the other route was the surprising outcome.
+            // Default ON: adding `site.example` and silently losing
+            // `cdn.site.example` to the other route was the surprising outcome.
             // Widening only adds coverage towards the route the rule names, so
             // it cannot leak to an unintended route. The SQL column DEFAULT
             // stays 0 (checksummed DDL, inert — upserts bind every column).
@@ -823,14 +825,6 @@ impl<'c> RouteBindingsRepository<'c> {
         Ok((mode, source))
     }
 
-    /// Load both `secondary_block_policy` flags for `sid`: the
-    /// `block_secondary_when_unavailable` toggle and the
-    /// `kill_switch_fail_closed` posture. A missing row returns
-    /// `(true, true, ALL)` — leak-guard ON by default ("Защита от утечки"),
-    /// fail-closed posture, all protocols, so an un-configured SID never
-    /// leaks secondary-bound traffic to the primary link. An explicit
-    /// stored `0` (the user unchecked it) still wins.
-    #[allow(clippy::type_complexity)]
     /// One `secondary_block_policy` row, decoded. A struct rather than a tuple:
     /// with twenty fields a positional return is a bug waiting for the next
     /// column to be added in the wrong place.
@@ -838,7 +832,17 @@ impl<'c> RouteBindingsRepository<'c> {
         let row: Option<BlockPolicyRow> = self
             .conn
             .query_row(
-                "SELECT block_secondary_when_unavailable, kill_switch_fail_closed,                  kill_switch_protocols, kill_switch_block_all, kill_switch_enabled,                  allow_dns_over_primary, include_subdomains, shared_ip_policy,                  mode_a_coverage_strategy, resolve_hosts_bypass,                  doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed,                  kill_switch_strict_shared_ips, auto_rules_mode,                  auto_rules_eager_delivery_names, primary_probe_auto,                  primary_probe_timeout_ms, primary_probe_max_targets,                  primary_probe_repeat_secs,                  local_networks_auto_accept, zone_priority_over_ip,                  short_name_completion, short_name_suffix
+                "SELECT block_secondary_when_unavailable, kill_switch_fail_closed, \
+                 kill_switch_protocols, kill_switch_block_all, kill_switch_enabled, \
+                 allow_dns_over_primary, include_subdomains, shared_ip_policy, \
+                 mode_a_coverage_strategy, resolve_hosts_bypass, \
+                 doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed, \
+                 kill_switch_strict_shared_ips, auto_rules_mode, \
+                 auto_rules_eager_delivery_names, primary_probe_auto, \
+                 primary_probe_timeout_ms, primary_probe_max_targets, \
+                 primary_probe_repeat_secs, \
+                 local_networks_auto_accept, zone_priority_over_ip, \
+                 short_name_completion, short_name_suffix
                  FROM secondary_block_policy WHERE sid = ?1",
                 params![sid],
                 |row| {
@@ -846,7 +850,10 @@ impl<'c> RouteBindingsRepository<'c> {
                     Ok(BlockPolicyRow {
                         block_secondary_when_unavailable: row.get::<_, i64>(0)? != 0,
                         kill_switch_fail_closed: row.get::<_, i64>(1)? != 0,
-                        kill_switch_protocols: row.get::<_, i64>(2)? as u16,
+                        kill_switch_protocols: stored_kill_switch_protocols(
+                            sid,
+                            row.get::<_, i64>(2)?,
+                        ),
                         kill_switch_block_all: row.get::<_, i64>(3)? != 0,
                         kill_switch_enabled: row.get::<_, i64>(4)? != 0,
                         allow_dns_over_primary: row.get::<_, i64>(5)? != 0,
@@ -1076,6 +1083,35 @@ fn insert_binding(
     )
     .map(|_| ())
     .map_err(|e| StorageError::Internal(format!("insert binding {role}: {e}")))
+}
+
+/// A stored protocol mask, or every protocol when it blocks nothing: the column
+/// admits `0`, and "Other" alone, which earlier builds let a user save.
+fn stored_kill_switch_protocols(sid: &str, raw: i64) -> u16 {
+    match u16::try_from(raw) {
+        Ok(bits) if is_valid_kill_switch_protocols(bits) => bits,
+        _ => {
+            note_protocol_mask_reset(sid, raw);
+            KILL_SWITCH_PROTOCOLS_ALL
+        }
+    }
+}
+
+/// Once per principal and process: the row is re-read on every apply.
+fn note_protocol_mask_reset(sid: &str, raw: i64) {
+    static NOTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let first = NOTED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(sid.to_owned());
+    if first {
+        tracing::warn!(
+            msg_key = "storage-kill-switch-protocols-reset",
+            sid = %sid,
+            stored = raw,
+            "stored leak protection protocol mask blocks nothing; reading it as every protocol",
+        );
+    }
 }
 
 // ── known_stable_ids ──────────────────────────────────────────────────────────

@@ -477,7 +477,7 @@ fn the_same_host_is_offered_once_the_main_link_stops_answering() {
 }
 
 /// An offer parked while the host was failing is withdrawn once it works —
-/// from the list a person reads AND from the parked set the badge counts.
+/// from the list a person reads, the badge, AND the parked set.
 #[test]
 fn an_offer_is_withdrawn_when_the_main_link_starts_carrying_the_host() {
     let verdicts = Arc::new(Mutex::new(HashMap::new()));
@@ -497,12 +497,14 @@ fn an_offer_is_withdrawn_when_the_main_link_starts_carrying_the_host() {
         f.engine.candidates(SID).is_empty(),
         "the reason for the offer stopped being true",
     );
-    f.engine.tick(SID, wall_clock() + Duration::from_secs(60));
     assert_eq!(
         f.engine.pending_count(SID),
         0,
-        "and the badge stops counting it",
+        "and the badge stops counting it"
     );
+    assert_eq!(parked(&f.engine), 1, "still parked until the tick runs");
+    f.engine.tick(SID, wall_clock() + Duration::from_secs(60));
+    assert_eq!(parked(&f.engine), 0, "and the tick retires it for good");
 }
 
 /// A self-signed offer states what the network is doing now, and nothing
@@ -581,7 +583,7 @@ fn shared_ad_and_telemetry_endpoints_are_never_offered_however_badly_they_fail()
     let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
     for host in [
         "ads.googlesyndication.com",
-        "pubads.g.doubleclick.net",
+        "pubads.googlesyndication.com",
         "stats.g.doubleclick.net",
         "www.googletagservices.com",
     ] {

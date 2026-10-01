@@ -151,7 +151,10 @@ mod tests {
             "r",
             CanonicalAddressMatch::ExactFqdn("other.example".into()),
         )]);
-        assert_eq!(match_specificity("a.nel.cloudflare.com", &unrelated), None);
+        assert_eq!(
+            match_specificity("report.telemetry.example", &unrelated),
+            None
+        );
         // A disabled rule claims nothing either.
         let mut disabled = rule("d", CanonicalAddressMatch::ExactFqdn("host.example".into()));
         disabled.enabled = false;

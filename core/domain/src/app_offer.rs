@@ -34,6 +34,19 @@ pub fn main_link_does_not_carry(reach: AppMainLinkReach) -> bool {
         && reach.failing_addresses > reach.working_addresses
 }
 
+/// A "not carried" verdict stands until working addresses outnumber failing
+/// ones by this much, so one address flipping between the two cannot turn it
+/// back and forth.
+pub const APP_WITHDRAW_MARGIN: usize = 2;
+
+/// An earlier "not carried" no longer holds: the program is split across the
+/// links, or most of its addresses work on the main one by a clear margin.
+#[must_use]
+pub fn main_link_carries_again(reach: AppMainLinkReach) -> bool {
+    reach.rides_additional_link
+        || reach.working_addresses >= reach.failing_addresses + APP_WITHDRAW_MARGIN
+}
+
 /// Where operating systems keep their own programs. Those serve every
 /// application on the machine, so routing one would move traffic nobody asked
 /// to move; they are never offered.
@@ -93,6 +106,17 @@ mod tests {
     #[test]
     fn two_stalled_addresses_are_not_enough() {
         assert!(!main_link_does_not_carry(reach(2, 0)));
+    }
+
+    #[test]
+    fn a_verdict_is_withdrawn_only_past_the_margin() {
+        assert!(!main_link_carries_again(reach(4, 5)), "one address short");
+        assert!(main_link_carries_again(reach(4, 6)));
+        let split = AppMainLinkReach {
+            rides_additional_link: true,
+            ..reach(8, 0)
+        };
+        assert!(main_link_carries_again(split));
     }
 
     #[test]

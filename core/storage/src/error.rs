@@ -24,9 +24,6 @@ pub enum StorageError {
     /// The database schema version is newer than this build supports (opened by
     /// a newer binary, then downgraded).  Must not attempt to downgrade.
     UnsupportedSchemaVersion { found: u32, max_supported: u32 },
-    /// SQLite `SQLITE_BUSY` — another writer held the lock longer than
-    /// `PRAGMA busy_timeout`.
-    BusyTimeout { timeout_ms: u32 },
     /// Backend error that does not fit a more specific variant.  Message
     /// carries the stringified rusqlite / I/O error without exposing the type.
     Internal(String),
@@ -73,9 +70,6 @@ impl fmt::Display for StorageError {
                     f,
                     "unsupported schema version {found} (max supported: {max_supported})"
                 )
-            }
-            Self::BusyTimeout { timeout_ms } => {
-                write!(f, "database busy timeout after {timeout_ms} ms")
             }
             Self::Internal(msg) => write!(f, "internal storage error: {msg}"),
         }

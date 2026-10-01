@@ -1,9 +1,8 @@
 //! Path resolution for the sidecar database.
 //!
-//! Default location is the per-user roaming AppData directory so each
-//! Windows account on a shared machine sees its own comments and
-//! pending state, consistent with the per-SID storage convention the
-//! service-side runtime uses for rules themselves (block 16.8).
+//! Default location is the per-user LOCAL AppData directory, so each account
+//! on a shared machine sees its own comments and pending state; a sidecar left
+//! in the roaming profile by an older build is adopted on first open.
 //!
 //! Tests, headless drivers, and the CI runner override via
 //! `NRR_SIDECAR_PATH`. The value is used verbatim, but it must be an absolute
@@ -35,11 +34,14 @@ const FILE_NAME: &str = "gui_metadata.db";
 /// Resolve the sidecar path, honouring the `NRR_SIDECAR_PATH` override.
 ///
 /// Returns the override verbatim when set; otherwise delegates to
-/// [`resolve_default_path`] which uses the platform's user-AppData
-/// directory. The parent directory is ensured to exist as a side effect
-/// so callers can pass the returned path straight to `rusqlite::Connection::open`.
+/// [`resolve_default_path`], so every production open adopts a sidecar left in
+/// the roaming profile. The parent directory is ensured to exist as a side
+/// effect so callers can pass the returned path straight to `rusqlite::Connection::open`.
 pub fn resolve_path() -> SidecarResult<PathBuf> {
-    resolve_path_with(env::var_os(NRR_SIDECAR_PATH_ENV), default_base())
+    match env::var_os(NRR_SIDECAR_PATH_ENV) {
+        Some(value) => resolve_path_with(Some(value), None),
+        None => resolve_default_path(),
+    }
 }
 
 /// Env-free resolver used by [`resolve_path`] and by tests that want
@@ -95,7 +97,7 @@ pub fn resolve_path_with(
 /// Windows: `%LOCALAPPDATA%\NetRuleRouter\gui_metadata.db`.
 /// Non-Windows: `$XDG_DATA_HOME/NetRuleRouter/gui_metadata.db` falling
 /// back to `$HOME/.local/share/NetRuleRouter/gui_metadata.db`. The GUI
-/// is Windows-first today (block 16.16) but the implementation stays
+/// is Windows-first today but the implementation stays
 /// portable so tests on developer macOS/Linux laptops don't have to
 /// override the path.
 pub fn resolve_default_path() -> SidecarResult<PathBuf> {

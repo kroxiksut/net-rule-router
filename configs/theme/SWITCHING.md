@@ -20,7 +20,7 @@ Both GUI and tray consume this resolver output in their runtime context payload.
 ## `system` Theme Behavior And Fallback
 
 - Primary source on Windows: registry value `HKCU\\...\\Themes\\Personalize\\AppsUseLightTheme`
-- Optional explicit override for tests/dev: `NRR_SYSTEM_THEME=light|dark`
+- Explicit override for tests/dev, read by debug builds only: `NRR_SYSTEM_THEME=light|dark|high-contrast`
 - Fallback when system mode cannot be detected: `light` (fail-safe deterministic baseline)
 
 ## Surface Application Scope

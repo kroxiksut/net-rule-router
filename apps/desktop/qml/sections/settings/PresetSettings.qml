@@ -57,7 +57,7 @@ GroupBox {
                 Layout.fillWidth: true
                 text: root.tr(
                     "settings.presets.import-secondary",
-                    "Import secondary route preset...")
+                    "Import additional route preset...")
                 icon.source: root.uiIconSource("load-list")
                 enabled: !root.mutationsModel.hasInFlight
                 onClicked: {
@@ -88,7 +88,7 @@ GroupBox {
                 Layout.fillWidth: true
                 text: root.tr(
                     "settings.presets.export-secondary",
-                    "Export secondary route preset...")
+                    "Export additional route preset...")
                 icon.source: root.uiIconSource("save")
                 onClicked: {
                     exportDialog.pendingSourceRoute = "secondary"

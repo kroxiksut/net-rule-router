@@ -1,509 +1,148 @@
 # Security
 
-## Purpose
+This page describes the trust model NetRuleRouter actually implements today: who may change routing policy, what protects that policy, and where the protection stops. It states the known gaps plainly; a gap is listed here until it is closed, and a promise that the code does not keep does not belong on this page.
 
-This file captures the baseline security model for NetRuleRouter and should evolve together with the implementation.
+To report a vulnerability, see [`CONTRIBUTING.md`](CONTRIBUTING.md#reporting-a-security-issue). A report that names the boundary it crosses is much easier to act on.
 
-Rules for maintaining this file:
-- keep it aligned with `README.md` and `STRUCTURE.md`
-- document stable security decisions, not temporary implementation details
+## What the product protects
 
-## Security Goals
+- **No silent policy changes.** Routing changes only through the background service, and only as a request from an identified user. A file changing on disk never becomes active policy by itself.
+- **Attributable, reversible changes.** Every accepted change becomes a stored revision recorded in an append-only audit trail with the user who made it, and a previous working revision can be restored in one step.
+- **Tamper evidence.** Stored revisions carry integrity data kept by the service. A revision that fails the check is not loaded.
+- **Per-user separation.** One user's rules, history and diagnostics are not visible to, or changeable by, another ordinary user of the same PC.
+- **Fail-Closed.** When leak protection is on and the additional connection goes down, traffic that your rules send through it is held back rather than silently sent through the main connection.
+- **Enforcement without the GUI.** Routing is enforced by the service whether or not the app window or the tray is running.
 
-The baseline security model is designed to:
-- prevent silent routing-policy changes
-- make policy changes attributable, reviewable, and reversible
-- minimize privileged code and privileged writable state
-- preserve Fail-Closed behavior when `secondary` is unavailable
-- keep routing enforcement independent from the GUI lifecycle
+## Where the protection stops
 
-## Threat Model Baseline
-
-The product should defend against:
-- untrusted imported profiles and presets
-- local processes attempting to change policy through files
-- future browser extensions proposing unsafe changes
-- unauthorized local clients attempting to talk to the service
-- stale, tampered, or poisoned configuration, cache, and diagnostics data
-- crashes or partial failures during policy application
-
-The baseline does not promise full protection if an attacker already has full administrative control or fully controls the active interactive user session.
-Even then, the product should still make silent policy tampering harder, more visible, and easier to roll back.
-
-## Core Principles
-
-Required principles:
-- the Windows service is the only component allowed to own and apply active routing policy
-- GUI, imports, and future browser extensions are request sources, not direct policy owners
-- external files are import artifacts, not live active policy
-- every accepted change becomes an internal revision with provenance metadata
-- risky or non-interactive external-origin changes should require explicit review before activation
-- narrow user-initiated flows may activate immediately after service validation and audit logging
-- the product should always keep a `last known good` revision for rollback
+The product does not protect against:
+- someone who already has administrator rights on the PC, or code running as the system account — they can replace the service, its data and its keys;
+- another program running as the same user, beyond what that user could do themselves — it can ask the service for anything the user could ask for;
+- a destination site recognising you — routing changes the exit address, not your accounts, cookies or browser;
+- the operator of the additional connection — traffic routed through it is visible to them.
 
-## Security Invariants
-
-These invariants are mandatory for every policy-changing flow:
-- Service-owned active revision: only the service can own and switch `ActiveRevision`.
-- No silent activation: activation is either explicitly approved by the user or allowed by a narrow documented immediate-apply path.
-- Service-mediated changes only: every accepted change must pass service validation and normalization before becoming a revision.
-- Last known good always available: rollback to `last known good` must remain possible after failed apply or failed integrity checks.
-- Fail-Closed behavior preserved: `secondary`-scoped traffic must not silently degrade to `primary` when that violates active policy.
+Anonymity, censorship circumvention and content filtering are not product goals, and nothing on this page should be read as evidence of them. User-facing wording for these limits lives in [`docs/en/what-routing-changes.md`](docs/en/what-routing-changes.md).
 
-## Revision Activation Policy
+Browser-side encrypted DNS (DoH/DoT) hides names from the provider and from the product at the same time, which weakens rule matching and leak protection for that traffic. The product exposes this as an explicit setting that can block browser encrypted DNS, rather than as a silently accepted gap.
 
-After service validation, revision activation is split into two classes:
-- Immediate activation allowed: explicit interactive user actions in trusted product UI flows with narrow scope (for example, direct GUI save or future click-to-add exact site action), followed by audit logging.
-- Pending review required: imported, linked, extension-originated, bulk, high-risk, or otherwise non-interactive changes. These changes must create `PendingRevision` and require explicit review before activation.
+## Components and who owns what
 
-## Trust Boundaries
+| Component | Runs as | Role |
+|---|---|---|
+| Background service | the Windows system account (`LocalSystem`) | The only owner of active policy. Validates requests, stores revisions, applies routes and firewall filters, writes the audit trail. |
+| App window and tray | the signed-in user | Show status, diffs, diagnostics and alerts; send requests to the service. They hold no privileged routing logic. |
+| Elevation helper | the same user, elevated | Started on demand for the few administrator actions; see below. |
+| Console (`nrr-cli`) | the user who runs it | Service lifecycle and diagnostics. It never edits or applies rules. |
+| Rules files, presets | — | Untrusted input. They are imported, never enforced by reference. |
 
-### Background Service
+**Why the system account.** Changing the routing table and installing firewall filters both require administrator-level rights on Windows; the restricted service accounts cannot do either. The consequence is that a compromise of the service is a compromise of the machine, which is why the service's reachable surface is kept to a local, access-controlled channel and every request is validated there.
 
-The service is the trust anchor for policy enforcement.
-It should:
-- own the active policy revision
-- validate and normalize imported data
-- apply routing changes
-- record audit events
-- verify integrity before loading persisted policy
+## The service channel
 
-Avoid `LocalSystem` unless it is proven necessary.
-Prefer `LocalService` or a dedicated service identity whenever practical.
+The app, the tray and the console talk to the service over a local named pipe. There is no localhost HTTP control plane and the pipe refuses remote clients.
 
-### Tray and Main GUI
+- **Who can connect.** Any signed-in user can connect and send requests. Only the system, administrators and the service itself can create the endpoint; an ordinary user cannot open a second instance of it to intercept other users' requests.
+- **The client checks the server.** Before sending anything, a client confirms that the process answering on the endpoint is the registered service itself, so a process that claimed the endpoint name first receives nothing. For that check, and for the status badge, ordinary users may query the service's status. Signed-in interactive users may also start the service; they cannot stop or reconfigure it.
+- **The service checks the caller.** The service identifies the caller from the connection itself — account, elevation and integrity level — never from anything the request claims. Low-integrity processes are refused. Each operation is classified by the service as read-only or state-changing, and state-changing operations are checked against the caller's rights and written to the audit trail before they run.
+- **Scoped answers.** Diagnostics reads return the caller's own records plus machine-level ones; an administrator sees everything. Notifications about one user's state reach only that user's connections. No request can name another user as its target or audience.
 
-The tray application and main GUI are user interaction surfaces.
-They should:
-- present status, diff, diagnostics, and approval workflows
-- submit change requests to the service
-- avoid owning privileged routing logic
+**Known gap.** The service tells its own clients apart (app, tray, console) by the name of the connecting executable. That decides which set of operations a client may call, not whose data it reaches — the account still comes from the connection — but it is not a strong identity.
 
-### Future Browser Extensions
+## Per-user rules and the shared baseline
 
-Future browser extensions should be treated as constrained request sources.
-They should submit requests through the service and should not write directly to active service-owned policy state.
+Each Windows user's rule edits are their own: no other user sees them, and making them requires no administrator prompt. Until a user makes their own edit they are governed by a shared, administrator-managed **baseline**; **Reset to baseline** discards the user's own edits and returns them to it. Editing the baseline requires administrator elevation.
 
-### External Files
+Why a non-elevated edit is safe:
+- **Scope.** A user's edit can only write that user's own data, because the service takes the user from the connection. It cannot reach another user's rules or the baseline.
+- **Isolation.** One user's edit, rollback, reset or cleanup never touches another user's data, and a user's rules only affect that user's traffic.
+- **Confirmation belongs to the proposer.** A proposed change can be confirmed only by the same user who proposed it. (It is bound to the user, not to the particular app session.)
+- **Audit and integrity.** Every change — own edit, reset, baseline edit — is recorded with its author, and silently reassigning a stored change to a different user is detectable.
 
-Imported YAML profiles, presets, and future external rule bundles are untrusted input.
-They must never be treated as trusted active policy simply because they were selected by path.
+## Elevation
 
-### Explicit Role Split
+Administrator rights are obtained through a same-user elevation helper, started when an administrator action is needed and ending when the app closes. It covers installing, starting and stopping the service and editing the baseline. UAC itself is not a security boundary by Microsoft's design; what this model guarantees is that the elevated helper can only be reached by the same user who raised it.
 
-Role and ownership boundaries are mandatory and non-overlapping:
-- Background service: the only owner of `ActiveRevision`, policy apply logic, integrity checks, and privileged mutations.
-- Tray/Main GUI: user-facing surfaces for status, diff, review, diagnostics, and request submission; they do not own or apply active policy directly.
-- Other non-privileged local clients (CLI tools, helpers, automation entry points): request-only channels with no direct write access to active service-owned state.
-- Future browser extensions and external channels: constrained request sources only; never direct owners of service-owned policy state.
-- External files: untrusted artifacts that can produce candidates/pending revisions through the service, but never become live policy by reference.
-
-## Service Communication Model
-
-The product should not expose a localhost HTTP control plane for privileged operations.
-Prefer local Windows IPC such as `Named Pipes` with:
-- ACL restrictions
-- caller identity verification
-- user/session awareness where needed
-- explicit separation between read-only methods and state-changing methods
-
-### IPC Boundary Rules
-
-The privileged control-plane boundary is fixed by these rules:
-- Localhost HTTP is not an allowed transport class for privileged mutations.
-- Preferred transport class for privileged operations: local Windows IPC, baseline-oriented to `Named Pipes`.
-- Endpoint ACLs must restrict callers to allowed principals only.
-- Caller identity must be verified before any mutating operation is accepted.
-- User/session context must be checked where operation scope depends on interactive user ownership.
-- Read-only methods and mutating methods must be separated at the API contract level (distinct method sets and authorization paths).
-- Reads are scoped to the caller, not only mutations. A user sees their own diagnostics records and the machine-level ones; the records of another account are not returned to them. An administrator sees everything on the machine. The scope is decided by the service from the connection, never taken from the request.
-- Notifications are scoped the same way: an event about one user's state reaches only that user's connections, and a change to the shared baseline reaches everyone. No request can name another user as the recipient.
-- The client verifies the server as well. Before sending anything, a client confirms that the process answering on the service endpoint is the registered service itself, so a process that took the endpoint name first receives nothing. To let that check run from any session, ordinary users are granted only the right to query the service's status — not to start, stop or reconfigure it.
-
-## Policy Data Model
-
-The policy pipeline should use explicit internal entities:
-- `ImportedArtifact`: external source metadata, path or reference, file hash, import time, schema result
-- `CanonicalProfile`: normalized internal form produced after parsing and validation
-- `PolicyRevision`: immutable revision with source, user, timestamp, diff summary, risk level, and integrity metadata
-- `PendingRevision`: candidate revision waiting for review or approval when the source is imported, linked, extension-originated, or otherwise non-interactive
-- `ActiveRevision`: currently enforced internal revision
-- `AuditEvent`: append-only event such as import, approval, activation, rejection, tamper alert, or rollback
-
-## Import and Change Model
-
-NetRuleRouter should allow user-selected external profile files, but only through controlled import.
-
-### External Source Trust Classification
-
-Trust boundaries for external policy sources are fixed as follows:
-- External files (`.yaml`, presets, bundles): untrusted artifacts only; they can be parsed into candidates but are never treated as live policy.
-- Snapshot-import source: one-time input for candidate creation; later source-file edits do not change active policy.
-- Linked-import source: monitored external input that can only create `PendingRevision`; source updates never auto-activate.
-- Browser-extension channel: constrained request channel only, with explicit user intent and service mediation required.
-- Service-owned internal state (`ActiveRevision`, revision store, integrity metadata): trusted control plane owned only by the service and never directly writable by external channels.
-
-### Snapshot Import
-
-`Snapshot import` should be the default model for the initial product version.
-
-Behavior:
-- the user selects a profile file
-- the GUI submits it to the service
-- the service parses, validates, and normalizes it
-- the service creates a candidate revision
-- the user reviews the diff and confirms activation
-- the active policy becomes the internal revision, not the source file
-
-Later changes to the original file must not silently change active behavior.
-
-### Linked Import
-
-`Linked import` may exist as an advanced mode, but must not silently auto-apply changes.
-
-Behavior:
-- the user explicitly links a file as an update source
-- if the file changes, the service creates a new pending revision
-- the user receives a persistent alert and can review the diff
-- the active policy remains unchanged until explicit approval
-
-If the linked file changes outside approved product flows, that should be treated as a tamper-relevant event, not as a trusted update.
-
-Imported, linked, extension-originated, and other non-interactive external changes should create pending revisions by default.
-Narrow interactive flows such as an explicit GUI save or a future browser-extension click-to-add site action may create and activate a revision immediately after service validation and audit logging.
-
-## Review and Approval Flow
-
-Before activation, the product should present a clear human-readable diff.
-The review should show at least:
-- added domains
-- removed domains
-- route changes for existing entries
-- changes to application rules
-- changes to default behavior
-- the origin channel such as GUI, import, linked file, or extension
-
-The service should assign a basic risk level to a candidate revision.
-Examples:
-- low risk: a small number of exact `FQDN` additions
-- medium risk: broader wildcard or suffix changes
-- high risk: default route changes, mass changes, or rerouting known destinations to `secondary`
-
-High-risk and non-interactive external-origin changes should generate persistent alerts until reviewed.
-
-## External File Change Handling
-
-The product should not rely on file watching as the only security mechanism.
-Instead:
-- if a snapshot-import source file changes later, inform the user that the source changed but the active policy did not
-- if a linked-import source file changes, create a pending revision and require review before activation
-- if service-owned persisted state changes unexpectedly, raise a tamper alert and refuse silent activation
-
-The key invariant is that a file change on disk must not automatically become an active routing-policy change.
-
-## Tamper Alerts and Security-Visible States
-
-The product should expose a minimal but explicit security-visible state model:
-- `secure`: no known integrity or tamper signals requiring user action.
-- `review_required`: a pending high-risk or non-interactive change exists and requires explicit review.
-- `tamper_suspected`: service-owned state integrity failed or an unauthorized change path was detected.
-
-The following events are tamper-relevant and must be recorded and surfaced:
-- unexpected linked-source change outside approved product flows;
-- unexpected mutation of service-owned persisted policy/revision state;
-- integrity verification failure for revision or integrity metadata;
-- high-risk non-interactive external-origin change proposals.
-
-Persistent alerts baseline:
-- high-risk and non-interactive changes must keep a persistent alert until the user reviews or resolves the change;
-- `tamper_suspected` alerts must remain visible until explicit user acknowledgement and remediation path selection (review, rollback, or reject).
-
-Minimum security-visible audit event set:
-- import;
-- review opened/completed;
-- approval/confirmation;
-- activation;
-- rejection;
-- rollback;
-- tamper alert raised/cleared;
-- integrity failure detected.
-
-## Future Browser Extension Model
-
-Future channels should be allowed only under explicit constraints.
-
-### Browser Extension
-
-A future browser extension may submit an immediate-apply request only when all of the following are true:
-- the action is triggered by an explicit user click in the browser
-- the user chooses the target profile in the extension flow
-- the change is limited to adding the current site's exact hostname or exact `FQDN` to that chosen profile
-- the request is sent through the service
-
-The extension must not run background automation or silent synchronization.
-Baseline constraints:
-- do not generate wildcard or suffix rules by default
-- do not generate IP rules by default
-- do not change the default route
-- do not perform bulk changes without explicit review
-- record every accepted extension change as an audit event and surface it in the user-visible history
-
-## Configuration Integrity and Storage
-
-The product should split writable locations by trust level:
-- service-owned active policy, revision store, and integrity data under `%ProgramData%` with restrictive ACLs
-- user-facing UI preferences under `%LocalAppData%`
-- imported files may live anywhere, but must remain external artifacts
-
-The service must not rely on user-writable locations as the source of truth for active policy.
-
-Internal revisions should carry integrity metadata such as a hash or HMAC managed by the service.
-If integrity verification fails:
-- do not silently load the tampered revision
-- fall back to `last known good`
-- record an audit event
-- alert the user
-
-If the service's signing key itself is lost while stored rules exist, nothing can be verified against it any more. The service then generates a new key, does not re-sign the old records, and keeps every user's rules in force — neither re-blessing possibly forged data nor rolling back legitimate rules — until the user acknowledges the reset. The fact that a reset awaits acknowledgement is kept under the same protection as the key, not in the database, so editing the database cannot fake the acknowledgement or shield a tampered revision. Every key loss raises its own alert.
-
-### Third-Party Edits to Database Files
-
-The service-owned database files are managed by the application and are not a supported external editing surface. Opening and changing them directly with a generic database tool, instead of through the application's own settings, import, and export flows, is unsupported: it can leave the application unable to start, cause it to apply an unintended routing policy, or lose stored rules and settings. There are legitimate reasons to touch these files outside the application — restoring one from a backup or moving it to another machine — so this is not prohibited, but the product's stability guarantees only cover changes made through its own interfaces. Whoever edits these files with an outside tool is responsible for the consequences.
-
-## Parsing and Validation Rules
-
-All imported profiles and presets must be treated as untrusted input.
-
-Required safeguards:
-- use safe parsing only
-- require explicit schema versioning
-- validate each rule type strictly
-- reject unknown or unsupported critical fields
-- apply limits on file size, nesting depth, and rule counts
-- normalize data before diffing and persistence
-- reject control characters in single-line fields, so a rule can never turn into several when a file is written back out
-- refuse a rule that enforcement cannot carry out as written instead of enforcing a wider version of it; a stored rule of such a shape is not enforced at all, and the product says so
-
-Rules by application should not rely only on a bare executable name when a stronger identity is available.
-The long-term preferred identity is a normalized executable path, with future room for publisher- or signature-aware verification.
-
-## Enforcement Safety
-
-Policy application should be atomic from the product point of view.
-The service should:
-- snapshot the relevant current state
-- apply the candidate policy
-- verify expected post-apply state where possible
-- rollback automatically if application or verification fails
-- while a revision is being applied, serve that revision to every part of the service that reads rules, so no background pass enforces the previous one in the meantime
-
-Fail-Closed must be implemented as a product invariant, not as best effort.
-Traffic associated with `secondary` must not silently fall back to `primary` when that would violate active policy.
-
-## Service Least-Privilege Baseline
-
-Least-privilege requirements for the background service:
-- run under the minimal practical service identity and privileges required for routing operations;
-- avoid `LocalSystem` by default; prefer `LocalService` or a dedicated service identity unless stronger privileges are explicitly justified;
-- keep privileged writable state minimal and strictly service-owned;
-- keep privilege-bearing routing logic in the service boundary, never in GUI/tray code paths;
-- deny direct privileged mutation paths from non-privileged clients even when they run locally.
-
-## Service Installation Scope
-
-The background service is installed machine-wide only. A per-user installation mode must not be offered for it, even where one is offered for the desktop surfaces.
-
-The service runs under a system identity, so whoever can write to the directory holding its executable can replace that executable and gain code execution under that identity. A per-user install puts the binary inside a profile directory that its own user can write, which turns an unprivileged account into a full compromise of the machine.
-
-Required controls:
-- the service executable and the files it loads live in a system-wide location writable by administrators only;
-- installing or updating the service requires elevation;
-- an attempt to register the service from a user-writable directory is refused, and the refusal states the reason rather than failing silently.
-
-## Per-User Rules and the Elevation Relaxation
-
-Each Windows user's rule edits are private to that user: no other user of
-the same machine can see them, and making them requires no administrator
-prompt. Until a user makes their own edit, they are governed by a shared,
-admin-managed **baseline**; **Reset to baseline** discards a user's own
-edits and returns them to that baseline. Editing the baseline itself is
-the one operation that still requires administrator elevation.
-
-**Why a non-elevated per-user edit is safe:**
-- **Scope.** A user-scoped edit can only ever write the caller's *own*
-  data. The service identifies the caller from the authenticated
-  connection itself, never from anything the request claims about who it
-  is, so a non-admin user cannot reach another user's rules or the shared
-  baseline.
-- **Isolation.** Every user's rule history is kept fully separate from
-  every other user's. One user's edit, rollback, reset, or cleanup never
-  touches another user's data.
-- **Session binding.** A pending change can only be finalized by the same
-  session that proposed it; it cannot be captured and committed by a
-  different user.
-- **Protected baseline.** Editing the shared baseline is the one
-  operation that still requires administrator elevation; the relaxation
-  that lets ordinary edits go unelevated applies only to a user's own
-  data, never to the machine-wide default.
-- **Enforcement.** Live enforcement is scoped per user, so a user's rules
-  only ever affect that user's own traffic.
-- **Audit.** Every change — a user's own edit, a reset to baseline, or a
-  baseline edit — is written to the append-only audit trail before it
-  takes effect, with the user who made it recorded.
-- **Integrity.** Stored rule history is tamper-evident: silently
-  reassigning a stored change to a different user is detectable.
-
-**Elevation model.** Administrator rights are obtained once per session
-through a same-user elevation step whose local channel only that user's
-own processes can reach, and which ends when the requesting app closes.
-It covers the few genuinely privileged actions: installing, starting, or
-stopping the background service, and editing the admin baseline. UAC
-itself is not a security boundary by Microsoft's own design; what this
-model guarantees is that elevation can never be reached by a different
-user — only raised, as intended, by the same one.
-
-The elevated helper is held to narrow rules:
+The helper is held to narrow rules:
+- its channel is reachable only by that user's own processes, and it answers only the app that started it;
 - it never runs a program path received from the app — only the service executable installed beside itself;
-- before sending anything, the session secret included, the app confirms that the process answering on the helper's channel is an elevated copy of itself, so a process that claimed the channel name first learns nothing;
-- it writes its log only into a directory that no ordinary user could have created, owns, or redirected elsewhere;
-- the administrator prompt is offered only when elevation can actually fix the refusal;
+- before sending anything, the app confirms that the process answering on the helper's channel is an elevated copy of itself;
+- it writes its log only into a directory that an ordinary user could not have created or redirected;
 - a slow operation is never treated as a dead helper: the app neither restarts the helper nor repeats an operation that may already have run.
 
-**Reset to baseline** removes only the caller's own edits. It can never
-delete the baseline itself or another user's data; once a user's edits
-are gone, they are governed by the shared baseline again, exactly as if
-they had never diverged from it.
+## Installation scope
 
-## Service-Safe Dependency Boundary
+The service is installed machine-wide only; there is no per-user install. A release build refuses to register the service from a directory an ordinary user can write to, and says why: whoever can replace the service executable gets code execution as the system account. Installing or updating the service requires elevation.
 
-To support block 6 decomposition, the service must treat the following as non-service-safe:
-- GUI/tray presentation modules, QML views, and UI-only interaction logic;
-- theme assets and localization presentation resources;
-- user-writable UI preference state as a policy source of truth;
-- extension-side automation logic and any client-owned mutable state.
+On Windows every executable loads libraries only from the Windows system directory and its own installation folder, never from the current directory or `PATH`. The interface takes its Qt plugins and QML modules from the installation folder only: environment variables and folders outside it cannot redirect them. That makes the installation folder the one place whose integrity matters, so it must stay writable by administrators only.
 
-Service-owned policy, pending changes, integrity metadata, and audit trail must remain in service-owned data paths and crates.
+## Where data lives and who can write it
 
-## Runtime Hardening
+| Location | Contents | Protection |
+|---|---|---|
+| `%ProgramData%\NetRuleRouter\` | Active policy and revisions, caches, logs, audit trail, backups | System and administrators only. Ordinary users reach its contents through the service, which scopes the answer to them. |
+| Service signing key | Integrity key for stored revisions | Readable only by the system account and bound to it. |
+| `%APPDATA%\NetRuleRouter\` | Per-user preferences: theme, language, accessibility, window state, route labels, remembered choices | Writable by that user. Roams with the profile on domain PCs. |
+| `%LOCALAPPDATA%\NetRuleRouter\` | Per-user, per-machine app cache | Writable by that user. |
+| Your rules files | Wherever you saved them | Yours. Imported, never enforced by reference. |
 
-Baseline hardening expectations:
-- keep privileged code surface as small as practical
-- localize and justify any `unsafe` Rust usage
-- restrict DLL and Qt plugin loading to trusted locations
-- do not support arbitrary script execution or unrestricted plugin execution in the initial product version
-- keep privilege-bearing logic out of the GUI layer
+The service never reads the preferences file and holds no rules there. The app does keep a few remembered intents in it — for example a change made while the service was stopped — and replays them to the service when it connects. A replayed intent is an ordinary request from that user: the service validates it like any other, and it cannot reach another user's data or the baseline. Settings that apply to the whole machine are the exception: they are never replayed, not even when the app itself runs as an administrator. When the service uses a different value, the app shows that and changes nothing until the user either applies their choice — an ordinary change that asks for administrator approval — or keeps the service's value. Details of every file: [`docs/en/where-files-live.md`](docs/en/where-files-live.md).
 
-## Product Trust Limits
+## Integrity and tamper alerts
 
-Baseline product trust limits:
-- no mandatory account login is required for core local routing functionality;
-- no telemetry is enabled by default;
-- no hidden network actions are allowed in the background.
+Stored revisions and the pointer to the active one carry integrity data kept by the service. If a check fails:
+- the tampered revision is not loaded or activated;
+- the service falls back to the last revision that verifies;
+- the failure is recorded in the audit trail and raised as a security alert.
 
-Allowed network actions in baseline must be explicit and user-controlled (for example, optional update checks or explicit diagnostics actions).
+If the signing key itself is lost while rules are stored, nothing can be verified against it any more. The service then generates a new key, does not re-sign the old records, and keeps every user's rules in force until the reset is acknowledged. That acknowledgement state is protected like the key, not kept in the database, so editing the database cannot fake it.
 
-## Non-Goals: What Routing Does Not Protect
+If the check itself cannot run at startup — the signing key or the stored records cannot be read — the service keeps routing without it rather than stopping, and says so: it raises a security alert that the integrity check is not working and records the cause in the audit trail; if even the alert cannot be recorded, the service reports itself as degraded. The check resumes on the next start that can run it.
 
-Routing decides which connection a request leaves through. It does not change who the user is to the other side, and the security model must not be read as if it did.
+Security alerts stay visible until acknowledged, and while an alert about tampered data is open, rule changes wait.
 
-Explicitly out of scope:
-- **identity on the destination site** — accounts, cookies, local site state, and browser characteristics are untouched by routing, so a site that recognizes the user keeps recognizing them after the exit address changes;
-- **confidentiality towards the additional connection's operator** — routed traffic is fully visible to whoever operates that connection; the product moves the observer, it does not remove one;
-- **anonymity, censorship circumvention, and content filtering** — none of these are product goals, and no invariant here should be cited as evidence of them;
-- **protection between local users of the same machine beyond the per-user policy split** — separation of interactive sessions is an operating-system responsibility.
+The audit trail is append-only and hash-chained, is kept separately from operational logs, and is never removed by in-app cleanup. Imports, rejected revisions and every acknowledgement or resolution of a security alert are recorded as events of their own.
 
-A consequence worth stating: a threat model that names "the user's provider" as the adversary is partially served by routing, while one that names "the destination site" is not served at all.
+**Known gaps.**
+- On Linux the signing key is protected by file permissions (readable by the service account only), not encrypted at rest.
 
-Browser-side encrypted DNS (DoH/DoT) is a related limit. It hides names from the provider and from the product at the same time, which weakens both rule matching and leak protection for that traffic. The baseline treats this as a user-visible trade-off with an explicit setting, not as a silently accepted gap.
+The service-owned database files are not a supported editing surface. Restoring one from a backup or moving it to another machine is legitimate, but a change made with an outside database tool can leave the app unable to start, apply an unintended policy, or lose rules; the product's guarantees cover only changes made through its own interfaces.
 
-User-facing wording for all of the above lives in `docs/en/what-routing-changes.md`.
+## Imports and review
 
-## Logs, Diagnostics, and Cache Safety
+Rules files and presets are untrusted input. On import:
+- the file is size-limited, must be UTF-8, and is limited in rule count and value length;
+- each rule is validated by type and normalised before it is compared or stored; control characters are refused, so a rule can never turn into several when a file is written back out;
+- a section the product does not understand is kept with a warning and never enforced; a file from a newer format version is read as far as the product understands it, with a warning;
+- a rule that enforcement cannot carry out as written is refused rather than enforced in a wider form; a stored rule of such a shape is not enforced at all, and the product says so.
 
-Logs and explain output can expose application paths, host names, IP addresses, policy decisions, and connectivity failures.
+Before an import takes effect, the app shows where the change came from (an edit in the app or an imported rules file), what it adds, removes and changes, with each entry's route, and flags risky patterns such as a change of the default behaviour, a mass change, or rerouting traffic to the additional connection. Nothing is activated until the user confirms. An imported file is a snapshot: editing it later changes nothing until it is imported again.
 
-Baseline rules:
-- log the minimum necessary by default
-- make verbose diagnostics explicit and time-bounded when practical
-- distinguish user-facing diagnostics from security audit events
-- store cache freshness metadata, source metadata, and timestamps
-- avoid relying on stale or context-free FQDN/IP cache entries
-- import hostnames from browser history only out of the requesting user's own browser profiles, never another account's
+**Known gaps.**
+- Application rules match an executable's file name (optionally with a `*` wildcard), not its publisher or signature. A different program with a matching name gets the same route.
 
-## Application Updates and GitHub Releases
+## Applying policy
 
-The application may support checking for new versions through official GitHub releases, but this must not weaken the local-first and security model.
+- While a revision is being applied, every part of the service that reads rules sees that revision, so no background task enforces the previous one in the meantime.
+- By default the service applies everything it can and reports any rule it had to skip, so one unresolvable rule does not leave you with no policy at all. An administrator can switch to all-or-nothing, where a failed apply is rolled back to the previous state.
+- After an apply the service checks what was actually installed and reports differences; that check reports, it does not roll back.
 
-Baseline update rules:
-- update checking must be optional or clearly user-controlled
-- update checks must not be required for routing or normal operation
-- use only the official GitHub repository or release endpoint configured by the product
-- show the exact version, tag, release source, and destination URL before download or install
-- do not silently install or execute a downloaded update in the initial product version
-- if checksums are published, verify them before presenting the package as valid
-- update-check failure must not affect policy enforcement
-- avoid unnecessary device-identifying data during update checks
+## Network activity of the product itself
 
-A staged trust model is acceptable:
-- baseline: check official release metadata and present it to the user
-- stronger future model: signed release manifests, signed application packages, and stronger package verification
+There is no telemetry and no account login. Besides the traffic you route, the product itself:
+- looks up the host names named in your rules and keeps their addresses fresh;
+- checks that the additional connection is alive, and asks a public address-discovery (STUN) service which public address it exits from;
+- when you use rule suggestions, tests whether a site answers over the main connection;
+- every N days (14 by default, adjustable), from the app window, makes one anonymous request to the project's GitHub releases page to see whether a newer version exists. It only shows a notification: it never downloads, installs or changes routing. The check can be turned off in Settings, and then the request is not made at all. Help → Check for updates makes the same single request when you choose it, whether or not the automatic check is on.
 
-## Security-Informed UX
+Logging is minimal by default. Verbose logging is an explicit choice that switches itself off after the chosen period or at the next restart. Browser-history seeding is opt-in and reads only the requesting user's own browser profiles.
 
-The product should make security-relevant state visible in everyday use.
-Examples:
-- show the source of the active policy revision
-- show whether pending external changes exist
-- show when a linked source changed
-- keep tamper alerts persistent until reviewed
-- provide one-step rollback to the last known good revision
+## Not built yet
 
-## Baseline Security Invariants
+These are directions, not current behaviour, and nothing above depends on them:
+- a linked import that watches a file and turns its changes into a pending review;
+- a browser extension that could propose a single exact-host rule on an explicit click;
+- publisher- or signature-aware identity for application rules;
+- signed rule bundles and signed release packages;
+- property-based or fuzz testing of the parsers (today they are covered by unit and fixture tests).
 
-The architecture should preserve these invariants:
-1. Active routing policy is always an internal service-owned revision.
-2. External file changes never silently become active policy.
-3. Privileged routing changes require approved service-mediated flows.
-4. `secondary` policy remains Fail-Closed when required by the active rules.
-5. A rollback path to a previously valid revision is always available.
-6. GitHub update checking cannot silently change routing policy or silently install a new build.
-
-## Block 4 Readiness Criteria
-
-Block 4 is considered complete only when the following are documented consistently:
-- trust boundaries and active-policy ownership;
-- security invariants and revision activation model;
-- external-source/import/review model;
-- local IPC boundary and privileged control-plane constraints;
-- service least-privilege and runtime-hardening baseline;
-- tamper-visible states, alerts, and audit-event baseline.
-
-## Recommended Validation Work
-
-Implementation should eventually validate at least these cases:
-- tampered imported file
-- unexpected change to a linked source
-- unauthorized IPC client
-- crash during policy apply
-- failed integrity verification for a persisted revision
-- stale or inconsistent FQDN/IP cache data
-- `secondary` route outage with rules that require Fail-Closed
-- suspicious bulk import or unsafe change proposal from a future extension channel
-
-Recommended engineering practices:
-- dependency auditing such as `cargo audit`
-- dependency and license policy enforcement such as `cargo deny`
-- focused tests for import validation and revision diffing
-- property or fuzz testing for parsers and rule evaluation inputs
-
-## Evolution Direction
-
-The baseline model intentionally leaves room for stronger trust features later, such as:
-- publisher- or signature-aware identity for application rules
-- trust levels such as `unsigned external`, `signed community`, and `signed official` for imported profiles
-- signed official or community profile bundles
-- signed release manifests and signed application packages for updates
-- richer per-source approval policies
-
-Those additions should strengthen the same core model rather than replace it:
-service-owned active revisions, explicit review flows, strong rollback, and visible provenance.
+Engineering practice that does exist: dependency license and advisory policy enforced by `cargo deny` in the quality gate, `unsafe` Rust denied workspace-wide and allowed only in the modules that call the operating system.

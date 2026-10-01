@@ -70,10 +70,12 @@ fn luids(indexes: &[u32]) -> Vec<u64> {
 #[test]
 fn a_pppoe_primary_is_never_a_foreign_tunnel_but_a_wireguard_beside_it_is() {
     let (_, coord) = machine(named("ppp0", PRIMARY, "ppp0", "ppp0"));
-    let foreign = coord.fail_closed_exemptions(SID).foreign_tunnel_luids;
+    let foreign = coord
+        .fail_closed_exemptions(SID, &coord.read_machine())
+        .foreign_tunnel_luids;
     assert_eq!(foreign, luids(&[WIREGUARD, L2TP]));
     let resolution = coord
-        .kill_switch_exemptions(SID)
+        .kill_switch_exemptions(SID, &coord.read_machine())
         .expect("the fixture resolves");
     assert_eq!(resolution.foreign_tunnel_luids, luids(&[WIREGUARD, L2TP]));
 }
@@ -87,7 +89,7 @@ fn a_windows_pppoe_primary_is_never_a_foreign_tunnel() {
         "High-speed connection",
     ));
     assert!(!coord
-        .fail_closed_exemptions(SID)
+        .fail_closed_exemptions(SID, &coord.read_machine())
         .foreign_tunnel_luids
         .contains(&mock_luid_for_index(PRIMARY)));
 }
@@ -105,7 +107,7 @@ fn a_primary_with_a_tunnel_name_is_never_a_foreign_tunnel() {
     // Even without its default route the binding alone decides.
     api.set_route_table(vec![route([100, 64, 0, 0], 24, [0, 0, 0, 0], PRIMARY)]);
     assert!(!coord
-        .fail_closed_exemptions(SID)
+        .fail_closed_exemptions(SID, &coord.read_machine())
         .foreign_tunnel_luids
         .contains(&mock_luid_for_index(PRIMARY)));
 }
@@ -115,7 +117,7 @@ fn a_primary_with_a_tunnel_name_is_never_a_foreign_tunnel() {
 /// PPPoE session rides on, and `ppp0` holds the only default.
 #[test]
 fn the_sole_default_route_holder_is_never_a_foreign_tunnel_even_unbound() {
-    let (api, coord) = machine(named("eth", PRIMARY, "Intel(R) Ethernet", "eth0"));
+    let (api, coord) = machine(named("eth", PRIMARY, "Ethernet Controller", "eth0"));
     let mut adapters = api.get_adapter_infos().expect("mock adapters");
     adapters.push(named("ppp0", PPP, "ppp0", "ppp0"));
     api.set_adapter_infos(adapters);
@@ -124,7 +126,9 @@ fn the_sole_default_route_holder_is_never_a_foreign_tunnel_even_unbound() {
     table.push(route([0, 0, 0, 0], 0, [0, 0, 0, 0], PPP));
     api.set_route_table(table);
     assert_eq!(
-        coord.fail_closed_exemptions(SID).foreign_tunnel_luids,
+        coord
+            .fail_closed_exemptions(SID, &coord.read_machine())
+            .foreign_tunnel_luids,
         luids(&[WIREGUARD, L2TP]),
     );
 }
@@ -134,12 +138,14 @@ fn the_sole_default_route_holder_is_never_a_foreign_tunnel_even_unbound() {
 /// keeps its permit by name, as it always did.
 #[test]
 fn a_full_tunnel_beside_a_physical_default_stays_foreign() {
-    let (api, coord) = machine(named("eth", PRIMARY, "Intel(R) Ethernet", "Ethernet"));
+    let (api, coord) = machine(named("eth", PRIMARY, "Ethernet Controller", "Ethernet"));
     let mut table = api.get_ip_forward_table().expect("mock table");
     table.push(route([0, 0, 0, 0], 0, [0, 0, 0, 0], L2TP));
     api.set_route_table(table);
     assert_eq!(
-        coord.fail_closed_exemptions(SID).foreign_tunnel_luids,
+        coord
+            .fail_closed_exemptions(SID, &coord.read_machine())
+            .foreign_tunnel_luids,
         luids(&[WIREGUARD, L2TP]),
     );
 }
@@ -148,12 +154,14 @@ fn a_full_tunnel_beside_a_physical_default_stays_foreign() {
 /// default is the v6 uplink even though the v4 default sits elsewhere.
 #[test]
 fn ipv4_and_ipv6_defaults_are_counted_separately() {
-    let (api, coord) = machine(named("eth", PRIMARY, "Intel(R) Ethernet", "Ethernet"));
+    let (api, coord) = machine(named("eth", PRIMARY, "Ethernet Controller", "Ethernet"));
     let mut table = api.get_ip_forward_table().expect("mock table");
     table.push(v6_default(WIREGUARD));
     api.set_route_table(table.clone());
     assert_eq!(
-        coord.fail_closed_exemptions(SID).foreign_tunnel_luids,
+        coord
+            .fail_closed_exemptions(SID, &coord.read_machine())
+            .foreign_tunnel_luids,
         luids(&[L2TP]),
         "the sole v6 default holder is the v6 uplink",
     );
@@ -163,7 +171,9 @@ fn ipv4_and_ipv6_defaults_are_counted_separately() {
     table.push(v6_default(L2TP));
     api.set_route_table(table);
     assert_eq!(
-        coord.fail_closed_exemptions(SID).foreign_tunnel_luids,
+        coord
+            .fail_closed_exemptions(SID, &coord.read_machine())
+            .foreign_tunnel_luids,
         luids(&[WIREGUARD, L2TP]),
     );
 }
@@ -185,10 +195,10 @@ fn v6_default(ifindex: u32) -> RouteEntry {
 /// kill-switch.
 #[test]
 fn an_unreadable_route_table_exempts_no_foreign_tunnel() {
-    let (api, coord) = machine(named("eth", PRIMARY, "Intel(R) Ethernet", "Ethernet"));
+    let (api, coord) = machine(named("eth", PRIMARY, "Ethernet Controller", "Ethernet"));
     api.set_route_table_read_error(Some("enumeration failed"));
     assert!(coord
-        .fail_closed_exemptions(SID)
+        .fail_closed_exemptions(SID, &coord.read_machine())
         .foreign_tunnel_luids
         .is_empty());
 }
@@ -198,7 +208,7 @@ fn an_unreadable_route_table_exempts_no_foreign_tunnel() {
 #[test]
 fn the_block_all_opens_no_egress_on_a_pppoe_primary() {
     let (_, coord) = machine(named("ppp0", PRIMARY, "ppp0", "ppp0"));
-    let exemptions = coord.fail_closed_exemptions(SID);
+    let exemptions = coord.fail_closed_exemptions(SID, &coord.read_machine());
     let permits: Vec<u64> =
         fail_closed_block_all_filters(SID, &exemptions, KillSwitchProtocols::ALL)
             .iter()

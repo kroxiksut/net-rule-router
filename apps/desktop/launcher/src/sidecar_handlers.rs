@@ -18,7 +18,6 @@
 //!
 //! | Slug                          | Description                                                    |
 //! |-------------------------------|----------------------------------------------------------------|
-//! | `sidecar.comment.read`        | Read one comment by signature                                  |
 //! | `sidecar.comment.read-all`    | Bulk read every stored comment (one RPC for the snapshot bind) |
 //! | `sidecar.comment.write`       | Write/replace one comment (empty string deletes)               |
 //! | `sidecar.comment.gc`          | Drop comments not in the supplied active-signature list        |
@@ -29,7 +28,6 @@
 //! | `sidecar.pending-apply.clear` | Drop the parked snapshot                                       |
 //! | `sidecar.external-ip.read-all`  | Bulk read every cached last-known external IP                |
 //! | `sidecar.external-ip.write-all` | Upsert last-known external IPs for one or more adapters      |
-//! | `sidecar.vacuum`              | Force-vacuum the sidecar (Settings → Reset application data)   |
 //! | `sidecar.reset`               | Full reset — wipe all comments/passthrough/pending-apply       |
 //!
 //! Slug shape mirrors the IpcOperationName convention
@@ -80,24 +78,34 @@ pub fn handle_sidecar_request(
     payload: &Value,
 ) -> SidecarHandlerResult {
     let mut guard = handle.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        match SidecarDb::open_default() {
-            Ok(db) => *guard = Some(db),
-            // The one request that has to work on a database we cannot open is
-            // the one that throws it away. It used to fail with the same error
-            // as everything else — the open happened before dispatch — so the
-            // recovery the crate documents ("let the user pick Reset
-            // application data") was unreachable exactly when it was needed.
-            Err(open_error) if operation == RESET_OPERATION => {
-                return rebuild_unopenable_sidecar(&mut guard, open_error);
-            }
-            Err(open_error) => return Err(open_error),
-        }
+    // The other launcher (GUI or tray) may have rebuilt the file under this
+    // connection; on Unix it would keep serving the unlinked inode until
+    // restart, and every write here would vanish.
+    let reopen_at = guard
+        .as_ref()
+        .filter(|db| db.file_replaced())
+        .map(|db| db.path().to_path_buf());
+    if reopen_at.is_some() {
+        *guard = None;
     }
-    // SAFETY-from-`unwrap`: we just inserted `Some(...)` above.
-    let db = guard.as_mut().ok_or_else(|| SidecarError::PathResolution {
-        reason: "sidecar handle was unexpectedly empty after init".into(),
-    })?;
+    let db = match guard.as_mut() {
+        Some(db) => db,
+        None => {
+            let path = match reopen_at {
+                Some(path) => path,
+                None => nrr_storage_sidecar::profile::resolve_path()?,
+            };
+            match SidecarDb::open(&path) {
+                Ok(db) => guard.insert(db),
+                // Reset is the documented way out of a sidecar that will not
+                // open, so it must not fail on that same open.
+                Err(open_error) if operation == RESET_OPERATION => {
+                    return rebuild_unopenable_sidecar(&mut guard, &path, open_error);
+                }
+                Err(open_error) => return Err(open_error),
+            }
+        }
+    };
     dispatch(db, operation, payload)
 }
 
@@ -106,36 +114,32 @@ const RESET_OPERATION: &str = "sidecar.reset";
 
 /// Throw away a sidecar that will not open and put a fresh one in its place.
 ///
-/// Only ever reached from an explicit `sidecar.reset` — the crate's rule is
-/// that a non-empty user database is never auto-truncated, and this does not
-/// change that: the user asked. What it does change is that asking now works.
-/// The `-wal` and `-shm` companions go too; leaving them behind is how a
-/// "fresh" database inherits the journal of the broken one.
+/// Only an explicit `sidecar.reset` gets here: a non-empty user database is
+/// never auto-truncated. The `-wal` / `-shm` companions go too, or the fresh
+/// file inherits the broken one's journal. A launcher still holding the old
+/// file notices through [`SidecarDb::file_replaced`] and reopens.
 fn rebuild_unopenable_sidecar(
     guard: &mut Option<SidecarDb>,
+    path: &std::path::Path,
     open_error: SidecarError,
 ) -> SidecarHandlerResult {
-    let path = nrr_storage_sidecar::profile::resolve_path()?;
     for companion in ["", "-wal", "-shm"] {
-        let mut victim = path.clone().into_os_string();
+        let mut victim = path.as_os_str().to_os_string();
         victim.push(companion);
         match std::fs::remove_file(std::path::PathBuf::from(victim)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            // Could not remove it: report the ORIGINAL failure, which is what
-            // the user is actually looking at, not a second one about a file
+            // Report the failure the user is looking at, not one about a file
             // they never heard of.
             Err(_) => return Err(open_error),
         }
     }
-    let db = SidecarDb::open_default()?;
-    *guard = Some(db);
+    *guard = Some(SidecarDb::open(path)?);
     Ok(json!({ "reset": true, "rebuilt": true }))
 }
 
 fn dispatch(db: &SidecarDb, operation: &str, payload: &Value) -> SidecarHandlerResult {
     match operation {
-        "sidecar.comment.read" => handle_comment_read(db, payload),
         "sidecar.comment.read-all" => handle_comment_read_all(db),
         "sidecar.comment.write" => handle_comment_write(db, payload),
         "sidecar.comment.gc" => handle_comment_gc(db, payload),
@@ -146,21 +150,14 @@ fn dispatch(db: &SidecarDb, operation: &str, payload: &Value) -> SidecarHandlerR
         "sidecar.pending-apply.clear" => handle_pending_apply_clear(db),
         "sidecar.external-ip.read-all" => handle_external_ip_read_all(db),
         "sidecar.external-ip.write-all" => handle_external_ip_write_all(db, payload),
-        "sidecar.vacuum" => handle_vacuum(db, payload),
         RESET_OPERATION => handle_reset(db),
-        other => Err(SidecarError::PathResolution {
-            reason: format!("unknown sidecar operation: {other}"),
+        other => Err(SidecarError::UnsupportedOperation {
+            operation: other.to_string(),
         }),
     }
 }
 
 // ── comment.* ──────────────────────────────────────────────────────────
-
-fn handle_comment_read(db: &SidecarDb, payload: &Value) -> SidecarHandlerResult {
-    let sig = read_signature(payload)?;
-    let comment = db.read_comment(&sig)?;
-    Ok(json!({ "comment": comment }))
-}
 
 fn handle_comment_read_all(db: &SidecarDb) -> SidecarHandlerResult {
     let comments = db.read_all_comments()?;
@@ -217,13 +214,13 @@ fn handle_passthrough_write(db: &SidecarDb, payload: &Value) -> SidecarHandlerRe
         .ok_or_else(|| missing("sections (object: name → raw text)"))?;
     let mut map = std::collections::BTreeMap::new();
     for (name, value) in raw_sections {
-        let text = value.as_str().ok_or_else(|| SidecarError::PathResolution {
+        let text = value.as_str().ok_or_else(|| SidecarError::InvalidPayload {
             reason: format!("sections.{name} must be a string"),
         })?;
         map.insert(name.clone(), text.to_string());
     }
-    db.write_passthrough(route, &map)?;
-    Ok(json!({ "saved": map.len() }))
+    let dropped = db.write_passthrough(route, &map)?;
+    Ok(json!({ "saved": map.len() - dropped.len(), "dropped": dropped }))
 }
 
 // ── pending-apply.* ────────────────────────────────────────────────────
@@ -301,22 +298,6 @@ fn handle_external_ip_write_all(db: &SidecarDb, payload: &Value) -> SidecarHandl
     Ok(json!({ "saved": rows.len() }))
 }
 
-// ── vacuum ─────────────────────────────────────────────────────────────
-
-fn handle_vacuum(db: &SidecarDb, payload: &Value) -> SidecarHandlerResult {
-    let force = payload
-        .get("force")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if force {
-        db.vacuum_now()?;
-        Ok(json!({ "vacuumed": true, "forced": true }))
-    } else {
-        let ran = db.maybe_vacuum()?;
-        Ok(json!({ "vacuumed": ran, "forced": false }))
-    }
-}
-
 // ── reset ──────────────────────────────────────────────────────────────
 
 /// Full-reset: wipe every GUI-local data row (comments, passthrough,
@@ -342,13 +323,13 @@ fn read_signature(payload: &Value) -> Result<RuleSignature, SidecarError> {
         .get("route")
         .and_then(Value::as_str)
         .ok_or_else(|| missing("route"))?;
-    RuleSignature::build(rule_type, value, route).ok_or_else(|| SidecarError::PathResolution {
+    RuleSignature::build(rule_type, value, route).ok_or_else(|| SidecarError::InvalidPayload {
         reason: "rule signature components must be non-empty and free of `|`".to_string(),
     })
 }
 
 fn missing(field: &str) -> SidecarError {
-    SidecarError::PathResolution {
+    SidecarError::InvalidPayload {
         reason: format!("missing required payload field: {field}"),
     }
 }
@@ -360,8 +341,7 @@ mod tests {
     use serde_json::json;
 
     fn fresh_handle(env_path: &std::path::Path) -> SidecarHandle {
-        // Use a tempfile path; we open the DB eagerly here so the
-        // handler doesn't try the real %APPDATA% during tests.
+        // Opened eagerly so the handler never resolves the real per-user path.
         let db = SidecarDb::open(env_path).expect("open sidecar");
         Arc::new(Mutex::new(Some(db)))
     }
@@ -416,8 +396,6 @@ mod tests {
     fn comment_read_write_roundtrip() {
         let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let handle = fresh_handle(&tmp.path().join("sidecar.db"));
-        let sig = json!({ "type": "zone", "value": "ru", "route": "primary" });
-
         let write = handle_sidecar_request(
             &handle,
             "sidecar.comment.write",
@@ -426,8 +404,9 @@ mod tests {
         .expect("write");
         assert_eq!(write["comment"], "Россия");
 
-        let read = handle_sidecar_request(&handle, "sidecar.comment.read", &sig).expect("read");
-        assert_eq!(read["comment"], "Россия");
+        let all = handle_sidecar_request(&handle, "sidecar.comment.read-all", &json!({}))
+            .expect("read-all");
+        assert_eq!(all["comments"]["zone|ru|primary"], "Россия");
     }
 
     #[test]
@@ -487,6 +466,38 @@ mod tests {
         assert_eq!(read["sections"]["MacOS"], "Safari\n");
     }
 
+    /// The count must be what was stored: an oversized section is refused, and
+    /// reporting it as saved hides that the next export will lack it.
+    #[test]
+    fn passthrough_write_reports_refused_sections() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let handle = fresh_handle(&tmp.path().join("sidecar.db"));
+        let long_name = "n".repeat(129);
+        let mut sections = serde_json::Map::new();
+        sections.insert(
+            "Linux".into(),
+            json!(
+                "firefox
+"
+            ),
+        );
+        sections.insert(
+            long_name.clone(),
+            json!(
+                "x
+"
+            ),
+        );
+        let write = handle_sidecar_request(
+            &handle,
+            "sidecar.passthrough.write",
+            &json!({ "route": "primary", "sections": Value::Object(sections) }),
+        )
+        .expect("write");
+        assert_eq!(write["saved"], 1);
+        assert_eq!(write["dropped"], json!([long_name]));
+    }
+
     #[test]
     fn pending_apply_lifecycle() {
         let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
@@ -499,7 +510,6 @@ mod tests {
             &handle,
             "sidecar.pending-apply.write",
             &json!({
-                "rules-json":   "{}",
                 "summary-json": "{}",
                 "content-hash": "deadbeef",
             }),
@@ -522,7 +532,74 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let handle = fresh_handle(&tmp.path().join("sidecar.db"));
         let err = handle_sidecar_request(&handle, "sidecar.bogus.op", &json!({}));
-        assert!(err.is_err(), "unknown ops must error out");
+        assert!(
+            matches!(err, Err(SidecarError::UnsupportedOperation { ref operation }) if operation == "sidecar.bogus.op"),
+            "unknown ops must error out as unsupported, got {err:?}"
+        );
+    }
+
+    /// A malformed request is the caller's fault, not a path the launcher
+    /// failed to resolve; the log line must say which.
+    #[test]
+    fn a_malformed_payload_is_reported_as_such() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let handle = fresh_handle(&tmp.path().join("sidecar.db"));
+        for (operation, payload) in [
+            (
+                "sidecar.comment.write",
+                json!({ "type": "zone", "route": "primary" }),
+            ),
+            (
+                "sidecar.comment.write",
+                json!({ "type": "zone", "value": "a|b", "route": "primary" }),
+            ),
+            (
+                "sidecar.passthrough.write",
+                json!({ "route": "primary", "sections": { "Linux": 7 } }),
+            ),
+        ] {
+            let err = handle_sidecar_request(&handle, operation, &payload);
+            assert!(
+                matches!(err, Err(SidecarError::InvalidPayload { .. })),
+                "{operation} {payload}: got {err:?}"
+            );
+        }
+    }
+
+    /// Unix lets the other launcher unlink and rebuild the file under this
+    /// connection. Serving the orphaned inode would drop every later write.
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_rebuilt_by_the_other_launcher_is_reopened() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let path = tmp.path().join("sidecar.db");
+        let tray = fresh_handle(&path);
+        handle_sidecar_request(
+            &tray,
+            "sidecar.comment.write",
+            &json!({ "type": "zone", "value": "old", "route": "primary", "comment": "old" }),
+        )
+        .expect("write before rebuild");
+
+        for companion in ["", "-wal", "-shm"] {
+            let mut victim = path.clone().into_os_string();
+            victim.push(companion);
+            match std::fs::remove_file(std::path::PathBuf::from(victim)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => panic!("remove: {e}"),
+                _ => {}
+            }
+        }
+        let gui = fresh_handle(&path);
+        handle_sidecar_request(
+            &gui,
+            "sidecar.comment.write",
+            &json!({ "type": "zone", "value": "new", "route": "primary", "comment": "new" }),
+        )
+        .expect("write after rebuild");
+
+        let seen = handle_sidecar_request(&tray, "sidecar.comment.read-all", &json!({}))
+            .expect("read after rebuild");
+        assert_eq!(seen["comments"], json!({ "zone|new|primary": "new" }));
     }
 
     #[test]
@@ -573,16 +650,6 @@ mod tests {
             &json!({ "entries": [ { "key": "adapter-a" } ] }),
         );
         assert!(err.is_err(), "missing external-ip must error out");
-    }
-
-    #[test]
-    fn vacuum_force_path() {
-        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
-        let handle = fresh_handle(&tmp.path().join("sidecar.db"));
-        let res = handle_sidecar_request(&handle, "sidecar.vacuum", &json!({ "force": true }))
-            .expect("vacuum");
-        assert_eq!(res["vacuumed"], true);
-        assert_eq!(res["forced"], true);
     }
 
     #[test]

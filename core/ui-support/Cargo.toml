@@ -16,9 +16,8 @@ nrr-shared = { path = "../../shared/contracts" }
 nrr-platform-api = { path = "../platform/api" }
 
 [dev-dependencies]
-# Used by `ui_preferences` tests to spin up scratch directories that are
-# auto-removed on drop. Replaces the prior `std::env::temp_dir().join(...)`
-# pattern which leaked `nrr-ui-preferences-tests-*` dirs into `%TEMP%`.
+# Scratch directories for `ui_preferences` tests, removed on drop so nothing
+# leaks into `%TEMP%`.
 tempfile = "3"
 
 [lints]

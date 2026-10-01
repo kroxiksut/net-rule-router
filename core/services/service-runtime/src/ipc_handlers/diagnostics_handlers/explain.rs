@@ -127,7 +127,7 @@ impl ExplainGetHandler {
         {
             // Host itself is un-cached (never matches a rule — e.g. bare
             // search.example), but rule-cached subdomains exist under it
-            // (gemini.search.example). Same-front-end CDNs serve both from one IP
+            // (ai.search.example). Same-front-end CDNs serve both from one IP
             // pool, so collateral is likely even before it is observed.
             return ("collateral-risk-subdomain-rules".to_string(), 0, 0);
         }

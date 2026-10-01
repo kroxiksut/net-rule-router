@@ -57,24 +57,30 @@ impl<'c> BlockNoticeJournalRepository<'c> {
         if sid.is_empty() {
             return Ok(());
         }
-        self.conn
-            .execute(
-                "INSERT INTO block_notice_journal
+        // The eviction keeps the cap only if it commits with the insert.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| StorageError::Internal(format!("block_notice_journal tx: {e}")))?;
+        tx.execute(
+            "INSERT INTO block_notice_journal
                      (sid, raised_at, destination, app, reason, attempts, launched_by)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    sid,
-                    now_ms,
-                    notice.destination,
-                    notice.app,
-                    notice.reason.slug(),
-                    i64::from(notice.attempts),
-                    encode_launched_by(&notice.launched_by),
-                ],
-            )
-            .map_err(|e| StorageError::Internal(format!("block_notice_journal append: {e}")))?;
+            params![
+                sid,
+                now_ms,
+                notice.destination,
+                notice.app,
+                notice.reason.slug(),
+                i64::from(notice.attempts),
+                encode_launched_by(&notice.launched_by),
+            ],
+        )
+        .map_err(|e| StorageError::Internal(format!("block_notice_journal append: {e}")))?;
         self.purge_stale(sid, now_ms)?;
-        self.evict_overflow(sid)
+        self.evict_overflow(sid)?;
+        tx.commit()
+            .map_err(|e| StorageError::Internal(format!("block_notice_journal commit: {e}")))
     }
 
     /// Everything `sid` has not been shown yet, oldest first — the order a
@@ -345,5 +351,37 @@ mod tests {
             .expect("append");
 
         assert!(repo.list_pending("", 2_000).expect("list").is_empty());
+    }
+
+    #[test]
+    fn a_failed_eviction_rolls_the_append_back_so_the_cap_holds() {
+        let conn = migrated_conn();
+        let repo = BlockNoticeJournalRepository::new(&conn);
+        for i in 0..MAX_ENTRIES_PER_SID {
+            repo.append("S-A", &notice(&format!("host-{i}.example")), 1_000)
+                .expect("fill to cap");
+        }
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_evict BEFORE DELETE ON block_notice_journal
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .expect("trigger");
+
+        assert!(repo.append("S-A", &notice("late.example"), 1_000).is_err());
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM block_notice_journal", [], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, MAX_ENTRIES_PER_SID as i64);
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM block_notice_journal WHERE destination = 'late.example'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(stored, 0, "the failed append left no row");
     }
 }

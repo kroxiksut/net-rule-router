@@ -258,7 +258,7 @@ impl RuleHostnameSeeder {
     /// the same host — and carries no new information about the host. Without
     /// this, one burst of concurrent passes walked a host 60→1800 s in
     /// milliseconds (observed : a delivery apex banned for 30 minutes off
-    /// six simultaneous boot-time failures, which YouTube then wore).
+    /// six simultaneous boot-time failures, which a video site then wore).
     fn note_resolve_failed(&self, host: &str) -> Duration {
         let mut guard = self.retry_after.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
@@ -468,7 +468,8 @@ impl RuleHostnameSeeder {
             tracing::warn!(
                 target: "nrr::rule-seed",
                 msg_key = "hostseed-seed-worker-spawn-failed",
-                "could not start the rule-host seed worker — recomputing from the cache as it is: {e}",
+                error = %e,
+                "could not start the rule-host seed worker — recomputing from the cache as it is",
             );
             return SeedWait::Detached;
         }
@@ -638,8 +639,8 @@ impl RuleHostnameSeeder {
     }
 
     /// resolve `host` up to [`SEED_RESOLVE_ATTEMPTS`] times
-    /// and UNION every A-record returned, so a rotating / multi-A CDN (Facebook
-    /// edge out of `157.240.0.0/16`, Cloudflare) seeds more of its address pool
+    /// and UNION every A-record returned, so a rotating / multi-A CDN (a large
+    /// edge network) seeds more of its address pool
     /// on the first (cold) pass instead of a single snapshot — the miss that let
     /// a `ping` to a not-yet-seeded edge IP leak past the kill-switch. Later
     /// rotation is still absorbed incrementally by the DNS refresh task (which

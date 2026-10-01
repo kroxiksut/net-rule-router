@@ -4,7 +4,7 @@ use nrr_shared::{
 };
 
 #[test]
-fn settings_contract_sections_are_fixed_for_block_2_5() {
+fn settings_contract_sections_are_fixed() {
     let shell = gui_shell_v1();
     assert_eq!(
         shell

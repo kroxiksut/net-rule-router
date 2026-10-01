@@ -1,6 +1,6 @@
 // Confirm dialog for "Safe rollback": reverts the active
-// routing configuration to the last-known-good (previous) revision via the
-// service `RollbackRequest` recovery action. Destructive → explicit confirm.
+// user's rules to their last-known-good (previous) revision via the service
+// `RollbackRequest`. Destructive → explicit confirm.
 // "Dumb" dialog: emits `confirmed()`; the caller (Main.qml) runs the IPC call.
 // Shared state comes in through `ownerRoot` (the ApplicationWindow).
 import QtQuick 2.15

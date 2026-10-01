@@ -104,65 +104,6 @@ impl RecommendationConfidence {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AdapterCheckActionId {
-    CheckRoute,
-    ShowExternalIp,
-    CheckInternetAvailability,
-}
-
-impl AdapterCheckActionId {
-    pub const fn slug(self) -> &'static str {
-        match self {
-            Self::CheckRoute => "check-route",
-            Self::ShowExternalIp => "show-external-ip",
-            Self::CheckInternetAvailability => "check-internet-availability",
-        }
-    }
-
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::CheckRoute => "Check route",
-            Self::ShowExternalIp => "Show external IP",
-            Self::CheckInternetAvailability => "Internet available via adapter",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AdapterCheckExecutionScope {
-    ReadOnlyDiagnostics,
-    RequiresServiceMediation,
-}
-
-impl AdapterCheckExecutionScope {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::ReadOnlyDiagnostics => "read-only-diagnostics",
-            Self::RequiresServiceMediation => "requires-service-mediation",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AdapterCheckResultStatus {
-    Success,
-    Degraded,
-    Unavailable,
-    Timeout,
-}
-
-impl AdapterCheckResultStatus {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::Degraded => "degraded",
-            Self::Unavailable => "unavailable",
-            Self::Timeout => "timeout",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AdapterIdentityField {
     AdapterName,
     Ipv6IfIndex,
@@ -212,7 +153,7 @@ pub struct AdapterIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterSnapshotEntry {
     pub identity: AdapterIdentity,
-    pub windows_name: String,
+    pub name: String,
     pub interface_description: String,
     pub interface_type: String,
     pub oper_status: String,

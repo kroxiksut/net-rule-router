@@ -10,17 +10,21 @@
 //!   [`CanonicalRulesJsonV1`] in canonical order. The encoder is
 //!   infallible — it only re-shapes existing canonical types.
 //! - [`decode`] takes a [`CanonicalRulesJsonV1`] and reconstructs a
-//!   `RulesRevisionContent`. It rejects unknown schema versions,
-//!   malformed IPv4 strings, rules that carry neither `address_match`
-//!   nor `app_match`, and the bare `*` application glob.
+//!   `RulesRevisionContent`. It rejects unknown schema versions, rules that
+//!   carry neither `address_match` nor `app_match`, and any address or
+//!   application value the rule pipeline refuses.
 //!
-//! The codec is **trust-the-wire** for spelling: it does NOT re-run the
-//! validation pipeline (lowercase, IDNA, glob syntax, …), and wire bytes are
-//! expected to be canonical — [`crate::validation`] is the upstream gate.
-//! Trusting the spelling is not trusting the CONSEQUENCE, though: a revision
-//! reaches enforcement from storage or the wire without passing that gate, so
-//! the one pattern whose blast radius is the whole machine (`*`, every
-//! process) is refused here as well.
+//! The codec does not re-run the validation pipeline's acceptance, but it does
+//! not trust the wire's SPELLING either: the GUI sends names as the user typed
+//! them (`.ru`, `example.com.`, `Cloud.exe`), so names are re-spelled the way
+//! [`crate::validation`] spells them, and a host name the pipeline refuses is
+//! kept as it came: a stored revision must keep decoding, so refusing a new one
+//! is the service's acceptance gate
+//! ([`crate::rule_value_validation::rules_with_refused_values`]).
+//! Addresses and applications are read by the pipeline's own readers, refusals
+//! included: a stored book is read through
+//! [`crate::rule_value_validation::drop_rules_refused_outright`] first, so only
+//! a new submission can still carry such a value.
 //!
 //! ## Schema-version vs format-version
 //!
@@ -35,7 +39,7 @@
 //! domain types may or may not require a wire schema bump — they
 //! evolve as two separate releases.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use nrr_shared::rules_json::{
     AddressMatchDto, AppMatchDto, AppPatternDto, CanonicalRulesJsonV1,
@@ -48,6 +52,9 @@ use crate::canonical::{
 };
 use crate::rules_file::HostPlatform;
 use crate::rules_revision::{RulesRevisionContent, RULES_REVISION_FORMAT_VERSION};
+use crate::validation::{
+    canonical_app_pattern, canonical_host_name, canonical_ip_address, HostNameKind, ValidationError,
+};
 use crate::RuleId;
 use nrr_shared::app_identity::ExecutableNaming;
 
@@ -68,15 +75,16 @@ pub enum RulesJsonCodecError {
         /// Version this build expects.
         expected: u16,
     },
-    /// `AddressMatchDto::ExactIpv4.address` did not parse as a
-    /// dotted-quad IPv4 string.
+    /// `AddressMatchDto::ExactIpv4.address` is not an address the rule
+    /// pipeline reads.
     InvalidIpv4 {
         /// The offending rule's id, for error context.
         rule_id: String,
         /// The raw string the decoder failed to parse.
         raw: String,
     },
-    /// `AddressMatchDto::ExactIpv6.address` did not parse as an IPv6 address.
+    /// `AddressMatchDto::ExactIpv6.address` is not an address the rule
+    /// pipeline reads.
     InvalidIpv6 { rule_id: String, raw: String },
     /// A rule carries neither `address_match` nor `app_match`. The
     /// domain invariant requires at least one.
@@ -84,16 +92,15 @@ pub enum RulesJsonCodecError {
         /// The offending rule's id, for error context.
         rule_id: String,
     },
-    /// An application pattern is the bare glob `*`, which matches every
-    /// running process. The rule pipeline rejects it as a blocking error
-    /// ([`crate::validation::ValidationError::AppGlobTooWide`]), so a stored
-    /// or wire-delivered revision carrying one came from a producer that
-    /// skipped validation — and applying it would route (or cut) the traffic
-    /// of every process on the machine.
+    /// An application pattern that matches every running process: `*`, or one
+    /// reducing to it such as `*.exe`.
     AppGlobTooWide {
         /// The offending rule's id, for error context.
         rule_id: String,
     },
+    /// An application value the rule pipeline refuses (too long, a control
+    /// character).
+    AppNameInvalid { rule_id: String, raw: String },
 }
 
 impl core::fmt::Display for RulesJsonCodecError {
@@ -115,8 +122,11 @@ impl core::fmt::Display for RulesJsonCodecError {
             ),
             Self::AppGlobTooWide { rule_id } => write!(
                 f,
-                "rule {rule_id:?}: application pattern \"*\" matches every process"
+                "rule {rule_id:?}: application pattern matches every process"
             ),
+            Self::AppNameInvalid { rule_id, raw } => {
+                write!(f, "rule {rule_id:?}: invalid application name {raw:?}")
+            }
         }
     }
 }
@@ -212,11 +222,9 @@ fn encode_app_match(m: &CanonicalAppMatch) -> AppMatchDto {
 
 /// Reconstruct a [`RulesRevisionContent`] from the canonical wire DTO.
 ///
-/// Rejects unknown schema versions, malformed IPv4 strings, and rules
-/// that carry no match. Per-route rules are passed through
-/// [`CanonicalRuleSet::from_rules`] which re-applies the canonical
-/// sort — so even if the wire arrives out of order, the decoded book
-/// is canonically ordered.
+/// Rejects unknown schema versions, addresses and application values the rule
+/// pipeline refuses, and rules that carry no match. [`CanonicalRuleSet::from_rules`]
+/// re-sorts each route, so a wire arriving out of order decodes canonically.
 ///
 /// `platform` is the one the revision's application rules are for — on the
 /// service, the host it runs on — and decides how their names are spelled.
@@ -283,66 +291,83 @@ fn decode_address_match(
     m: AddressMatchDto,
 ) -> Result<CanonicalAddressMatch, RulesJsonCodecError> {
     Ok(match m {
-        AddressMatchDto::ExactFqdn { value } => CanonicalAddressMatch::ExactFqdn(value),
-        AddressMatchDto::SuffixDomain { suffix } => CanonicalAddressMatch::SuffixDomain(suffix),
-        AddressMatchDto::Zone { name } => CanonicalAddressMatch::Zone(name),
+        AddressMatchDto::ExactFqdn { value } => {
+            CanonicalAddressMatch::ExactFqdn(respelled(HostNameKind::Domain, value))
+        }
+        AddressMatchDto::SuffixDomain { suffix } => {
+            CanonicalAddressMatch::SuffixDomain(respelled(HostNameKind::Domain, suffix))
+        }
+        AddressMatchDto::Zone { name } => {
+            CanonicalAddressMatch::Zone(respelled(HostNameKind::Zone, name))
+        }
         AddressMatchDto::ExactIpv4 { address } => {
-            let parsed =
-                address
-                    .parse::<Ipv4Addr>()
-                    .map_err(|_| RulesJsonCodecError::InvalidIpv4 {
-                        rule_id: rule_id.to_string(),
-                        raw: address.clone(),
-                    })?;
-            CanonicalAddressMatch::ExactIp(IpAddr::V4(parsed))
+            CanonicalAddressMatch::ExactIp(exact_ip(rule_id, address, false)?)
         }
         AddressMatchDto::ExactIpv6 { address } => {
-            let parsed =
-                address
-                    .parse::<Ipv6Addr>()
-                    .map_err(|_| RulesJsonCodecError::InvalidIpv6 {
-                        rule_id: rule_id.to_string(),
-                        raw: address.clone(),
-                    })?;
-            CanonicalAddressMatch::ExactIp(crate::address_class::canonical_ip(IpAddr::V6(parsed)))
+            CanonicalAddressMatch::ExactIp(exact_ip(rule_id, address, true)?)
         }
     })
 }
 
-/// The stored spelling is canonicalized on the way in, not trusted.
-///
-/// A revision can arrive from a client that never ran validation, and one
-/// un-canonicalized name is enough to make the same rule set compare unequal to
-/// itself — the diff then adds and removes the same rule on every pass.
-///
-/// Canonicalization is not the same as acceptance: the bare glob `*` is a
-/// blocking error in the rule pipeline, and this decoder is the only gate on
-/// the wire/storage path, so it rejects it here rather than handing enforcement
-/// a rule that matches every process.
+/// The address the rule pipeline reads from `raw`. The wire kind only names
+/// the error: the value decides the family, as it does everywhere else.
+fn exact_ip(rule_id: &str, raw: String, v6: bool) -> Result<IpAddr, RulesJsonCodecError> {
+    canonical_ip_address(&raw, &RuleId(rule_id.to_string()), &mut Vec::new()).map_err(|_| {
+        let rule_id = rule_id.to_string();
+        if v6 {
+            RulesJsonCodecError::InvalidIpv6 { rule_id, raw }
+        } else {
+            RulesJsonCodecError::InvalidIpv4 { rule_id, raw }
+        }
+    })
+}
+
+/// The pipeline's spelling of a name it accepts; any other name unchanged.
+/// Without it `.ru` or `example.com.` from the GUI would be stored as typed and
+/// never match: `match_zone` looks for `..ru`, a query name has no final dot.
+fn respelled(kind: HostNameKind, raw: String) -> String {
+    canonical_host_name(kind, &raw, &RuleId(String::new()), &mut Vec::new()).unwrap_or(raw)
+}
+
+/// The pipeline's reading of a wire application pattern: canonical spelling (a
+/// client may never have run validation, and two spellings of one rule would
+/// make the set unequal to itself) or the pipeline's refusal.
+pub(crate) fn wire_app_pattern(
+    pattern: &AppPatternDto,
+    naming: ExecutableNaming,
+    rule_id: &RuleId,
+) -> Result<CanonicalAppPattern, ValidationError> {
+    let (value, glob) = match pattern {
+        // No process can carry a `*` in its name: an "exact" value holding one
+        // is a mislabelled pattern.
+        AppPatternDto::Exact { value } => (value, value.contains('*')),
+        AppPatternDto::Glob { value } => (value, true),
+    };
+    canonical_app_pattern(value, glob, naming, rule_id, &mut Vec::new())
+}
+
 fn decode_app_match(
     rule_id: &str,
     m: AppMatchDto,
     naming: ExecutableNaming,
 ) -> Result<CanonicalAppMatch, RulesJsonCodecError> {
-    let pattern = match m.pattern {
-        // A `*` in an "exact" filename is a client that mislabelled a
-        // pattern: no process can ever carry that name, so read it as the
-        // glob it plainly is instead of storing a rule that matches nothing.
-        AppPatternDto::Exact { value } if value.contains('*') => {
-            CanonicalAppPattern::Glob(crate::app_identity::canonical_glob_process_pattern(&value))
-        }
-        AppPatternDto::Exact { value } => CanonicalAppPattern::Exact(
-            crate::app_identity::canonical_exact_process_name(&value, naming).0,
-        ),
-        AppPatternDto::Glob { value } => {
-            CanonicalAppPattern::Glob(crate::app_identity::canonical_glob_process_pattern(&value))
-        }
-    };
-    if matches!(&pattern, CanonicalAppPattern::Glob(g) if g == "*") {
-        return Err(RulesJsonCodecError::AppGlobTooWide {
-            rule_id: rule_id.to_string(),
-        });
-    }
+    let pattern =
+        wire_app_pattern(&m.pattern, naming, &RuleId(rule_id.to_string())).map_err(|refusal| {
+            let rule_id = rule_id.to_string();
+            match refusal {
+                ValidationError::AppGlobTooWide { .. } => {
+                    RulesJsonCodecError::AppGlobTooWide { rule_id }
+                }
+                _ => RulesJsonCodecError::AppNameInvalid {
+                    rule_id,
+                    raw: match &m.pattern {
+                        AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => {
+                            value.clone()
+                        }
+                    },
+                },
+            }
+        })?;
     Ok(CanonicalAppMatch {
         pattern,
         include_child_processes: m.include_child_processes,
@@ -355,6 +380,7 @@ fn decode_app_match(
 mod tests {
     use super::*;
     use nrr_shared::rules_json::{from_canonical_string, to_canonical_string};
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn exact_fqdn(id: &str, value: &str) -> CanonicalRule {
         CanonicalRule {
@@ -518,6 +544,63 @@ mod tests {
         .is_ok());
     }
 
+    /// Decode reads an application value by the pipeline's verdict alone: it
+    /// accepts exactly what the per-row verdict accepts, and keeps no reader
+    /// of its own.
+    #[test]
+    fn decode_reads_applications_by_the_pipeline_verdict_only() {
+        let dto = |value: &str| CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![RuleDto {
+                id: "r-app".into(),
+                enabled: true,
+                address_match: None,
+                app_match: Some(AppMatchDto {
+                    pattern: AppPatternDto::Exact {
+                        value: value.into(),
+                    },
+                    include_child_processes: false,
+                }),
+                comment: String::new(),
+                action: WireRuleAction::default(),
+                origin: None,
+            }],
+            secondary: vec![],
+        };
+        let long = "a".repeat(crate::preset_validation::MAX_MATCH_VALUE_LEN + 1);
+        for value in [
+            "chrome.exe",
+            "chrome*.exe",
+            "tab\tname.exe",
+            "*",
+            "bell\u{7}.exe",
+            "line\nbreak.exe",
+            long.as_str(),
+        ] {
+            let verdict = crate::rule_value_validation::validate_rule_value("application", value);
+            assert_eq!(
+                decode(dto(value), HostPlatform::Windows).is_ok(),
+                !verdict.is_error(),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            decode(dto(&long), HostPlatform::Windows),
+            Err(RulesJsonCodecError::AppNameInvalid {
+                rule_id: "r-app".into(),
+                raw: long.clone(),
+            })
+        );
+        let source = include_str!("rules_json_codec.rs");
+        let (code, _) = source.split_once("#[cfg(test)]").expect("test module");
+        for own_reader in [
+            concat!("canonical_exact_", "process_name"),
+            concat!("canonical_glob_", "process_pattern"),
+        ] {
+            assert!(!code.contains(own_reader), "{own_reader}");
+        }
+    }
+
     /// A submission a Linux service re-spells must come out as the name the
     /// process has, not the Windows spelling of it.
     #[test]
@@ -530,7 +613,7 @@ mod tests {
                 address_match: None,
                 app_match: Some(AppMatchDto {
                     pattern: AppPatternDto::Exact {
-                        value: "Telegram-Desktop".into(),
+                        value: "Messenger-Desktop".into(),
                     },
                     include_child_processes: false,
                 }),
@@ -553,9 +636,9 @@ mod tests {
                 .as_str()
                 .to_string()
         };
-        assert_eq!(name(HostPlatform::Linux), "telegram-desktop");
-        assert_eq!(name(HostPlatform::MacOS), "telegram-desktop");
-        assert_eq!(name(HostPlatform::Windows), "telegram-desktop.exe");
+        assert_eq!(name(HostPlatform::Linux), "messenger-desktop");
+        assert_eq!(name(HostPlatform::MacOS), "messenger-desktop");
+        assert_eq!(name(HostPlatform::Windows), "messenger-desktop.exe");
     }
 
     #[test]
@@ -772,6 +855,61 @@ mod tests {
         }
     }
 
+    /// Stored revisions keep loading: every address the decoder read before
+    /// it went through the pipeline's reader comes out as the same address.
+    #[test]
+    fn every_address_the_former_decoder_read_decodes_unchanged() {
+        let former = |address: &AddressMatchDto| match address {
+            AddressMatchDto::ExactIpv4 { address } => {
+                address.parse::<Ipv4Addr>().ok().map(IpAddr::V4)
+            }
+            AddressMatchDto::ExactIpv6 { address } => address
+                .parse::<Ipv6Addr>()
+                .ok()
+                .map(|a| crate::address_class::canonical_ip(IpAddr::V6(a))),
+            _ => None,
+        };
+        // "This host" and the broadcast are left out: a stored book drops
+        // them before decoding.
+        let values = [
+            "203.0.113.5",
+            "10.0.0.1",
+            "::1",
+            "2001:DB8::7",
+            "2001:db8:0:0:0:0:0:7",
+            "::ffff:203.0.113.7",
+            "fe80::1",
+            "01.0.2.4",
+            " 203.0.113.5",
+            "203.0.113.5/32",
+            "203.0.113.1-203.0.113.9",
+            "fe80::1%3",
+            "example.com",
+            "",
+        ];
+        for value in values {
+            for address in [
+                AddressMatchDto::ExactIpv4 {
+                    address: value.into(),
+                },
+                AddressMatchDto::ExactIpv6 {
+                    address: value.into(),
+                },
+            ] {
+                let Some(expected) = former(&address) else {
+                    continue;
+                };
+                let decoded = decode_address_match("r-ip", address.clone())
+                    .unwrap_or_else(|e| panic!("{address:?} stopped decoding: {e}"));
+                assert_eq!(
+                    decoded,
+                    CanonicalAddressMatch::ExactIp(expected),
+                    "{address:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn decode_rejects_rule_without_any_match() {
         let dto = CanonicalRulesJsonV1 {
@@ -794,6 +932,78 @@ mod tests {
             }
             other => panic!("expected EmptyMatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn names_are_spelled_the_pipeline_way_and_refused_ones_kept_as_they_came() {
+        let rule = |id: &str, address_match: AddressMatchDto| RuleDto {
+            id: id.into(),
+            enabled: true,
+            address_match: Some(address_match),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        };
+        let dto = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![
+                rule("z1", AddressMatchDto::Zone { name: ".RU".into() }),
+                rule(
+                    "z2",
+                    AddressMatchDto::Zone {
+                        name: "*.org.".into(),
+                    },
+                ),
+                rule(
+                    "z3",
+                    AddressMatchDto::Zone {
+                        name: "рф".into()
+                    },
+                ),
+                rule(
+                    "f1",
+                    AddressMatchDto::ExactFqdn {
+                        value: "Example.COM.".into(),
+                    },
+                ),
+                rule(
+                    "s1",
+                    AddressMatchDto::SuffixDomain {
+                        suffix: "cdn.example.".into(),
+                    },
+                ),
+                rule(
+                    "bad",
+                    AddressMatchDto::ExactFqdn {
+                        value: "192.168.1.1".into(),
+                    },
+                ),
+            ],
+            secondary: vec![],
+        };
+        let content = decode(dto, HostPlatform::Windows).expect("decode");
+        let spelled: std::collections::BTreeMap<&str, String> = content
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .map(|r| {
+                let value = match r.address_match.as_ref().expect("address") {
+                    CanonicalAddressMatch::Zone(v)
+                    | CanonicalAddressMatch::ExactFqdn(v)
+                    | CanonicalAddressMatch::SuffixDomain(v) => v.clone(),
+                    CanonicalAddressMatch::ExactIp(ip) => ip.to_string(),
+                };
+                (r.id.as_str(), value)
+            })
+            .collect();
+        assert_eq!(spelled["z1"], "ru");
+        assert_eq!(spelled["z2"], "org");
+        assert_eq!(spelled["z3"], "xn--p1ai");
+        assert_eq!(spelled["f1"], "example.com");
+        assert_eq!(spelled["s1"], "cdn.example");
+        assert_eq!(spelled["bad"], "192.168.1.1");
     }
 
     #[test]
@@ -854,7 +1064,7 @@ mod tests {
             vec![
                 exact_fqdn("r-2", "b.test"),
                 exact_fqdn("r-1", "a.test"),
-                ip("r-ip", Ipv4Addr::new(1, 1, 1, 1)),
+                ip("r-ip", Ipv4Addr::new(192, 0, 2, 1)),
             ],
             vec![app_glob("r-app", "*proxy*.exe")],
         ));

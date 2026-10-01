@@ -3,72 +3,14 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import "../../components"
 
-// Experimental settings. Detailed mode, the pre-flight apply-policy opt-in and
-// the virtual-machines screen are working toggles and sit above the divider; extended
-// diagnostics and kill-switch mode A are dormant and sit below it,
-// disabled, until their wiring lands.
+// Experimental settings. Detailed mode and the virtual-machines screen are
+// working toggles and sit above the divider; kill-switch mode A is dormant and
+// sits below it, disabled, until its re-verification lands.
 GroupBox {
     id: group
     property var root
     title: root.tr("settings.group.experimental", "Experimental")
     Layout.fillWidth: true
-
-    readonly property var diagCtx: root.context.diagnosticsSettings || {}
-    readonly property var modeState: diagCtx.diagnosticMode || {}
-
-    function formatRemaining(ms) {
-        var n = Number(ms || 0)
-        if (!isFinite(n) || n <= 0) return "-"
-        var totalMinutes = Math.floor(n / 60000)
-        var h = Math.floor(totalMinutes / 60)
-        var m = totalMinutes % 60
-        if (h > 0) return h + "h " + m + "m"
-        return m + "m"
-    }
-
-    // Real "Extended diagnostics" wiring (the Switch + TTL
-    // radios were no-ops that toasted "saved"). Reuses the `diagnostics.mode.set`
-    // op; the resulting state echoes back and immediately unredacts the cache +
-    // connection-trace viewers (they read the same diagnostic session).
-    property bool _diagModeApplying: false
-    function _selectedDiagTtlMs() {
-        if (ttlRadio4h.checked) return 14400000
-        if (ttlRadioRestart.checked) return 0     // 0 → until restart
-        return 3600000                            // default: 1 hour
-    }
-    function _applyDiagnosticMode(enabled) {
-        if (!root.bridgeAvailable
-                || typeof nrrNativeBridge === "undefined"
-                || nrrNativeBridge === null
-                || typeof nrrNativeBridge.rpcDiagnosticModeSet !== "function") {
-            root.statusLine = root.tr("status.bridge-unavailable", "Service bridge not connected.")
-            diagnosticModeSwitch.checked = !enabled   // revert the visual toggle
-            return
-        }
-        var ttl = group._selectedDiagTtlMs()
-        var untilRestart = enabled && (ttl === 0)
-        var durationMs = (enabled && ttl > 0) ? ttl : 0
-        group._diagModeApplying = true
-        var corr = nrrNativeBridge.rpcDiagnosticModeSet(enabled, durationMs, untilRestart, "all")
-        root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-            group._diagModeApplying = false
-            if (!ok) {
-                root.statusLine = root.tr("status.diag-mode-failed",
-                    "Failed to change diagnostic mode: ")
-                    + ((typeof root.ipcErrorLabel === "function")
-                        ? root.ipcErrorLabel(String(errorCode || "unknown"))
-                        : String(errorCode || "unknown"))
-                diagnosticModeSwitch.checked = !enabled
-                return
-            }
-            // payload is the authoritative DiagnosticModeStateDto echo.
-            var active = (payload && payload.active) === true
-            diagnosticModeSwitch.checked = active
-            root.statusLine = active
-                ? root.tr("status.diag-mode-enabled", "Extended diagnostics enabled.")
-                : root.tr("status.diag-mode-disabled", "Extended diagnostics disabled.")
-        })
-    }
 
     ColumnLayout {
         anchors.left: parent.left
@@ -189,134 +131,6 @@ GroupBox {
             Layout.topMargin: root.uiTheme.spacingXs
             Layout.bottomMargin: root.uiTheme.spacingXs
             color: root.uiTheme.colorBorder
-        }
-
-        // Diagnostic mode toggle (moved from Diagnostics and Logs). The
-        // `diagnostics.mode.set` wiring is dormant — the toggle round-trips
-        // to the service but produces no observable effect yet — so the
-        // whole card is disabled until it lands.
-        Frame {
-            Layout.fillWidth: true
-            enabled: false
-            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
-            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
-            ColumnLayout {
-                anchors.fill: parent
-                spacing: root.uiTheme.spacingSm
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: root.uiTheme.spacingSm
-                    Image {
-                        Layout.preferredWidth: 20
-                        Layout.preferredHeight: 20
-                        source: root.uiIconSource("icon_diagnostic_mode_on")
-                        sourceSize.width: 20
-                        sourceSize.height: 20
-                        fillMode: Image.PreserveAspectFit
-                        asynchronous: true
-                    }
-                    Switch {
-                        id: diagnosticModeSwitch
-                        text: root.tr("diag.diagnostic-mode.toggle-label", "Extended diagnostics")
-                        // The session expires on its own, and the refreshed
-                        // state is the only thing that knows it. A plain
-                        // `checked` binding dies on the first click, so from
-                        // then on the switch shows the user's last gesture
-                        // rather than the machine — the toggle would sit on
-                        // hours after diagnostics had stopped.
-                        Binding {
-                            target: diagnosticModeSwitch
-                            property: "checked"
-                            value: !!group.modeState.active
-                        }
-                        Accessible.role: Accessible.CheckBox
-                        Accessible.name: text
-                        Accessible.description: root.tr("settings.experimental.in-development",
-                            "In development")
-                        // Apply the real diagnostics.mode.set op.
-                        onToggled: group._applyDiagnosticMode(checked)
-                    }
-                    Label {
-                        text: root.tr("settings.experimental.in-development", "In development")
-                        color: root.uiTheme.colorAccent
-                        font.bold: true
-                    }
-                    Item { Layout.fillWidth: true }
-                }
-                Label {
-                    Layout.fillWidth: true
-                    text: root.tr("diag.diagnostic-mode.toggle-description",
-                        "Enables detailed routing and cache information in logs. Automatically expires.")
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                }
-                RowLayout {
-                    Layout.fillWidth: true
-                    enabled: diagnosticModeSwitch.checked
-                    spacing: root.uiTheme.spacingSm
-                    // Same reason as the switch, doubled: a ButtonGroup
-                    // writes `checked` on its members, so a plain binding here
-                    // dies before the user has touched anything.
-                    ButtonGroup { id: ttlGroup }
-                    ThemedRadioButton {
-                        theme: root.uiTheme
-                        id: ttlRadio1h
-                        text: root.tr("diag.diagnostic-mode.ttl-1h", "1 hour")
-                        ButtonGroup.group: ttlGroup
-                        Binding {
-                            target: ttlRadio1h
-                            property: "checked"
-                            value: Number(group.modeState.selectedTtlMs || 3600000) === 3600000
-                        }
-                        // Re-arm the session with the new TTL if active.
-                        onClicked: if (diagnosticModeSwitch.checked && !group._diagModeApplying)
-                            group._applyDiagnosticMode(true)
-                    }
-                    ThemedRadioButton {
-                        theme: root.uiTheme
-                        id: ttlRadio4h
-                        text: root.tr("diag.diagnostic-mode.ttl-4h", "4 hours")
-                        ButtonGroup.group: ttlGroup
-                        Binding {
-                            target: ttlRadio4h
-                            property: "checked"
-                            value: Number(group.modeState.selectedTtlMs || 0) === 14400000
-                        }
-                        onClicked: if (diagnosticModeSwitch.checked && !group._diagModeApplying)
-                            group._applyDiagnosticMode(true)
-                    }
-                    ThemedRadioButton {
-                        theme: root.uiTheme
-                        id: ttlRadioRestart
-                        text: root.tr("diag.diagnostic-mode.ttl-restart", "Until restart")
-                        ButtonGroup.group: ttlGroup
-                        Binding {
-                            target: ttlRadioRestart
-                            property: "checked"
-                            value: Number(group.modeState.selectedTtlMs || 0) === 0
-                        }
-                        onClicked: if (diagnosticModeSwitch.checked && !group._diagModeApplying)
-                            group._applyDiagnosticMode(true)
-                    }
-                    Item { Layout.fillWidth: true }
-                }
-                Label {
-                    Layout.fillWidth: true
-                    visible: diagnosticModeSwitch.checked
-                    text: root.tr("diag.diagnostic-mode.warning-banner",
-                        "Extended diagnostics are active. More detailed information is being logged.")
-                    color: root.uiTheme.colorAccent
-                    wrapMode: Text.WordWrap
-                }
-                Label {
-                    Layout.fillWidth: true
-                    visible: diagnosticModeSwitch.checked && Number(group.modeState.remainingMs || 0) > 0
-                    text: root.tr("diag.diagnostic-mode.expires-in", "Expires in {time}")
-                        .replace("{time}", group.formatRemaining(group.modeState.remainingMs))
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                }
-            }
         }
 
         // Legacy kill-switch mode A opt-in. Off by default; when on, the routing

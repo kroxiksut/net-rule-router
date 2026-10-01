@@ -26,7 +26,7 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, localNetworkExceptions: true, blockNotices: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, localNetworkExceptions: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
     // Unknown feature or missing profile → true (show it), which is why the
@@ -50,7 +50,7 @@ ApplicationWindow {
             "This is not available on your operating system yet, so the controls here stay off. "
             + "Nothing here is sent to the background service.")
         : ""
-    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, appGroupsOfferDismissed: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
+    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, appGroupsOfferDismissed: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, updateCheckEnabled: true, updateCheckIntervalDays: 14, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
     // The section open at launch loads synchronously: an asynchronous first
     // load could stall with an empty pane until the user clicked something.
@@ -435,7 +435,7 @@ ApplicationWindow {
                     "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules.")
                     .replace("{apps}", _unenforcedAppRulesSummary()),
                 "actionKey": "open-rules",
-                "actionText": tr("status.app-unresolved-banner-button", "Open Rules")
+                "actionText": tr("action.open-rules", "Open rules")
             })
         }
         // Standing warning while the STRICT
@@ -464,18 +464,17 @@ ApplicationWindow {
                 "severity": "warning",
                 "dismissible": false,
                 "title": tr("notifications.strict-killswitch.title",
-                    "Strict kill-switch is on"),
+                    "Block-all leak protection is on"),
                 "body": tr("notifications.strict-killswitch.body",
                     "While the additional adapter (VPN) is down, ALL internet is blocked except your local network — including normal browsing — until it comes back. Switch to the best-effort variant in Settings → Routing behavior if you want your main connection to keep working when the VPN drops."),
                 "actionKey": "open-routing-settings",
-                "actionText": tr("notifications.strict-killswitch.action", "Open settings")
+                "actionText": tr("action.open-settings", "Open settings")
             })
         }
-        // Daily GitHub release check (launcher-cached;
-        // `context.updateCheck` is non-null only when a strictly newer release
-        // exists). Dismissible info notice, re-fires next start while newer.
-        var upd = (window.context || {}).updateCheck || null
-        if (upd && upd.latestVersion) {
+        // GitHub release check: the daily one's cached verdict, or the user's
+        // own from the Help menu. Non-null only for a strictly newer release.
+        var upd = updateCheckController.offer
+        if (Pure.updateOfferShown(upd, prefs.dismissedUpdateVersion)) {
             out.push({
                 "id": "update-available",
                 "severity": "info",
@@ -504,7 +503,7 @@ ApplicationWindow {
                 "body": tr("notifications.kill-switch-restored.body",
                     "Leak protection was turned back on from your saved settings (the background service had been reset). If you didn't expect this, you can turn it off in Settings → Routing behavior."),
                 "actionKey": "open-routing-settings",
-                "actionText": tr("notifications.strict-killswitch.action", "Open settings")
+                "actionText": tr("action.open-settings", "Open settings")
             })
         }
         // Notices the service pushed at us. Everything above is derived from
@@ -717,8 +716,7 @@ ApplicationWindow {
         return kind === "connecting" ? "#d4a017" : "#c0392b"
     }
     // Footer "Service: …" indicator, derived from the LIVE backend connection
-    // state — not `context.security.serviceStatus`, a cold-start mock field
-    // hardwired to "alert" that would misreport a healthy connected service.
+    // state.
     // Localizes the word; the raw slug must never be shown.
     function serviceFooterStatusText() {
         var kind = String((backendStatus || {}).kind || "connected")
@@ -837,8 +835,6 @@ ApplicationWindow {
     // Generic mutation-in-flight tracker. Listens
     // to `mutation-progress` push events from `handlePushEvent`.
     MutationsModel { id: mutationsModel }
-    ListModel { id: wizardStepsModel }
-    ListModel { id: wizardScenariosModel }
     FontMetrics { id: fontMetricsProbe; font: window.font }
 
     function tr(key, fallbackText) {
@@ -867,7 +863,7 @@ ApplicationWindow {
     function defaultRouteLabel(role) {
         if (role === "primary") return tr("label.primary", "Primary")
         if (role === "block") return tr("label.block", "Block")
-        return tr("label.secondary", "Secondary")
+        return tr("label.secondary", "Additional")
     }
     function routeLabel(role) {
         if (role === "primary") return prefs.routePrimaryLabel || defaultRouteLabel("primary")
@@ -1336,6 +1332,17 @@ ApplicationWindow {
         return slug
     }
 
+    /// The words for a `Pure.previewRefusal`: the refused values when the
+    /// service names them, else the refusal code's own text.
+    function previewRefusalText(refusal) {
+        if (!refusal) return ""
+        if (refusal.values !== "") {
+            return tr("risk.signal.invalid-rule-value",
+                "A rule contains an invalid value: {rules}").replace("{rules}", refusal.values)
+        }
+        return ipcErrorLabel(refusal.code)
+    }
+
     // Guarded section navigation. Every site that
     // would write `section = X` (sidebar buttons, Ctrl+1..5
     // shortcuts, tray-driven hand-offs, settings shortcut) calls
@@ -1499,6 +1506,8 @@ ApplicationWindow {
         // Security-audit viewing-tab display toggle (default off). Only an
         // explicit true reveals the tab; the audit trail records regardless.
         normalized.showAuditTab = !!normalized.showAuditTab
+        // Only an explicit false turns the scheduled release check off.
+        normalized.updateCheckEnabled = normalized.updateCheckEnabled !== false
         // Idle delay (seconds) before a settings panel that owns draft state
         // commits it without the user pressing anything. Clamped to the same
         // range the preference store enforces; 0/absent means "use the default".
@@ -1994,14 +2003,10 @@ ApplicationWindow {
     }
 
 
-    // Shared source of truth for the "verbose service logging" flag.
-    // Surfaced from two places — Settings -> «Диагностика и логи» and the
-    // Logs view filter bar — both of which bind their checkbox to this
-    // single property so a change in one place is immediately reflected in
-    // the other. Kept fresh by each surface's stability-config fetch and by
-    // the live apply below. Session-scoped mirror of the service value; the
-    // service remains authoritative.
-    property bool serviceVerboseLogging: false
+    // Verbose service logging as the service last reported it: "off",
+    // "timed" (ends at `serviceVerboseLoggingUntilMs`) or "until-restart".
+    property string serviceVerboseLoggingMode: "off"
+    property real serviceVerboseLoggingUntilMs: 0
 
     // Preferences that live in the footer Apply/Cancel BUFFER: the user edits
     // them in Settings, and nothing happens until Apply. Only a patch touching
@@ -2045,7 +2050,9 @@ ApplicationWindow {
         "importBothFilesTogether": true,
         "mergeConflictPolicy": true,
         "showBundledPresets": true,
-        "compatBannerMode": true
+        "compatBannerMode": true,
+        "updateCheckEnabled": true,
+        "updateCheckIntervalDays": true
     })
     function _patchArmsPrefsSnapshot(patch) {
         for (var key in patch) {
@@ -2376,6 +2383,26 @@ ApplicationWindow {
     RpcTransport {
         id: rpcTransport
         bridge: nrrNativeBridge
+        answerDeadlines: (typeof nrrLaunchContext !== "undefined" && nrrLaunchContext)
+            ? (nrrLaunchContext.rpcAnswerDeadlines || null) : null
+        // A long call already failed as timed out has landed after all: what it
+        // applied is live, so re-read it rather than leave the window on the
+        // failure. Unsaved edits are not clobbered, as on reconnect.
+        onLateResponse: function(correlationId, operation, wasLong, ok, errorCode) {
+            if (!ok || !wasLong || !window.bridgeAvailable) return
+            // The status line still reports the timeout as a failure.
+            window.statusLine = window.tr("status.screen.change-applied-late.success",
+                "The change was applied after all.")
+            if (!window.unsavedChangesRegistry["rules"] && !window._offlineRulesPendingPush) {
+                Qt.callLater(function() { window._refreshRulesFromService({ silent: true }) })
+            } else {
+                Qt.callLater(window.driftController._driftRefreshServiceBaselineFromService)
+            }
+            _adaptersChangedSnapshotRefreshTimer.restart()
+        }
+        // So the user sees which alert Diagnostics asks them to acknowledge.
+        // Deferred: the refusal's own callback runs first.
+        onSecurityAlertGateHit: Qt.callLater(window.refreshDiagnosticsSnapshot)
     }
 
     // What the tray cannot work out for itself: whether this window exists and
@@ -2453,25 +2480,104 @@ ApplicationWindow {
     readonly property var contextSecurityAlerts: (context.diagnostics || ({})).activeAlerts || []
     property var securityAlertItems: contextSecurityAlerts
     onContextSecurityAlertsChanged: securityAlertItems = contextSecurityAlerts
+    // An empty list the service did not give is not "no alerts".
+    readonly property bool contextSecurityAlertsKnown:
+        (context.diagnostics || ({})).alertsStale !== true
+    property bool securityAlertsKnown: contextSecurityAlertsKnown
+    onContextSecurityAlertsKnownChanged: securityAlertsKnown = contextSecurityAlertsKnown
+    // The service answered but could not read its alert store.
+    readonly property bool contextSecurityAlertsUnreadable:
+        (context.diagnostics || ({})).alertsUnreadable === true
+    property bool securityAlertsUnreadable: contextSecurityAlertsUnreadable
+    onContextSecurityAlertsUnreadableChanged:
+        securityAlertsUnreadable = contextSecurityAlertsUnreadable
 
-    // Optimistic transition after a successful Acknowledge: the backend moved
-    // the alert Active→Acknowledged (and re-signed the revision rows).
-    function markSecurityAlertAcknowledged(alertId) {
-        var next = []
-        for (var i = 0; i < securityAlertItems.length; i++) {
-            var a = securityAlertItems[i]
-            if (a && a.alertId === alertId) {
-                var copy = {}
-                for (var k in a)
-                    copy[k] = a[k]
-                copy.state = "acknowledged"
-                copy.requiresAction = false
-                next.push(copy)
-            } else {
-                next.push(a)
+    // The Diagnostics cards (service, audit chain, cache, logs), seeded from the
+    // launch context in `loadContext` and replaced by every live re-read.
+    property var diagnosticsSnapshot: ({})
+    property double _diagnosticsLiveAt: 0
+    readonly property int _diagnosticsPageOpenThrottleMs: 30000
+
+    // The launch context is a cold-start copy: an alert raised later (an
+    // acknowledgement meeting a row changed since shown, a service restart)
+    // holds rule changes shut without appearing in it, and a service that was
+    // not up yet left every card without data. So the snapshot is re-read on
+    // events, and on opening Diagnostics at most once per throttle window. One
+    // read at a time; a request meanwhile is queued behind it, because the
+    // read in flight may predate whatever prompted the request.
+    property bool _diagnosticsReadInFlight: false
+    property bool _diagnosticsReadAgain: false
+    property bool _diagnosticsReadAgainForced: false
+    property var _diagnosticsReadAgainWaiters: []
+    function refreshDiagnosticsOnPageOpen() {
+        refreshDiagnosticsSnapshot(false)
+    }
+    // `onDone(live, status, code)`, if given, runs once the answer this request
+    // got has been applied; `status` is the service's raw answer, null for none.
+    function refreshDiagnosticsSnapshot(forced, onDone) {
+        _readDiagnosticsSnapshot(forced !== false, typeof onDone === "function" ? [onDone] : [])
+    }
+    function _notifyDiagnosticsWaiters(waiters, live, status, code) {
+        for (var i = 0; i < waiters.length; i++) {
+            // One throwing waiter must not starve the rest.
+            try {
+                waiters[i](live, status, code)
+            } catch (e) {
+                console.warn("diagnostics read waiter failed: " + e)
             }
         }
-        securityAlertItems = next
+    }
+    function _readDiagnosticsSnapshot(isForced, waiters) {
+        if (!bridgeAvailable || typeof nrrNativeBridge.rpcSnapshotDiagnosticsGet !== "function") {
+            _notifyDiagnosticsWaiters(waiters, false, null, "")
+            return
+        }
+        var decision = Pure.diagnosticsReadDecision(_diagnosticsReadInFlight, isForced,
+            _diagnosticsLiveAt, Date.now(), _diagnosticsPageOpenThrottleMs)
+        if (decision === "queue") {
+            _diagnosticsReadAgain = true
+            _diagnosticsReadAgainForced = _diagnosticsReadAgainForced || isForced
+            _diagnosticsReadAgainWaiters = _diagnosticsReadAgainWaiters.concat(waiters)
+            return
+        }
+        if (decision !== "read") {
+            _notifyDiagnosticsWaiters(waiters, false, null, "")
+            return
+        }
+        var corr = nrrNativeBridge.rpcSnapshotDiagnosticsGet()
+        if (!corr) {
+            _notifyDiagnosticsWaiters(waiters, false, null, "")
+            return
+        }
+        _diagnosticsReadInFlight = true
+        rpcTransport.registerRpcCallback(corr, function(ok, p, code) {
+            window._diagnosticsReadInFlight = false
+            var status = ok && p ? p.status : null
+            var merged = Pure.diagnosticsSnapshotMerged(window.diagnosticsSnapshot, status)
+            if (merged !== null) {
+                window.diagnosticsSnapshot = merged
+                window._diagnosticsLiveAt = Date.now()
+            }
+            var items = Pure.securityAlertItemsFromStatus(status)
+            if (items !== null) {
+                window.securityAlertItems = items
+                window.securityAlertsKnown = true
+                window.securityAlertsUnreadable = false
+            } else if (Pure.securityAlertsUnreadable(status)) {
+                // The alerts shown stay; they are just no longer known current.
+                window.securityAlertsUnreadable = true
+            }
+            if (window._diagnosticsReadAgain) {
+                var againForced = window._diagnosticsReadAgainForced
+                var againWaiters = window._diagnosticsReadAgainWaiters
+                window._diagnosticsReadAgain = false
+                window._diagnosticsReadAgainForced = false
+                window._diagnosticsReadAgainWaiters = []
+                window._readDiagnosticsSnapshot(againForced, againWaiters)
+            }
+            window._notifyDiagnosticsWaiters(waiters, merged !== null, status,
+                ok ? "" : String(code || ""))
+        })
     }
 
     // The service refused to enforce a rule set that reached the database
@@ -2549,6 +2655,11 @@ ApplicationWindow {
     // Push-driven notices: composing them, retiring them, and running what they
     // offer. The push DISPATCHER stays in this shell.
     property alias notificationsController: notificationsController
+    property alias updateCheckController: updateCheckController
+    UpdateCheckController {
+        id: updateCheckController
+        root: window
+    }
     NotificationsController {
         id: notificationsController
         root: window
@@ -2830,6 +2941,10 @@ ApplicationWindow {
                     // editing while we were disconnected — re-read it so the
                     // Rules section stops offering edits that would bounce.
                     Qt.callLater(refreshRuleEditPermission)
+                    // A restarted service re-checks its rows at boot and may
+                    // have raised alerts that now hold rule changes shut; a GUI
+                    // that started first has no Diagnostics data at all.
+                    Qt.callLater(refreshDiagnosticsSnapshot)
                     // The GUI started (or ran)
                     // while the service was down → it's showing mock / stale
                     // cold-start data. Now that the live service is reachable,
@@ -3168,6 +3283,9 @@ ApplicationWindow {
                 console.log("revision-status-changed:",
                     event["revision-id"], "->", event.status)
                 break
+            case "security-alerts-changed":
+                refreshDiagnosticsSnapshot()
+                break
             case "mutation-progress":
                 // Service-emitted lifecycle phase
                 // for one in-flight mutation. `correlation-id`
@@ -3189,6 +3307,9 @@ ApplicationWindow {
                 } else if (mpPhase === "completed" || mpPhase === "failed") {
                     operationToastStack.model.settle(mpCorr, mpPhase, mpErr)
                 }
+                // Refused behind an alert this window may not list yet.
+                if (mpPhase === "failed" && mpErr === rpcTransport.securityAlertGateCode)
+                    refreshDiagnosticsSnapshot()
                 // Auto-rules land through the ordinary mutation path (the tray
                 // accepted a suggestion, or "apply automatically" authored one),
                 // so this push is the GUI's only notice that its rule set grew
@@ -3891,21 +4012,9 @@ ApplicationWindow {
         for (var i = 0; i < args.length; i += 1) {
             if (args[i].indexOf("--nrr-auto-close-ms=") === 0) autoCloseMs = Number(args[i].slice("--nrr-auto-close-ms=".length))
         }
-        if (typeof nrrLaunchContext !== "undefined" && nrrLaunchContext) {
-            context = nrrLaunchContext
-        } else {
-            var url = ""
-            for (var j = 0; j < args.length; j += 1) {
-                if (args[j].indexOf("--nrr-context-file=") === 0) url = args[j].slice("--nrr-context-file=".length)
-            }
-            if (url === "" && typeof nrrContextFileUrl !== "undefined" && nrrContextFileUrl) url = nrrContextFileUrl
-            if (url === "") return
-            var xhr = new XMLHttpRequest()
-            xhr.open("GET", url, false)
-            xhr.send()
-            if (!(xhr.status === 0 || xhr.status === 200)) return
-            context = JSON.parse(xhr.responseText)
-        }
+        // The host parses the context file; when it could not, nothing here can.
+        if (typeof nrrLaunchContext === "undefined" || !nrrLaunchContext) return
+        context = nrrLaunchContext
         localeCatalog = context.localeCatalog || {}
         availableLanguages = context.availableLanguages || []
         platformProfile = context.platformProfile || platformProfile
@@ -3913,6 +4022,10 @@ ApplicationWindow {
         currentLanguage = prefs.language
         backendStatus = context.backendStatus || { kind: "connected" }
         backendServiceBacked = context.backendServiceBacked !== false
+        // Before `section`: opening Diagnostics right away must see whether
+        // the launch snapshot already counts as a fresh live answer.
+        diagnosticsSnapshot = context.diagnostics || ({})
+        if (Pure.diagnosticsSnapshotIsLive(diagnosticsSnapshot)) _diagnosticsLiveAt = Date.now()
         // Cold-start loads the persisted theme/font — force the theme
         // tokens to recompute from the freshly-bound prefs (uiRevision no
         // longer drives the theme; see the themeRevision split).
@@ -4030,12 +4143,6 @@ ApplicationWindow {
         Pure.clearModel(logsModel)
         var logsRows = ((context.logs || {}).entries) || []
         if (logsRows.length > 0) logsModel.append(logsRows)
-        Pure.clearModel(wizardStepsModel)
-        var stepRows = ((context.firstRun || {}).steps) || []
-        for (var s = 0; s < stepRows.length; s += 1) wizardStepsModel.append(stepRows[s])
-        Pure.clearModel(wizardScenariosModel)
-        var scenarioRows = ((context.firstRun || {}).availableScenarios) || []
-        for (var c = 0; c < scenarioRows.length; c += 1) wizardScenariosModel.append(scenarioRows[c])
     }
 
     function emitPrefs() {
@@ -4288,15 +4395,8 @@ ApplicationWindow {
         if (!obj[ns]) obj[ns] = {}
         obj[ns][key] = value
         _writePendingOffline(obj)
-        // Parking is about DELIVERY; intent is about what the user decided.
-        // A change made while the service is down is still a decision, and it
-        // is exactly then that losing it hurts — a freshly wiped state DB
-        // would otherwise answer with its own defaults and win.
-        if (ns === "stability") {
-            var decided = {}
-            decided[key] = value
-            serviceIntentController._recordServiceIntent(decided)
-        }
+        // No stability intent yet: it is recorded when the pending-changes
+        // apply is confirmed by the service, like every other write.
         console.log("offline change recorded:", ns, key, "=", value)
         statusLine = tr("status.offline-change-recorded",
             "The background service is unavailable — your change was saved and will "
@@ -4538,8 +4638,8 @@ ApplicationWindow {
     // ("user:enforcement-mode", "user:verbose-toggle", …) the service logs
     // with the write, so a clobbered toggle is diagnosable from the NDJSON.
     function applyServiceStabilityPatch(partial, onDone, origin) {
-        // Refused before the intent is recorded: a parked decision for a config
-        // this OS never reads would be replayed on every connect edge forever.
+        // Refused before anything is queued: a decision for a config this OS
+        // never reads would be replayed on every connect edge forever.
         if (!serviceStabilitySupported) {
             if (typeof onDone === "function") onDone(false, "unsupported-platform", null)
             return
@@ -4547,29 +4647,18 @@ ApplicationWindow {
         var originText = String(origin || "")
         // Every user-driven change to a service-owned setting funnels through
         // here, so this is the one place that can record intent without having
-        // to trust each call site to remember. Recorded on submit rather than
-        // on success: the user decided regardless of whether the service was
-        // reachable, and an unreachable service is precisely when the record
-        // matters. Non-user origins (read-back re-seeds, the replay itself)
-        // must never write intent or they would launder service defaults into
-        // "what the user wanted".
-        // Recording the decision must never be able to cost the write: an
-        // unguarded throw here would abort the whole function before the
-        // queue below ever saw the job — no request would leave the GUI,
-        // nothing would say so, and every later save would be refused by a
-        // loading flag with no one left to clear it.
-        if (originText.indexOf("user:") === 0 || originText === "offline-pending-apply") {
-            try {
-                serviceIntentController._recordServiceIntent(partial)
-                // A pending replay carries values recorded BEFORE this write, so
-                // letting it run now would undo what the user just chose.
-                serviceIntentController._serviceIntentSupersededByUser = true
-            } catch (e) {
-                console.log("applyServiceStabilityPatch: recording the intent failed:", e)
-            }
+        // to trust each call site to remember. Non-user origins (read-back
+        // re-seeds, the replay itself) never record, or they would launder
+        // service defaults into "what the user wanted".
+        var userWrite = originText.indexOf("user:") === 0
+            || originText === "offline-pending-apply"
+        if (userWrite) {
+            // A pending replay carries values recorded BEFORE this write, so
+            // letting it run now would undo what the user just chose.
+            serviceIntentController._serviceIntentSupersededByUser = true
         }
-        _stabilityPatchQueue.push({ partial: partial, onDone: onDone,
-                                    origin: originText })
+        _stabilityPatchQueue.push({ partial: partial, onDone: onDone, origin: originText,
+                                    recordsIntent: userWrite })
         _drainStabilityPatchQueue()
     }
 
@@ -4599,17 +4688,28 @@ ApplicationWindow {
             // an in-flight slot nobody releases stops every later patch from
             // every panel, and the only symptom is silence.
             try {
-                // The merge base is the live row PLUS the decisions the user has
-                // on record, so this full-row write cannot re-affirm a service
-                // default that contradicts one of them. A recorded decision the
-                // service has not accepted yet (delivery failed, state DB wiped)
-                // would otherwise be cancelled by the next unrelated save.
-                var merged = Pure.mergeStabilityWrite(payload || {},
-                                                      serviceIntentController._readServiceIntent(),
+                // The merge base is the live row plus the recorded decisions the
+                // GUI may replay unasked, so a full-row write cannot re-affirm a
+                // service default over one of them. A machine-wide value is never
+                // carried: a save about something else would overwrite another
+                // administrator's choice.
+                var carried = Pure.stabilityReplayableIntent(
+                    serviceIntentController._readServiceIntent())
+                var merged = Pure.mergeStabilityWrite(payload || {}, carried,
                                                       window._readPendingOffline()["stability"] || {},
                                                       job.partial || {})
                 var setCorr = bridge.rpcServiceStabilityConfigSet(merged, job.origin || "")
                 rpcTransport.registerRpcCallback(setCorr, function(ok2, p2, code2, msg2) {
+                    // Recorded only once the service confirmed it. Recording
+                    // must never cost the write its answer.
+                    if (ok2 && job.recordsIntent) {
+                        try {
+                            serviceIntentController._recordServiceIntentAfterWrite(
+                                job.partial || {}, payload || {})
+                        } catch (e) {
+                            console.log("applyServiceStabilityPatch: recording the intent failed:", e)
+                        }
+                    }
                     finish(!!ok2, String(code2 || ""), p2)
                 })
             } catch (e) {
@@ -4619,30 +4719,27 @@ ApplicationWindow {
         })
     }
 
-    // Live apply-on-change path for the "verbose service logging" toggle,
-    // shared by the Settings -> Diagnostics panel and the Logs view filter
-    // bar (both bind their checkbox to `serviceVerboseLogging`, so one
-    // implementation keeps them in sync). Optimistic: the shared flag flips
-    // immediately — both checkboxes track it through a Binding — and reverts
-    // if the live apply fails. Admin-gated (may raise one UAC through the
-    // session elevation broker), matching the enforcement-mode behaviour.
-    // `origin` distinguishes the call site in the service write log.
-    function applyVerboseLogging(enabled, origin) {
-        var prior = !enabled
-        window.serviceVerboseLogging = enabled
-        // Service stopped: park the intent like every other service-backed
-        // toggle instead of bouncing the checkbox back. The user can arm
-        // verbose logging BEFORE starting the service and have it delivered on
-        // the connect edge; without this the checkbox silently refused to stay
-        // ticked whenever the service was not running yet.
+    /// Adopt the verbose-logging state out of a service-stability payload.
+    function adoptVerboseLogging(payload) {
+        var p = payload || {}
+        var mode = Pure.stabilityEffective(p, "verbose-logging-mode")
+        window.serviceVerboseLoggingMode = mode
+        window.serviceVerboseLoggingUntilMs = (mode === "timed")
+            ? Number(p["verbose-logging-until-ms"] || 0) : 0
+    }
+
+    // Verbose service logging: `change` is one of `Pure.VERBOSE_LOGGING_CHANGES`.
+    // Applied live and admin-gated like every stability write; the service owns
+    // the window and ends it itself, so what is shown is what it reports back.
+    // A stopped service gets the request parked and delivered on connect.
+    function applyVerboseLogging(change, origin) {
         if (!window._routingBackendConnected()) {
-            window._recordOfflineRoutingIntent("stability", "verbose-logging", enabled)
+            window._recordOfflineRoutingIntent("stability", "verbose-logging-change", change)
             return
         }
-        window.applyServiceStabilityPatch({ "verbose-logging": enabled },
+        window.applyServiceStabilityPatch({ "verbose-logging-change": change },
             function(ok, code, payload) {
                 if (!ok) {
-                    window.serviceVerboseLogging = prior
                     window.statusLine = window.tr("status.verbose-logging-failed",
                         "Could not update verbose service logging: ")
                         + ((typeof window.ipcErrorLabel === "function")
@@ -4650,12 +4747,68 @@ ApplicationWindow {
                             : String(code || "unknown"))
                     return
                 }
-                window.statusLine = enabled
+                window.adoptVerboseLogging(payload)
+                window.statusLine = (change !== "off")
                     ? window.tr("status.verbose-logging-enabled",
                         "Verbose service logging enabled — applies immediately")
                     : window.tr("status.verbose-logging-disabled",
                         "Verbose service logging disabled — applies immediately")
-            }, String(origin || "user:verbose-toggle"))
+            }, String(origin || "user:verbose-logging"))
+    }
+
+    // Verbose-logging wording shared by the Settings panel and the Logs tab
+    // banner, so both read one formatter instead of keeping two in sync.
+    function verboseLoggingChangeLabel(change) {
+        switch (String(change)) {
+            case "one-hour":
+                return window.tr("settings.diagnostics.service-stability.verbose.option-one-hour",
+                    "Verbose for 1 hour")
+            case "four-hours":
+                return window.tr("settings.diagnostics.service-stability.verbose.option-four-hours",
+                    "Verbose for 4 hours")
+            case "until-restart":
+                return window.tr("settings.diagnostics.service-stability.verbose.option-until-restart",
+                    "Verbose until the service restarts")
+        }
+        return window.tr("settings.diagnostics.service-stability.verbose.option-off", "Normal")
+    }
+
+    /// A request parked while the service was offline, else "".
+    function _verboseLoggingParkedChange() {
+        var parked = window._readPendingOffline()["stability"] || {}
+        return parked.hasOwnProperty("verbose-logging-change")
+            ? String(parked["verbose-logging-change"]) : ""
+    }
+
+    /// Whether the Logs tab banner has anything to say: a parked non-off
+    /// request, or a window the service is actually running.
+    function verboseLoggingIsActive() {
+        var parkedChange = window._verboseLoggingParkedChange()
+        if (parkedChange !== "") return parkedChange !== "off"
+        var mode = window.serviceVerboseLoggingMode
+        return mode === "timed" || mode === "until-restart"
+    }
+
+    /// What the closed box / Logs banner reads: a request parked while the
+    /// service was offline outranks what it last reported, else the running
+    /// window with the time left as of `nowMs`.
+    function verboseLoggingStateText(nowMs) {
+        var parkedChange = window._verboseLoggingParkedChange()
+        if (parkedChange !== "") return window.verboseLoggingChangeLabel(parkedChange)
+        var mode = window.serviceVerboseLoggingMode
+        if (mode === "until-restart") return window.verboseLoggingChangeLabel("until-restart")
+        if (mode !== "timed") return window.verboseLoggingChangeLabel("off")
+        var left = Pure.remainingHoursMinutes(window.serviceVerboseLoggingUntilMs, nowMs)
+        var time = (left.hours > 0)
+            ? window.tr("settings.diagnostics.service-stability.verbose.left-hours-minutes",
+                "{hours} h {minutes} min")
+                .replace("{hours}", left.hours).replace("{minutes}", left.minutes)
+            : window.tr("settings.diagnostics.service-stability.verbose.left-minutes",
+                "{minutes} min").replace("{minutes}", left.minutes)
+        return window.tr("settings.diagnostics.service-stability.verbose.state-timed",
+            "Verbose: {time} left, until {clock}")
+            .replace("{time}", time)
+            .replace("{clock}", Qt.formatTime(new Date(window.serviceVerboseLoggingUntilMs), "HH:mm"))
     }
 
     /// Shared read-modify-write driver for ONE per-SID route-policy field.
@@ -4999,6 +5152,8 @@ ApplicationWindow {
             // value the user had tuned — a reset that skips a key is a reset
             // the user cannot trust.
             trayNoticeOpacityPercent: 100,
+            updateCheckEnabled: true,
+            updateCheckIntervalDays: 14,
             // Parked work and the service-owned mirrors go with the settings
             // they belong to. Left behind, an offline intent recorded against
             // the OLD values replays on the next connect and quietly undoes
@@ -5021,6 +5176,7 @@ ApplicationWindow {
     // the context carries a URL only when the folder can actually be listed, and
     // an action that opens an empty window explains nothing. Diagnostics ->
     // export archive is the path that works without administrator rights.
+    Action { id: checkForUpdatesAction; text: tr("action.check-for-updates", "Check for updates"); shortcut: "Ctrl+U"; onTriggered: updateCheckController.checkNow() }
     Action { id: logsFolderAction; text: tr("action.open-logs-folder", "Open logs folder"); shortcut: "Ctrl+Shift+O"; icon.source: uiIconSource("open-file"); enabled: String(((context.about || {}).logsFolderUrl) || "") !== ""; onTriggered: Pure.openExternalUrl(((context.about || {}).logsFolderUrl || "")) }
     Action { id: interfacesAction; text: sectionTitle("interfaces-routes"); shortcut: "Ctrl+1"; icon.source: sectionIconSource("interfaces-routes"); onTriggered: requestSectionChange("interfaces-routes") }
     Action { id: rulesAction; text: sectionTitle("rules"); shortcut: "Ctrl+2"; icon.source: sectionIconSource("rules"); onTriggered: requestSectionChange("rules") }
@@ -5041,6 +5197,7 @@ ApplicationWindow {
     Shortcut { sequence: aboutAction.shortcut; context: Qt.ApplicationShortcut; onActivated: aboutAction.trigger() }
     Shortcut { sequence: licenseAction.shortcut; context: Qt.ApplicationShortcut; onActivated: licenseAction.trigger() }
     Shortcut { sequence: logsFolderAction.shortcut; context: Qt.ApplicationShortcut; onActivated: logsFolderAction.trigger() }
+    Shortcut { sequence: checkForUpdatesAction.shortcut; context: Qt.ApplicationShortcut; onActivated: checkForUpdatesAction.trigger() }
     Shortcut { sequence: StandardKey.Quit; context: Qt.ApplicationShortcut; onActivated: exitAction.trigger() }
     Shortcut { sequence: StandardKey.Close; context: Qt.ApplicationShortcut; onActivated: closeActiveOverlay() }
     Shortcut { sequence: "Escape"; context: Qt.ApplicationShortcut; onActivated: closeActiveOverlay() }
@@ -5113,6 +5270,11 @@ ApplicationWindow {
         if (bridgeAvailable && typeof nrrNativeBridge.rpcResponse !== "undefined") {
             nrrNativeBridge.rpcResponse.connect(rpcTransport.handleRpcResponse)
         }
+        // Launched connected, yet the snapshot missed the service: no
+        // reconnect will come to fill the Diagnostics cards in.
+        if (((backendStatus || {}).kind) === "connected"
+                && !Pure.diagnosticsSnapshotIsLive(diagnosticsSnapshot))
+            refreshDiagnosticsSnapshot()
         // The sidebar offers Virtual machines only when there are some, and
         // needs the answer before the user opens Rules.
         if (prefs.showVirtualMachinesSection === true) virtualMachinesController.refresh()
@@ -5968,7 +6130,7 @@ ApplicationWindow {
             ShortcutMenuItem { theme: uiTheme; labelText: aboutAction.text; shortcutText: "F1"; onTriggered: aboutAction.trigger() }
             ShortcutMenuItem { theme: uiTheme; labelText: licenseAction.text; shortcutText: "Ctrl+Shift+L"; onTriggered: licenseAction.trigger() }
             ShortcutMenuItem { theme: uiTheme; labelText: logsFolderAction.text; shortcutText: "Ctrl+Shift+O"; onTriggered: logsFolderAction.trigger() }
-            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.check-for-updates", "Check for updates"); shortcutText: "Ctrl+U"; onTriggered: statusLine = tr("status.updates-not-implemented", "Update check is not implemented yet.") }
+            ShortcutMenuItem { theme: uiTheme; labelText: checkForUpdatesAction.text; shortcutText: "Ctrl+U"; onTriggered: checkForUpdatesAction.trigger() }
         }
     }
 
@@ -7513,6 +7675,13 @@ ApplicationWindow {
                 return
             }
             var summary = (p && p["review-summary"]) || p || {}
+            // A refused set has an empty diff too; it still differs, and the
+            // alarm stays up.
+            var refusal = Pure.previewRefusal(summary)
+            if (refusal) {
+                statusLine = previewRefusalText(refusal)
+                return
+            }
             // The service just compared the two sets rule by rule. An empty
             // verdict outranks the hashes that raised the alarm: they can
             // disagree over things that change no routing, and a banner nobody
@@ -7776,7 +7945,7 @@ ApplicationWindow {
     // collects an audit reason and emits `confirmed(reason)`; the
     // host wires the next step.
 
-    // Safe rollback confirm → RollbackRequest recovery action.
+    // Safe rollback confirm → RollbackRequest of the user's own rules.
 
     AboutWindow { id: aboutWindow; root: window }
 

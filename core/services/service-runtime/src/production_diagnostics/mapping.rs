@@ -9,7 +9,9 @@ use super::*;
 
 // ── Filter mapping ───────────────────────────────────────────────────────────
 
-pub(super) fn log_filter_to_query(filter: &LogEntryFilter) -> LogQueryFilter {
+/// `None` when the filter names a level or category no event can have: the
+/// answer is then empty, never the unfiltered log.
+pub(super) fn log_filter_to_query(filter: &LogEntryFilter) -> Option<LogQueryFilter> {
     let mut q = LogQueryFilter::new();
     if let Some(v) = filter.from_ms {
         q = q.from_ms(v);
@@ -18,14 +20,10 @@ pub(super) fn log_filter_to_query(filter: &LogEntryFilter) -> LogQueryFilter {
         q = q.to_ms(v);
     }
     if let Some(level_str) = filter.level_min.as_deref() {
-        if let Some(lvl) = level_from_str(level_str) {
-            q = q.level_min(lvl);
-        }
+        q = q.level_min(level_from_str(level_str)?);
     }
     if let Some(cat_str) = filter.category.as_deref() {
-        if let Some(cat) = category_from_str(cat_str) {
-            q = q.category(cat);
-        }
+        q = q.category(category_from_str(cat_str)?);
     }
     if let Some(kind) = filter.kind.clone() {
         q = q.kind(kind);
@@ -36,7 +34,7 @@ pub(super) fn log_filter_to_query(filter: &LogEntryFilter) -> LogQueryFilter {
     if let Some(id) = filter.revision_id.clone() {
         q = q.revision_id(id);
     }
-    q
+    Some(q)
 }
 
 pub(super) fn audit_filter_to_query(filter: &AuditEntryFilter) -> AuditQueryFilter {
@@ -112,25 +110,6 @@ fn scalar_args(payload: &serde_json::Map<String, serde_json::Value>) -> BTreeMap
         .collect()
 }
 
-/// Whether a principal-scoped reader may see `event`.
-///
-/// Two things are visible to everyone: what the SERVICE did on its own behalf
-/// (starts, applies, retention passes — facts about the machine, not about a
-/// person) and events with no actor at all, which are the same thing written
-/// before the actor was recorded. Everything else belongs to whoever performed
-/// it, and only they — or an administrator, who never reaches this function —
-/// get to read it back.
-pub(super) fn audit_event_is_visible_to(event: &AuditEvent, my_actor_hash: Option<&str>) -> bool {
-    if event.actor_kind == nrr_diagnostics::audit::ActorKind::Service.as_str() {
-        return true;
-    }
-    match (event.actor_id_hash.as_deref(), my_actor_hash) {
-        (None, _) => true,
-        (Some(theirs), Some(mine)) => theirs == mine,
-        (Some(_), None) => false,
-    }
-}
-
 pub(super) fn audit_event_to_dto(event: &AuditEvent) -> AuditEntryDto {
     AuditEntryDto {
         event_id: event.event_id.clone(),
@@ -182,6 +161,44 @@ pub(super) fn duplicate_positions<T>(items: &[T], position: PositionFn<T>) -> Op
     (count > 0).then_some(count)
 }
 
+/// A page already cut to size by the reader: `has_more` says whether a next
+/// cursor is due. The total is not counted, since counting would read what the
+/// window skipped.
+pub(super) fn window_page<T>(
+    items: Vec<T>,
+    has_more: bool,
+    position: PositionFn<T>,
+) -> PageResult<T> {
+    warn_on_duplicate_positions(&items, position);
+    let next_cursor = if has_more {
+        items.last().map(|last| {
+            let (ts, id) = position(last);
+            PageCursor::from_position(ts, id)
+        })
+    } else {
+        None
+    };
+    PageResult {
+        items,
+        next_cursor,
+        total_count: None,
+        stale: false,
+    }
+}
+
+/// Resuming strictly after a cursor is sound only while positions are unique;
+/// a repeat turns into a visible line instead of silently missing entries.
+fn warn_on_duplicate_positions<T>(items: &[T], position: PositionFn<T>) {
+    if let Some(duplicates) = duplicate_positions(items, position) {
+        tracing::warn!(
+            target: "nrr::diagnostics",
+            msg_key = "prod-diag-log-page-duplicate-positions",
+            duplicates,
+            "log page positions are not unique — paging can drop entries"
+        );
+    }
+}
+
 /// Slice `items` by the optional cursor + `page_size`; the cursor points at the
 /// last returned item and is opaque to the caller.
 ///
@@ -198,19 +215,7 @@ pub(super) fn paginate<T>(
         .cursor
         .as_ref()
         .and_then(|c| c.parse().map(|(ts, id)| (ts, id.to_string())));
-    // Resume strictly after the cursor's position. This is only sound because
-    // every event id is unique: when ids repeated (the old call-site-constant
-    // id), a page edge inside a run of identical pairs dropped the rest of that
-    // run — silently. Ids are unique at the source now; the loop below turns a
-    // regression there into a visible line instead of missing evidence.
-    if let Some(duplicates) = duplicate_positions(&items, position) {
-        tracing::warn!(
-            target: "nrr::diagnostics",
-            msg_key = "prod-diag-log-page-duplicate-positions",
-            duplicates,
-            "log page positions are not unique — paging can drop entries"
-        );
-    }
+    warn_on_duplicate_positions(&items, position);
     let start_index = match cursor_pos {
         None => 0,
         Some((cts, cid)) => items

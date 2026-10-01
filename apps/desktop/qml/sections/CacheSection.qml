@@ -51,8 +51,38 @@ ScrollView {
             }
         }
     }
+    // Host names have no spaces, so the stock tooltip never wraps and runs off
+    // the window; it is bounded, wrapped anywhere and clamped inside instead.
+    component TruncatedCellLabel: Label {
+        id: cell
+        elide: Text.ElideRight
+        Accessible.role: Accessible.StaticText
+        Accessible.name: cell.text
+        HoverHandler { id: cellHover }
+        ToolTip.visible: cell.truncated && cellHover.hovered
+        ToolTip.text: cell.text
+        ToolTip.toolTip.width: Math.min(ToolTip.toolTip.implicitWidth,
+            root.popupAvailableWidth(cell))
+        // `hovered` re-evaluates the position on each hover: columns resize.
+        ToolTip.toolTip.x: cellHover.hovered
+            ? section._tooltipX(cell, ToolTip.toolTip.width) : 0
+        Component.onCompleted: ToolTip.toolTip.contentItem.wrapMode = Text.WrapAnywhere
+    }
     id: section
     property var root
+    // Centred on `item`, never past the window edges; in `item` coordinates.
+    function _tooltipX(item, tipWidth) {
+        if (!item || typeof item.mapToItem !== "function")
+            return 0
+        var winWidth = (item.Window && item.Window.width) || 0
+        if (winWidth <= 0)
+            return (item.width - tipWidth) / 2
+        var margin = 8
+        var globalLeft = item.mapToItem(null, 0, 0).x
+        var desired = globalLeft + (item.width - tipWidth) / 2
+        var clamped = Math.max(margin, Math.min(winWidth - margin - tipWidth, desired))
+        return clamped - globalLeft
+    }
     clip: true
     Layout.fillWidth: true
     Layout.fillHeight: true
@@ -68,7 +98,10 @@ ScrollView {
     property var _cacheEntries: []
     property string _cacheEntriesCursor: ""
     property bool _cacheEntriesLoading: false
-    property bool _cacheEntriesShown: false
+    // Bumped by every fresh load. A page that answers for an older generation
+    // belongs to a list that has since been reset and is dropped, or a slow
+    // answer for one query lands in the list another query started.
+    property int _cacheLoadGeneration: 0
     // Is the resolver actually answering with virtual addresses right now? The
     // service stamps `fake_ip` on every cache row from the live allocator, but
     // an allocation left over from a session where the feature WAS on keeps
@@ -98,8 +131,7 @@ ScrollView {
                     { "fake-ip-enabled": section._fakeIpEnabled })
         })
     }
-    // TASK A (in-table classic copy) — direct row selection for the cache table.
-    // Replaces the retired "select text" monospace view: rows are picked in the
+    // Direct row selection for the cache table: rows are picked in the
     // table itself (click = single, Ctrl+click = toggle, Shift+click = extend a
     // range) and copied with Ctrl+C, the right-click "Copy selected" item, or the
     // toolbar button. `_cacheSel` holds the selected GROUP row objects (one per
@@ -637,24 +669,25 @@ ScrollView {
                 || typeof nrrNativeBridge.rpcCacheEntriesList !== "function") {
             section._cacheEntriesError = root.tr("diag.cache.entries-bridge-unavailable",
                 "Service bridge not connected — cache entries unavailable")
-            section._cacheEntriesShown = true
             return
         }
         if (reset) {
+            section._cacheLoadGeneration += 1
             section._cacheEntries = []
             section._cacheEntriesCursor = ""
             // Re-read the virtual-address setting alongside the first page so
             // the fake-IP rows appear/disappear with the live service state.
             section._refreshFakeIpEnabled()
         }
-        section._cacheEntriesShown = true
         section._cacheEntriesLoading = true
         section._cacheEntriesError = ""
         var cursor = reset ? "" : section._cacheEntriesCursor
         // Pass the server-side search term so a large cache is
         // filtered in SQLite (WHERE LIKE) rather than drained page-by-page.
+        var generation = section._cacheLoadGeneration
         var corr = nrrNativeBridge.rpcCacheEntriesList(cursor, 50, section._cacheQuery)
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+            if (generation !== section._cacheLoadGeneration) return
             section._cacheEntriesLoading = false
             if (!ok) {
                 section._cacheEntriesError = root.tr("diag.cache.entries-failed",
@@ -855,10 +888,9 @@ ScrollView {
                 }
             }
         }
-        // C4b: Cache entries viewer (read-only, populated on demand)
+        // Cache entries viewer (read-only, populated on demand)
         Frame {
             Layout.fillWidth: true
-            visible: section._cacheEntriesShown
             padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
             background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
             ColumnLayout {
@@ -1022,11 +1054,6 @@ ScrollView {
                     interval: 250
                     repeat: false
                     onTriggered: {
-                        // A pending tick can outlive a hide (clearing
-                        // the field on hide restarts this timer); do nothing once
-                        // the viewer is closed so it can't re-open itself.
-                        if (!section._cacheEntriesShown)
-                            return
                         // Filter the already-loaded rows only. The
                         // per-keystroke full-cache DRAIN was removed: it re-fetched
                         // page after page and each append built a fresh render array,
@@ -1097,8 +1124,7 @@ ScrollView {
                     wrapMode: Text.WordWrap
                 }
 
-                // Copy toolbar (TASK A) — classic in-table selection. The old
-                // "select text" toggle + monospace view is gone; rows are picked
+                // Copy toolbar for in-table row selection: rows are picked
                 // in the table itself and copied with Ctrl+C, the right-click
                 // menu, or these buttons.
                 RowLayout {
@@ -1285,15 +1311,14 @@ ScrollView {
                     Layout.fillWidth: true
                     Layout.preferredHeight: Math.min(section._listMaxHeight,
                         Math.max(section._listLineHeight, section._cacheRenderedHeight))
-                    visible: section._cacheEntriesShown
-                        && section._cacheRendered.length > 0
+                    visible: section._cacheRendered.length > 0
                     clip: true
                     interactive: contentHeight > height
                     ScrollBar.vertical: ScrollBar {
                         policy: cacheEntriesList.contentHeight > cacheEntriesList.height
                             ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
                     }
-                    // TASK A — Ctrl+C copies the selected rows once the list holds
+                    // Ctrl+C copies the selected rows once the list holds
                     // keyboard focus (a row click calls forceActiveFocus). Escape
                     // clears the selection. Focus arrives via the row MouseArea.
                     Keys.onPressed: function(event) {
@@ -1307,9 +1332,7 @@ ScrollView {
                     }
                     // Reuse the cached `_cacheFiltered` view (render-capped
                     // to `_renderCap`) so each page-append evaluates the filter once.
-                    model: section._cacheEntriesShown
-                        ? section._cacheRendered
-                        : []
+                    model: section._cacheRendered
                     delegate: Item {
                         id: cacheRowItem
                         width: cacheEntriesList.width
@@ -1321,14 +1344,14 @@ ScrollView {
                         // (which bumps that revision) re-evaluates this binding.
                         readonly property bool _expanded:
                             section._isCacheExpanded(_g && _g.hostname)
-                        // TASK A — is this row part of the current selection? Reads
+                        // Is this row part of the current selection? Reads
                         // `_cacheSelRev` (via the helper) so it re-evaluates on every
                         // selection change.
                         readonly property bool _selected: section._cacheRowSelected(_g)
                         // Whole-row right-click → copy. One TSV line per address so
                         // the copy stays lossless despite the collapsed display.
                         readonly property string _rowTsv: section._cacheGroupTsv(_g)
-                        // TASK A — accent-tinted selection highlight, behind the row
+                        // Accent-tinted selection highlight, behind the row
                         // content (mirrors the leak-mismatch tint in the trace twin).
                         Rectangle {
                             visible: cacheRowItem._selected
@@ -1337,7 +1360,7 @@ ScrollView {
                             opacity: 0.14
                             z: -1
                         }
-                        // TASK A — left-click row selection (plain = single,
+                        // Left-click row selection (plain = single,
                         // Ctrl = toggle, Shift = extend). Declared before the row
                         // content so the content's own handlers (the IP "+N"
                         // expander, the freshness tooltip) stay on top and keep
@@ -1460,13 +1483,14 @@ ScrollView {
                             // Host cell — same toggle as the IP cell beside it. The
                             // name is what the eye goes to, so making only the
                             // "+N" work reads as a dead row.
-                            Label {
+                            TruncatedCellLabel {
                                 Layout.fillWidth: true
                                 Layout.preferredWidth: section._cacheColHostW
                                 Layout.minimumWidth: section._cacheColHostMinW
                                 text: String((cacheRowItem._g && cacheRowItem._g.hostname) || "—")
                                 color: root.textColor
-                                elide: Text.ElideRight
+                                // Keeps the registrable domain visible.
+                                elide: Text.ElideMiddle
                                 HoverHandler {
                                     enabled: cacheRowItem._ipCount > 1
                                     cursorShape: Qt.PointingHandCursor
@@ -1489,7 +1513,7 @@ ScrollView {
                                     id: cacheIpRow
                                     anchors.fill: parent
                                     spacing: root.uiTheme.spacingXxs
-                                    Label {
+                                    TruncatedCellLabel {
                                         Layout.fillWidth: true
                                         leftPadding: 9
                                         verticalAlignment: Text.AlignVCenter
@@ -1518,7 +1542,7 @@ ScrollView {
                                         cacheRowItem._g && cacheRowItem._g.hostname)
                                 }
                             }
-                            Label {
+                            TruncatedCellLabel {
                                 Layout.preferredWidth: section._cacheColSourceW
                                 leftPadding: 9
                                 text: section._cacheGroupSourceLabel(cacheRowItem._g)
@@ -1599,7 +1623,7 @@ ScrollView {
                                         Layout.preferredWidth: section._cacheColHostW
                                         Layout.minimumWidth: section._cacheColHostMinW
                                     }
-                                    Label {
+                                    TruncatedCellLabel {
                                         Layout.preferredWidth: section._cacheColIpW
                                         leftPadding: 18
                                         text: String((modelData && modelData.ip) || "—")
@@ -1632,8 +1656,7 @@ ScrollView {
                 // render cap. Copy-all-shown still exports the FULL filtered list.
                 Label {
                     Layout.fillWidth: true
-                    visible: section._cacheEntriesShown
-                        && section._cacheFiltered.length > section._cacheRendered.length
+                    visible: section._cacheFiltered.length > section._cacheRendered.length
                     text: root.tr("diag.cache.render-truncated",
                         "Showing the first %1 of %2 matches — refine your search to narrow it.")
                         .arg(section._cacheRendered.length).arg(section._cacheFiltered.length)
@@ -1647,7 +1670,7 @@ ScrollView {
                     theme: root.uiTheme
                     visible: section._cacheEntriesCursor !== ""
                     enabled: !section._cacheEntriesLoading
-                    text: root.tr("diag.cache.entries-load-more", "Load more")
+                    text: root.tr("action.load-more", "Load more")
                     onClicked: section._loadCacheEntries(false)
                 }
             }

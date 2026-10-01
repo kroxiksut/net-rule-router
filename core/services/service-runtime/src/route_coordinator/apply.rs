@@ -224,12 +224,10 @@ impl SecondaryRouteCoordinator {
     /// `recompute_active` reconciles them — keeping the ones the active user
     /// still wants and deleting the rest.
     ///
-    /// Two route shapes carry our signature, both at the uncommon
-    /// [`SECONDARY_ROUTE_METRIC`]: the `/32` secondary host routes (on the
-    /// secondary NIC) AND the mode-A `/2` counter-overlay halves ([`COUNTER_OVERLAY`], on
-    /// the primary NIC). We adopt BOTH: an unadopted `/2` overlay would strand
-    /// all non-rule traffic on the primary indefinitely, even after the
-    /// service that wanted it is gone.
+    /// Our signature is the uncommon [`crate::route_codegen::SECONDARY_ROUTE_METRIC`] on a shape the
+    /// codegen emits: host routes AND the overlay halves, whose length follows
+    /// the tunnel's catch-alls. An unadopted counter-overlay half would strand
+    /// non-rule traffic on the primary after the service that wanted it is gone.
     ///
     /// The signature is a heuristic (the OS never tags routes as ours); a
     /// third-party route at the same metric would be adopted and then deleted
@@ -244,7 +242,8 @@ impl SecondaryRouteCoordinator {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
                     msg_key = "route-orphan-enum-failed",
-                    "route table enumeration failed during startup orphan adoption: {e:?}",
+                    error = %e,
+                    "route table enumeration failed during startup orphan adoption",
                 );
                 return;
             }

@@ -63,35 +63,17 @@ Pane {
                 asynchronous: true
             }
             Item { Layout.fillWidth: true; visible: !root.sidebarCollapsed }
-            // Collapse / expand toggle. Raw Button mirrors the themed
-            // section buttons below (both override background +
-            // contentItem so the Native style can't leak through).
-            Button {
-                id: sidebarToggleButton
+            SidebarGlyphButton {
+                shell: root
                 Layout.preferredWidth: 32
                 Layout.preferredHeight: 32
                 Layout.alignment: Qt.AlignVCenter | Qt.AlignHCenter
-                activeFocusOnTab: true
+                glyph: root.sidebarCollapsed ? "»" : "«"
+                glyphPixelSize: Math.max(16, root.font.pixelSize + 2)
                 Accessible.name: root.sidebarCollapsed
                     ? root.tr("action.expand-navigation", "Expand navigation")
                     : root.tr("action.collapse-navigation", "Collapse navigation")
                 onClicked: root.sidebarCollapsed = !root.sidebarCollapsed
-                ToolTip.visible: hovered
-                ToolTip.delay: 400
-                ToolTip.text: Accessible.name
-                background: PanelSurface {
-                    theme: root.uiTheme
-                    cornerRadius: root.uiTheme.radiusSm
-                    color: sidebarToggleButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor
-                    border.color: sidebarToggleButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder
-                }
-                contentItem: Label {
-                    text: root.sidebarCollapsed ? "»" : "«"
-                    color: root.accentColor
-                    font.pixelSize: Math.max(16, root.font.pixelSize + 2)
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                }
             }
         }
         Label { visible: !root.sidebarCollapsed; Layout.fillWidth: true; text: root.context.windowTitle || "NetRuleRouter"; color: root.textColor; font.bold: true; wrapMode: Text.WordWrap; horizontalAlignment: Text.AlignLeft }
@@ -126,12 +108,14 @@ Pane {
                     Layout.fillWidth: true
                     Layout.fillHeight: false
                     spacing: 0
-                    Button {
+                    ThemedButton {
                         id: navButton
+                        theme: root.uiTheme
                         Layout.fillWidth: true
-                        activeFocusOnTab: true
                         leftPadding: root.sidebarCollapsed ? root.uiTheme.spacingXs : root.uiTheme.spacingMd - root.uiTheme.spacingXxs
                         rightPadding: root.sidebarCollapsed ? root.uiTheme.spacingXs : root.uiTheme.spacingMd - root.uiTheme.spacingXxs
+                        implicitWidth: contentItem.implicitWidth + leftPadding + rightPadding
+                        implicitHeight: contentItem.implicitHeight + topPadding + bottomPadding
                         highlighted: root.section === modelData
                         // The header always opens the section (unchanged
                         // behaviour); for Rules it also reveals the submenu
@@ -224,18 +208,16 @@ Pane {
                             }
                         }
                     }
-                    // Expand/collapse toggle for the Rules submenu, kept as a
-                    // control separate from the header button above so the
-                    // "open Rules" click and the "just show me the submenu"
-                    // click stay independent, both reachable by keyboard.
-                    Button {
-                        id: rulesChevronButton
+                    // Expand/collapse toggle for the submenu, separate from the
+                    // header button so "open the section" and "just show the
+                    // submenu" stay independent, both reachable by keyboard.
+                    SidebarGlyphButton {
+                        shell: root
                         visible: navEntry.hasSubmenu && !root.sidebarCollapsed
                         Layout.preferredWidth: visible ? 28 : 0
-                        // Fills the row's height instead of a fixed 28px so it
-                        // matches navButton's actual (two-line) height exactly.
+                        // Matches the header button's height, not a fixed one.
                         Layout.fillHeight: true
-                        activeFocusOnTab: true
+                        glyph: navEntry.submenuExpanded ? "▾" : "▸"
                         Accessible.name: navEntry.submenuExpanded
                             ? root.tr("action.collapse-submenu", "Collapse submenu")
                             : root.tr("action.expand-submenu", "Expand submenu")
@@ -247,21 +229,6 @@ Pane {
                             } else {
                                 navigationSidebar.settingsNavExpanded = !navigationSidebar.settingsNavExpanded
                             }
-                        }
-                        ToolTip.visible: hovered
-                        ToolTip.delay: 400
-                        ToolTip.text: Accessible.name
-                        background: PanelSurface {
-                            theme: root.uiTheme
-                            cornerRadius: root.uiTheme.radiusSm
-                            color: rulesChevronButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor
-                            border.color: rulesChevronButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder
-                        }
-                        contentItem: Label {
-                            text: navEntry.submenuExpanded ? "▾" : "▸"
-                            color: root.accentColor
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
                         }
                     }
                 }
@@ -280,47 +247,14 @@ Pane {
 
                     Repeater {
                         model: Pure.settingsCategories()
-                        delegate: Button {
-                            id: settingsCategoryButton
-                            Layout.fillWidth: true
-                            activeFocusOnTab: true
-                            highlighted: root.section === "settings"
+                        delegate: SidebarSubNavButton {
+                            shell: navigationSidebar.root
+                            iconName: modelData.icon || ""
+                            text: root.uiRevision >= 0
+                                ? root.tr(modelData.key, modelData.fallback) : ""
+                            selected: root.section === "settings"
                                 && root.settingsCategory === modelData.id
-                            Accessible.role: Accessible.Button
-                            Accessible.name: root.tr(modelData.key, modelData.fallback)
                             onClicked: root.openSettingsCategory(modelData.id)
-                            background: PanelSurface {
-                                theme: root.uiTheme
-                                cornerRadius: root.uiTheme.radiusSm
-                                color: settingsCategoryButton.highlighted ? root.accentColor
-                                    : (settingsCategoryButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
-                                border.color: settingsCategoryButton.highlighted ? root.uiTheme.stateSelectedBorder
-                                    : (settingsCategoryButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
-                            }
-                            contentItem: RowLayout {
-                                spacing: modelData.icon ? root.uiTheme.spacingSm : 0
-                                Image {
-                                    visible: !!modelData.icon
-                                    source: !modelData.icon ? ""
-                                        : (settingsCategoryButton.highlighted
-                                            ? root.uiIconSourceOnAccent(modelData.icon)
-                                            : root.uiIconSource(modelData.icon))
-                                    sourceSize.width: 16
-                                    sourceSize.height: 16
-                                    Layout.preferredWidth: visible ? 16 : 0
-                                    Layout.preferredHeight: visible ? 16 : 0
-                                    fillMode: Image.PreserveAspectFit
-                                    asynchronous: true
-                                }
-                                Label {
-                                    Layout.fillWidth: true
-                                    text: root.uiRevision >= 0
-                                        ? root.tr(modelData.key, modelData.fallback) : ""
-                                    color: settingsCategoryButton.highlighted ? palette.highlightedText : root.textColor
-                                    elide: Text.ElideRight
-                                    verticalAlignment: Text.AlignVCenter
-                                }
-                            }
                         }
                     }
                 }
@@ -335,80 +269,20 @@ Pane {
                     Layout.topMargin: root.uiTheme.spacingXxs
                     spacing: root.uiTheme.spacingXxs
 
-                    Button {
-                        id: connTraceNavButton
-                        Layout.fillWidth: true
-                        activeFocusOnTab: true
-                        highlighted: root.section === "conn-trace"
-                        Accessible.name: root.sectionTitle("conn-trace")
+                    SidebarSubNavButton {
+                        shell: navigationSidebar.root
+                        sectionId: "conn-trace"
+                        iconName: "routing"
+                        text: root.sectionTitle("conn-trace")
                         onClicked: root.requestSectionChange("conn-trace")
-                        background: PanelSurface {
-                            theme: root.uiTheme
-                            cornerRadius: root.uiTheme.radiusSm
-                            color: connTraceNavButton.highlighted ? root.accentColor
-                                : (connTraceNavButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
-                            border.color: connTraceNavButton.highlighted ? root.uiTheme.stateSelectedBorder
-                                : (connTraceNavButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
-                        }
-                        contentItem: RowLayout {
-                            spacing: root.uiTheme.spacingXs
-                            Image {
-                                source: connTraceNavButton.highlighted
-                                    ? root.uiIconSourceOnAccent("routing")
-                                    : root.uiIconSource("routing")
-                                sourceSize.width: 16
-                                sourceSize.height: 16
-                                Layout.preferredWidth: 16
-                                Layout.preferredHeight: 16
-                                fillMode: Image.PreserveAspectFit
-                                asynchronous: true
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: root.sectionTitle("conn-trace")
-                                color: connTraceNavButton.highlighted ? palette.highlightedText : root.textColor
-                                elide: Text.ElideRight
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                        }
                     }
 
-                    Button {
-                        id: cacheNavButton
-                        Layout.fillWidth: true
-                        activeFocusOnTab: true
-                        highlighted: root.section === "cache"
-                        Accessible.name: root.sectionTitle("cache")
+                    SidebarSubNavButton {
+                        shell: navigationSidebar.root
+                        sectionId: "cache"
+                        iconName: "cache"
+                        text: root.sectionTitle("cache")
                         onClicked: root.requestSectionChange("cache")
-                        background: PanelSurface {
-                            theme: root.uiTheme
-                            cornerRadius: root.uiTheme.radiusSm
-                            color: cacheNavButton.highlighted ? root.accentColor
-                                : (cacheNavButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
-                            border.color: cacheNavButton.highlighted ? root.uiTheme.stateSelectedBorder
-                                : (cacheNavButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
-                        }
-                        contentItem: RowLayout {
-                            spacing: root.uiTheme.spacingXs
-                            Image {
-                                source: cacheNavButton.highlighted
-                                    ? root.uiIconSourceOnAccent("cache")
-                                    : root.uiIconSource("cache")
-                                sourceSize.width: 16
-                                sourceSize.height: 16
-                                Layout.preferredWidth: 16
-                                Layout.preferredHeight: 16
-                                fillMode: Image.PreserveAspectFit
-                                asynchronous: true
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: root.sectionTitle("cache")
-                                color: cacheNavButton.highlighted ? palette.highlightedText : root.textColor
-                                elide: Text.ElideRight
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                        }
                     }
                 }
 
@@ -423,46 +297,21 @@ Pane {
                     Layout.topMargin: root.uiTheme.spacingXxs
                     spacing: root.uiTheme.spacingXxs
 
-                    Button {
-                        id: rulesListNavButton
-                        Layout.fillWidth: true
-                        activeFocusOnTab: true
-                        highlighted: root.section === "rules"
+                    SidebarSubNavButton {
+                        shell: navigationSidebar.root
+                        sectionId: "rules"
+                        iconName: "edit-list"
+                        text: root.tr("rules.nav.list", "Rules list")
                         onClicked: root.requestSectionChange("rules")
-                        Accessible.name: root.tr("rules.nav.list", "Rules list")
-                        background: PanelSurface {
-                            theme: root.uiTheme
-                            cornerRadius: root.uiTheme.radiusSm
-                            color: rulesListNavButton.highlighted ? root.accentColor : root.panelColor
-                            border.color: rulesListNavButton.highlighted ? root.uiTheme.stateSelectedBorder : root.uiTheme.stateDefaultBorder
-                        }
-                        contentItem: RowLayout {
-                            spacing: root.uiTheme.spacingSm
-                            Image {
-                                source: root.uiIconSource("edit-list")
-                                sourceSize.width: 16
-                                sourceSize.height: 16
-                                Layout.preferredWidth: 16
-                                Layout.preferredHeight: 16
-                                fillMode: Image.PreserveAspectFit
-                                asynchronous: true
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: root.tr("rules.nav.list", "Rules list")
-                                color: rulesListNavButton.highlighted ? palette.highlightedText : root.textColor
-                                elide: Text.ElideRight
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                        }
                     }
-                    Button {
+                    SidebarSubNavButton {
                         id: rulesCheckSyncButton
-                        Layout.fillWidth: true
-                        activeFocusOnTab: true
+                        shell: navigationSidebar.root
                         visible: navigationSidebar.rulesCheckDivergence
                         enabled: navigationSidebar.rulesCheckAvailable
-                        Accessible.name: root.tr("rules.nav.check-sync", "Check rules match")
+                        sectionId: "rules-check-sync"
+                        iconName: "refresh"
+                        text: root.tr("rules.nav.check-sync", "Check rules match")
                         onClicked: root.driftController._driftRecheckNow(true)
                         ToolTip.visible: rulesCheckSyncButton.hovered && root.prefs.tooltipsEnabled
                         ToolTip.text: rulesCheckSyncButton.enabled
@@ -470,172 +319,47 @@ Pane {
                                 "Compare the rules on screen with your rules file and with the service right now.")
                             : root.tr("rules.state.unknown",
                                 "Not verified — the service isn't reachable right now.")
-                        background: PanelSurface {
-                            theme: root.uiTheme
-                            cornerRadius: root.uiTheme.radiusSm
-                            color: !rulesCheckSyncButton.enabled
-                                ? root.uiTheme.stateDisabledFill
-                                : (rulesCheckSyncButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
-                            border.color: !rulesCheckSyncButton.enabled
-                                ? root.uiTheme.stateDisabledBorder
-                                : (rulesCheckSyncButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
-                        }
-                        contentItem: RowLayout {
-                            spacing: root.uiTheme.spacingSm
-                            Image {
-                                source: root.uiIconSource("refresh")
-                                sourceSize.width: 16
-                                sourceSize.height: 16
-                                Layout.preferredWidth: 16
-                                Layout.preferredHeight: 16
-                                fillMode: Image.PreserveAspectFit
-                                opacity: rulesCheckSyncButton.enabled ? 1.0 : 0.55
-                                asynchronous: true
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: root.tr("rules.nav.check-sync", "Check rules match")
-                                color: rulesCheckSyncButton.enabled ? root.textColor : root.mutedTextColor
-                                elide: Text.ElideRight
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                        }
                     }
                     // Suggested + dismissed addresses, merged into one table
                     // section. Carries the pending count because the whole
                     // point is that nothing pending is lost — a silent entry
                     // would not say there is anything to answer.
-                    Button {
-                        id: rulesSuggestionsInboxButton
-                        Layout.fillWidth: true
-                        activeFocusOnTab: true
-                        highlighted: root.section === "rule-suggestions"
-                        Accessible.name: root.tr("rules.suggestions.inbox.nav-label",
-                            "Suggested addresses")
+                    SidebarSubNavButton {
+                        shell: navigationSidebar.root
+                        sectionId: "rule-suggestions"
+                        iconName: "add"
+                        text: root.tr("rules.suggestions.inbox.nav-label", "Suggested addresses")
+                        badge: root.autoRuleSuggestionsController.autoRuleCandidatesPending
                         onClicked: root.autoRuleSuggestionsController.openAutoRuleSuggestions()
-                        background: PanelSurface {
-                            theme: root.uiTheme
-                            cornerRadius: root.uiTheme.radiusSm
-                            color: rulesSuggestionsInboxButton.highlighted ? root.accentColor
-                                : (rulesSuggestionsInboxButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
-                            border.color: rulesSuggestionsInboxButton.highlighted ? root.uiTheme.stateSelectedBorder
-                                : (rulesSuggestionsInboxButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
-                        }
-                        contentItem: RowLayout {
-                            spacing: root.uiTheme.spacingXs
-                            Image {
-                                source: root.uiIconSource("add")
-                                sourceSize.width: 16
-                                sourceSize.height: 16
-                                Layout.preferredWidth: 16
-                                Layout.preferredHeight: 16
-                                fillMode: Image.PreserveAspectFit
-                                asynchronous: true
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: root.tr("rules.suggestions.inbox.nav-label", "Suggested addresses")
-                                color: rulesSuggestionsInboxButton.highlighted ? palette.highlightedText : root.textColor
-                                elide: Text.ElideRight
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                            Label {
-                                visible: root.autoRuleSuggestionsController.autoRuleCandidatesPending > 0
-                                text: String(root.autoRuleSuggestionsController.autoRuleCandidatesPending)
-                                color: rulesSuggestionsInboxButton.highlighted ? palette.highlightedText : root.accentColor
-                                font.bold: true
-                            }
-                        }
                     }
                     // Rules of the two routes claiming the same hosts, and the
                     // address conflicts of the applied rules. Hidden while there
                     // are neither; the count is the unconfirmed pairs.
-                    Button {
-                        id: rulesOverlapsButton
-                        Layout.fillWidth: true
-                        activeFocusOnTab: true
+                    SidebarSubNavButton {
+                        shell: navigationSidebar.root
                         visible: root.ruleOverlapsController.overlaps.length > 0
                             || root.ruleOverlapsController.conflicts.length > 0
-                        highlighted: root.section === "rule-overlaps"
-                        Accessible.name: root.tr("rules.overlaps.nav-label", "Overlaps")
+                        sectionId: "rule-overlaps"
+                        iconName: "overlaps"
+                        text: root.tr("rules.overlaps.nav-label", "Overlaps")
+                        badge: root.ruleOverlapsController.pendingCount
                         Accessible.description: root.ruleOverlapsController.pendingCount > 0
                             ? root.tr("rules.overlaps.pending-badge", "{n} overlap(s) not confirmed")
                                 .replace("{n}", String(root.ruleOverlapsController.pendingCount))
                             : ""
                         onClicked: root.ruleOverlapsController.open()
-                        background: PanelSurface {
-                            theme: root.uiTheme
-                            cornerRadius: root.uiTheme.radiusSm
-                            color: rulesOverlapsButton.highlighted ? root.accentColor
-                                : (rulesOverlapsButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
-                            border.color: rulesOverlapsButton.highlighted ? root.uiTheme.stateSelectedBorder
-                                : (rulesOverlapsButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
-                        }
-                        contentItem: RowLayout {
-                            spacing: root.uiTheme.spacingXs
-                            Image {
-                                source: root.uiIconSource("routing")
-                                sourceSize.width: 16
-                                sourceSize.height: 16
-                                Layout.preferredWidth: 16
-                                Layout.preferredHeight: 16
-                                fillMode: Image.PreserveAspectFit
-                                asynchronous: true
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: root.tr("rules.overlaps.nav-label", "Overlaps")
-                                color: rulesOverlapsButton.highlighted ? palette.highlightedText : root.textColor
-                                elide: Text.ElideRight
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                            Label {
-                                visible: root.ruleOverlapsController.pendingCount > 0
-                                text: String(root.ruleOverlapsController.pendingCount)
-                                color: rulesOverlapsButton.highlighted ? palette.highlightedText : root.accentColor
-                                font.bold: true
-                            }
-                        }
                     }
                     // Behind the experimental opt-in, and only where a
                     // hypervisor's network or machines exist: with none, there
                     // is nothing on this screen to act on.
-                    Button {
-                        id: rulesVirtualMachinesButton
-                        Layout.fillWidth: true
-                        activeFocusOnTab: true
+                    SidebarSubNavButton {
+                        shell: navigationSidebar.root
                         visible: (root.uiRevision >= 0 ? root.prefs.showVirtualMachinesSection === true : false)
                             && root.virtualMachinesController.available
-                        highlighted: root.section === "rule-virtual-machines"
-                        Accessible.name: root.tr("rules.vm.nav-label", "Virtual machines")
+                        sectionId: "rule-virtual-machines"
+                        iconName: "routing"
+                        text: root.uiRevision >= 0 ? root.tr("rules.vm.nav-label", "Virtual machines") : ""
                         onClicked: root.requestSectionChange("rule-virtual-machines")
-                        background: PanelSurface {
-                            theme: root.uiTheme
-                            cornerRadius: root.uiTheme.radiusSm
-                            color: rulesVirtualMachinesButton.highlighted ? root.accentColor
-                                : (rulesVirtualMachinesButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
-                            border.color: rulesVirtualMachinesButton.highlighted ? root.uiTheme.stateSelectedBorder
-                                : (rulesVirtualMachinesButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
-                        }
-                        contentItem: RowLayout {
-                            spacing: root.uiTheme.spacingXs
-                            Image {
-                                source: root.uiIconSource("routing")
-                                sourceSize.width: 16
-                                sourceSize.height: 16
-                                Layout.preferredWidth: 16
-                                Layout.preferredHeight: 16
-                                fillMode: Image.PreserveAspectFit
-                                asynchronous: true
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: root.uiRevision >= 0 ? root.tr("rules.vm.nav-label", "Virtual machines") : ""
-                                color: rulesVirtualMachinesButton.highlighted ? palette.highlightedText : root.textColor
-                                elide: Text.ElideRight
-                                verticalAlignment: Text.AlignVCenter
-                            }
-                        }
                     }
                 }
             }

@@ -28,6 +28,8 @@ pub enum AuditEventKind {
     TamperAlertRaised,
     /// A user acknowledged a tamper alert.
     TamperAlertAcknowledged,
+    /// A user marked a tamper alert resolved.
+    TamperAlertResolved,
     /// An integrity verification failure was detected.
     IntegrityFailureDetected,
     /// A recovery action was requested by the operator or service.
@@ -54,6 +56,14 @@ pub enum AuditEventKind {
     /// revision when none verified. Does not block further mutations —
     /// the service is already running on trusted content.
     UntrustedRevisionRejected,
+    /// An administrator restarted the audit chain over the breaks they were
+    /// shown; verification starts again from this event. Sealed with the
+    /// service's key, so only the service can write one that verifies.
+    AuditChainRestarted,
+    /// The integrity check could not run (key store, state database or alert
+    /// store failed). The service keeps routing without it until a start
+    /// where it can run again.
+    IntegrityCheckUnavailable,
 }
 
 impl AuditEventKind {
@@ -69,12 +79,15 @@ impl AuditEventKind {
             Self::RollbackCompleted => "rollback_completed",
             Self::TamperAlertRaised => "tamper_alert_raised",
             Self::TamperAlertAcknowledged => "tamper_alert_acknowledged",
+            Self::TamperAlertResolved => "tamper_alert_resolved",
             Self::IntegrityFailureDetected => "integrity_failure_detected",
             Self::RecoveryActionRequested => "recovery_action_requested",
             Self::PrivilegedRequestAdmitted => "privileged_request_admitted",
             Self::DbTamperDetected => "db_tamper_detected",
             Self::KeyResetWithExistingData => "key_reset_with_existing_data",
             Self::UntrustedRevisionRejected => "untrusted_revision_rejected",
+            Self::AuditChainRestarted => "audit_chain_restarted",
+            Self::IntegrityCheckUnavailable => "integrity_check_unavailable",
         }
     }
 
@@ -90,12 +103,15 @@ impl AuditEventKind {
             "rollback_completed" => Some(Self::RollbackCompleted),
             "tamper_alert_raised" => Some(Self::TamperAlertRaised),
             "tamper_alert_acknowledged" => Some(Self::TamperAlertAcknowledged),
+            "tamper_alert_resolved" => Some(Self::TamperAlertResolved),
             "integrity_failure_detected" => Some(Self::IntegrityFailureDetected),
             "recovery_action_requested" => Some(Self::RecoveryActionRequested),
             "privileged_request_admitted" => Some(Self::PrivilegedRequestAdmitted),
             "db_tamper_detected" => Some(Self::DbTamperDetected),
             "key_reset_with_existing_data" => Some(Self::KeyResetWithExistingData),
             "untrusted_revision_rejected" => Some(Self::UntrustedRevisionRejected),
+            "audit_chain_restarted" => Some(Self::AuditChainRestarted),
+            "integrity_check_unavailable" => Some(Self::IntegrityCheckUnavailable),
             _ => None,
         }
     }
@@ -110,6 +126,7 @@ impl AuditEventKind {
                 | Self::DbTamperDetected
                 | Self::KeyResetWithExistingData
                 | Self::UntrustedRevisionRejected
+                | Self::IntegrityCheckUnavailable
         )
     }
 }
@@ -185,11 +202,14 @@ mod tests {
             AuditEventKind::RollbackCompleted,
             AuditEventKind::TamperAlertRaised,
             AuditEventKind::TamperAlertAcknowledged,
+            AuditEventKind::TamperAlertResolved,
             AuditEventKind::IntegrityFailureDetected,
             AuditEventKind::RecoveryActionRequested,
             AuditEventKind::DbTamperDetected,
             AuditEventKind::KeyResetWithExistingData,
             AuditEventKind::UntrustedRevisionRejected,
+            AuditEventKind::AuditChainRestarted,
+            AuditEventKind::IntegrityCheckUnavailable,
         ] {
             let s = kind.as_str();
             let back = AuditEventKind::from_str(s).expect("round trip");
@@ -230,6 +250,7 @@ mod tests {
         assert!(AuditEventKind::DbTamperDetected.requires_alert());
         assert!(AuditEventKind::KeyResetWithExistingData.requires_alert());
         assert!(AuditEventKind::UntrustedRevisionRejected.requires_alert());
+        assert!(AuditEventKind::IntegrityCheckUnavailable.requires_alert());
         assert!(!AuditEventKind::ReviewApproved.requires_alert());
         assert!(!AuditEventKind::RevisionActivated.requires_alert());
     }

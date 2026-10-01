@@ -19,7 +19,8 @@
 //!  ├─ yes → load key; verify every row:
 //!  │         Verified → ok
 //!  │         Unsigned → lazy backfill (legacy v10→v11 row; re-sign)
-//!  │         Tampered → emit DbTamperDetected (one per revision), block
+//!  │         Tampered → emit DbTamperDetected (one per row content),
+//!  │                    block; none while a key reset is pending
 //!  └─ no  → generate + save key:
 //!            revisions empty     → fresh install, no alert
 //!            revisions non-empty → write the re-sign marker, emit a new
@@ -34,8 +35,9 @@
 //! Tamper detection is a **notification**, never fail-closed: the
 //! kernel WFP filters for the active revision are already applied and
 //! keep routing traffic. Blocking applies only to *new* mutations from
-//! the GUI, lifted when the user acknowledges the alert (which triggers
-//! a full re-sign — see `ProductionMutationExecutor`'s ack path).
+//! the GUI, lifted when the user acknowledges the alert, which re-signs
+//! exactly the rows the acknowledgement dialog listed (see
+//! [`crate::integrity_review`]).
 //!
 //! ## Residual risk (documented, accepted by spec)
 //!
@@ -54,7 +56,10 @@ use nrr_diagnostics::audit::kind::AuditEventKind;
 use nrr_diagnostics::reason::integrity;
 use nrr_platform_api::key_store::{generate_signing_key, KeyStore};
 use nrr_storage::revision_hmac::HmacVerification;
-use nrr_storage::revisions::RevisionsRepository;
+use nrr_storage::revisions::{RevisionsRepository, ScannedContent, ScannedRow};
+
+use crate::integrity_review::{row_label, tamper_alert_id};
+use crate::ipc_handlers::payloads::MutationKind;
 use rusqlite::Connection;
 
 /// Synthetic NDJSON pointer for bootstrap-raised alerts. The audit
@@ -81,13 +86,6 @@ fn resign_marker_for(key: &[u8]) -> Vec<u8> {
     h.update(RESIGN_MARKER_LABEL);
     h.update(key);
     h.finalize().to_vec()
-}
-
-/// Deterministic alert id for a tampered revision, so re-detecting the
-/// same row across restarts updates the single alert rather than
-/// spamming a new one each boot (dedup: one alert per revision).
-fn tamper_alert_id(revision_id: &str) -> String {
-    format!("alt-dbtamper-{revision_id}")
 }
 
 /// Errors from [`run_tamper_bootstrap`]. Each wraps the underlying
@@ -131,10 +129,9 @@ pub struct TamperBootstrapOutcome {
     pub tampered_revision_ids: Vec<String>,
     /// Number of legacy `Unsigned` rows that were lazily backfilled.
     pub backfilled_rows: usize,
-    /// `true` when at least one blocking alert (tamper or key-reset) was
-    /// raised this boot. Informational — the live mutation gate
-    /// recomputes from the alerts repo, since acknowledgement lifts it
-    /// at runtime (see [`mutations_blocked_by_alert`]).
+    /// `true` when this boot reached a blocking verdict (tamper or key reset),
+    /// even if writing its alert row failed. Informational — the live mutation
+    /// gate recomputes from the alerts repo (see [`mutations_blocked_by_alert`]).
     pub raised_blocking_alert: bool,
 }
 
@@ -144,6 +141,26 @@ pub struct TamperBootstrapOutcome {
 pub fn is_blocking_alert_kind(kind: &str) -> bool {
     kind == AuditEventKind::DbTamperDetected.as_str()
         || kind == AuditEventKind::KeyResetWithExistingData.as_str()
+}
+
+/// Refusal code of [`mutation_refused_by_alert`], passed through to whoever
+/// asked for the change (the tray's authoring actions included). The same slug
+/// the wire refusal reaches clients as.
+pub const SECURITY_ALERT_GATE_CODE: &str =
+    nrr_shared::ipc_transport::SECURITY_ALERT_UNACKNOWLEDGED_CLIENT_SLUG;
+pub const SECURITY_ALERT_GATE_MESSAGE: &str = "Verify rules and acknowledge security alert";
+
+/// The tamper gate: while a blocking alert is active, only the
+/// acknowledgement or resolution that clears it may run.
+#[must_use]
+pub fn mutation_refused_by_alert(
+    kind: MutationKind,
+    alerts_repo: &dyn SecurityAlertsRepository,
+) -> bool {
+    !matches!(
+        kind,
+        MutationKind::SecurityAlertAck | MutationKind::SecurityAlertResolve
+    ) && mutations_blocked_by_alert(alerts_repo)
 }
 
 /// Live mutation gate: `true` when an unacknowledged (`Active`)
@@ -248,13 +265,16 @@ pub fn run_tamper_bootstrap(
                 "DB-MAC key was missing with existing revisions; \
                  regenerated and blocking mutations pending acknowledgement",
             );
-            emit_alert(
-                alerts_repo,
-                key_reset_alert_id(now_ms),
+            log_unrecorded_alert(
                 AuditEventKind::KeyResetWithExistingData.as_str(),
-                integrity::KEY_RESET_WITH_EXISTING_DATA.as_str(),
-                now_ms,
-            )?;
+                emit_alert(
+                    alerts_repo,
+                    key_reset_alert_id(now_ms),
+                    AuditEventKind::KeyResetWithExistingData.as_str(),
+                    integrity::KEY_RESET_WITH_EXISTING_DATA.as_str(),
+                    now_ms,
+                ),
+            );
         }
         return Ok(outcome);
     };
@@ -267,100 +287,61 @@ pub fn run_tamper_bootstrap(
         ensure_key_reset_alert_active(alerts_repo, now_ms);
     }
 
-    // Key loaded — verify every row.
-    let verifications = {
+    // Key loaded — verify every row and pointer.
+    let scan = {
         let guard = lock_state(conn)?;
         RevisionsRepository::with_signing_key(&guard, signing_key.clone())
-            .verify_all()
+            .integrity_scan()
             .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?
     };
-    let mut backfill_ids: Vec<String> = Vec::new();
-    for (revision_id, verification) in verifications {
-        match verification {
+    let mut backfill: Vec<&ScannedRow> = Vec::new();
+    for row in &scan {
+        match row.verification {
             HmacVerification::Verified => {}
-            HmacVerification::Unsigned => backfill_ids.push(revision_id),
+            HmacVerification::Unsigned => backfill.push(row),
             HmacVerification::Tampered => {
+                outcome.tampered_revision_ids.push(row_label(row));
+                outcome.raised_blocking_alert = true;
+                // Under a pending reset every row the lost key signed reads as
+                // tampered; the key-reset alert already covers all of them.
+                if outcome.key_reset_unacknowledged {
+                    continue;
+                }
                 tracing::warn!(
                     target: "nrr::tamper",
                     msg_key = "tamper-row-hmac-mismatch",
-                    revision_id = %revision_id,
+                    revision_id = %row_label(row),
                     "revision row failed HMAC verification; raising tamper alert",
                 );
-                emit_alert(
-                    alerts_repo,
-                    tamper_alert_id(&revision_id),
+                log_unrecorded_alert(
                     AuditEventKind::DbTamperDetected.as_str(),
-                    integrity::DB_ROW_HMAC_MISMATCH.as_str(),
-                    now_ms,
-                )?;
-                outcome.tampered_revision_ids.push(revision_id);
-                outcome.raised_blocking_alert = true;
-            }
-        }
-    }
-
-    // The pointers, same three-way answer. Which revision is ACTIVE is as much
-    // a part of the enforced policy as the revision's contents: move it out of
-    // band and both revisions still verify while a different rule set runs.
-    let pointer_verifications = {
-        let guard = lock_state(conn)?;
-        RevisionsRepository::with_signing_key(&guard, signing_key.clone())
-            .verify_all_pointers()
-            .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?
-    };
-    let mut pointer_backfill: Vec<String> = Vec::new();
-    for (principal, verification) in pointer_verifications {
-        match verification {
-            HmacVerification::Verified => {}
-            HmacVerification::Unsigned => pointer_backfill.push(principal),
-            HmacVerification::Tampered => {
-                tracing::warn!(
-                    target: "nrr::tamper",
-                    msg_key = "tamper-pointer-hmac-mismatch",
-                    principal = %principal,
-                    "active-revision pointer failed HMAC verification; raising tamper alert",
+                    raise_tamper_alert(alerts_repo, row, now_ms),
                 );
-                emit_alert(
-                    alerts_repo,
-                    tamper_alert_id(&format!("pointer:{principal}")),
-                    AuditEventKind::DbTamperDetected.as_str(),
-                    integrity::DB_ROW_HMAC_MISMATCH.as_str(),
-                    now_ms,
-                )?;
-                outcome
-                    .tampered_revision_ids
-                    .push(format!("pointer:{principal}"));
-                outcome.raised_blocking_alert = true;
             }
         }
     }
-    if !pointer_backfill.is_empty() {
-        let guard = lock_state(conn)?;
-        let repo = RevisionsRepository::with_signing_key(&guard, signing_key.clone());
-        for principal in &pointer_backfill {
-            repo.re_sign_pointer_for(principal)
-                .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?;
-        }
-    }
 
-    // Lazy backfill of legacy unsigned rows (the v10→v11 migration
-    // added the column with an empty default). Safe to re-sign: these
-    // predate signing and are not tampered. See module-level residual
+    // Lazy backfill of rows written before signing existed (the v10→v11
+    // migration added the column with an empty default). Safe to re-sign:
+    // these predate signing and are not tampered. See module-level residual
     // risk note.
-    if !backfill_ids.is_empty() {
+    if !backfill.is_empty() {
         let guard = lock_state(conn)?;
         let repo = RevisionsRepository::with_signing_key(&guard, signing_key.clone());
-        for revision_id in &backfill_ids {
-            repo.re_sign_row(revision_id)
-                .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?;
+        for row in &backfill {
+            match row.content {
+                ScannedContent::Revision(_) => repo.re_sign_row(row.revision_id()),
+                ScannedContent::Pointer(_) => repo.re_sign_pointer_for(&row.principal),
+            }
+            .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?;
         }
     }
-    outcome.backfilled_rows = backfill_ids.len() + pointer_backfill.len();
-    if !backfill_ids.is_empty() {
+    outcome.backfilled_rows = backfill.len();
+    if !backfill.is_empty() {
         tracing::info!(
             target: "nrr::tamper",
             msg_key = "tamper-legacy-rows-backfilled",
-            backfilled = backfill_ids.len(),
+            backfilled = backfill.len(),
             "lazily backfilled legacy unsigned revision rows",
         );
     }
@@ -386,7 +367,7 @@ impl TamperBootstrapOutcome {
 /// An unreadable marker counts as pending: the file sits beside the key under
 /// the same protection, so failing to read it is an OS fault, and guessing
 /// "acknowledged" there would roll every principal's rules back to nothing.
-fn resign_pending(key_store: &dyn KeyStore, key: &[u8]) -> bool {
+pub(crate) fn resign_pending(key_store: &dyn KeyStore, key: &[u8]) -> bool {
     match key_store.load_resign_marker() {
         Ok(None) => false,
         Ok(Some(marker)) if marker == resign_marker_for(key) => true,
@@ -442,6 +423,21 @@ fn ensure_key_reset_alert_active(alerts_repo: &Arc<dyn SecurityAlertsRepository>
     }
 }
 
+/// A failed alert write never fails the bootstrap: the verdict is already in
+/// the outcome, and the boot sweep acts on the key it returns. Propagating it
+/// dropped the key, and with it the rollback of the tampered revision.
+fn log_unrecorded_alert(kind: &str, written: Result<(), TamperBootstrapError>) {
+    if let Err(e) = written {
+        tracing::error!(
+            target: "nrr::tamper",
+            msg_key = "tamper-alert-write-failed",
+            kind,
+            error = %e,
+            "could not record the security alert; the integrity verdict still stands for this start",
+        );
+    }
+}
+
 /// Lock the shared state connection for one storage pass. Kept narrow on
 /// purpose — see the deadlock note at the top of [`run_tamper_bootstrap`].
 fn lock_state(
@@ -449,6 +445,23 @@ fn lock_state(
 ) -> Result<std::sync::MutexGuard<'_, Connection>, TamperBootstrapError> {
     conn.lock()
         .map_err(|_| TamperBootstrapError::Storage("state connection mutex poisoned".into()))
+}
+
+/// Raise the tamper alert for `row`'s current content. Deduped by id, so the
+/// same content never alerts twice; the dedup only silences a repeat, it never
+/// makes the row verify.
+pub fn raise_tamper_alert(
+    alerts_repo: &Arc<dyn SecurityAlertsRepository>,
+    row: &ScannedRow,
+    now_ms: i64,
+) -> Result<(), TamperBootstrapError> {
+    emit_alert(
+        alerts_repo,
+        tamper_alert_id(row),
+        AuditEventKind::DbTamperDetected.as_str(),
+        integrity::DB_ROW_HMAC_MISMATCH.as_str(),
+        now_ms,
+    )
 }
 
 /// Insert an alert unless one with this id already exists (dedup across

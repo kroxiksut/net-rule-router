@@ -178,7 +178,7 @@ fn a_brand_related_companion_is_proposed_once_the_relation_repeats() {
             "chatapp.test",
         ),
         ("ab.example", "login.ab.test", "login.ab.test"),
-        ("tiktok.com", "tiktokv.com", "tiktokv.com"),
+        ("clipfeed.test", "clipfeedv.test", "clipfeedv.test"),
     ] {
         let mut ledger = defaults();
         two_visits(&mut ledger, anchor, &[candidate]);
@@ -290,20 +290,20 @@ fn an_unrelated_name_is_not_mistaken_for_a_brand_relation() {
 
 #[test]
 fn a_brand_sitting_in_someone_elses_subdomain_is_not_a_relation() {
-    // From a live run: a Fastly machine named after its customer offered to
-    // move all of mozilla.org onto the additional link.
+    // From a live run: a CDN machine named after its customer offered to move
+    // the customer's whole domain onto the additional link.
     let mut ledger = defaults();
     page_load(
         &mut ledger,
         0,
-        "mozilla.map.fastly.net",
+        "brandname.map.tenantnet.test",
         SECONDARY,
-        &["mozilla.org"],
+        &["brandname.test"],
     );
 
     assert!(
         ledger.proposals(10_000, &NoExclusions).is_empty(),
-        "the brand names Fastly's customer, not Fastly's kin"
+        "the brand names the CDN's customer, not the CDN's kin"
     );
 }
 
@@ -313,8 +313,8 @@ fn a_brand_in_the_registrable_domain_is_still_a_relation() {
     let mut ledger = defaults();
     two_visits(
         &mut ledger,
-        "user-images.githubusercontent.com",
-        &["github.com"],
+        "user-images.codehostcontent.test",
+        &["codehost.test"],
     );
 
     let proposals = ledger.proposals(150_000, &NoExclusions);

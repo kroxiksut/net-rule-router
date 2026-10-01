@@ -175,6 +175,10 @@ fn the_kernel_accepts_what_we_generate_and_teardown_removes_it() {
         listed.contains("policy accept"),
         "the chain must not default to dropping: {listed}"
     );
+    assert!(
+        listed.contains("priority filter - 10"),
+        "the chain must run ahead of ufw and firewalld: {listed}"
+    );
 
     // Re-apply must be a no-op rather than an append — the property the
     // create-then-flush batch exists for.
@@ -195,4 +199,47 @@ fn the_kernel_accepts_what_we_generate_and_teardown_removes_it() {
         !table_exists(&table),
         "teardown must remove our table completely"
     );
+}
+
+/// A table an older version installed with another chain priority: the apply
+/// must move the hook itself, not fail with EEXIST until someone deletes the
+/// table by hand.
+#[test]
+#[ignore = "needs root, nft and nf_tables; run with --ignored"]
+fn a_chain_installed_at_another_priority_is_recreated_by_the_apply() {
+    require_environment();
+
+    let table = format!("nrr_live_prio_{}", std::process::id());
+    let _guard = TableGuard(table.clone());
+    let older = format!(
+        "add table inet {table}
+         add chain inet {table} output {{ type filter hook output priority 0; policy accept; }}
+         add rule inet {table} output ip daddr 198.51.100.9 drop comment \"older\"
+"
+    );
+    let mut child = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("nft must be runnable");
+    std::io::Write::write_all(child.stdin.as_mut().expect("nft stdin"), older.as_bytes())
+        .expect("the older table must reach nft");
+    drop(child.stdin.take());
+    assert!(
+        child.wait().expect("nft must finish").success(),
+        "the older table must install"
+    );
+
+    NftCliEnforcement::new()
+        .apply(&live_ruleset(&table))
+        .unwrap_or_else(|e| panic!("the apply must replace the older chain: {e}"));
+
+    let listed = list_table(&table);
+    assert!(listed.contains("priority filter - 10"), "{listed}");
+    assert!(!listed.contains("priority filter;"), "{listed}");
+    assert!(
+        !listed.contains("older"),
+        "the older rules must be gone: {listed}"
+    );
+    assert!(listed.contains("198.51.100.7"), "{listed}");
 }

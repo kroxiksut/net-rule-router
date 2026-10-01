@@ -120,12 +120,11 @@ pub struct ServiceStabilityConfigRecord {
     pub set_by_sid: Option<String>,
     /// UTC milliseconds. `0` for the implicit default record.
     pub updated_at: i64,
-    /// When `true` the supervisor installs the
-    /// `tracing_subscriber::EnvFilter` directive `"nrr=debug,info"`
-    /// instead of the canonical `"nrr=info,info"`, so operational
-    /// NDJSON captures `tracing::debug!` events. Persisted as INTEGER
-    /// 0/1 on disk; default `false`.
-    pub verbose_logging: bool,
+    /// UTC milliseconds until which the service logs verbosely; `None` is
+    /// normal logging. Only a timed window is stored: "until the service
+    /// restarts" must not survive one, and a deadline already passed reads as
+    /// normal logging (schema v67).
+    pub verbose_until_ms: Option<i64>,
     /// When `true` the opt-in connection-egress trace writes each observed
     /// connection to the operational NDJSON. Persisted as INTEGER 0/1;
     /// default `false`.
@@ -246,7 +245,7 @@ pub fn clamp_liveness_window_secs(secs: u32) -> u32 {
 
 impl ServiceStabilityConfigRecord {
     /// Canonical default: `Recoverable` with documented constants,
-    /// no `set_by_sid`, `updated_at = 0`, `verbose_logging = false`.
+    /// no `set_by_sid`, `updated_at = 0`, normal logging.
     /// Returned by [`ServiceStabilityConfigRepository::get_or_default`]
     /// when the singleton row has never been written.
     pub fn default_record() -> Self {
@@ -258,7 +257,7 @@ impl ServiceStabilityConfigRecord {
             },
             set_by_sid: None,
             updated_at: 0,
-            verbose_logging: false,
+            verbose_until_ms: None,
             conn_trace_ndjson: false,
             // Showing the trace in the GUI costs nothing on disk and is what
             // makes the Diagnostics panel useful out of the box; the
@@ -322,7 +321,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                         ipc_backoff_cap_ms,
                         set_by_sid,
                         updated_at,
-                        verbose_logging,
+                        verbose_until_ms,
                         conn_trace_ndjson,
                         conn_trace_gui,
                         rule_scope_service_driven,
@@ -346,7 +345,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                     let backoff_cap_ms: Option<i64> = row.get(3)?;
                     let set_by_sid: Option<String> = row.get(4)?;
                     let updated_at: i64 = row.get(5)?;
-                    let verbose_logging: i64 = row.get(6)?;
+                    let verbose_until_ms: Option<i64> = row.get(6)?;
                     let conn_trace_ndjson: i64 = row.get(7)?;
                     let conn_trace_gui: i64 = row.get(8)?;
                     let rule_scope_service_driven: i64 = row.get(9)?;
@@ -367,7 +366,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                         backoff_cap_ms,
                         set_by_sid,
                         updated_at,
-                        verbose_logging,
+                        verbose_until_ms,
                         conn_trace_ndjson,
                         conn_trace_gui,
                         rule_scope_service_driven,
@@ -396,7 +395,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                 cap_ms,
                 sid,
                 updated,
-                verbose,
+                verbose_until_ms,
                 ct_ndjson,
                 ct_gui,
                 rule_scope,
@@ -422,7 +421,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                     ipc_accept_policy: policy,
                     set_by_sid: sid,
                     updated_at: updated,
-                    verbose_logging: verbose != 0,
+                    verbose_until_ms,
                     conn_trace_ndjson: ct_ndjson != 0,
                     conn_trace_gui: ct_gui != 0,
                     rule_scope_service_driven: rule_scope != 0,
@@ -460,16 +459,11 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
     /// CHECKs (see `STATE_DB_V8_DDL`) reject out-of-range params at
     /// the SQL boundary; callers that want a Rust-side error before
     /// hitting SQL can use [`validate_recoverable_params`] first.
-    ///
-    /// `verbose_logging` is persisted alongside the policy in the same
-    /// row — both fields update together on every Save so callers don't
-    /// have to coordinate two writes. Pass `false` to preserve the
-    /// default.
     #[allow(clippy::too_many_arguments)]
     pub fn set(
         &self,
         policy: &IpcAcceptPolicyWrite,
-        verbose_logging: bool,
+        verbose_until_ms: Option<i64>,
         conn_trace_ndjson: bool,
         conn_trace_gui: bool,
         rule_scope_service_driven: bool,
@@ -499,7 +493,6 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
             ),
             IpcAcceptPolicyWrite::Critical => (KIND_CRITICAL, None, None, None),
         };
-        let verbose_int: i64 = if verbose_logging { 1 } else { 0 };
         let ct_ndjson_int: i64 = if conn_trace_ndjson { 1 } else { 0 };
         let ct_gui_int: i64 = if conn_trace_gui { 1 } else { 0 };
         let rule_scope_int: i64 = if rule_scope_service_driven { 1 } else { 0 };
@@ -527,7 +520,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                 "INSERT INTO service_stability_config
                     (id, ipc_accept_kind,
                      ipc_max_restarts, ipc_backoff_base_ms, ipc_backoff_cap_ms,
-                     set_by_sid, updated_at, verbose_logging,
+                     set_by_sid, updated_at, verbose_until_ms,
                      conn_trace_ndjson, conn_trace_gui, rule_scope_service_driven,
                      routing_stop_policy, cache_refresh_interval_secs, enforcement_mode,
                      secondary_liveness_window_secs, fake_ip_enabled, dns_via_secondary,
@@ -542,7 +535,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                      ipc_backoff_cap_ms  = excluded.ipc_backoff_cap_ms,
                      set_by_sid          = excluded.set_by_sid,
                      updated_at          = excluded.updated_at,
-                     verbose_logging     = excluded.verbose_logging,
+                     verbose_until_ms    = excluded.verbose_until_ms,
                      conn_trace_ndjson   = excluded.conn_trace_ndjson,
                      conn_trace_gui      = excluded.conn_trace_gui,
                      rule_scope_service_driven = excluded.rule_scope_service_driven,
@@ -563,7 +556,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                     cap_ms,
                     set_by_sid,
                     now_ms,
-                    verbose_int,
+                    verbose_until_ms,
                     ct_ndjson_int,
                     ct_gui_int,
                     rule_scope_int,
@@ -608,16 +601,14 @@ pub fn validate_recoverable_params(
     Ok(())
 }
 
-/// Standalone probe for the verbose-logging flag.
-/// Called from the service binary entrypoint BEFORE `install_ndjson_tracing`
-/// (so the right `EnvFilter` directive is picked at install time, not
-/// later). Returns `false` on any error so a corrupted or missing row
-/// degrades to the canonical info-only behaviour.
-pub fn probe_verbose_logging(conn: &Connection) -> bool {
+/// The stored verbose-logging deadline, read before tracing is installed so
+/// the first event already meets the right filter. `None` on any error: an
+/// unreadable row degrades to normal logging.
+pub fn probe_verbose_until(conn: &Connection) -> Option<i64> {
     ServiceStabilityConfigRepository::new(conn)
         .get_or_default()
-        .map(|r| r.verbose_logging)
-        .unwrap_or(false)
+        .ok()
+        .and_then(|r| r.verbose_until_ms)
 }
 
 fn decode_policy(

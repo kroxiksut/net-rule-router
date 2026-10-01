@@ -8,11 +8,9 @@ use super::*;
 // ── DiagnosticsFacade impl ───────────────────────────────────────────────────
 
 impl DiagnosticsFacade for ProductionDiagnosticsFacade {
-    fn get_status(&self) -> DiagnosticsStatusDto {
-        let now_ms = millis_since_epoch();
-
+    fn get_status(&self, audience: &DiagnosticsAudience) -> DiagnosticsStatusDto {
         // Service health
-        let (active_revision_id, pending_changes) = self.read_revision_summary();
+        let (active_revision_id, pending_changes) = self.read_revision_summary(audience);
         let start_relation = self.start_relative_to_sign_in();
         let service_health = ServiceHealthCard {
             state: "running".to_string(),
@@ -27,13 +25,25 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         let audit_chain_ok = self.audit_chain_ok(&audit_reader);
         let audit_write_healthy = is_dir_writable(&self.audit_dir);
 
-        let open_alerts = self.alerts_repo.list_open().unwrap_or_default();
-        let active_alert_count = open_alerts.len() as u32;
-        let active_alerts: Vec<SecurityAlertDto> = open_alerts.iter().map(alert_to_dto).collect();
+        // An unreadable store is not an empty one: the card says which it was.
+        let (active_alerts, alerts_readable) =
+            match self.list_alerts(AlertListFilter::Open, audience) {
+                Ok(alerts) => (alerts, true),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "nrr::diagnostics",
+                        error = %e,
+                        "security alerts could not be read for the status snapshot",
+                    );
+                    (Vec::new(), false)
+                }
+            };
+        let active_alert_count = active_alerts.len() as u32;
         let security_status = SecurityStatusCard {
             audit_chain_ok,
             active_alert_count,
             audit_write_healthy,
+            alerts_readable,
         };
 
         // Cache
@@ -42,33 +52,11 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         // Log health
         let log_health = self.compute_log_health();
 
-        let diagnostic_mode = self
-            .diagnostic_session
-            .current(now_ms)
-            .map(|s| {
-                // A no-expiry ("until restart") session has no countdown.
-                let until_restart = s.is_until_restart();
-                DiagnosticModeStateDto {
-                    active: true,
-                    expires_at: if until_restart {
-                        None
-                    } else {
-                        Some(s.expires_at)
-                    },
-                    remaining_ms: if until_restart {
-                        None
-                    } else {
-                        Some(s.remaining_ms(now_ms))
-                    },
-                    scope_key: Some(scope_slug(s.scope).to_string()),
-                }
-            })
-            .unwrap_or_else(DiagnosticModeStateDto::inactive);
-
         let overall_healthy = audit_chain_ok
             && audit_write_healthy
             && cache_health.healthy
             && log_health.dir_writable
+            && alerts_readable
             && active_alert_count == 0;
 
         DiagnosticsStatusDto {
@@ -78,7 +66,6 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
             active_alerts,
             cache_health,
             log_health,
-            diagnostic_mode,
             stale: false,
             origin: DiagnosticsDataOrigin::Service,
         }
@@ -90,14 +77,19 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         pagination: &PaginationParams,
         audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<LogEntryDto>> {
-        let events = self.scan_sorted_log_events_for(filter, audience);
-        let items: Vec<LogEntryDto> = events.iter().rev().map(log_event_to_dto).collect();
-        Ok(paginate(items, pagination, log_entry_position))
+        // A malformed cursor restarts from the newest entry, as it always has.
+        let before = pagination.cursor.as_ref().and_then(PageCursor::parse);
+        let page = self.log_page_for(
+            filter,
+            audience,
+            before,
+            pagination.effective_page_size() as usize,
+        );
+        let items: Vec<LogEntryDto> = page.events.iter().map(log_event_to_dto).collect();
+        Ok(window_page(items, page.has_more, log_entry_position))
     }
 
-    /// Single-scan override (see the trait default): take the newest
-    /// `max_entries` of the ascending scan (its tail) and reverse to
-    /// newest-first, without paging the full tree once per wire page.
+    /// One read of the newest `max_entries` rather than one per wire page.
     fn recent_log_entries(
         &self,
         filter: &LogEntryFilter,
@@ -107,11 +99,8 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         if max_entries == 0 {
             return Ok(Vec::new());
         }
-        let events = self.scan_sorted_log_events_for(filter, audience);
-        let start = events.len().saturating_sub(max_entries);
-        let mut items: Vec<LogEntryDto> = events[start..].iter().map(log_event_to_dto).collect();
-        items.reverse();
-        Ok(items)
+        let page = self.log_page_for(filter, audience, None, max_entries);
+        Ok(page.events.iter().map(log_event_to_dto).collect())
     }
 
     fn list_audit_entries(
@@ -122,14 +111,7 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>> {
         let reader = AuditReader::new(self.audit_dir.clone());
         let query_filter = audit_filter_to_query(filter);
-        let mut events: Vec<AuditEvent> = reader.scan(&query_filter);
-        // Whose events these are is decided here, not by the request. The hash
-        // is computed from the caller's own principal with the same function
-        // the writer used, so "mine" cannot be spelled as somebody else's.
-        if let Some(principal) = audience.principal() {
-            let mine = nrr_diagnostics::audit::actor_id_hash(principal);
-            events.retain(|event| audit_event_is_visible_to(event, mine.as_deref()));
-        }
+        let mut events: Vec<AuditEvent> = reader.scan(&query_filter, audience);
 
         events.sort_by(|a, b| {
             b.created_at
@@ -149,7 +131,7 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
     ) -> DiagnosticsResult<Vec<String>> {
         Ok(
             nrr_diagnostics::logs::reader::LogReader::new(self.logs_dir.clone())
-                .recent_raw_lines_for(max_bytes, audience.principal(), from_ms),
+                .recent_raw_lines_for(max_bytes, audience, from_ms),
         )
     }
 
@@ -161,21 +143,48 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
     ) -> DiagnosticsResult<Vec<nrr_diagnostics::logs::reader::RawLogFile>> {
         Ok(
             nrr_diagnostics::logs::reader::LogReader::new(self.logs_dir.clone())
-                .recent_raw_files_for(max_bytes, audience.principal(), from_ms),
+                .recent_raw_files_for(max_bytes, audience, from_ms),
         )
     }
 
-    fn recent_audit_chain_lines(&self, max_bytes: usize) -> DiagnosticsResult<Vec<String>> {
-        // Read the raw NDJSON verbatim (chain fields intact) straight off disk;
-        // the reader keeps the newest byte-budgeted suffix. The SYSTEM service
-        // has full access to the audit dir, so no ACL gate here — the redaction
-        // gate is the caller's (diagnostics-tier export only).
-        Ok(AuditReader::new(self.audit_dir.clone()).recent_raw_lines(max_bytes))
+    fn recent_audit_chain_lines(
+        &self,
+        max_bytes: usize,
+        audience: &DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<String>> {
+        // The redaction gate is the caller's (diagnostics-tier export only);
+        // the audience gate is the reader's.
+        Ok(AuditReader::new(self.audit_dir.clone()).recent_raw_lines(max_bytes, audience))
     }
 
-    fn list_active_alerts(&self) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
-        let alerts = self.alerts_repo.list_open()?;
-        Ok(alerts.iter().map(alert_to_dto).collect())
+    fn list_alerts(
+        &self,
+        filter: AlertListFilter,
+        audience: &DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
+        let alerts = match filter {
+            AlertListFilter::Open => self.alerts_repo.list_open()?,
+            AlertListFilter::In(state) => self.alerts_repo.list_by_state(state)?,
+            AlertListFilter::All => {
+                let mut all = Vec::new();
+                for state in [
+                    SecurityAlertState::Active,
+                    SecurityAlertState::Acknowledged,
+                    SecurityAlertState::Resolved,
+                    SecurityAlertState::Superseded,
+                ] {
+                    all.extend(self.alerts_repo.list_by_state(state)?);
+                }
+                all
+            }
+        };
+        let owner = |revision_id: &str| self.principal_of_revision(revision_id);
+        Ok(
+            crate::alert_audience::scope_alerts(alerts, audience, &owner)
+                .iter()
+                .map(alert_to_dto)
+                .collect(),
+        )
     }
 
     fn acknowledge_alert(&self, req: &AcknowledgeAlertRequest) -> DiagnosticsResult<()> {
@@ -193,34 +202,9 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         }
         Err(DiagnosticsError::AuditWriteFailed {
             reason: "acknowledge_alert must be routed through \
-                     MutationKind::SecurityAlertAck (block 16.10)"
+                     MutationKind::SecurityAlertAck"
                 .into(),
         })
-    }
-
-    fn set_diagnostic_mode(&self, req: &SetDiagnosticModeRequest) -> DiagnosticsResult<()> {
-        let now_ms = millis_since_epoch();
-        if !req.enabled {
-            self.diagnostic_session.store(None);
-            return Ok(());
-        }
-        let scope = req
-            .scope
-            .as_deref()
-            .map(slug_to_scope)
-            .unwrap_or(DiagnosticSessionScope::All);
-        // The "until restart" radio maps to a no-expiry session; the
-        // 1h/4h radios pass a bounded duration.
-        let session = if req.until_restart {
-            DiagnosticSession::until_restart(now_ms, "gui-user", scope, None)
-        } else {
-            let duration_ms = req
-                .duration_ms
-                .unwrap_or(DiagnosticSession::DEFAULT_DURATION_MS);
-            DiagnosticSession::new(now_ms, duration_ms, "gui-user", scope, None)
-        };
-        self.diagnostic_session.store(Some(session));
-        Ok(())
     }
 
     fn clear_logs(&self, req: &ClearLogsRequest) -> DiagnosticsResult<ClearLogsResult> {

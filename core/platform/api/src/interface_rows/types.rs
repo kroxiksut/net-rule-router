@@ -58,13 +58,13 @@ impl InterfacesDataSource {
 }
 
 /// One enriched adapter row consumed by the GUI list and the diagnostics
-/// surfaces. `selected_role` / `route_state` start unbound here — the
-/// preview layer (mock-backend) and the GUI re-apply user role bindings.
+/// surfaces. `selected_role` / `route_state` start unbound; the desktop
+/// applies the user's bindings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceRouteRow {
     pub persistent_id: String,
     pub adapter_name: String,
-    pub windows_name: String,
+    pub name: String,
     pub interface_description: String,
     pub interface_type: String,
     pub is_bluetooth_like: bool,
@@ -103,13 +103,9 @@ pub struct InterfaceRouteRow {
     pub derived_assessment: DerivedInterfaceAssessment,
     // ── Decoration slots ─────────────────────────────────────────────────
     //
-    // The three fields below are NOT observations. Nothing on the service side
-    // fills them — `from_wire_dto` resets them on the way in — and the preview
-    // layer recomputes all three from the fields above on every pass. Reading
-    // one as "what the service is enforcing" is the mistake they invite: the
-    // row can arrive from the service and still carry a purely local verdict
-    // here. Their meaning is decided in `nrr-mock-backend::network_interfaces`.
-    /// Advisory only, and it says so on the wire (`advisory_only`).
+    // The three fields below are NOT observations and never say what the
+    // service enforces: they are derived from the fields above.
+    /// Advisory only, from [`assign_recommendations`] over the rows alone.
     pub recommendation: RouteRoleRecommendation,
     /// The role the USER bound, re-applied from the request — not a role the
     /// service reported.
@@ -145,7 +141,6 @@ pub struct RouteRoleRecommendation {
     pub class: RecommendationClass,
     pub confidence: RecommendationConfidence,
     pub advisory_only: bool,
-    pub summary: String,
     pub key_signals: Vec<String>,
     pub excluded_alternatives: Vec<String>,
 }

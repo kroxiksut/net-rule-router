@@ -153,12 +153,12 @@ impl ActivationCoordinator {
         self.enforce_active_integrity_all(correlation_id)
     }
 
-    /// Verifies every principal's active revision (HMAC + Free rule cap)
-    /// and rolls each failing one back to the newest trusted prior
-    /// revision. Run once at service startup, before any SID install, so
-    /// a row written into `revisions` outside the app is never enforced.
-    /// Best-effort per principal: one principal's storage error does not
-    /// abort the sweep for the rest.
+    /// Verifies every principal's active revision (HMAC + Free rule cap),
+    /// rolls each failing one back to the newest trusted prior revision, and
+    /// makes each pointer name what the `active` status names. Run once at
+    /// service startup, before any SID install, so a row written into
+    /// `revisions` outside the app is never enforced. This is the only
+    /// recovery: the keyless boot check before it only reports.
     pub fn enforce_active_integrity_all(
         &self,
         correlation_id: &str,
@@ -175,17 +175,36 @@ impl ActivationCoordinator {
                     message: e.to_string(),
                 })?
         };
-        if !principals
-            .iter()
-            .any(|p| p == nrr_storage::BASELINE_PRINCIPAL)
+        // A pointer can outlive every row of its principal when an editor ran
+        // without foreign keys; it still has to be cleared.
+        let with_pointer = {
+            let conn = self.conn.lock().expect("connection mutex poisoned");
+            self.revisions_repo(&conn)
+                .verify_all_pointers()
+                .map_err(|e| PolicyError::StorageFailure {
+                    operation: "verify_all_pointers",
+                    message: e.to_string(),
+                })?
+        };
+        for principal in with_pointer
+            .into_iter()
+            .map(|(p, _)| p)
+            .chain(std::iter::once(nrr_storage::BASELINE_PRINCIPAL.to_string()))
         {
-            principals.push(nrr_storage::BASELINE_PRINCIPAL.to_string());
+            if !principals.contains(&principal) {
+                principals.push(principal);
+            }
         }
-        let mut outcomes = Vec::with_capacity(principals.len());
-        for principal in principals {
-            let outcome = self.enforce_active_integrity_for(&principal, correlation_id)?;
-            outcomes.push((principal, outcome));
-        }
+        // One principal's failure must not leave the rest unchecked.
+        let outcomes = principals
+            .into_iter()
+            .map(|principal| {
+                let outcome = self
+                    .enforce_active_integrity_for(&principal, correlation_id)
+                    .unwrap_or_else(|error| ActiveIntegrityOutcome::CheckFailed { error });
+                (principal, outcome)
+            })
+            .collect();
         Ok(outcomes)
     }
 
@@ -211,12 +230,16 @@ impl ActivationCoordinator {
             .first()
             .filter(|e| e.record.status == RevisionStatus::Active)
         else {
-            return Ok(ActiveIntegrityOutcome::NoActiveRevision);
+            return Ok(self
+                .realign_pointer(principal, None)?
+                .unwrap_or(ActiveIntegrityOutcome::NoActiveRevision));
         };
         let Some(reason) = classify_reject_reason(&active.record, active.verification) else {
-            return Ok(ActiveIntegrityOutcome::Trusted {
-                revision_id: active.record.revision_id.clone(),
-            });
+            return Ok(self
+                .realign_pointer(principal, Some(&active.record))?
+                .unwrap_or_else(|| ActiveIntegrityOutcome::Trusted {
+                    revision_id: active.record.revision_id.clone(),
+                }));
         };
         let rejected_revision_id = active.record.revision_id.clone();
         let rejected_user_rule_count =
@@ -319,5 +342,64 @@ impl ActivationCoordinator {
             });
 
         Ok(outcome)
+    }
+
+    /// Point `principal`'s pointer at its `active` row, or clear it when there
+    /// is none. Every enforcement read goes by status, so the status is the
+    /// truth and the pointer follows it; a pointer left elsewhere is what let
+    /// the next activation's supersede undo a recovery. `None` when it already
+    /// agreed and its signature holds.
+    fn realign_pointer(
+        &self,
+        principal: &str,
+        active: Option<&RevisionRecord>,
+    ) -> Result<Option<ActiveIntegrityOutcome>, PolicyError> {
+        let storage = |operation: &'static str| {
+            move |e: nrr_storage::StorageError| PolicyError::StorageFailure {
+                operation,
+                message: e.to_string(),
+            }
+        };
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let repo = self.revisions_repo(&conn);
+        let pointer_was = repo
+            .get_active_pointer_for(principal)
+            .map_err(storage("get_active_pointer(integrity)"))?
+            .map(|p| p.revision_id);
+        let signature_holds = !repo
+            .verify_all_pointers()
+            .map_err(storage("verify_all_pointers(integrity)"))?
+            .iter()
+            .any(|(p, v)| p == principal && *v == HmacVerification::Tampered);
+        let active_id = active.map(|r| r.revision_id.clone());
+        if pointer_was == active_id && signature_holds {
+            return Ok(None);
+        }
+        match active {
+            Some(record) => repo
+                .set_active_pointer_for(
+                    principal,
+                    &ActiveRevisionPointer {
+                        revision_id: record.revision_id.clone(),
+                        activated_at: record.activated_at.unwrap_or_else(|| self.clock.now_secs()),
+                        apply_attempt_id: None,
+                    },
+                )
+                .map_err(storage("set_active_pointer(integrity)"))?,
+            None => repo
+                .clear_active_pointer_for(principal)
+                .map_err(storage("clear_active_pointer(integrity)"))?,
+        }
+        tracing::warn!(
+            target: "nrr::tamper",
+            principal = %principal,
+            pointer_was = ?pointer_was,
+            active = ?active_id,
+            "active pointer disagreed with the active revision; realigned",
+        );
+        Ok(Some(ActiveIntegrityOutcome::PointerRealigned {
+            pointer_was,
+            revision_id: active_id,
+        }))
     }
 }

@@ -104,6 +104,14 @@ pub struct PlatformSupports {
     /// Blocked-connection notices: the per-SID journal, its mutes, and the
     /// offer to re-route a blocked destination. Fed by the connection observer.
     pub block_notices: bool,
+    /// An administrator can restart a broken audit chain. The restart is sealed
+    /// with the service's integrity key; a daemon that holds none cannot tell
+    /// its own restart from a forged one, so it refuses every restart.
+    pub audit_chain_restart: bool,
+    /// The connection trace can be written to the service's operational log.
+    /// Where the observer only feeds the in-memory panel, the GUI does not
+    /// offer a switch that would write nothing.
+    pub conn_trace_log: bool,
 
     // ── Capability INVERSIONS ────────────────────────────────────────────────
     // Unlike the flags above (a Windows superset that other OSes may lack),
@@ -166,6 +174,8 @@ impl PlatformProfile {
                 service_stability_config: true,
                 local_network_exceptions: true,
                 block_notices: true,
+                audit_chain_restart: true,
+                conn_trace_log: true,
                 // Inversions: Windows blocks apps leak-proof (ALE_APP_ID) but
                 // cannot route per-user or scope a per-user block to all
                 // protocols (packet layer forces user_sid = None).
@@ -201,6 +211,10 @@ impl PlatformProfile {
                 service_stability_config: false,
                 local_network_exceptions: false,
                 block_notices: false,
+                // The daemon wires no integrity key into the coordinator.
+                audit_chain_restart: false,
+                // The Linux observer tees into the panel's ring only.
+                conn_trace_log: false,
                 // Inversions: Linux routes per-user (ip rule uidrange) and
                 // scopes per-user blocks to all protocols (meta skuid), which
                 // Windows cannot — but its per-app block is NOT leak-proof
@@ -233,6 +247,8 @@ impl PlatformProfile {
                 service_stability_config: false,
                 local_network_exceptions: false,
                 block_notices: false,
+                audit_chain_restart: false,
+                conn_trace_log: false,
                 // Conservative until the macOS Network Extension backend is
                 // verified: claim none of the inversions (an unverified
                 // capability flag defaults to `false`, never a false promise).
@@ -267,11 +283,11 @@ mod tests {
         assert!(s.kill_switch && s.app_routing && s.dns_observe && s.dns_resolver);
         assert!(s.hosts_pin && s.background_service && s.autostart);
         assert!(s.service_stability_config && s.local_network_exceptions && s.block_notices);
+        assert!(s.audit_chain_restart && s.conn_trace_log);
     }
 
-    /// The three service-backed features whose Linux handlers are not
-    /// registered. A `true` here would put the GUI back to asking for an
-    /// operation the daemon answers "not yet implemented".
+    /// Service-backed features the Linux daemon does not carry out. A `true`
+    /// here would put the GUI back to asking for an operation it refuses.
     #[test]
     fn unimplemented_service_features_are_false_off_windows() {
         for supports in [
@@ -281,6 +297,8 @@ mod tests {
             assert!(!supports.service_stability_config);
             assert!(!supports.local_network_exceptions);
             assert!(!supports.block_notices);
+            assert!(!supports.audit_chain_restart);
+            assert!(!supports.conn_trace_log);
         }
     }
 
@@ -303,6 +321,8 @@ mod tests {
         assert_eq!(v["supports"]["serviceStabilityConfig"], true);
         assert_eq!(v["supports"]["localNetworkExceptions"], true);
         assert_eq!(v["supports"]["blockNotices"], true);
+        assert_eq!(v["supports"]["auditChainRestart"], true);
+        assert_eq!(v["supports"]["connTraceLog"], true);
         // Inversion flags reach QML under camelCase keys too.
         assert_eq!(v["supports"]["perAppBlockLeakproof"], true);
         assert_eq!(v["supports"]["perUserRouting"], false);
@@ -319,7 +339,7 @@ mod tests {
         assert!(hosts_content_has_entries("127.0.0.1 ads.example.com\n"));
         assert!(hosts_content_has_entries("0.0.0.0 tracker.example\n"));
         assert!(hosts_content_has_entries(
-            "23.10.20.138 example.com # pinned\n"
+            "203.0.113.138 example.com # pinned\n"
         ));
         assert!(hosts_content_has_entries("::1 ipv6.local\n"));
         // An IP with no hostname, or junk, is not an entry.

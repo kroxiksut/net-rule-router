@@ -1,12 +1,11 @@
-//! Privacy filtering, redaction, and diagnostic session.
+//! Privacy filtering and redaction.
 //!
-//! # Three components
+//! # Two components
 //!
 //! | Module   | Responsibility                                               |
 //! |----------|--------------------------------------------------------------|
-//! | `mode`   | `RedactionMode`, `DiagnosticSession`, mode conversions       |
+//! | `mode`   | `RedactionMode` and its conversions                          |
 //! | `redact` | `Redacted<T>`, redaction markers, per-field helper functions |
-//! | `secret` | `SecretNeverLog<T>` — deny-by-construction                   |
 //!
 //! # Unified policy
 //!
@@ -17,12 +16,10 @@
 
 pub mod mode;
 pub mod redact;
-pub mod secret;
 
-pub use mode::{DiagnosticSession, DiagnosticSessionScope, RedactionMode};
+pub use mode::RedactionMode;
 pub use redact::{
     redact_adapter_id, redact_hostname, redact_ipv4, redact_ipv4_str, redact_process_path,
-    redact_resolver_source, Redacted, MARKER_DIAGNOSTIC_REQUIRED, MARKER_MASKED_IPV4,
-    MARKER_MASKED_PATH, MARKER_PRIVATE_IPV4, MARKER_PUBLIC_IPV4, MARKER_REDACTED,
+    redact_resolver_source, Redacted, MARKER_MASKED_IPV4, MARKER_MASKED_PATH, MARKER_PRIVATE_IPV4,
+    MARKER_PUBLIC_IPV4, MARKER_REDACTED,
 };
-pub use secret::SecretNeverLog;

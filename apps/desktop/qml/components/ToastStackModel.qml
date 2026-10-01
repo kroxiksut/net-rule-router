@@ -10,9 +10,7 @@
 //   completed ← settle("completed")  (auto-dismissed by OperationToast
 //                                    after a few seconds)
 //   failed    ← settle("failed")     (NOT auto-dismissed; user must
-//                                    click ✕ — per design memory
-//                                    `project_block16_12_design.md`
-//                                    decision #8)
+//                                    click ✕ to dismiss it)
 //
 // Eviction policy when the stack would exceed `capacity`:
 //   * Prefer to drop the oldest non-failed entry (completed first,

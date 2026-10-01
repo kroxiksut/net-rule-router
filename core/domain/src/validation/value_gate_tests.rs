@@ -6,10 +6,8 @@ fn err_for(value: &str) -> ValidationError {
         .expect_err("must be refused")
 }
 
-/// The `--- IP` section passes an unparseable value through as a domain so
-/// the semantic validator can name the problem. It never did: a subnet, a
-/// range and a typo were all accepted as host names, with zero errors and
-/// zero warnings, and travelled into storage and codegen.
+/// A subnet, a range or a typo in a domain rule was once accepted as a host
+/// name and travelled into storage and codegen; it is refused and named.
 #[test]
 fn an_address_shaped_value_is_refused_and_named() {
     assert!(matches!(
@@ -69,4 +67,41 @@ fn ordinary_host_names_still_pass() {
             "{value} must be accepted"
         );
     }
+}
+
+/// The matcher drops a host longer than 253 octets as malformed, so a rule
+/// naming one was accepted and never matched. The limit is on the punycode
+/// form: an IDN that fits in UTF-8 can outgrow it once encoded.
+#[test]
+fn a_name_longer_than_253_octets_is_refused_the_way_the_matcher_drops_it() {
+    let label = |c: char, n: usize| c.to_string().repeat(n);
+    let fits = [
+        label('a', 63),
+        label('b', 63),
+        label('c', 63),
+        label('d', 61),
+    ]
+    .join(".");
+    let over = [
+        label('a', 63),
+        label('b', 63),
+        label('c', 63),
+        label('d', 62),
+    ]
+    .join(".");
+    assert_eq!(fits.len(), 253);
+    let mut warnings = Vec::new();
+    assert!(normalize_domain_label(&fits, &RuleId("r-1".to_owned()), &mut warnings).is_ok());
+    assert!(matches!(
+        err_for(&over),
+        ValidationError::DomainInvalidValue { .. }
+    ));
+
+    let idn_label = format!("{}ü", label('a', 55));
+    let idn = [idn_label.as_str(); 4].join(".");
+    assert!(idn.len() <= 253, "fits before encoding");
+    assert!(matches!(
+        err_for(&idn),
+        ValidationError::DomainInvalidValue { .. }
+    ));
 }

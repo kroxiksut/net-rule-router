@@ -24,4 +24,19 @@ const NET: &str = "10.0.0.0/8"; // 10.0.0.0/8 is private
 const VERSION: &str = "16.18.vpn"; // string data only
 // Fixed in 16.18.vpn slice D.
 // Block T keeps the traffic counter.
+// block D of the spec needs no changes.
+// a block of code is not a marker, nor is block all traffic.
 // Direct-answer steering (П0-D).
+
+// Lost `\` continuation, collapsed onto one line by the cleanup pass that
+// dropped it: a wide gap flanked by text on both sides is reported.
+const GAP: &str = "one line ends here                              and continues where a backslash used to be";
+// A gap under the threshold must not be reported.
+const SHORT_GAP: &str = "one line ends here     and a short gap stays under the threshold";
+// A raw string keeps its own formatting and is exempt even with the same gap.
+const RAW_OK: &str = r"one line ends here                              and continues, but raw strings are exempt";
+// A genuine multi-line literal (this codebase's SQL text uses exactly this
+// shape) is not reported: the check only looks inside one physical line, and
+// a continuation line's leading indentation has no string content before it.
+const SQL_OK: &str = "SELECT * FROM t WHERE a = 1
+              AND b = 2";

@@ -117,8 +117,8 @@ pub const TASK_ID_OPERATION_RESULTS_GC: &str = "operation-results-gc";
 /// Periodic revisions retention pruner. Runs the same 1-hour cadence
 /// as `diagnostics-cleanup`. Optional class.
 pub const TASK_ID_REVISIONS_RETENTION: &str = "revisions-retention-prune";
-/// Periodic WAL checkpoint over every database the service holds open. Same
-/// 1-hour cadence as the retention pruners. Optional class.
+/// Periodic cache sweep and WAL checkpoint over every database the service
+/// holds open. Same 1-hour cadence as the retention pruners. Optional class.
 pub const TASK_ID_STORAGE_CHECKPOINT: &str = "storage-wal-checkpoint";
 pub const TASK_ID_IPC_ACCEPT_LOOP: &str = "ipc-accept-loop";
 pub const TASK_ID_IPC_SHUTDOWN_WATCHER: &str = "ipc-shutdown-watcher";

@@ -96,6 +96,81 @@ fn a_rebuilt_executable_reads_as_a_different_build() {
     }
 }
 
+mod reclaim {
+    use super::super::single_instance::SingleInstanceGuard;
+    use super::parse_pid_from_lock_content;
+    use nrr_platform_api::error::PlatformError;
+    use nrr_platform_api::single_instance::{SingleInstanceClaim, SingleInstancePort};
+    use std::fs;
+    use std::io;
+
+    struct HeldClaim;
+    impl SingleInstanceClaim for HeldClaim {}
+
+    enum FakePort {
+        Refuses,
+        Fails,
+        Grants,
+    }
+
+    impl SingleInstancePort for FakePort {
+        fn claim(&self, _key: &str) -> Result<Option<Box<dyn SingleInstanceClaim>>, PlatformError> {
+            match self {
+                Self::Refuses => Ok(None),
+                Self::Fails => Err(PlatformError::AccessDenied { operation: "claim" }),
+                Self::Grants => Ok(Some(Box::new(HeldClaim))),
+            }
+        }
+    }
+
+    const LIVE_PRIMARY_LOCK: &str = "pid=4242\nversion=0.0.0\nexe_size=1\nexe_mtime=2\n";
+
+    #[test]
+    fn a_refused_takeover_leaves_the_live_primarys_lock_in_place() {
+        for port in [FakePort::Refuses, FakePort::Fails] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("gui-shell-v1.lock");
+            fs::write(&path, LIVE_PRIMARY_LOCK).expect("primary's lock");
+
+            let refused =
+                SingleInstanceGuard::reclaim_at(path.clone(), "gui-shell-v1", Some(&port));
+
+            assert_eq!(
+                refused.err().map(|e| e.kind()),
+                Some(io::ErrorKind::AddrInUse)
+            );
+            assert_eq!(
+                fs::read_to_string(&path).expect("lock survives"),
+                LIVE_PRIMARY_LOCK
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_lock_is_reclaimed_once_the_claim_is_granted() {
+        for port in [Some(FakePort::Grants), None] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("gui-shell-v1.lock");
+            fs::write(&path, LIVE_PRIMARY_LOCK).expect("stale lock");
+
+            let guard = SingleInstanceGuard::reclaim_at(
+                path.clone(),
+                "gui-shell-v1",
+                port.as_ref().map(|p| p as &dyn SingleInstancePort),
+            )
+            .expect("takeover");
+
+            let content = fs::read_to_string(&path).expect("new lock");
+            assert_eq!(
+                parse_pid_from_lock_content(&content),
+                Some(std::process::id())
+            );
+            drop(guard);
+            assert!(!path.exists(), "the new owner removes its own lock on exit");
+        }
+    }
+}
+
 /// The written record and the parser are one format or the comparison is
 /// worthless: a writer that drifts reads back as "no build information".
 #[test]
@@ -223,8 +298,9 @@ fn a_live_owner_earns_the_long_activation_wait() {
     // Our own pid stands in for a primary that exists but has not reached
     // the point of reading the activation file yet.
     let key = format!("nrr-test-live-owner-{}", std::process::id());
-    let dir = nrr_platform_api::paths::user_runtime_dir();
-    std::fs::create_dir_all(&dir).expect("runtime dir");
+    // Created the way production creates it: a plain `create_dir_all` leaves
+    // a 0755 dir on Unix that every later `acquire` refuses.
+    let dir = nrr_platform_api::paths::ensure_user_runtime_dir().expect("runtime dir");
     let lock = dir.join(format!("{key}.lock"));
     std::fs::write(
         &lock,

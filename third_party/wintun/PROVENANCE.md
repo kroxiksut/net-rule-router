@@ -52,7 +52,7 @@ Get-FileHash .\bin\amd64\wintun.dll -Algorithm SHA256
 The same two checks run automatically:
 
 - `cargo test -p nrr-platform-windows fake_ip` asserts the vendored hash still
-  matches the value pinned in `nrr_platform_api::third_party::WINTUN_COMPONENT`
+  matches the value pinned in `nrr_shared::third_party::WINTUN_COMPONENT`
   and that the driver loads through the signature-verifying loader.
 - At runtime the application re-checks the copy actually in use and reports the
   result to the user (path, hash, signer), so a substituted DLL is visible
@@ -64,7 +64,8 @@ The same two checks run automatically:
    its SHA-256 with the value published on that page.
 2. Replace the files here and update every hash in this document.
 3. Update `version` and `known_sha256` in
-   `core/platform/api/src/third_party.rs`.
+   `shared/contracts/src/third_party.rs` (`WINTUN_COMPONENT`; the platform port only
+   re-exports it).
 4. Run `cargo test -p nrr-platform-windows fake_ip` — the pin-drift test fails
    until step 3 is done, by design.
 5. Update `THIRD_PARTY_LICENSES.md` if the licence text changed.

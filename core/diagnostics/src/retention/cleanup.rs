@@ -169,90 +169,11 @@ fn apply_retention(
     max_files: u32,
     result: &mut CleanupResult,
 ) {
-    let now = SystemTime::now();
-    let age_threshold = Duration::from_secs(max_age_days as u64 * 86400);
-
-    // The newest file is the one the writer currently holds open, and this
-    // module's header has always promised to skip it. There was no code behind
-    // the promise: a size pass could unlink the live file while `write_all` went
-    // on returning `Ok` (Linux unlinks the inode, Windows opens with
-    // FILE_SHARE_DELETE), so security events would be written into nothing and
-    // reported as recorded. Protecting the newest entry keeps the promise
-    // without threading a file handle through every caller.
-    let (files, live) = split_off_newest(files);
-
-    // Remaining files after age-based deletion (newest-first for size/count trimming).
-    let mut remaining: Vec<&FileEntry> = Vec::new();
-
-    for f in files {
-        let age = now.duration_since(f.modified).unwrap_or(Duration::ZERO);
-        if max_age_days > 0 && age > age_threshold {
-            match std::fs::remove_file(&f.path) {
-                Ok(()) => result.deleted(f.size),
-                Err(e) => result.error(&f.path, &e.to_string()),
-            }
-        } else {
-            remaining.push(f);
-        }
-    }
-
-    // Count-based trim: keep only the newest `max_files` files. The protected
-    // live file is one of them, so it counts against the budget — otherwise
-    // "keep 2" would quietly keep 3.
-    let keep_closed = (max_files as usize).saturating_sub(live.iter().count());
-    if max_files > 0 && remaining.len() > keep_closed {
-        let to_delete = remaining.len() - keep_closed;
-        // `remaining` is oldest-first, so delete from the front.
-        for f in remaining.iter().take(to_delete) {
-            match std::fs::remove_file(&f.path) {
-                Ok(()) => result.deleted(f.size),
-                Err(e) => result.error(&f.path, &e.to_string()),
-            }
-        }
-        remaining = remaining.into_iter().skip(to_delete).collect();
-    }
-
-    // Size-based trim: delete oldest until total size is within limit.
-    //
-    // Zero means "no size cap", exactly as `max_age_days` and `max_files` above
-    // already read it and as the config layer documents and validates it. Taken
-    // literally it meant "shrink to zero bytes": the loop could never satisfy
-    // `total_size <= 0`, so picking "do not limit the size" in Settings deleted
-    // every log — and, through `run_audit`, the whole audit hash chain with it.
-    if max_total_size_bytes == 0 {
-        return;
-    }
-    // The live file counts toward the total: the cap is about disk usage, and
-    // pretending it is not there would trim the closed files harder than asked.
-    let mut total_size: u64 =
-        remaining.iter().map(|f| f.size).sum::<u64>() + live.map(|f| f.size).unwrap_or(0);
-    // Decide the whole delete set FIRST, then attempt it. Shrinking the running
-    // total only on success let one failed delete (file held by an export, an
-    // ACL) push the loop on into ever NEWER files, deleting past the budget the
-    // successful part had already met. Over budget until the next pass is the
-    // right failure; deleting more than asked is not.
-    let mut doomed = 0usize;
-    for f in &remaining {
-        if total_size <= max_total_size_bytes {
-            break;
-        }
-        total_size = total_size.saturating_sub(f.size);
-        doomed += 1;
-    }
-    for f in remaining.iter().take(doomed) {
+    for f in retention_plan(files, max_age_days, max_total_size_bytes, max_files) {
         match std::fs::remove_file(&f.path) {
             Ok(()) => result.deleted(f.size),
             Err(e) => result.error(&f.path, &e.to_string()),
         }
-    }
-}
-
-/// Split the newest entry off the (oldest-first) list. That entry is the file
-/// the writer holds open; the rest are rotated away and safe to delete.
-fn split_off_newest(files: &[FileEntry]) -> (&[FileEntry], Option<&FileEntry>) {
-    match files.split_last() {
-        Some((newest, rest)) => (rest, Some(newest)),
-        None => (files, None),
     }
 }
 
@@ -263,39 +184,78 @@ fn dry_run_retention(
     max_files: u32,
     result: &mut CleanupResult,
 ) {
+    for f in retention_plan(files, max_age_days, max_total_size_bytes, max_files) {
+        result.deleted(f.size);
+    }
+}
+
+/// The files a pass removes, oldest first. One plan for the real pass and its
+/// preview: two copies drifted, and the preview promised one file fewer than
+/// the pass then deleted.
+///
+/// The whole set is decided before anything is attempted. Shrinking the
+/// running total only on a successful delete let one failure (a file held by
+/// an export, an ACL) push the pass on into ever NEWER files; over budget until
+/// the next pass is the right failure, deleting more than asked is not.
+fn retention_plan(
+    files: &[FileEntry],
+    max_age_days: u32,
+    max_total_size_bytes: u64,
+    max_files: u32,
+) -> Vec<&FileEntry> {
     let now = SystemTime::now();
     let age_threshold = Duration::from_secs(max_age_days as u64 * 86400);
-    let (files, live) = split_off_newest(files);
-    let mut remaining: Vec<&FileEntry> = Vec::new();
 
+    // The newest file is the one the writer holds open. Unlinking it lets
+    // `write_all` go on returning `Ok` into nothing (Linux unlinks the inode,
+    // Windows opens with FILE_SHARE_DELETE).
+    let (files, live) = split_off_newest(files);
+
+    let mut doomed: Vec<&FileEntry> = Vec::new();
+    let mut remaining: Vec<&FileEntry> = Vec::new();
     for f in files {
         let age = now.duration_since(f.modified).unwrap_or(Duration::ZERO);
         if max_age_days > 0 && age > age_threshold {
-            result.deleted(f.size); // dry-run: count but don't delete
+            doomed.push(f);
         } else {
             remaining.push(f);
         }
     }
 
-    if max_files > 0 && remaining.len() > max_files as usize {
-        let to_delete = remaining.len() - max_files as usize;
-        for f in remaining.iter().take(to_delete) {
-            result.deleted(f.size);
-        }
-        remaining = remaining.into_iter().skip(to_delete).collect();
+    // The protected live file counts against the file budget, or "keep 2"
+    // would quietly keep 3.
+    let keep_closed = (max_files as usize).saturating_sub(live.iter().count());
+    if max_files > 0 && remaining.len() > keep_closed {
+        let excess = remaining.len() - keep_closed;
+        doomed.extend(remaining.drain(..excess));
     }
 
+    // Zero means "no size cap", as for age and count. Read literally it meant
+    // "shrink to zero bytes" and deleted every log and the whole audit chain.
     if max_total_size_bytes == 0 {
-        return;
+        return doomed;
     }
+    // The live file counts toward the total: the cap is about disk usage.
     let mut total_size: u64 =
         remaining.iter().map(|f| f.size).sum::<u64>() + live.map(|f| f.size).unwrap_or(0);
+    let mut excess = 0usize;
     for f in &remaining {
         if total_size <= max_total_size_bytes {
             break;
         }
-        result.deleted(f.size);
         total_size = total_size.saturating_sub(f.size);
+        excess += 1;
+    }
+    doomed.extend(remaining.drain(..excess));
+    doomed
+}
+
+/// Split the newest entry off the (oldest-first) list. That entry is the file
+/// the writer holds open; the rest are rotated away and safe to delete.
+fn split_off_newest(files: &[FileEntry]) -> (&[FileEntry], Option<&FileEntry>) {
+    match files.split_last() {
+        Some((newest, rest)) => (rest, Some(newest)),
+        None => (files, None),
     }
 }
 
@@ -354,7 +314,6 @@ mod tests {
             max_files: 2,
             max_age_days: 0,                // no age limit
             max_total_size_bytes: u64::MAX, // no size limit
-            ..LogRetentionPolicy::default()
         };
         let scope = ManualCleanupScope::default();
         let r = CleanupJob::run_logs(dir.path(), &policy, &scope);
@@ -382,7 +341,6 @@ mod tests {
             max_files: 0,
             max_age_days: 0,
             max_total_size_bytes: 0,
-            ..LogRetentionPolicy::default()
         };
         let r = CleanupJob::run_logs(dir.path(), &policy, &ManualCleanupScope::default());
         assert_eq!(r.files_deleted, 0, "zero means unlimited, not 'delete all'");
@@ -440,7 +398,6 @@ mod tests {
             // take the file currently being written to as well.
             max_age_days: 1,
             max_total_size_bytes: u64::MAX,
-            ..LogRetentionPolicy::default()
         };
         let _ = CleanupJob::run_logs(dir.path(), &policy, &ManualCleanupScope::default());
         assert!(
@@ -461,7 +418,6 @@ mod tests {
             max_total_size_bytes: 8, // allow only 2 files worth
             max_age_days: 0,
             max_files: 0,
-            ..LogRetentionPolicy::default()
         };
         let scope = ManualCleanupScope::default();
         let r = CleanupJob::run_logs(dir.path(), &policy, &scope);
@@ -485,7 +441,6 @@ mod tests {
             max_files: 0,
             max_age_days: 0,
             max_total_size_bytes: 1, // tiny limit to force deletion
-            ..LogRetentionPolicy::default()
         };
         let scope = ManualCleanupScope::default();
         CleanupJob::run_logs(dir.path(), &policy, &scope);
@@ -508,7 +463,6 @@ mod tests {
             max_files: 2,
             max_age_days: 0,
             max_total_size_bytes: u64::MAX,
-            ..LogRetentionPolicy::default()
         };
         let scope = ManualCleanupScope::default();
         let r = CleanupJob::dry_run_logs(dir.path(), &policy, &scope);
@@ -517,6 +471,37 @@ mod tests {
         assert!(r.files_deleted > 0);
         let still_present = std::fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(still_present, 5, "dry run must not delete files");
+    }
+
+    /// The preview is a promise: it names what the real pass then deletes, no
+    /// more and no less. The real pass reserves a slot for the live file and
+    /// the dry run did not, so it promised one file fewer.
+    #[test]
+    fn a_dry_run_promises_exactly_what_the_real_run_deletes() {
+        let policies = [
+            LogRetentionPolicy {
+                max_files: 2,
+                max_age_days: 0,
+                max_total_size_bytes: 0,
+            },
+            LogRetentionPolicy {
+                max_files: 0,
+                max_age_days: 0,
+                max_total_size_bytes: 9,
+            },
+        ];
+        for policy in policies {
+            let dir = tempfile::tempdir().expect("temp");
+            for i in 1..=5 {
+                log_file(dir.path(), i);
+            }
+            let scope = ManualCleanupScope::default();
+            let promised = CleanupJob::dry_run_logs(dir.path(), &policy, &scope);
+            let done = CleanupJob::run_logs(dir.path(), &policy, &scope);
+            assert!(done.files_deleted > 0, "{policy:?}");
+            assert_eq!(promised.files_deleted, done.files_deleted, "{policy:?}");
+            assert_eq!(promised.bytes_freed, done.bytes_freed, "{policy:?}");
+        }
     }
 
     #[test]
@@ -618,7 +603,6 @@ mod tests {
             max_age_days: 0,
             max_total_size_bytes: 250,
             max_files: 0,
-            ..LogRetentionPolicy::default()
         };
         let r = CleanupJob::run_logs(dir.path(), &policy, &ManualCleanupScope::default());
 

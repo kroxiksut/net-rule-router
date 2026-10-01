@@ -9,6 +9,7 @@ members = [
   # so it can leave this repository as its own published crate.
   # `tests/independence.rs` enforces that.
   "core/platform/nftlink",
+  "core/sqlite-support",
   "core/storage",
   "core/storage-sidecar",
   "core/diagnostics",

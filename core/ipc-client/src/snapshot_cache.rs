@@ -7,8 +7,8 @@
 //! directory (`%LOCALAPPDATA%\<product>\` on Windows,
 //! `$XDG_CACHE_HOME/<product>/` on Unix). When the channel later
 //! goes down (service restart, killed by user, network glitch on a
-//! domain-joined box) the [`crate::IpcBackendFacade`] can hand the GUI a
-//! cached snapshot tagged `stale = true` so screens don't blank out.
+//! domain-joined box) the GUI's backend facade can hand it a cached snapshot
+//! tagged `stale = true` so screens don't blank out.
 //!
 //! ## Why a file (not in-memory)
 //!
@@ -46,8 +46,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use nrr_application::backend_facade::CacheError;
 use nrr_shared::ipc_payloads::MutationKind;
+
+/// A cache that cannot be read or written. Never fatal: the cache is decoration.
+#[derive(Debug)]
+pub enum CacheError {
+    /// I/O failure reading or writing the cache directory.
+    Io(String),
+    /// Serialization failure (cache payload corrupted or schema drift).
+    Serialization(String),
+}
+
+impl std::fmt::Display for CacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(s) => write!(f, "snapshot cache I/O error: {s}"),
+            Self::Serialization(s) => write!(f, "snapshot cache serialization error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for CacheError {}
 
 /// Entries written by a build that speaks a different wire contract are
 /// deleted on read rather than returned.
@@ -61,10 +80,7 @@ fn contract_fingerprint() -> String {
     nrr_shared::contract_fingerprint()
 }
 
-/// TTL for the service-health entry — short because health flips fast.
-pub const HEALTH_TTL_SECS: u64 = 5 * 60;
-
-/// TTL for snapshot entries — longer because snapshots are expensive to
+/// TTL for snapshot entries — long because snapshots are expensive to
 /// recompute and the data is decoration during reconnect.
 pub const SNAPSHOT_TTL_SECS: u64 = 60 * 60;
 
@@ -72,70 +88,43 @@ pub const SNAPSHOT_TTL_SECS: u64 = 60 * 60;
 /// the cache root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CacheKey {
-    /// `service.health.get`
-    ServiceHealth,
-    /// `snapshot.initial.get` — the bundled first-render snapshot.
-    SnapshotInitial,
     /// `snapshot.interfaces.get`
     SnapshotInterfaces,
     /// `snapshot.diagnostics.get`
     SnapshotDiagnostics,
     /// `security.alerts.list`
     SecurityAlerts,
-    /// `rules.list` with `route = all`
-    RulesAll,
-    /// `rules.list` with `route = primary`
-    RulesPrimary,
-    /// `rules.list` with `route = secondary`
-    RulesSecondary,
 }
 
 impl CacheKey {
     /// Filename within the cache root. Stable — used as the on-disk key.
     pub fn filename(self) -> &'static str {
         match self {
-            Self::ServiceHealth => "service_health.json",
-            Self::SnapshotInitial => "snapshot_initial.json",
             Self::SnapshotInterfaces => "snapshot_interfaces.json",
             Self::SnapshotDiagnostics => "snapshot_diagnostics.json",
             Self::SecurityAlerts => "security_alerts.json",
-            Self::RulesAll => "rules_list_all.json",
-            Self::RulesPrimary => "rules_list_primary.json",
-            Self::RulesSecondary => "rules_list_secondary.json",
         }
     }
 
     /// Operation slug recorded inside the cache entry for diagnostics.
     pub fn operation_slug(self) -> &'static str {
         match self {
-            Self::ServiceHealth => "service.health.get",
-            Self::SnapshotInitial => "snapshot.initial.get",
             Self::SnapshotInterfaces => "snapshot.interfaces.get",
             Self::SnapshotDiagnostics => "snapshot.diagnostics.get",
             Self::SecurityAlerts => "security.alerts.list",
-            Self::RulesAll => "rules.list[all]",
-            Self::RulesPrimary => "rules.list[primary]",
-            Self::RulesSecondary => "rules.list[secondary]",
         }
     }
 
+    /// The key decides, never the file: an entry may not extend its own life.
     pub fn ttl_secs(self) -> u64 {
-        match self {
-            Self::ServiceHealth => HEALTH_TTL_SECS,
-            _ => SNAPSHOT_TTL_SECS,
-        }
+        SNAPSHOT_TTL_SECS
     }
 
-    /// Every key that exists today — used by `clear_all` and tests.
-    pub const ALL: [Self; 8] = [
-        Self::ServiceHealth,
-        Self::SnapshotInitial,
+    /// Every key that exists today; anything else in the root is a stranger.
+    pub const ALL: [Self; 3] = [
         Self::SnapshotInterfaces,
         Self::SnapshotDiagnostics,
         Self::SecurityAlerts,
-        Self::RulesAll,
-        Self::RulesPrimary,
-        Self::RulesSecondary,
     ];
 }
 
@@ -146,32 +135,18 @@ impl CacheKey {
 /// `SettingsExport`) invalidate nothing.
 pub fn invalidation_targets(kind: MutationKind) -> &'static [CacheKey] {
     match kind {
-        MutationKind::RulesUpdate => &[
-            CacheKey::RulesAll,
-            CacheKey::RulesPrimary,
-            CacheKey::RulesSecondary,
-            CacheKey::SnapshotInitial,
-        ],
-        MutationKind::RouteBindingsUpdate => {
-            &[CacheKey::SnapshotInitial, CacheKey::SnapshotInterfaces]
-        }
-        // A reset discards the caller's per-SID rules and falls back to
-        // baseline, so the rules views + initial snapshot all change, same
-        // invalidation set as a rules edit.
-        MutationKind::PresetImport | MutationKind::RulesResetToBaseline => &[
-            CacheKey::RulesAll,
-            CacheKey::RulesPrimary,
-            CacheKey::RulesSecondary,
-            CacheKey::SnapshotInitial,
-        ],
+        // Rules are never cached here: the window reads them live.
+        MutationKind::RulesUpdate
+        | MutationKind::PresetImport
+        | MutationKind::RulesResetToBaseline => &[],
+        MutationKind::RouteBindingsUpdate => &[CacheKey::SnapshotInterfaces],
         #[allow(deprecated)]
         MutationKind::PresetExport | MutationKind::SettingsExport => &[],
-        // Security alert state changes do not currently populate a
-        // dedicated cache key, but they affect the alerts section of
-        // `SnapshotInitial`, so invalidate that entry to force a re-fetch.
         MutationKind::SecurityAlertAck | MutationKind::SecurityAlertResolve => {
-            &[CacheKey::SnapshotInitial]
+            &[CacheKey::SecurityAlerts]
         }
+        // The audit trail is read live, never from this cache.
+        MutationKind::AuditChainRestart => &[],
     }
 }
 
@@ -355,21 +330,6 @@ impl FileCache {
         first_err.map_or(Ok(()), Err)
     }
 
-    /// Drop every known cache file. The cache directory itself is
-    /// preserved. Used by GUI's "Reset" action and by the IPC facade's
-    /// [`crate::IpcBackendFacade::clear_cache`].
-    pub fn clear_all(&self) -> Result<(), CacheError> {
-        let mut first_err: Option<CacheError> = None;
-        for &key in &CacheKey::ALL {
-            if let Err(e) = self.invalidate(key) {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        first_err.map_or(Ok(()), Err)
-    }
-
     /// Sweep any non-recognised JSON file out of the cache root. Used
     /// at startup so files left over from an earlier
     /// contract are purged proactively rather than only at first read of
@@ -519,7 +479,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 /// Create (or truncate) a file only its owner can read.
 ///
-/// What lands here is one user's rules, route bindings and security alerts.
+/// What lands here is one user's adapters, diagnostics and security alerts.
 /// The default 0644 made every local account on a Linux box a reader of every
 /// other account's policy; on Windows the file inherits the profile's ACL,
 /// which is already owner-scoped, so the mode is a no-op there.
@@ -571,15 +531,15 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let cache = FileCache::with_root(dir.path().to_path_buf()).expect("cache");
         cache
-            .write(CacheKey::RulesAll, json!({ "rules": [] }))
+            .write(CacheKey::SecurityAlerts, json!({ "alerts": [] }))
             .expect("write");
-        let path = cache.root().join(CacheKey::RulesAll.filename());
+        let path = cache.root().join(CacheKey::SecurityAlerts.filename());
         let mut entry: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
         entry["cached_at_epoch"] = json!(epoch_now() + 86_400);
         fs::write(&path, serde_json::to_vec(&entry).expect("serialise")).expect("rewrite");
 
-        let read = cache.read(CacheKey::RulesAll).expect("entry present");
+        let read = cache.read(CacheKey::SecurityAlerts).expect("entry present");
         assert!(read.expired, "a future timestamp must not read as fresh");
     }
 
@@ -589,16 +549,19 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let cache = FileCache::with_root(dir.path().to_path_buf()).expect("cache");
         cache
-            .write(CacheKey::ServiceHealth, json!({ "ok": true }))
+            .write(CacheKey::SnapshotDiagnostics, json!({ "ok": true }))
             .expect("write");
-        let path = cache.root().join(CacheKey::ServiceHealth.filename());
+        let path = cache.root().join(CacheKey::SnapshotDiagnostics.filename());
         let mut entry: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
         entry["ttl_secs"] = json!(u64::MAX);
-        entry["cached_at_epoch"] = json!(epoch_now() - (CacheKey::ServiceHealth.ttl_secs() + 60));
+        entry["cached_at_epoch"] =
+            json!(epoch_now() - (CacheKey::SnapshotDiagnostics.ttl_secs() + 60));
         fs::write(&path, serde_json::to_vec(&entry).expect("serialise")).expect("rewrite");
 
-        let read = cache.read(CacheKey::ServiceHealth).expect("entry present");
+        let read = cache
+            .read(CacheKey::SnapshotDiagnostics)
+            .expect("entry present");
         assert!(read.expired, "the key's TTL decides, not the file's");
     }
 
@@ -618,7 +581,7 @@ mod tests {
         );
     }
 
-    /// The cache holds one user's rules, bindings and alerts — on a shared
+    /// The cache holds one user's adapters, diagnostics and alerts — on a shared
     /// Linux box the default modes handed them to every local account.
     #[cfg(unix)]
     #[test]
@@ -627,7 +590,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let cache = FileCache::with_root(dir.path().join("snapshot_cache")).expect("cache");
         cache
-            .write(CacheKey::RulesAll, json!({ "rules": [] }))
+            .write(CacheKey::SecurityAlerts, json!({ "alerts": [] }))
             .expect("write entry");
 
         let dir_mode = fs::metadata(cache.root())
@@ -637,7 +600,7 @@ mod tests {
             & 0o777;
         assert_eq!(dir_mode, 0o700, "cache directory must be owner-only");
 
-        let file_mode = fs::metadata(cache.root().join(CacheKey::RulesAll.filename()))
+        let file_mode = fs::metadata(cache.root().join(CacheKey::SecurityAlerts.filename()))
             .expect("file metadata")
             .permissions()
             .mode()
@@ -656,9 +619,9 @@ mod tests {
         let (_dir, cache) = fresh_cache();
         let payload = json!({"hello": "world", "n": 42});
         cache
-            .write(CacheKey::ServiceHealth, payload.clone())
+            .write(CacheKey::SnapshotDiagnostics, payload.clone())
             .expect("write");
-        let cached = cache.read(CacheKey::ServiceHealth).expect("hit");
+        let cached = cache.read(CacheKey::SnapshotDiagnostics).expect("hit");
         assert_eq!(cached.payload, payload);
         assert!(!cached.expired);
         assert!(cached.age_secs <= 1);
@@ -667,15 +630,15 @@ mod tests {
     #[test]
     fn read_returns_none_for_missing_entry() {
         let (_dir, cache) = fresh_cache();
-        assert!(cache.read(CacheKey::SnapshotInitial).is_none());
+        assert!(cache.read(CacheKey::SnapshotDiagnostics).is_none());
     }
 
     #[test]
     fn read_returns_none_and_deletes_corrupted_file() {
         let (_dir, cache) = fresh_cache();
-        let path = cache.path_for(CacheKey::SnapshotInitial);
+        let path = cache.path_for(CacheKey::SnapshotDiagnostics);
         fs::write(&path, b"{not valid json").expect("write garbage");
-        assert!(cache.read(CacheKey::SnapshotInitial).is_none());
+        assert!(cache.read(CacheKey::SnapshotDiagnostics).is_none());
         assert!(!path.exists(), "corrupted cache file should be removed");
     }
 
@@ -706,19 +669,19 @@ mod tests {
     #[test]
     fn expired_entry_is_returned_with_expired_flag() {
         let (_dir, cache) = fresh_cache();
-        let path = cache.path_for(CacheKey::ServiceHealth);
+        let path = cache.path_for(CacheKey::SnapshotInterfaces);
         // Write a hand-crafted entry whose cached_at_epoch is far in the past.
         let entry = CacheEntry {
-            operation: CacheKey::ServiceHealth.operation_slug().to_string(),
-            cached_at_epoch: epoch_now().saturating_sub(HEALTH_TTL_SECS + 60),
-            ttl_secs: HEALTH_TTL_SECS,
+            operation: CacheKey::SnapshotInterfaces.operation_slug().to_string(),
+            cached_at_epoch: epoch_now().saturating_sub(SNAPSHOT_TTL_SECS + 60),
+            ttl_secs: SNAPSHOT_TTL_SECS,
             contract: contract_fingerprint(),
-            payload: json!({"state": "running"}),
+            payload: json!({"adapters": []}),
         };
         fs::write(&path, serde_json::to_vec_pretty(&entry).expect("serialize")).expect("write");
-        let cached = cache.read(CacheKey::ServiceHealth).expect("hit");
+        let cached = cache.read(CacheKey::SnapshotInterfaces).expect("hit");
         assert!(cached.expired);
-        assert!(cached.age_secs > HEALTH_TTL_SECS);
+        assert!(cached.age_secs > SNAPSHOT_TTL_SECS);
     }
 
     #[test]
@@ -738,66 +701,26 @@ mod tests {
     fn invalidate_missing_file_is_ok() {
         let (_dir, cache) = fresh_cache();
         cache
-            .invalidate(CacheKey::SnapshotInitial)
+            .invalidate(CacheKey::SnapshotDiagnostics)
             .expect("idempotent");
     }
 
     #[test]
-    fn rules_update_invalidates_rules_files_and_initial_snapshot() {
-        let (_dir, cache) = fresh_cache();
-        // Seed every key we expect to be wiped.
-        for key in [
-            CacheKey::RulesAll,
-            CacheKey::RulesPrimary,
-            CacheKey::RulesSecondary,
-            CacheKey::SnapshotInitial,
-            CacheKey::ServiceHealth, // should NOT be wiped
-        ] {
-            cache
-                .write(key, json!({"k": key.filename()}))
-                .expect("seed");
-        }
-        cache
-            .invalidate_for_mutation(MutationKind::RulesUpdate)
-            .expect("invalidate");
-        for key in [
-            CacheKey::RulesAll,
-            CacheKey::RulesPrimary,
-            CacheKey::RulesSecondary,
-            CacheKey::SnapshotInitial,
-        ] {
-            assert!(
-                !cache.path_for(key).exists(),
-                "{:?} should be invalidated",
-                key
-            );
-        }
-        assert!(
-            cache.path_for(CacheKey::ServiceHealth).exists(),
-            "service-health is unaffected by rules updates"
-        );
-    }
-
-    #[test]
-    fn route_bindings_update_invalidates_interfaces_and_initial() {
+    fn route_bindings_update_invalidates_interfaces() {
         let (_dir, cache) = fresh_cache();
         cache
             .write(CacheKey::SnapshotInterfaces, json!({"adapters": []}))
             .unwrap();
         cache
-            .write(CacheKey::SnapshotInitial, json!({"x": 1}))
-            .unwrap();
-        cache
-            .write(CacheKey::RulesAll, json!({"rows": []}))
+            .write(CacheKey::SecurityAlerts, json!({"alerts": []}))
             .unwrap();
         cache
             .invalidate_for_mutation(MutationKind::RouteBindingsUpdate)
             .expect("invalidate");
         assert!(!cache.path_for(CacheKey::SnapshotInterfaces).exists());
-        assert!(!cache.path_for(CacheKey::SnapshotInitial).exists());
         assert!(
-            cache.path_for(CacheKey::RulesAll).exists(),
-            "rules cache survives route-binding changes"
+            cache.path_for(CacheKey::SecurityAlerts).exists(),
+            "alerts cache survives route-binding changes"
         );
     }
 
@@ -811,35 +734,21 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_removes_every_known_entry() {
-        let (_dir, cache) = fresh_cache();
-        for &key in &CacheKey::ALL {
-            cache
-                .write(key, json!({"k": key.filename()}))
-                .expect("seed");
-        }
-        cache.clear_all().expect("clear");
-        for &key in &CacheKey::ALL {
-            assert!(!cache.path_for(key).exists(), "{:?}", key);
-        }
-    }
-
-    #[test]
     fn purge_unknown_files_removes_strangers_and_abandoned_tmps() {
         let (dir, cache) = fresh_cache();
         // A known entry — must survive.
         cache
-            .write(CacheKey::SnapshotInitial, json!({"x": 1}))
+            .write(CacheKey::SnapshotDiagnostics, json!({"x": 1}))
             .expect("seed known");
         // An unknown JSON file from a future cache version.
         fs::write(dir.path().join("future_cache.json"), b"{}").expect("write stranger");
         // A tmp file left by a process that died long ago.
-        let stale_tmp = dir.path().join("snapshot_initial.json.999.0.tmp");
+        let stale_tmp = dir.path().join("snapshot_diagnostics.json.999.0.tmp");
         fs::write(&stale_tmp, b"partial").expect("write tmp");
         let long_ago = SystemTime::now() - std::time::Duration::from_secs(3600);
         filetime_set(&stale_tmp, long_ago);
         cache.purge_unknown_files().expect("purge");
-        assert!(cache.path_for(CacheKey::SnapshotInitial).exists());
+        assert!(cache.path_for(CacheKey::SnapshotDiagnostics).exists());
         assert!(!dir.path().join("future_cache.json").exists());
         assert!(!stale_tmp.exists());
     }
@@ -850,7 +759,7 @@ mod tests {
         // the tray share this directory. Deleting it makes that write's rename
         // fail and loses the entry.
         let (dir, cache) = fresh_cache();
-        let live_tmp = dir.path().join("snapshot_initial.json.1234.0.tmp");
+        let live_tmp = dir.path().join("snapshot_diagnostics.json.1234.0.tmp");
         fs::write(&live_tmp, b"partial").expect("write tmp");
         cache.purge_unknown_files().expect("purge");
         assert!(live_tmp.exists(), "a write in flight must not be swept");
@@ -870,30 +779,32 @@ mod tests {
     fn atomic_write_overwrites_existing_file() {
         let (_dir, cache) = fresh_cache();
         cache
-            .write(CacheKey::ServiceHealth, json!({"state": "running"}))
+            .write(CacheKey::SnapshotDiagnostics, json!({"state": "running"}))
             .expect("first");
         cache
-            .write(CacheKey::ServiceHealth, json!({"state": "degraded"}))
+            .write(CacheKey::SnapshotDiagnostics, json!({"state": "degraded"}))
             .expect("overwrite");
-        let cached = cache.read(CacheKey::ServiceHealth).expect("hit");
+        let cached = cache.read(CacheKey::SnapshotDiagnostics).expect("hit");
         assert_eq!(cached.payload["state"], "degraded");
     }
 
     #[test]
     fn invalidation_target_set_is_minimal_and_correct() {
-        // Sanity: every kind that mutates user-visible policy state
-        // wipes SnapshotInitial (so first re-render after mutation
-        // pulls fresh data from the service).
         for kind in [
             MutationKind::RulesUpdate,
-            MutationKind::RouteBindingsUpdate,
             MutationKind::PresetImport,
+            MutationKind::RulesResetToBaseline,
         ] {
             assert!(
-                invalidation_targets(kind).contains(&CacheKey::SnapshotInitial),
-                "{:?} must wipe SnapshotInitial",
-                kind
+                invalidation_targets(kind).is_empty(),
+                "{kind:?}: rules are not cached"
             );
+        }
+        for kind in [
+            MutationKind::SecurityAlertAck,
+            MutationKind::SecurityAlertResolve,
+        ] {
+            assert_eq!(invalidation_targets(kind), &[CacheKey::SecurityAlerts]);
         }
     }
 }

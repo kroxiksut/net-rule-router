@@ -36,11 +36,12 @@ impl PerSidApplyOrchestrator {
             failure_mode: Arc::new(|| FilterFailureMode::BestEffort),
             // Default: kill-switch off (unresolved). Production overrides
             // via `with_kill_switch_resolver`.
-            kill_switch_resolver: Arc::new(|_| None),
-            ipv6_guard_resolver: Arc::new(|_| crate::enforcement_planner::Ipv6Guard::Off),
+            machine_reader: Arc::new(MachineReading::empty),
+            kill_switch_resolver: Arc::new(|_, _| None),
+            ipv6_guard_resolver: Arc::new(|_, _| crate::enforcement_planner::Ipv6Guard::Off),
             // Default: no extra exemptions. Production overrides via
             // `with_fail_closed_exemptions_resolver`.
-            fail_closed_exemptions_resolver: Arc::new(|_| FailClosedExemptions::default()),
+            fail_closed_exemptions_resolver: Arc::new(|_, _| FailClosedExemptions::default()),
             // Default: no verified VPN clients. Production wires the learned
             // registry via `with_vpn_client_apps_provider`.
             vpn_client_apps_provider: None,
@@ -81,6 +82,7 @@ impl PerSidApplyOrchestrator {
             announced_app_rules: Mutex::new(HashMap::new()),
             events: None,
             posture_log_state: Mutex::new(HashMap::new()),
+            pin_trim_log_state: Mutex::new(HashMap::new()),
             // Default: fake-IP out of the plan. Production wires a live
             // provider via `with_fake_ip_context_provider`.
             fake_ip_context: Arc::new(|| None),
@@ -301,7 +303,7 @@ impl PerSidApplyOrchestrator {
             .any(|armed| *armed)
     }
 
-    /// Block D (fake-IP, slice 5) — wire the LIVE fake-IP context provider,
+    /// Fake-IP: wire the LIVE fake-IP context provider,
     /// consulted on every compute, so the per-SID codegen suppresses
     /// fake-routed hosts' real `/32` permits, permits the fake pool, and
     /// hard-blocks their non-shared real IPs exactly while the feature is
@@ -413,6 +415,13 @@ impl PerSidApplyOrchestrator {
     /// active user's secondary binding + exemptions through the route
     /// coordinator; the kill-switch then activates only when the user has
     /// also turned on `block_secondary_when_unavailable`.
+    /// Plug the one machine reading each compute hands its resolvers.
+    #[must_use]
+    pub fn with_machine_reader(mut self, reader: MachineReader) -> Self {
+        self.machine_reader = reader;
+        self
+    }
+
     /// Plug the resolver that says what policy may do about IPv6 this pass.
     /// Unset, the orchestrator names IPv4 only.
     #[must_use]

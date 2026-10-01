@@ -17,6 +17,9 @@ QtObject {
     /// hypervisors are listed.
     property var hypervisors: []
     property bool scanning: false
+    /// A refresh asked for mid-scan: that scan may predate the change the
+    /// caller wants to see, so its answer is dropped and the scan re-run.
+    property bool _refreshPending: false
     property bool scanFailed: false
     /// "<machineId>/<slot>" of the adapter being pinned, "" when idle.
     property string bindingKey: ""
@@ -38,7 +41,11 @@ QtObject {
     }
 
     function refresh() {
-        if (!root || !root.bridgeAvailable || scanning) return
+        if (!root || !root.bridgeAvailable) return
+        if (scanning) {
+            _refreshPending = true
+            return
+        }
         var corr = root.rpc.rpcVmInventoryList(_additionalAdapter())
         if (!corr || corr === "") {
             scanFailed = true
@@ -47,6 +54,11 @@ QtObject {
         scanning = true
         root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             virtualMachinesController.scanning = false
+            if (virtualMachinesController._refreshPending) {
+                virtualMachinesController._refreshPending = false
+                virtualMachinesController.refresh()
+                return
+            }
             if (!ok || !payload) {
                 virtualMachinesController.scanFailed = true
                 console.log("vm inventory failed:", code, msg)

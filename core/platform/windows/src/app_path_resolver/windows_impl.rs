@@ -1,30 +1,17 @@
 //! Windows mechanism behind `AppPathResolver`: registry App Paths, running
 //! process images and a bounded walk of the install roots.
 
-#![allow(unsafe_code)]
-
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FALSE, FILETIME,
-};
-use windows::Win32::System::ProcessStatus::EnumProcesses;
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
-    HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, REG_SAM_FLAGS, REG_VALUE_TYPE,
-};
-use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-};
-
-use std::sync::{Arc, OnceLock};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
 use super::{
     dedup_paths, glob_match, matching_images, BackgroundWalks, ProcessImages, ResolveCache,
 };
 use crate::app_path_resolver::AppPathResolver;
+use crate::win32_ffi::{process, registry};
 
 /// `App Paths` registry subkey (relative to the hive root).
 const APP_PATHS_SUBKEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
@@ -298,17 +285,17 @@ fn resolve_from_app_paths(query: &str, is_glob: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
         if is_glob {
-            for sub in enum_subkeys(hive, APP_PATHS_SUBKEY) {
+            for sub in registry::enum_subkeys(hive, APP_PATHS_SUBKEY) {
                 if glob_match(query, &sub) {
                     let full = format!(r"{APP_PATHS_SUBKEY}\{sub}");
-                    if let Some(raw) = read_default_value(hive, &full) {
+                    if let Some(raw) = registry::read_string(hive, &full, None) {
                         push_registry_path(&mut out, &raw);
                     }
                 }
             }
         } else {
             let full = format!(r"{APP_PATHS_SUBKEY}\{query}");
-            if let Some(raw) = read_default_value(hive, &full) {
+            if let Some(raw) = registry::read_string(hive, &full, None) {
                 push_registry_path(&mut out, &raw);
             }
         }
@@ -319,20 +306,11 @@ fn resolve_from_app_paths(query: &str, is_glob: bool) -> Vec<PathBuf> {
 /// Normalize a raw registry value (strip surrounding quotes, expand
 /// `%VAR%` tokens) and push it if non-empty.
 fn push_registry_path(out: &mut Vec<PathBuf>, raw: &str) {
-    let unquoted = unquote(raw);
+    let unquoted = registry::unquote(raw);
     let expanded = expand_env(unquoted);
     if !expanded.is_empty() {
         out.push(PathBuf::from(expanded));
     }
-}
-
-/// Strip a single pair of surrounding double quotes, if present.
-fn unquote(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    trimmed
-        .strip_prefix('"')
-        .and_then(|r| r.strip_suffix('"'))
-        .unwrap_or(trimmed)
 }
 
 /// Expand `%VAR%` tokens against the process environment. Unknown variables
@@ -373,190 +351,15 @@ fn expand_env(input: &str) -> String {
     out
 }
 
-/// Open `hive\subkey` with `access`. `None` on any failure (never an error).
-fn open_key(hive: HKEY, subkey: &str, access: u32) -> Option<HKEY> {
-    let wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut hkey = HKEY::default();
-    // SAFETY: `wide` is NUL-terminated UTF-16 that outlives the call; `hkey`
-    // is a fresh out-param; the hive is a Win32 pseudo-handle.
-    let rc = unsafe {
-        RegOpenKeyExW(
-            hive,
-            PCWSTR(wide.as_ptr()),
-            0,
-            REG_SAM_FLAGS(access),
-            &mut hkey,
-        )
-    };
-    (rc == ERROR_SUCCESS).then_some(hkey)
-}
-
-fn close_key(hkey: HKEY) {
-    // SAFETY: `hkey` came from `RegOpenKeyExW`; closing a valid handle is
-    // sound. A close failure is non-actionable at this layer.
-    unsafe {
-        let _ = RegCloseKey(hkey);
-    }
-}
-
-/// Read the default (unnamed) `REG_SZ`/`REG_EXPAND_SZ` value of `hive\subkey`.
-fn read_default_value(hive: HKEY, subkey: &str) -> Option<String> {
-    let hkey = open_key(hive, subkey, KEY_QUERY_VALUE.0)?;
-
-    let mut size: u32 = 0;
-    let mut value_type = REG_VALUE_TYPE::default();
-    // First call probes the byte size of the default value.
-    // SAFETY: `PCWSTR::null()` selects the default value; the out-params are
-    // valid stack locations that outlive the call.
-    let rc = unsafe {
-        RegQueryValueExW(
-            hkey,
-            PCWSTR::null(),
-            None,
-            Some(&mut value_type),
-            None,
-            Some(&mut size),
-        )
-    };
-    if rc != ERROR_SUCCESS {
-        close_key(hkey);
-        return None;
-    }
-
-    let mut buf: Vec<u16> = vec![0u16; (size as usize) / 2 + 1];
-    let mut read: u32 = (buf.len() * 2) as u32;
-    // SAFETY: `buf` is sized from the probe; `read` carries its byte length.
-    let rc = unsafe {
-        RegQueryValueExW(
-            hkey,
-            PCWSTR::null(),
-            None,
-            Some(&mut value_type),
-            Some(buf.as_mut_ptr().cast()),
-            Some(&mut read),
-        )
-    };
-    close_key(hkey);
-    if rc != ERROR_SUCCESS {
-        return None;
-    }
-
-    let chars = (read as usize) / 2;
-    let slice = &buf[..chars.min(buf.len())];
-    let s = String::from_utf16_lossy(slice);
-    Some(s.trim_end_matches('\0').to_string())
-}
-
-/// Enumerate the immediate subkey names of `hive\subkey`.
-fn enum_subkeys(hive: HKEY, subkey: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let access = KEY_ENUMERATE_SUB_KEYS.0 | KEY_QUERY_VALUE.0;
-    let Some(hkey) = open_key(hive, subkey, access) else {
-        return out;
-    };
-    let mut index: u32 = 0;
-    loop {
-        // Registry key names are bounded at 255 chars; 256 fits name + NUL.
-        let mut name_buf = [0u16; 256];
-        let mut name_len = name_buf.len() as u32;
-        let mut _last_write = FILETIME::default();
-        // SAFETY: `name_buf`/`name_len` are valid in/out params sized above;
-        // the class + reserved params are unused (null / None).
-        let rc = unsafe {
-            RegEnumKeyExW(
-                hkey,
-                index,
-                PWSTR(name_buf.as_mut_ptr()),
-                &mut name_len,
-                None,
-                PWSTR::null(),
-                None,
-                Some(&mut _last_write),
-            )
-        };
-        if rc == ERROR_NO_MORE_ITEMS || rc != ERROR_SUCCESS {
-            break;
-        }
-        out.push(String::from_utf16_lossy(&name_buf[..name_len as usize]));
-        index += 1;
-        if index > 10_000 {
-            break; // pathological hive guard
-        }
-    }
-    close_key(hkey);
-    out
-}
-
 // ── Source 2: running-process image paths ─────────────────────────────────
 
 /// Image path of every running process; a PID that exited or cannot be
 /// opened (access denied) is skipped.
 fn running_process_images() -> Vec<PathBuf> {
-    enum_process_ids()
+    process::enum_process_ids()
         .into_iter()
-        .filter_map(process_image_path)
+        .filter_map(process::process_image_path)
         .collect()
-}
-
-/// Snapshot the running-process PID set via `EnumProcesses`, growing the
-/// buffer until it is not saturated. Empty on failure.
-fn enum_process_ids() -> Vec<u32> {
-    let mut pids = vec![0u32; 1024];
-    loop {
-        let cap_bytes = (pids.len() * std::mem::size_of::<u32>()) as u32;
-        let mut needed: u32 = 0;
-        // SAFETY: `pids` is a valid `cap_bytes`-sized buffer; `needed` is a
-        // fresh out-param receiving the bytes written.
-        let ok = unsafe { EnumProcesses(pids.as_mut_ptr(), cap_bytes, &mut needed) };
-        if ok.is_err() {
-            return Vec::new();
-        }
-        let returned = (needed as usize) / std::mem::size_of::<u32>();
-        if returned < pids.len() {
-            pids.truncate(returned);
-            return pids;
-        }
-        // Buffer was full — some PIDs may have been dropped; grow and retry.
-        if pids.len() >= 65_536 {
-            pids.truncate(returned.min(pids.len()));
-            return pids;
-        }
-        pids.resize(pids.len() * 2, 0);
-    }
-}
-
-/// Resolve a PID to its full image path. `None` for PID 0, an exited
-/// process, or a protected PID `OpenProcess` cannot open (access denied).
-pub(super) fn process_image_path(pid: u32) -> Option<PathBuf> {
-    if pid == 0 {
-        return None;
-    }
-    // SAFETY: `OpenProcess` with QUERY_LIMITED rights on a PID; the handle is
-    // closed on every return path. `QueryFullProcessImageNameW` writes at
-    // most `size` UTF-16 units into `buf` and updates `size` to the count
-    // written (excluding the NUL).
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid).ok()?;
-        if handle.is_invalid() {
-            return None;
-        }
-        let mut buf = [0u16; 260]; // MAX_PATH — Win32 image paths fit.
-        let mut size = buf.len() as u32;
-        let query = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            PWSTR(buf.as_mut_ptr()),
-            &mut size,
-        );
-        let _ = CloseHandle(handle);
-        query.ok()?;
-        if size == 0 {
-            return None;
-        }
-        Some(PathBuf::from(String::from_utf16_lossy(
-            &buf[..size as usize],
-        )))
-    }
 }
 
 // ── Source 3: bounded Program Files walk ──────────────────────────────────
@@ -879,14 +682,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("does-not-exist-nrr-test");
         assert!(walk(&missing, "target.exe", 2, 100).is_empty());
-    }
-
-    #[test]
-    fn unquote_strips_a_single_surrounding_pair() {
-        assert_eq!(unquote(r#""C:\a\b.exe""#), r"C:\a\b.exe");
-        assert_eq!(unquote(r"C:\a\b.exe"), r"C:\a\b.exe");
-        // Unbalanced quote is left as-is.
-        assert_eq!(unquote(r#""C:\a\b.exe"#), r#""C:\a\b.exe"#);
     }
 
     #[test]

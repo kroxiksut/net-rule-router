@@ -206,19 +206,17 @@ pub(super) type ConnTraceWiring = (
     Option<Arc<dyn Fn() + Send + Sync>>,
 );
 
-/// Build the opt-in connection-egress trace source+consumer pair. Returns
-/// `(None, None)` unless the trace is requested ([`conn_trace_requested`]) AND
-/// the route path
-/// (coordinator + active-SID resolver) is available. The WFP net-event source
-/// is started here; failure to start degrades to no trace (a WARN only), the
-/// same graceful-degradation contract as the DNS-Client observer.
+/// Build the connection-egress trace source+consumer pair. Returns `None`s
+/// unless the route path (coordinator + active-SID resolver) is available.
+/// The WFP net-event source is started here; failure to start degrades to no
+/// trace (a WARN only), the same contract as the DNS-Client observer.
 pub(super) fn build_conn_trace_pair(
     api: &Arc<dyn WindowsApiPort>,
     route_coordinator: Option<
         &Arc<nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator>,
     >,
     active_routing_sid: Option<&nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn>,
-    ndjson_on: bool,
+    ndjson_on: Arc<std::sync::atomic::AtomicBool>,
     trace_ring: Option<Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>>,
     sinks: ObservationSinks,
     vpn_learning: VpnLearningDeps<'_>,
@@ -232,7 +230,7 @@ pub(super) fn build_conn_trace_pair(
     // passive kernel event subscription that also feeds app-routing's observed
     // app→IP store) and ALWAYS feeds the in-memory GUI ring, so "Show
     // connections" works without a service restart. The on-disk NDJSON sink is
-    // written only when explicitly enabled (`ndjson_on`).
+    // written only while `ndjson_on` is set.
     let (Some(coord), Some(active_sid)) = (route_coordinator, active_routing_sid) else {
         tracing::warn!(
             target: "nrr::conn-trace",
@@ -246,10 +244,11 @@ pub(super) fn build_conn_trace_pair(
             Arc::clone(api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
             Arc::clone(coord),
             Arc::clone(active_sid),
-            // Write to the on-disk NDJSON sink only when explicitly enabled;
-            // the in-memory GUI ring is always fed (wired below).
-            ndjson_on,
+            false,
         )
+        // The on-disk NDJSON sink follows the live switch; the in-memory GUI
+        // ring is always fed (wired below).
+        .with_log_ndjson_flag(ndjson_on)
         // App-routing via observation: feed the process-wide
         // observed app→IP store the codegen reads for `Application` rules.
         .with_app_observations(
@@ -629,7 +628,8 @@ pub(super) fn build_conn_trace_pair(
                     Err(e) => tracing::warn!(
                         target: "nrr::conn-trace",
                         msg_key = "svc-conntrace-etw-unavailable-merged",
-                        "ETW connection observer unavailable (merged mode) — continuing with WFP only: {e}",
+                        error = %e,
+                        "ETW connection observer unavailable (merged mode) — continuing with WFP only",
                     ),
                 }
                 // ETW down in merged mode leaves WFP as the only source of
@@ -647,7 +647,8 @@ pub(super) fn build_conn_trace_pair(
                     Err(e) => tracing::warn!(
                         target: "nrr::conn-trace",
                         msg_key = "svc-conntrace-wfp-unavailable-merged",
-                        "WFP connection observer unavailable (merged mode) — continuing with ETW only: {e}",
+                        error = %e,
+                        "WFP connection observer unavailable (merged mode) — continuing with ETW only",
                     ),
                 }
                 if live.len() >= 2 {
@@ -712,7 +713,8 @@ pub(super) fn build_conn_trace_pair(
                 target: "nrr::conn-trace",
                 msg_key = "svc-conntrace-trace-unavailable",
                 backend = backend.slug(),
-                "connection observer unavailable; connection trace disabled: {e}",
+                error = %e,
+                "connection observer unavailable; connection trace disabled",
             );
             (None, None, None)
         }

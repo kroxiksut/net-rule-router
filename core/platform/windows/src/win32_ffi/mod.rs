@@ -41,7 +41,7 @@ pub mod adapters;
 #[cfg(target_os = "windows")]
 pub mod route_table;
 
-// Block T (traffic counter) — per-interface octet counters via `GetIfTable2`.
+// Traffic-counter core — per-interface octet counters via `GetIfTable2`.
 #[cfg(target_os = "windows")]
 pub mod interface_counters;
 
@@ -65,3 +65,15 @@ pub mod wfp_sublayer;
 
 #[cfg(target_os = "windows")]
 pub mod wfp_filter;
+
+// The global DNS suffix search list, written without a child process.
+#[cfg(target_os = "windows")]
+pub mod dns_settings;
+
+// Process ids and image paths, for every module that looks at running programs.
+#[cfg(target_os = "windows")]
+pub mod process;
+
+// Read-only registry access shared by discovery, DNS scopes and profiles.
+#[cfg(target_os = "windows")]
+pub mod registry;

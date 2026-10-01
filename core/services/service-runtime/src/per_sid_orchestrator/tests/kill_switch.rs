@@ -1,6 +1,6 @@
 use super::*;
 
-// ── Kill-switch (block 16.18.vpn slice D) ───────────────────────────────
+// ── Kill-switch ───────────────────────────────
 
 /// Same as [`fixture_with_resolution`], plus a wired kill-switch drop
 /// registry, for tests that verify the reactive VPN-endpoint learner's
@@ -30,7 +30,7 @@ fn fixture_with_resolution_and_registry(
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| resolution.clone()))
+        .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
         .with_killswitch_drop_registry(Arc::clone(&registry)),
     );
     (api, orch, source, rules, registry)
@@ -58,7 +58,7 @@ fn mode_b_carries_the_resolutions_v6_exemptions_into_the_block() {
         local_subnets_v6: vec![(lan, 64)],
         ..full_ks_resolution()
     }));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -78,13 +78,13 @@ fn mode_b_carries_the_resolutions_v6_exemptions_into_the_block() {
 #[test]
 fn mode_b_arms_catch_all_kill_switch() {
     let (api, orch, src, rules) = fixture_with_resolution(Some(full_ks_resolution()));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
     let filters = api.wfp_filters.lock().unwrap();
     // 0704 (P2): the catch-all arms at BOTH the ALE (TCP/UDP) and the
-    // packet layers. 16.HW-0716: the packet side is one NAMED block per
+    // packet layers. The packet side is one NAMED block per
     // ICMP/IGMP/GRE/ESP (4) instead of one agnostic block-all; IPv6 adds a
     // V6 ALE + V6 packet block-all → 1 + 4 + 2 = 7 block filters.
     assert_eq!(
@@ -113,7 +113,7 @@ fn mode_b_arms_catch_all_kill_switch() {
 fn killswitch_registry_publishes_exactly_the_armed_block_ids() {
     let (api, orch, src, rules, registry) =
         fixture_with_resolution_and_registry(Some(full_ks_resolution()));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
@@ -160,7 +160,7 @@ fn killswitch_registry_publishes_exactly_the_armed_block_ids() {
 fn killswitch_registry_clears_when_leak_guard_disarms() {
     let (api, orch, src, rules, registry) =
         fixture_with_resolution_and_registry(Some(full_ks_resolution()));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
     orch.install_for_sid("S-1-5-21-A").unwrap();
     let armed_ids: Vec<u64> = api
@@ -196,7 +196,7 @@ fn mode_b_catch_all_fails_open_without_server_exemption() {
         local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
     }));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     // Fail-OPEN posture: the catch-all refusing to arm without a server
     // exemption (to avoid a reconnect deadlock) is the fail-open contract.
     // Under fail-closed the user has explicitly opted to cut everything,
@@ -294,7 +294,7 @@ fn reconcile_swaps_stale_luid_permit_and_keeps_blocks() {
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| {
+        .with_kill_switch_resolver(Arc::new(move |_, _| {
             Some(KillSwitchResolution {
                 secondary_luid: luid_for_resolver.load(Ordering::SeqCst),
                 ..Default::default()
@@ -433,7 +433,7 @@ fn strict_mode_arms_leak_guard_even_without_explicit_flag() {
     // only on `block_secondary_when_unavailable` the real IP would leak
     // while the UI claimed protection.
     let (api, orch, src, rules) = fixture_with_resolution(Some(full_ks_resolution()));
-    rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
     let mut s = snap_full("Wi-Fi", "TAP");
     s.mode = PerSidBehaviorMode::StrictSecondaryFailClosed;
     // The separate toggle stays OFF on purpose — the strict MODE alone
@@ -487,7 +487,7 @@ fn reconcile_swaps_block_shape_on_vpn_loss_without_uncovering() {
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| {
+        .with_kill_switch_resolver(Arc::new(move |_, _| {
             if vpn_for_resolver.load(Ordering::SeqCst) {
                 Some(KillSwitchResolution {
                     secondary_luid: KS_LUID,
@@ -562,7 +562,7 @@ fn builtin_vpn_globs_resolve_to_paths_no_glob_in_fail_closed_set() {
         )
         .with_app_resolver(Arc::new(resolver))
         // Secondary unresolved → the `None` fail-closed branch (VPN down).
-        .with_kill_switch_resolver(Arc::new(|_| None)),
+        .with_kill_switch_resolver(Arc::new(|_, _| None)),
     );
     rules.set(rules_with_n_primary_ips(1));
     source.set("S-1-5-21-A", snap_full("Wi-Fi", "TAP"));
@@ -577,7 +577,7 @@ fn builtin_vpn_globs_resolve_to_paths_no_glob_in_fail_closed_set() {
             && f.app_pattern.as_deref() == Some(r"C:\Tools\openvpn.exe")),
         "built-in openvpn glob installed an exempt permit stamped with the resolved path",
     );
-    // The core HW-0716 assertion: NO installed filter carries a glob in
+    // The core assertion: NO installed filter carries a glob in
     // `app_pattern` — a verbatim glob would never enforce.
     assert!(
         filters.iter().all(|f| f
@@ -629,7 +629,7 @@ fn a_clients_nested_transport_is_exempt_while_an_unrelated_app_is_not() {
         )
         .with_app_resolver(Arc::new(resolver))
         // Secondary unresolved → the fail-closed branch that emits exemptions.
-        .with_kill_switch_resolver(Arc::new(|_| None)),
+        .with_kill_switch_resolver(Arc::new(|_, _| None)),
     );
     rules.set(rules_with_n_primary_ips(1));
     source.set("S-1-5-21-A", snap_full("Wi-Fi", "TAP"));
@@ -685,7 +685,7 @@ fn reconcile_reaps_dead_permits_even_when_new_permit_add_skips() {
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| {
+        .with_kill_switch_resolver(Arc::new(move |_, _| {
             Some(KillSwitchResolution {
                 secondary_luid: luid_for_resolver.load(Ordering::SeqCst),
                 ..Default::default()
@@ -762,7 +762,7 @@ fn reconcile_defers_delete_when_replacement_block_add_skipped() {
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| {
+        .with_kill_switch_resolver(Arc::new(move |_, _| {
             Some(KillSwitchResolution {
                 secondary_luid: luid_for_resolver.load(Ordering::SeqCst),
                 ..Default::default()
@@ -999,7 +999,7 @@ fn link_provider_app_earns_app_exempt_permit_under_fail_closed() {
     // the user-confirmed link-provider app (VPN client)
     // must be permitted through the fail-closed kill-switch by app id, so
     // the app that establishes the secondary link can always (re)connect
-    // (the C4 self-blocking class from HW-0717/0718: the client could not
+    // (the C4 self-blocking class: the client could not
     // reach its server until the kill-switch was disabled).
     let ip = Ipv4Addr::new(203, 0, 113, 9);
     let (api, orch, src, rules) = fixture_with_luid(None); // secondary unresolved
@@ -1066,7 +1066,7 @@ fn filters_for(
         Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
     )
     .with_app_resolver(Arc::new(resolver))
-    .with_kill_switch_resolver(Arc::new(move |_| Some(resolution.clone())));
+    .with_kill_switch_resolver(Arc::new(move |_, _| Some(resolution.clone())));
     rules.set(ActiveRulesSnapshot {
         rule_book: book,
         behavior_mode: RouteBehaviorMode::PreferPrimary,

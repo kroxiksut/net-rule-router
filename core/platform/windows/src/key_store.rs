@@ -44,6 +44,7 @@ pub use windows_impl::WindowsDpapiKeyStore;
 mod windows_impl {
     #![allow(unsafe_code)]
 
+    use std::io::Write;
     use std::path::{Path, PathBuf};
 
     use windows::core::PCWSTR;
@@ -55,6 +56,9 @@ mod windows_impl {
     };
     use windows::Win32::Security::{
         SetFileSecurityW, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
     use crate::error::PlatformError;
@@ -115,7 +119,7 @@ mod windows_impl {
                 .join("systemprofile")
                 .join("AppData")
                 .join("Local")
-                .join("NetRuleRouter")
+                .join(nrr_platform_api::paths::product_dir_leaf())
                 .join(KEY_FILE_NAME);
             Self {
                 path,
@@ -157,17 +161,20 @@ mod windows_impl {
                 })?;
             }
             let ciphertext = dpapi_protect(plain)?;
-            // Temp file then rename: a crash mid-write never leaves a
-            // truncated blob that would read as "present but corrupt".
+            // Temp file, flushed, then a write-through rename: without both a
+            // power cut can leave the renamed name over a zero-length file, and
+            // a lost key costs every signed revision its verification.
             let tmp = path.with_extension("bin.tmp");
-            std::fs::write(&tmp, &ciphertext).map_err(|e| PlatformError::Transient {
+            let write_tmp = || -> std::io::Result<()> {
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(&ciphertext)?;
+                file.sync_all()
+            };
+            write_tmp().map_err(|e| PlatformError::Transient {
                 operation: "key_store::save::write_tmp",
                 detail: format!("write {}: {e}", tmp.display()),
             })?;
-            std::fs::rename(&tmp, path).map_err(|e| PlatformError::Transient {
-                operation: "key_store::save::rename",
-                detail: format!("rename {} -> {}: {e}", tmp.display(), path.display()),
-            })?;
+            replace_write_through(&tmp, path)?;
             self.tighten_acl(path);
             Ok(())
         }
@@ -310,6 +317,25 @@ mod windows_impl {
         }
     }
 
+    /// Renames `from` over `to` and returns only once the rename is on disk.
+    fn replace_write_through(from: &Path, to: &Path) -> Result<(), PlatformError> {
+        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+        let (from_w, to_w) = (wide(from), wide(to));
+        // SAFETY: both buffers are NUL-terminated UTF-16 paths that outlive
+        // the synchronous call.
+        unsafe {
+            MoveFileExW(
+                PCWSTR(from_w.as_ptr()),
+                PCWSTR(to_w.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(|e| PlatformError::Transient {
+            operation: "key_store::save::rename",
+            detail: format!("rename {} -> {}: {e}", from.display(), to.display()),
+        })
+    }
+
     /// Encrypt `plain` with per-user DPAPI (no machine flag).
     fn dpapi_protect(plain: &[u8]) -> Result<Vec<u8>, PlatformError> {
         let in_blob = CRYPT_INTEGER_BLOB {
@@ -402,6 +428,41 @@ mod tests {
 
         store.delete().expect("delete");
         assert_eq!(store.load().expect("load after delete"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_replaces_an_existing_key_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("db-mac-key.bin");
+        let store = WindowsDpapiKeyStore::at(&path);
+        store.save(&[1u8; SIGNING_KEY_BYTE_LEN]).expect("save 1");
+        store.save(&[2u8; SIGNING_KEY_BYTE_LEN]).expect("save 2");
+        assert_eq!(
+            store.load().expect("load"),
+            Some(vec![2u8; SIGNING_KEY_BYTE_LEN])
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("db-mac-key.bin")]);
+    }
+
+    /// A retyped product name reads as "no key" after a rename of the product
+    /// directory: a reset alert on every machine for nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_production_key_lives_in_the_product_directory() {
+        let store = WindowsDpapiKeyStore::default_systemprofile();
+        let dir = store.path().parent().and_then(|p| p.file_name());
+        assert_eq!(
+            dir,
+            Some(std::ffi::OsStr::new(
+                nrr_shared::product_identity::PRODUCT_NAME
+            ))
+        );
     }
 
     #[cfg(windows)]

@@ -54,3 +54,45 @@ fn the_reader_actually_reads_the_literal() {
     let source = "    readonly property int demoCap: 4242\n";
     assert_eq!(qml_int_property(source, "demoCap"), 4242);
 }
+
+/// Quoted slugs in the coercion that starts at the first `trafficStatsPeriod ===`
+/// line: the compared values plus the fallback that follows.
+fn qml_traffic_period_slugs(source: &str) -> std::collections::BTreeSet<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.contains("trafficStatsPeriod === \""))
+        .unwrap_or_else(|| panic!("no `trafficStatsPeriod ===` coercion in the QML file"));
+    lines[start..(start + 4).min(lines.len())]
+        .iter()
+        .flat_map(|l| l.split('"').skip(1).step_by(2))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn qml_traffic_period_lists_equal_the_shared_periods() {
+    let expected: std::collections::BTreeSet<String> =
+        nrr_ui_support::ui_preferences::TRAFFIC_STATS_PERIODS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+    for file in [
+        "apps/desktop/qml/Main.qml",
+        "apps/desktop/qml/sections/settings/TrafficStatsSettings.qml",
+    ] {
+        assert_eq!(
+            qml_traffic_period_slugs(&qml(file)),
+            expected,
+            "{file}: period slugs must equal TRAFFIC_STATS_PERIODS"
+        );
+    }
+}
+
+#[test]
+fn the_traffic_period_reader_reads_the_literals() {
+    let source =
+        "x.trafficStatsPeriod === \"a\"\n || x.trafficStatsPeriod === \"b\")\n ? 1\n : \"c\"\n";
+    let got = qml_traffic_period_slugs(source);
+    assert_eq!(got.into_iter().collect::<Vec<_>>(), ["a", "b", "c"]);
+}

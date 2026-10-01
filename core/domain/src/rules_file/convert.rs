@@ -61,17 +61,10 @@ pub fn rules_file_to_route_rule_set(
                     };
                     (Some(addr_match), None)
                 }
+                // Addresses only: validation refuses anything else, a name
+                // included, rather than reading it as a domain.
                 RulesFileSection::Ip => {
-                    let addr = entry.match_value.parse::<std::net::IpAddr>().ok();
-                    match addr {
-                        Some(ip) => (Some(AddressMatch::ExactIp(ip)), None),
-                        // Unparseable IP — pass through as ExactFqdn so the
-                        // semantic validator can produce a proper diagnostic.
-                        None => (
-                            Some(AddressMatch::ExactFqdn(entry.match_value.clone())),
-                            None,
-                        ),
-                    }
+                    (Some(AddressMatch::ExactIp(entry.match_value.clone())), None)
                 }
                 // Platform-specific app sections.
                 RulesFileSection::Windows | RulesFileSection::Linux | RulesFileSection::MacOS => {

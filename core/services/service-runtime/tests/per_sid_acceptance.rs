@@ -16,8 +16,6 @@
 //! [`nrr_domain::user_principal::UserPrincipal`] view so the acceptance
 //! also pins the on-disk format.
 
-#![cfg(target_os = "windows")]
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 

@@ -1,31 +1,14 @@
 //! Production [`RecoveryAuditEmitter`] backed by [`nrr_diagnostics::AuditWriter`].
 //!
-//! ## Contract
-//!
-//! [`crate::policy_loader::PolicyLoader`] consults a `RecoveryAuditEmitter` when
-//! integrity verification fails and the LKG-fallback recovery path kicks in:
-//!
-//! > The emitter must persist the event durably *before* returning `Ok`.
-//! > If persistence fails, returning `Err` causes the loader to fall
-//! > through to `RecoveryRequired` rather than silently mutate the
-//! > active pointer.
-//!
-//! This adapter maps the loader's narrow [`crate::policy_loader::RecoveryAuditEvent`]
-//! onto the broader [`nrr_diagnostics::AuditEventInput`] schema and flushes through
-//! the durable NDJSON writer.
-//!
 //! ## Mapping
 //!
-//! | RecoveryAuditEvent              | AuditEventKind            | result   | reason_code                          |
-//! |---------------------------------|---------------------------|----------|--------------------------------------|
-//! | `LkgFallbackStarted`            | `IntegrityFailureDetected`| `Failure`| `integrity.policy_integrity_failure` |
-//! | `LkgFallbackCompleted`          | `RecoveryActionRequested` | `Success`| `integrity.policy_integrity_failure` |
-//! | `RecoveryRequired`              | `IntegrityFailureDetected`| `Blocked`| `integrity.policy_integrity_failure` |
+//! | RecoveryAuditEvent          | AuditEventKind            | result    | reason_code                          |
+//! |-----------------------------|---------------------------|-----------|--------------------------------------|
+//! | `IntegrityFailureReported`  | `IntegrityFailureDetected`| `Failure` | `integrity.policy_integrity_failure` |
+//! | `RecoveryRequired`          | `IntegrityFailureDetected`| `Blocked` | `integrity.policy_integrity_failure` |
 //!
-//! `actor_kind` is always [`ActorKind::Service`] (recovery is service-driven, never
-//! user-initiated). `revision_id` is `broken_active` for the two LKG variants so an
-//! auditor can correlate the failure to a specific revision; `RecoveryRequired`
-//! carries no revision because there is no usable active.
+//! `actor_kind` is always [`ActorKind::Service`]; neither event names a
+//! revision, because the keyless loader cannot tell which one to trust.
 //!
 //! ## Event ID generation
 //!
@@ -37,8 +20,7 @@
 //! ## Failure semantics
 //!
 //! Any [`nrr_diagnostics::error::DiagnosticsError`] from `AuditWriter::append` is
-//! converted to a `String` and returned via `Err(...)`; the loader does not mutate
-//! state on `Err`.
+//! converted to a `String` and returned via `Err(...)`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -80,36 +62,17 @@ impl RecoveryAuditEmitter for DiagnosticsRecoveryAuditEmitter {
 /// snapshot tests of the wire shape).
 pub(crate) fn recovery_event_to_audit_input(event: RecoveryAuditEvent) -> AuditEventInput {
     match event {
-        RecoveryAuditEvent::LkgFallbackStarted {
-            broken_active,
-            lkg_target,
-            details,
-        } => AuditEventInput {
+        RecoveryAuditEvent::IntegrityFailureReported { details } => AuditEventInput {
             event_id: next_event_id(),
             kind: AuditEventKind::IntegrityFailureDetected,
             created_at: now_ms(),
             actor_kind: ActorKind::Service,
             actor_id_hash: None,
-            revision_id: Some(broken_active.clone()),
+            revision_id: None,
             risk_level: Some("critical".to_string()),
             result: AuditEventResult::Failure,
             reason_code: integrity::POLICY_INTEGRITY_FAILURE,
-            payload_summary_json: Some(payload_lkg_started(&broken_active, &lkg_target, &details)),
-        },
-        RecoveryAuditEvent::LkgFallbackCompleted {
-            broken_active,
-            new_active,
-        } => AuditEventInput {
-            event_id: next_event_id(),
-            kind: AuditEventKind::RecoveryActionRequested,
-            created_at: now_ms(),
-            actor_kind: ActorKind::Service,
-            actor_id_hash: None,
-            revision_id: Some(new_active.clone()),
-            risk_level: Some("high".to_string()),
-            result: AuditEventResult::Success,
-            reason_code: integrity::POLICY_INTEGRITY_FAILURE,
-            payload_summary_json: Some(payload_lkg_completed(&broken_active, &new_active)),
+            payload_summary_json: Some(payload_integrity_failure_reported(&details)),
         },
         RecoveryAuditEvent::RecoveryRequired { details } => AuditEventInput {
             event_id: next_event_id(),
@@ -149,7 +112,7 @@ pub(crate) fn cache_rebuild_audit_input(original_error: &str) -> AuditEventInput
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn next_event_id() -> String {
+pub(crate) fn next_event_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -166,62 +129,22 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Build a compact payload summary. We hand-roll the JSON instead of
-/// pulling in serde_json::Value because (a) the shape is small and
-/// fixed, (b) the audit pipeline trims to ~200 chars anyway, and (c) the
-/// fields are guaranteed safe to splice directly (revision IDs are
-/// `rev-{uuid}` and details strings are produced by our own code paths,
-/// no untrusted input). We still escape the message text defensively.
-fn payload_lkg_started(broken: &str, lkg: &str, details: &str) -> String {
-    format!(
-        r#"{{"event":"lkg_fallback_started","broken_active":{},"lkg_target":{},"details":{}}}"#,
-        json_str(broken),
-        json_str(lkg),
-        json_str(details),
-    )
-}
-
-fn payload_lkg_completed(broken: &str, new_active: &str) -> String {
-    format!(
-        r#"{{"event":"lkg_fallback_completed","broken_active":{},"new_active":{}}}"#,
-        json_str(broken),
-        json_str(new_active),
-    )
+// Serialised by the JSON library: `details` carries error text whose content is
+// not ours to assume, and a raw control character leaves the payload unparseable.
+fn payload_integrity_failure_reported(details: &str) -> String {
+    serde_json::json!({ "event": "integrity_failure_reported", "details": details }).to_string()
 }
 
 fn payload_recovery_required(details: &str) -> String {
-    format!(
-        r#"{{"event":"recovery_required","details":{}}}"#,
-        json_str(details)
-    )
+    serde_json::json!({ "event": "recovery_required", "details": details }).to_string()
 }
 
 fn payload_cache_rebuilt(original_error: &str) -> String {
-    format!(
-        r#"{{"event":"cache_rebuilt_after_corruption","original_error":{}}}"#,
-        json_str(original_error)
-    )
-}
-
-/// Minimal JSON-string escape: covers the four characters that would
-/// break the surrounding JSON literal (`"`, `\`, control chars
-/// `\n`/`\r`/`\t`). Other control characters are rare in our inputs but
-/// passed through unchanged — they don't break parsing, just look ugly.
-fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
+    serde_json::json!({
+        "event": "cache_rebuilt_after_corruption",
+        "original_error": original_error,
+    })
+    .to_string()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -259,33 +182,18 @@ mod tests {
     }
 
     #[test]
-    fn maps_lkg_fallback_started_to_integrity_failure_detected() {
-        let input = recovery_event_to_audit_input(RecoveryAuditEvent::LkgFallbackStarted {
-            broken_active: "rev-bad".into(),
-            lkg_target: "rev-good".into(),
+    fn maps_integrity_failure_reported_to_integrity_failure_detected() {
+        let input = recovery_event_to_audit_input(RecoveryAuditEvent::IntegrityFailureReported {
             details: "hash mismatch".into(),
         });
         assert_eq!(input.kind, AuditEventKind::IntegrityFailureDetected);
         assert_eq!(input.result, AuditEventResult::Failure);
         assert_eq!(input.actor_kind, ActorKind::Service);
-        assert_eq!(input.revision_id.as_deref(), Some("rev-bad"));
+        assert!(input.revision_id.is_none());
         assert_eq!(input.reason_code, integrity::POLICY_INTEGRITY_FAILURE);
         let payload = input.payload_summary_json.unwrap();
-        assert!(payload.contains("\"lkg_fallback_started\""));
-        assert!(payload.contains("rev-bad"));
-        assert!(payload.contains("rev-good"));
+        assert!(payload.contains("\"integrity_failure_reported\""));
         assert!(payload.contains("hash mismatch"));
-    }
-
-    #[test]
-    fn maps_lkg_fallback_completed_to_recovery_action_requested() {
-        let input = recovery_event_to_audit_input(RecoveryAuditEvent::LkgFallbackCompleted {
-            broken_active: "rev-bad".into(),
-            new_active: "rev-good".into(),
-        });
-        assert_eq!(input.kind, AuditEventKind::RecoveryActionRequested);
-        assert_eq!(input.result, AuditEventResult::Success);
-        assert_eq!(input.revision_id.as_deref(), Some("rev-good"));
     }
 
     #[test]
@@ -326,12 +234,39 @@ mod tests {
         assert!(a.starts_with("adt-"));
     }
 
+    /// Built from code points so the fixture carries no escapes of its own.
     #[test]
-    fn json_str_escapes_quotes_and_backslashes() {
-        assert_eq!(json_str("plain"), r#""plain""#);
-        assert_eq!(json_str(r#"with "quotes""#), r#""with \"quotes\"""#);
-        assert_eq!(json_str("back\\slash"), r#""back\\slash""#);
-        assert_eq!(json_str("tab\there"), r#""tab\there""#);
+    fn a_payload_survives_json_metacharacters_and_control_characters() {
+        let nasty: String = [
+            'C',
+            ':',
+            char::from(92u8),
+            'x',
+            char::from(34u8),
+            char::from(10u8),
+            char::from(1u8),
+            char::from(31u8),
+            char::from(127u8),
+            'y',
+        ]
+        .into_iter()
+        .collect();
+        for payload in [
+            payload_integrity_failure_reported(&nasty),
+            payload_recovery_required(&nasty),
+            payload_cache_rebuilt(&nasty),
+        ] {
+            assert!(
+                !payload.contains(char::from(10u8)),
+                "NDJSON-unsafe: {payload}"
+            );
+            let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+            let carried = value
+                .get("details")
+                .or_else(|| value.get("original_error"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(carried, Some(nasty.as_str()));
+        }
     }
 
     #[test]
@@ -340,10 +275,8 @@ mod tests {
         let writer = Arc::new(AuditWriter::open(AuditWriterConfig::new(dir.path())));
         let emitter = DiagnosticsRecoveryAuditEmitter::new(writer);
         emitter
-            .emit(RecoveryAuditEvent::LkgFallbackStarted {
-                broken_active: "rev-bad".into(),
-                lkg_target: "rev-good".into(),
-                details: "test".into(),
+            .emit(RecoveryAuditEvent::IntegrityFailureReported {
+                details: "rev-bad signature mismatch".into(),
             })
             .expect("persist ok");
         let entries: Vec<_> = std::fs::read_dir(dir.path())

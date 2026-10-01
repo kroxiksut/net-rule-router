@@ -315,9 +315,7 @@ pub struct PresetExportGetResponse {
     /// Base64-encoded canonical txt bytes of the rules file for the
     /// requested route. UTF-8 inside the base64 wrapper.
     pub file_bytes_b64: String,
-    /// SHA-256 hex of the unwrapped UTF-8 bytes. The GUI uses this as
-    /// `last_file_synced_hash_<role>` for divergence detection on
-    /// subsequent close-window events.
+    /// SHA-256 hex of the unwrapped UTF-8 bytes.
     pub content_hash: String,
 }
 
@@ -473,6 +471,10 @@ pub enum MutationKind {
     /// target principal from the caller SID, so a reset can only ever
     /// clear the caller's own partition, never the baseline.
     RulesResetToBaseline,
+    /// Restart the audit chain over the breaks the dry-run listed. Wire
+    /// payload: [`AuditChainRestartPayload`]. Confirms as an elevated
+    /// `mutation-request`; the service records the confirming administrator.
+    AuditChainRestart,
 }
 
 impl MutationKind {
@@ -494,7 +496,8 @@ impl MutationKind {
             Self::PresetExport
             | Self::SettingsExport
             | Self::SecurityAlertAck
-            | Self::SecurityAlertResolve => false,
+            | Self::SecurityAlertResolve
+            | Self::AuditChainRestart => false,
         }
     }
 }
@@ -657,10 +660,12 @@ fn rule_summary_enabled_is_default(enabled: &bool) -> bool {
 }
 
 /// Wire-form mirror of `nrr_domain::risk::RiskSignal`, plus the service's
-/// pre-apply findings (the last three variants), so the review lists both.
+/// pre-apply findings (the variants after `FailClosedActivation`), so the
+/// review lists both.
 ///
 /// The GUI renders each `kind` through `risk.signal.<kind>` with the payload
-/// fields as placeholders.
+/// fields as placeholders; a refusal (`InvalidRuleValue`, `ChangeRefused`) is
+/// shown instead of the review, never in it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 // `rename_all_fields = "kebab-case"` is essential: the QML reads
 // e.g. `signal["rule-count"]`, but without this attribute the
@@ -714,6 +719,17 @@ pub enum RiskSignalDto {
     AdditionalAdapterUnresolved,
     /// The service's own consistency check would refuse this apply.
     ApplyWillBeRefused,
+    /// Values the per-row verdict refuses, so the revision is not accepted.
+    /// The kind is also the code the refusal carries on execute.
+    InvalidRuleValue {
+        rules: Vec<String>,
+    },
+    /// Any other refusal of the submitted rules; `code` is the one the execute
+    /// fails with. A refused preview carries no rule changes, and without this
+    /// a client could not tell it from an unchanged rule set.
+    ChangeRefused {
+        code: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -722,6 +738,14 @@ pub struct MutationDryRunResponse {
     pub review_summary: ReviewSummaryResponse,
     pub confirmation_token: String,
     pub review_risk_level: ReviewRiskLevel,
+    /// Security-alert kinds only: what acknowledging would adopt, from the
+    /// service's own integrity scan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_rows: Vec<UnverifiedRowDto>,
+    /// `audit-chain-restart` only: what the restart would paper over, from
+    /// the service's own verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_chain: Option<AuditChainRestartPreviewDto>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

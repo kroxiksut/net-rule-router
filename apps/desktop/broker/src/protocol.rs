@@ -197,7 +197,7 @@ pub fn build_broker_argv(
 /// Derive the per-session pipe path. The launcher PID + random suffix keep
 /// it unique against a stale broker from a previous run.
 pub fn derive_pipe_name(launcher_pid: u32, rand_suffix: &str) -> String {
-    format!(r"\\.\pipe\NetRuleRouter\broker-{launcher_pid}-{rand_suffix}")
+    nrr_shared::product_identity::windows_pipe_path(&format!("broker-{launcher_pid}-{rand_suffix}"))
 }
 
 /// True when `slug` is a broker-local control operation.
@@ -314,6 +314,34 @@ mod tests {
         // Whatever the caller asks, the child may run for the full budget.
         let wait = client_answer_timeout(BROKER_SERVICE_CONTROL, Duration::from_secs(1));
         assert!(wait > POST_ELEVATION_SETTLE + SERVICE_CONTROL_BUDGET);
+    }
+
+    /// The Qt host cannot link this crate, so it spells the bound out; a GUI
+    /// that gave up first would report a restart that succeeded as failed.
+    #[test]
+    fn the_gui_waits_for_a_service_control_answer_as_long_as_the_launcher() {
+        const DECLARATION: &str = "inline constexpr int kBrokerServiceControlTimeoutMs =";
+        let header = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../qt-host/native/src/service_controller.h");
+        let source = std::fs::read_to_string(&header).expect("read the host's service controller");
+        let rest = source
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(DECLARATION))
+            .expect("the host declares its broker service-control timeout");
+        let digits: String = rest
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let host_ms: u128 = digits
+            .parse()
+            .expect("the timeout starts with the broker bound");
+        let launcher = client_answer_timeout(BROKER_SERVICE_CONTROL, Duration::ZERO);
+        assert_eq!(
+            host_ms,
+            launcher.as_millis(),
+            "service_controller.h must start from the launcher's bound"
+        );
     }
 
     #[test]

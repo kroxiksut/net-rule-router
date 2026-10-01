@@ -76,13 +76,13 @@ fn a_foreign_process_on_the_tunnel_names_the_pin_that_moved_it() {
 #[test]
 fn a_process_no_rule_names_never_owns_a_pin() {
     let store = AppObservationStore::new();
-    store.record("chrome.exe", Ipv4Addr::new(23, 10, 20, 165));
+    store.record("chrome.exe", Ipv4Addr::new(203, 0, 113, 165));
     let owners = owners_for(
         &store,
         "assistant.exe",
         &routed(),
         EgressRole::Secondary,
-        Ipv4Addr::new(23, 10, 20, 165),
+        Ipv4Addr::new(203, 0, 113, 165),
     );
     assert!(owners.is_empty(), "{owners:?}");
 }
@@ -94,14 +94,14 @@ fn an_updaters_leftover_binary_is_not_an_owner() {
     let store = AppObservationStore::new();
     store.record(
         "assistant.exe.old.1787377508929",
-        Ipv4Addr::new(23, 10, 20, 130),
+        Ipv4Addr::new(203, 0, 113, 130),
     );
     let owners = owners_for(
         &store,
         "assistant.exe",
         &routed(),
         EgressRole::Secondary,
-        Ipv4Addr::new(23, 10, 20, 130),
+        Ipv4Addr::new(203, 0, 113, 130),
     );
     assert!(owners.is_empty(), "{owners:?}");
 }
@@ -189,7 +189,7 @@ fn an_address_no_application_rule_pinned_is_left_alone() {
         "chrome.exe",
         &routed(),
         EgressRole::Secondary,
-        Ipv4Addr::new(23, 10, 20, 138),
+        Ipv4Addr::new(203, 0, 113, 138),
     );
     assert!(owners.is_empty());
 }
@@ -455,8 +455,8 @@ fn test_consumer_with_live_secondary() -> ConnectionObservationConsumer {
     let vpn = AdapterInfo {
         index: VPN,
         adapter_name: "{vpn-live}".into(),
-        description: "SwiftVPN 3.0 OpenVPN Adapter".into(),
-        friendly_name: "swiftvpn VPN".into(),
+        description: "ExampleVPN 3.0 OpenVPN Adapter".into(),
+        friendly_name: "examplevpn VPN".into(),
         mac: None,
         interface_type: nrr_platform_api::adapters::InterfaceType::Ethernet,
         oper_status: nrr_platform_api::adapters::IfOperStatus::Up,
@@ -656,7 +656,7 @@ fn vpn_name_match_accepts_vpn_clients_rejects_others() {
         r"\device\harddiskvolume2\program files\openvpn\bin\openvpn.exe"
     )));
     assert!(process_name_matches_vpn(Some(
-        r"\device\harddiskvolume3\swiftvpn\swiftvpn.exe"
+        r"\device\harddiskvolume3\examplevpn\examplevpn.exe"
     )));
     assert!(process_name_matches_vpn(Some(
         r"C:\Program Files\WireGuard\wireguard.exe"
@@ -756,7 +756,7 @@ fn build_unicast_table_carries_both_address_families() {
 fn classify_resolves_an_ipv6_source_to_its_interface() {
     let local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x27b2);
     let unicast = vec![(IpAddr::V6(local), VPN)];
-    let mut observation = obs(Ipv4Addr::new(10, 8, 0, 6), Ipv4Addr::new(23, 10, 20, 162));
+    let mut observation = obs(Ipv4Addr::new(10, 8, 0, 6), Ipv4Addr::new(203, 0, 113, 162));
     observation.local = SocketAddr::new(IpAddr::V6(local), 50000);
     observation.remote = SocketAddr::new(
         IpAddr::V6(Ipv6Addr::new(0x2620, 0x2d, 0, 1, 0, 0, 0, 0x28)),
@@ -771,14 +771,14 @@ fn classify_resolves_an_ipv6_source_to_its_interface() {
 fn classify_labels_vpn_source_as_secondary() {
     let unicast = vec![(v4(Ipv4Addr::new(10, 8, 0, 6)), VPN)];
     let rec = classify_connection(
-        &obs(Ipv4Addr::new(10, 8, 0, 6), Ipv4Addr::new(23, 10, 20, 162)),
+        &obs(Ipv4Addr::new(10, 8, 0, 6), Ipv4Addr::new(203, 0, 113, 162)),
         &unicast,
         Some(ETHERNET),
         Some(VPN),
     );
     assert_eq!(rec.egress.role, EgressRole::Secondary);
     assert_eq!(rec.egress.ifindex, VPN);
-    assert_eq!(rec.remote.ip(), IpAddr::V4(Ipv4Addr::new(23, 10, 20, 162)));
+    assert_eq!(rec.remote.ip(), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 162)));
 }
 
 #[test]
@@ -787,7 +787,7 @@ fn classify_labels_lan_source_as_primary() {
     let rec = classify_connection(
         &obs(
             Ipv4Addr::new(192, 168, 0, 50),
-            Ipv4Addr::new(23, 10, 20, 138),
+            Ipv4Addr::new(203, 0, 113, 138),
         ),
         &unicast,
         Some(ETHERNET),
@@ -950,14 +950,14 @@ fn reverse_learner_consumer(
 
 #[test]
 fn a_dns_lockdown_drop_never_reaches_the_reverse_learner() {
-    // The field case: an app goes to Google Public DNS of its own, the
+    // The field case: an app goes to a public DNS resolver of its own, the
     // lockdown cuts it, and naming the address registered the resolver as a
     // DIRECT host — whose block-all exemption outranks the lockdown block.
     const LOCKDOWN_SPEC: u64 = 5;
     let (consumer, named) = reverse_learner_consumer(Arc::new(|id| id == LOCKDOWN_SPEC));
     let resolver = || {
         let mut o = block_obs(Some(true), Some(LOCKDOWN_SPEC));
-        o.remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 443));
+        o.remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 443));
         o
     };
     consumer.consume(&[resolver()], SystemTime::now());
@@ -973,7 +973,7 @@ fn a_dns_lockdown_drop_never_reaches_the_reverse_learner() {
     consumer.consume(&[other], SystemTime::now());
     assert_eq!(
         *named.lock().unwrap_or_else(|p| p.into_inner()),
-        vec![Ipv4Addr::new(8, 8, 4, 4)]
+        vec![Ipv4Addr::new(198, 51, 100, 4)]
     );
 }
 
@@ -1295,7 +1295,7 @@ fn a_cut_ipv6_destination_is_announced_as_the_closed_family() {
     let (mut consumer, notices) = block_notice_consumer(None);
     consumer = consumer.with_ipv6_cut_drop_check(Arc::new(|id| id == 42));
     let mut obs = block_obs(Some(true), Some(42));
-    obs.remote = SocketAddr::new("2606:4700::1111".parse().expect("v6"), 443);
+    obs.remote = SocketAddr::new("2001:db8::1111".parse().expect("v6"), 443);
     consumer.consume(&[obs], SystemTime::now());
 
     let got = notices.lock().unwrap_or_else(|p| p.into_inner());
@@ -1451,10 +1451,51 @@ fn a_filter_classify_is_not_an_establishment() {
     assert!(seen.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
 }
 
-/// A browser whose routed sites already go through the tunnel is split across
-/// both links; the measure must hear about that half to leave it alone.
+/// A dropped connection never came up, so its close says nothing either.
 #[test]
-fn a_program_leaving_over_the_additional_link_is_reported_as_split() {
+fn a_dropped_connection_on_the_main_link_is_not_measured() {
+    let (consumer, seen) = test_consumer_on_both_links();
+    consumer.consume(
+        &[
+            over_the_main_link(ConnectionVerdict::Block, ConnectionProgress::Attempt),
+            over_the_main_link(
+                ConnectionVerdict::Unknown,
+                ConnectionProgress::ClosedInOrder,
+            ),
+        ],
+        SystemTime::now(),
+    );
+    assert!(seen.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+}
+
+/// Tunnel clients and the operating system's own programs are never offered,
+/// so the main-link half does not measure them either.
+#[test]
+fn a_program_never_offered_is_not_measured_on_the_main_link() {
+    for path in [
+        r"\device\harddiskvolume2\program files\openvpn\bin\openvpn.exe",
+        r"\device\harddiskvolume2\windows\system32\svchost.exe",
+    ] {
+        let (consumer, seen) = test_consumer_on_both_links();
+        let from = |progress| ConnectionObservation {
+            process_path: Some(path.to_string()),
+            ..over_the_main_link(ConnectionVerdict::Unknown, progress)
+        };
+        consumer.consume(
+            &[
+                from(ConnectionProgress::Attempt),
+                from(ConnectionProgress::ClosedInOrder),
+            ],
+            SystemTime::now(),
+        );
+        assert!(
+            seen.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+            "{path}"
+        );
+    }
+}
+
+fn consumer_reporting_splits() -> (ConnectionObservationConsumer, Arc<Mutex<Vec<String>>>) {
     let (consumer, _) = test_consumer_on_both_links();
     let split: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&split);
@@ -1463,6 +1504,23 @@ fn a_program_leaving_over_the_additional_link_is_reported_as_split() {
             .unwrap_or_else(|p| p.into_inner())
             .push(program.to_string());
     }));
+    (consumer, split)
+}
+
+fn over_the_additional_link(process: &str, verdict: ConnectionVerdict) -> ConnectionObservation {
+    ConnectionObservation {
+        pid: 4242,
+        process_path: Some(format!(r"\device\harddiskvolume2\{process}")),
+        verdict,
+        ..obs(Ipv4Addr::new(10, 88, 1, 41), Ipv4Addr::new(203, 0, 113, 9))
+    }
+}
+
+/// A browser whose routed sites already go through the tunnel is split across
+/// both links; the measure must hear about that half to leave it alone.
+#[test]
+fn a_program_leaving_over_the_additional_link_is_reported_as_split() {
+    let (consumer, split) = consumer_reporting_splits();
     // Positive control: the same program on the main link says nothing here.
     consumer.consume(
         &[over_the_main_link(
@@ -1474,9 +1532,9 @@ fn a_program_leaving_over_the_additional_link_is_reported_as_split() {
     assert!(split.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
 
     consumer.consume(
-        &[obs(
-            Ipv4Addr::new(10, 88, 1, 41),
-            Ipv4Addr::new(203, 0, 113, 9),
+        &[over_the_additional_link(
+            "chrome.exe",
+            ConnectionVerdict::Unknown,
         )],
         SystemTime::now(),
     );
@@ -1484,4 +1542,36 @@ fn a_program_leaving_over_the_additional_link_is_reported_as_split() {
         *split.lock().unwrap_or_else(|p| p.into_inner()),
         vec!["chrome.exe".to_string()]
     );
+}
+
+/// Nothing went over the link when the connection was dropped or only passed
+/// a filter before its handshake: neither makes the program "split".
+#[test]
+fn only_an_establishment_on_the_additional_link_reports_a_split() {
+    let (consumer, split) = consumer_reporting_splits();
+    consumer.consume(
+        &[
+            over_the_additional_link("chrome.exe", ConnectionVerdict::Block),
+            over_the_additional_link("chrome.exe", ConnectionVerdict::Permit),
+        ],
+        SystemTime::now(),
+    );
+    assert!(split.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+}
+
+/// A torrent client, a tunnel client and the OS's own programs are never
+/// offered, so their traffic on the additional link must not touch the
+/// registry either.
+#[test]
+fn a_program_never_offered_is_not_reported_as_split() {
+    let (consumer, split) = consumer_reporting_splits();
+    consumer.consume(
+        &[
+            over_the_additional_link("btweb.exe", ConnectionVerdict::Unknown),
+            over_the_additional_link("openvpn.exe", ConnectionVerdict::Unknown),
+            over_the_additional_link(r"windows\system32\svchost.exe", ConnectionVerdict::Unknown),
+        ],
+        SystemTime::now(),
+    );
+    assert!(split.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
 }

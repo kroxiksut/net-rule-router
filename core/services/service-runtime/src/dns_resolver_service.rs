@@ -9,9 +9,9 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nrr_domain::enforcement_mode::EnforcementMode;
 use nrr_platform_api::dns_redirect::{
@@ -37,8 +37,10 @@ pub enum DnsResolverRunOutcome {
     /// Could not bind the loopback listener (port already in use / no
     /// privilege). Nothing was redirected — system DNS is untouched.
     BindFailed,
-    /// Bound, but pointing the OS at us failed. The socket is dropped and the
-    /// OS DNS is left exactly as it was (fail-open — general DNS keeps working).
+    /// Bound, but pointing the OS at us failed. The socket is dropped and an
+    /// explicit `restore` is run as a backstop for a multi-step redirect that
+    /// applied part of itself before failing (fail-open — general DNS keeps
+    /// working once that rollback lands).
     RedirectFailed,
     /// Redirected, served until stop, and the OS DNS was restored.
     ServedAndRestored,
@@ -56,8 +58,17 @@ pub enum DnsResolverRunOutcome {
 /// the machine resolving past us for minutes without a single log line.
 const REDIRECT_GUARD_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long the claims may go unread while a change feed is wired. The feed
+/// carries every change it can see; this bounds what a missed one costs (a
+/// domain policy rewriting the search list, a feed that stopped).
+pub const CLAIMS_SAFETY_RECHECK_INTERVAL: Duration = Duration::from_secs(300);
+
+/// A link coming up is a burst of events; the claims are read once it settles.
+const RECHECK_SETTLE: Duration = Duration::from_millis(250);
+
 /// Raised when something happened that can change which namespaces are claimed
-/// — a link appearing or going away.
+/// or how short names are completed — a link or route change, a DNS settings
+/// write, the user's own short-name domain.
 ///
 /// A VPN that connects hands its own DNS suffix to the machine, and until we
 /// step out of that namespace its names resolve through us and fail. Waiting
@@ -67,8 +78,6 @@ const REDIRECT_GUARD_INTERVAL: Duration = Duration::from_secs(30);
 /// unresolvable for a minute and a half after it was ready.
 pub type NamespaceRecheck = Arc<AtomicBool>;
 
-/// Owns the Mode-B intercept listener plus the system-DNS redirect port and
-/// drives their combined lifecycle in one blocking call.
 /// Which namespaces the product should stay out of, asked afresh each time.
 ///
 /// A closure rather than a stored list: connections come and go, and the
@@ -79,16 +88,121 @@ pub type DnsNamespaceExemptionsFn = Arc<dyn Fn() -> Vec<DnsNamespaceExemption> +
 /// Suffixes the user named for completing short names, asked afresh each tick.
 pub type ShortNameSuffixesFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
+/// The claims as the arm or the last guard tick read them, for the query path:
+/// on Windows a read enumerates the adapters and walks the registry, which
+/// has no place inside a DNS answer's budget. Empty until the arm publishes,
+/// which completes nothing, exactly as with no source wired.
+#[derive(Clone, Default)]
+pub(crate) struct ClaimsSnapshot(Arc<RwLock<Arc<[DnsNamespaceExemption]>>>);
+
+impl ClaimsSnapshot {
+    /// The lock is held only for the pointer copy, never across a lookup.
+    pub(crate) fn current(&self) -> Arc<[DnsNamespaceExemption]> {
+        Arc::clone(&self.0.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    pub(crate) fn publish(&self, claims: Arc<[DnsNamespaceExemption]>) {
+        *self.0.write().unwrap_or_else(|p| p.into_inner()) = claims;
+    }
+}
+
+/// Where the claims come from, and where the query path reads them.
+#[derive(Clone, Default)]
+struct NamespaceClaims {
+    /// `None` claims every name, which is what the product did before it
+    /// learned to step aside.
+    source: Option<DnsNamespaceExemptionsFn>,
+    published: ClaimsSnapshot,
+    /// `None` re-reads on every guard tick: with nothing to say what changed,
+    /// only a look can tell.
+    feed: Option<ChangeFeed>,
+}
+
+/// Says when the claims changed, so a quiet tick reads nothing: on Windows a
+/// read enumerates the adapters and walks the registry, on Linux it can start
+/// a child process.
+#[derive(Clone)]
+struct ChangeFeed {
+    raised: NamespaceRecheck,
+    safety_interval: Duration,
+}
+
+impl NamespaceClaims {
+    /// Read once for every consumer, and published for the listener.
+    fn refresh(&self) -> Arc<[DnsNamespaceExemption]> {
+        let claims: Arc<[DnsNamespaceExemption]> =
+            self.source.as_ref().map(|s| s().into()).unwrap_or_default();
+        self.published.publish(Arc::clone(&claims));
+        claims
+    }
+
+    /// Take the raised flag, if any.
+    fn take_raised(&self) -> bool {
+        self.feed
+            .as_ref()
+            .is_some_and(|f| f.raised.swap(false, Ordering::SeqCst))
+    }
+
+    /// Whether this tick must read: always without a feed, otherwise when it
+    /// was raised or the safety interval ran out.
+    fn due(&self, raised: bool, last_read: Instant) -> bool {
+        self.feed
+            .as_ref()
+            .is_none_or(|f| raised || last_read.elapsed() >= f.safety_interval)
+    }
+}
+
+/// The user's short-name suffixes, and how the last attempt to keep short
+/// names went — carried from the arm into the guard, so a failure is logged
+/// once and retried until it clears.
+#[derive(Clone, Default)]
+struct ShortNameUpkeep {
+    user_suffixes: Option<ShortNameSuffixesFn>,
+    last_error: Option<String>,
+}
+
+impl ShortNameUpkeep {
+    /// Ask the port to keep short names resolvable with `claimed`: the
+    /// machine's suffixes change with its connections, and the port writes
+    /// only on change.
+    fn keep(
+        &mut self,
+        redirect: &Arc<dyn SystemDnsRedirectPort>,
+        claimed: &[DnsNamespaceExemption],
+    ) {
+        let source = self.user_suffixes.as_ref();
+        let extra = || source.map(|s| s()).unwrap_or_default();
+        match redirect.keep_short_names(claimed, &extra) {
+            Ok(()) => self.last_error = None,
+            Err(error) => {
+                let text = error.to_string();
+                if self.last_error.as_deref() != Some(text.as_str()) {
+                    tracing::warn!(
+                        target: "nrr::dns-resolver",
+                        msg_key = "dns-resolver-short-names-failed",
+                        error = %text,
+                        "Mode B: could not keep short names resolvable; single-label names may not resolve",
+                    );
+                    self.last_error = Some(text);
+                }
+            }
+        }
+    }
+
+    fn failing(&self) -> bool {
+        self.last_error.is_some()
+    }
+}
+
+/// Owns the Mode-B intercept listener plus the system-DNS redirect port and
+/// drives their combined lifecycle in one blocking call.
 pub struct DnsResolverService {
     listener: DnsInterceptListener,
     redirect: Arc<dyn SystemDnsRedirectPort>,
     listen_addr: SocketAddr,
     guard_interval: Duration,
-    recheck: Option<NamespaceRecheck>,
-    /// `None` claims every name, which is what the product did before it
-    /// learned to step aside.
-    exemptions: Option<DnsNamespaceExemptionsFn>,
-    short_name_suffixes: Option<ShortNameSuffixesFn>,
+    claims: NamespaceClaims,
+    short_names: ShortNameUpkeep,
 }
 
 impl DnsResolverService {
@@ -102,9 +216,8 @@ impl DnsResolverService {
             redirect,
             listen_addr,
             guard_interval: REDIRECT_GUARD_INTERVAL,
-            recheck: None,
-            exemptions: None,
-            short_name_suffixes: None,
+            claims: NamespaceClaims::default(),
+            short_names: ShortNameUpkeep::default(),
         }
     }
 
@@ -112,74 +225,54 @@ impl DnsResolverService {
     /// port's to know; these are added to them.
     #[must_use]
     pub fn with_short_name_suffixes(mut self, source: ShortNameSuffixesFn) -> Self {
-        self.short_name_suffixes = Some(source);
+        self.short_names.user_suffixes = Some(source);
         self
     }
 
-    /// Ask the port to keep short names resolvable. Every tick: the machine's
-    /// suffixes change with its connections, and the port writes only on
-    /// change. A failure is logged once until it changes or clears.
-    fn keep_short_names(
-        redirect: &Arc<dyn SystemDnsRedirectPort>,
-        source: Option<&ShortNameSuffixesFn>,
-        last_error: &mut Option<String>,
-    ) {
-        let extra = source.map(|s| s()).unwrap_or_default();
-        match redirect.keep_short_names(&extra) {
-            Ok(()) => *last_error = None,
-            Err(error) => {
-                let text = error.to_string();
-                if last_error.as_deref() != Some(text.as_str()) {
-                    tracing::warn!(
-                        target: "nrr::dns-resolver",
-                        msg_key = "dns-resolver-short-names-failed",
-                        "Mode B: could not keep short names resolvable ({text});                          single-label names may not resolve",
-                    );
-                    *last_error = Some(text);
-                }
-            }
-        }
-    }
-
-    /// Wire the source of namespaces to stay out of. Re-read on the guard
-    /// tick, so a VPN that connects later is honoured without a restart.
+    /// Wire the source of namespaces to stay out of. Re-read by the guard (see
+    /// [`Self::with_change_feed`]), so a VPN that connects later is honoured
+    /// without a restart.
     ///
-    /// The listener gets the same source: a short name reaches us with no
-    /// suffix, and a claimed namespace is what the OS would have completed it
-    /// with.
+    /// The listener completes short names with what the last read found: a short
+    /// name reaches us with no suffix, and a claimed namespace is what the OS
+    /// would have completed it with.
     #[must_use]
     pub fn with_namespace_exemptions(mut self, source: DnsNamespaceExemptionsFn) -> Self {
-        self.listener = self.listener.with_claimed_namespaces(Arc::clone(&source));
-        self.exemptions = Some(source);
+        self.listener = self
+            .listener
+            .with_claimed_namespaces(self.claims.published.clone());
+        self.claims.source = Some(source);
         self
     }
 
-    /// Wire the flag a link change raises, so the claimed namespaces are
-    /// re-read at once instead of at the next guard tick. See
-    /// [`NamespaceRecheck`] for why the tick alone is too slow.
+    /// Wire the flag the change feed raises. The claims are then read when it
+    /// is raised — at once, see [`NamespaceRecheck`] — or after
+    /// `safety_interval` without it, and never on a quiet tick. Wire it only
+    /// when the feed is actually subscribed.
     #[must_use]
-    pub fn with_namespace_recheck(mut self, recheck: NamespaceRecheck) -> Self {
-        self.recheck = Some(recheck);
+    pub fn with_change_feed(mut self, raised: NamespaceRecheck, safety_interval: Duration) -> Self {
+        self.claims.feed = Some(ChangeFeed {
+            raised,
+            safety_interval,
+        });
         self
     }
 
     /// Hand the current set to the port, and say so only when it changed.
     ///
-    /// Runs on every guard tick, so an unconditional line would write one
-    /// entry every thirty seconds for a machine that never changes.
+    /// Runs on every read of the claims, so an unconditional line would write
+    /// one entry per read for a machine that never changes. No source wired
+    /// claims every name, and nothing is handed over.
     fn apply_exemptions(
         redirect: &Arc<dyn SystemDnsRedirectPort>,
-        source: Option<&DnsNamespaceExemptionsFn>,
+        claims: &NamespaceClaims,
+        current: &[DnsNamespaceExemption],
         last: &mut Vec<DnsNamespaceExemption>,
     ) {
-        let Some(source) = source else {
-            return;
-        };
-        let current = source();
-        if current == *last {
+        if claims.source.is_none() || current == last.as_slice() {
             return;
         }
-        match redirect.exempt_namespaces(&current) {
+        match redirect.exempt_namespaces(current) {
             Ok(_) => {
                 let names: Vec<&str> = current.iter().map(|e| e.suffix.as_str()).collect();
                 tracing::info!(
@@ -188,14 +281,15 @@ impl DnsResolverService {
                     namespaces = %names.join(", "),
                     "Mode B: these namespaces are answered by the connections that claim them",
                 );
-                *last = current;
+                *last = current.to_vec();
             }
             // Keep the previous set as the last-known state so the next tick
             // retries instead of believing the failed write took effect.
             Err(error) => tracing::warn!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-resolver-exempt-namespaces-failed",
-                "Mode B: could not step out of the claimed namespaces ({error}); names inside them keep resolving through us",
+                error = %error,
+                "Mode B: could not step out of the claimed namespaces; names inside them keep resolving through us",
             ),
         }
     }
@@ -206,78 +300,118 @@ impl DnsResolverService {
         self
     }
 
+    /// Sleep `interval` in `slice` steps. `true` when the feed was raised,
+    /// which cuts the wait short: the namespaces a new link may claim are the
+    /// whole reason the guard exists.
+    fn wait_tick(claims: &NamespaceClaims, interval: Duration, stop: &AtomicBool) -> bool {
+        let slice = Duration::from_millis(50).min(interval);
+        let mut waited = Duration::ZERO;
+        while waited < interval && !stop.load(Ordering::SeqCst) {
+            if claims.take_raised() {
+                // One read for the whole burst a link change raises.
+                let mut settled = Duration::ZERO;
+                while settled < RECHECK_SETTLE && !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(slice);
+                    settled += slice;
+                }
+                claims.take_raised();
+                return true;
+            }
+            std::thread::sleep(slice);
+            waited += slice;
+        }
+        false
+    }
+
     /// Re-installs the redirect whenever `inspect` finds it missing or the
     /// table damaged, until `stop`. Runs beside the serve loop.
-    #[allow(clippy::too_many_arguments)]
     fn guard(
         redirect: Arc<dyn SystemDnsRedirectPort>,
         handle: RedirectHandle,
         interval: Duration,
         stop: Arc<AtomicBool>,
-        exemptions: Option<DnsNamespaceExemptionsFn>,
+        claims: NamespaceClaims,
         mut applied: Vec<DnsNamespaceExemption>,
-        recheck: Option<NamespaceRecheck>,
-        short_name_suffixes: Option<ShortNameSuffixesFn>,
+        mut short_names: ShortNameUpkeep,
     ) {
-        let mut short_name_error = None;
-        let slice = Duration::from_millis(50).min(interval);
+        // The arm has just read the claims.
+        let mut last_read = Instant::now();
+        // Something that undoes the redirect on every check is said once, not
+        // every tick; a check that finds it in place ends the streak.
+        let mut missing_streak = false;
+        let mut last_reinstall_error: Option<String> = None;
         loop {
-            let mut waited = Duration::ZERO;
-            while waited < interval && !stop.load(Ordering::SeqCst) {
-                // A link change cuts the wait short: the namespaces it may have
-                // claimed are the whole reason this loop exists.
-                if recheck
-                    .as_ref()
-                    .is_some_and(|r| r.swap(false, Ordering::SeqCst))
-                {
-                    break;
-                }
-                std::thread::sleep(slice);
-                waited += slice;
-            }
+            let raised = Self::wait_tick(&claims, interval, &stop);
             if stop.load(Ordering::SeqCst) {
                 return;
             }
-            // A connection that appeared since the last tick may claim a
-            // namespace of its own, and one that went away stops claiming it.
-            // Checked before the redirect itself: re-installing the catch-all
-            // without the exemptions beside it would capture those names for a
-            // whole interval.
-            Self::apply_exemptions(&redirect, exemptions.as_ref(), &mut applied);
-            Self::keep_short_names(
-                &redirect,
-                short_name_suffixes.as_ref(),
-                &mut short_name_error,
-            );
+            // A connection that appeared may claim a namespace of its own, and
+            // one that went away stops claiming it. Checked before the redirect
+            // itself: re-installing the catch-all without the exemptions beside
+            // it would capture those names for a whole interval.
+            let due = claims.due(raised, last_read);
+            let current = if due {
+                last_read = Instant::now();
+                claims.refresh()
+            } else {
+                claims.published.current()
+            };
+            // Unchanged claims cost a comparison; a write that failed is
+            // retried with what was read, without reading again.
+            Self::apply_exemptions(&redirect, &claims, &current, &mut applied);
+            if due || short_names.failing() {
+                short_names.keep(&redirect, &current);
+            }
             match redirect.inspect(&handle) {
-                Ok(RedirectState::Active) => {}
+                Ok(RedirectState::Active) => {
+                    missing_streak = false;
+                    last_reinstall_error = None;
+                }
                 Ok(RedirectState::Inactive) => {
-                    tracing::warn!(
-                        target: "nrr::dns-resolver",
-                        msg_key = "dns-resolver-redirect-missing",
-                        "Mode B: the system-DNS redirect is no longer configured as written — \
-                         re-installing it",
-                    );
+                    let repeat = std::mem::replace(&mut missing_streak, true);
+                    if repeat {
+                        tracing::debug!(
+                            target: "nrr::dns-resolver",
+                            "Mode B: the system-DNS redirect went missing again; re-installing it",
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "nrr::dns-resolver",
+                            msg_key = "dns-resolver-redirect-missing",
+                            "Mode B: the system-DNS redirect is no longer configured as written — \
+                             re-installing it",
+                        );
+                    }
                     match redirect.redirect_to(handle.listener) {
                         Ok(_) => {
                             // The catch-all was just rewritten; the exemptions
                             // must be put back beside it, and the remembered set
                             // no longer describes the table.
                             applied.clear();
-                            Self::apply_exemptions(&redirect, exemptions.as_ref(), &mut applied);
+                            Self::apply_exemptions(&redirect, &claims, &current, &mut applied);
                             let _ = redirect.flush_cache();
-                            tracing::info!(
-                                target: "nrr::dns-resolver",
-                                msg_key = "dns-resolver-redirect-reinstalled",
-                                "Mode B: system-DNS redirect re-installed",
-                            );
+                            last_reinstall_error = None;
+                            if !repeat {
+                                tracing::info!(
+                                    target: "nrr::dns-resolver",
+                                    msg_key = "dns-resolver-redirect-reinstalled",
+                                    "Mode B: system-DNS redirect re-installed",
+                                );
+                            }
                         }
-                        Err(error) => tracing::warn!(
-                            target: "nrr::dns-resolver",
-                            msg_key = "dns-resolver-reinstall-failed",
-                            "Mode B: re-installing the system-DNS redirect failed ({error}); \
-                             names resolve past the resolver until the next check",
-                        ),
+                        Err(error) => {
+                            let text = error.to_string();
+                            if last_reinstall_error.as_deref() != Some(text.as_str()) {
+                                tracing::warn!(
+                                    target: "nrr::dns-resolver",
+                                    msg_key = "dns-resolver-reinstall-failed",
+                                    error = %text,
+                                    "Mode B: re-installing the system-DNS redirect failed; \
+                                     names resolve past the resolver until the next check",
+                                );
+                                last_reinstall_error = Some(text);
+                            }
+                        }
                     }
                 }
                 Err(error) => tracing::debug!(
@@ -307,7 +441,8 @@ impl DnsResolverService {
                     target: "nrr::dns-resolver",
                     msg_key = "dns-resolver-bind-failed",
                     addr = %self.listen_addr,
-                    "Mode B: could not bind the DNS listener ({error}); resolver disabled, \
+                    error = %error,
+                    "Mode B: could not bind the DNS listener; resolver disabled, \
                      system DNS untouched",
                 );
                 return DnsResolverRunOutcome::BindFailed;
@@ -336,29 +471,54 @@ impl DnsResolverService {
         let handle = match self.redirect.redirect_to(self.listen_addr) {
             Ok(handle) => handle,
             Err(error) => {
-                tracing::warn!(
-                    target: "nrr::dns-resolver",
-                    msg_key = "dns-resolver-redirect-failed",
-                    addr = %self.listen_addr,
-                    "Mode B: system-DNS redirect failed ({error}); resolver disabled, \
-                     system DNS untouched",
-                );
+                // Backstop for a redirect that applied part of itself. Every
+                // `restore` is idempotent and ignores the handle's fields.
+                let backstop = RedirectHandle {
+                    marker: String::new(),
+                    listener: self.listen_addr,
+                };
+                match self.redirect.restore(&backstop) {
+                    Ok(()) => tracing::warn!(
+                        target: "nrr::dns-resolver",
+                        msg_key = "dns-resolver-redirect-failed",
+                        addr = %self.listen_addr,
+                        error = %error,
+                        "Mode B: system-DNS redirect failed; resolver disabled, \
+                         system DNS untouched",
+                    ),
+                    Err(restore_error) => tracing::error!(
+                        target: "nrr::dns-resolver",
+                        msg_key = "dns-resolver-restore-failed",
+                        error = %restore_error,
+                        redirect_error = %error,
+                        "Mode B: system-DNS redirect failed and the rollback also \
+                         failed; if name resolution is broken, remove the \
+                         NetRuleRouter NRPT rule manually (Get-DnsClientNrptRule / \
+                         Remove-DnsClientNrptRule)",
+                    ),
+                }
                 return DnsResolverRunOutcome::RedirectFailed;
             }
         };
         // Before the flush, so a name inside a claimed namespace is never
         // answered by us even once: the flush is what sends every cached name
-        // back through the table we just wrote.
+        // back through the table we just wrote. Also published for the
+        // listener before it serves, so no query waits for the first tick.
         let mut applied: Vec<DnsNamespaceExemption> = Vec::new();
-        Self::apply_exemptions(&self.redirect, self.exemptions.as_ref(), &mut applied);
-        Self::keep_short_names(&self.redirect, self.short_name_suffixes.as_ref(), &mut None);
+        // This read covers every change raised before it.
+        self.claims.take_raised();
+        let claims = self.claims.refresh();
+        Self::apply_exemptions(&self.redirect, &self.claims, &claims, &mut applied);
+        let mut short_names = self.short_names.clone();
+        short_names.keep(&self.redirect, &claims);
         // A warm OS cache would otherwise bypass us on first contact.
         // Best-effort: a flush failure is logged, not fatal.
         if let Err(error) = self.redirect.flush_cache() {
             tracing::warn!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-resolver-cache-flush-failed",
-                "Mode B: DNS cache flush on activation failed ({error}); warm entries may \
+                error = %error,
+                "Mode B: DNS cache flush on activation failed; warm entries may \
                  bypass the resolver until they expire",
             );
         }
@@ -377,22 +537,19 @@ impl DnsResolverService {
                 let handle = handle.clone();
                 let interval = self.guard_interval;
                 let stop = Arc::clone(&guard_stop);
-                let exemptions = self.exemptions.clone();
+                let claims = self.claims.clone();
                 // The set arm time installed: the guard starts from it so an
                 // unchanged machine writes nothing on its first tick.
                 let applied = applied.clone();
-                let recheck = self.recheck.clone();
-                let short_name_suffixes = self.short_name_suffixes.clone();
                 move || {
                     Self::guard(
                         redirect,
                         handle,
                         interval,
                         stop,
-                        exemptions,
+                        claims,
                         applied,
-                        recheck,
-                        short_name_suffixes,
+                        short_names,
                     )
                 }
             })
@@ -412,7 +569,8 @@ impl DnsResolverService {
             tracing::error!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-resolver-restore-failed",
-                "Mode B: FAILED to restore system DNS ({error}); if name resolution is \
+                error = %error,
+                "Mode B: FAILED to restore system DNS; if name resolution is \
                  broken, remove the NetRuleRouter NRPT rule manually \
                  (Get-DnsClientNrptRule / Remove-DnsClientNrptRule)",
             );
@@ -428,7 +586,8 @@ impl DnsResolverService {
             tracing::warn!(
                 target: "nrr::dns-resolver",
                 msg_key = "dns-resolver-serve-loop-error",
-                "Mode B: DNS serve loop ended with an error ({error})",
+                error = %error,
+                "Mode B: DNS serve loop ended with an error",
             );
         }
         DnsResolverRunOutcome::ServedAndRestored
@@ -537,6 +696,15 @@ impl DnsResolverController {
                 EnforcementMode::Reactive
             });
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn desired_mode(&self) -> EnforcementMode {
+        if self.lock().desired {
+            EnforcementMode::Resolver
+        } else {
+            EnforcementMode::Reactive
+        }
     }
 
     /// True while a resolver thread is live (and hasn't self-exited).
@@ -665,7 +833,8 @@ impl DnsResolverController {
                 tracing::error!(
                     target: "nrr::dns-resolver",
                     msg_key = "dns-resolver-spawn-failed",
-                    "Mode B: failed to spawn DNS resolver thread ({e}); staying reactive",
+                    error = %e,
+                    "Mode B: failed to spawn DNS resolver thread; staying reactive",
                 );
             }
         }
@@ -779,8 +948,14 @@ mod tests {
         /// Set once the guard has re-installed the redirect at least once, so
         /// a test can stop the serve loop at that moment.
         reinstalled: Option<Arc<AtomicBool>>,
-        /// Every suffix set the port was asked to keep short names with.
+        /// Every set of user suffixes the port asked for, as the Windows
+        /// port does; `false` leaves them unasked, as the default does.
+        asks_user_suffixes: bool,
         short_names: Mutex<Vec<Vec<String>>>,
+        /// The claims each keep-short-names call was handed.
+        short_name_claims: Mutex<Vec<Vec<String>>>,
+        /// How many keep-short-names calls fail before one holds.
+        short_names_fail: std::sync::atomic::AtomicUsize,
     }
     impl SystemDnsRedirectPort for RecordingRedirect {
         fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
@@ -831,9 +1006,27 @@ mod tests {
                 .push(exemptions.iter().map(|e| e.suffix.clone()).collect());
             Ok(exemptions.len())
         }
-        fn keep_short_names(&self, extra: &[String]) -> Result<(), PlatformError> {
+        fn keep_short_names(
+            &self,
+            claimed: &[DnsNamespaceExemption],
+            extra: &dyn Fn() -> Vec<String>,
+        ) -> Result<(), PlatformError> {
             self.calls.lock().unwrap().push("short_names");
-            self.short_names.lock().unwrap().push(extra.to_vec());
+            self.short_name_claims
+                .lock()
+                .unwrap()
+                .push(claimed.iter().map(|e| e.suffix.clone()).collect());
+            if self.asks_user_suffixes {
+                self.short_names.lock().unwrap().push(extra());
+            }
+            let left = self.short_names_fail.load(Ordering::SeqCst);
+            if left > 0 {
+                self.short_names_fail.store(left - 1, Ordering::SeqCst);
+                return Err(PlatformError::Transient {
+                    operation: "test",
+                    detail: "search list refused".to_string(),
+                });
+            }
             Ok(())
         }
     }
@@ -932,6 +1125,7 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let redirect = Arc::new(RecordingRedirect {
                 flip_stop: Some(Arc::clone(&stop)),
+                asks_user_suffixes: true,
                 ..Default::default()
             });
             let service = DnsResolverService::new(
@@ -955,6 +1149,292 @@ mod tests {
         }
     }
 
+    /// The guard running alone, counting each read of the claims (with when
+    /// it happened) and of the user's suffixes.
+    struct GuardRun {
+        redirect: Arc<RecordingRedirect>,
+        claim_reads: Arc<Mutex<Vec<std::time::Instant>>>,
+        users_read: Arc<std::sync::atomic::AtomicUsize>,
+        raised: NamespaceRecheck,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl GuardRun {
+        /// `safety`: the change feed's safety interval; `None` runs without a
+        /// feed, re-reading on every tick.
+        fn start(redirect: Arc<RecordingRedirect>, safety: Option<Duration>) -> Self {
+            use std::sync::atomic::AtomicUsize;
+            let claim_reads = Arc::new(Mutex::new(Vec::new()));
+            let users_read = Arc::new(AtomicUsize::new(0));
+            let raised: NamespaceRecheck = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let claims = NamespaceClaims {
+                source: Some({
+                    let reads = Arc::clone(&claim_reads);
+                    Arc::new(move || {
+                        reads.lock().expect("reads").push(std::time::Instant::now());
+                        vec![exemption("branch.corp.example")]
+                    })
+                }),
+                published: ClaimsSnapshot::default(),
+                feed: safety.map(|safety_interval| ChangeFeed {
+                    raised: Arc::clone(&raised),
+                    safety_interval,
+                }),
+            };
+            let short_names = ShortNameUpkeep {
+                user_suffixes: Some({
+                    let count = Arc::clone(&users_read);
+                    Arc::new(move || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        vec!["lab.example".to_string()]
+                    })
+                }),
+                last_error: None,
+            };
+            let thread = std::thread::spawn({
+                let redirect: Arc<dyn SystemDnsRedirectPort> = redirect.clone();
+                let stop = Arc::clone(&stop);
+                move || {
+                    DnsResolverService::guard(
+                        redirect,
+                        RedirectHandle {
+                            marker: "test".to_string(),
+                            listener: "127.0.0.1:0".parse().expect("addr"),
+                        },
+                        Duration::from_millis(5),
+                        stop,
+                        claims,
+                        Vec::new(),
+                        short_names,
+                    );
+                }
+            });
+            Self {
+                redirect,
+                claim_reads,
+                users_read,
+                raised,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn calls(&self, name: &str) -> usize {
+            let calls = self.redirect.calls.lock().expect("calls");
+            calls.iter().filter(|c| **c == name).count()
+        }
+
+        fn ticks(&self) -> usize {
+            self.calls("inspect")
+        }
+
+        fn claim_reads(&self) -> Vec<std::time::Instant> {
+            self.claim_reads.lock().expect("reads").clone()
+        }
+
+        fn users_read(&self) -> usize {
+            self.users_read.load(Ordering::SeqCst)
+        }
+
+        fn wait_until(&self, done: impl Fn(&Self) -> bool) -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !done(self) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            done(self)
+        }
+
+        fn wait_ticks(&self, more: usize) {
+            let target = self.ticks() + more;
+            assert!(self.wait_until(|r| r.ticks() >= target), "the guard ticked");
+        }
+
+        /// Stop and join, so every count is final.
+        fn stop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Drop for GuardRun {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    /// Without a change feed only a look can tell what changed: the claims
+    /// are read on every tick, once for both consumers.
+    #[test]
+    fn without_a_feed_a_tick_reads_the_claims_once_for_both_consumers() {
+        let mut run = GuardRun::start(
+            Arc::new(RecordingRedirect {
+                asks_user_suffixes: true,
+                ..Default::default()
+            }),
+            None,
+        );
+        run.wait_ticks(3);
+        run.stop();
+        let (reads, ticks) = (run.claim_reads().len(), run.ticks());
+        // The stop can land between a read and its inspection.
+        assert!(
+            reads == ticks || reads == ticks + 1,
+            "{reads} reads, {ticks} ticks"
+        );
+        assert_eq!(run.users_read(), reads, "asked once per read");
+        assert!(run
+            .redirect
+            .short_name_claims
+            .lock()
+            .expect("lock")
+            .iter()
+            .all(|c| c == &["branch.corp.example".to_string()]));
+    }
+
+    /// A port that completes nothing never costs a settings read.
+    #[test]
+    fn a_port_without_short_name_upkeep_never_reads_the_users_suffixes() {
+        let run = GuardRun::start(Arc::new(RecordingRedirect::default()), None);
+        run.wait_ticks(3);
+        assert!(!run.claim_reads().is_empty());
+        assert_eq!(run.users_read(), 0);
+    }
+
+    fn fed_run(safety: Duration) -> GuardRun {
+        GuardRun::start(
+            Arc::new(RecordingRedirect {
+                asks_user_suffixes: true,
+                ..Default::default()
+            }),
+            Some(safety),
+        )
+    }
+
+    /// The point of the feed: a machine where nothing changes costs the guard
+    /// no adapter enumeration, no registry walk and no settings read.
+    #[test]
+    fn quiet_ticks_read_nothing() {
+        let run = fed_run(Duration::from_secs(3600));
+        run.wait_ticks(20);
+        assert!(
+            run.claim_reads().is_empty(),
+            "no claims read on a quiet tick"
+        );
+        assert_eq!(run.users_read(), 0, "no settings read on a quiet tick");
+        assert_eq!(run.calls("short_names"), 0);
+        assert_eq!(run.calls("exempt"), 0, "nothing changed, nothing written");
+    }
+
+    #[test]
+    fn a_raised_feed_costs_exactly_one_read() {
+        let run = fed_run(Duration::from_secs(3600));
+        run.wait_ticks(3);
+        run.raised.store(true, Ordering::SeqCst);
+        assert!(
+            run.wait_until(|r| !r.claim_reads().is_empty()),
+            "the event was read"
+        );
+        run.wait_ticks(10);
+        assert_eq!(run.claim_reads().len(), 1);
+        assert_eq!(run.users_read(), 1);
+        assert_eq!(run.calls("short_names"), 1);
+        assert_eq!(
+            *run.redirect.exempted.lock().expect("exempted"),
+            vec![vec!["branch.corp.example".to_string()]],
+            "what the read found was applied"
+        );
+    }
+
+    /// A link coming up raises the feed many times within a moment.
+    #[test]
+    fn a_burst_of_events_is_read_once() {
+        let run = fed_run(Duration::from_secs(3600));
+        run.wait_ticks(3);
+        for _ in 0..5 {
+            run.raised.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(run.wait_until(|r| !r.claim_reads().is_empty()));
+        run.wait_ticks(10);
+        assert_eq!(run.claim_reads().len(), 1);
+    }
+
+    /// With no event at all the claims are still read once per safety
+    /// interval, never sooner.
+    #[test]
+    fn the_safety_interval_reads_once_per_interval() {
+        let safety = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let mut run = fed_run(safety);
+        assert!(
+            run.wait_until(|r| r.claim_reads().len() >= 2),
+            "two intervals passed"
+        );
+        run.stop();
+        let reads = run.claim_reads();
+        assert!(
+            reads[0] - started >= safety,
+            "not before the first interval"
+        );
+        for pair in reads.windows(2) {
+            // The interval runs from just before the previous read.
+            assert!(pair[1] - pair[0] >= safety - Duration::from_millis(10));
+        }
+        assert_eq!(run.users_read(), reads.len());
+    }
+
+    /// A failed search-list write is retried on the next tick from what was
+    /// read, without reading the claims again.
+    #[test]
+    fn a_failing_short_name_upkeep_is_retried_without_a_new_read() {
+        let run = GuardRun::start(
+            Arc::new(RecordingRedirect {
+                short_names_fail: std::sync::atomic::AtomicUsize::new(2),
+                ..Default::default()
+            }),
+            Some(Duration::from_secs(3600)),
+        );
+        run.raised.store(true, Ordering::SeqCst);
+        assert!(
+            run.wait_until(|r| r.calls("short_names") >= 3),
+            "retried until it held"
+        );
+        run.wait_ticks(5);
+        assert_eq!(run.calls("short_names"), 3, "no retry once it held");
+        assert_eq!(run.claim_reads().len(), 1);
+    }
+
+    /// The trait's own default is what every Linux mechanism inherits.
+    #[test]
+    fn the_default_short_name_upkeep_asks_for_nothing() {
+        struct Bare;
+        impl SystemDnsRedirectPort for Bare {
+            fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
+                Ok(RedirectHandle {
+                    marker: String::new(),
+                    listener,
+                })
+            }
+            fn restore(&self, _handle: &RedirectHandle) -> Result<(), PlatformError> {
+                Ok(())
+            }
+            fn verify(&self, _handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
+                Ok(RedirectState::Active)
+            }
+        }
+        let asked = AtomicBool::new(false);
+        Bare.keep_short_names(&[exemption("branch.corp.example")], &|| {
+            asked.store(true, Ordering::SeqCst);
+            Vec::new()
+        })
+        .expect("default");
+        assert!(!asked.load(Ordering::SeqCst));
+    }
+
     /// One source feeds both: the namespaces we step out of are the ones a
     /// short name is completed with. Wired separately, the listener's half was
     /// never wired at all.
@@ -967,6 +1447,160 @@ mod tests {
         let wired =
             bare.with_namespace_exemptions(Arc::new(|| vec![exemption("branch.corp.example")]));
         assert!(wired.listener.completes_short_names());
+    }
+
+    /// The arm reads the claims before the listener serves its first query,
+    /// so a short name never waits for the first guard tick.
+    #[test]
+    fn the_arm_publishes_the_claims_for_the_listener() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect {
+            flip_stop: Some(Arc::clone(&stop)),
+            ..Default::default()
+        });
+        let service =
+            DnsResolverService::new(listener(), redirect, "127.0.0.1:0".parse().expect("addr"))
+                .with_namespace_exemptions(Arc::new(|| vec![exemption("branch.corp.example")]));
+        assert!(service.claims.published.current().is_empty());
+        assert_eq!(service.run(&stop), DnsResolverRunOutcome::ServedAndRestored);
+        assert_eq!(
+            &*service.claims.published.current(),
+            &[exemption("branch.corp.example")]
+        );
+    }
+
+    /// Knows `scanner` under two namespaces with a different address each, so
+    /// an answer tells which claims completed it.
+    fn two_namespace_resolver() -> u16 {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("resolver socket");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let port = socket.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = socket.recv_from(&mut buf) {
+                let q = &buf[..n];
+                let Some(name) = crate::dns_wire::parse_question(q).map(|p| p.qname) else {
+                    continue;
+                };
+                let host = match name.trim_end_matches('.') {
+                    "scanner.old.corp.example" => 41,
+                    "scanner.new.corp.example" => 42,
+                    _ => continue,
+                };
+                let address = std::net::Ipv4Addr::new(192, 0, 2, host);
+                if let Some(reply) = crate::dns_wire::build_a_response(q, &[address], 60) {
+                    let _ = socket.send_to(&reply, from);
+                }
+            }
+        });
+        port
+    }
+
+    /// A single-label answer costs no enumeration: the listener reads what
+    /// the guard tick published, and the next tick's claims are what the
+    /// next query completes with.
+    #[test]
+    fn a_short_name_answer_reads_the_claims_the_guard_published() {
+        use crate::dns_wire::{parse_address_response, AddressResponseOutcome, QTYPE_A};
+        use std::sync::atomic::AtomicUsize;
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let namespace = Arc::new(Mutex::new("old.corp.example"));
+        let recheck: NamespaceRecheck = Arc::new(AtomicBool::new(false));
+        let claims = NamespaceClaims {
+            source: Some({
+                let reads = Arc::clone(&reads);
+                let namespace = Arc::clone(&namespace);
+                Arc::new(move || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    vec![DnsNamespaceExemption {
+                        suffix: namespace.lock().expect("lock").to_string(),
+                        servers: vec![std::net::Ipv4Addr::LOCALHOST],
+                    }]
+                })
+            }),
+            published: ClaimsSnapshot::default(),
+            feed: Some(ChangeFeed {
+                raised: Arc::clone(&recheck),
+                safety_interval: Duration::from_secs(3600),
+            }),
+        };
+        let listener = listener()
+            .with_claimed_namespaces(claims.published.clone())
+            .with_resolver_port(two_namespace_resolver());
+        let query = crate::dns_wire::build_address_query(0x2a2a, "scanner", QTYPE_A).expect("q");
+        let answer = || {
+            let reply =
+                listener.complete_single_label(&query, "scanner", Duration::from_secs(2))?;
+            match parse_address_response(0x2a2a, "scanner", QTYPE_A, &reply) {
+                AddressResponseOutcome::Answers { addresses, .. } => addresses.first().copied(),
+                _ => None,
+            }
+        };
+        let published_under = |suffix: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if claims
+                    .published
+                    .current()
+                    .iter()
+                    .any(|c| c.suffix == suffix)
+                {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        };
+
+        // Nothing published yet: completes nothing, as with no source wired.
+        for _ in 0..10 {
+            assert_eq!(answer(), None);
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let guard = std::thread::spawn({
+            let redirect: Arc<dyn SystemDnsRedirectPort> = Arc::new(RecordingRedirect::default());
+            let stop = Arc::clone(&stop);
+            let claims = claims.clone();
+            move || {
+                DnsResolverService::guard(
+                    redirect,
+                    RedirectHandle {
+                        marker: "test".to_string(),
+                        listener: "127.0.0.1:0".parse().expect("addr"),
+                    },
+                    Duration::from_secs(3600),
+                    stop,
+                    claims,
+                    Vec::new(),
+                    ShortNameUpkeep::default(),
+                );
+            }
+        });
+
+        recheck.store(true, Ordering::SeqCst);
+        assert!(published_under("old.corp.example"));
+        for _ in 0..10 {
+            assert_eq!(answer(), Some("192.0.2.41".parse().expect("ip")));
+        }
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "one read per tick, none per query"
+        );
+
+        *namespace.lock().expect("lock") = "new.corp.example";
+        recheck.store(true, Ordering::SeqCst);
+        assert!(published_under("new.corp.example"));
+        assert_eq!(answer(), Some("192.0.2.42".parse().expect("ip")));
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = guard.join();
     }
 
     /// A link that appears between guard ticks claims its namespace at once.
@@ -998,7 +1632,7 @@ mod tests {
         let guard = std::thread::spawn({
             let redirect: Arc<dyn SystemDnsRedirectPort> = redirect.clone();
             let stop = Arc::clone(&stop);
-            let recheck = Arc::clone(&recheck);
+            let raised = Arc::clone(&recheck);
             move || {
                 DnsResolverService::guard(
                     redirect,
@@ -1008,10 +1642,16 @@ mod tests {
                     },
                     Duration::from_secs(3600),
                     stop,
-                    Some(source),
+                    NamespaceClaims {
+                        source: Some(source),
+                        published: ClaimsSnapshot::default(),
+                        feed: Some(ChangeFeed {
+                            raised,
+                            safety_interval: Duration::from_secs(3600),
+                        }),
+                    },
                     std::mem::take(&mut applied),
-                    Some(recheck),
-                    None,
+                    ShortNameUpkeep::default(),
                 );
             }
         });
@@ -1113,8 +1753,13 @@ mod tests {
     }
 
     #[test]
-    fn redirect_failure_leaves_dns_untouched() {
-        struct FailRedirect;
+    fn redirect_failure_calls_restore_as_a_backstop() {
+        // `redirect_to` can fail after applying part of a multi-step change;
+        // `run` must call `restore` as a backstop even though it holds no
+        // handle from a successful `redirect_to`.
+        struct FailRedirect {
+            restore_calls: Mutex<u32>,
+        }
         impl SystemDnsRedirectPort for FailRedirect {
             fn redirect_to(&self, _l: SocketAddr) -> Result<RedirectHandle, PlatformError> {
                 Err(PlatformError::Transient {
@@ -1123,7 +1768,49 @@ mod tests {
                 })
             }
             fn restore(&self, _h: &RedirectHandle) -> Result<(), PlatformError> {
-                panic!("restore must not run when redirect never installed")
+                *self.restore_calls.lock().unwrap() += 1;
+                Ok(())
+            }
+            fn verify(&self, _h: &RedirectHandle) -> Result<RedirectState, PlatformError> {
+                Ok(RedirectState::Inactive)
+            }
+        }
+        let redirect = Arc::new(FailRedirect {
+            restore_calls: Mutex::new(0),
+        });
+        let service =
+            DnsResolverService::new(listener(), redirect.clone(), "127.0.0.1:0".parse().unwrap());
+        // `stop` false so `run` reaches the (failing) redirect; a preset stop
+        // would instead short-circuit as CancelledBeforeRedirect and never
+        // exercise the redirect-failure path this test covers.
+        let stop = AtomicBool::new(false);
+        assert_eq!(service.run(&stop), DnsResolverRunOutcome::RedirectFailed);
+        assert_eq!(
+            *redirect.restore_calls.lock().unwrap(),
+            1,
+            "restore must run as a backstop after a failed redirect_to"
+        );
+        assert!(!stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn redirect_failure_survives_a_failing_restore_without_panicking() {
+        // The backstop `restore` itself can fail (the same broken mechanism
+        // that made `redirect_to` fail); `run` must still return cleanly
+        // rather than propagate or ignore the double failure.
+        struct DoubleFailRedirect;
+        impl SystemDnsRedirectPort for DoubleFailRedirect {
+            fn redirect_to(&self, _l: SocketAddr) -> Result<RedirectHandle, PlatformError> {
+                Err(PlatformError::Transient {
+                    operation: "test",
+                    detail: "boom".to_string(),
+                })
+            }
+            fn restore(&self, _h: &RedirectHandle) -> Result<(), PlatformError> {
+                Err(PlatformError::Transient {
+                    operation: "test",
+                    detail: "restore also boom".to_string(),
+                })
             }
             fn verify(&self, _h: &RedirectHandle) -> Result<RedirectState, PlatformError> {
                 Ok(RedirectState::Inactive)
@@ -1131,16 +1818,11 @@ mod tests {
         }
         let service = DnsResolverService::new(
             listener(),
-            Arc::new(FailRedirect),
+            Arc::new(DoubleFailRedirect),
             "127.0.0.1:0".parse().unwrap(),
         );
-        // `stop` false so `run` reaches the (failing) redirect; a preset stop
-        // would instead short-circuit as CancelledBeforeRedirect and never
-        // exercise the redirect-failure path this test covers.
         let stop = AtomicBool::new(false);
         assert_eq!(service.run(&stop), DnsResolverRunOutcome::RedirectFailed);
-        // No panic from restore ⇒ we never touched (or restored) system DNS.
-        assert!(!stop.load(Ordering::SeqCst));
     }
 
     // ── DnsResolverController (live re-arm) ───────────────────────────────────

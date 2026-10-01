@@ -29,7 +29,8 @@ impl SecondaryRouteCoordinator {
                     target: "nrr::route-coordinator",
                     msg_key = "route-local-networks-unreadable-additional",
                     sid = %sid,
-                    "route table could not be read; reporting no local networks for the additional link: {e:?}",
+                    error = %e,
+                    "route table could not be read; reporting no local networks for the additional link",
                 );
                 return Vec::new();
             }
@@ -57,7 +58,8 @@ impl SecondaryRouteCoordinator {
                     target: "nrr::route-coordinator",
                     msg_key = "route-local-networks-unreadable-screen",
                     sid = %sid,
-                    "route table could not be read; the local-networks screen will show nothing: {e:?}",
+                    error = %e,
+                    "route table could not be read; the local-networks screen will show nothing",
                 );
                 return Vec::new();
             }
@@ -98,21 +100,22 @@ impl SecondaryRouteCoordinator {
         out
     }
 
-    /// Settle which LOCAL networks stay reachable while the kill-switch blocks
-    /// everything else.
-    ///
-    /// A kill-switch exists to stop traffic escaping to the provider instead of
-    /// the tunnel. Traffic to a hypervisor's host-only segment never leaves
-    /// this machine, so blocking it protects nothing and takes the user's
-    /// virtual machines away with the tunnel. The tunnel's own subnet is
-    /// excluded, and a VPN adapter is never mistaken for a hypervisor one —
-    /// both live in RFC1918 space, and that is exactly the confusion this must
-    /// not make.
-    ///
-    /// The user has the last word in both directions: a network they named
-    /// themselves is added (a hypervisor in NAT mode creates no host interface,
-    /// so nothing here can discover it), and a network they refused is removed
-    /// even if it was discovered automatically.
+    /// The route table from `reading`, or read live when there is none.
+    /// `None` when it could not be read.
+    pub(super) fn routes_of<'a>(
+        &self,
+        reading: Option<&'a MachineReading>,
+    ) -> Option<std::borrow::Cow<'a, [RouteEntry]>> {
+        match reading {
+            Some(reading) => reading.routes().map(std::borrow::Cow::Borrowed),
+            None => self
+                .api
+                .get_ip_forward_table()
+                .ok()
+                .map(std::borrow::Cow::Owned),
+        }
+    }
+
     /// Mark the rows the reconciler knows are ours.
     ///
     /// The route-table FFI cannot tell — it reports `is_ours = false` for
@@ -131,17 +134,32 @@ impl SecondaryRouteCoordinator {
         routes
     }
 
+    /// Settle which LOCAL networks stay reachable while the kill-switch blocks
+    /// everything else.
+    ///
+    /// A kill-switch exists to stop traffic escaping to the provider instead of
+    /// the tunnel. Traffic to a hypervisor's host-only segment never leaves
+    /// this machine, so blocking it protects nothing and takes the user's
+    /// virtual machines away with the tunnel. The tunnel's own subnet is
+    /// excluded, and a VPN adapter is never mistaken for a hypervisor one —
+    /// both live in RFC1918 space, and that is exactly the confusion this must
+    /// not make.
+    ///
+    /// The user has the last word in both directions: a network they named
+    /// themselves is added (a hypervisor in NAT mode creates no host interface,
+    /// so nothing here can discover it), and a network they refused is removed
+    /// even if it was discovered automatically.
     pub(super) fn apply_local_network_policy(
         &self,
         sid: &str,
         routes: &[RouteEntry],
+        adapters: &[AdapterInfo],
         secondary_ifindex: Option<u32>,
         out: &mut Vec<(Ipv4Addr, u8)>,
     ) {
-        let adapters = self.api.get_adapter_infos().unwrap_or_default();
         for subnet in crate::route_reconciler::virtual_machine_local_subnets(
             routes,
-            &adapters,
+            adapters,
             secondary_ifindex,
         ) {
             if !out.contains(&subnet) {
@@ -272,18 +290,20 @@ impl SecondaryRouteCoordinator {
     /// [`SecondaryRouteTarget`] against live `infos`. `None` when the bound
     /// adapter is missing, unusable, or has no gateway and no derivable
     /// next-hop. `role` ("primary"/"secondary") only labels the diagnostics.
+    /// Next hops are derived from `reading`'s route table, or the live one.
     pub(super) fn resolve_binding_target(
         &self,
         sid: &str,
         binding: &PerSidBinding,
         infos: &[AdapterInfo],
         role: &str,
+        reading: Option<&MachineReading>,
     ) -> Option<SecondaryRouteTarget> {
         // Granular resolution so the log names the EXACT reason: not-found
         // (id mismatch), down/no-IP, or up-but-no-gateway.
         // resolve by id, but only ACCEPT the by-id match when it is
         // actually usable (Available = up + IPv4). A found-but-DOWN bound adapter
-        // (a GUID-churning VPN like swiftvpn can leave a stale/down TAP instance
+        // (a GUID-churning VPN like examplevpn can leave a stale/down TAP instance
         // enumerated while the freshly-connected one carries traffic) must NOT short-
         // circuit to fail-closed — it falls into the same name-heal below so we can
         // adopt a live same-name SIBLING. If the bound adapter is genuinely down with
@@ -490,9 +510,7 @@ impl SecondaryRouteCoordinator {
                 // the link's own traffic, instead of tearing every route down
                 // when no next-hop can be derived.
                 let derived = self
-                    .api
-                    .get_ip_forward_table()
-                    .ok()
+                    .routes_of(reading)
                     .and_then(|t| derive_secondary_next_hop(&t, info.index));
                 match derived {
                     Some(nh) => {
@@ -588,9 +606,7 @@ impl SecondaryRouteCoordinator {
         // not what keeps the link usable, so a pass that cannot read the table
         // simply names no v6 route rather than steering on a stale peer.
         let gateway_v6 = self
-            .api
-            .get_ip_forward_table()
-            .ok()
+            .routes_of(reading)
             .and_then(|t| derive_secondary_next_hop_v6(&t, info.index));
         Some(SecondaryRouteTarget {
             gateway,

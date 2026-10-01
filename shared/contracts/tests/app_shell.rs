@@ -1,11 +1,10 @@
 use nrr_shared::{
-    gui_shell_v1, AppAction, AppSection, FirstRunScenarioId, FirstRunStepId, GuiDialog, GuiWindow,
-    MenuAvailability, MenuGroupId, NavigationStyle, SecondaryLaunchBehavior,
-    SetupActionAvailability,
+    gui_shell_v1, AppAction, AppSection, GuiDialog, GuiWindow, MenuAvailability, MenuGroupId,
+    NavigationStyle, SecondaryLaunchBehavior, SetupActionAvailability,
 };
 
 #[test]
-fn main_window_sections_match_block_2_1_baseline() {
+fn main_window_sections_match_fixed_baseline() {
     let shell = gui_shell_v1();
     assert_eq!(
         shell.information_architecture.main_window_sections,
@@ -122,36 +121,8 @@ fn navigation_and_single_instance_policy_are_fixed() {
 }
 
 #[test]
-fn first_run_contract_covers_block_2_2_baseline() {
+fn first_run_contract_covers_fixed_baseline() {
     let shell = gui_shell_v1();
-    assert_eq!(
-        shell
-            .first_run
-            .steps
-            .iter()
-            .map(|step| step.id)
-            .collect::<Vec<_>>(),
-        vec![
-            FirstRunStepId::Welcome,
-            FirstRunStepId::BasicScenarioSelection,
-            FirstRunStepId::RoutesSetup,
-            FirstRunStepId::RulesSetup,
-            FirstRunStepId::DiagnosticsPreview,
-            FirstRunStepId::Finish
-        ]
-    );
-    assert!(shell.first_run.steps.iter().all(|step| step.required));
-    assert_eq!(
-        shell.first_run.scenarios,
-        &[
-            FirstRunScenarioId::QuickStart,
-            FirstRunScenarioId::GuidedDefault
-        ]
-    );
-    assert_eq!(
-        shell.first_run.default_scenario,
-        FirstRunScenarioId::QuickStart
-    );
     assert_eq!(
         shell.first_run.quick_start_path_sections,
         &[
@@ -160,14 +131,6 @@ fn first_run_contract_covers_block_2_2_baseline() {
             AppSection::Diagnostics
         ]
     );
-    assert!(shell
-        .first_run
-        .startup_states
-        .iter()
-        .any(|entry| entry.section == AppSection::Rules && entry.state.title() == "empty"));
-    assert!(shell.first_run.startup_states.iter().any(|entry| {
-        entry.section == AppSection::InterfacesAndRoutes && entry.state.title() == "semi-empty"
-    }));
     let export_gate = shell
         .first_run
         .action_gates_before_completion
@@ -188,10 +151,6 @@ fn first_run_contract_covers_block_2_2_baseline() {
         rules_gate.before_completion,
         SetupActionAvailability::SoftGuided
     );
-    assert!(shell
-        .first_run
-        .list_editing_preview_notice
-        .contains("preview/setup only"));
     assert!(shell
         .first_run
         .completion_notice

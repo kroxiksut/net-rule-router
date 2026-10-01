@@ -1,34 +1,9 @@
-use crate::route_bindings::{route_bindings_export_snapshot, RouteBindingsExportSnapshot};
-// Re-exported so downstream crates such as `nrr-ipc-client` can reference
-// the trait's parameter type without taking a direct dependency on
-// `nrr-ui-support` (a UI-only crate forbidden for the IPC client per
-// CLAUDE.md).
-pub use nrr_ui_support::ui_preferences::UiPreferences;
+use nrr_shared::diagnostics_dto::{DiagnosticsStatusDto, SecurityAlertsView};
 
-pub mod diagnostics {
-    pub use crate::mock_backend::diagnostics::*;
-}
-
-pub mod logs {
-    pub use crate::mock_backend::logs::*;
-}
-
-pub mod network_interfaces {
-    pub use crate::mock_backend::network_interfaces::*;
-}
-
-pub mod rules {
-    pub use crate::mock_backend::rules::*;
-}
-
-pub mod security_status {
-    pub use crate::mock_backend::security_status::*;
-}
-
-pub use crate::mock_backend::{
-    mock_required_scenarios_6_6, mock_scenario_from_env, tray_status_for_mock_scenario,
-    MockScenarioId, MOCK_REQUIRED_SCENARIOS_6_6,
-};
+// One re-export path for these preview modules: `crate::mock_backend`.
+// Consumers reach them as `nrr_application::mock_backend::{diagnostics,
+// network_interfaces, rules}`, not through this module too.
+use crate::mock_backend::{diagnostics, network_interfaces, rules};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BackendProviderKind {
@@ -46,9 +21,9 @@ pub enum BackendProviderKind {
 
 /// Connection state surfaced by [`BackendFacade::connection_status`] for UX banners.
 ///
-/// Mirrors the richer `nrr-ipc-client::ConnectionStatus` but kept in the
-/// `nrr-application` crate so the trait can be expressed without pulling
-/// the IPC client into the dependency graph of every consumer.
+/// Mirrors `nrr-ipc-client::ConnectionStatus`, kept here so the trait does not
+/// pull the IPC client into every consumer. Which states need the user is
+/// decided once, by `ConnectionStatus::requires_user_action`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendConnectionStatus {
     /// Backend is fully usable.
@@ -76,140 +51,75 @@ impl BackendConnectionStatus {
     pub fn is_connected(&self) -> bool {
         matches!(self, Self::Connected)
     }
-    pub fn requires_user_action(&self) -> bool {
-        matches!(
-            self,
-            Self::ServiceNotInstalled | Self::ServiceStopped | Self::ProtocolMismatch { .. }
-        )
-    }
 }
-
-/// Errors returned when interacting with the backend's snapshot cache.
-#[derive(Debug)]
-pub enum CacheError {
-    /// I/O failure reading or writing the cache directory.
-    Io(String),
-    /// Serialization failure (cache payload corrupted or schema drift).
-    Serialization(String),
-}
-
-impl std::fmt::Display for CacheError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(s) => write!(f, "snapshot cache I/O error: {s}"),
-            Self::Serialization(s) => write!(f, "snapshot cache serialization error: {s}"),
-        }
-    }
-}
-
-impl std::error::Error for CacheError {}
 
 pub trait BackendFacade {
     fn provider_kind(&self) -> BackendProviderKind;
-    fn status_snapshot(&self) -> security_status::SecurityStatusSnapshot;
 
-    /// Top-level diagnostics health/status snapshot — see [`diagnostics::DiagnosticsStatusDto`].
-    fn diagnostics_status_snapshot(&self) -> diagnostics::DiagnosticsStatusDto;
+    /// Top-level diagnostics health/status snapshot.
+    fn diagnostics_status_snapshot(&self) -> DiagnosticsStatusDto;
 
-    /// Paginated operational log entries for the Logs viewer.
-    ///
-    /// Returns entries newest-first.  See [`logs::LogEntryDto`].
-    fn list_log_entries(
-        &self,
-        filter: &logs::LogEntryFilter,
-        pagination: &logs::PaginationParams,
-    ) -> logs::PageResult<logs::LogEntryDto>;
-
-    /// Paginated audit trail entries for the Logs viewer (Audit tab).
-    ///
-    /// Returns entries newest-first.  See [`logs::AuditEntryDto`].
-    fn list_audit_entries(
-        &self,
-        filter: &logs::AuditEntryFilter,
-        pagination: &logs::PaginationParams,
-    ) -> logs::PageResult<logs::AuditEntryDto>;
-
-    /// Active security alerts for the Diagnostics viewer.
-    ///
-    /// `state_filter` is the alert lifecycle state
-    /// (`"active"`, `"acknowledged"`, `"resolved"`, `"superseded"`).
-    /// `None` returns the default view (active + acknowledged).
-    /// Mock providers ignore this parameter; the real service
-    /// implementation honours it.
-    fn list_security_alerts(&self, state_filter: Option<&str>) -> diagnostics::SecurityAlertsView;
+    /// Security alerts. `state_filter` is the lifecycle state (`"active"`,
+    /// `"acknowledged"`, `"resolved"`, `"superseded"`); `None` is the default
+    /// view (active + acknowledged). Preview providers ignore it.
+    fn list_security_alerts(&self, state_filter: Option<&str>) -> SecurityAlertsView;
 
     fn interfaces_snapshot(
         &self,
         request: network_interfaces::RouteSelectionRequest,
     ) -> network_interfaces::InterfacesRoutesPreviewSnapshot;
-    fn interface_checks_snapshot(
-        &self,
-        request: network_interfaces::RouteSelectionRequest,
-    ) -> network_interfaces::InterfaceDiagnosticsChecksSnapshot;
     fn rules_snapshot(
         &self,
         request: rules::RulesScreenRequest,
     ) -> rules::RulesScreenPreviewSnapshot;
-    fn route_bindings_snapshot(
-        &self,
-        preferences: &UiPreferences,
-        active_revision: &str,
-    ) -> RouteBindingsExportSnapshot;
 
-    /// Current connection state. Default impl returns `Connected`, which is
-    /// correct for in-process providers (`Mock`, `PreviewLocal`); the
-    /// IPC-backed facade overrides this to mirror the live pipe state.
+    /// Current connection state. `Connected` for in-process providers; the
+    /// IPC-backed facade mirrors the live channel.
     fn connection_status(&self) -> BackendConnectionStatus {
         BackendConnectionStatus::Connected
     }
 
-    /// Drop any persisted snapshot cache. Default impl is a no-op because
-    /// in-process providers do not maintain a cache; the IPC-backed facade
-    /// clears `%LOCALAPPDATA%\NetRuleRouter\snapshot_cache\`.
-    fn clear_cache(&self) -> Result<(), CacheError> {
-        Ok(())
-    }
-
-    /// Trigger an immediate reconnect attempt. Default impl is a no-op for
-    /// in-process providers; the IPC-backed facade signals its background
-    /// reader thread to abandon backoff and retry now. Used by the "Retry
-    /// connection" GUI button.
+    /// Retry the connection now instead of waiting out the backoff. No-op for
+    /// in-process providers.
     fn force_reconnect(&self) {}
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MockBackendFacade;
+/// Preview data over an adapter enumeration: this host's by default.
+#[derive(Clone, Copy)]
+pub struct MockBackendFacade {
+    interface_rows: &'static dyn network_interfaces::InterfaceRowsPort,
+}
+
+impl MockBackendFacade {
+    /// Over another enumeration, so a test does not read this host's adapters.
+    #[must_use]
+    pub fn over(interface_rows: &'static dyn network_interfaces::InterfaceRowsPort) -> Self {
+        Self { interface_rows }
+    }
+}
+
+impl Default for MockBackendFacade {
+    fn default() -> Self {
+        Self::over(network_interfaces::local_interface_rows())
+    }
+}
+
+impl std::fmt::Debug for MockBackendFacade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MockBackendFacade").finish_non_exhaustive()
+    }
+}
 
 impl BackendFacade for MockBackendFacade {
     fn provider_kind(&self) -> BackendProviderKind {
         BackendProviderKind::Mock
     }
 
-    fn status_snapshot(&self) -> security_status::SecurityStatusSnapshot {
-        security_status::security_status_preview_snapshot()
-    }
-
-    fn diagnostics_status_snapshot(&self) -> diagnostics::DiagnosticsStatusDto {
+    fn diagnostics_status_snapshot(&self) -> DiagnosticsStatusDto {
         diagnostics::preview_diagnostics_status()
     }
 
-    fn list_log_entries(
-        &self,
-        _filter: &logs::LogEntryFilter,
-        _pagination: &logs::PaginationParams,
-    ) -> logs::PageResult<logs::LogEntryDto> {
-        logs::preview_operational_logs_first_page()
-    }
-
-    fn list_audit_entries(
-        &self,
-        _filter: &logs::AuditEntryFilter,
-        _pagination: &logs::PaginationParams,
-    ) -> logs::PageResult<logs::AuditEntryDto> {
-        logs::preview_audit_entries_first_page()
-    }
-
-    fn list_security_alerts(&self, _state_filter: Option<&str>) -> diagnostics::SecurityAlertsView {
+    fn list_security_alerts(&self, _state_filter: Option<&str>) -> SecurityAlertsView {
         diagnostics::preview_active_security_alerts()
     }
 
@@ -217,14 +127,7 @@ impl BackendFacade for MockBackendFacade {
         &self,
         request: network_interfaces::RouteSelectionRequest,
     ) -> network_interfaces::InterfacesRoutesPreviewSnapshot {
-        network_interfaces::interfaces_routes_preview_snapshot(request)
-    }
-
-    fn interface_checks_snapshot(
-        &self,
-        request: network_interfaces::RouteSelectionRequest,
-    ) -> network_interfaces::InterfaceDiagnosticsChecksSnapshot {
-        network_interfaces::interface_diagnostics_checks_snapshot(request)
+        network_interfaces::interfaces_snapshot_from(self.interface_rows, &request)
     }
 
     fn rules_snapshot(
@@ -233,115 +136,89 @@ impl BackendFacade for MockBackendFacade {
     ) -> rules::RulesScreenPreviewSnapshot {
         rules::rules_screen_preview_snapshot(request)
     }
-
-    fn route_bindings_snapshot(
-        &self,
-        preferences: &UiPreferences,
-        active_revision: &str,
-    ) -> RouteBindingsExportSnapshot {
-        route_bindings_export_snapshot(preferences, active_revision)
-    }
 }
 
+/// Same data as [`MockBackendFacade`], reserved for the future local-only
+/// enforcement preview path — distinct [`BackendProviderKind`] so callers can
+/// tell the two apart, everything else delegated rather than duplicated.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct PreviewLocalBackendFacade;
+pub struct PreviewLocalBackendFacade {
+    inner: MockBackendFacade,
+}
+
+impl PreviewLocalBackendFacade {
+    /// See [`MockBackendFacade::over`].
+    #[must_use]
+    pub fn over(interface_rows: &'static dyn network_interfaces::InterfaceRowsPort) -> Self {
+        Self {
+            inner: MockBackendFacade::over(interface_rows),
+        }
+    }
+}
 
 impl BackendFacade for PreviewLocalBackendFacade {
     fn provider_kind(&self) -> BackendProviderKind {
         BackendProviderKind::PreviewLocal
     }
 
-    fn status_snapshot(&self) -> security_status::SecurityStatusSnapshot {
-        security_status::security_status_preview_snapshot()
+    fn diagnostics_status_snapshot(&self) -> DiagnosticsStatusDto {
+        self.inner.diagnostics_status_snapshot()
     }
 
-    // preview-only — production GUI goes via IPC `SnapshotDiagnosticsGet`.
-    // The MockBackendFacade returns canned preview data so the QML layer
-    // can render without a real service connected.
-    fn diagnostics_status_snapshot(&self) -> diagnostics::DiagnosticsStatusDto {
-        diagnostics::preview_diagnostics_status()
-    }
-
-    // preview-only — production GUI goes via IPC `LogsList` with real
-    // filter + pagination handled in `LogsListHandler`.
-    fn list_log_entries(
-        &self,
-        _filter: &logs::LogEntryFilter,
-        _pagination: &logs::PaginationParams,
-    ) -> logs::PageResult<logs::LogEntryDto> {
-        logs::preview_operational_logs_first_page()
-    }
-
-    // preview-only — production GUI goes via IPC `AuditList` with
-    // pagination handled in `AuditListHandler`.
-    fn list_audit_entries(
-        &self,
-        _filter: &logs::AuditEntryFilter,
-        _pagination: &logs::PaginationParams,
-    ) -> logs::PageResult<logs::AuditEntryDto> {
-        logs::preview_audit_entries_first_page()
-    }
-
-    // preview-only — production GUI goes via IPC `SecurityAlertsList`
-    // backed by the `security_alerts` SQLite table.
-    fn list_security_alerts(&self, _state_filter: Option<&str>) -> diagnostics::SecurityAlertsView {
-        diagnostics::preview_active_security_alerts()
+    fn list_security_alerts(&self, state_filter: Option<&str>) -> SecurityAlertsView {
+        self.inner.list_security_alerts(state_filter)
     }
 
     fn interfaces_snapshot(
         &self,
         request: network_interfaces::RouteSelectionRequest,
     ) -> network_interfaces::InterfacesRoutesPreviewSnapshot {
-        network_interfaces::interfaces_routes_preview_snapshot(request)
-    }
-
-    fn interface_checks_snapshot(
-        &self,
-        request: network_interfaces::RouteSelectionRequest,
-    ) -> network_interfaces::InterfaceDiagnosticsChecksSnapshot {
-        network_interfaces::interface_diagnostics_checks_snapshot(request)
+        self.inner.interfaces_snapshot(request)
     }
 
     fn rules_snapshot(
         &self,
         request: rules::RulesScreenRequest,
     ) -> rules::RulesScreenPreviewSnapshot {
-        rules::rules_screen_preview_snapshot(request)
-    }
-
-    fn route_bindings_snapshot(
-        &self,
-        preferences: &UiPreferences,
-        active_revision: &str,
-    ) -> RouteBindingsExportSnapshot {
-        route_bindings_export_snapshot(preferences, active_revision)
+        self.inner.rules_snapshot(request)
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::assertions_on_constants, clippy::expect_used)]
 mod tests {
-    use super::{BackendFacade, BackendProviderKind, MockBackendFacade, PreviewLocalBackendFacade};
-    use nrr_ui_support::ui_preferences::UiPreferences;
+    use super::{
+        network_interfaces, BackendFacade, BackendProviderKind, MockBackendFacade,
+        PreviewLocalBackendFacade,
+    };
+    use network_interfaces::{InterfacesDataSource, MockInterfaceRows};
+
+    /// Fixed rows, so the contract is checked the same on every host.
+    fn fixed_rows() -> &'static MockInterfaceRows {
+        Box::leak(Box::new(MockInterfaceRows::new(
+            InterfacesDataSource::FallbackMock,
+            network_interfaces::fallback_rows(),
+        )))
+    }
 
     fn assert_provider_contract(facade: &dyn BackendFacade, expected_kind: BackendProviderKind) {
         assert_eq!(facade.provider_kind(), expected_kind);
-        assert!(!facade
-            .interfaces_snapshot(Default::default())
-            .rows
-            .is_empty());
+        let interfaces = facade.interfaces_snapshot(Default::default());
+        assert_eq!(interfaces.data_source, InterfacesDataSource::FallbackMock);
+        assert_eq!(
+            interfaces.rows.len(),
+            network_interfaces::fallback_rows().len()
+        );
         assert!(!facade.rules_snapshot(Default::default()).rows.is_empty());
-        assert!(!facade.status_snapshot().active_revision.is_empty());
-        let bindings = facade.route_bindings_snapshot(&UiPreferences::default(), "rev-preview-001");
-        assert_eq!(bindings.active_revision, "rev-preview-001");
     }
 
     #[test]
     fn facade_contract_is_provider_agnostic_for_mock_and_preview_local() {
-        let mock = MockBackendFacade;
-        assert_provider_contract(&mock, BackendProviderKind::Mock);
-
-        let preview_local = PreviewLocalBackendFacade;
-        assert_provider_contract(&preview_local, BackendProviderKind::PreviewLocal);
+        let rows = fixed_rows();
+        assert_provider_contract(&MockBackendFacade::over(rows), BackendProviderKind::Mock);
+        assert_provider_contract(
+            &PreviewLocalBackendFacade::over(rows),
+            BackendProviderKind::PreviewLocal,
+        );
+        assert_eq!(rows.probe_requests(), vec![false, false], "never probes");
     }
 }

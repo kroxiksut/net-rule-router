@@ -20,7 +20,7 @@ pub struct SingleInstanceGuard {
     _lock_file: File,
     /// The OS-held claim, when the platform offers one. It — not the lock file
     /// — is what decides ownership: the kernel releases it when this process
-    /// dies, and no one can delete it out of the runtime directory.
+    /// dies, and deleting files from the runtime directory does not end it.
     _os_claim: Option<Box<dyn nrr_platform_api::single_instance::SingleInstanceClaim>>,
     /// PID a stale lock was reclaimed from on this `acquire`, if any — surfaced
     /// so the caller can log it once its own diagnostic log file is open.
@@ -124,26 +124,39 @@ impl SingleInstanceGuard {
     pub fn reclaim(instance_key: &str) -> io::Result<Self> {
         let lock_directory = nrr_platform_api::paths::ensure_user_runtime_dir()?;
         let lock_path = lock_directory.join(format!("{instance_key}.lock"));
+        Self::reclaim_at(
+            lock_path,
+            instance_key,
+            os_single_instance_port().as_deref(),
+        )
+    }
+
+    pub(super) fn reclaim_at(
+        lock_path: PathBuf,
+        instance_key: &str,
+        port: Option<&dyn nrr_platform_api::single_instance::SingleInstancePort>,
+    ) -> io::Result<Self> {
+        // The OS claim is the takeover's PRECONDITION: without it a second
+        // primary runs beside a live one, and every later launch becomes one
+        // too. It also comes before the file — a refused takeover must leave
+        // the live primary's lock, which the activation budget, the build
+        // check and that primary's `Drop` all read.
+        let os_claim = match port {
+            Some(port) => match port.claim(instance_key) {
+                Ok(Some(claim)) => Some(claim),
+                Ok(None) | Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "the running instance still holds the single-instance claim",
+                    ))
+                }
+            },
+            None => None,
+        };
         match fs::remove_file(&lock_path) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
-        }
-        // The OS claim is the takeover's PRECONDITION, not a nicety. Proceeding
-        // without it starts a second primary beside a live one: two writers over
-        // one preferences file, two RPC dispatchers, two UAC prompts — and,
-        // because the newcomer holds no claim, every later launch becomes
-        // another primary too, so single-instance stays broken for the session.
-        // A window we cannot open is a smaller harm than a session we cannot
-        // trust.
-        let os_claim = os_single_instance_port()
-            .and_then(|port| port.claim(instance_key).ok())
-            .flatten();
-        if os_claim.is_none() && os_single_instance_port().is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "the running instance still holds the single-instance claim",
-            ));
         }
         let mut lock_file = OpenOptions::new()
             .create(true)

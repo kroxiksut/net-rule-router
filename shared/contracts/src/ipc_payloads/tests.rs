@@ -184,15 +184,7 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
         StatusUpdateEvent::AdaptersChanged {
             data_source: "os".into(),
         },
-        StatusUpdateEvent::AlertRaised {
-            alert_id: "a-1".into(),
-            kind: "tamper".into(),
-        },
-        StatusUpdateEvent::OperationFinished {
-            operation_id: "op-1".into(),
-            state: "completed".into(),
-            error_code: None,
-        },
+        StatusUpdateEvent::SecurityAlertsChanged,
         StatusUpdateEvent::Overflow { dropped_count: 3 },
         StatusUpdateEvent::RevisionStatusChanged {
             revision_id: "rev-1".into(),
@@ -217,6 +209,7 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             mutation_kind: "rules-update".into(),
             phase: "completed".into(),
             error_code: None,
+            sid: Some("S-1-5-21".into()),
         },
         StatusUpdateEvent::HostUnreachableOnBothRoutes {
             sid: "S-1-5-21-1".into(),
@@ -290,6 +283,7 @@ fn push_event_keys_the_ui_reads_are_stable() {
         mutation_kind: "rules-update".into(),
         phase: "completed".into(),
         error_code: None,
+        sid: None,
     })
     .expect("serialise");
     assert_eq!(progress["correlation-id"], "corr-1");
@@ -318,6 +312,19 @@ fn push_event_keys_the_ui_reads_are_stable() {
     assert_eq!(notice["attempts"], 1);
     assert_eq!(notice["launched-by"][0], "cmd.exe");
     assert_eq!(notice["launched-by"][1], "explorer.exe");
+
+    let alerts = serde_json::to_value(StatusUpdateEvent::SecurityAlertsChanged).expect("serialise");
+    assert_eq!(
+        alerts,
+        serde_json::json!({ "type": "security-alerts-changed" })
+    );
+}
+
+/// The alert gate refuses every user's rule changes, so the news that it
+/// moved reaches every session.
+#[test]
+fn security_alert_changes_reach_every_session() {
+    assert_eq!(StatusUpdateEvent::SecurityAlertsChanged.addressee(), None);
 }
 
 /// An unknown ancestry is absent, not an empty list, and a payload from before
@@ -408,6 +415,22 @@ fn per_user_settings_events_name_their_addressee() {
         json.get("sid").is_none(),
         "no SID key for the baseline: {json}"
     );
+}
+
+/// A user's rules edit names its author; the baseline's reaches everyone.
+#[test]
+fn mutation_progress_names_the_owner_of_the_changed_rules() {
+    let progress = |sid: Option<&str>| StatusUpdateEvent::MutationProgress {
+        correlation_id: "corr-1".into(),
+        mutation_kind: "rules-update".into(),
+        phase: "failed".into(),
+        error_code: Some("invalid-rule-value".into()),
+        sid: sid.map(str::to_string),
+    };
+    assert_eq!(progress(Some("S-1-5-21-A")).addressee(), Some("S-1-5-21-A"));
+    assert_eq!(progress(None).addressee(), None);
+    let json = serde_json::to_value(progress(None)).expect("serialise");
+    assert!(json.get("sid").is_none(), "{json}");
 }
 
 /// The machine-wide policy is read by every user; who last wrote it is not
@@ -837,4 +860,38 @@ fn block_notice_route_to_secondary_round_trips() {
     let resp = BlockNoticeRouteToSecondaryResponse { authored: true };
     let json = serde_json::to_value(&resp).expect("serialise");
     assert_eq!(json["authored"], true);
+}
+
+/// The review reads the refused values under the error code's own name.
+#[test]
+fn the_refused_values_signal_is_named_after_its_error_code() {
+    let json = serde_json::to_value(RiskSignalDto::InvalidRuleValue {
+        rules: vec!["123".into(), "10.0.0.1.".into()],
+    })
+    .expect("serialise");
+    assert_eq!(json["kind"], "invalid-rule-value");
+    assert_eq!(json["rules"][1], "10.0.0.1.");
+}
+
+/// A refusal other than a value names the code the execute fails with.
+#[test]
+fn a_refused_change_names_its_error_code() {
+    let json = serde_json::to_value(RiskSignalDto::ChangeRefused {
+        code: "unsupported-rule-shape".into(),
+    })
+    .expect("serialise");
+    assert_eq!(json["kind"], "change-refused");
+    assert_eq!(json["code"], "unsupported-rule-shape");
+}
+
+/// A mask that blocks nothing (empty, or "Other" alone) is leak protection
+/// that reads as on; a bit outside the mask is damage.
+#[test]
+fn only_a_mask_that_blocks_something_within_the_known_protocols_is_a_selection() {
+    for kept in [1, 5, 0x20, 0x41, KILL_SWITCH_PROTOCOLS_ALL] {
+        assert!(is_valid_kill_switch_protocols(kept), "{kept:#x}");
+    }
+    for refused in [0, 0x40, 0x80, 0x85, u16::MAX] {
+        assert!(!is_valid_kill_switch_protocols(refused), "{refused:#x}");
+    }
 }

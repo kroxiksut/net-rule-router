@@ -196,7 +196,7 @@ fn handle() -> RedirectHandle {
 
 #[test]
 fn capture_upstream_dns_picks_first_routable_v4_skipping_loopback() {
-    let runner = FakeRunner::new(ok("127.0.0.1\n192.168.1.1\n8.8.8.8\n"));
+    let runner = FakeRunner::new(ok("127.0.0.1\n192.168.1.1\n198.51.100.8\n"));
     assert_eq!(
         capture_upstream_dns_v4(&runner),
         Some("192.168.1.1".parse().unwrap())
@@ -215,13 +215,13 @@ fn candidates_keep_order_and_drop_repeats() {
     // The script lists the default-route interface first and then every
     // connected one, so the preferred server legitimately appears twice.
     let runner = FakeRunner::new(ok(
-        "17 192.168.0.1\n17 0.0.0.0\n17 192.168.0.1\n48 1.1.1.1\n",
+        "17 192.168.0.1\n17 0.0.0.0\n17 192.168.0.1\n48 198.51.100.1\n",
     ));
     assert_eq!(
         capture_upstream_dns_candidates_v4(&runner),
         vec![
             UpstreamDnsCandidate::new(Some(17), "192.168.0.1".parse().unwrap()),
-            UpstreamDnsCandidate::new(Some(48), "1.1.1.1".parse().unwrap()),
+            UpstreamDnsCandidate::new(Some(48), "198.51.100.1".parse().unwrap()),
         ],
         "the caller probes down the list, so a repeat would cost a second probe"
     );
@@ -229,10 +229,13 @@ fn candidates_keep_order_and_drop_repeats() {
 
 #[test]
 fn a_candidate_line_without_an_interface_column_still_parses() {
-    let runner = FakeRunner::new(ok("8.8.8.8\n"));
+    let runner = FakeRunner::new(ok("198.51.100.8\n"));
     assert_eq!(
         capture_upstream_dns_candidates_v4(&runner),
-        vec![UpstreamDnsCandidate::new(None, "8.8.8.8".parse().unwrap())],
+        vec![UpstreamDnsCandidate::new(
+            None,
+            "198.51.100.8".parse().unwrap()
+        )],
         "a degraded emitter must not silently yield nothing"
     );
 }
@@ -419,41 +422,19 @@ fn restore_deletes_only_our_key_and_spawns_nothing() {
         .expect("restoring twice is a no-op");
 }
 
-/// A search list held in memory, as the DNS client would hold it.
-#[derive(Default)]
-struct MemorySearchList {
-    view: Mutex<SearchListView>,
-    noted: Mutex<Vec<String>>,
-}
-impl SearchListStore for MemorySearchList {
-    fn read(&self) -> Result<SearchListView, PlatformError> {
-        Ok(self.view.lock().unwrap_or_else(|p| p.into_inner()).clone())
-    }
-    fn write(&self, suffixes: &[String]) -> Result<(), PlatformError> {
-        self.view.lock().unwrap_or_else(|p| p.into_inner()).global = suffixes.to_vec();
-        Ok(())
-    }
-    fn noted(&self) -> Vec<String> {
-        self.noted.lock().unwrap_or_else(|p| p.into_inner()).clone()
-    }
-    fn note(&self, suffixes: &[String]) -> Result<(), PlatformError> {
-        *self.noted.lock().unwrap_or_else(|p| p.into_inner()) = suffixes.to_vec();
-        Ok(())
-    }
-}
-
 /// The list exists only for the catch-all; it leaves with it.
 #[test]
 fn restore_takes_back_the_search_list_the_redirect_wrote() {
-    let list = Arc::new(MemorySearchList::default());
-    list.view
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .connections = vec!["branch.corp.example".to_string()];
+    let list = Arc::new(search_list::FakeList::default());
     let redirect = NrptDnsRedirect::new(FakeRunner::new(ok("")), FakeStore::default())
         .with_search_list(list.clone());
 
-    redirect.keep_short_names(&[]).expect("keep");
+    redirect
+        .keep_short_names(
+            &[exemption("branch.corp.example", &["192.168.0.53"])],
+            &Vec::new,
+        )
+        .expect("keep");
     assert_eq!(
         list.read().expect("read").global,
         ["branch.corp.example".to_string()]
@@ -463,13 +444,49 @@ fn restore_takes_back_the_search_list_the_redirect_wrote() {
     assert!(list.noted().is_empty());
 }
 
+/// The list is built from the claims the caller exempted, and the user's
+/// suffixes are asked for once per sync.
+#[test]
+fn the_list_follows_the_exempted_claims_and_asks_the_users_suffixes_once() {
+    let list = Arc::new(search_list::FakeList::default());
+    let redirect = NrptDnsRedirect::new(FakeRunner::new(ok("")), FakeStore::default())
+        .with_search_list(list.clone());
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let users = || {
+        asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        vec!["lab.example".to_string()]
+    };
+    redirect
+        .keep_short_names(
+            &[exemption("branch.corp.example", &["192.168.0.53"])],
+            &users,
+        )
+        .expect("keep");
+    assert_eq!(
+        list.read().expect("read").global,
+        ["branch.corp.example".to_string(), "lab.example".to_string()]
+    );
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 #[test]
 fn without_a_search_list_short_names_are_left_as_they_were() {
     let redirect = NrptDnsRedirect::new(FakeRunner::new(ok("")), FakeStore::default());
+    let asked = std::sync::atomic::AtomicBool::new(false);
     redirect
-        .keep_short_names(&["lab.example".to_string()])
+        .keep_short_names(
+            &[exemption("branch.corp.example", &["192.168.0.53"])],
+            &|| {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                vec!["lab.example".to_string()]
+            },
+        )
         .expect("keep");
     assert!(redirect.runner.scripts().is_empty());
+    assert!(
+        !asked.load(std::sync::atomic::Ordering::SeqCst),
+        "no list, no settings read"
+    );
 }
 
 fn exemption(suffix: &str, servers: &[&str]) -> DnsNamespaceExemption {
@@ -681,8 +698,8 @@ fn verify_asks_the_effective_policy_table_not_our_own_write() {
 #[test]
 fn upstream_candidates_drop_hypervisor_networks_and_our_own_pool() {
     let runner = FakeRunner::new(ok(concat!(
-            "16\t192.168.0.1\tIntel(R) Ethernet Connection (2) I219-V\tEthernet\n",
-            "24\t1.1.1.1\tTAP-Windows Adapter V9\tswiftvpn VPN OpenVPN Adapter\n",
+            "16\t192.168.0.1\tEthernet Connection (2)\tEthernet\n",
+            "24\t198.51.100.1\tTAP-Windows Adapter V9\texamplevpn VPN OpenVPN Adapter\n",
             "4\t192.168.140.2\tVMware Virtual Ethernet Adapter for VMnet8\tVMware Network Adapter VMnet8\n",
             "28\t172.20.80.1\tHyper-V Virtual Ethernet Adapter\tvEthernet (Default Switch)\n",
             "14\t192.168.56.1\tVirtualBox Host-Only Ethernet Adapter\tVirtualBox Host-Only Network\n",
@@ -692,7 +709,7 @@ fn upstream_candidates_drop_hypervisor_networks_and_our_own_pool() {
         capture_upstream_dns_candidates_v4(&runner),
         vec![
             UpstreamDnsCandidate::new(Some(16), "192.168.0.1".parse().unwrap()),
-            UpstreamDnsCandidate::new(Some(24), "1.1.1.1".parse().unwrap()),
+            UpstreamDnsCandidate::new(Some(24), "198.51.100.1".parse().unwrap()),
         ],
         "a hypervisor's NAT/host-only resolver answers its guests and black-holes \
              us; our own TUN would point the resolver at itself; a VPN's resolver is \
@@ -711,4 +728,50 @@ fn an_unnamed_adapter_still_yields_its_candidate() {
             "192.168.0.1".parse().unwrap()
         )]
     );
+}
+
+/// Every NRPT call fails, as on a registry the sweep cannot open.
+struct UnreachableNrpt;
+impl NrptRuleStore for UnreachableNrpt {
+    fn write_rule(&self, _: &str, _: &[RegistryValue]) -> Result<(), PlatformError> {
+        Err(unreachable_nrpt())
+    }
+    fn delete_rule(&self, _: &str) -> Result<bool, PlatformError> {
+        Err(unreachable_nrpt())
+    }
+    fn scan(&self, _: &str, _: &[RegistryValue]) -> Result<NrptTableScan, PlatformError> {
+        Err(unreachable_nrpt())
+    }
+    fn sweep_orphans(&self, _: &str, _: &str) -> Result<usize, PlatformError> {
+        Err(unreachable_nrpt())
+    }
+}
+fn unreachable_nrpt() -> PlatformError {
+    PlatformError::Transient {
+        operation: "test.nrpt",
+        detail: "unreachable".into(),
+    }
+}
+
+#[test]
+fn a_failed_nrpt_sweep_still_takes_back_our_suffix_list() {
+    let list = search_list::FakeList::default();
+    let ours = vec!["corp.example".to_string()];
+    list.write(&ours).expect("seed");
+    list.note(&ours).expect("seed");
+
+    let sweep = sweep_orphan_dns_state(&UnreachableNrpt, &list);
+
+    assert!(sweep.nrpt_rules.is_err());
+    assert!(matches!(sweep.search_list, Ok(true)));
+    assert!(list.read().expect("read").global.is_empty());
+    assert!(!sweep.is_clean(), "one failed half makes the sweep unclean");
+}
+
+#[test]
+fn a_sweep_with_nothing_left_behind_is_clean() {
+    let sweep = sweep_orphan_dns_state(&FakeStore::default(), &search_list::FakeList::default());
+    assert!(matches!(sweep.nrpt_rules, Ok(0)));
+    assert!(matches!(sweep.search_list, Ok(false)));
+    assert!(sweep.is_clean());
 }

@@ -9,10 +9,10 @@ use std::fs::File;
 use std::io::Read;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
 
 use nrr_platform_api::vm_inventory::virtualbox::{
-    self, GLOBAL_SETTINGS_FILE, TRAFFIC_PROCESS_STEMS,
+    self, COMMAND_LINE_TOOL_BUDGET, GLOBAL_SETTINGS_FILE, TRAFFIC_PROCESS_STEMS,
 };
 use nrr_platform_api::vm_inventory::vmware::{self, HostNetworks, MachineEntry};
 use nrr_platform_api::vm_inventory::{
@@ -38,6 +38,29 @@ const VMWARE_PREFERENCES_FILE: &str = "preferences";
 /// Enough of the tool's message to say what went wrong.
 const MAX_FAILURE_CHARS: usize = 300;
 
+/// File systems whose open blocks while the server is unreachable: a machine
+/// on a dead hard mount would stall discovery inside a synchronous request.
+const NETWORK_FILE_SYSTEMS: &[&str] = &[
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "ncpfs",
+    "9p",
+    "afs",
+    "ceph",
+    "glusterfs",
+    "lustre",
+    "davfs",
+    "fuse.sshfs",
+    "fuse.rclone",
+    "fuse.s3fs",
+    "fuse.gvfsd-fuse",
+    "fuse.glusterfs",
+    "fuse.ceph-fuse",
+];
+
 /// Where the inventory looks; injectable so tests read temp dirs.
 #[derive(Debug, Clone)]
 pub struct VmInventoryRoots {
@@ -48,6 +71,8 @@ pub struct VmInventoryRoots {
     pub vmware_networking: PathBuf,
     pub sys_class_net: PathBuf,
     pub tool_candidates: Vec<PathBuf>,
+    /// `/proc/self/mountinfo`: which file system each machine file sits on.
+    pub mount_table: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +96,7 @@ impl LinuxVmInventory {
             vmware_networking: PathBuf::from("/etc/vmware/networking"),
             sys_class_net: PathBuf::from("/sys/class/net"),
             tool_candidates: COMMAND_LINE_TOOL_PATHS.iter().map(PathBuf::from).collect(),
+            mount_table: PathBuf::from("/proc/self/mountinfo"),
         })
     }
 
@@ -87,34 +113,37 @@ impl LinuxVmInventory {
             .find(|tool| tool.is_file())
     }
 
-    fn host_has_adapter(&self, prefix: &str) -> bool {
+    /// Every interface name, from one listing.
+    fn adapter_names(&self) -> Vec<String> {
         std::fs::read_dir(&self.roots.sys_class_net)
             .map(|entries| {
-                entries.flatten().any(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.starts_with(prefix))
-                })
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect()
             })
-            .unwrap_or(false)
+            .unwrap_or_default()
     }
 
-    fn virtualbox_inventory(&self) -> HypervisorInventory {
+    fn virtualbox_inventory(
+        &self,
+        host_network_seen: bool,
+        mounts: &MountTable,
+    ) -> HypervisorInventory {
         // TODO: confirm on a Linux host that a NAT guest asking the host alias
         // reaches the loopback resolver; the advice assumes it does, as on Windows.
         let mut machines = self
             .roots
             .virtualbox_home
             .as_deref()
-            .map(machines_in)
+            .map(|home| machines_in(home, mounts))
             .unwrap_or_default();
         if let Some(tool) = self.command_line_tool() {
             virtualbox::attach_enable_commands(&mut machines, &tool.to_string_lossy());
         }
         HypervisorInventory {
             hypervisor: Hypervisor::VirtualBox,
-            host_network_seen: self.host_has_adapter(VIRTUALBOX_ADAPTER_PREFIX),
+            host_network_seen,
             // Linux executables carry no suffix; application rules name the
             // bare file name.
             traffic_processes: TRAFFIC_PROCESS_STEMS
@@ -127,7 +156,11 @@ impl LinuxVmInventory {
 
     /// No traffic processes: VMware's NAT runs as a system daemon that no
     /// application rule binds.
-    fn vmware_inventory(&self) -> HypervisorInventory {
+    fn vmware_inventory(
+        &self,
+        host_network_seen: bool,
+        mounts: &MountTable,
+    ) -> HypervisorInventory {
         let mut networks = HostNetworks::default();
         if let Some(text) = read_settings(&self.roots.vmware_networking) {
             networks.apply_linux_networking(&text);
@@ -136,11 +169,11 @@ impl LinuxVmInventory {
             .roots
             .vmware_settings
             .as_deref()
-            .map(|settings| vmware_machines_in(settings, &networks))
+            .map(|settings| vmware_machines_in(settings, &networks, mounts))
             .unwrap_or_default();
         HypervisorInventory {
             hypervisor: Hypervisor::VMware,
-            host_network_seen: self.host_has_adapter(VMWARE_ADAPTER_PREFIX),
+            host_network_seen,
             traffic_processes: Vec::new(),
             machines,
         }
@@ -149,10 +182,16 @@ impl LinuxVmInventory {
 
 impl VmInventoryPort for LinuxVmInventory {
     fn inventory(&self) -> Vec<HypervisorInventory> {
-        [self.virtualbox_inventory(), self.vmware_inventory()]
-            .into_iter()
-            .filter(HypervisorInventory::is_present)
-            .collect()
+        let adapters = self.adapter_names();
+        let host_has = |prefix: &str| adapters.iter().any(|name| name.starts_with(prefix));
+        let mounts = MountTable::read(&self.roots.mount_table);
+        [
+            self.virtualbox_inventory(host_has(VIRTUALBOX_ADAPTER_PREFIX), &mounts),
+            self.vmware_inventory(host_has(VMWARE_ADAPTER_PREFIX), &mounts),
+        ]
+        .into_iter()
+        .filter(HypervisorInventory::is_present)
+        .collect()
     }
 
     fn bind_nat(
@@ -170,14 +209,16 @@ impl VmInventoryPort for LinuxVmInventory {
         let tool = self
             .command_line_tool()
             .ok_or(VmControlError::ToolMissing)?;
-        let output = Command::new(tool)
-            .args(&arguments)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => VmControlError::ToolMissing,
-                _ => VmControlError::Failed(error.to_string()),
-            })?;
+        let tool = tool.to_str().ok_or(VmControlError::ToolMissing)?;
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let output =
+            crate::command::output_with_timeout(tool, &arguments, COMMAND_LINE_TOOL_BUDGET)
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::NotFound => VmControlError::ToolMissing,
+                    // The generic "could not be changed": the tool said nothing.
+                    std::io::ErrorKind::TimedOut => VmControlError::Failed(String::new()),
+                    _ => VmControlError::Failed(error.to_string()),
+                })?;
         tool_outcome(&output)
     }
 }
@@ -223,7 +264,7 @@ fn absolute_env(name: &str) -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
-fn machines_in(home: &Path) -> Vec<VirtualMachine> {
+fn machines_in(home: &Path, mounts: &MountTable) -> Vec<VirtualMachine> {
     let Some(global) = read_settings(&home.join(GLOBAL_SETTINGS_FILE)) else {
         return Vec::new();
     };
@@ -236,14 +277,18 @@ fn machines_in(home: &Path) -> Vec<VirtualMachine> {
             } else {
                 home.join(path)
             };
-            virtualbox::machine(&read_settings(&path)?)
+            virtualbox::machine(&read_machine_file(&path, mounts)?)
         })
         .collect()
 }
 
 /// Workstation's inventory, then the recent list, each machine once. Paths
 /// are compared exactly: Linux file names are case-sensitive.
-fn vmware_machines_in(settings: &Path, networks: &HostNetworks) -> Vec<VirtualMachine> {
+fn vmware_machines_in(
+    settings: &Path,
+    networks: &HostNetworks,
+    mounts: &MountTable,
+) -> Vec<VirtualMachine> {
     let listed = |file: &str, parse: fn(&str) -> Vec<MachineEntry>| {
         read_settings(&settings.join(file))
             .map(|text| parse(&text))
@@ -258,7 +303,7 @@ fn vmware_machines_in(settings: &Path, networks: &HostNetworks) -> Vec<VirtualMa
         .filter(|entry| seen.insert(entry.config.clone()))
         .filter_map(|entry| {
             vmware::machine(
-                &read_lossy(Path::new(&entry.config))?,
+                &read_machine_file(Path::new(&entry.config), mounts)?,
                 &entry.config,
                 entry.display_name.as_deref(),
                 networks,
@@ -267,8 +312,86 @@ fn vmware_machines_in(settings: &Path, networks: &HostNetworks) -> Vec<VirtualMa
         .collect()
 }
 
-/// A `.vmx` from an older release may not be UTF-8; its names still show.
-fn read_lossy(path: &Path) -> Option<String> {
+/// A machine the inventory lists is read only from a local file system.
+fn read_machine_file(path: &Path, mounts: &MountTable) -> Option<String> {
+    (!mounts.is_network(path))
+        .then(|| read_settings(path))
+        .flatten()
+}
+
+/// Mount points and their file-system types, from `mountinfo`.
+#[derive(Debug, Default)]
+struct MountTable {
+    mounts: Vec<(PathBuf, String)>,
+}
+
+impl MountTable {
+    /// An unreadable table marks nothing as remote.
+    fn read(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .map(|text| Self::parse(&text))
+            .unwrap_or_default()
+    }
+
+    /// `ID PARENT MAJ:MIN ROOT MOUNT-POINT OPTIONS [TAGS…] - FSTYPE SOURCE …`
+    fn parse(text: &str) -> Self {
+        let mounts = text
+            .lines()
+            .filter_map(|line| {
+                let (head, tail) = line.split_once(" - ")?;
+                let mount_point = head.split(' ').nth(4)?;
+                let fs_type = tail.split(' ').next()?;
+                Some((
+                    PathBuf::from(unescape_mount_field(mount_point)),
+                    fs_type.to_string(),
+                ))
+            })
+            .collect();
+        Self { mounts }
+    }
+
+    /// Lexical on purpose: asking the file system itself (`statfs`, a
+    /// canonicalising lookup) blocks on a dead hard mount just like the open.
+    /// The deepest mount point wins; among equals the later mount, which is
+    /// the one on top.
+    fn is_network(&self, path: &Path) -> bool {
+        self.mounts
+            .iter()
+            .filter(|(point, _)| path.starts_with(point))
+            .max_by_key(|(point, _)| point.components().count())
+            .is_some_and(|(_, fs_type)| NETWORK_FILE_SYSTEMS.contains(&fs_type.as_str()))
+    }
+}
+
+/// `mountinfo` writes space, tab, newline and backslash as `\ooo`.
+fn unescape_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = (bytes[i] == b'\\')
+            .then(|| bytes.get(i + 1..i + 4))
+            .flatten()
+            .filter(|digits| digits.iter().all(|d| (b'0'..=b'7').contains(d)))
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        match escaped {
+            Some(byte) => {
+                out.push(byte);
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Bounded, and lossy: a `.vmx` from an older release may not be UTF-8, and
+/// its names should still show.
+fn read_settings(path: &Path) -> Option<String> {
     let mut bytes = Vec::new();
     File::open(path)
         .ok()?
@@ -276,16 +399,6 @@ fn read_lossy(path: &Path) -> Option<String> {
         .read_to_end(&mut bytes)
         .ok()?;
     (bytes.len() as u64 <= MAX_SETTINGS_BYTES).then(|| String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn read_settings(path: &Path) -> Option<String> {
-    let mut text = String::new();
-    File::open(path)
-        .ok()?
-        .take(MAX_SETTINGS_BYTES + 1)
-        .read_to_string(&mut text)
-        .ok()?;
-    (text.len() as u64 <= MAX_SETTINGS_BYTES).then_some(text)
 }
 
 #[cfg(test)]
@@ -312,6 +425,7 @@ mod tests {
             virtualbox_home,
             vmware_settings: None,
             vmware_networking: sys_class_net.join("no-networking"),
+            mount_table: sys_class_net.join("no-mountinfo"),
             sys_class_net,
             tool_candidates,
         })
@@ -349,7 +463,8 @@ mod tests {
             &settings.join(VMWARE_PREFERENCES_FILE),
             &format!("pref.mruVM0.filename = \"{one}\"\npref.mruVM1.filename = \"{two}\"\n"),
         );
-        let machines = vmware_machines_in(&settings, &HostNetworks::default());
+        let machines =
+            vmware_machines_in(&settings, &HostNetworks::default(), &MountTable::default());
         let found: Vec<(&str, &VmAttachment)> = machines
             .iter()
             .map(|m| (m.name.as_str(), &m.adapters[0].attachment))
@@ -381,6 +496,7 @@ mod tests {
             virtualbox_home: None,
             vmware_settings: Some(settings),
             vmware_networking: networking,
+            mount_table: root.path().join("no-mountinfo"),
             sys_class_net: net,
             tool_candidates: Vec::new(),
         })
@@ -442,7 +558,7 @@ mod tests {
         let elsewhere = tempfile::tempdir().expect("elsewhere");
         home_with_machines(home.path(), elsewhere.path());
 
-        let machines = machines_in(home.path());
+        let machines = machines_in(home.path(), &MountTable::default());
         let names: Vec<&str> = machines.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(
             names,
@@ -453,6 +569,65 @@ mod tests {
             machines[0].adapters[0].attachment,
             VmAttachment::Nat(_)
         ));
+    }
+
+    /// One `mountinfo` line, the mount point escaped as the kernel writes it.
+    fn mountinfo_line(id: u32, point: &Path, fs_type: &str) -> String {
+        let point = point
+            .to_string_lossy()
+            .replace('\\', "\\134")
+            .replace(' ', "\\040");
+        format!("{id} 1 0:{id} / {point} rw,relatime shared:{id} - {fs_type} source rw\n")
+    }
+
+    #[test]
+    fn a_machine_on_a_network_mount_is_not_opened() {
+        let home = tempfile::tempdir().expect("home");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        home_with_machines(home.path(), elsewhere.path());
+        let table = |fs_type: &str| {
+            MountTable::parse(&format!(
+                "{}{}",
+                mountinfo_line(1, Path::new("/"), "ext4"),
+                mountinfo_line(2, elsewhere.path(), fs_type)
+            ))
+        };
+        let names = |mounts: &MountTable| -> Vec<String> {
+            machines_in(home.path(), mounts)
+                .into_iter()
+                .map(|m| m.name)
+                .collect()
+        };
+        // Positive control: the same machine on a local file system is read.
+        assert_eq!(names(&table("ext4")), vec!["One", "Two"]);
+        assert_eq!(names(&table("nfs4")), vec!["Two"]);
+        assert_eq!(names(&table("fuse.sshfs")), vec!["Two"]);
+    }
+
+    #[test]
+    fn the_deepest_and_latest_mount_decides() {
+        let mounts = MountTable::parse(concat!(
+            "20 1 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "21 20 0:50 / /srv/vms rw - nfs server.example:/vms rw\n",
+            "22 21 8:2 / /srv/vms/local rw - xfs /dev/sda2 rw\n",
+            "23 20 0:51 / /mnt/share rw - ext4 /dev/sdb1 rw\n",
+            "24 23 0:52 / /mnt/share rw - cifs //server.example/share rw\n",
+            "25 20 0:53 / /mnt/my\\040vms rw shared:5 master:2 - smb3 //server.example/vms rw\n",
+            "not a mountinfo line\n",
+        ));
+        assert!(!mounts.is_network(Path::new("/home/user/VirtualBox VMs/One/One.vbox")));
+        assert!(mounts.is_network(Path::new("/srv/vms/One/One.vbox")));
+        assert!(!mounts.is_network(Path::new("/srv/vms/local/One/One.vbox")));
+        assert!(
+            !mounts.is_network(Path::new("/srv/vmsx/One.vbox")),
+            "whole components only"
+        );
+        assert!(
+            mounts.is_network(Path::new("/mnt/share/One.vmx")),
+            "the mount on top"
+        );
+        assert!(mounts.is_network(Path::new("/mnt/my vms/One.vmx")));
+        assert!(!MountTable::default().is_network(Path::new("/srv/vms/One.vbox")));
     }
 
     #[test]

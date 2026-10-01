@@ -4,11 +4,9 @@ import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import "../lib/pure.js" as Pure
 
-// About window (extracted from Main.qml). Logo lockup / author / version /
-// license / build channel / project URL, plus buttons to the Licenses window
-// and the project page. Keeps its `aboutWindow` id so Main.qml's
-// overlays/children arrays and openChildWindow wiring are unchanged. Shared
-// state via `root`.
+// About window: logo lockup, author, version, license, build details and the
+// project URL, plus buttons to the Licenses window and the project page. Keeps
+// its `aboutWindow` id for Main.qml's openChildWindow wiring.
 Window {
     id: aboutWindow
 
@@ -16,7 +14,7 @@ Window {
     property var root: null
 
     width: 560
-    height: 420
+    height: 470
     visible: false
     modality: Qt.NonModal
     color: root.panelColor
@@ -75,14 +73,45 @@ Window {
         Label { text: root.tr("label.version", "Version") + ": " + ((root.context.about || {}).version || "n/a"); color: root.textColor }
         Label { text: root.tr("label.license", "License") + ": " + ((root.context.about || {}).license || "MPL-2.0"); color: root.textColor }
         Label { text: root.tr("label.build-channel", "Build channel") + ": " + ((root.context.about || {}).buildChannel || "development"); color: root.textColor }
+        // Profile and compiler are what a bug report needs to reproduce a build.
+        Label {
+            readonly property string profile: String((root.context.about || {}).buildProfile || "")
+            visible: profile !== ""
+            color: root.textColor
+            text: root.tr("label.build-profile", "Build profile") + ": "
+                + root.tr("label.build-profile-" + profile, profile)
+        }
+        Label {
+            readonly property string toolchain: String((root.context.about || {}).toolchain || "")
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            visible: toolchain !== ""
+            color: root.textColor
+            text: root.tr("label.compiler", "Compiler") + ": Rust " + toolchain
+        }
         Label { text: root.tr("label.project-url", "Project") + ": " + ((root.context.about || {}).projectUrl || "-"); color: root.textColor; wrapMode: Text.WordWrap }
         Item { Layout.fillHeight: true }
         RowLayout {
             Layout.fillWidth: true
-            Button { activeFocusOnTab: true; text: root.tr("action.open-license-window", "License"); onClicked: root.openChildWindow(root.licenseWindow) }
-            Button { activeFocusOnTab: true; text: root.tr("label.project-url", "Project"); onClicked: Pure.openExternalUrl((root.context.about || {}).projectUrl || "") }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("action.open-license-window", "License")
+                Accessible.name: text
+                onClicked: root.openChildWindow(root.licenseWindow)
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("label.project-url", "Project")
+                Accessible.name: text
+                onClicked: Pure.openExternalUrl((root.context.about || {}).projectUrl || "")
+            }
             Item { Layout.fillWidth: true }
-            Button { activeFocusOnTab: true; text: root.tr("action.close", "Close"); onClicked: aboutWindow.close() }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("action.close", "Close")
+                Accessible.name: text
+                onClicked: aboutWindow.close()
+            }
         }
     }
 }

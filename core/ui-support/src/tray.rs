@@ -34,7 +34,7 @@ impl TrayStatusKind {
     /// Russian tray tooltip.
     pub const fn title(self) -> &'static str {
         match self {
-            Self::PreviewMode => "Preview mode",
+            Self::PreviewMode => "Setup not finished",
             Self::CheckingStatus => "Checking status…",
             // Worded exactly as `tray.status.*` in the English catalogue, so
             // the fallback and the normal path read identically.
@@ -99,13 +99,15 @@ impl FromStr for TrayStatusKind {
     type Err = &'static str;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "preview-mode" | "preview" => Ok(Self::PreviewMode),
-            "checking-status" | "checking" => Ok(Self::CheckingStatus),
-            "no-active-policy" | "no-policy" => Ok(Self::NoActivePolicy),
-            "service-unavailable" | "service-down" => Ok(Self::ServiceUnavailable),
-            _ => Err("unknown tray status kind"),
-        }
+        [
+            Self::PreviewMode,
+            Self::CheckingStatus,
+            Self::NoActivePolicy,
+            Self::ServiceUnavailable,
+        ]
+        .into_iter()
+        .find(|kind| kind.slug() == value)
+        .ok_or("unknown tray status kind")
     }
 }
 
@@ -123,7 +125,6 @@ pub struct TrayRuntimeSnapshot {
     pub icon_asset_hint: &'static str,
     pub primary_actions: Vec<TrayActionRuntime>,
     pub quick_actions: Vec<TrayActionRuntime>,
-    pub single_instance_note: &'static str,
 }
 
 /// Build the tray's launch snapshot.
@@ -167,8 +168,6 @@ pub fn tray_runtime_snapshot(
             .iter()
             .map(|item| map_action_runtime(shell, *item, first_run_completed))
             .collect(),
-        single_instance_note:
-            "Tray commands are routed into the existing GUI instance (single-instance policy).",
     }
 }
 
@@ -212,7 +211,7 @@ mod tests {
             TrayServiceLink::Reachable,
         );
         assert_eq!(snapshot.status_kind, TrayStatusKind::PreviewMode);
-        assert_eq!(snapshot.status_line, "Preview mode");
+        assert_eq!(snapshot.status_line, "Setup not finished");
         assert_eq!(
             snapshot.icon_asset_hint,
             "assets/icons/tray/tray-warning.ico"

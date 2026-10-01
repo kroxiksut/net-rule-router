@@ -19,26 +19,48 @@
 //! | `list_log_entries`     | ✓   | –    | ✓               | ✓        |
 //! | `list_audit_entries`   | ✓   | –    | ✓               | ✓        |
 //! | `acknowledge_alert`    | ✓   | ✓    | –               | ✓        |
-//! | `set_diagnostic_mode`  | ✓   | ✓    | –               | ✓        |
 //! | `clear_logs`           | ✓   | –    | –               | ✓        |
 
+use crate::audit::alert::SecurityAlertState;
 use crate::error::DiagnosticsResult;
 use crate::explain::{ExplainQuery, ExplainResponse};
 use crate::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, ClearLogsRequest, ClearLogsResult,
     DiagnosticsAudience, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, SecurityAlertDto,
-    SetDiagnosticModeRequest,
 };
 use crate::facade::pagination::{PageCursor, PageResult, PaginationParams, MAX_PAGE_SIZE};
 use crate::redaction::ExplainDetailLevel;
+
+/// Which alerts [`DiagnosticsFacade::list_alerts`] returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlertListFilter {
+    /// Active and acknowledged, newest first.
+    Open,
+    /// One state, oldest first.
+    In(SecurityAlertState),
+    /// Every state, oldest first within each.
+    All,
+}
+
+impl AlertListFilter {
+    #[must_use]
+    pub fn admits(self, state: SecurityAlertState) -> bool {
+        match self {
+            Self::Open => state.is_open(),
+            Self::In(wanted) => state == wanted,
+            Self::All => true,
+        }
+    }
+}
 
 /// Read/write diagnostics facade for GUI and tray.
 ///
 /// Implemented by `RealDiagnosticsFacade` (wired to the
 /// service) and by [`super::mock::MockDiagnosticsFacade`] for scaffold.
 pub trait DiagnosticsFacade: Send + Sync {
-    /// Returns the top-level health and status overview.
-    fn get_status(&self) -> DiagnosticsStatusDto;
+    /// Returns the top-level health and status overview. Its alerts are the
+    /// ones `audience` may see — see [`Self::list_alerts`].
+    fn get_status(&self, audience: &DiagnosticsAudience) -> DiagnosticsStatusDto;
 
     /// Returns a paginated list of operational log entries, newest-first: the
     /// first page is the latest activity and each next page reaches further back.
@@ -161,22 +183,30 @@ pub trait DiagnosticsFacade: Send + Sync {
     /// The raw lines carry `payload_summary_json`, so the CALLER gates this to
     /// the Diagnostics / DeveloperLocal redaction tiers; the default
     /// implementation returns an empty vec, so only the storage-backed
-    /// production facade actually ships the chain.
+    /// production facade actually ships the chain. A chain cannot be scoped to
+    /// one principal and still verify, so anything but a machine-wide
+    /// `audience` gets none.
     ///
     /// [`list_audit_entries`]: Self::list_audit_entries
-    fn recent_audit_chain_lines(&self, max_bytes: usize) -> DiagnosticsResult<Vec<String>> {
-        let _ = max_bytes;
+    fn recent_audit_chain_lines(
+        &self,
+        _max_bytes: usize,
+        _audience: &DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<String>> {
         Ok(Vec::new())
     }
 
-    /// Returns all currently active (unresolved) security alerts.
-    fn list_active_alerts(&self) -> DiagnosticsResult<Vec<SecurityAlertDto>>;
+    /// Security alerts matching `filter`, as `audience` may see them: machine
+    /// alerts to everyone, an alert about one principal's stored rules only to
+    /// that principal and a machine-wide audience.
+    fn list_alerts(
+        &self,
+        filter: AlertListFilter,
+        audience: &DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<SecurityAlertDto>>;
 
     /// Acknowledges a security alert.  Creates a new audit event.
     fn acknowledge_alert(&self, req: &AcknowledgeAlertRequest) -> DiagnosticsResult<()>;
-
-    /// Enables or disables explicit diagnostic mode.
-    fn set_diagnostic_mode(&self, req: &SetDiagnosticModeRequest) -> DiagnosticsResult<()>;
 
     /// Clears operational logs (never audit trail).
     /// If `dry_run = true`, returns what would be deleted without deleting.

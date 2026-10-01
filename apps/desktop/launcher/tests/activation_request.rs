@@ -24,7 +24,6 @@ fn make_request(
         open_about,
         open_license,
         first_run_completed_override: None,
-        first_run_scenario_override: None,
         action: None,
         reason: None,
         focus: None,
@@ -171,8 +170,8 @@ fn cold_start_context_carries_the_launch_action() {
 
     let shell = nrr_shared::gui_shell_v1();
     let preferences = nrr_ui_support::ui_preferences::UiPreferences::default();
-    let first_run = nrr_ui_support::first_run::first_run_flow_snapshot(&shell, true, None);
-    let backend = nrr_application::backend_facade::MockBackendFacade;
+    let first_run = nrr_ui_support::first_run::first_run_flow_snapshot(&shell);
+    let backend = nrr_application::backend_facade::MockBackendFacade::default();
     let status = nrr_application::backend_facade::BackendConnectionStatus::Connected;
 
     let dir = tempdir().expect("tempdir");
@@ -186,6 +185,7 @@ fn cold_start_context_carries_the_launch_action() {
         &request,
         &backend,
         &status,
+        &nrr_launcher::rpc_dispatcher::host_answer_deadlines(),
     )
     .expect("write context");
 
@@ -197,5 +197,9 @@ fn cold_start_context_carries_the_launch_action() {
     assert_eq!(
         json["launchFocusContext"]["apps"],
         serde_json::json!(["a.exe"])
+    );
+    let deadlines = &json[nrr_shared::launcher_rpc::HOST_ANSWER_DEADLINES_CONTEXT_KEY];
+    assert!(
+        deadlines["operationsMs"]["mutation.submit"].as_u64() > deadlines["defaultMs"].as_u64()
     );
 }

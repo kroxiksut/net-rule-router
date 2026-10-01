@@ -269,6 +269,7 @@ pub(crate) fn build_supervised_runtime_deps(
         settings_conn: settings_conn.clone(),
         cache_store: cache_store.clone(),
         event_bus: Arc::clone(&event_bus),
+        health_agg: Arc::clone(&health_agg),
         sid_registry: Arc::clone(&sid_registry),
         id_generator: Arc::clone(&id_generator),
         per_sid_orchestrator: per_sid_orchestrator.clone(),
@@ -280,7 +281,7 @@ pub(crate) fn build_supervised_runtime_deps(
     // Lives in `runtime_deps::ipc_surface`; the router and the named pipe
     // server that consume its registry stay here.
     let ipc_surface::IpcSurface {
-        conn_trace_persisted_ndjson,
+        conn_trace_ndjson,
         conn_trace_ring,
         auto_probe_wiring,
         registry,
@@ -398,58 +399,18 @@ pub(crate) fn build_supervised_runtime_deps(
 
     // ── Diagnostics cleanup wiring ──────────────────────────────────────
     let logs_dir: PathBuf = artifacts.topology.logs_dir.clone();
-    // Read the persisted log/audit retention (age + size caps) so both
-    // cleanup tasks enforce the operator's saved config on startup. Audit files
-    // live in the same `logs_dir` (run_audit targets only `nrr_audit_*`). Falls
-    // back to CLAUDE.md defaults when the settings DB / row is unavailable.
-    let (log_retention, audit_retention) =
-        match settings_conn.as_ref().and_then(read_log_retention_config) {
-            Some(cfg) => (
-                LogRetentionPolicy {
-                    max_age_days: cfg.log_max_age_days,
-                    max_total_size_bytes: cfg.log_max_size_bytes,
-                    ..LogRetentionPolicy::default()
-                },
-                AuditRetentionPolicy {
-                    max_age_days: cfg.audit_max_age_days,
-                    max_total_size_bytes: cfg.audit_max_size_bytes,
-                },
-            ),
-            None => (
-                LogRetentionPolicy::default(),
-                AuditRetentionPolicy::default(),
-            ),
-        };
+    // The operator's saved retention caps and accept-loop policy; the documented
+    // defaults where the settings DB or a row is unavailable. Audit files live
+    // in the same `logs_dir` (run_audit targets only `nrr_audit_*`).
+    let nrr_service_runtime::boot_settings::BootSettings {
+        stability: stability_config,
+        log_retention,
+        audit_retention,
+    } = nrr_service_runtime::boot_settings::read_boot_settings(settings_conn.as_ref());
     let cleanup_scope = ManualCleanupScope {
         operational_logs: true,
         diagnostic_temp_data: false,
         exported_archives: false,
-    };
-
-    // ── Service stability config ────────────────────────────────────────
-    // Read the persisted policy from `service_stability_config` so the
-    // `ipc-accept-loop` task picks up the operator's saved
-    // backoff_base / backoff_cap / max_restarts on startup. If the row
-    // is missing or the settings DB never opened, fall back to canonical
-    // defaults, consistent with the
-    // GUI's "config not yet written" state. When the read returns None
-    // (DB missing OR row missing OR error) we emit a defaults-applied
-    // log so the operator can tell from NDJSON that the supervisor is
-    // running on factory values rather than what they last saved.
-    let stability_config: ServiceStabilityConfig = match settings_conn
-        .as_ref()
-        .and_then(read_service_stability_config)
-    {
-        Some(cfg) => cfg,
-        None => {
-            tracing::info!(
-                target: "nrr::stability",
-                msg_key = "svc-boot-stability-defaults-applied",
-                source = "default",
-                "service_stability_config defaults applied (no persisted row or settings DB unavailable)",
-            );
-            ServiceStabilityConfig::default()
-        }
     };
 
     // Last-logged "leak-guard reconciled" `added` count per
@@ -467,7 +428,6 @@ pub(crate) fn build_supervised_runtime_deps(
     let route_recompute_hook: Option<nrr_service_runtime::supervised_runtime::RouteRecomputeHook> =
         route_coordinator.as_ref().map(|coord| {
             let coord = Arc::clone(coord);
-            let namespace_recheck = Arc::clone(namespace_recheck());
             let registry = Arc::clone(&sid_registry);
             let leak_guard_log_state = Arc::clone(&leak_guard_log_state);
             // This hook fires on the DNS warm-up
@@ -512,11 +472,6 @@ pub(crate) fn build_supervised_runtime_deps(
                 if nrr_service_runtime::teardown_in_progress() {
                     return;
                 }
-                // This hook fires on the adapter monitor, so a link that just
-                // appeared may have brought a claimed namespace with it. Wake
-                // the DNS guard instead of leaving its names to us for up to a
-                // guard interval.
-                namespace_recheck.store(true, std::sync::atomic::Ordering::SeqCst);
                 // What this pass costs, phase by phase. A 10 s median with
                 // requests queueing behind it was measured as ONE number, which
                 // says nothing about what to take off the periodic path.
@@ -543,7 +498,8 @@ pub(crate) fn build_supervised_runtime_deps(
                     tracing::error!(
                         target: "nrr::route-coordinator",
                         msg_key = "svc-boot-route-recompute-failed",
-                        "route recompute after DNS warm-up failed: {e:?}",
+                        error = %e,
+                        "route recompute after DNS warm-up failed",
                     );
                 }
                 timings.mark("routes");
@@ -580,7 +536,8 @@ pub(crate) fn build_supervised_runtime_deps(
                             tracing::error!(
                                 target: "nrr::per_sid_orchestrator",
                                 msg_key = "svc-boot-pause-state-read-failed",
-                                "pause-state read failed; skipping enforcement reconcile: {e:?}",
+                                error = %e,
+                                "pause-state read failed; skipping enforcement reconcile",
                             );
                             dns_ctl.tick();
                             report_recompute_cost(&timings);
@@ -596,7 +553,8 @@ pub(crate) fn build_supervised_runtime_deps(
                         tracing::error!(
                             target: "nrr::per_sid_orchestrator",
                             msg_key = "svc-boot-enforcement-reconcile-failed",
-                            "periodic enforcement reconcile failed: {e:?}",
+                            error = %e,
+                            "periodic enforcement reconcile failed",
                         );
                     }
                     timings.mark("filters");
@@ -631,7 +589,8 @@ pub(crate) fn build_supervised_runtime_deps(
                                 target: "nrr::per_sid_orchestrator",
                                 msg_key = "svc-boot-leak-guard-reconcile-failed",
                                 sid = %sid,
-                                "leak-guard reconcile failed: {e:?}",
+                                error = %e,
+                                "leak-guard reconcile failed",
                             ),
                         }
                     }
@@ -775,7 +734,8 @@ pub(crate) fn build_supervised_runtime_deps(
                                 Err(e) => tracing::warn!(
                                     target: "nrr::route-coordinator",
                                     msg_key = "svc-boot-teardown-keep-secondary-failed",
-                                    "route keep-secondary teardown on shutdown failed: {e:?}",
+                                    error = %e,
+                                    "route keep-secondary teardown on shutdown failed",
                                 ),
                             }
                         } else {
@@ -789,7 +749,8 @@ pub(crate) fn build_supervised_runtime_deps(
                                 Err(e) => tracing::warn!(
                                     target: "nrr::route-coordinator",
                                     msg_key = "svc-boot-teardown-full-failed",
-                                    "route teardown on shutdown failed: {e:?}",
+                                    error = %e,
+                                    "route teardown on shutdown failed",
                                 ),
                             }
                         }
@@ -805,7 +766,8 @@ pub(crate) fn build_supervised_runtime_deps(
                             Err(e) => tracing::warn!(
                                 target: "nrr::route-coordinator",
                                 msg_key = "svc-boot-wfp-strip-failed",
-                                "WFP filter strip on shutdown failed: {e:?}",
+                                error = %e,
+                                "WFP filter strip on shutdown failed",
                             ),
                         }
                     })
@@ -899,7 +861,7 @@ pub(crate) fn build_supervised_runtime_deps(
                                 Err(e) => tracing::warn!(
                                     target: "nrr::dns-observe",
                                     msg_key = "svc-boot-dns-cache-flush-failed",
-                                    error = ?e,
+                                    error = %e,
                                     "OS DNS resolver cache flush failed — names cached before the service started stay invisible until their TTL expires",
                                 ),
                             }
@@ -912,25 +874,19 @@ pub(crate) fn build_supervised_runtime_deps(
                     tracing::warn!(
                         target: "nrr::dns-observe",
                         msg_key = "svc-boot-dns-etw-unavailable",
+                        error = %e,
                         "DNS-Client ETW observer unavailable; suffix/zone routing will not \
-                         observe new sub-hostnames: {e}",
+                         observe new sub-hostnames",
                     );
                     None
                 }
             }
         });
 
-    // Opt-in connection-egress observer.
-    // Enabled by the persisted toggles (NDJSON sink + GUI stream) on
-    // service_stability_config; a dev sentinel/env (NRR_CONN_TRACE /
-    // conn-trace.enabled) additionally forces the NDJSON path on without the
-    // GUI. The observer starts if either output is on. Captures outbound
-    // connections (process + remote + egress interface) for diagnostics; never
-    // installs routes/filters. Paired source+consumer (both Some or both None).
-    // Flags (conn_trace_persisted_ndjson, conn_trace_gui) and the shared ring
-    // were read/created at the top of this fn (the ring must reach the IPC deps
-    // built earlier). Reuse them here for the observer construction.
-    let conn_trace_ndjson = conn_trace_persisted_ndjson || conn_trace_requested();
+    // Connection-egress observer: captures outbound connections (process +
+    // remote + egress interface); never installs routes or filters. The NDJSON
+    // switch and the ring come from the IPC surface, whose settings writer
+    // flips the switch live. Paired source+consumer (both Some or both None).
     // Wire FCrDNS reverse-learning only when the
     // DNS-observation consumer exists (it owns the rule-gated cache sink). The
     // conn-trace consumer's drop hook feeds this channel; the worker (below) drains
@@ -1038,13 +994,15 @@ pub(crate) fn build_supervised_runtime_deps(
         spawn_fcrdns_learner_worker(fcrdns_rx, Arc::clone(dns_consumer), companion);
     }
 
-    // Clear any orphaned NRPT redirect a prior
-    // crashed Resolver session may have left (a dead :53 would break ALL DNS),
-    // regardless of the current mode, then arm the local resolver iff the
-    // persisted mode is Resolver.
-    match nrr_platform_windows::dns_redirect::clear_orphan_redirect(
+    // Clear any orphaned NRPT redirect a prior crashed Resolver session may
+    // have left (a dead :53 would break ALL DNS) and a suffix list a killed
+    // instance wrote (it outlives a reboot), regardless of the current mode;
+    // then arm the local resolver iff the persisted mode is Resolver.
+    let dns_sweep = nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
         &nrr_platform_windows::dns_redirect::TransactedNrptStore,
-    ) {
+        &nrr_platform_windows::dns_redirect::WindowsSearchList,
+    );
+    match dns_sweep.nrpt_rules {
         Ok(removed) => tracing::info!(
             target: "nrr::dns-resolver",
             msg_key = "svc-boot-nrpt-sweep-finished",
@@ -1054,17 +1012,16 @@ pub(crate) fn build_supervised_runtime_deps(
         Err(e) => tracing::warn!(
             target: "nrr::dns-resolver",
             msg_key = "svc-boot-nrpt-cleanup-failed",
-            "Mode B: orphan NRPT cleanup at boot failed ({e})",
+            error = %e,
+            "Mode B: orphan NRPT cleanup at boot failed",
         ),
     }
-    // A search list a killed instance wrote outlives it across a reboot.
-    if let Err(e) = nrr_platform_windows::dns_redirect::release_search_list(
-        &nrr_platform_windows::dns_redirect::WindowsSearchList,
-    ) {
+    if let Err(e) = dns_sweep.search_list {
         tracing::warn!(
             target: "nrr::dns-resolver",
             msg_key = "svc-boot-search-list-release-failed",
-            "startup: could not take back a DNS suffix search list left by a previous run ({e})",
+            error = %e,
+            "startup: could not take back a DNS suffix search list left by a previous run",
         );
     }
     // Install the platform resolver factory now that the cache / routing-SID /
@@ -1254,7 +1211,7 @@ pub(crate) fn build_supervised_runtime_deps(
                             tracing::warn!(
                                 target: "nrr::fake-ip",
                                 msg_key = "svc-boot-fakeip-watchdog-flush-failed",
-                                error = ?e,
+                                error = %e,
                                 "OS DNS resolver cache flush after watchdog rebuild failed — stale answers persist until TTL",
                             );
                         }
@@ -1403,7 +1360,7 @@ pub(crate) fn build_supervised_runtime_deps(
                     tracing::warn!(
                         target: "nrr::fake-ip",
                         msg_key = "svc-boot-fakeip-bringup-flush-failed",
-                        error = ?e,
+                        error = %e,
                         "OS DNS resolver cache flush after fake-IP boot bring-up failed — stale real answers persist until TTL",
                     );
                 }
@@ -1463,6 +1420,8 @@ pub(crate) fn build_supervised_runtime_deps(
         _ => None,
     };
 
+    let dns_resolver_mode =
+        nrr_service_runtime::dns_stack::persisted_enforcement_mode(settings_conn.clone());
     SupervisedRuntimeDeps {
         health: Arc::clone(&health_agg),
         ipc_server,
@@ -1497,7 +1456,7 @@ pub(crate) fn build_supervised_runtime_deps(
         auto_rule_probe: auto_probe_wiring,
         app_destination_memory,
         dns_resolver_controller: Some(dns_resolver_controller),
-        dns_resolver_boot_mode,
+        dns_resolver_mode,
         // The SAME EventBus the IPC handlers publish
         // through, so the adapter monitor's `AdaptersChanged` push reaches every
         // subscribed GUI and the Interfaces page auto-refreshes on secondary up/down.

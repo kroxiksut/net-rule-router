@@ -1,7 +1,7 @@
 //! The neutral fake-IP relay.
 //!
-//! The adapter (slice 2) delivers raw IP packets addressed to the pool, and the
-//! allocator (slice 1) knows which hostname each fake address stands for. This
+//! The adapter delivers raw IP packets addressed to the pool, and the
+//! allocator knows which hostname each fake address stands for. This
 //! module is what sits between them and the real internet:
 //!
 //! - [`flow`] — parse a packet far enough to identify its flow and spot the

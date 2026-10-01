@@ -77,7 +77,7 @@ fn ip_rule(id: &str, addr: IpAddr) -> Rule {
     Rule {
         id: RuleId(id.to_string()),
         enabled: true,
-        address_match: Some(AddressMatch::ExactIp(addr)),
+        address_match: Some(AddressMatch::ExactIp(addr.to_string())),
         app_match: None,
         comment: String::new(),
         action: crate::canonical::RuleAction::Route,
@@ -296,8 +296,8 @@ fn zone_written_with_a_leading_dot_canonicalizes_to_the_matchable_form() {
     // wire comparison key and the GUI validator already assumed.
     assert_eq!(canonical_zone(".ru"), "ru");
     assert_eq!(canonical_zone(".рф"), "xn--p1ai");
-    assert_eq!(canonical_zone("msk.ru"), "msk.ru");
-    assert_eq!(canonical_zone("мск.рф"), "xn--j1adp.xn--p1ai");
+    assert_eq!(canonical_zone("corp.ru"), "corp.ru");
+    assert_eq!(canonical_zone("пример.рф"), "xn--e1afmkfd.xn--p1ai");
 }
 
 /// The property the test above exists for: a zone the user wrote with a
@@ -352,8 +352,8 @@ fn zone_unicode_and_punycode_forms_produce_empty_diff() {
 fn ipv4_accepted_as_is() {
     let mut warnings = Vec::new();
     let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-    let result = canonicalize_ip_addr(addr, &RuleId("r-1".to_string()), &mut warnings);
-    assert_eq!(result, addr);
+    let result = canonical_ip_address("10.0.0.1", &RuleId("r-1".to_string()), &mut warnings);
+    assert_eq!(result, Ok(addr));
     assert!(warnings.is_empty());
 }
 
@@ -361,18 +361,20 @@ fn ipv4_accepted_as_is() {
 fn ipv6_accepted_as_is() {
     let mut warnings = Vec::new();
     let addr = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
-    let result = canonicalize_ip_addr(addr, &RuleId("r-1".to_string()), &mut warnings);
-    assert_eq!(result, addr);
+    let result = canonical_ip_address("2001:db8::1", &RuleId("r-1".to_string()), &mut warnings);
+    assert_eq!(result, Ok(addr));
     assert!(warnings.is_empty());
 }
 
 #[test]
 fn ipv4_mapped_ipv6_normalized_to_ipv4() {
     let mut warnings = Vec::new();
-    // ::ffff:192.0.2.1
-    let addr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0201));
-    let result = canonicalize_ip_addr(addr, &RuleId("r-1".to_string()), &mut warnings);
-    assert_eq!(result, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+    let result = canonical_ip_address(
+        "::ffff:192.0.2.1",
+        &RuleId("r-1".to_string()),
+        &mut warnings,
+    );
+    assert_eq!(result, Ok(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
     assert!(warnings
         .iter()
         .any(|w| matches!(w, ValidationWarning::Ipv4MappedIpv6Normalized { .. })));
@@ -430,8 +432,8 @@ fn unix_rules_keep_their_names_and_raise_no_suffix_warning() {
             None,
             RouteBehaviorMode::PreferPrimary,
             vec![
-                app_rule("r-1", "telegram-desktop"),
-                app_rule("r-2", "org.telegram.desktop"),
+                app_rule("r-1", "messenger-desktop"),
+                app_rule("r-2", "org.example.messenger"),
                 Rule {
                     app_match: Some(AppMatch {
                         pattern: AppMatchPattern::Glob("Codex*".to_string()),
@@ -458,7 +460,7 @@ fn unix_rules_keep_their_names_and_raise_no_suffix_warning() {
             3,
             "{platform:?}: every rule survives: {names:?}"
         );
-        for expected in ["telegram-desktop", "org.telegram.desktop", "codex*"] {
+        for expected in ["messenger-desktop", "org.example.messenger", "codex*"] {
             assert!(names.contains(&expected), "{platform:?}: {names:?}");
         }
         assert!(
@@ -475,7 +477,7 @@ fn unix_rules_keep_their_names_and_raise_no_suffix_warning() {
 #[test]
 fn a_unix_path_is_still_reduced_to_its_file_name() {
     let app = AppMatch {
-        pattern: AppMatchPattern::Exact("/usr/bin/Signal-Desktop".to_string()),
+        pattern: AppMatchPattern::Exact("/usr/bin/Chat-Desktop".to_string()),
         include_child_processes: false,
         windows_service_name: None,
     };
@@ -487,7 +489,7 @@ fn a_unix_path_is_still_reduced_to_its_file_name() {
         &mut warnings,
     )
     .expect("Exact pattern must normalize successfully");
-    assert_eq!(result.pattern.as_str(), "signal-desktop");
+    assert_eq!(result.pattern.as_str(), "chat-desktop");
     assert!(warnings
         .iter()
         .all(|w| matches!(w, ValidationWarning::ProcessNameContainedPath { .. })));
@@ -590,6 +592,48 @@ fn process_name_glob_bare_star_is_rejected() {
         result,
         Err(ValidationError::AppGlobTooWide { .. })
     ));
+}
+
+/// The matcher drops the directory and `.exe` before comparing, so these
+/// name every process just as a bare `*` does.
+#[test]
+fn process_name_glob_that_reduces_to_a_bare_star_is_rejected() {
+    for pattern in [
+        r"C:\Games\*",
+        "/opt/*",
+        "*.exe",
+        "*.EXE",
+        "**",
+        r"C:\Games\**.exe",
+    ] {
+        for naming in [ExecutableNaming::WindowsExe, ExecutableNaming::AsNamed] {
+            let result = canonical_app_pattern(
+                pattern,
+                true,
+                naming,
+                &RuleId("r-1".to_string()),
+                &mut Vec::new(),
+            );
+            assert!(
+                matches!(result, Err(ValidationError::AppGlobTooWide { .. })),
+                "{pattern}: {result:?}"
+            );
+        }
+    }
+    // Something left after the reduction still narrows the match.
+    for pattern in [r"C:\Games\*game*.exe", "/opt/*torrent", r"C:\*\steam.exe"] {
+        assert!(
+            canonical_app_pattern(
+                pattern,
+                true,
+                ExecutableNaming::WindowsExe,
+                &RuleId("r-1".to_string()),
+                &mut Vec::new(),
+            )
+            .is_ok(),
+            "{pattern}"
+        );
+    }
 }
 
 #[test]
@@ -790,7 +834,7 @@ fn canonical_profile_rules_are_in_canonical_order() {
         RouteBehaviorMode::PreferPrimary,
         vec![
             app_rule("r-app", "firefox"),
-            ip_rule("r-ip", IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            ip_rule("r-ip", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
             domain_rule("r-dom", "example.com"),
         ],
         vec![],
@@ -818,10 +862,10 @@ fn canonical_profile_rules_are_in_canonical_order() {
 fn equivalent_configs_different_rule_order_produce_equal_profiles() {
     let rules_a = vec![
         domain_rule("r-1", "example.com"),
-        ip_rule("r-2", IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        ip_rule("r-2", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8))),
     ];
     let rules_b = vec![
-        ip_rule("r-2", IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        ip_rule("r-2", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8))),
         domain_rule("r-1", "example.com"),
     ];
 
@@ -985,4 +1029,139 @@ fn rule_with(id: &str, host: &str, enabled: bool) -> CanonicalRule {
         action: crate::canonical::RuleAction::Route,
         origin: None,
     }
+}
+
+// ── Rule cap ──────────────────────────────────────────────────────────────
+
+fn many_domain_rules(n: usize, prefix: &str) -> Vec<Rule> {
+    (0..n)
+        .map(|i| domain_rule(&format!("{prefix}-{i}"), &format!("{prefix}{i}.test")))
+        .collect()
+}
+
+#[test]
+fn a_book_at_the_rule_cap_is_accepted_and_one_past_it_is_refused() {
+    let cap = nrr_shared::rules_json::FREE_MAX_RULES;
+    let with = |n: usize| {
+        // Split across both routes: the cap is on the book, not a route.
+        let config = config_with_rules(
+            Some(primary()),
+            Some(secondary()),
+            RouteBehaviorMode::PreferPrimary,
+            many_domain_rules(n / 2, "p"),
+            many_domain_rules(n - n / 2, "s"),
+        );
+        validate_and_canonicalize(&config, HostPlatform::Windows)
+    };
+    assert!(with(cap).is_accepted());
+    match with(cap + 1) {
+        ValidationOutcome::Rejected { errors, .. } => assert_eq!(
+            errors,
+            vec![ValidationError::TooManyRules {
+                count: cap + 1,
+                limit: cap
+            }]
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn app_authored_rules_spend_their_own_allowance_not_the_users() {
+    let cap = nrr_shared::rules_json::FREE_MAX_RULES;
+    let auto_cap = crate::auto_rule_budget::MAX_AUTO_RULES;
+    let auto = |n: usize| {
+        many_domain_rules(n, "a")
+            .into_iter()
+            .map(|rule| Rule {
+                origin: Some(crate::RuleOrigin::auto(
+                    crate::AutoRuleReason::SiteCompanion,
+                    "site.example",
+                    "2026-01-01",
+                )),
+                ..rule
+            })
+            .collect::<Vec<_>>()
+    };
+    let with = |n_auto: usize| {
+        let config = config_with_rules(
+            Some(primary()),
+            Some(secondary()),
+            RouteBehaviorMode::PreferPrimary,
+            many_domain_rules(cap, "u"),
+            auto(n_auto),
+        );
+        validate_and_canonicalize(&config, HostPlatform::Windows)
+    };
+    assert!(with(auto_cap).is_accepted());
+    // A file on its own does not know the book it lands in, so the app's
+    // budget is the service write's to hold; a pre-budget export reads back.
+    assert!(with(auto_cap + 500).is_accepted());
+}
+
+/// The app's allowance is its own ceiling, not headroom left over by the
+/// user: a book with few rules of the user's still cannot carry more
+/// app-authored ones than their budget.
+#[test]
+fn app_authored_rules_are_capped_even_when_the_user_has_few() {
+    let auto_cap = crate::auto_rule_budget::MAX_AUTO_RULES;
+    let flags = |user: usize, auto: usize| {
+        std::iter::repeat_n(true, user).chain(std::iter::repeat_n(false, auto))
+    };
+    assert_eq!(rule_cap_excess(flags(10, auto_cap), Some(auto_cap)), None);
+    assert_eq!(
+        rule_cap_excess(flags(10, auto_cap + 1), Some(auto_cap)),
+        Some(RuleCapExcess::Auto {
+            count: auto_cap + 1,
+            limit: auto_cap
+        })
+    );
+    assert_eq!(
+        rule_cap_excess(flags(10, auto_cap + 1), None),
+        None,
+        "no book to hold the app's rules against"
+    );
+    let cap = nrr_shared::rules_json::FREE_MAX_RULES;
+    for auto_limit in [Some(auto_cap), None] {
+        assert_eq!(
+            rule_cap_excess(flags(cap + 1, auto_cap + 1), auto_limit),
+            Some(RuleCapExcess::User {
+                count: cap + 1,
+                limit: cap
+            }),
+            "the user's own cap is absolute and its overrun the one to report",
+        );
+    }
+}
+
+/// A book saved before the budget stays editable at its size, and cannot grow.
+#[test]
+fn the_app_allowance_is_the_budget_or_what_the_book_already_holds() {
+    use crate::auto_rule_budget::{auto_rule_allowance, MAX_AUTO_RULES};
+    assert_eq!(auto_rule_allowance(0), MAX_AUTO_RULES);
+    assert_eq!(auto_rule_allowance(1_999), MAX_AUTO_RULES);
+    assert_eq!(auto_rule_allowance(2_500), 2_500);
+    let auto = |n: usize| std::iter::repeat_n(false, n);
+    assert_eq!(
+        rule_cap_excess(auto(2_500), Some(auto_rule_allowance(2_500))),
+        None
+    );
+    assert_eq!(
+        rule_cap_excess(auto(2_400), Some(auto_rule_allowance(2_500))),
+        None
+    );
+    assert_eq!(
+        rule_cap_excess(auto(2_501), Some(auto_rule_allowance(2_500))),
+        Some(RuleCapExcess::Auto {
+            count: 2_501,
+            limit: 2_500
+        })
+    );
+    assert_eq!(
+        rule_cap_excess(auto(2_001), Some(auto_rule_allowance(1_999))),
+        Some(RuleCapExcess::Auto {
+            count: 2_001,
+            limit: MAX_AUTO_RULES
+        })
+    );
 }

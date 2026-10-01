@@ -1,12 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Cross-cutting integration tests for the apply pipeline.
 //!
-//! These exercise the full chain from `bootstrap`-style state +
-//! cache DB creation, through `PerSidApplyOrchestrator` construction
-//! with real producers, to the WFP plan executed against a
-//! `MockWindowsApi` backing. Each test covers one end-to-end
-//! scenario the per-module unit tests can't observe in isolation:
+//! These exercise the full chain from a migrated state DB, through
+//! `PerSidApplyOrchestrator` construction with real producers, to the WFP
+//! plan and the route table of a `MockWindowsApi`. Each test covers one
+//! end-to-end scenario the per-module unit tests can't observe in isolation:
 //!
+//! - a secondary route rule under an armed leak-guard, with the route
+//!   coordinator, kill-switch resolvers, route sync and flow reset wired as in
+//!   production, becomes a `/32` over the additional link, not a block,
 //! - install_for_sid lands rule-driven filters in the WFP layer with
 //!   correct per-user tagging,
 //! - recompile_for_sid swaps live filter sets when the active
@@ -22,28 +24,31 @@
 //! - re-installing the same active revision produces an idempotent
 //!   `Updated` audit record without filter churn.
 //!
-//! All tests run on a tempdir-backed SQLite + an in-memory mock WFP
-//! engine, so they pass on any host without administrator rights.
+//! All tests run on a tempdir-backed SQLite + in-memory mock WFP engine and
+//! route table, so they pass on any host without administrator rights.
 
-#![cfg(target_os = "windows")]
-
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 
 use nrr_domain::canonical::{
     CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
 };
 use nrr_domain::RuleId;
-use nrr_platform_windows::types::WfpAction;
-use nrr_platform_windows::wfp::WfpSession;
-use nrr_platform_windows::windows_api::{MockWindowsApi, WindowsApiPort};
+use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+use nrr_platform_api::fake_ip::stale_flows::{MockStaleFlowReset, StaleFlowReset};
+use nrr_platform_api::route_table::RouteTablePort;
+use nrr_platform_api::types::WfpAction;
+use nrr_platform_api::wfp::WfpSession;
+use nrr_platform_api::windows_api::{MockWindowsApi, WindowsApiPort};
 use nrr_service_runtime::fqdn_cache_lookup::{FqdnCacheLookup, MockFqdnCacheLookup};
+use nrr_service_runtime::machine_reading::MachineReading;
 use nrr_service_runtime::per_sid_orchestrator::{
     ActiveRulesSnapshot, PerSidApplyAudit, PerSidApplyAuditKind, PerSidApplyOrchestrator,
     RoutePolicySource, RulesProvider,
 };
 use nrr_service_runtime::production_handlers_misc::ProductionRoutePolicySource;
 use nrr_service_runtime::production_rules_provider::ProductionRulesProvider;
+use nrr_service_runtime::route_coordinator::{RuleScopeProvider, SecondaryRouteCoordinator};
 use nrr_shared::rules_json::{
     to_canonical_string, AddressMatchDto, CanonicalRulesJsonV1, RuleDto, RULES_JSON_SCHEMA_VERSION,
 };
@@ -195,9 +200,18 @@ fn rule_book(primary: Vec<CanonicalRule>, secondary: Vec<CanonicalRule>) -> Cano
 /// per-SID behavior mode that the orchestrator threads through
 /// `behavior_mode_for_codegen`.
 fn seed_route_binding(fx: &PipelineFixture, sid: &str, mode: BehaviorMode) {
-    let g = fx.state_conn.lock().unwrap();
-    let repo = RouteBindingsRepository::new(&g);
-    let record = RoutePolicyRecord {
+    store_route_policy(&fx.state_conn, sid, &route_policy_record(sid, mode));
+}
+
+fn store_route_policy(conn: &Mutex<Connection>, sid: &str, record: &RoutePolicyRecord) {
+    let g = conn.lock().unwrap();
+    RouteBindingsRepository::new(&g)
+        .update_for_sid(sid, record, 1_700_000_000)
+        .expect("seed binding");
+}
+
+fn route_policy_record(sid: &str, mode: BehaviorMode) -> RoutePolicyRecord {
+    RoutePolicyRecord {
         primary: Some(RouteBindingRecord {
             stable_id: format!("adapter-primary-{sid}"),
             display_name: "Primary Adapter".into(),
@@ -243,9 +257,7 @@ fn seed_route_binding(fx: &PipelineFixture, sid: &str, mode: BehaviorMode) {
         short_name_completion: false,
         short_name_suffix: String::new(),
         binding_source: BindingSource::UserAssigned,
-    };
-    repo.update_for_sid(sid, &record, 1_700_000_000)
-        .expect("seed binding");
+    }
 }
 
 fn applied_rules_snapshot(book: CanonicalRuleBook) -> ActiveRulesSnapshot {
@@ -253,6 +265,193 @@ fn applied_rules_snapshot(book: CanonicalRuleBook) -> ActiveRulesSnapshot {
         rule_book: book,
         behavior_mode: RouteBehaviorMode::PreferPrimary,
     }
+}
+
+// ── Route half ───────────────────────────────────────────────────────────────
+
+const ROUTE_SID: &str = "S-1-5-21-ROUTE";
+const PRIMARY_IFINDEX: u32 = 3;
+const SECONDARY_IFINDEX: u32 = 7;
+
+fn live_adapter(name: &str, index: u32, address: Ipv4Addr, gateway: Ipv4Addr) -> AdapterInfo {
+    AdapterInfo {
+        index,
+        adapter_name: name.into(),
+        description: format!("{name} adapter"),
+        friendly_name: name.into(),
+        mac: Some([0x02, 0, 0, 0, 0, index as u8]),
+        interface_type: InterfaceType::Ethernet,
+        oper_status: IfOperStatus::Up,
+        ipv4_addresses: vec![address],
+        ipv6_addresses: Vec::new(),
+        gateways: vec![gateway],
+    }
+}
+
+/// A secondary route rule under an armed leak-guard, with the route half
+/// wired the way the service wires it: the route coordinator owns the table,
+/// the kill-switch and fail-closed resolvers read the same coordinator, route
+/// sync runs before any destination pin, and a flow reset breaks sockets that
+/// predate the rule. Without the route half this rule's pin has no `/32` to
+/// hold traffic on the additional link, and the rule behaves as a block.
+#[test]
+fn a_secondary_route_rule_becomes_a_slash32_over_the_additional_link_not_a_block() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_connection(&dir.path().join("state.db")).expect("open state");
+    let runner = SqliteMigrationRunner::for_state_db(conn);
+    runner.run_pending_migrations().expect("migrate state");
+    let state_conn = Arc::new(Mutex::new(runner.into_connection()));
+
+    let api = Arc::new(MockWindowsApi::new());
+    api.set_adapter_infos(vec![
+        live_adapter(
+            "main-link",
+            PRIMARY_IFINDEX,
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(192, 0, 2, 1),
+        ),
+        live_adapter(
+            "tunnel",
+            SECONDARY_IFINDEX,
+            Ipv4Addr::new(198, 51, 100, 10),
+            Ipv4Addr::new(198, 51, 100, 1),
+        ),
+    ]);
+
+    let mut policy = route_policy_record(ROUTE_SID, BehaviorMode::PreferPrimary);
+    for (binding, name) in [
+        (policy.primary.as_mut(), "main-link"),
+        (policy.secondary.as_mut(), "tunnel"),
+    ] {
+        let binding = binding.expect("both roles bound");
+        binding.stable_id = format!("win-adapter:{name}");
+        binding.display_name = name.into();
+    }
+    policy.kill_switch_enabled = true;
+    policy.kill_switch_fail_closed = true;
+    policy.block_secondary_when_unavailable = true;
+    store_route_policy(&state_conn, ROUTE_SID, &policy);
+
+    let destination = Ipv4Addr::new(203, 0, 113, 10);
+    let rules = Arc::new(ScriptedRulesProvider::default());
+    rules.set(applied_rules_snapshot(rule_book(
+        vec![],
+        vec![exact_ip_rule("r-sec", destination)],
+    )));
+    let route_source: Arc<dyn RoutePolicySource> =
+        Arc::new(ProductionRoutePolicySource::new(Arc::clone(&state_conn)));
+    let fqdn_cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+
+    let coordinator = Arc::new(SecondaryRouteCoordinator::new(
+        Arc::clone(&api) as Arc<dyn RouteTablePort>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::clone(&route_source),
+        Arc::clone(&fqdn_cache),
+        Arc::new(|| false) as RuleScopeProvider,
+    ));
+
+    // The route pass records how many filters were live when it ran: `0`
+    // proves the `/32` went in before the first pin.
+    let filters_live_at_route_sync = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let route_sync = {
+        let coord = Arc::clone(&coordinator);
+        let api = Arc::clone(&api);
+        let seen = Arc::clone(&filters_live_at_route_sync);
+        Arc::new(move || {
+            seen.lock()
+                .unwrap()
+                .push(api.wfp_filters.lock().unwrap().len());
+            coord
+                .recompute_active(&[ROUTE_SID.to_string()])
+                .expect("route pass");
+        })
+    };
+    let flow_reset = Arc::new(MockStaleFlowReset::new());
+    let session = Arc::new(
+        WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>)
+            .expect("WfpSession::open over mock"),
+    );
+    let orchestrator = {
+        let (ks, v6, fc, machine) = (
+            Arc::clone(&coordinator),
+            Arc::clone(&coordinator),
+            Arc::clone(&coordinator),
+            Arc::clone(&coordinator),
+        );
+        PerSidApplyOrchestrator::new(
+            session,
+            route_source,
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            fqdn_cache,
+            Arc::new(RecordingAudit::default()) as Arc<dyn PerSidApplyAudit>,
+        )
+        .with_machine_reader(Arc::new(move || machine.read_machine()))
+        .with_kill_switch_resolver(Arc::new(move |sid: &str, m: &MachineReading| {
+            ks.kill_switch_exemptions(sid, m)
+        }))
+        .with_ipv6_guard_resolver(Arc::new(move |sid: &str, m: &MachineReading| {
+            v6.ipv6_guard(sid, m)
+        }))
+        .with_fail_closed_exemptions_resolver(Arc::new(move |sid: &str, m: &MachineReading| {
+            fc.fail_closed_exemptions(sid, m)
+        }))
+        .with_route_sync(route_sync)
+        .with_stale_flow_reset(Arc::clone(&flow_reset) as Arc<dyn StaleFlowReset>)
+    };
+
+    orchestrator.install_for_sid(ROUTE_SID).expect("install");
+
+    let routes = api.get_ip_forward_table().expect("route table");
+    let host_route = routes
+        .iter()
+        .find(|r| r.destination == IpAddr::V4(destination))
+        .unwrap_or_else(|| panic!("no route to {destination}: {routes:?}"));
+    assert_eq!(
+        host_route.prefix_length, 32,
+        "a host route, not a wider one"
+    );
+    assert_eq!(
+        host_route.interface_index, SECONDARY_IFINDEX,
+        "the rule's traffic leaves over the additional link"
+    );
+    assert_eq!(
+        host_route.next_hop,
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))
+    );
+
+    let filters = api.wfp_filters.lock().unwrap().clone();
+    let secondary_luid = api
+        .interface_luid_for_index(SECONDARY_IFINDEX)
+        .expect("secondary LUID");
+    let permit_on_secondary = filters
+        .iter()
+        .filter(|f| f.action == WfpAction::Permit && f.covers_v4(destination))
+        .find(|f| f.local_interface_luid == Some(secondary_luid))
+        .unwrap_or_else(|| panic!("no permit for {destination} over the additional link"));
+    let pins: Vec<_> = filters
+        .iter()
+        .filter(|f| f.action == WfpAction::Block && f.covers_v4(destination))
+        .collect();
+    assert!(
+        !pins.is_empty(),
+        "the leak-guard must be armed for this case"
+    );
+    for block in pins {
+        assert!(
+            block.weight < permit_on_secondary.weight,
+            "a pin must not outrank the additional link's permit: {block:?}"
+        );
+    }
+
+    assert_eq!(
+        *filters_live_at_route_sync.lock().unwrap(),
+        vec![0],
+        "the route pass ran once, before any filter reached the engine"
+    );
+    assert!(
+        flow_reset.queried().contains(&destination),
+        "sockets opened before the rule must be looked up for teardown"
+    );
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -315,9 +514,9 @@ fn recompile_for_sid_reflects_rule_changes() {
     // Book A → 3 filters.
     fx.rules_provider.set(applied_rules_snapshot(rule_book(
         vec![
-            exact_ip_rule("r-1", Ipv4Addr::new(10, 0, 0, 1)),
-            exact_ip_rule("r-2", Ipv4Addr::new(10, 0, 0, 2)),
-            exact_ip_rule("r-3", Ipv4Addr::new(10, 0, 0, 3)),
+            exact_ip_rule("r-1", Ipv4Addr::new(198, 51, 100, 1)),
+            exact_ip_rule("r-2", Ipv4Addr::new(198, 51, 100, 2)),
+            exact_ip_rule("r-3", Ipv4Addr::new(198, 51, 100, 3)),
         ],
         vec![],
     )));
@@ -408,7 +607,7 @@ fn per_sid_isolation_distinct_filter_ids() {
     seed_route_binding(&fx, "S-A", BehaviorMode::PreferPrimary);
     seed_route_binding(&fx, "S-B", BehaviorMode::PreferPrimary);
     fx.rules_provider.set(applied_rules_snapshot(rule_book(
-        vec![exact_ip_rule("r-1", Ipv4Addr::new(1, 1, 1, 1))],
+        vec![exact_ip_rule("r-1", Ipv4Addr::new(203, 0, 113, 21))],
         vec![],
     )));
 
@@ -443,7 +642,7 @@ fn second_install_for_same_sid_is_idempotent_and_audited_as_updated() {
     let fx = build_fixture();
     seed_route_binding(&fx, "S", BehaviorMode::PreferPrimary);
     fx.rules_provider.set(applied_rules_snapshot(rule_book(
-        vec![exact_ip_rule("r-1", Ipv4Addr::new(8, 8, 8, 8))],
+        vec![exact_ip_rule("r-1", Ipv4Addr::new(203, 0, 113, 22))],
         vec![],
     )));
 

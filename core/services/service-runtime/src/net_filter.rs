@@ -86,10 +86,10 @@ mod tests {
 
     #[test]
     fn public_and_private_are_routable() {
-        assert!(!is_non_routable_v4(&Ipv4Addr::new(23, 10, 20, 138)));
+        assert!(!is_non_routable_v4(&Ipv4Addr::new(203, 0, 113, 138)));
         assert!(!is_non_routable_v4(&Ipv4Addr::new(10, 0, 0, 1)));
         assert!(!is_non_routable_v4(&Ipv4Addr::new(192, 168, 1, 1)));
-        assert!(!is_non_routable_v4(&Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!is_non_routable_v4(&Ipv4Addr::new(198, 51, 100, 8)));
     }
 
     /// Unreachable space reaches every pinning site through this predicate.

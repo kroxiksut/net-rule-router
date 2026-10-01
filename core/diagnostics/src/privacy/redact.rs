@@ -10,15 +10,12 @@
 //! | `<redacted>`                  | Generic — field exists but is hidden  |
 //! | `<masked-ipv4>`               | IPv4 address hidden in default mode   |
 //! | `<masked-path>`               | Full process path hidden              |
-//! | `<diagnostic-mode-required>`  | Field needs explicit diagnostic mode  |
 //! | `<private-ipv4>`              | RFC-1918 / loopback address           |
 //! | `<public-ipv4>`               | Public IPv4, hidden in default mode   |
 //!
 //! # Golden rule: `PrivacyClass::SecretNeverLog`
 //!
 //! Any value tagged `SecretNeverLog` must **never** appear in any output.
-//! Use [`SecretNeverLog`] (defined in `secret.rs`) for values that must be
-//! denied at the type level.
 
 use std::net::Ipv4Addr;
 
@@ -29,7 +26,6 @@ use crate::privacy::mode::RedactionMode;
 pub const MARKER_REDACTED: &str = "<redacted>";
 pub const MARKER_MASKED_IPV4: &str = "<masked-ipv4>";
 pub const MARKER_MASKED_PATH: &str = "<masked-path>";
-pub const MARKER_DIAGNOSTIC_REQUIRED: &str = "<diagnostic-mode-required>";
 pub const MARKER_PRIVATE_IPV4: &str = "<private-ipv4>";
 pub const MARKER_PUBLIC_IPV4: &str = "<public-ipv4>";
 
@@ -143,7 +139,7 @@ fn extract_etld1(hostname: &str) -> Option<String> {
 /// | Mode          | Output                                      |
 /// |---------------|---------------------------------------------|
 /// | `Default`     | `<private-ipv4>` or `<public-ipv4>`         |
-/// | `Diagnostics` | Full dotted-decimal `"1.2.3.4"`             |
+/// | `Diagnostics` | Full dotted-decimal `"192.0.2.4"`             |
 /// | `DeveloperLocal` | Full dotted-decimal                     |
 #[must_use]
 pub fn redact_ipv4(ip: Ipv4Addr, mode: RedactionMode) -> Redacted<String> {
@@ -468,14 +464,14 @@ mod tests {
 
     #[test]
     fn ip_default_public_returns_marker() {
-        let r = redact_ipv4("8.8.8.8".parse().unwrap(), RedactionMode::Default);
+        let r = redact_ipv4("198.51.100.8".parse().unwrap(), RedactionMode::Default);
         assert_eq!(r, Redacted::Hidden(MARKER_PUBLIC_IPV4.into()));
     }
 
     #[test]
     fn ip_diagnostics_shows_full() {
-        let r = redact_ipv4("8.8.8.8".parse().unwrap(), RedactionMode::Diagnostics);
-        assert_eq!(r, Redacted::Value("8.8.8.8".into()));
+        let r = redact_ipv4("198.51.100.8".parse().unwrap(), RedactionMode::Diagnostics);
+        assert_eq!(r, Redacted::Value("198.51.100.8".into()));
     }
 
     #[test]
@@ -490,8 +486,8 @@ mod tests {
         assert!(is_private_ipv4("172.16.0.1".parse().unwrap()));
         assert!(is_private_ipv4("192.168.0.1".parse().unwrap()));
         assert!(is_private_ipv4("127.0.0.1".parse().unwrap()));
-        assert!(!is_private_ipv4("8.8.8.8".parse().unwrap()));
-        assert!(!is_private_ipv4("1.1.1.1".parse().unwrap()));
+        assert!(!is_private_ipv4("198.51.100.8".parse().unwrap()));
+        assert!(!is_private_ipv4("198.51.100.1".parse().unwrap()));
     }
 
     // ── Process path redaction ────────────────────────────────────────────────
@@ -552,14 +548,14 @@ mod tests {
 
     #[test]
     fn resolver_default_shows_category() {
-        let r = redact_resolver_source("dns", Some("8.8.8.8:53"), RedactionMode::Default);
+        let r = redact_resolver_source("dns", Some("198.51.100.8:53"), RedactionMode::Default);
         assert_eq!(r, Redacted::Value("dns".into()));
     }
 
     #[test]
     fn resolver_diagnostics_shows_detail() {
-        let r = redact_resolver_source("dns", Some("8.8.8.8:53"), RedactionMode::Diagnostics);
-        assert_eq!(r, Redacted::Value("8.8.8.8:53".into()));
+        let r = redact_resolver_source("dns", Some("198.51.100.8:53"), RedactionMode::Diagnostics);
+        assert_eq!(r, Redacted::Value("198.51.100.8:53".into()));
     }
 
     // ── Golden test: same data → same output regardless of path ──────────────
@@ -598,7 +594,6 @@ mod tests {
         assert_eq!(MARKER_REDACTED, "<redacted>");
         assert_eq!(MARKER_MASKED_IPV4, "<masked-ipv4>");
         assert_eq!(MARKER_MASKED_PATH, "<masked-path>");
-        assert_eq!(MARKER_DIAGNOSTIC_REQUIRED, "<diagnostic-mode-required>");
         assert_eq!(MARKER_PRIVATE_IPV4, "<private-ipv4>");
         assert_eq!(MARKER_PUBLIC_IPV4, "<public-ipv4>");
     }

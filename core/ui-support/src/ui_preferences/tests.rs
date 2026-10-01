@@ -87,8 +87,8 @@ use super::{
     declared_schema_version, format_preferences, parse_preferences, preferred_available_language,
     without_expired_parked_intents, ForwardCompat, SystemFontFamily, UiPreferences,
     UiPreferencesStore, ADMIN_AUTO_REVOKE_MAX_MINUTES, ADMIN_AUTO_REVOKE_MIN_MINUTES,
-    CURRENT_UI_PREFS_SCHEMA_VERSION, LEGACY_PREFERENCES_FILE_NAMES, MAX_STORED_JSON_BLOB_BYTES,
-    MAX_STORED_STRING_BYTES, SETTINGS_AUTOSAVE_MIN_SECS, STABLE_PREFERENCES_FILE_NAME,
+    CURRENT_UI_PREFS_SCHEMA_VERSION, MAX_STORED_JSON_BLOB_BYTES, MAX_STORED_STRING_BYTES,
+    SETTINGS_AUTOSAVE_MIN_SECS,
 };
 use nrr_shared::{
     AppSection, RouteBehaviorMode, RulesEnabledFilter, RulesFileChangeBehavior, RulesTypeFilter,
@@ -335,10 +335,6 @@ fn save_then_load_roundtrip_is_stable() {
         last_loaded_path_secondary: None,
         auto_open_on_launch_path_primary: Some(r"C:\rules_primary.txt".to_string()),
         auto_open_on_launch_path_secondary: None,
-        last_file_synced_revision_id_primary: Some("rev-abc-123".to_string()),
-        last_file_synced_revision_id_secondary: None,
-        last_file_synced_hash_primary: Some("deadbeef".repeat(8)),
-        last_file_synced_hash_secondary: None,
         // Exercise both serialise paths for the UAC decline state.
         service_install_uac_declined_at_epoch: Some(1_700_000_123),
         service_install_uac_declined_count: 2,
@@ -348,6 +344,9 @@ fn save_then_load_roundtrip_is_stable() {
         import_only_active: false,
         compat_banner_mode: "always".to_string(),
         update_page_url: "https://example.test/releases".to_string(),
+        update_check_enabled: false,
+        update_check_interval_days: 30,
+        dismissed_update_version: "9.9.9".to_string(),
         show_bundled_presets: false,
         // Non-default path (with spaces + backslashes) so the round-trip
         // proves the user-owned rule-set folder persists.
@@ -363,7 +362,7 @@ fn save_then_load_roundtrip_is_stable() {
         forward_compat: ForwardCompat::default(),
         // Non-default value so the round-trip proves the VPN-split
         // banner ack persists.
-        secondary_split_ack_adapter_name: "SwiftVPN 3.0".to_string(),
+        secondary_split_ack_adapter_name: "ExampleVPN 3.0".to_string(),
         // Non-default values so the round-trip proves the per-SID
         // policy mirrors persist across save/load. Subdomain coverage
         // defaults to `true`, so `false` is the non-default value this
@@ -405,7 +404,7 @@ fn save_then_load_roundtrip_is_stable() {
             .to_string(),
         // Non-empty signature so the round-trip proves the
         // notification-dismiss state persists across GUI restarts.
-        unenforced_apps_ack_signature: "citymap.exe|SwiftVPN 3.0.exe".to_string(),
+        unenforced_apps_ack_signature: "citymap.exe|ExampleVPN 3.0.exe".to_string(),
         // Non-empty so the round-trip proves a kept overlap pair survives
         // a GUI restart.
         rules_overlap_keep_signature: "secondary:example.com>primary:api.example.com".to_string(),
@@ -590,33 +589,11 @@ fn legacy_high_contrast_flag_upgrades_theme_mode() {
 }
 
 #[test]
-fn legacy_file_is_migrated_to_stable_file_name() {
-    let dir_handle = test_dir("migration-dir");
-    let dir = dir_handle.path();
-    let store = UiPreferencesStore {
-        path: dir.join(STABLE_PREFERENCES_FILE_NAME),
-        legacy_paths: vec![dir.join(LEGACY_PREFERENCES_FILE_NAMES[0])],
-        is_profile_persistent: true,
-    };
-    let legacy_payload = "theme_mode=light\nlanguage=en\nroute_primary_label=Primary\nroute_secondary_label=Secondary\n";
-    fs::write(&store.legacy_paths[0], legacy_payload)
-        .unwrap_or_else(|error| panic!("legacy file write should succeed: {error}"));
-
-    let loaded = store
-        .load()
-        .unwrap_or_else(|error| panic!("load should migrate and succeed: {error}"));
-    assert_eq!(loaded.theme_mode, ThemeMode::Light);
-    assert_eq!(loaded.language, "en");
-    assert!(store.path.exists());
-    assert!(!store.legacy_paths[0].exists());
-}
-
-#[test]
 fn schema_version_constant_is_current() {
     // Each schema bump is additive: older files load with the new
     // fields defaulted via the "missing key → default" path in
     // `parse_preferences`.
-    assert_eq!(CURRENT_UI_PREFS_SCHEMA_VERSION, 11);
+    assert_eq!(CURRENT_UI_PREFS_SCHEMA_VERSION, 12);
 }
 
 #[test]
@@ -664,6 +641,148 @@ fn route_labels_follow_the_chosen_language_not_the_system_one() {
 }
 
 #[test]
+fn a_file_that_names_its_language_never_asks_the_system() {
+    let asked = std::cell::Cell::new(0u32);
+    let probe = || {
+        asked.set(asked.get() + 1);
+        "en".to_string()
+    };
+    let parsed = super::parse_preferences_with("language=ru\ntheme_mode=dark\n", probe);
+    assert_eq!(asked.get(), 0);
+    assert_eq!(parsed.language, "ru");
+    assert_eq!(parsed.route_secondary_label, "Дополнительный");
+}
+
+#[test]
+fn a_file_without_a_language_asks_the_system_once() {
+    let asked = std::cell::Cell::new(0u32);
+    let probe = || {
+        asked.set(asked.get() + 1);
+        "ru".to_string()
+    };
+    let parsed = super::parse_preferences_with("theme_mode=dark\nroute_primary_label=Дом\n", probe);
+    assert_eq!(asked.get(), 1);
+    assert_eq!(parsed.language, "ru");
+    assert_eq!(parsed.route_primary_label, "Дом");
+    assert_eq!(parsed.route_secondary_label, "Дополнительный");
+}
+
+#[test]
+fn the_system_language_comes_from_the_port_unless_overridden() {
+    use nrr_platform_api::system_locale::SystemLocalePort;
+
+    struct Counting(std::sync::atomic::AtomicU32, Option<&'static str>);
+    impl SystemLocalePort for Counting {
+        fn ui_language_candidates(&self) -> Vec<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.1.map(str::to_string).into_iter().collect()
+        }
+    }
+    let calls = |port: &Counting| port.0.load(std::sync::atomic::Ordering::Relaxed);
+
+    let russian = Counting(Default::default(), Some("ru-RU"));
+    assert_eq!(
+        super::detect_system_language_with(None, Some(&russian)),
+        "ru"
+    );
+    assert_eq!(calls(&russian), 1);
+
+    // The product override outranks the OS and spares the probe.
+    let untouched = Counting(Default::default(), Some("ru-RU"));
+    assert_eq!(
+        super::detect_system_language_with(Some("en_US.UTF-8"), Some(&untouched)),
+        "en"
+    );
+    assert_eq!(calls(&untouched), 0);
+
+    // A host that cannot tell, or no probe at all, lands on English.
+    let silent = Counting(Default::default(), None);
+    assert_eq!(
+        super::detect_system_language_with(None, Some(&silent)),
+        "en"
+    );
+    assert_eq!(super::detect_system_language_with(None, None), "en");
+}
+
+/// A candidate list of one, standing for what a real port returns: on
+/// Windows, either the UI language or (only when that could not be read at
+/// all) the regional-format locale — never both.
+struct FixedCandidates(&'static [&'static str]);
+impl nrr_platform_api::system_locale::SystemLocalePort for FixedCandidates {
+    fn ui_language_candidates(&self) -> Vec<String> {
+        self.0.iter().map(|item| item.to_string()).collect()
+    }
+}
+
+#[test]
+fn an_untranslated_ui_language_falls_to_english_not_the_regional_format() {
+    // The Windows port never offers the regional-format locale alongside a
+    // readable UI language, so a single "de" candidate is what it looks
+    // like when the interface language is German but Windows' regional
+    // format is Russian: the owner's 29.09 decision is that the regional
+    // format must not stand in for the untranslated "de".
+    assert_eq!(
+        super::detect_system_language_with(None, Some(&FixedCandidates(&["de"]))),
+        "en"
+    );
+}
+
+#[test]
+fn a_translated_ui_language_is_used_as_is() {
+    assert_eq!(
+        super::detect_system_language_with(None, Some(&FixedCandidates(&["ru"]))),
+        "ru"
+    );
+}
+
+#[test]
+fn an_unreadable_ui_language_falls_to_the_regional_format() {
+    // Stands in for Windows when the UI language truly could not be read:
+    // the port's only candidate is then the regional-format locale, and
+    // that candidate is used exactly like any other.
+    assert_eq!(
+        super::detect_system_language_with(None, Some(&FixedCandidates(&["ru-RU"]))),
+        "ru"
+    );
+}
+
+#[test]
+fn a_linux_language_list_is_walked_to_the_first_translated_entry() {
+    // `LANGUAGE=de:ru:en` — German has no bundled translation, so the walk
+    // continues to Russian rather than stopping at the untranslated head or
+    // jumping straight to English.
+    assert_eq!(
+        super::detect_system_language_with(None, Some(&FixedCandidates(&["de", "ru", "en"]))),
+        "ru"
+    );
+}
+
+#[test]
+fn the_override_still_outranks_every_port_candidate() {
+    assert_eq!(
+        super::detect_system_language_with(Some("ru"), Some(&FixedCandidates(&["de", "en"]))),
+        "ru"
+    );
+}
+
+#[test]
+fn repeated_language_lookups_read_the_locale_catalog_once() {
+    use std::sync::atomic::Ordering;
+    // Whatever this process already cached, one more lookup settles it (if
+    // it had not already) and no further lookup re-reads or re-validates
+    // the locales directory.
+    let _ = super::preferred_available_language("ru");
+    let after_first = super::LOCALE_CATALOG_READS.load(Ordering::Relaxed);
+    let _ = super::preferred_available_language("de");
+    let _ = super::detect_system_language_with(None, Some(&FixedCandidates(&["fr"])));
+    let after_more = super::LOCALE_CATALOG_READS.load(Ordering::Relaxed);
+    assert_eq!(
+        after_more, after_first,
+        "the locale catalog must be read at most once per process"
+    );
+}
+
+#[test]
 fn a_language_no_catalog_carries_resolves_instead_of_being_stored() {
     assert_eq!(parse_preferences("language=zz\n").language, "en");
     assert_eq!(parse_preferences("language=ru-RU\n").language, "ru");
@@ -691,6 +810,29 @@ fn out_of_range_numbers_clamp_and_garbage_keeps_the_current_value() {
     assert_eq!(
         parsed.admin_auto_revoke_minutes,
         UiPreferences::default().admin_auto_revoke_minutes
+    );
+}
+
+#[test]
+fn a_stored_update_check_interval_snaps_to_an_offered_choice() {
+    assert_eq!(UiPreferences::default().update_check_interval_days, 14);
+    for (stored, read) in [
+        (0, 7),
+        (1, 7),
+        (7, 7),
+        (10, 7),
+        (14, 14),
+        (29, 14),
+        (30, 30),
+        (365, 30),
+    ] {
+        let parsed = parse_preferences(&format!("update_check_interval_days={stored}\n"));
+        assert_eq!(parsed.update_check_interval_days, read, "stored {stored}");
+    }
+    let parsed = parse_preferences("update_check_interval_days=weekly\n");
+    assert_eq!(
+        parsed.update_check_interval_days, 14,
+        "unparseable keeps the default"
     );
 }
 
@@ -726,16 +868,47 @@ fn every_stored_blob_passes_the_same_gate() {
     assert!(parsed.service_backed_mirror_json.is_empty());
 }
 
+/// Keys are added without a schema bump, so a build of the same version that
+/// predates a key must not erase it by saving over the file.
 #[test]
-fn an_unknown_key_in_a_current_file_is_dropped_not_carried() {
-    // Negative control for the carry above: at our own version an unknown
-    // key is the residue of a key we removed, and it must not live forever.
-    let content = format!(
-        "schema_version={CURRENT_UI_PREFS_SCHEMA_VERSION}\ntheme_mode=dark\nretired_key=1\n"
+fn an_unknown_key_in_a_current_file_survives_load_and_save() {
+    let (_dir, path) = test_path("same-version-unknown-key.conf");
+    fs::write(
+        &path,
+        format!(
+            "schema_version={CURRENT_UI_PREFS_SCHEMA_VERSION}\ntheme_mode=dark\n\
+             key_added_by_a_later_build=true\n"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("write: {e}"));
+    let store = UiPreferencesStore::for_path(path.clone());
+    let loaded = store.load().unwrap_or_else(|e| panic!("load: {e}"));
+    assert_eq!(loaded.forward_compat.newer_schema_version, None);
+    store.save(&loaded).unwrap_or_else(|e| panic!("save: {e}"));
+
+    let saved = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read: {e}"));
+    assert!(
+        saved.contains("key_added_by_a_later_build=true\n"),
+        "{saved}"
     );
-    let parsed = parse_preferences(&content);
-    assert_eq!(parsed.forward_compat, ForwardCompat::default());
-    assert!(!format_preferences(&parsed).contains("retired_key"));
+    assert!(saved.contains(&format!(
+        "schema_version={CURRENT_UI_PREFS_SCHEMA_VERSION}\n"
+    )));
+}
+
+/// Removing a key bumps the schema, so in an older file an unknown key is the
+/// residue of one, and it must not live forever.
+#[test]
+fn an_unknown_key_in_an_older_file_is_dropped_not_carried() {
+    let older = CURRENT_UI_PREFS_SCHEMA_VERSION - 1;
+    for content in [
+        format!("schema_version={older}\ntheme_mode=dark\nretired_key=1\n"),
+        "theme_mode=dark\nretired_key=1\n".to_string(),
+    ] {
+        let parsed = parse_preferences(&content);
+        assert_eq!(parsed.forward_compat, ForwardCompat::default());
+        assert!(!format_preferences(&parsed).contains("retired_key"));
+    }
 }
 
 #[test]
@@ -784,10 +957,6 @@ first_run_completed=true
     assert!(parsed.last_saved_path_secondary.is_none());
     assert!(parsed.auto_open_on_launch_path_primary.is_none());
     assert!(parsed.auto_open_on_launch_path_secondary.is_none());
-    assert!(parsed.last_file_synced_revision_id_primary.is_none());
-    assert!(parsed.last_file_synced_revision_id_secondary.is_none());
-    assert!(parsed.last_file_synced_hash_primary.is_none());
-    assert!(parsed.last_file_synced_hash_secondary.is_none());
 }
 
 /// Empty value parses as `None` (sentinel for "not recorded"),
@@ -1000,12 +1169,153 @@ fn a_gutted_primary_never_overwrites_a_good_backup() {
     );
 }
 
+fn with_trailing_keys(eula: u32) -> UiPreferences {
+    UiPreferences {
+        accepted_eula_version: eula,
+        first_run_completed: true,
+        service_intent_json: r#"{"intent":"keep"}"#.to_string(),
+        selected_primary_interface_id: "adapter-a".to_string(),
+        ..UiPreferences::default()
+    }
+}
+
+#[test]
+fn a_save_stopped_after_staging_leaves_the_old_primary() {
+    let (_dir, path) = test_path("stop-after-stage.conf");
+    let store = UiPreferencesStore::for_path(path.clone());
+    store.save(&with_trailing_keys(1)).expect("first save");
+    let before = fs::read(&path).expect("primary");
+
+    let _staged = store.stage(&with_trailing_keys(2)).expect("stage");
+
+    assert_eq!(fs::read(&path).expect("primary"), before);
+    assert_eq!(store.load().expect("load"), with_trailing_keys(1));
+}
+
+#[test]
+fn a_save_stopped_between_the_renames_leaves_a_whole_backup() {
+    let (_dir, path) = test_path("stop-between-renames.conf");
+    let store = UiPreferencesStore::for_path(path.clone());
+    store.save(&with_trailing_keys(1)).expect("first save");
+    let before = fs::read(&path).expect("primary");
+
+    let _staged = store.stage(&with_trailing_keys(2)).expect("stage");
+    store.retire_primary_to_backup();
+
+    assert!(!path.exists(), "the primary moved, it was not copied");
+    assert_eq!(
+        fs::read(path.with_extension("bak")).expect("backup"),
+        before,
+        "the backup is the old primary byte for byte, trailing keys included"
+    );
+    let reopened = UiPreferencesStore::for_path(path.clone());
+    assert_eq!(reopened.load().expect("load"), with_trailing_keys(1));
+}
+
+#[test]
+fn a_completed_save_keeps_the_previous_file_as_the_backup() {
+    let (_dir, path) = test_path("complete.conf");
+    let store = UiPreferencesStore::for_path(path.clone());
+    store.save(&with_trailing_keys(1)).expect("first save");
+    let first = fs::read(&path).expect("primary");
+    store.save(&with_trailing_keys(2)).expect("second save");
+
+    assert_eq!(fs::read(path.with_extension("bak")).expect("backup"), first);
+    assert_eq!(store.load().expect("load"), with_trailing_keys(2));
+}
+
+#[test]
+fn a_husk_primary_leaves_the_good_backup_byte_for_byte() {
+    let (_dir, path) = test_path("husk-keeps-bak.conf");
+    let store = UiPreferencesStore::for_path(path.clone());
+    store.save(&with_trailing_keys(1)).expect("first save");
+    store
+        .save(&with_trailing_keys(1))
+        .expect("second save writes the backup");
+    let good_backup = fs::read(path.with_extension("bak")).expect("backup");
+
+    fs::write(&path, "\0\0\0\0").expect("plant the husk");
+    store
+        .save(&with_trailing_keys(3))
+        .expect("save over the husk");
+
+    assert_eq!(
+        fs::read(path.with_extension("bak")).expect("backup"),
+        good_backup
+    );
+    assert_eq!(store.load().expect("load"), with_trailing_keys(3));
+}
+
 #[test]
 fn first_launch_with_no_files_still_defaults() {
     let (_dir, path) = test_path("fresh.conf");
     let store = UiPreferencesStore::for_path(path);
     let loaded = store.load().expect("fresh load");
     assert!(!loaded.first_run_completed);
+}
+
+/// A write error after the scratch file was created must not orphan it: the
+/// forced failure fires only after `File::create` succeeds, so a leftover
+/// here would be a real regression, not a creation that never happened.
+#[test]
+fn stage_removes_its_scratch_file_when_the_write_fails() {
+    let (_dir, path) = test_path("stage-write-fails.conf");
+    let store = UiPreferencesStore::for_path(path.clone());
+    let parent = path.parent().expect("parent").to_path_buf();
+
+    crate::ui_preferences::store::FORCE_NEXT_STAGE_WRITE_FAILURE.with(|flag| flag.set(true));
+    let result = store.stage(&UiPreferences::default());
+
+    assert!(result.is_err(), "the forced failure must surface");
+    let leftovers: Vec<_> = fs::read_dir(&parent)
+        .expect("read the scratch directory")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a failed stage must not leave a scratch file behind: {leftovers:?}"
+    );
+}
+
+/// `.tmp` scratch files older than the sweep floor are this store's own
+/// litter (a crash before `commit`, or a write error before the cleanup
+/// above existed) and must go; a fresh one — another writer's in-flight
+/// save — and files that are not this store's scratch shape must survive.
+#[test]
+fn save_sweeps_only_its_own_stale_scratch_files() {
+    let (_dir, path) = test_path("sweep.conf");
+    let store = UiPreferencesStore::for_path(path.clone());
+    fs::create_dir_all(path.parent().expect("parent")).expect("scratch dir");
+
+    let stale = path.with_extension("123-0.tmp");
+    let fresh = path.with_extension("456-0.tmp");
+    let unrelated = path.with_extension("bak");
+    for scratch in [&stale, &fresh, &unrelated] {
+        fs::write(scratch, b"leftover").expect("plant a file");
+    }
+    let far_past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    set_file_mtime(&stale, far_past);
+
+    store.save(&UiPreferences::default()).expect("save");
+
+    assert!(!stale.exists(), "a stale scratch file must be swept");
+    assert!(
+        fresh.exists(),
+        "a fresh scratch file is not this save's to remove"
+    );
+    assert!(
+        unrelated.exists(),
+        "a non-scratch sibling must never be touched"
+    );
+}
+
+fn set_file_mtime(path: &std::path::Path, when: std::time::SystemTime) {
+    let file = fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for mtime");
+    file.set_modified(when).expect("backdate mtime");
 }
 
 fn test_dir(prefix: &str) -> tempfile::TempDir {
@@ -1015,23 +1325,56 @@ fn test_dir(prefix: &str) -> tempfile::TempDir {
         .unwrap_or_else(|error| panic!("failed to create temp dir: {error}"))
 }
 
-/// A damaged protocol mask used to be masked into meaning: `128 & 0x7F` is
-/// zero, an empty mask makes the codegen emit no filter, and the kill
-/// switch then reads as ON while blocking nothing — and the value is seeded
-/// back into the service after its database is cleared.
+/// A protocol mask that blocks nothing must not be stored or masked into
+/// meaning (`128 & 0x7F` is zero, "Other" alone cuts nothing): the value is
+/// seeded back into the service after its database is cleared, and the service
+/// refuses such a mask.
 #[test]
 fn a_nonsense_protocol_mask_keeps_the_default_instead_of_disarming() {
     let default = UiPreferences::default().route_kill_switch_protocols;
-    for garbage in ["128", "256", "0", "4294967295", "-1", "seven"] {
+    assert_eq!(default, 127);
+    for garbage in ["0", "64", "128", "256", "4294967295", "-1", "seven", ""] {
         let parsed = parse_preferences(&format!("route_kill_switch_protocols={garbage}\n"));
         assert_eq!(
             parsed.route_kill_switch_protocols, default,
             "{garbage:?} must not redefine the protocol mask",
         );
     }
-    // A legitimate selection still round-trips.
-    let parsed = parse_preferences("route_kill_switch_protocols=5\n");
-    assert_eq!(parsed.route_kill_switch_protocols, 5);
+    for kept in ["1", "5", "127"] {
+        let parsed = parse_preferences(&format!("route_kill_switch_protocols={kept}\n"));
+        assert_eq!(parsed.route_kill_switch_protocols.to_string(), kept);
+    }
+}
+
+/// A slug off its list keeps the default: an underscore spelling of a shared-IP
+/// policy was stored as-is and refused by `route.policy.update` on the reseed.
+#[test]
+fn policy_and_period_slugs_off_their_lists_keep_the_default() {
+    let default = UiPreferences::default();
+    for garbage in ["majority_of_ip", "MAJORITY-OF-IP", "none", ""] {
+        let parsed = parse_preferences(&format!("route_shared_ip_policy={garbage}\n"));
+        assert_eq!(
+            parsed.route_shared_ip_policy, default.route_shared_ip_policy,
+            "{garbage:?}"
+        );
+    }
+    for garbage in ["yesterday", "all_time", ""] {
+        let parsed = parse_preferences(&format!("traffic_stats_period={garbage}\n"));
+        assert_eq!(
+            parsed.traffic_stats_period, default.traffic_stats_period,
+            "{garbage:?}"
+        );
+    }
+    for slug in super::SHARED_IP_POLICIES {
+        let parsed = parse_preferences(&format!("route_shared_ip_policy={slug}\n"));
+        assert_eq!(parsed.route_shared_ip_policy, slug);
+    }
+    for slug in super::TRAFFIC_STATS_PERIODS {
+        let parsed = parse_preferences(&format!("traffic_stats_period={slug}\n"));
+        assert_eq!(parsed.traffic_stats_period, slug);
+    }
+    assert!(super::SHARED_IP_POLICIES.contains(&default.route_shared_ip_policy.as_str()));
+    assert!(super::TRAFFIC_STATS_PERIODS.contains(&default.traffic_stats_period.as_str()));
 }
 
 #[test]

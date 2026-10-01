@@ -213,7 +213,7 @@ mod tests {
             scope.decide("assistant.example", None),
             FakeIpVerdict::FakeIp
         );
-        assert!(scope.decide("Www.Google.com.", None).is_fake_ip());
+        assert!(scope.decide("Www.Site.Example.", None).is_fake_ip());
         // A hypervisor's guest traffic is explicitly in scope.
         assert!(scope
             .decide("example.com", Some(AppGroupKind::Hypervisor))
@@ -256,11 +256,11 @@ mod tests {
     fn literals_and_local_names_keep_real_addresses() {
         let scope = FakeIpScope::enabled(Vec::<String>::new());
         assert_eq!(
-            scope.decide("23.10.20.78", None),
+            scope.decide("203.0.113.78", None),
             FakeIpVerdict::RealIp(RealIpReason::LiteralAddress)
         );
         assert_eq!(
-            scope.decide("2606:4700::1111", None),
+            scope.decide("2001:db8::1111", None),
             FakeIpVerdict::RealIp(RealIpReason::LiteralAddress)
         );
         for host in [

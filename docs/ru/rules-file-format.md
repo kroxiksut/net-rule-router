@@ -592,7 +592,7 @@ nrr_settings_export:
       user_confirmed: true
     secondary:
       system_id: "mac=11:22:33:44:55:66;ifindex=7"
-      user_label: "ВПН"
+      user_label: "VPN"
       user_confirmed: true
 
   rules_files:
@@ -657,8 +657,8 @@ nrr_settings_export:
 
 ```
 # NetRuleRouter пресет — версия 4
-# name: Корпоративные правила ВПН
-# description: Маршрутизирует корпоративный трафик через дополнительный интерфейс (ВПН)
+# name: Корпоративные правила VPN
+# description: Маршрутизирует корпоративный трафик через дополнительный интерфейс (VPN)
 # author: Иван Иванов
 # preset_version: 1
 ```

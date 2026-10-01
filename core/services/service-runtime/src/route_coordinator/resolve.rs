@@ -34,7 +34,8 @@ impl SecondaryRouteCoordinator {
                     msg_key = "route-secondary-luid-error",
                     sid = %sid,
                     ifindex = secondary.interface_index,
-                    "could not resolve secondary interface LUID for kill-switch; staying off (fail-open): {e:?}",
+                    error = %e,
+                    "could not resolve secondary interface LUID for kill-switch; staying off (fail-open)",
                 );
                 None
             }
@@ -106,10 +107,29 @@ impl SecondaryRouteCoordinator {
         (source_of(r.primary), source_of(r.secondary))
     }
 
+    /// One reading of the links and the route table, for a pass that asks
+    /// several of the questions below and must get one machine's answers.
+    pub fn read_machine(&self) -> MachineReading {
+        MachineReading {
+            routes: self.api.get_ip_forward_table(),
+            adapters: self.api.get_adapter_infos(),
+        }
+    }
+
     /// Resolve `sid`'s routing inputs (mode + primary/secondary targets) from
     /// its per-SID route policy and the live adapters. Logs WHY whenever a
     /// target can't be resolved, so "no route" is never a silent exit.
     pub(super) fn resolve(&self, sid: &str) -> RouteResolution {
+        self.resolve_from(sid, None)
+    }
+
+    /// [`Self::resolve`] against a pass's `reading`, or the live machine when
+    /// there is none.
+    pub(super) fn resolve_from(
+        &self,
+        sid: &str,
+        reading: Option<&MachineReading>,
+    ) -> RouteResolution {
         let Some(policy) = self.route_source.load_for_sid(sid) else {
             tracing::info!(
                 target: "nrr::route-coordinator",
@@ -128,7 +148,15 @@ impl SecondaryRouteCoordinator {
             };
         };
         let mode = route_behavior_mode(policy.mode);
-        let infos = match self.api.get_adapter_infos() {
+        let live;
+        let infos = match reading {
+            Some(reading) => reading.adapters.as_deref(),
+            None => {
+                live = self.api.get_adapter_infos();
+                live.as_deref()
+            }
+        };
+        let infos = match infos {
             Ok(i) => i,
             Err(e) => {
                 self.publish_enforcement_status(sid, "adapters-unreadable", "", Vec::new());
@@ -136,7 +164,8 @@ impl SecondaryRouteCoordinator {
                     target: "nrr::route-coordinator",
                     msg_key = "route-adapter-enum-failed",
                     sid = %sid,
-                    "adapter enumeration failed; cannot resolve route targets: {e:?}",
+                    error = %e,
+                    "adapter enumeration failed; cannot resolve route targets",
                 );
                 return RouteResolution {
                     mode,
@@ -147,7 +176,7 @@ impl SecondaryRouteCoordinator {
         };
         let secondary = match policy.secondary.as_ref() {
             Some(b) => {
-                let raw = self.resolve_binding_target(sid, b, &infos, "secondary");
+                let raw = self.resolve_binding_target(sid, b, infos, "secondary", reading);
                 self.gate_secondary_on_liveness(sid, raw)
             }
             None => {
@@ -157,7 +186,7 @@ impl SecondaryRouteCoordinator {
                     sid = %sid,
                     "NO SECONDARY ADAPTER BOUND — assign primary+secondary in 'Interfaces & routes' and apply (needs elevation). Without a secondary target nothing is routed out the secondary NIC.",
                 );
-                self.offer_unassigned_tunnel(sid, &infos);
+                self.offer_unassigned_tunnel(sid, infos);
                 None
             }
         };
@@ -166,15 +195,20 @@ impl SecondaryRouteCoordinator {
         let mut primary = policy
             .primary
             .as_ref()
-            .and_then(|b| self.resolve_binding_target(sid, b, &infos, "primary"));
+            .and_then(|b| self.resolve_binding_target(sid, b, infos, "primary", reading));
         // Footgun fix: the common setup binds ONLY the secondary (VPN). Without
         // a primary, mode A's counter-overlay can't be emitted and unmatched
         // traffic silently rides the VPN's redirect. Derive the real primary
         // from the OS default route so "direct" actually routes direct.
         if primary.is_none() {
             if let Some(sec) = secondary.as_ref() {
-                let routes = self.api.get_ip_forward_table().unwrap_or_default();
-                match derive_primary_target(&routes, sec.interface_index) {
+                let routes = self.routes_of(reading).unwrap_or_default();
+                let foreign_tunnels = super::exemptions::foreign_tunnel_indexes(
+                    infos,
+                    &[sec.interface_index],
+                    &routes,
+                );
+                match derive_primary_target(&routes, sec.interface_index, &foreign_tunnels) {
                     Some(derived) => {
                         tracing::info!(
                             target: "nrr::route-coordinator",

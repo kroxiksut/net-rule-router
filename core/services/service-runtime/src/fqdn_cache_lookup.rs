@@ -467,10 +467,7 @@ impl FqdnCacheLookup for SqliteFqdnCacheLookup {
         // A read error degrades to "no sharing seen" → the smart kill-switch
         // pins everything that pass (fail toward protection, never toward a
         // silent un-pin of the whole set).
-        guard
-            .shared_ip_census_ips()
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default()
+        census_or_empty(guard.shared_ip_census_ips())
     }
 
     fn shared_direct_ips_primary_ruled(&self) -> std::collections::HashSet<Ipv4Addr> {
@@ -480,10 +477,25 @@ impl FqdnCacheLookup for SqliteFqdnCacheLookup {
         };
         // Same degradation direction as above: on a read error nothing is
         // spared, so the failure mode is "too strict", never "silently leaky".
-        guard
-            .shared_ip_census_primary_ruled_ips()
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default()
+        census_or_empty(guard.shared_ip_census_primary_ruled_ips())
+    }
+}
+
+/// An unreadable census is an empty one — nothing spared — and says so.
+fn census_or_empty(
+    read: nrr_storage::StorageResult<Vec<Ipv4Addr>>,
+) -> std::collections::HashSet<Ipv4Addr> {
+    match read {
+        Ok(ips) => ips.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!(
+                target: "nrr::wfp-codegen",
+                msg_key = "fqdncache-shared-hosts-read-failed",
+                error = %e,
+                "shared-IP census read failed; sparing nothing this pass"
+            );
+            std::collections::HashSet::new()
+        }
     }
 }
 
@@ -564,14 +576,9 @@ impl FqdnCacheSnapshot {
             .shared_ip_direct_host_counts()
             .map(|rows| rows.into_iter().collect())
             .unwrap_or_default();
-        let shared_direct = guard
-            .shared_ip_census_ips()
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default();
-        let shared_direct_primary_ruled = guard
-            .shared_ip_census_primary_ruled_ips()
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default();
+        let shared_direct = census_or_empty(guard.shared_ip_census_ips());
+        let shared_direct_primary_ruled =
+            census_or_empty(guard.shared_ip_census_primary_ruled_ips());
         drop(guard);
 
         Self {
@@ -657,36 +664,36 @@ mod tests {
         let cache = MockFqdnCacheLookup::new();
         cache.set_ips(
             "Api.Example.COM",
-            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(2, 2, 2, 2)],
+            vec![Ipv4Addr::new(100, 64, 1, 1), Ipv4Addr::new(100, 64, 2, 2)],
         );
         // Canonicalised lookup (any casing).
         assert_eq!(
             cache.ips_for_hostname("api.example.com"),
-            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(2, 2, 2, 2)]
+            vec![Ipv4Addr::new(100, 64, 1, 1), Ipv4Addr::new(100, 64, 2, 2)]
         );
         assert_eq!(
             cache.ips_for_hostname("API.EXAMPLE.COM"),
-            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(2, 2, 2, 2)]
+            vec![Ipv4Addr::new(100, 64, 1, 1), Ipv4Addr::new(100, 64, 2, 2)]
         );
     }
 
     #[test]
     fn mock_set_ips_last_write_wins() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("x.test", vec![Ipv4Addr::new(1, 1, 1, 1)]);
-        cache.set_ips("x.test", vec![Ipv4Addr::new(2, 2, 2, 2)]);
+        cache.set_ips("x.test", vec![Ipv4Addr::new(100, 64, 1, 1)]);
+        cache.set_ips("x.test", vec![Ipv4Addr::new(100, 64, 2, 2)]);
         assert_eq!(
             cache.ips_for_hostname("x.test"),
-            vec![Ipv4Addr::new(2, 2, 2, 2)]
+            vec![Ipv4Addr::new(100, 64, 2, 2)]
         );
     }
 
     #[test]
     fn mock_hostnames_under_suffix_excludes_apex() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("example.com", vec![Ipv4Addr::new(1, 1, 1, 1)]);
-        cache.set_ips("www.example.com", vec![Ipv4Addr::new(2, 2, 2, 2)]);
-        cache.set_ips("api.example.com", vec![Ipv4Addr::new(3, 3, 3, 3)]);
+        cache.set_ips("example.com", vec![Ipv4Addr::new(100, 64, 1, 1)]);
+        cache.set_ips("www.example.com", vec![Ipv4Addr::new(100, 64, 2, 2)]);
+        cache.set_ips("api.example.com", vec![Ipv4Addr::new(100, 64, 3, 3)]);
         let listed = cache.hostnames_under_suffix("example.com", 16);
         assert_eq!(
             listed,
@@ -697,8 +704,8 @@ mod tests {
     #[test]
     fn suffix_domain_expansion_includes_the_cached_apex() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("example.com", vec![Ipv4Addr::new(1, 1, 1, 1)]);
-        cache.set_ips("www.example.com", vec![Ipv4Addr::new(2, 2, 2, 2)]);
+        cache.set_ips("example.com", vec![Ipv4Addr::new(100, 64, 1, 1)]);
+        cache.set_ips("www.example.com", vec![Ipv4Addr::new(100, 64, 2, 2)]);
         assert_eq!(
             cache.hostnames_for_suffix_domain("example.com", 16),
             vec!["example.com".to_string(), "www.example.com".to_string()]
@@ -718,7 +725,7 @@ mod tests {
         assert!(cache
             .hostnames_for_suffix_domain("example.com", 16)
             .is_empty());
-        cache.set_ips("www.example.com", vec![Ipv4Addr::new(2, 2, 2, 2)]);
+        cache.set_ips("www.example.com", vec![Ipv4Addr::new(100, 64, 2, 2)]);
         assert_eq!(
             cache.hostnames_for_suffix_domain("example.com", 16),
             vec!["www.example.com".to_string()]
@@ -728,11 +735,11 @@ mod tests {
     #[test]
     fn suffix_domain_expansion_keeps_the_apex_at_the_fan_out_cap() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("example.com", vec![Ipv4Addr::new(1, 1, 1, 1)]);
+        cache.set_ips("example.com", vec![Ipv4Addr::new(100, 64, 1, 1)]);
         for sub in ["a", "b", "c", "d"] {
             cache.set_ips(
                 &format!("{sub}.example.com"),
-                vec![Ipv4Addr::new(2, 2, 2, 2)],
+                vec![Ipv4Addr::new(100, 64, 2, 2)],
             );
         }
         let hosts = cache.hostnames_for_suffix_domain("example.com", 3);
@@ -745,7 +752,7 @@ mod tests {
     #[test]
     fn suffix_domain_expansion_zero_limit_short_circuits() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("example.com", vec![Ipv4Addr::new(1, 1, 1, 1)]);
+        cache.set_ips("example.com", vec![Ipv4Addr::new(100, 64, 1, 1)]);
         assert!(cache
             .hostnames_for_suffix_domain("example.com", 0)
             .is_empty());
@@ -755,7 +762,7 @@ mod tests {
     fn mock_hostnames_under_suffix_respects_limit() {
         let cache = MockFqdnCacheLookup::new();
         for sub in ["a", "b", "c", "d"] {
-            cache.set_ips(&format!("{sub}.test"), vec![Ipv4Addr::new(1, 1, 1, 1)]);
+            cache.set_ips(&format!("{sub}.test"), vec![Ipv4Addr::new(100, 64, 1, 1)]);
         }
         let listed = cache.hostnames_under_suffix("test", 2);
         assert_eq!(listed.len(), 2);
@@ -764,7 +771,7 @@ mod tests {
     #[test]
     fn mock_hostnames_under_suffix_case_insensitive() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("api.example.com", vec![Ipv4Addr::new(1, 1, 1, 1)]);
+        cache.set_ips("api.example.com", vec![Ipv4Addr::new(100, 64, 1, 1)]);
         let listed = cache.hostnames_under_suffix("EXAMPLE.COM", 16);
         assert_eq!(listed, vec!["api.example.com".to_string()]);
     }
@@ -772,14 +779,14 @@ mod tests {
     #[test]
     fn mock_hostnames_under_suffix_zero_limit_short_circuits() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("api.example.com", vec![Ipv4Addr::new(1, 1, 1, 1)]);
+        cache.set_ips("api.example.com", vec![Ipv4Addr::new(100, 64, 1, 1)]);
         assert!(cache.hostnames_under_suffix("example.com", 0).is_empty());
     }
 
     #[test]
     fn mock_clear_drops_all_entries() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("x.test", vec![Ipv4Addr::new(1, 1, 1, 1)]);
+        cache.set_ips("x.test", vec![Ipv4Addr::new(100, 64, 1, 1)]);
         cache.clear();
         assert!(cache.ips_for_hostname("x.test").is_empty());
     }
@@ -1070,8 +1077,8 @@ mod tests {
     fn a_rotated_out_address_is_withheld_while_the_confirmed_one_is_kept() {
         let store = confirmation_store();
         let now = SystemTime::now();
-        let rotated = Ipv4Addr::new(23, 10, 20, 165);
-        let current = Ipv4Addr::new(23, 10, 20, 147);
+        let rotated = Ipv4Addr::new(203, 0, 113, 165);
+        let current = Ipv4Addr::new(203, 0, 113, 147);
         let yesterday = now
             .checked_sub(Duration::from_secs(26 * 60 * 60))
             .expect("clock past the epoch");

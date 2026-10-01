@@ -188,7 +188,10 @@ impl ProductionRulesSnapshotProvider {
         // The stored JSON was validated on the write path; a decode
         // failure here means stale/corrupt data — surface the revision id
         // with no rows rather than erroring the whole read.
-        let Ok(dto) = nrr_shared::rules_json::from_canonical_string(&active.rules_json) else {
+        let Ok(dto) = crate::production_rules_provider::read_stored_rules(
+            &active.rules_json,
+            &active.revision_id,
+        ) else {
             return RulesListResponse {
                 rows: Vec::new(),
                 supported_rule_types: rule_type_slugs(),
@@ -286,27 +289,10 @@ impl RulesSnapshotProvider for ProductionRulesSnapshotProvider {
 /// an address and an app match shows the address; an app-only rule falls
 /// back to the application pattern).
 fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRowEntry {
-    use nrr_shared::rules_json::{AddressMatchDto, AppPatternDto};
-    let (rule_type, match_value) = if let Some(addr) = &dto.address_match {
-        match addr {
-            AddressMatchDto::ExactFqdn { value } => ("domain".to_string(), value.clone()),
-            AddressMatchDto::SuffixDomain { suffix } => {
-                ("domain".to_string(), format!("*.{suffix}"))
-            }
-            AddressMatchDto::Zone { name } => ("zone".to_string(), name.clone()),
-            AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
-                ("exact-ip".to_string(), address.clone())
-            }
-        }
-    } else if let Some(app) = &dto.app_match {
-        let value = match &app.pattern {
-            AppPatternDto::Exact { value } => value.clone(),
-            AppPatternDto::Glob { value } => value.clone(),
-        };
-        ("application".to_string(), value)
-    } else {
-        ("application".to_string(), String::new())
-    };
+    let (rule_type, match_value) = nrr_domain::rule_value_validation::wire_rule_values(dto)
+        .next()
+        .unwrap_or(("application", String::new()));
+    let rule_type = rule_type.to_string();
     let validation =
         nrr_domain::rule_value_validation::validate_rule_value(&rule_type, &match_value);
     let message_key = validation.message_key();
@@ -404,7 +390,7 @@ fn rule_type_slugs() -> Vec<String> {
 /// "no filters to install").
 pub struct ProductionRoutePolicySource {
     conn: Arc<Mutex<Connection>>,
-    /// Optional FQDN cache so DoH-resolver-list HOST entries (`dns.google`)
+    /// Optional FQDN cache so DoH-resolver-list HOST entries (`resolver.example`)
     /// resolve for the lockdown. Host entries contribute nothing without it;
     /// the seed carries literal addresses, so the lockdown still works by IP.
     fqdn_cache: Option<Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>>,
@@ -733,6 +719,7 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
         let written = repo
             .load_for_sid(sid)
             .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+        crate::short_name_suffixes::global_user_short_name_suffixes().publish(sid, &written);
         let providers = repo
             .load_link_provider_apps(sid, "secondary")
             .unwrap_or_default();
@@ -800,6 +787,7 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
             .map_err(|_| RoutePolicyWriteError::Storage("connection mutex poisoned".into()))?;
         let summary = nrr_storage::purge_principal_data(&mut conn, sid)
             .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+        crate::short_name_suffixes::global_user_short_name_suffixes().forget(sid);
         let rules_rows_deleted = if include_rules_history {
             nrr_storage::purge_principal_rules(&mut conn, sid)
                 .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?
@@ -828,6 +816,7 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
         for principal in &principals {
             let summary = nrr_storage::purge_principal_data(&mut conn, principal)
                 .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+            crate::short_name_suffixes::global_user_short_name_suffixes().forget(principal);
             total.rows_deleted += summary.rows_deleted;
             total.tables_touched = total.tables_touched.max(summary.tables_touched as u32);
             if include_rules_history {
@@ -1131,6 +1120,7 @@ fn now_ms() -> i64 {
 
 pub struct MonitoredAdaptersSnapshotProvider {
     api: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+    interface_rows: Arc<dyn nrr_platform_api::InterfaceRowsPort>,
     /// Last externally-observed address per adapter, keyed by the adapter's
     /// persistent id (adapter name when the id is empty). Snapshots are
     /// whole-table replacements, and a snapshot that did not probe carries no
@@ -1154,9 +1144,13 @@ struct CachedExternalAddress {
 }
 
 impl MonitoredAdaptersSnapshotProvider {
-    pub fn new(api: Arc<dyn nrr_platform_api::route_table::RouteTablePort>) -> Self {
+    pub fn new(
+        api: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+        interface_rows: Arc<dyn nrr_platform_api::InterfaceRowsPort>,
+    ) -> Self {
         Self {
             api,
+            interface_rows,
             last_external: Mutex::new(std::collections::HashMap::new()),
             address_recorder: None,
         }
@@ -1193,23 +1187,13 @@ impl MonitoredAdaptersSnapshotProvider {
                         local_ip: row.local_ip.clone(),
                     },
                 );
-                // Persist a FRESH resolution only (this
-                // branch is never reached for a replayed/cached one, which
-                // takes the `Some(entry) if ...` arm below). The join key is
-                // `row.windows_name` — the OS friendly interface name shown
-                // in `resolve_windows_name` — NOT `row.adapter_name`, which
-                // carries the low-level identity (a GUID on Windows, see
-                // `interface_manager::collect_windows_adapters`) and never
-                // matches the traffic ledger's key. The ledger keys on
-                // `MIB_IF_ROW2.Alias` (`nrr_platform_windows::interface_traffic`),
-                // which is the same OS-assigned friendly name `windows_name`
-                // resolves to, so this is an exact match, not a best-effort
-                // guess — in the rare case the two disagree (a rename race
-                // between the two enumerations), the row simply gets no
-                // address annotation this round rather than a wrong one.
+                // Only a FRESH resolution is persisted. Keyed by `row.name`,
+                // the OS friendly name the traffic ledger also keys on, never
+                // by `adapter_name` (a GUID on Windows); a rename race between
+                // the two enumerations leaves the row unannotated this round.
                 if let Some(recorder) = &self.address_recorder {
-                    if !row.windows_name.is_empty() && !row.local_ip.is_empty() {
-                        recorder.record(&row.windows_name, &row.local_ip, &ip, now_ms());
+                    if !row.name.is_empty() && !row.local_ip.is_empty() {
+                        recorder.record(&row.name, &row.local_ip, &ip, now_ms());
                     }
                 }
                 continue;
@@ -1222,10 +1206,10 @@ impl MonitoredAdaptersSnapshotProvider {
             // this adapter's. Only the external half: the local one is a fact
             // about the adapter in front of us.
             if let Some(recorder) = &self.address_recorder {
-                if !row.windows_name.is_empty() && !row.local_ip.is_empty() {
-                    if let Some(stored_local) = recorder.remembered_local_ip(&row.windows_name) {
+                if !row.name.is_empty() && !row.local_ip.is_empty() {
+                    if let Some(stored_local) = recorder.remembered_local_ip(&row.name) {
                         if stored_local != row.local_ip {
-                            recorder.forget_external(&row.windows_name, &row.local_ip, now_ms());
+                            recorder.forget_external(&row.name, &row.local_ip, now_ms());
                         }
                     }
                 }
@@ -1259,32 +1243,11 @@ impl MonitoredAdaptersSnapshotProvider {
                 Vec::new()
             }
         };
-        // Build the rich, GUI-shaped rows from a fresh live
-        // enumeration so the GUI "Interfaces & routes" list reflects
-        // runtime-appearing adapters (VPN up, USB dongle, VM NIC) on a
-        // plain "Refresh interfaces" — the service is the single source
-        // of truth for the adapter list. The external-address probe runs only
-        // when `probe_external_ip` says the user asked for it; every other
-        // snapshot path stays network-silent and returns immediately. The
-        // enrichment is the same builder the GUI cold-start path uses, so
-        // a refreshed row renders identically to a cold-start one.
-        // Each OS enumerates its own links; the rows and every judgement on
-        // them are the neutral ones. An OS with no enumeration of its own says
-        // so with the placeholder set rather than inventing adapters.
-        #[cfg(windows)]
-        let (source, mut rich_rows) =
-            nrr_platform_windows::interface_rows::collect_interfaces_rows(probe_external_ip);
-        #[cfg(target_os = "linux")]
-        let (source, mut rich_rows) =
-            nrr_platform_linux::interface_rows::collect_interfaces_rows(probe_external_ip);
-        #[cfg(not(any(windows, target_os = "linux")))]
-        let (source, mut rich_rows) = {
-            let _ = probe_external_ip;
-            (
-                nrr_platform_api::InterfacesDataSource::FallbackMock,
-                nrr_platform_api::fallback_rows(),
-            )
-        };
+        // A fresh enumeration on every snapshot, so a plain "Refresh
+        // interfaces" shows adapters that appeared at runtime (VPN up, USB
+        // dongle, VM NIC). The external-address probe runs only when the user
+        // asked for it.
+        let (source, mut rich_rows) = self.interface_rows.collect_rows(probe_external_ip);
         // Report the provenance the enumeration actually reached, not the one
         // this path hopes for. The rows are a deterministic PLACEHOLDER
         // whenever the live enumeration came back empty, and a placeholder
@@ -1300,6 +1263,8 @@ impl MonitoredAdaptersSnapshotProvider {
             );
         }
         self.fold_cached_external(&mut rich_rows);
+        // After the fold: a remembered external address is part of the score.
+        nrr_platform_api::interface_rows::assign_recommendations(&mut rich_rows);
         let rows = rich_rows
             .iter()
             .map(nrr_shared::ipc_payloads::InterfaceRowDto::from)
@@ -1371,7 +1336,7 @@ impl ProductionFailClosedProbe {
                 target: "nrr::stability",
                 msg_key = "prodmisc-failclosed-state",
                 fail_closed_active = new_state,
-                "secondary route fail-closed state",
+                "leak protection blocking traffic for the additional route",
             );
             *guard = Some(new_state);
         }
@@ -1396,7 +1361,7 @@ impl crate::ipc_handlers::providers::FailClosedStateProbe for ProductionFailClos
                     target: "nrr::stability",
                     msg_key = "prodmisc-route-bindings-load-failed",
                     error = %e,
-                    "RouteBindingsRepository::load_for_sid failed; suppressing Fail-Closed banner",
+                    "could not load route bindings; suppressing the leak protection banner",
                 );
                 return None;
             }
@@ -1457,7 +1422,7 @@ fn adapter_to_entry(
         adapter_name: info.adapter_name.clone(),
         ipv6_if_index: info.index,
         physical_address: mac_hex,
-        windows_name: info.adapter_name,
+        name: info.adapter_name,
         interface_description: info.description,
         interface_type: format!("{:?}", info.interface_type),
         oper_status: format!("{:?}", info.oper_status),

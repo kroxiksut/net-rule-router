@@ -235,113 +235,86 @@ Dialog {
     // Permissive partial-match regexes so that the validator allows
     // every intermediate keystroke (otherwise the user can't type the
     // first character — Qt rejects partial input as Invalid). Length
-    // ceilings are enforced separately via `maximumLength`. Strict
-    // semantic validation runs in `isMatchValueValid()` and gates the
-    // OK button.
+    // ceilings are enforced separately via `maximumLength`; whether the
+    // value can be saved is `isMatchValueValid()`.
     //
     // - `exact-ip` accepts hex digits, dots and colons up to 45 chars, the
-    //   longest IPv6 text form; the full form is checked in isMatchValueValid().
-    // - `zone` is a single DNS label — letters/digits/hyphens, no dots
-    //   (compound zones like `corp.internal` are rare; if needed, the
-    //   user can edit the rules file directly).
-    // - `domain` accepts any Unicode letter/digit (Cyrillic, IDN etc.)
-    //   plus dot, hyphen, and `*` for the suffix glob.
-    // - `application` uses Windows filename rules — every char except
-    //   OS-forbidden `< > : " / \ | ?` and control codes, so scripts
-    //   (.ps1/.bat/.sh) and Unicode names all pass.
+    //   longest IPv6 text form.
+    // - the rest cap the length only: `\p{L}` / `\u…` ranges silently block
+    //   Cyrillic input on some Qt builds.
     function matchValueRegex(ruleType) {
         if (ruleType === "exact-ip") {
             return new RegExp("^[0-9A-Fa-f.:]{0,45}$")
         }
-        // Permissive validators — only enforce the per-type length cap.
-        // Qt's `RegularExpressionValidator` rejects characters that don't
-        // match, which silently blocks Cyrillic / Unicode input on some
-        // Qt builds when `\p{L}` or `\u…` ranges are used. The strict
-        // semantic check in `isMatchValueValid()` still gates OK, so we
-        // can afford to accept anything intermediate here and keep the
-        // text field usable on every keyboard layout.
-        if (ruleType === "zone")        return new RegExp("^.{0,63}$")
-        if (ruleType === "domain")      return new RegExp("^.{0,253}$")
+        if (ruleType === "zone" || ruleType === "domain") return new RegExp("^.{0,253}$")
         if (ruleType === "application") return new RegExp("^.{0,260}$")
         return new RegExp("^.*$")
     }
     function matchValueMaxLength(ruleType) {
-        if (ruleType === "zone")        return 63
-        if (ruleType === "domain")      return 253
+        if (ruleType === "zone" || ruleType === "domain") return 253
         if (ruleType === "exact-ip")    return 45
         if (ruleType === "application") return 260
         return 260
     }
-    // An IPv6 literal, RFC 4291 text forms: eight groups, or fewer around one
-    // `::`, optionally ending in a dotted IPv4 that stands for two groups.
-    function isIpv6Literal(v) {
-        if (v.indexOf(":") < 0) return false
-        var head = v
-        var lastColon = v.lastIndexOf(":")
-        var tail = v.substring(lastColon + 1)
-        if (tail.indexOf(".") >= 0) {
-            if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(tail)) return false
-            var octets = tail.split(".")
-            for (var o = 0; o < 4; o += 1)
-                if (parseInt(octets[o], 10) > 255) return false
-            head = v.substring(0, lastColon + 1) + "0:0"
-        }
-        var halves = head.split("::")
-        if (halves.length > 2) return false
-        var groups = []
-        for (var h = 0; h < halves.length; h += 1)
-            if (halves[h] !== "") groups = groups.concat(halves[h].split(":"))
-        for (var g = 0; g < groups.length; g += 1)
-            if (!/^[0-9A-Fa-f]{1,4}$/.test(groups[g])) return false
-        return halves.length === 2 ? groups.length <= 7 : groups.length === 8
+    // The verdict on the value on screen, asked of the launcher: the one the
+    // rules table shows, which for a zone or domain is the service's own
+    // import pipeline. `key` names the value it answers, so the answer to an
+    // earlier keystroke never gates a later one.
+    property var _verdict: ({ key: "", status: "", messageKey: "", args: ({}) })
+    function _verdictKey(ruleType, raw) {
+        return String(ruleType || "") + "|" + String(raw || "").trim()
     }
-    // Strict semantic validation. Empty values are invalid; per-type
-    // rules below. First octet of an IPv4 must be ≥ 1 (0.x.x.x is
-    // reserved). Any octet > 255 is rejected. Returns true only when
-    // the value can be saved.
-    function isMatchValueValid(ruleType, raw) {
-        var v = String(raw || "").trim()
-        if (v === "") return false
-        if (ruleType === "exact-ip") {
-            if (v.indexOf(":") >= 0) return isIpv6Literal(v)
-            if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(v)) return false
-            var parts = v.split(".")
-            for (var i = 0; i < 4; i += 1) {
-                var n = parseInt(parts[i], 10)
-                if (isNaN(n)) return false
-                if (i === 0 && n < 1) return false
-                if (n < 0 || n > 255) return false
+    function _requestVerdict() {
+        var type = localRuleType
+        var value = String(localValue || "").trim()
+        if (value === "" || !root.rpc || !root.rpc.bridgeAvailable
+                || typeof root.rpc.bridge.rpcRuleValueVerdict !== "function") {
+            return
+        }
+        var key = _verdictKey(type, value)
+        var corr = root.rpc.bridge.rpcRuleValueVerdict(type, value)
+        root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            if (!ok) {
+                console.log("local.rule-value-verdict failed:", code, msg)
+                return
             }
-            return true
+            ruleDialog._verdict = {
+                key: key,
+                status: String((payload && payload.status) || ""),
+                messageKey: String((payload && payload["message-key"]) || ""),
+                args: (payload && payload.args) || ({})
+            }
+        })
+    }
+    onLocalValueChanged: _requestVerdict()
+    onLocalRuleTypeChanged: _requestVerdict()
+    function _verdictFor(ruleType, raw) {
+        return _verdict.key === _verdictKey(ruleType, raw) ? _verdict : null
+    }
+    // No answer yet counts as not saveable: OK waits for the verdict.
+    function isMatchValueValid(ruleType, raw) {
+        if (String(raw || "").trim() === "") return false
+        var verdict = _verdictFor(ruleType, raw)
+        return verdict !== null && verdict.status !== "error"
+    }
+    function isMatchValueRefused(ruleType, raw) {
+        var verdict = _verdictFor(ruleType, raw)
+        return verdict !== null && verdict.status === "error"
+    }
+    // The refusal in the rules table's words, `{name}` args filled in.
+    function refusalText() {
+        var fallback = root.tr("rules.validation.error", "Error — rule is inactive")
+        var verdict = _verdictFor(localRuleType, localValue)
+        if (verdict === null || verdict.messageKey === "") return fallback
+        var msg = root.tr(verdict.messageKey, fallback)
+        for (var k in verdict.args) {
+            msg = msg.split("{" + k + "}").join(String(verdict.args[k]))
         }
-        if (ruleType === "zone") {
-            // Strip optional leading dot so `.ru` and `ru` are both
-            // accepted forms of the same zone (docs/en/rules-file-format.md uses `.ru`).
-            if (v.charAt(0) === ".") v = v.substring(1)
-            // Accept any Unicode letter/digit as an IDN label, not just a
-            // hardcoded Latin+Greek+Cyrillic subset — `\u0080-\uFFFF`
-            // covers Tamil (இந்தியா), CJK (中国), Arabic, Devanagari, etc.
-            // Deliberately a SOFT filter (looser than the backend): the
-            // Rust SSOT (`rule_value_validation`) strictly validates IDN
-            // via UTS-46 (`idna`) on apply, so client pre-validation must
-            // never be stricter than the backend.
-            return /^[A-Za-z0-9\u0080-\uFFFF-]{1,63}$/.test(v)
-        }
-        if (ruleType === "domain") {
-            if (v.length > 253) return false
-            return /^(\*\.)?[A-Za-z0-9\u0080-\uFFFF-]+(\.[A-Za-z0-9\u0080-\uFFFF-]+)*$/.test(v)
-        }
-        if (ruleType === "application") {
-            return /^[^<>:"/\\|?\x00-\x1f]{1,260}$/.test(v)
-        }
-        return false
+        return msg
     }
     // Paste convenience: when the user pastes a full URL copied from a
-    // browser (e.g. `https://www.whatismyip.com/`), reduce it to the bare
-    // host so the value passes validation. Applies only to hostname-shaped
-    // types — `exact-ip` and `application` values are left untouched. Kept
-    // deliberately soft (the Rust `rule_value_validation` SSOT re-validates
-    // on apply); it acts only when the text actually looks like a URL, so
+    // browser, reduce it to the bare host so the value passes validation.
+    // Hostname-shaped types only, and only when the text looks like a URL, so
     // ordinary typing of a plain hostname is never disturbed.
     function normalizeHostInput(ruleType, raw) {
         if (ruleType !== "zone" && ruleType !== "domain"
@@ -366,9 +339,8 @@ Dialog {
 
     onAccepted: {
         if (!isMatchValueValid(localRuleType, localValue)) {
-            // Re-open the dialog: the inline-warning label is already
-            // visible and the OK button stays disabled. This branch only
-            // catches Enter-key submission against an invalid value.
+            // Enter-key submission of a value that cannot be saved (yet):
+            // stay on the form, where OK is disabled.
             open()
             return
         }
@@ -437,8 +409,8 @@ Dialog {
             placeholderText: root.uiRevision >= 0
                 ? ruleDialog.matchValuePlaceholder(ruleDialog.localRuleType)
                 : ""
-            // Length cap per rule type — `zone` 63, `domain` 253,
-            // `exact-ip` 45, `application` 260 (Windows MAX_PATH).
+            // Length cap per rule type — `zone`/`domain` 253, `exact-ip` 45,
+            // `application` 260.
             maximumLength: ruleDialog.matchValueMaxLength(ruleDialog.localRuleType)
             // Validator uses partial-match-friendly regex so each
             // keystroke is accepted (Qt rejects Invalid intermediate
@@ -469,7 +441,7 @@ Dialog {
             visible: ruleDialog.localRuleType === "application"
             ThemedButton {
                 theme: root.uiTheme
-                text: root.tr("rules.app-browse", "Browse…")
+                text: root.tr("action.browse", "Browse...")
                 onClicked: appExeFileDialog.open()
             }
             Item { Layout.fillWidth: true }
@@ -560,20 +532,16 @@ Dialog {
                 matchValueField.text = checked ? ("*." + bare) : bare
             }
         }
-        // Inline validation message — visible only when the field has
-        // text but fails the strict per-type check. Blank value is
-        // simply "incomplete" and not flagged as an error.
+        // Why the value cannot be saved, in the rules table's words. A blank
+        // value is incomplete, not wrong.
         Label {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
             color: root.uiTheme.colorDanger
             font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
             visible: ruleDialog.localValue !== ""
-                && !ruleDialog.isMatchValueValid(ruleDialog.localRuleType, ruleDialog.localValue)
-            text: root.uiRevision >= 0
-                ? root.tr("rules.validation.match-value-invalid." + ruleDialog.localRuleType,
-                    root.tr("rules.validation.error", "Invalid value"))
-                : ""
+                && ruleDialog.isMatchValueRefused(ruleDialog.localRuleType, ruleDialog.localValue)
+            text: root.uiRevision >= 0 ? ruleDialog.refusalText() : ""
         }
         Label { text: root.tr("label.target-route", "Target route"); color: root.textColor }
         ThemedComboBox {

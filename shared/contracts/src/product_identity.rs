@@ -24,19 +24,37 @@
 //! be changed after the first release, so it is chosen before the first macOS
 //! build and added here — not guessed now.
 
+// The one place the literals are spelled; `concat!` needs literal tokens, so
+// the derived constants below take them through these macros.
+macro_rules! name {
+    () => {
+        "NetRuleRouter"
+    };
+}
+macro_rules! name_unix {
+    () => {
+        "netrulerouter"
+    };
+}
+macro_rules! tagline {
+    () => {
+        "Network Policy Manager"
+    };
+}
+
 // ── The three spellings ──────────────────────────────────────────────────────
 
 /// Canonical product name. Windows SCM service name, display names, and the
 /// `%ProgramData%` / `Application Support` directory leaf.
-pub const PRODUCT_NAME: &str = "NetRuleRouter";
+pub const PRODUCT_NAME: &str = name!();
 
 /// Unix spelling. systemd unit stem, `/etc` + `/var/lib` directory leaf,
 /// package names, and the GUI executable name on Unix.
-pub const PRODUCT_NAME_UNIX: &str = "netrulerouter";
+pub const PRODUCT_NAME_UNIX: &str = name_unix!();
 
 /// One-line product descriptor appended to display names. Not a name in its
 /// own right — never used to build a path or an identifier.
-pub const PRODUCT_TAGLINE: &str = "Network Policy Manager";
+pub const PRODUCT_TAGLINE: &str = tagline!();
 
 // ── Derived service identity ─────────────────────────────────────────────────
 
@@ -48,7 +66,7 @@ pub const WINDOWS_SERVICE_NAME: &str = PRODUCT_NAME;
 /// Services MMC display name on Windows and the systemd unit `Description=` on
 /// Linux. One line, one declaration — a unit whose description drifts from the
 /// Windows display name is two products as far as an operator is concerned.
-pub const SERVICE_DISPLAY_NAME: &str = "NetRuleRouter — Network Policy Manager";
+pub const SERVICE_DISPLAY_NAME: &str = concat!(name!(), " — ", tagline!());
 
 /// Display name shown in the Services MMC console. Spelled separately from
 /// [`SERVICE_DISPLAY_NAME`] only because callers name the Windows concept.
@@ -56,18 +74,36 @@ pub const WINDOWS_SERVICE_DISPLAY_NAME: &str = SERVICE_DISPLAY_NAME;
 
 /// Description shown in the Services MMC console. Plain English: the service
 /// is an operator-facing surface and is not localised.
-pub const WINDOWS_SERVICE_DESCRIPTION: &str =
-    "Applies and enforces NetRuleRouter routing policy across configured \
+pub const WINDOWS_SERVICE_DESCRIPTION: &str = concat!(
+    "Applies and enforces ",
+    name!(),
+    " routing policy across configured \
      Windows network interfaces. Maintains the rule cache, decision \
      audit trail, and fail-closed enforcement when configured. Required \
-     for the GUI/tray to apply policy changes.";
+     for the GUI/tray to apply policy changes."
+);
 
 /// Event Log source registered during install.
 pub const WINDOWS_EVENT_SOURCE_NAME: &str = PRODUCT_NAME;
 
 /// systemd unit file name. The stem is the unix spelling; the suffix is
 /// systemd's, not ours.
-pub const SYSTEMD_UNIT_NAME: &str = "netrulerouter.service";
+pub const SYSTEMD_UNIT_NAME: &str = concat!(name_unix!(), ".service");
+
+/// Name of the fake-IP TUN adapter. Linux caps interface names at 15 bytes
+/// (`IFNAMSIZ` - 1).
+pub const TUN_ADAPTER_NAME: &str = PRODUCT_NAME;
+
+/// Autostart `.desktop` basename of the tray on Unix.
+pub const TRAY_DESKTOP_FILE_NAME: &str = concat!(name_unix!(), "-tray.desktop");
+
+/// polkit action file name.
+pub const POLKIT_ACTIONS_FILE_NAME: &str = concat!(name_unix!(), ".policy");
+
+/// Path of a named pipe under the product's own pipe namespace on Windows.
+pub fn windows_pipe_path(leaf: &str) -> String {
+    format!(r"\\.\pipe\{PRODUCT_NAME}\{leaf}")
+}
 
 // ── Executable names by role ─────────────────────────────────────────────────
 
@@ -150,6 +186,34 @@ mod tests {
     #[test]
     fn systemd_unit_name_derives_from_the_unix_spelling() {
         assert_eq!(SYSTEMD_UNIT_NAME, format!("{PRODUCT_NAME_UNIX}.service"));
+    }
+
+    #[test]
+    fn derived_names_keep_their_external_spelling() {
+        assert_eq!(SYSTEMD_UNIT_NAME, "netrulerouter.service");
+        assert_eq!(TRAY_DESKTOP_FILE_NAME, "netrulerouter-tray.desktop");
+        assert_eq!(POLKIT_ACTIONS_FILE_NAME, "netrulerouter.policy");
+        assert_eq!(TUN_ADAPTER_NAME, "NetRuleRouter");
+        assert!(TUN_ADAPTER_NAME.len() <= 15, "IFNAMSIZ - 1");
+        assert_eq!(
+            SERVICE_DISPLAY_NAME,
+            "NetRuleRouter — Network Policy Manager"
+        );
+        assert_eq!(
+            WINDOWS_SERVICE_DESCRIPTION,
+            "Applies and enforces NetRuleRouter routing policy across configured \
+             Windows network interfaces. Maintains the rule cache, decision \
+             audit trail, and fail-closed enforcement when configured. Required \
+             for the GUI/tray to apply policy changes."
+        );
+    }
+
+    #[test]
+    fn pipe_path_sits_under_the_product_namespace() {
+        assert_eq!(
+            windows_pipe_path("broker-42-aa"),
+            r"\\.\pipe\NetRuleRouter\broker-42-aa"
+        );
     }
 
     #[test]

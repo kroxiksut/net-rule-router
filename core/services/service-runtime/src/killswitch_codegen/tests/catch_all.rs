@@ -267,7 +267,7 @@ fn catch_all_emits_exemptions_and_block() {
         pkt.iter()
             .filter(|f| f.action == WfpAction::Block)
             .all(|f| f.ip_protocol.is_some()),
-        "16.HW-0716: no protocol-agnostic packet block-all"
+        "no protocol-agnostic packet block-all"
     );
 }
 

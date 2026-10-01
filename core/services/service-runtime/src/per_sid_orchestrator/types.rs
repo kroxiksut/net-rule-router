@@ -50,7 +50,7 @@ pub struct PerSidPolicySnapshot {
     /// (default, "smart"): IPs the shared-IP census has seen on direct
     /// (non-rule) hosts are EXCLUDED from the kill-switch per-IP pin/block set
     /// — blocking a secondary-routed CDN address must not cut an innocent
-    /// co-tenant site (e.g. gemini/video-site share Google front-end IPs with
+    /// co-tenant site (e.g. ai-site/video-site share CDN front-end IPs with
     /// www.search.example; strict pinning killed search.example in every browser).
     /// `true` ("strict"): pin every shared IP regardless of co-tenancy. Routing
     /// (`/32` while the secondary is up) stays governed by `shared_ip_policy`.
@@ -58,7 +58,7 @@ pub struct PerSidPolicySnapshot {
     /// Mode-A (`PreferPrimary`) coverage strategy for a routed domain's
     /// un-seeded edge IP. `FailClosedUnknown` (default) escalates
     /// the per-IP fail-closed to the catch-all so the rotating-IP leak
-    /// (e.g. chatgpt over primary) cannot happen; `PerIp` keeps
+    /// (e.g. assistant over primary) cannot happen; `PerIp` keeps
     /// per-IP-only pinning. Consulted only in `PreferPrimary` + fail-closed.
     pub mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy,
     /// exe paths of the secondary binding's **link-provider
@@ -110,7 +110,7 @@ pub struct PerSidPolicySnapshot {
 pub struct PerSidBinding {
     pub stable_id: String,
     /// User-facing adapter name stored with the binding (e.g.
-    /// "swiftvpn VPN OpenVPN Adapter"). Used by the route coordinator to
+    /// "examplevpn VPN OpenVPN Adapter"). Used by the route coordinator to
     /// auto-heal when `stable_id` (a GUID) goes stale after a secondary adapter reinstall —
     /// the friendly name survives the GUID change.
     pub display_name: String,

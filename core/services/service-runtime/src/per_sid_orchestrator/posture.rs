@@ -32,6 +32,9 @@ pub(super) struct PostureLogLatch {
     last_logged_at: Instant,
 }
 
+/// `(kept, dropped, app_covered)` of one pin-set trim.
+pub(super) type PinTrimCounts = (usize, usize, usize);
+
 /// How often an unchanged, persisting posture re-announces itself at full
 /// level (see [`PostureLogEvent::Heartbeat`]). A long block-all session that
 /// never changes state would otherwise go from two WARN lines straight to
@@ -146,7 +149,7 @@ impl PerSidApplyOrchestrator {
                 msg_key = "persid-posture-dns-flush-failed",
                 sid,
                 block_all_armed = armed,
-                error = ?e,
+                error = %e,
                 "OS DNS resolver cache flush failed on kill-switch block-all transition — names the OS already cached stay invisible to the DNS observer until their TTL expires",
             ),
         }
@@ -200,6 +203,30 @@ impl PerSidApplyOrchestrator {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(sid);
+        self.pin_trim_log_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+    }
+
+    /// Whether this trim differs from the last one logged for `sid`; `None`
+    /// (nothing trimmed) re-arms it.
+    pub(super) fn pin_trim_changed(&self, sid: &str, counts: Option<PinTrimCounts>) -> bool {
+        let mut g = self
+            .pin_trim_log_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match counts {
+            None => {
+                g.remove(sid);
+                false
+            }
+            Some(counts) if g.get(sid) == Some(&counts) => false,
+            Some(counts) => {
+                g.insert(sid.to_string(), counts);
+                true
+            }
+        }
     }
 
     /// Tell everyone else when somebody arms a cut that reaches them.

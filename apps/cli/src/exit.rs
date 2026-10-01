@@ -36,7 +36,9 @@ pub fn for_error(err: &ServiceControlError) -> u8 {
         ServiceControlError::NotInstalled => NOT_INSTALLED,
         ServiceControlError::AccessDenied => NEEDS_PRIVILEGE,
         ServiceControlError::Timeout { .. } => NOT_RESPONDING,
-        ServiceControlError::Unsupported { .. } => UNSUPPORTED,
+        // No service manager on this host: nothing to install, start or query.
+        ServiceControlError::Unsupported { .. }
+        | ServiceControlError::ManagerUnavailable { .. } => UNSUPPORTED,
         ServiceControlError::InvalidState { .. } | ServiceControlError::Mechanism { .. } => FAILED,
     }
 }
@@ -117,5 +119,16 @@ mod tests {
             }),
             USAGE
         );
+    }
+
+    /// A host without systemd must not send the user off to install a service
+    /// that may well be installed already.
+    #[test]
+    fn a_missing_service_manager_is_not_reported_as_not_installed() {
+        let code = for_error(&ServiceControlError::ManagerUnavailable {
+            detail: "Failed to connect to bus".into(),
+        });
+        assert_eq!(code, UNSUPPORTED);
+        assert_ne!(code, NOT_INSTALLED);
     }
 }

@@ -155,10 +155,34 @@ pub fn first_unsupported(
     book: &CanonicalRuleBook,
     support: RuleShapeSupport,
 ) -> Option<(&CanonicalRule, UnsupportedShapeReason)> {
-    book.primary
+    first_unsupported_new(book, None, support)
+}
+
+/// [`first_unsupported`] over the rules `book` adds or changes relative to
+/// `carried` (the book in force). A rule carried over unchanged is already
+/// skipped by enforcement and listed as a conflict; refusing the whole book
+/// over it would freeze every edit, and support differs per OS, so a book
+/// from another platform or a backup would hit exactly that.
+#[must_use]
+pub fn first_unsupported_new<'a>(
+    book: &'a CanonicalRuleBook,
+    carried: Option<&CanonicalRuleBook>,
+    support: RuleShapeSupport,
+) -> Option<(&'a CanonicalRule, UnsupportedShapeReason)> {
+    let (carried_primary, carried_secondary): (&[CanonicalRule], &[CanonicalRule]) =
+        carried.map_or((&[], &[]), |c| (c.primary.rules(), c.secondary.rules()));
+    let primary = book
+        .primary
         .rules()
         .iter()
-        .chain(book.secondary.rules())
+        .filter(|r| !carried_primary.contains(r));
+    let secondary = book
+        .secondary
+        .rules()
+        .iter()
+        .filter(|r| !carried_secondary.contains(r));
+    primary
+        .chain(secondary)
         .find_map(|rule| match rule_verdict(rule, support) {
             ShapeVerdict::Supported => None,
             ShapeVerdict::Unsupported { reason } => Some((rule, reason)),
@@ -322,5 +346,38 @@ mod tests {
             app_scoped_destination_route: true,
         };
         assert!(first_unsupported(&book, all).is_none());
+    }
+
+    #[test]
+    fn first_unsupported_new_spares_only_a_rule_carried_over_unchanged() {
+        let combined = rule("c", true, true, RuleAction::Block);
+        let carried = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![combined.clone()]),
+            secondary: CanonicalRuleSet::default(),
+        };
+        let added = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![
+                combined.clone(),
+                rule("n", true, false, RuleAction::Route),
+            ]),
+            secondary: CanonicalRuleSet::default(),
+        };
+        assert!(first_unsupported_new(&added, Some(&carried), RuleShapeSupport::NONE).is_none());
+
+        let mut edited = combined.clone();
+        edited.enabled = false;
+        let changed = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![edited]),
+            secondary: CanonicalRuleSet::default(),
+        };
+        assert!(first_unsupported_new(&changed, Some(&carried), RuleShapeSupport::NONE).is_some());
+
+        // Moved to the other route: a new rule there.
+        let moved = CanonicalRuleBook {
+            primary: CanonicalRuleSet::default(),
+            secondary: CanonicalRuleSet::from_rules(vec![combined]),
+        };
+        assert!(first_unsupported_new(&moved, Some(&carried), RuleShapeSupport::NONE).is_some());
+        assert!(first_unsupported_new(&added, None, RuleShapeSupport::NONE).is_some());
     }
 }

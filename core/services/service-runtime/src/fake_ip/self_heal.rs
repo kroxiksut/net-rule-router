@@ -159,7 +159,7 @@ pub fn probe_and_heal(
     }
     if is_platform_infrastructure(hostname) {
         // A VPN client observed through the relay can touch third-party
-        // platform hosts (e.g. a Google API endpoint used for its own
+        // platform hosts (e.g. a platform API endpoint used for its own
         // config/telemetry); excluding those from fake-IP for the whole
         // session would be wrong — only its tunnel endpoint deserves the
         // exclusion.
@@ -476,7 +476,7 @@ mod tests {
         let owner = MockFlowOwnerLookup::new();
         let client = addr("10.0.0.2:51000");
         let tunnel = addr("10.117.0.1:80");
-        owner.set_owner(client, tunnel, "swiftvpn 3.0.exe");
+        owner.set_owner(client, tunnel, "examplevpn 3.0.exe");
         let ex = RuntimeHostExclusions::new();
         let flush = || panic!("must not flush the OS resolver cache for a literal address");
 
@@ -519,13 +519,13 @@ mod tests {
 
     #[test]
     fn a_vpn_flow_to_platform_infrastructure_is_not_excluded() {
-        // A VPN client fetching a shared platform host (e.g. a Google API
+        // A VPN client fetching a shared platform host (e.g. a platform API
         // used for its own config/telemetry) through the relay must not rip
         // that host out of fake-IP or trigger a DNS flush.
         let owner = MockFlowOwnerLookup::new();
         let client = addr("10.0.0.2:51000");
         let fake = addr("198.18.0.11:443");
-        owner.set_owner(client, fake, "swiftvpn 3.0.exe");
+        owner.set_owner(client, fake, "examplevpn 3.0.exe");
         let ex = RuntimeHostExclusions::new();
         let flush = || panic!("must not flush for platform infrastructure");
 

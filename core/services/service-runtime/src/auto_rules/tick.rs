@@ -89,7 +89,7 @@ impl AutoRulesEngine {
             }
         };
         if proposals.is_empty() {
-            summary.pending = self.pending_count(sid);
+            summary.pending = self.pending_count_under(sid, &snapshot);
             return summary;
         }
 
@@ -193,7 +193,7 @@ impl AutoRulesEngine {
             );
         }
         if fresh.is_empty() {
-            summary.pending = self.pending_count(sid);
+            summary.pending = self.pending_count_under(sid, &snapshot);
             if matches!(mode, AutoRulesMode::Suggest) {
                 summary.published = self.announce_pending(sid, now);
             }
@@ -204,7 +204,7 @@ impl AutoRulesEngine {
             AutoRulesMode::Off => unreachable_off(),
             AutoRulesMode::Auto => {
                 summary.authored = self.author_now(sid, &fresh, now);
-                summary.pending = self.pending_count(sid);
+                summary.pending = self.pending_count_under(sid, &snapshot);
                 if summary.authored > 0 {
                     // Informational: the tray drops an event whose pending count
                     // yields no unseen candidates, so this cannot prompt. It
@@ -215,9 +215,9 @@ impl AutoRulesEngine {
                 }
             }
             AutoRulesMode::Suggest => {
-                let (added, total) = self.park(sid, fresh.clone(), now_ms);
+                let (added, _) = self.park(sid, fresh.clone(), now_ms);
                 summary.parked = added;
-                summary.pending = total;
+                summary.pending = self.pending_count_under(sid, &snapshot);
                 if added > 0 {
                     // WHAT was found, not just how many. "5 candidates" cannot
                     // be checked against "the site I just opened offered
@@ -265,37 +265,27 @@ impl AutoRulesEngine {
             );
             return false;
         }
-        // The count stays whole — the list the user opens holds every offer.
-        let pending = offered.len() as u64;
-        // "Answers on the main route" silences a host of someone else's brand.
-        //
-        // It is not proof the address is unwanted: a site can complete the
-        // connection and serve a refusal — ChatGPT answers the main link with
-        // "this address is not served" — so an address belonging to the routed
-        // site itself (brand-related, or its own delivery name) still opens the
-        // question. What it does settle is a name of ANOTHER brand — a shared
-        // CDN, an advertising or telemetry endpoint that merely loads nearby.
-        // Those work without the tunnel, and offering them is noise. Held-back
-        // rows keep their place in the list, and a later stall re-opens the
-        // question — the verdict is recomputed every tick.
-        // A site the user marked as refusing main-link addresses is the one case
-        // where "it answers" says nothing: answering with a refusal is still
-        // answering. Its companions keep their popup.
-        let refusing: Vec<String> = self
-            .refusing_anchors
-            .as_ref()
-            .map(|read| read(sid))
-            .unwrap_or_default();
+        // Only what the inbox lists by default (`shown_by_default`) is news: a
+        // push for hidden rows opens a popup with nothing to show. The verdict
+        // is recomputed every tick, so a later stall re-opens the question.
+        // Value: the site refuses main-link addresses, which skips the wait
+        // below — answering with a refusal is still answering.
+        let listed: HashMap<String, bool> = self
+            .candidates(sid)
+            .into_iter()
+            .filter(shown_by_default)
+            .map(|dto| (dto.id, dto.anchor_refuses_main_link))
+            .collect();
         let pass_can_answer = self
             .main_link_pass_enabled
             .as_ref()
             .map(|read| read(sid))
             .unwrap_or(false);
-        let (worth_a_popup, settled): (Vec<PendingCandidate>, Vec<PendingCandidate>) =
-            offered.into_iter().partition(|c| {
-                refusing.contains(&c.dto.anchor)
-                    || (!settled_by_the_main_link(&c.dto)
-                        && !awaiting_the_main_link(&c.dto, pass_can_answer))
+        let (worth_a_popup, settled): (Vec<PendingCandidate>, Vec<PendingCandidate>) = offered
+            .into_iter()
+            .partition(|c| match listed.get(&c.dto.id) {
+                Some(&refuses) => refuses || !awaiting_the_main_link(&c.dto, pass_can_answer),
+                None => false,
             });
         if !settled.is_empty() {
             tracing::debug!(
@@ -303,13 +293,14 @@ impl AutoRulesEngine {
                 sid = %sid,
                 held_back = settled.len(),
                 sample = %preview(&settled),
-                "suggestions kept out of the tray — a nearby third-party host that answers on the main route, or one the main-link pass has not answered for yet",
+                "suggestions kept out of the tray — the inbox does not list them by default, or the main-link pass has not answered for them yet",
             );
         }
         if worth_a_popup.is_empty() {
             return false;
         }
-        self.publish(sid, pending, &worth_a_popup, false, now)
+        // The count is what the inbox shows by default, not what popped.
+        self.publish(sid, listed.len() as u64, &worth_a_popup, false, now)
     }
 
     fn pending_snapshot(&self, sid: &str) -> Vec<PendingCandidate> {

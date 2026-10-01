@@ -150,7 +150,7 @@ QtObject {
     // (the Full-reset confirm already gated the action). Same payload shape
     // as `startBothRoutesPresetImportReviewFlow`; the confirm phase carries
     // the dry-run token. Non-admin → confirm Forbidden → launcher R3 elevates
-    // (UAC) and retries; `onComplete(false)` on UAC-decline / failure.
+    // (UAC) and retries; `onComplete(true)` only once the operation completed.
     function applyEmptyRules(onComplete) {
         if (!root.bridgeAvailable || typeof nrrNativeBridge.rpcMutationSubmit !== "function") {
             onComplete(false)
@@ -169,7 +169,16 @@ QtObject {
             if (!ok || !p) { onComplete(false); return }
             var token = (p && p["confirmation-token"]) || ""
             var c2 = nrrNativeBridge.rpcMutationSubmit("preset-import", payload, false, token)
-            root.rpc.registerLongRpcCallback(c2, function(ok2) { onComplete(!!ok2) })
+            root.rpc.registerLongRpcCallback(c2, function(ok2, p2) {
+                if (!ok2) { onComplete(false); return }
+                // The confirm only accepts the change; its verdict is on the
+                // operation record.
+                root.rpc.readMutationOutcome(p2, root.rpc.settleByPreview("preset-import", payload),
+                    function(failure) {
+                        if (failure !== "") console.log("full-reset: empty rules refused:", failure)
+                        onComplete(failure === "")
+                    })
+            })
         })
     }
 

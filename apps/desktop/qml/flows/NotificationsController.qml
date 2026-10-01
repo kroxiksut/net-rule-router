@@ -110,8 +110,8 @@ QtObject {
                 "Service action failed: {operation}").replace("{operation}", op),
             "body": body,
             "actionKey": "open-routing-settings",
-            "actionText": root.tr("notifications.service-operation-failed.action",
-                "Open Settings")
+            "actionText": root.tr("action.open-settings",
+                "Open settings")
         })
     }
 
@@ -158,9 +158,8 @@ QtObject {
         else if (actionKey === "open-rules") root.section = "rules"
         else if (actionKey === "open-routing-settings") root.section = "settings"
         else if (actionKey === "open-release-page") {
-            // Release URL from the update-check cache; fall
-            // back to the project's releases page.
-            var u = ((root.context || {}).updateCheck || {}).url || ""
+            // The release the notice names; else the project's releases page.
+            var u = (root.updateCheckController.offer || {}).url || ""
             if (u === "") {
                 var base = ((root.context || {}).about || {}).projectUrl || ""
                 if (base !== "") u = base + "/releases"
@@ -206,6 +205,14 @@ QtObject {
             root.emitPrefs()
         } else if (notificationId === "kill-switch-restored") {
             killSwitchRestoredNoticeActive = false
+        } else if (notificationId === "update-available") {
+            // Remembered by version: the notice comes back only for a release
+            // other than the one dismissed.
+            var offer = root.updateCheckController.offer
+            if (offer && offer.latestVersion) {
+                root.updatePrefs({ dismissedUpdateVersion: String(offer.latestVersion) })
+                root.emitPrefs()
+            }
         }
         // A push notice is answered for good, on every surface: record it before
         // dropping it so the tray stops offering the same thing. The

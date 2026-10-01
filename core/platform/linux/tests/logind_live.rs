@@ -25,7 +25,7 @@ fn logind_answers_who_is_logged_in() {
                 // the name is what tells the two apart.
                 assert!(
                     u.uid != 0 || u.name == "root",
-                    "uid 0 must belong to root; anything else is a zero that came from a                      field this parser did not understand",
+                    "uid 0 must belong to root; anything else is a zero that came from a field this parser did not understand",
                 );
             }
             eprintln!("logind reported {} live user(s)", users.len());

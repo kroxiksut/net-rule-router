@@ -5,13 +5,13 @@ use super::*;
 #[test]
 fn fail_closed_mode_a_blocks_each_protected_dest_at_both_layers() {
     // All protocols: per dest → 1 ALE block (TCP/UDP) + 4 named packet
-    // blocks (16.HW-0716: ICMP/IGMP/GRE/ESP, no agnostic block-all).
+    // blocks (ICMP/IGMP/GRE/ESP, no agnostic block-all).
     let out = fail_closed_block_destinations(
         "S",
-        &v4_pins([ip(203, 0, 113, 5), ip(8, 8, 8, 8)]),
+        &v4_pins([ip(203, 0, 113, 5), ip(198, 51, 100, 8)]),
         KillSwitchProtocols::ALL,
     );
-    let chunks = pack_v4([ip(203, 0, 113, 5), ip(8, 8, 8, 8)]).len();
+    let chunks = pack_v4([ip(203, 0, 113, 5), ip(198, 51, 100, 8)]).len();
     assert_eq!(out.len(), chunks * 5);
     for f in &out {
         assert_eq!(f.action, WfpAction::Block);
@@ -43,7 +43,7 @@ fn fail_closed_mode_a_blocks_each_protected_dest_at_both_layers() {
         assert_eq!(f.user_sid, None, "packet layer has no ALE_USER_ID");
     }
     assert!(out.iter().any(|f| f.covers_v4(ip(203, 0, 113, 5))));
-    assert!(out.iter().any(|f| f.covers_v4(ip(8, 8, 8, 8))));
+    assert!(out.iter().any(|f| f.covers_v4(ip(198, 51, 100, 8))));
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn fail_closed_no_protocols_yields_no_filters() {
         esp: false,
         other: false,
     };
-    assert!(fail_closed_block_destinations("S", &v4_pins([ip(8, 8, 8, 8)]), none).is_empty());
+    assert!(fail_closed_block_destinations("S", &v4_pins([ip(198, 51, 100, 8)]), none).is_empty());
     assert!(fail_closed_block_all_filters("S", &FailClosedExemptions::default(), none).is_empty());
 }
 
@@ -142,7 +142,7 @@ fn fail_closed_allow_dns_over_primary_adds_port_scoped_dns_permits() {
 fn fail_closed_block_all_permits_known_primary_at_packet_layer_above_block() {
     // a known-primary host earns a
     // packet-layer proto-agnostic permit that outranks the named packet
-    // blocks, so ping/ICMP to it survives the block-all (the ya.ru case).
+    // blocks, so ping/ICMP to it survives the block-all (the regional-site case).
     let primary = ip(203, 0, 113, 50);
     let ex = FailClosedExemptions {
         primary_dest_ips: vec![primary, ip(127, 0, 0, 1)], // loopback filtered
@@ -412,7 +412,7 @@ fn fail_closed_uncheck_icmp_leaves_icmp_unblocked() {
                 && f.action == WfpAction::Block
                 && f.ip_protocol.is_none()
         }),
-        "no protocol-agnostic packet block-all (16.HW-0716)"
+        "no protocol-agnostic packet block-all"
     );
     assert!(
         !out.iter().any(|f| {

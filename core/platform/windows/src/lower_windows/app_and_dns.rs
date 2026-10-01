@@ -108,10 +108,14 @@ pub(super) fn doh_port_block(
         .unwrap_or_else(|| "any".to_string());
     let id = derive_set_id(
         user_sid.as_deref(),
-        layer,
-        WfpAction::Block,
-        &format!("doh|{seg}"),
-        weight,
+        SetFilterKey {
+            layer,
+            action: WfpAction::Block,
+            seg: &format!("doh|{seg}|{}", remote_port.unwrap_or(0)),
+            proto,
+            egress_luid: None,
+            weight,
+        },
     );
     let (remote_ip_set, remote_ip_set_v6) = match scope {
         Some(FamilyChunk::V4(c)) => (c.members.clone(), Vec::new()),

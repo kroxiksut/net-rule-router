@@ -834,12 +834,14 @@ fn moving_the_active_pointer_out_of_band_is_caught() {
         )],
     );
 
-    // Acknowledging adopts the state — and says which row it adopted.
-    let report = repo.re_sign_all().expect("re-sign");
-    assert!(report
-        .adopted_tampered
-        .iter()
-        .any(|id| id.starts_with("pointer:")));
+    // Acknowledging adopts the state — and says what the signature said before.
+    let before = repo
+        .re_sign_pointer_for(crate::BASELINE_PRINCIPAL)
+        .expect("re-sign");
+    assert_eq!(
+        before,
+        Some(crate::revision_hmac::HmacVerification::Tampered)
+    );
     assert!(repo
         .verify_all_pointers()
         .expect("verify")
@@ -1143,51 +1145,6 @@ fn orphan_sweep_does_not_re_sign_a_tampered_candidate() {
         repo.verify_row_hmac("rev-bad").expect("verify bad"),
         Some(crate::revision_hmac::HmacVerification::Tampered)
     );
-}
-
-#[test]
-fn re_sign_all_walks_every_row() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let conn = open_state_db(&dir);
-    // Insert three rows WITHOUT a key (simulating legacy / lazy-
-    // backfill state after a v10→v11 migration).
-    let unsigned = RevisionsRepository::new(&conn);
-    for i in 0..3 {
-        unsigned
-            .insert_candidate(&sample_record(&format!("rev-{i}"), &format!("h-{i}")))
-            .expect("insert");
-    }
-    // All three should be Unsigned.
-    let with_key = RevisionsRepository::with_signing_key(&conn, hmac_key());
-    for i in 0..3 {
-        assert_eq!(
-            with_key
-                .verify_row_hmac(&format!("rev-{i}"))
-                .expect("verify"),
-            Some(crate::revision_hmac::HmacVerification::Unsigned),
-        );
-    }
-    // Re-sign all in one pass …
-    assert_eq!(with_key.re_sign_all().expect("re-sign-all").re_signed, 3);
-    // … and every row is now Verified.
-    for i in 0..3 {
-        assert_eq!(
-            with_key
-                .verify_row_hmac(&format!("rev-{i}"))
-                .expect("verify"),
-            Some(crate::revision_hmac::HmacVerification::Verified),
-        );
-    }
-}
-
-#[test]
-fn re_sign_all_without_key_is_noop() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let conn = open_state_db(&dir);
-    let repo = RevisionsRepository::new(&conn);
-    repo.insert_candidate(&sample_record("rev-noop", "h-noop"))
-        .expect("insert");
-    assert_eq!(repo.re_sign_all().expect("re-sign-all").re_signed, 0);
 }
 
 #[test]
@@ -1507,4 +1464,201 @@ fn prune_caps_are_per_principal() {
     // Each principal still has its active revision.
     assert!(repo.get_active_for("S-1-5-21-A").expect("a").is_some());
     assert!(repo.get_active_for("S-1-5-21-B").expect("b").is_some());
+}
+
+// ── integrity scan / adoption ──────────────────────────────────────────────────
+
+fn scanned<'a>(scan: &'a [ScannedRow], revision_id: &str) -> &'a ScannedRow {
+    scan.iter()
+        .find(|r| r.kind() == IntegrityRowKind::Revision && r.revision_id() == revision_id)
+        .expect("row scanned")
+}
+
+fn adoption(row: &ScannedRow) -> AdoptionRequest<'_> {
+    AdoptionRequest {
+        kind: row.kind(),
+        principal: &row.principal,
+        revision_id: row.revision_id(),
+        fingerprint: &row.fingerprint,
+    }
+}
+
+fn tamper(conn: &Connection, id: &str, rules_json: &str) {
+    conn.execute(
+        "UPDATE revisions SET rules_json = ?1 WHERE revision_id = ?2",
+        params![rules_json, id],
+    )
+    .expect("hand edit");
+}
+
+#[test]
+fn adopting_a_shown_tampered_row_re_signs_only_that_row() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::with_signing_key(&conn, vec![0x51; 32]);
+    for (id, hash) in [("rev-a", "h-a"), ("rev-b", "h-b"), ("rev-ok", "h-ok")] {
+        repo.insert_candidate(&sample_record(id, hash))
+            .expect("insert");
+    }
+    tamper(&conn, "rev-a", r#"{"a":1}"#);
+    tamper(&conn, "rev-b", r#"{"b":1}"#);
+
+    let scan = repo.integrity_scan().expect("scan");
+    assert_eq!(
+        scanned(&scan, "rev-ok").verification,
+        crate::revision_hmac::HmacVerification::Verified
+    );
+    let shown = scanned(&scan, "rev-a");
+    assert_eq!(
+        shown.verification,
+        crate::revision_hmac::HmacVerification::Tampered
+    );
+
+    let outcomes = repo
+        .adopt_rows(&[adoption(shown), adoption(scanned(&scan, "rev-ok"))])
+        .expect("adopt");
+    assert_eq!(
+        outcomes,
+        vec![AdoptionOutcome::Adopted, AdoptionOutcome::NotTampered]
+    );
+    assert_eq!(
+        repo.verify_row_hmac("rev-a").expect("verify"),
+        Some(crate::revision_hmac::HmacVerification::Verified)
+    );
+    assert_eq!(
+        repo.verify_row_hmac("rev-b").expect("verify"),
+        Some(crate::revision_hmac::HmacVerification::Tampered),
+        "a row nobody asked about stays tampered"
+    );
+}
+
+#[test]
+fn a_row_edited_after_it_was_shown_is_not_adopted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::with_signing_key(&conn, vec![0x52; 32]);
+    repo.insert_candidate(&sample_record("rev-a", "h-a"))
+        .expect("insert");
+    tamper(&conn, "rev-a", r#"{"shown":1}"#);
+    let scan = repo.integrity_scan().expect("scan");
+    let shown = scanned(&scan, "rev-a").clone();
+
+    tamper(&conn, "rev-a", r#"{"swapped":1}"#);
+    let outcomes = repo.adopt_rows(&[adoption(&shown)]).expect("adopt");
+    let rescanned = repo.integrity_scan().expect("scan");
+    assert_eq!(
+        outcomes,
+        vec![AdoptionOutcome::Changed {
+            fingerprint: scanned(&rescanned, "rev-a").fingerprint.clone()
+        }]
+    );
+    assert_eq!(
+        repo.verify_row_hmac("rev-a").expect("verify"),
+        Some(crate::revision_hmac::HmacVerification::Tampered)
+    );
+}
+
+#[test]
+fn a_request_with_a_forged_fingerprint_adopts_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::with_signing_key(&conn, vec![0x53; 32]);
+    repo.insert_candidate(&sample_record("rev-a", "h-a"))
+        .expect("insert");
+    tamper(&conn, "rev-a", r#"{"x":1}"#);
+    let scan = repo.integrity_scan().expect("scan");
+    let row = scanned(&scan, "rev-a");
+    let forged = AdoptionRequest {
+        fingerprint: "0000000000000000000000000000000000000000000000000000000000000000",
+        ..adoption(row)
+    };
+    let wrong_owner = AdoptionRequest {
+        principal: "S-1-5-21-9-9-9-1001",
+        ..adoption(row)
+    };
+    assert_eq!(
+        repo.adopt_rows(&[forged, wrong_owner]).expect("adopt"),
+        vec![
+            AdoptionOutcome::Changed {
+                fingerprint: row.fingerprint.clone()
+            },
+            AdoptionOutcome::Missing
+        ]
+    );
+    assert_eq!(
+        repo.verify_row_hmac("rev-a").expect("verify"),
+        Some(crate::revision_hmac::HmacVerification::Tampered)
+    );
+    // Positive control: the honest request for the same row goes through.
+    assert_eq!(
+        repo.adopt_rows(&[adoption(row)]).expect("adopt"),
+        vec![AdoptionOutcome::Adopted]
+    );
+}
+
+#[test]
+fn a_tampered_pointer_is_scanned_and_adoptable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = RevisionsRepository::with_signing_key(&conn, vec![0x54; 32]);
+    for (id, hash) in [("rev-one", "h-1"), ("rev-two", "h-2")] {
+        repo.insert_candidate(&sample_record(id, hash))
+            .expect("insert");
+    }
+    repo.set_active_pointer(&ActiveRevisionPointer {
+        revision_id: "rev-one".into(),
+        activated_at: 1,
+        apply_attempt_id: None,
+    })
+    .expect("point");
+    conn.execute(
+        "UPDATE active_revision_pointer SET revision_id = 'rev-two'",
+        [],
+    )
+    .expect("hand edit");
+
+    let scan = repo.integrity_scan().expect("scan");
+    let pointer = scan
+        .iter()
+        .find(|r| r.kind() == IntegrityRowKind::ActivePointer)
+        .expect("pointer scanned");
+    assert_eq!(pointer.revision_id(), "rev-two");
+    assert_eq!(
+        pointer.verification,
+        crate::revision_hmac::HmacVerification::Tampered
+    );
+    assert_eq!(
+        repo.adopt_rows(&[adoption(pointer)]).expect("adopt"),
+        vec![AdoptionOutcome::Adopted]
+    );
+    assert!(repo
+        .verify_all_pointers()
+        .expect("verify")
+        .iter()
+        .all(|(_, v)| *v == crate::revision_hmac::HmacVerification::Verified));
+}
+
+#[test]
+fn the_fingerprint_survives_a_key_change() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    RevisionsRepository::with_signing_key(&conn, vec![0x55; 32])
+        .insert_candidate(&sample_record("rev-a", "h-a"))
+        .expect("insert");
+    let old = RevisionsRepository::with_signing_key(&conn, vec![0x55; 32])
+        .integrity_scan()
+        .expect("scan");
+    let new_key = RevisionsRepository::with_signing_key(&conn, vec![0x56; 32]);
+    let rescanned = new_key.integrity_scan().expect("scan");
+    let row = scanned(&rescanned, "rev-a");
+    assert_eq!(row.fingerprint, scanned(&old, "rev-a").fingerprint);
+    assert_eq!(
+        row.verification,
+        crate::revision_hmac::HmacVerification::Tampered,
+        "an old-key row reads as tampered under a new key"
+    );
+    assert_eq!(
+        new_key.adopt_rows(&[adoption(row)]).expect("adopt"),
+        vec![AdoptionOutcome::Adopted]
+    );
 }

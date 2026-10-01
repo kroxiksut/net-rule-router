@@ -123,6 +123,20 @@ impl<'c> RevisionsRepository<'c> {
             .map_err(|e| StorageError::Internal(format!("revisions get_active: {e}")))
     }
 
+    /// `(revision_id, content_hash)` of `principal`'s active revision, without
+    /// the rules blob: lets a reader tell whether its decoded copy is current.
+    pub fn active_identity_for(&self, principal: &str) -> StorageResult<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT revision_id, content_hash FROM revisions
+                 WHERE principal = ?1 AND status = 'active' LIMIT 1",
+                params![principal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| StorageError::Internal(format!("revisions active_identity_for: {e}")))
+    }
+
     /// Returns the most recent superseded revision — the canonical
     /// "last known good" rollback target.
     ///

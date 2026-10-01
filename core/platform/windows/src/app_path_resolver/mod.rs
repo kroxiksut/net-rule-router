@@ -376,7 +376,7 @@ fn truncation_report(patterns: &[String]) -> Option<TruncationReport> {
 #[cfg(target_os = "windows")]
 #[must_use]
 pub fn image_name_for_pid(pid: u32) -> Option<String> {
-    windows_impl::process_image_path(pid).and_then(|p| {
+    crate::win32_ffi::process::process_image_path(pid).and_then(|p| {
         p.file_name()
             .map(|n| n.to_string_lossy().to_ascii_lowercase())
     })

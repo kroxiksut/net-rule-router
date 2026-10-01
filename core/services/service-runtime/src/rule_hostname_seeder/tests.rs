@@ -136,7 +136,7 @@ fn seeds_uncached_exact_fqdn_hostnames() {
     let resolver = Arc::new(MockDnsResolver::new());
     resolver.set_response(
         "api.example.com",
-        record("api.example.com", &[Ipv4Addr::new(1, 2, 3, 4)]),
+        record("api.example.com", &[Ipv4Addr::new(100, 64, 1, 4)]),
     );
     let (cache, lookup) = in_memory_cache();
     let rules = Arc::new(FakeRules::new(
@@ -155,7 +155,7 @@ fn seeds_uncached_exact_fqdn_hostnames() {
     // The IP is now resolvable through the real cache.
     assert_eq!(
         lookup.ips_for_hostname("api.example.com"),
-        vec![Ipv4Addr::new(1, 2, 3, 4)]
+        vec![Ipv4Addr::new(100, 64, 1, 4)]
     );
 }
 
@@ -163,7 +163,7 @@ fn seeds_uncached_exact_fqdn_hostnames() {
 fn skips_already_cached_hostnames_without_resolving() {
     let resolver = Arc::new(MockDnsResolver::new());
     let (cache, lookup) = in_memory_cache();
-    pre_seed(&cache, "api.example.com", Ipv4Addr::new(9, 9, 9, 9));
+    pre_seed(&cache, "api.example.com", Ipv4Addr::new(100, 64, 9, 9));
     let rules = Arc::new(FakeRules::new(
         empty(),
         CanonicalRuleSet::from_rules(vec![fqdn_rule("r1", "api.example.com")]),
@@ -342,7 +342,7 @@ fn mixed_resolution_seeds_only_routable_ips() {
         "mix.example.com",
         record(
             "mix.example.com",
-            &[Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(1, 2, 3, 4)],
+            &[Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(100, 64, 1, 4)],
         ),
     );
     let (cache, lookup) = in_memory_cache();
@@ -361,7 +361,7 @@ fn mixed_resolution_seeds_only_routable_ips() {
     // The unspecified address is dropped; only the public IP is cached.
     assert_eq!(
         lookup.ips_for_hostname("mix.example.com"),
-        vec![Ipv4Addr::new(1, 2, 3, 4)]
+        vec![Ipv4Addr::new(100, 64, 1, 4)]
     );
 }
 
@@ -427,7 +427,7 @@ fn a_failed_hostname_is_not_re_queried_on_the_next_pass() {
 /// While the guard blocks an unresolved link, an unresolvable rule host is
 /// also an UNPROTECTED one: the guard can only block addresses it knows.
 /// The calm minute of patience is what kept the hole open at logon
-/// (HW-0830: assistant.example unprotected for the full 65 s backoff), so the
+/// (assistant.example unprotected for the full 65 s backoff), so the
 /// pacing drops to seconds and stops escalating early.
 #[test]
 fn the_backoff_tightens_while_the_guard_is_blocking() {
@@ -863,11 +863,11 @@ fn collects_from_both_routes_deduped() {
     let resolver = Arc::new(MockDnsResolver::new());
     resolver.set_response(
         "a.example.com",
-        record("a.example.com", &[Ipv4Addr::new(1, 1, 1, 1)]),
+        record("a.example.com", &[Ipv4Addr::new(100, 64, 1, 1)]),
     );
     resolver.set_response(
         "b.example.com",
-        record("b.example.com", &[Ipv4Addr::new(2, 2, 2, 2)]),
+        record("b.example.com", &[Ipv4Addr::new(100, 64, 2, 2)]),
     );
     let (cache, lookup) = in_memory_cache();
     // Same host in both routes → resolved once (deduped by BTreeSet).
@@ -884,7 +884,7 @@ fn collects_from_both_routes_deduped() {
     let queries = resolver.observed_queries();
     // Deduped ACROSS routes: `a.example.com` is in both the primary and the
     // secondary set but is seeded once — so it is queried
-    // `SEED_RESOLVE_ATTEMPTS` times (the HW-0707 union multi-resolve), NOT
+    // `SEED_RESOLVE_ATTEMPTS` times (the union multi-resolve), NOT
     // `2 * SEED_RESOLVE_ATTEMPTS` (which is what a per-route double-seed
     // would produce).
     assert_eq!(
@@ -947,7 +947,7 @@ fn gated_seeder() -> (Arc<GatedResolver>, Arc<RuleHostnameSeeder>) {
     let mock = MockDnsResolver::new();
     mock.set_response(
         "api.example.com",
-        record("api.example.com", &[Ipv4Addr::new(1, 2, 3, 4)]),
+        record("api.example.com", &[Ipv4Addr::new(100, 64, 1, 4)]),
     );
     let resolver = Arc::new(GatedResolver::new(mock));
     let (cache, lookup) = in_memory_cache();
@@ -987,7 +987,7 @@ fn a_seed_that_fits_the_budget_is_waited_for_and_recomputes_nothing_extra() {
     assert_eq!(wait, SeedWait::Finished);
     assert_eq!(
         seeder.fqdn_lookup.ips_for_hostname("api.example.com"),
-        vec![Ipv4Addr::new(1, 2, 3, 4)]
+        vec![Ipv4Addr::new(100, 64, 1, 4)]
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
@@ -1011,7 +1011,7 @@ fn a_stalled_seed_releases_the_caller_and_recomputes_once_it_lands() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         seeder.fqdn_lookup.ips_for_hostname("api.example.com"),
-        vec![Ipv4Addr::new(1, 2, 3, 4)]
+        vec![Ipv4Addr::new(100, 64, 1, 4)]
     );
 }
 

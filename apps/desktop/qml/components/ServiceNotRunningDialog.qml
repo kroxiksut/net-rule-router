@@ -162,7 +162,7 @@ Dialog {
                 id: cancelButton
                 theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
                 text: dialog.tr(
-                    "dialog.service-not-running.cancel", "Cancel")
+                    "action.cancel", "Cancel")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: dialog.tr(

@@ -982,6 +982,9 @@ fn sleep_observing_shutdown(inner: &Arc<ClientInner>, total: Duration) {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod resubscribe_scripted_pipe_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

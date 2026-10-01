@@ -12,9 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 nrr-domain = { path = "../domain" }
 nrr-shared = { path = "../../shared/contracts" }
-nrr-ui-support = { path = "../ui-support" }
 nrr-mock-backend = { path = "../mock-backend" }
-serde = { version = "1.0", features = ["derive"] }
 
 [lints]
 workspace = true

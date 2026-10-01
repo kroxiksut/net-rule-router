@@ -2090,7 +2090,7 @@ ColumnLayout {
                     + "The background service is not needed for this.")
                 : root.tr(
                     "rules.empty.body",
-                    "Add your first routing rule to start sending traffic through the secondary route.")
+                    "Add your first routing rule to start sending traffic through the additional route.")
             color: root.uiTheme.colorTextMuted
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter

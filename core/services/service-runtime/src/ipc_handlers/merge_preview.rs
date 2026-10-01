@@ -256,12 +256,12 @@ mod tests {
         let handler = RulesMergePreviewHandler::new(source.clone());
         handler
             .handle(
-                &envelope(serde_json::json!({ "keep-secondary": ["ip:1.1.1.1"] })),
+                &envelope(serde_json::json!({ "keep-secondary": ["ip:198.51.100.1"] })),
                 &ctx(),
             )
             .expect("handler success");
         let calls = source.calls.lock().unwrap();
-        assert_eq!(calls[0].5, vec!["ip:1.1.1.1".to_string()]);
+        assert_eq!(calls[0].5, vec!["ip:198.51.100.1".to_string()]);
     }
 
     #[test]

@@ -275,7 +275,7 @@ fn a_slow_resolve_shortens_the_reconcile_it_precedes() {
         &oracle(&["assistant.example"]),
         &SlowUpstream {
             spends: Duration::from_millis(250),
-            answer: Ok(resolved(&[ip(23, 10, 20, 138)])),
+            answer: Ok(resolved(&[ip(100, 64, 0, 138)])),
         },
         &FakeSink(&CallLog::default()),
         &spy,
@@ -308,7 +308,7 @@ fn an_exhausted_budget_does_not_hold_the_answer_for_a_reconcile() {
         &oracle(&["assistant.example"]),
         &SlowUpstream {
             spends: Duration::from_millis(200),
-            answer: Ok(resolved(&[ip(23, 10, 20, 138)])),
+            answer: Ok(resolved(&[ip(100, 64, 0, 138)])),
         },
         &FakeSink(&CallLog::default()),
         &spy,
@@ -336,7 +336,7 @@ fn non_rule_host_fails_open_without_touching_enforcement() {
         },
         &oracle(&[]),
         &FakeUpstream {
-            answer: Ok(resolved(&[ip(23, 10, 20, 138)])),
+            answer: Ok(resolved(&[ip(100, 64, 0, 138)])),
         },
         &FakeSink(&log),
         &FakeReconciler {
@@ -350,7 +350,7 @@ fn non_rule_host_fails_open_without_touching_enforcement() {
     assert_eq!(
         out,
         QueryOutcome::Answer {
-            ips: vec![ip(23, 10, 20, 138)],
+            ips: vec![ip(100, 64, 0, 138)],
             enforced: false,
         }
     );
@@ -463,7 +463,7 @@ fn a_placeholder_only_answer_is_never_pinned() {
 #[test]
 fn an_unusable_address_beside_a_real_one_is_dropped_and_the_host_stays_enforced() {
     let log = CallLog::default();
-    let real = ip(23, 10, 20, 78);
+    let real = ip(100, 64, 0, 78);
     let out = handle_a_query(
         "rule.example",
         AnswerHold {
@@ -547,7 +547,7 @@ impl SyncReconciler for SlowReconciler<'_> {
 #[test]
 fn fast_answers_skips_the_hold_when_every_answered_address_is_enforced() {
     let log = CallLog::default();
-    let addr = ip(23, 10, 20, 159);
+    let addr = ip(100, 64, 0, 159);
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
@@ -587,7 +587,7 @@ fn a_cached_address_the_policy_does_not_carry_is_not_the_fast_path() {
     // name ever resolved to, so a rotated CDN address read as covered and
     // the answer went out ahead of its enforcement. Cached is not enforced.
     let log = CallLog::default();
-    let addr = ip(23, 10, 20, 158);
+    let addr = ip(100, 64, 0, 158);
     let out = handle_a_query(
         "static.proflcdn.test",
         AnswerHold {
@@ -629,7 +629,7 @@ fn a_wait_that_cannot_finish_is_not_attempted() {
     // installs nothing and only spends the budget. Answer, say so, and let
     // the learn-from-drops path recover the first connect.
     let log = CallLog::default();
-    let addr = ip(23, 10, 20, 158);
+    let addr = ip(100, 64, 0, 158);
     let out = handle_a_query(
         "static.proflcdn.test",
         AnswerHold {
@@ -689,8 +689,8 @@ impl SyncReconciler for FirstContactReconciler<'_> {
 #[test]
 fn a_first_contact_gets_its_route_before_the_answer_goes_out() {
     let log = CallLog::default();
-    let known = ip(23, 10, 20, 159);
-    let new = ip(23, 10, 20, 160);
+    let known = ip(100, 64, 0, 159);
+    let new = ip(100, 64, 0, 160);
     let reconciler = FirstContactReconciler {
         log: &log,
         routed: Mutex::new(Vec::new()),
@@ -737,7 +737,7 @@ fn fast_answers_still_holds_on_first_contact_with_a_new_address() {
         },
         &oracle(&["assistant.example"]),
         &FakeUpstream {
-            answer: Ok(resolved(&[ip(23, 10, 20, 159)])),
+            answer: Ok(resolved(&[ip(100, 64, 0, 159)])),
         },
         // Cache is empty → the answer introduces a never-seen address and
         // the first connect could race the install: hold as before.
@@ -753,7 +753,7 @@ fn fast_answers_still_holds_on_first_contact_with_a_new_address() {
     assert_eq!(
         out,
         QueryOutcome::Answer {
-            ips: vec![ip(23, 10, 20, 159)],
+            ips: vec![ip(100, 64, 0, 159)],
             enforced: true,
         }
     );
@@ -763,7 +763,7 @@ fn fast_answers_still_holds_on_first_contact_with_a_new_address() {
 #[test]
 fn fast_answers_off_awaits_the_reconcile_even_for_cached_addresses() {
     let log = CallLog::default();
-    let addr = ip(23, 10, 20, 159);
+    let addr = ip(100, 64, 0, 159);
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
@@ -809,7 +809,7 @@ fn rule_host_records_then_reconciles_before_answering() {
         },
         &oracle(&["assistant.example"]),
         &FakeUpstream {
-            answer: Ok(resolved(&[ip(23, 10, 20, 159)])),
+            answer: Ok(resolved(&[ip(100, 64, 0, 159)])),
         },
         &FakeSink(&log),
         &FakeReconciler {
@@ -823,7 +823,7 @@ fn rule_host_records_then_reconciles_before_answering() {
     assert_eq!(
         out,
         QueryOutcome::Answer {
-            ips: vec![ip(23, 10, 20, 159)],
+            ips: vec![ip(100, 64, 0, 159)],
             enforced: true,
         }
     );
@@ -845,7 +845,7 @@ fn rule_host_answers_but_unenforced_when_deadline_exceeded() {
         },
         &oracle(&["assistant.example"]),
         &FakeUpstream {
-            answer: Ok(resolved(&[ip(23, 10, 20, 159)])),
+            answer: Ok(resolved(&[ip(100, 64, 0, 159)])),
         },
         &FakeSink(&log),
         &FakeReconciler {
@@ -861,7 +861,7 @@ fn rule_host_answers_but_unenforced_when_deadline_exceeded() {
     assert_eq!(
         out,
         QueryOutcome::Answer {
-            ips: vec![ip(23, 10, 20, 159)],
+            ips: vec![ip(100, 64, 0, 159)],
             enforced: false,
         }
     );
@@ -871,7 +871,7 @@ fn rule_host_answers_but_unenforced_when_deadline_exceeded() {
 /// The same missed deadline, but with the guard blocking a link it could
 /// not resolve: nothing has a filter for these addresses, so handing them
 /// over sends the caller out the main link — the leak the guard exists to
-/// prevent (the assistant.example case, HW-0830).
+/// prevent (the assistant.example case).
 #[test]
 fn rule_host_answer_is_withheld_when_the_guard_is_blocking_and_install_missed_the_deadline() {
     let log = CallLog::default();
@@ -884,7 +884,7 @@ fn rule_host_answer_is_withheld_when_the_guard_is_blocking_and_install_missed_th
         },
         &oracle(&["assistant.example"]),
         &FakeUpstream {
-            answer: Ok(resolved(&[ip(23, 10, 20, 159)])),
+            answer: Ok(resolved(&[ip(100, 64, 0, 159)])),
         },
         &FakeSink(&log),
         &FakeReconciler {
@@ -907,7 +907,7 @@ fn rule_host_answer_is_withheld_when_the_guard_is_blocking_and_install_missed_th
 #[test]
 fn deferred_answer_is_not_withheld_while_the_guard_is_blocking() {
     let log = CallLog::default();
-    let cached = ip(23, 10, 20, 159);
+    let cached = ip(100, 64, 0, 159);
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
@@ -942,7 +942,7 @@ fn deferred_answer_is_not_withheld_while_the_guard_is_blocking() {
 
 #[test]
 fn stable_answer_subset_passes_small_sets_through() {
-    let resolved = [ip(1, 1, 1, 1), ip(2, 2, 2, 2)];
+    let resolved = [ip(100, 64, 1, 1), ip(100, 64, 2, 2)];
     assert_eq!(
         stable_answer_subset(&resolved, &[], MAX_RULE_ANSWER_IPS),
         resolved.to_vec()
@@ -980,7 +980,7 @@ fn rule_host_answer_is_capped_to_stable_subset() {
     // Seven upstream addresses → the answer (and the recorded fact) must
     // carry only MAX_RULE_ANSWER_IPS of them.
     let log = CallLog::default();
-    let many: Vec<Ipv4Addr> = (1..=7).map(|i| ip(23, 10, 20, i)).collect();
+    let many: Vec<Ipv4Addr> = (1..=7).map(|i| ip(100, 64, 0, i)).collect();
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
@@ -1024,7 +1024,7 @@ fn fake_ip_scope_host_is_answered_with_the_virtual_address_and_skips_reconcile()
         },
         &oracle(&["assistant.example"]),
         &FakeUpstream {
-            answer: Ok(resolved(&[ip(23, 10, 20, 140)])),
+            answer: Ok(resolved(&[ip(100, 64, 0, 140)])),
         },
         &FakeSink(&log),
         &FakeReconciler {
@@ -1065,7 +1065,7 @@ fn a_rule_host_outside_fake_ip_scope_keeps_the_real_per_ip_path() {
         },
         &oracle(&["bank.example"]),
         &FakeUpstream {
-            answer: Ok(resolved(&[ip(23, 10, 20, 138)])),
+            answer: Ok(resolved(&[ip(100, 64, 0, 138)])),
         },
         &FakeSink(&log),
         &FakeReconciler {
@@ -1085,7 +1085,7 @@ fn a_rule_host_outside_fake_ip_scope_keeps_the_real_per_ip_path() {
     assert_eq!(
         out,
         QueryOutcome::Answer {
-            ips: vec![ip(23, 10, 20, 138)],
+            ips: vec![ip(100, 64, 0, 138)],
             enforced: true,
         }
     );
@@ -1119,7 +1119,7 @@ fn scoped_answerer_returns_none_when_disabled_or_excluded() {
     let on = ScopedFakeIpAnswerer::new(FakeIpScope::enabled(["bank.example"]), allocator);
     assert_eq!(on.fake_answer("api.bank.example"), None);
     assert_eq!(on.fake_answer("localhost"), None);
-    assert_eq!(on.fake_answer("23.10.20.78"), None);
+    assert_eq!(on.fake_answer("100.64.0.78"), None);
 }
 
 #[test]

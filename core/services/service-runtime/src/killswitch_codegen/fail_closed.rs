@@ -295,7 +295,7 @@ pub fn fail_closed_block_all_filters(
         }
         // known-primary destinations: a
         // proto-agnostic packet permit per IP so ping/ICMP to a positively
-        // primary-routed host (e.g. ya.ru) escapes the named packet blocks
+        // primary-routed host (e.g. a regional site) escapes the named packet blocks
         // below, while genuinely-unknown traffic is still cut. TCP/UDP already
         // escaped at the ALE layer via the rule permit; this closes the
         // packet-layer gap that made ping to a whitelisted host fail. Caller

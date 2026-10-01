@@ -60,7 +60,7 @@ Item {
             color: "#ffffff"
             text: root.uiRevision >= 0
                 ? root.tr("status.preview-data-banner",
-                    "Demo data. This window is running on a preview backend (NRR_BACKEND), so nothing shown here comes from the service and nothing changed here reaches it.")
+                    "Sample data: this window shows an example, not your service's data, and nothing changed here reaches the service.")
                 : ""
         }
     }
@@ -222,7 +222,7 @@ Item {
                     theme: root.uiTheme
                     visible: topBannerStack.combinedAmberExpanded
                             && !root._serviceRulesEmpty
-                    text: root.tr("status.drift-banner-details", "Details…")
+                    text: root.tr("action.details", "Details")
                     Accessible.role: Accessible.Button
                     Accessible.name: text
                     Accessible.description: root.tr(
@@ -234,8 +234,8 @@ Item {
                     theme: root.uiTheme
                     text: root.uiRevision >= 0
                         ? (topBannerStack.combinedAmberExpanded
-                            ? root.tr("settings.routing.show-less", "Hide details")
-                            : root.tr("settings.routing.show-more", "Show details"))
+                            ? root.tr("action.hide-details", "Hide details")
+                            : root.tr("action.show-details", "Show details"))
                         : ""
                     Accessible.role: Accessible.Button
                     Accessible.name: text
@@ -263,7 +263,7 @@ Item {
                     text: root.uiRevision >= 0
                         ? (root.secondaryReconfirmVisible
                             ? root.tr("status.secondary-reconfirm",
-                                "Your secondary adapter \"{name}\" looks reinstalled (new ID). Re-confirm it so the stored binding matches.")
+                                "Your additional adapter \"{name}\" looks reinstalled (new ID). Re-confirm it so the stored binding matches.")
                                 .replace("{name}", String(root.prefs.selectedSecondaryInterfaceName || ""))
                             : root.tr("status.secondary-unresolved",
                                 "The additional adapter \"{name}\" assigned to your rules isn't available right now — start it, or choose a different adapter in Interfaces and routes. While it's missing, matching traffic is blocked (leak protection) instead of leaking over your main connection.")
@@ -287,7 +287,7 @@ Item {
                     Accessible.name: text
                     Accessible.description: root.secondaryReconfirmVisible
                         ? root.tr("status.secondary-reconfirm-button-description",
-                            "Update the stored secondary adapter binding to the reinstalled adapter.")
+                            "Update the stored additional adapter binding to the reinstalled adapter.")
                         : root.tr("status.secondary-unresolved-button-description",
                             "Open Interfaces and routes to start or re-select the additional adapter.")
                     onClicked: {
@@ -381,7 +381,7 @@ Item {
             }
             ThemedButton {
                 theme: root.uiTheme
-                text: root.tr("status.drift-banner-details", "Details…")
+                text: root.tr("action.details", "Details")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: root.tr(
@@ -537,7 +537,7 @@ Item {
                 text: root.uiRevision >= 0
                     ? (root.secondaryReconfirmVisible
                         ? root.tr("status.secondary-reconfirm",
-                            "Your secondary adapter \"{name}\" looks reinstalled (new ID). Re-confirm it so the stored binding matches.")
+                            "Your additional adapter \"{name}\" looks reinstalled (new ID). Re-confirm it so the stored binding matches.")
                             .replace("{name}", String(root.prefs.selectedSecondaryInterfaceName || ""))
                         : (root.secondaryUnresolvedVisible
                             ? root.tr("status.secondary-unresolved",
@@ -567,7 +567,7 @@ Item {
                 Accessible.name: text
                 Accessible.description: root.secondaryReconfirmVisible
                     ? root.tr("status.secondary-reconfirm-button-description",
-                        "Update the stored secondary adapter binding to the reinstalled adapter.")
+                        "Update the stored additional adapter binding to the reinstalled adapter.")
                     : root.tr("status.secondary-unresolved-button-description",
                         "Open Interfaces and routes to start or re-select the additional adapter.")
                 onClicked: {
@@ -704,7 +704,7 @@ Item {
             }
             ThemedButton {
                 theme: root.uiTheme
-                text: root.tr("status.empty-rules-banner-button", "Open Rules")
+                text: root.tr("action.open-rules", "Open rules")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: root.tr(
@@ -979,7 +979,7 @@ Item {
             }
             ThemedButton {
                 theme: root.uiTheme
-                text: root.tr("status.drift-banner-details", "Details…")
+                text: root.tr("action.details", "Details")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: root.tr(

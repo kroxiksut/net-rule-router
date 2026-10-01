@@ -21,9 +21,9 @@ pub struct IpcOperationSpec {
     /// (`IpcOperationClass::requires_elevation`), and a by-value check inside the
     /// handler (`machine_scoped_write_allowed`, which lets an unelevated caller
     /// save an unchanged row and demands rights only for a real change).
-    /// `acceptance_block16::every_privileged_operation_is_actually_gated` binds
-    /// the declaration to one of the two, so a carrier with no gate fails the
-    /// build instead of shipping. Do not cite this field as the gate itself.
+    /// A cross-crate acceptance test binds the declaration to one of the two,
+    /// so a carrier with no gate fails the build instead of shipping. Do not
+    /// cite this field as the gate itself.
     pub requires_service_mutation_privilege: bool,
 }
 
@@ -39,7 +39,7 @@ const CLIENTS_GUI_AND_TRAY: [IpcClientProfile; 2] = [
     IpcClientProfile::TrayLightweight,
 ];
 
-const IPC_OPERATION_CATALOG: [IpcOperationSpec; 70] = [
+const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
     IpcOperationSpec {
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
@@ -118,7 +118,8 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 70] = [
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::AsyncWithOperationHandle,
         allowed_clients: &CLIENTS_GUI_AND_TRAY,
-        requires_service_mutation_privilege: true,
+        // By default the caller's own rules; the baseline form is class-gated.
+        requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::ProductImpactDisableTemporary,
@@ -340,15 +341,6 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 70] = [
         // Maintenance command — deletes rotated operational log files.
         // Audit trail is never affected. GUI-only by design (tray has
         // no UX for it).
-        class: IpcInteractionClass::Command,
-        execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
-        requires_service_mutation_privilege: false,
-    },
-    IpcOperationSpec {
-        name: IpcOperationName::DiagnosticModeSet,
-        // Enable/disable extended diagnostics (unredacted detail) for a bounded
-        // in-memory session. No elevation, no mutation queue, GUI-only.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_ONLY,

@@ -10,7 +10,7 @@ const STABLE_IDENTITY_FIELDS: [AdapterIdentityField; 3] = [
 ];
 
 const DISPLAY_ONLY_FIELDS: [&str; 4] = [
-    "windows_name",
+    "name",
     "interface_description",
     "interface_type",
     "oper_status",
@@ -69,10 +69,7 @@ fn collect_windows_adapters() -> Result<Vec<AdapterSnapshotEntry>, String> {
                     ipv6_if_index: adapter.ipv6_if_index(),
                     physical_address,
                 },
-                windows_name: resolve_windows_name(
-                    adapter.friendly_name(),
-                    adapter.adapter_name().trim(),
-                ),
+                name: resolve_windows_name(adapter.friendly_name(), adapter.adapter_name().trim()),
                 interface_description: adapter.description().to_string(),
                 interface_type: interface_type_slug(adapter.if_type()).to_string(),
                 oper_status: format!("{:?}", adapter.oper_status()).to_ascii_lowercase(),
@@ -81,9 +78,9 @@ fn collect_windows_adapters() -> Result<Vec<AdapterSnapshotEntry>, String> {
         .collect::<Vec<_>>();
 
     adapters.sort_by(|left, right| {
-        left.windows_name
+        left.name
             .to_ascii_lowercase()
-            .cmp(&right.windows_name.to_ascii_lowercase())
+            .cmp(&right.name.to_ascii_lowercase())
     });
     Ok(adapters)
 }
@@ -120,7 +117,7 @@ fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
                 ipv6_if_index: 10,
                 physical_address: Some("00-11-22-33-44-55".to_string()),
             },
-            windows_name: "Ethernet".to_string(),
+            name: "Ethernet".to_string(),
             interface_description: "Fallback Ethernet adapter".to_string(),
             interface_type: "ethernet".to_string(),
             oper_status: "ifoperstatusup".to_string(),
@@ -132,7 +129,7 @@ fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
                 ipv6_if_index: 20,
                 physical_address: Some("AA-BB-CC-DD-EE-FF".to_string()),
             },
-            windows_name: "Wi-Fi".to_string(),
+            name: "Wi-Fi".to_string(),
             interface_description: "Fallback Wi-Fi adapter".to_string(),
             interface_type: "wireless".to_string(),
             oper_status: "ifoperstatusup".to_string(),
@@ -144,7 +141,7 @@ fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
                 ipv6_if_index: 30,
                 physical_address: None,
             },
-            windows_name: "VPN".to_string(),
+            name: "VPN".to_string(),
             interface_description: "Fallback VPN tunnel".to_string(),
             interface_type: "tunnel".to_string(),
             oper_status: "ifoperstatusdormant".to_string(),

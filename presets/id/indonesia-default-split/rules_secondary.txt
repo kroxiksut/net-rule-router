@@ -1,187 +1,28 @@
 ﻿# NetRuleRouter preset - version 1
 # name: ID Indonesia Default Split - Secondary Route
-# description: Foreign social, messaging, developer, and AI services routed to secondary
+# description: Platforms blocked nationwide in Indonesia
 # author: NetRuleRouter contributors
-# preset_version: 1
+# preset_version: 2
 
 --- Zones
 # Keep empty to avoid over-broad routing by TLD
 
 --- Domains
-*.facebook.com
-*.fb.com
-*.messenger.com
-*.instagram.com
-*.cdninstagram.com
-*.fbcdn.net
-*.facebook.net
-*.fbsbx.com
-*.threads.net
-*.threads.com
-*.x.com
-*.twitter.com
-*.t.co
-*.twimg.com
-*.xusercontent.com
-*.youtube.com
-youtu.be
-*.googlevideo.com
-*.ytimg.com
-*.tiktok.com
-*.tiktokv.com
-*.musical.ly
-*.byteoversea.com
-*.ibyteimg.com
-*.tiktokcdn.com
-*.discord.com
-discord.gg
-*.discordapp.com
-*.discord.media
-*.reddit.com
-redd.it
-*.redditstatic.com
-*.redditmedia.com
-*.linkedin.com
-*.licdn.com
-*.twitch.tv
-*.jtvnw.net
-*.ttvnw.net
-*.pinterest.com
-*.pinimg.com
-*.snapchat.com
-*.sc-cdn.net
-*.bsky.app
-*.telegram.org
-*.t.me
-*.telegram.me
-*.whatsapp.com
-*.whatsapp.net
-*.signal.org
-*.signal.me
-*.viber.com
-*.viber.me
-*.line.me
-*.line-apps.com
-*.skype.com
-*.zoom.us
-*.slack.com
-*.openai.com
-*.chatgpt.com
-*.z.ai
-*.anthropic.com
-*.claude.ai
-*.claude.com
-*.perplexity.ai
-*.poe.com
-*.character.ai
-*.mistral.ai
-chat.mistral.ai
-lechat.mistral.ai
-api.mistral.ai
-*.huggingface.co
-*.replicate.com
-*.stability.ai
-*.cohere.com
-*.cursor.com
-*.openrouter.ai
-*.midjourney.com
-*.runwayml.com
-*.leonardo.ai
-*.civitai.com
-*.x.ai
-*.grok.com
-gemini.google.com
-ai.google.dev
-notebooklm.google.com
-aistudio.google.com
-copilot.microsoft.com
-*.jetbrains.com
-*.jb.gg
-*.intellij.net
-account.jetbrains.com
-plugins.jetbrains.com
-downloads.marketplace.jetbrains.com
-download.jetbrains.com
-download-cdn.jetbrains.com
-resources.jetbrains.com
-data.services.jetbrains.com
-api.jetbrains.ai
-*.youtrack.cloud
-*.teamcity.com
-*.jetbrains.space
-*.toolbox.app
+# Checked: September 2026. Few general-purpose platforms are blocked in Indonesia, and the
+# AI, developer and social services not listed here serve Indonesia directly.
+# Add a service yourself if your provider fails to reach it.
+
+*.vimeo.com  # Vimeo: blocked nationwide since 2014
+*.vimeocdn.com  # Vimeo: blocked nationwide since 2014
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 
 --- Windows
-telegram.exe
-WhatsAp*.exe
-discord.exe
-signal.exe
-viber.exe
-line.exe
-skype.exe
-zoom.exe
-slack.exe
-chatgpt.exe
-claude.exe
-poe.exe
-codex.exe
-codex*.exe
-Cursor.exe
-Windsurf.exe
-jetbrains-toolbox.exe
-idea.exe
-idea64.exe
-pycharm.exe
-pycharm64.exe
-webstorm.exe
-webstorm64.exe
-phpstorm.exe
-phpstorm64.exe
-clion.exe
-clion64.exe
-rider.exe
-rider64.exe
-datagrip.exe
-datagrip64.exe
-rubymine.exe
-rubymine64.exe
-goland.exe
-goland64.exe
-dataspell.exe
-dataspell64.exe
-aqua.exe
-aqua64.exe
-gateway.exe
-gateway64.exe
-fleet.exe
-mps.exe
+# No desktop apps are blocked in Indonesia as of the check date
 
 --- Linux
-clion
-codex
-codex*
-cursor
-datagrip
-dataspell
-discord
-goland
-idea
-jetbrains-toolbox
-phpstorm
-pycharm
-rider
-rubymine
-signal-desktop
-slack
-telegram
-telegram-desktop
-viber
-webstorm
-windsurf
-zoom
+# No desktop apps are blocked in Indonesia as of the check date
 
 --- MacOS
 # (reserved - not applied on Windows)

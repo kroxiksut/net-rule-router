@@ -29,7 +29,6 @@ use nrr_domain::rules_file::{
     PassthroughSection, PresetMetadata, RulesFileSection,
 };
 use nrr_domain::rules_json_codec;
-use nrr_shared::rules_json;
 use nrr_shared::RouteRole;
 use nrr_storage::revisions::RevisionsRepository;
 use rusqlite::Connection;
@@ -182,8 +181,11 @@ impl PresetExportSource for ProductionPresetExporter {
 
         // Wire-shape parse first; this catches malformed/older blobs
         // before the codec runs.
-        let dto = rules_json::from_canonical_string(&record.rules_json)
-            .map_err(|e| PresetExportError::DecodeError(format!("wire parse: {e}")))?;
+        let dto = crate::production_rules_provider::read_stored_rules(
+            &record.rules_json,
+            &record.revision_id,
+        )
+        .map_err(|e| PresetExportError::DecodeError(format!("wire parse: {e}")))?;
         // Names are spelled for the section they are written under.
         let platform = self
             .host_app_section
@@ -541,7 +543,7 @@ mod tests {
         seed_active_revision(
             &conn,
             RulesRevisionContent::new(CanonicalRuleBook {
-                primary: CanonicalRuleSet::from_rules(vec![app_rule("r-1", "telegram-desktop")]),
+                primary: CanonicalRuleSet::from_rules(vec![app_rule("r-1", "messenger-desktop")]),
                 secondary: CanonicalRuleSet::default(),
             }),
         );
@@ -556,7 +558,7 @@ mod tests {
             .expect("export");
         assert!(
             out.file_bytes_utf8
-                .contains("--- Linux\ntelegram-desktop\n"),
+                .contains("--- Linux\nmessenger-desktop\n"),
             "{}",
             out.file_bytes_utf8
         );
@@ -628,7 +630,7 @@ mod tests {
         assert!(
             out.file_bytes_utf8.starts_with(&format!(
                 "# NetRuleRouter preset \u{2014} version {}\n",
-                nrr_domain::rules_file::CURRENT_PRESET_FORMAT_VERSION
+                nrr_domain::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION
             )),
             "missing preset header; got:\n{}",
             out.file_bytes_utf8

@@ -187,11 +187,6 @@ QString NrrNativeBridge::rpcLogRetentionConfigSet(const QVariantMap &payload) {
                           QJsonObject::fromVariantMap(payload));
 }
 
-QString NrrNativeBridge::rpcApplyFailurePolicyGet() {
-    return emitRpcRequest(QStringLiteral("settings.apply-failure-policy.get"),
-                          QJsonObject());
-}
-
 QString NrrNativeBridge::rpcApplyFailurePolicySet(const QString &policy) {
     QJsonObject obj;
     obj.insert(QStringLiteral("policy"), policy);
@@ -217,10 +212,6 @@ QString NrrNativeBridge::rpcRoutingPauseToggle(bool paused, const QString &reaso
         obj.insert(QStringLiteral("reason"), reason);
     }
     return emitRpcRequest(QStringLiteral("routing.pause.toggle"), obj);
-}
-
-QString NrrNativeBridge::rpcAutostartGet() {
-    return emitRpcRequest(QStringLiteral("autostart.get"), QJsonObject());
 }
 
 QString NrrNativeBridge::rpcAutostartToggle(bool enabled) {
@@ -268,15 +259,17 @@ QString NrrNativeBridge::rpcMutationSubmit(const QString &mutationKind,
 }
 
 QString NrrNativeBridge::rpcRollbackRequest(const QString &targetRevisionId,
+                                           bool dryRun,
                                            const QString &confirmationToken) {
     QJsonObject obj;
     if (!targetRevisionId.isEmpty()) {
         obj.insert(QStringLiteral("target-revision-id"), targetRevisionId);
     }
+    obj.insert(QStringLiteral("dry-run"), dryRun);
     if (!confirmationToken.isEmpty()) {
         obj.insert(QStringLiteral("_envelope_confirmation_token"), confirmationToken);
     }
-    return emitRpcRequest(QStringLiteral("rollback.request"), obj);
+    return emitRpcRequest(QStringLiteral("revision.rollback.request"), obj);
 }
 
 QString NrrNativeBridge::rpcProductImpactDisable(const QString &reason,
@@ -291,14 +284,6 @@ QString NrrNativeBridge::rpcProductImpactDisable(const QString &reason,
     }
     return emitRpcRequest(
         QStringLiteral("product-impact.disable.temporary"), obj);
-}
-
-QString NrrNativeBridge::rpcPresetExport(const QString &route,
-                                        bool includeMetadata) {
-    QJsonObject obj;
-    obj.insert(QStringLiteral("route"), route);
-    obj.insert(QStringLiteral("include-metadata"), includeMetadata);
-    return emitRpcRequest(QStringLiteral("preset.export.get"), obj);
 }
 
 QString NrrNativeBridge::rpcSettingsExportFull(

@@ -260,6 +260,18 @@ pub fn classify_command_failure(outcome: &CommandOutcome, argv: &[String]) -> Se
     {
         return ServiceControlError::AccessDenied;
     }
+    // Checked before "not installed": with no systemd the bus error reads
+    // "No such file or directory", and every verb would say "install it first".
+    if text.contains("failed to connect to bus")
+        || text.contains("has not been booted with systemd")
+        || text.contains("systemd is not running")
+    {
+        return ServiceControlError::ManagerUnavailable {
+            detail: first_line(&outcome.stderr)
+                .unwrap_or("systemd is not running on this host")
+                .to_owned(),
+        };
+    }
     if text.contains("not found") || text.contains("no such file or directory") {
         return ServiceControlError::NotInstalled;
     }
@@ -275,6 +287,19 @@ pub fn classify_command_failure(outcome: &CommandOutcome, argv: &[String]) -> Se
 
 fn first_line(text: &str) -> Option<&str> {
     text.lines().map(str::trim).find(|l| !l.is_empty())
+}
+
+/// A `systemctl` that cannot even be started means there is no systemd here.
+fn classify_spawn_failure(err: &io::Error, argv: &[String]) -> ServiceControlError {
+    if err.kind() == io::ErrorKind::NotFound {
+        return ServiceControlError::ManagerUnavailable {
+            detail: format!(
+                "`{}` is not installed",
+                argv.first().map_or("", String::as_str)
+            ),
+        };
+    }
+    classify_io_failure(err, &format!("running `{}`", argv.join(" ")))
 }
 
 /// Turn a filesystem failure into the port's error taxonomy. Writing under
@@ -315,7 +340,7 @@ impl LinuxServiceControl {
         let outcome = self
             .ops
             .run(argv)
-            .map_err(|e| classify_io_failure(&e, &format!("running `{}`", argv.join(" "))))?;
+            .map_err(|e| classify_spawn_failure(&e, argv))?;
         if outcome.succeeded() {
             Ok(outcome)
         } else {
@@ -451,10 +476,18 @@ impl ServiceControlPort for LinuxServiceControl {
         // from the service, so registering a binary that lives in one produces
         // an install that reports success and a service that can never start.
         // The message names the way out, because the journal will only say 203.
-        if !crate::systemd::unit_can_execute(&spec.binary_path) {
+        if let Err(refusal) = crate::systemd::unit_can_execute(&spec.binary_path) {
+            let why = match refusal {
+                crate::systemd::UnitExecRefusal::HiddenByProtectHome => {
+                    "its unit hides the home directories (ProtectHome=yes)"
+                }
+                crate::systemd::UnitExecRefusal::Unrepresentable => {
+                    "a unit file cannot name that path (non-UTF-8, a control character or `$`)"
+                }
+            };
             return Err(ServiceControlError::Mechanism {
                 detail: format!(
-                    "the service cannot run from {}: its unit hides the home directories (ProtectHome=yes). Copy the binary somewhere system-wide, e.g. /usr/lib/{}/, and install it from there — scripts/install-service.sh does this.",
+                    "the service cannot run from {}: {why}. Copy the binary somewhere system-wide, e.g. /usr/lib/{}/, and install it from there — scripts/install-service.sh does this.",
                     spec.binary_path.display(),
                     nrr_shared::product_identity::PRODUCT_NAME_UNIX,
                 ),
@@ -495,7 +528,7 @@ impl ServiceControlPort for LinuxServiceControl {
         // behind, and nothing is left that would clear it. Same reason the
         // Windows port sweeps WFP and NRPT here.
         let machine_state_cleared = Some(sweep_nft_policy());
-        sweep_autostart_entry();
+        self.sweep_autostart_entries(&AutostartSweepEnv::from_process());
 
         if !spec.remove_service_owned_data {
             return Ok(ServiceUninstallReport {
@@ -544,7 +577,7 @@ impl ServiceControlPort for LinuxServiceControl {
         let outcome = self
             .ops
             .run(&argv)
-            .map_err(|e| classify_io_failure(&e, "querying the service registration"))?;
+            .map_err(|e| classify_spawn_failure(&e, &argv))?;
         if !outcome.succeeded() {
             return Err(classify_command_failure(&outcome, &argv));
         }
@@ -574,23 +607,67 @@ fn sweep_nft_policy() -> bool {
     true
 }
 
-/// Remove the autostart entry of whoever is running the removal.
-///
-/// Per-user by nature (an XDG desktop entry under the caller's `~/.config`),
-/// so this reaches exactly one home directory. Another account that enabled
-/// autostart keeps its file; the residue is inert, since it names a binary
-/// that no longer exists.
-fn sweep_autostart_entry() {
-    let Ok(registry) = crate::autostart::XdgAutostartRegistry::new() else {
-        return;
-    };
-    if let Err(e) = nrr_platform_api::autostart::AutostartRegistryPort::delete_value(&registry) {
-        tracing::debug!(
-            target: "nrr::autostart",
-            error = ?e,
-            "no autostart entry of ours to remove for this user",
-        );
+/// Whose tray autostart entry a removal sweeps.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AutostartSweepEnv {
+    /// `$XDG_CONFIG_HOME`, else `$HOME/.config`, of this process.
+    own_config_home: Option<PathBuf>,
+    /// `$SUDO_USER` or `$PKEXEC_UID`: the account that elevated, whose `$HOME`
+    /// this process no longer has.
+    invoker: Option<String>,
+}
+
+impl AutostartSweepEnv {
+    fn from_process() -> Self {
+        let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
+        Self {
+            own_config_home: var("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| var("HOME").map(|home| PathBuf::from(home).join(".config"))),
+            invoker: var("SUDO_USER").or_else(|| var("PKEXEC_UID")),
+        }
     }
+}
+
+impl LinuxServiceControl {
+    /// Remove the tray autostart entry of whoever asked for the removal.
+    ///
+    /// Under sudo or pkexec `$HOME` is root's, so the invoking account's entry
+    /// is found through its passwd home; left behind, every login would launch
+    /// a binary that is gone. Other accounts keep their entries.
+    fn sweep_autostart_entries(&self, env: &AutostartSweepEnv) {
+        let mut config_homes: Vec<PathBuf> = env.own_config_home.iter().cloned().collect();
+        if let Some(home) = env.invoker.as_deref().and_then(|who| self.home_of(who)) {
+            config_homes.push(home.join(".config"));
+        }
+        config_homes.dedup();
+        for config_home in config_homes {
+            let entry = config_home
+                .join("autostart")
+                .join(crate::autostart::AUTOSTART_DESKTOP_FILE);
+            if let Err(e) = self.ops.remove_file(&entry) {
+                tracing::debug!(
+                    target: "nrr::autostart",
+                    error = %e,
+                    "could not remove a tray autostart entry at uninstall",
+                );
+            }
+        }
+    }
+
+    /// The home directory the account database gives a user name or uid.
+    fn home_of(&self, who: &str) -> Option<PathBuf> {
+        let argv = ["getent", "passwd", who].map(String::from);
+        let outcome = self.ops.run(&argv).ok().filter(CommandOutcome::succeeded)?;
+        passwd_home(&outcome.stdout)
+    }
+}
+
+/// Field six of a `getent passwd` line. A relative or root-directory home is
+/// not one a desktop session keeps its autostart entries under.
+fn passwd_home(output: &str) -> Option<PathBuf> {
+    let home = output.lines().next()?.split(':').nth(5)?;
+    (home.starts_with('/') && home != "/").then(|| PathBuf::from(home))
 }
 
 #[cfg(test)]
@@ -884,7 +961,9 @@ mod tests {
         // because the registered ExecStart told us where the daemon lives.
         assert_eq!(
             ops.into_iter()
-                .filter(|o| !o.contains("show"))
+                .filter(|o| !o.contains("show")
+                    && !o.contains("autostart")
+                    && !o.contains("getent"))
                 .collect::<Vec<_>>(),
             vec![
                 "run systemctl disable --now netrulerouter.service".to_string(),
@@ -895,6 +974,53 @@ mod tests {
                 "run systemctl daemon-reload".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn an_elevated_removal_sweeps_the_invoking_users_autostart_entry() {
+        let (port, journal) = port_over(vec![(
+            "getent passwd alice",
+            ok("alice:x:1000:1000:Alice:/home/alice:/bin/bash\n"),
+        )]);
+        port.sweep_autostart_entries(&AutostartSweepEnv {
+            own_config_home: Some(PathBuf::from("/root/.config")),
+            invoker: Some("alice".into()),
+        });
+        assert_eq!(
+            recorded(&journal),
+            [
+                "run getent passwd alice",
+                "remove /root/.config/autostart/netrulerouter-tray.desktop",
+                "remove /home/alice/.config/autostart/netrulerouter-tray.desktop",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_invoker_leaves_only_the_own_entry_swept() {
+        let (port, journal) = port_over(vec![("getent", failed(2, ""))]);
+        port.sweep_autostart_entries(&AutostartSweepEnv {
+            own_config_home: Some(PathBuf::from("/root/.config")),
+            invoker: Some("1234".into()),
+        });
+        assert_eq!(
+            recorded(&journal),
+            [
+                "run getent passwd 1234",
+                "remove /root/.config/autostart/netrulerouter-tray.desktop",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_passwd_home_must_be_an_absolute_non_root_directory() {
+        assert_eq!(
+            passwd_home("u:x:1:1::/home/u:/bin/sh\n"),
+            Some(PathBuf::from("/home/u"))
+        );
+        assert_eq!(passwd_home("u:x:1:1::/:/bin/sh"), None);
+        assert_eq!(passwd_home("u:x:1:1::home/u:/bin/sh"), None);
+        assert_eq!(passwd_home(""), None);
     }
 
     #[test]
@@ -958,6 +1084,51 @@ mod tests {
                 "remove-tree /var/lib/netrulerouter".to_string(),
                 "remove-tree /var/log/netrulerouter".to_string(),
             ]
+        );
+    }
+
+    /// A container or WSL without systemd: the bus error contains "No such file
+    /// or directory", which used to read as "not installed" for every verb.
+    #[test]
+    fn a_host_without_systemd_is_not_told_the_service_is_missing() {
+        let no_bus = failed(
+            1,
+            "System has not been booted with systemd as init system (PID 1). Can't operate.\n\
+             Failed to connect to bus: No such file or directory",
+        );
+        let (port, _) = port_over(vec![("show", no_bus.clone())]);
+        assert!(matches!(
+            port.start(Duration::from_secs(1)),
+            Err(ServiceControlError::ManagerUnavailable { .. })
+        ));
+
+        // `install` writes the unit, then fails at daemon-reload the same way.
+        let (port, _) = port_over(vec![("daemon-reload", no_bus)]);
+        assert!(matches!(
+            port.install(&install_spec(ServiceStartMode::WithWindows)),
+            Err(ServiceControlError::ManagerUnavailable { .. })
+        ));
+
+        // Positive control: systemd answering "no such unit" is still that.
+        let argv = systemctl(&["show", SYSTEMD_UNIT_NAME]);
+        assert_eq!(
+            classify_command_failure(&failed(5, "Unit netrulerouter.service not found."), &argv),
+            ServiceControlError::NotInstalled
+        );
+    }
+
+    #[test]
+    fn a_missing_systemctl_binary_means_no_service_manager() {
+        let argv = systemctl(&["show", SYSTEMD_UNIT_NAME]);
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+        assert!(matches!(
+            classify_spawn_failure(&missing, &argv),
+            ServiceControlError::ManagerUnavailable { .. }
+        ));
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            classify_spawn_failure(&denied, &argv),
+            ServiceControlError::AccessDenied
         );
     }
 

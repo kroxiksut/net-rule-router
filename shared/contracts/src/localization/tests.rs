@@ -87,6 +87,48 @@ fn one_malformed_key_does_not_cost_the_whole_locale() {
     assert!(!broken.errors.is_empty());
 }
 
+/// A blank translation is a missing one: kept, it would shadow the English
+/// fallback and draw an empty button.
+#[test]
+fn a_blank_translation_is_dropped_so_the_key_falls_back() {
+    let parsed = json!({
+        "metadata": {
+            "language": "ru",
+            "label": "Russian",
+            "nativeLabel": "Русский",
+            "version": "1.0",
+            "fallbacks": ["en"]
+        },
+        "action": { "apply": "", "cancel": "  ", "close": "Закрыть" }
+    });
+    let mut subject = candidate("ru", &["en"], &[]);
+    subject.entries.clear();
+    validate_candidate_root(&parsed, &mut subject);
+
+    assert!(subject.errors.is_empty(), "{:?}", subject.errors);
+    assert!(!subject.entries.contains_key("action.apply"));
+    assert!(!subject.entries.contains_key("action.cancel"));
+    assert_eq!(
+        subject.entries.get("action.close").map(String::as_str),
+        Some("Закрыть")
+    );
+    assert!(
+        subject.warnings.iter().any(|w| w.contains("action.apply")),
+        "{:?}",
+        subject.warnings
+    );
+
+    let mut en = BTreeMap::new();
+    en.insert("action.apply".to_string(), "Apply".to_string());
+    let mut catalog = BTreeMap::new();
+    catalog.insert("en".to_string(), en);
+    catalog.insert("ru".to_string(), subject.entries.clone());
+    assert_eq!(
+        resolve_catalog_text(&catalog, "ru", "action.apply", "fallback"),
+        "Apply"
+    );
+}
+
 /// A user override is a second FILE for a language the bundle already
 /// ships, and the picker lists languages, not files.
 #[test]
@@ -373,4 +415,37 @@ fn duplicate_locale_ids_are_rejected_only_within_same_source() {
     assert_eq!(candidates[0].status(), LocaleLoadStatus::Rejected);
     assert_eq!(candidates[1].status(), LocaleLoadStatus::Rejected);
     assert_ne!(candidates[2].status(), LocaleLoadStatus::Rejected);
+}
+
+/// The validator is the only definition of a well-formed locale file, so the
+/// shipped locales and the example handed to translators must pass it clean:
+/// no error, and no warning (a warning means a key was ignored).
+#[test]
+fn shipped_locales_and_the_translator_example_pass_the_validator_clean() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let scratch = tempfile::tempdir().expect("tempdir");
+    // The locale id comes from the file name, so the example is judged as the
+    // `en.json` a translator would save it as.
+    let example = scratch.path().join("en.json");
+    std::fs::copy(
+        repo.join("configs/localization/locale.v1.example.json"),
+        &example,
+    )
+    .expect("copy example");
+
+    for path in [
+        repo.join("locales/en.json"),
+        repo.join("locales/ru.json"),
+        example,
+    ] {
+        let candidate = read_locale_candidate(&path, LocaleSource::Bundled)
+            .unwrap_or_else(|| panic!("{} is not read as a locale", path.display()));
+        assert!(
+            candidate.errors.is_empty() && candidate.warnings.is_empty(),
+            "{}: errors {:?}, warnings {:?}",
+            path.display(),
+            candidate.errors,
+            candidate.warnings
+        );
+    }
 }

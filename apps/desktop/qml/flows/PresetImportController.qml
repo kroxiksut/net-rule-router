@@ -826,6 +826,16 @@ QtObject {
     /// already-base64-wrapped preset file body (read by
     /// `nrrNativeBridge.readFileBytes`). `sourcePath` is stashed so
     /// the review flow can save it into `UiPreferences::last_saved_path_<role>`.
+    /// A refused import has an empty diff; saying "Nothing to apply" and
+    /// binding its files as matching would call it in force. True when refused.
+    function _announcePreviewRefusal(summary) {
+        var refusal = Pure.previewRefusal(summary)
+        if (!refusal) return false
+        root.statusLine = root.tr("status.preset-import-failed", "Failed to import preset: ")
+            + root.previewRefusalText(refusal)
+        return true
+    }
+
     function startPresetImportReviewFlow(targetRoute, bytesB64, sourcePath, mode, options) {
         if (!root.bridgeAvailable) {
             console.log("preset-import: bridge unavailable, aborting")
@@ -875,6 +885,7 @@ QtObject {
             }
             var summary = (p && p["review-summary"]) || p || {}
             var token = (p && p["confirmation-token"]) || ""
+            if (_announcePreviewRefusal(summary)) return
             // Re-importing a preset that already
             // matches the active rules yields an empty diff (content-based
             // diff, domain fix same day). Surface a plain notice instead of an
@@ -985,6 +996,7 @@ QtObject {
             }
             var summary = (p && p["review-summary"]) || p || {}
             var token = (p && p["confirmation-token"]) || ""
+            if (_announcePreviewRefusal(summary)) return
             // No-op re-import → plain notice
             // instead of an empty review dialog (see single-route variant).
             if (Pure.reviewSummaryIsEmpty(summary)) {
@@ -1063,56 +1075,58 @@ QtObject {
             }
             if (!ok) {
                 console.log("preset-import: activate failed:", code, msg)
-                // Preset import is per-principal (user-scoped,
-                // non-elevated), so `forbidden` no longer means "needs admin"
-                // — it's the mutation gate (e.g. an unacknowledged security
-                // alert). Route every failure through the generic localized
-                // error label rather than the old "re-launch as Admin" hint.
-                root.statusLine = root.tr("status.preset-import-failed",
-                    "Failed to import preset: ") +
-                    ((typeof root.ipcErrorLabel === "function")
-                        ? root.ipcErrorLabel(String(code || "unknown"))
-                        : String(code || "unknown"))
+                _announcePresetImportFailed(code)
                 return
             }
-            // Preset import is user-scoped (non-elevated):
-            // success no longer implies the elevation broker engaged, so we
-            // do NOT flip `_brokerSessionElevated` here (it's driven only by
-            // genuinely elevated service ops via `onBrokerSessionEstablished`).
-            // Share the same summary
-            // composer the offline path uses. We re-parse the same
-            // bytes locally to (a) capture passthrough sections for
-            // sidecar persistence, and (b) compute a user-facing
-            // rules count. `skipApply: true` because the service
-            // will fan the activated revision back via snapshot
-            // push; touching rulesModel here would race with it.
-            _refreshRulesAfterPresetImport(root.pendingPresetImportState, {
-                skipApply: true,
-                onComplete: function(summary) {
-                    var base = root.tr("status.preset-import-completed",
-                        "Preset imported and activated ({count} rules).")
-                        .replace("{count}", String(summary.rulesCount))
-                    root.statusLine = base
-                        + _formatImportPassthroughSuffix(summary.passthroughByRoute)
-                        + _formatNewerFormatSuffix()
-                }
-            })
-            // After successful activation the in-memory rules match
-            // what the service has — drop the dirty flag (mirrors the
-            // RulesUpdate path).
-            root.setUnsavedChanges("rules", false)
-            // Authoritatively rebind the
-            // table to the just-activated revision. The import payload is
-            // file bytes that never populated rulesModel locally
-            // (`skipApply: true` above), so without this the table keeps
-            // showing the PRE-import rows until the next launch.
-            // Idempotent with the `revision-status-changed` push.
-            root._refreshRulesFromService({ silent: true })
-            // Record path + clear dirty flags for the
-            // routes the import covered. `pendingPresetImportState`
-            // carries the import scope (single-route or both).
-            _bindImportedSourcePaths(root.pendingPresetImportState)
+            // The confirm only accepts the import; its verdict is on the
+            // operation record.
+            root.rpc.readMutationOutcome(p, root.rpc.settleByPreview("preset-import", payload),
+                function(failure) {
+                    if (failure === "") {
+                        _completePresetImportActivation(st)
+                        return
+                    }
+                    console.log("preset-import: import refused:", failure)
+                    // Nothing was imported: the edits flag and the file
+                    // bindings keep describing what is in force.
+                    _announcePresetImportFailed(failure)
+                })
         })
+    }
+
+    // Preset import is per-principal (user-scoped, non-elevated), so a
+    // `forbidden` is the mutation gate (e.g. an unacknowledged security
+    // alert), not missing rights.
+    function _announcePresetImportFailed(code) {
+        root.statusLine = root.tr("status.preset-import-failed",
+            "Failed to import preset: ") +
+            ((typeof root.ipcErrorLabel === "function")
+                ? root.ipcErrorLabel(String(code || "unknown"))
+                : String(code || "unknown"))
+    }
+
+    function _completePresetImportActivation(st) {
+        // The re-parse of the same bytes captures passthrough sections for the
+        // sidecar and the rules count. `skipApply`: the service fans the
+        // activated revision back itself, and touching rulesModel here would
+        // race with it.
+        _refreshRulesAfterPresetImport(st, {
+            skipApply: true,
+            onComplete: function(summary) {
+                var base = root.tr("status.preset-import-completed",
+                    "Preset imported and activated ({count} rules).")
+                    .replace("{count}", String(summary.rulesCount))
+                root.statusLine = base
+                    + _formatImportPassthroughSuffix(summary.passthroughByRoute)
+                    + _formatNewerFormatSuffix()
+            }
+        })
+        // The in-memory rules now match what the service has.
+        root.setUnsavedChanges("rules", false)
+        // The import never populated rulesModel locally, so rebind the table
+        // to the activated revision (idempotent with the push).
+        root._refreshRulesFromService({ silent: true })
+        _bindImportedSourcePaths(st)
     }
 
 }

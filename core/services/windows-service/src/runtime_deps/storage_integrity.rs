@@ -1,7 +1,7 @@
 //! Storage integrity: the row-MAC signing key and the coordinator that uses it.
 //!
 //! Carved out of [`super::build_supervised_runtime_deps`] because its
-//! interface is narrow — nine values in, two out — worth naming explicitly.
+//! interface is narrow — ten values in, two out — worth naming explicitly.
 //! Nothing here touches Windows: the DPAPI-backed key store is the
 //! OS-specific part, and it lives behind a port.
 
@@ -13,6 +13,7 @@ pub(super) struct StorageIntegrityInputs<'a> {
     pub settings_conn: Option<Arc<Mutex<Connection>>>,
     pub cache_store: Option<Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>>,
     pub event_bus: Arc<EventBus>,
+    pub health_agg: Arc<HealthAggregator>,
     pub sid_registry: Arc<ActiveSidRegistry>,
     pub id_generator: Arc<ProductionIdGenerator>,
     pub per_sid_orchestrator: Option<Arc<PerSidApplyOrchestrator>>,
@@ -37,6 +38,7 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
         settings_conn,
         cache_store,
         event_bus,
+        health_agg,
         sid_registry,
         id_generator,
         per_sid_orchestrator,
@@ -49,13 +51,34 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
     // store, verify existing revisions, and raise tamper / key-reset
     // alerts. The returned key is threaded into the
     // ActivationCoordinator below so every revision write is signed.
-    // Best effort: a bootstrap failure (or a non-Windows build with no
-    // DPAPI) logs and degrades to unsigned operation — routing is
-    // independent of this integrity scan.
+    // A failure degrades to unsigned operation and is raised as an alert,
+    // audited, and named in service health.
     let key_store = production_key_store();
-    let tamper_bootstrap = settings_conn
-        .as_ref()
-        .and_then(|conn| run_db_mac_tamper_bootstrap(conn, key_store.as_ref()));
+    let alerts_repo: Option<Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>> =
+        settings_conn.as_ref().map(|conn| {
+            Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(conn)))
+                as Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>
+        });
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let boot_integrity =
+        alerts_repo.as_ref().map(
+            |alerts| nrr_service_runtime::boot_integrity::BootIntegrity {
+                alerts,
+                audit: artifacts
+                    .audit_writer
+                    .as_deref()
+                    .map(|w| w as &nrr_service_runtime::boot_integrity::AuditTrail),
+                health: health_agg.as_ref(),
+                now_ms,
+            },
+        );
+    let tamper_bootstrap = match (boot_integrity.as_ref(), settings_conn.as_ref()) {
+        (Some(integrity), Some(conn)) => integrity.bootstrap(conn, key_store.as_ref()),
+        _ => None,
+    };
     let tamper_signing_key: Option<Vec<u8>> =
         tamper_bootstrap.as_ref().map(|o| o.signing_key.clone());
     // Keyed follow-up to the keyless boot sweep: signed candidate rows
@@ -124,8 +147,7 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
                 startup_failure_policy,
             );
             // Sign revision rows when the tamper bootstrap produced a key.
-            // Without it the coordinator runs unsigned (back-compat /
-            // non-Windows / bootstrap error).
+            // Without it the coordinator runs unsigned (reported above).
             if let Some(key) = tamper_signing_key.clone() {
                 coordinator = coordinator
                     .with_signing_key(key)
@@ -150,33 +172,32 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
     // reached `revisions` outside the app is rolled back to the last
     // trusted revision here instead of being enforced as-is. No bootstrap
     // outcome means no key, and an unsigned coordinator has nothing to verify.
-    if let (Some(coord), Some(conn), Some(bootstrap)) = (
+    if let (Some(coord), Some(integrity), Some(bootstrap)) = (
         activation_coordinator.as_ref(),
-        settings_conn.as_ref(),
+        boot_integrity.as_ref(),
         tamper_bootstrap.as_ref(),
     ) {
-        run_active_integrity_enforcement(coord, conn, bootstrap);
+        integrity.enforce_active(coord, bootstrap);
     }
 
-    // Build the rule author, now that the activation coordinator exists.
-    // Shared by the companion-domain engine's `accept` path AND the
-    // "route this blocked host" notice action: both go through the ORDINARY
-    // mutation executor, so an authored rule passes the same Free rule cap,
-    // tamper gate, revision audit and push events a rule the user typed does
-    // — the reason on the rule is the only difference. A dedicated executor
-    // instance rather than the handler-registry one below: that one is built
-    // inline inside `IpcHandlerDeps::new`, and the extra wiring it carries
-    // (`recovery_audit_sink` for safe-disable, `alerts_repo` for alert
-    // ack/resolve) governs mutation kinds this path never submits.
+    // The rule author behind companion-domain acceptance and the "route this
+    // blocked host" notice action. It submits through the ordinary mutation
+    // executor, so an authored rule meets the same rule cap, gates, revision
+    // audit and push events a typed rule does. A dedicated executor instance:
+    // the handler-registry one is built inside `IpcHandlerDeps::new`.
     let block_notice_rule_author: Option<Arc<dyn nrr_service_runtime::auto_rules::AutoRuleAuthor>> =
         match (activation_coordinator.as_ref(), settings_conn.as_ref()) {
             (Some(coord), Some(conn)) => {
+                // No IPC handler stands in front of the author, so both gates
+                // the executor enforces — the administrative rules lock and the
+                // tamper gate — must be wired here or this path goes around them.
                 let executor = ProductionMutationExecutor::new(Arc::clone(coord))
                     .with_state_conn(Arc::clone(conn))
                     .with_event_bus(Arc::clone(&event_bus))
-                    // The author reaches the executor without passing any IPC
-                    // handler, so the administrative rules lock has to be wired
-                    // here too or this path would be the way around it.
+                    .with_alerts_repo(Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(
+                        conn,
+                    )))
+                        as Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>)
                     .with_stability_provider(Arc::new(ProductionServiceStability::new(Arc::clone(
                         conn,
                     )))

@@ -22,7 +22,7 @@ impl SnapshotDiagnosticsHandler {
 }
 
 impl IpcHandler for SnapshotDiagnosticsHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let _req: SnapshotDiagnosticsRequest = if request.payload.is_null() {
             SnapshotDiagnosticsRequest::default()
         } else {
@@ -33,7 +33,7 @@ impl IpcHandler for SnapshotDiagnosticsHandler {
             })?
         };
 
-        let status = self.diagnostics.get_status();
+        let status = self.diagnostics.get_status(&ctx.diagnostics_audience());
         // TODO: when `_req.include_explain_sample` is true,
         // call `diagnostics.get_explain(ExplainQuery::Synthetic { ... })`
         // and embed the response. Today no synthetic input is available

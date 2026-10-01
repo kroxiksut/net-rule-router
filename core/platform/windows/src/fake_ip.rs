@@ -42,6 +42,11 @@ use nrr_platform_api::third_party::{
     ThirdPartyComponent, ThirdPartyComponentStatus, ThirdPartyIntegrityPort, WINTUN_COMPONENT,
 };
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod packet_relay;
+#[cfg(target_os = "windows")]
+use packet_relay::Drained;
+
 /// Environment override for the DLL location.
 pub const WINTUN_DLL_ENV: &str = "NRR_WINTUN_DLL";
 
@@ -189,7 +194,11 @@ mod windows_impl {
     use nrr_platform_api::error::PlatformError;
     use nrr_platform_api::third_party::SignatureStatus;
 
+    use super::packet_relay::{packet_relay, Drained, PacketDrain, PacketFeeder};
     use super::WINTUN_COMPONENT;
+
+    /// Inbound packets in flight between the reader thread and the poll loop.
+    const INBOUND_QUEUE_DEPTH: usize = 256;
 
     /// Load the driver through its published API. The ONE `unsafe` call in the
     /// fake-IP Windows path.
@@ -271,7 +280,9 @@ mod windows_impl {
         _adapter: Arc<wintun_bindings::Adapter>,
         mtu: u16,
         shutdown: Arc<AtomicBool>,
-        inbound: std::sync::mpsc::Receiver<Vec<u8>>,
+        // `None` only while dropping: releasing it unblocks a reader waiting
+        // for a free buffer.
+        inbound: Option<PacketDrain>,
         reader: Option<std::thread::JoinHandle<()>>,
         waker: ReadableWaker,
     }
@@ -284,14 +295,14 @@ mod windows_impl {
         ) -> Self {
             let shutdown = Arc::new(AtomicBool::new(false));
             let waker: ReadableWaker = Arc::new(std::sync::Mutex::new(None));
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let (mut feeder, drain) = packet_relay(INBOUND_QUEUE_DEPTH, usize::from(mtu));
             let reader = std::thread::Builder::new()
                 .name("nrr-wintun-read".to_string())
                 .spawn({
                     let session = Arc::clone(&session);
                     let shutdown = Arc::clone(&shutdown);
                     let waker = Arc::clone(&waker);
-                    move || run_reader(&session, &shutdown, &tx, &waker)
+                    move || run_reader(&session, &shutdown, &mut feeder, &waker)
                 })
                 .ok();
             if reader.is_none() {
@@ -306,7 +317,7 @@ mod windows_impl {
                 _adapter: adapter,
                 mtu,
                 shutdown,
-                inbound: rx,
+                inbound: Some(drain),
                 reader,
                 waker,
             }
@@ -320,10 +331,11 @@ mod windows_impl {
             self.mtu
         }
 
-        pub(super) fn pop_inbound(
-            &self,
-        ) -> std::result::Result<Vec<u8>, std::sync::mpsc::TryRecvError> {
-            self.inbound.try_recv()
+        pub(super) fn drain_inbound(&self, buf: &mut [u8]) -> Drained {
+            match &self.inbound {
+                Some(drain) => drain.drain_into(buf),
+                None => Drained::Disconnected,
+            }
         }
 
         pub(super) fn store_waker(&self, hint: Arc<dyn Fn() + Send + Sync>) {
@@ -353,6 +365,7 @@ mod windows_impl {
             // event pair) and reap it so no thread outlives the device.
             self.shutdown.store(true, Ordering::SeqCst);
             let _ = self.session.shutdown();
+            self.inbound = None;
             if let Some(handle) = self.reader.take() {
                 let _ = handle.join();
             }
@@ -366,7 +379,7 @@ mod windows_impl {
     fn run_reader(
         session: &Arc<wintun_bindings::Session>,
         shutdown: &AtomicBool,
-        tx: &std::sync::mpsc::Sender<Vec<u8>>,
+        feeder: &mut PacketFeeder,
         waker: &ReadableWaker,
     ) {
         // Ring packets are MTU-bound, but size for the maximum IP datagram so a
@@ -379,7 +392,7 @@ mod windows_impl {
             match session.recv(&mut buf) {
                 Ok(0) => continue,
                 Ok(len) => {
-                    if tx.send(buf[..len].to_vec()).is_err() {
+                    if feeder.push(&buf[..len]).is_err() {
                         // Device dropped — nobody is reading anymore.
                         return;
                     }
@@ -512,23 +525,21 @@ impl TunDevice for windows_impl::WintunDevice {
         if self.is_shutting_down() {
             return Ok(0);
         }
-        match self.pop_inbound() {
-            Ok(packet) => {
-                if packet.len() > buf.len() {
-                    tracing::warn!(
-                        target: "nrr::fake-ip",
-                        msg_key = "win-fakeip-packet-too-large",
-                        packet_len = packet.len(),
-                        buf_len = buf.len(),
-                        "inbound TUN packet exceeds the read buffer — dropped",
-                    );
-                    return Ok(0);
-                }
-                buf[..packet.len()].copy_from_slice(&packet);
-                Ok(packet.len())
+        let buf_len = buf.len();
+        match self.drain_inbound(buf) {
+            Drained::Packet(len) => Ok(len),
+            Drained::TooLarge { packet_len } => {
+                tracing::warn!(
+                    target: "nrr::fake-ip",
+                    msg_key = "win-fakeip-packet-too-large",
+                    packet_len,
+                    buf_len,
+                    "inbound TUN packet exceeds the read buffer — dropped",
+                );
+                Ok(0)
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(0),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Drained::Empty => Ok(0),
+            Drained::Disconnected => {
                 if self.is_shutting_down() {
                     Ok(0)
                 } else {

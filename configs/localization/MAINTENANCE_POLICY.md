@@ -1,4 +1,4 @@
-# Localization And Theme Maintenance Policy (Block 3.9)
+# Localization And Theme Maintenance Policy
 
 This document fixes operational rules for evolving UI text and theme resources.
 

@@ -444,14 +444,14 @@ mod tests {
     fn a_mapped_fake_address_relays_to_the_real_host_on_its_route() {
         let (allocator, fake) = allocator_with("assistant.example");
         let resolver =
-            StaticUpstreamResolver::new().with("assistant.example", &[ip("23.10.20.140")]);
+            StaticUpstreamResolver::new().with("assistant.example", &[ip("203.0.113.140")]);
         let relay = core(allocator, resolver, RouteRole::Secondary);
 
         let decision = relay.decide(&packet(SocketAddr::new(fake, 443), true));
         match decision {
             RelayDecision::Relay { hostname, target } => {
                 assert_eq!(hostname, "assistant.example");
-                assert_eq!(target.address, "23.10.20.140:443".parse().ok());
+                assert_eq!(target.address, "203.0.113.140:443".parse().ok());
                 assert_eq!(target.route, RouteRole::Secondary);
             }
             other => panic!("expected a relay decision, got {other:?}"),
@@ -497,7 +497,7 @@ mod tests {
     fn traffic_to_a_real_address_is_not_ours() {
         let (allocator, _) = allocator_with("assistant.example");
         let relay = core(allocator, StaticUpstreamResolver::new(), RouteRole::Primary);
-        let decision = relay.decide(&packet("23.10.20.78:443".parse().expect("addr"), true));
+        let decision = relay.decide(&packet("203.0.113.78:443".parse().expect("addr"), true));
         assert_eq!(decision, RelayDecision::NotFakeAddress);
     }
 
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn a_primary_routed_flow_never_pays_for_an_owner_lookup() {
         let (allocator, fake) = allocator_with("example.com");
-        let resolver = StaticUpstreamResolver::new().with("example.com", &[ip("23.10.20.138")]);
+        let resolver = StaticUpstreamResolver::new().with("example.com", &[ip("203.0.113.138")]);
         let relay = core(allocator, resolver, RouteRole::Primary)
             .with_vpn_client_bypass(Arc::new(NeverAsked));
         assert!(matches!(
@@ -622,7 +622,7 @@ mod tests {
         let (allocator, fake) = allocator_with("example.com");
         // Only an IPv6 upstream is known, but the app dialled the v4 fake
         // address — there is nothing legitimate to connect to.
-        let resolver = StaticUpstreamResolver::new().with("example.com", &[ip("2606:4700::1111")]);
+        let resolver = StaticUpstreamResolver::new().with("example.com", &[ip("2001:db8::1111")]);
         let relay = core(allocator, resolver, RouteRole::Primary);
         assert!(matches!(
             relay.decide(&packet(SocketAddr::new(fake, 443), true)),
@@ -634,7 +634,7 @@ mod tests {
     fn a_policy_change_that_excludes_the_host_stops_new_flows() {
         let (allocator, fake) = allocator_with("assistant.example");
         let resolver =
-            StaticUpstreamResolver::new().with("assistant.example", &[ip("23.10.20.140")]);
+            StaticUpstreamResolver::new().with("assistant.example", &[ip("203.0.113.140")]);
         let relay = RelayCore::new(
             allocator,
             FakeIpScope::enabled(["assistant.example"]),

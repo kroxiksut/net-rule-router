@@ -18,6 +18,7 @@ use nrr_shared::product_identity::BinaryRole;
 
 use nrr_desktop_gui::app_shell::{parse_launch_request_arguments, LaunchRequest};
 use nrr_desktop_gui::ui_surface::apply_qt_preferences_payload as apply_qt_payload;
+use nrr_ui_support::tray::TrayStatusKind;
 use nrr_ui_support::ui_preferences::{SessionPreferences, UiPreferences, UiPreferencesStore};
 
 mod child_process;
@@ -26,16 +27,17 @@ mod diag_log;
 mod resolve;
 mod single_instance;
 
-pub use child_process::path_to_file_url;
 pub use context::cold_start_section;
 pub(crate) use diag_log::{diag_log, user_diagnostics_dir};
+pub use nrr_desktop_gui::ui_surface::path_to_file_url;
 pub use resolve::resolve_native_host_executable;
+pub(crate) use resolve::sibling_service_binary;
 pub use single_instance::SingleInstanceGuard;
 
 use child_process::{apply_no_window, spawn_line_reader};
-use context::{cleanup_temp_leftovers, emit_context};
+use context::{cleanup_temp_leftovers, emit_context, take_tray_status_argument};
 use diag_log::{diag_log_path, rotate_session_log, surface_tag};
-use resolve::{resolve_native_icon_path, resolve_qml_path, sibling_service_binary};
+use resolve::{resolve_native_icon_path, resolve_qml_path};
 use single_instance::{
     foreign_build_in_lock, is_process_alive, lock_file_path, parse_pid_from_lock_content,
 };
@@ -104,21 +106,32 @@ pub fn run(config: LauncherConfig) -> ExitCode {
         return nrr_broker::run_broker_server(broker_args);
     }
 
+    let (tray_status, cli_args) = take_tray_status_argument(config.surface, cli_args);
+
     install_system_theme_port();
+    install_system_locale_port();
     cleanup_temp_leftovers();
-    // Once-a-day GitHub release check, main GUI only (the tray rides the
-    // same cache). Detached background thread: never blocks launch, 5 s
-    // network timeout, skipped while the last check is younger than 24 h.
-    // The result surfaces as a notification on the next start (the context
-    // is built before the fetch can finish — deliberate).
-    if config.surface == LauncherSurface::MainGui {
-        crate::update_check_fetch::spawn_daily_release_check();
-    }
     let launch_request = parse_launch_request_arguments(cli_args);
     let (store, preferences) = load_preferences_with_fallback();
+    // Main GUI only (the tray rides the same cache). Never blocks launch; the
+    // result surfaces on the next start, since the context is built before
+    // the fetch can finish.
+    if config.surface == LauncherSurface::MainGui {
+        crate::update_check_fetch::spawn_scheduled_release_check(
+            preferences.update_check_enabled,
+            preferences.update_check_interval_days,
+        );
+    }
 
     match SingleInstanceGuard::acquire(config.single_instance_key) {
-        Ok(Some(guard)) => run_primary(&config, store, preferences, launch_request, guard),
+        Ok(Some(guard)) => run_primary(
+            &config,
+            store,
+            preferences,
+            launch_request,
+            tray_status,
+            guard,
+        ),
         Ok(None) => match run_secondary(&config, &launch_request) {
             SecondaryOutcome::Handled(code) => code,
             // The lock owner never picked the activation up, so it cannot show a
@@ -126,13 +139,20 @@ pub fn run(config: LauncherConfig) -> ExitCode {
             // click that does nothing.
             SecondaryOutcome::TakeOver => {
                 match SingleInstanceGuard::reclaim(config.single_instance_key) {
-                    Ok(guard) => run_primary(&config, store, preferences, launch_request, guard),
+                    Ok(guard) => run_primary(
+                        &config,
+                        store,
+                        preferences,
+                        launch_request,
+                        tray_status,
+                        guard,
+                    ),
                     Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
                         // The owner is alive and still holds the OS claim; it is
                         // busy, not gone. A second primary here would be worse
                         // than no window.
                         eprintln!(
-                            "nrr-launcher: {} is already running but did not answer;                              not starting a second instance",
+                            "nrr-launcher: {} is already running but did not answer; not starting a second instance",
                             config.single_instance_key
                         );
                         ExitCode::FAILURE
@@ -165,6 +185,7 @@ fn run_primary(
     store: Option<UiPreferencesStore>,
     preferences: UiPreferences,
     request: LaunchRequest,
+    tray_status: Option<TrayStatusKind>,
     guard: SingleInstanceGuard,
 ) -> ExitCode {
     let tag = surface_tag(config.surface);
@@ -205,7 +226,7 @@ fn run_primary(
     crate::archive_localize::set_service_log_budget_mib(preferences.archive_log_budget_mib);
 
     // Pick the BackendFacade implementation honoured by the cold-start
-    // `write_qt_context_file_at`. NRR_BACKEND env var overrides the default
+    // `write_qt_context_file_at`. NRR_BACKEND (debug builds only) overrides the default
     // (`Ipc`); IPC mode probes the named pipe briefly and falls back to
     // mock + `Disconnected` on failure so the GUI can paint a status
     // banner without crashing.
@@ -225,7 +246,13 @@ fn run_primary(
         ),
     );
 
-    let context_file = match emit_context(config.surface, &preferences, &backend_bundle, &request) {
+    let context_file = match emit_context(
+        config.surface,
+        &preferences,
+        &backend_bundle,
+        &request,
+        tray_status,
+    ) {
         Ok(path) => path,
         Err(error) => {
             diag_log(
@@ -250,8 +277,7 @@ fn run_primary(
                 tag,
                 "nrr-launcher: `nrr_qt_native_host.exe` was not found. Build the \
                  `nrr-qt-host` crate (it owns the C++ Qt host build) and ensure \
-                 the artefact is adjacent to this binary or pointed to by \
-                 `NRR_QT_NATIVE_HOST_EXE`.",
+                 the artefact is adjacent to this binary.",
             );
             let _ = fs::remove_file(&context_file);
             return ExitCode::FAILURE;
@@ -286,7 +312,8 @@ fn run_primary(
 
     let mut host_arguments = vec![
         format!("--qml={}", qml_path.display()),
-        format!("--nrr-context-file={}", path_to_file_url(&context_file)),
+        // A plain path, like `--qml=`: nothing to encode or decode.
+        format!("--nrr-context-file={}", context_file.display()),
         // The host derives every lock and flag path from this. Passed rather
         // than recomputed there: the two sides agreed on Windows only because
         // both spelled `%TEMP%\NetRuleRouter`, and on Unix they would not —
@@ -645,6 +672,19 @@ fn install_system_theme_port() {
     ));
 }
 
+/// Wires the OS display-language probe into `nrr-ui-support`. Before the first
+/// preferences load: that load is what asks, and the answer is cached.
+fn install_system_locale_port() {
+    #[cfg(windows)]
+    nrr_ui_support::ui_preferences::install_system_locale_port(Box::new(
+        nrr_platform_windows::system_locale::WindowsSystemLocale,
+    ));
+    #[cfg(target_os = "linux")]
+    nrr_ui_support::ui_preferences::install_system_locale_port(Box::new(
+        nrr_platform_linux::system_locale::LinuxSystemLocale,
+    ));
+}
+
 /// How long to wait for the primary to answer, decided by whether it is still
 /// there to answer at all.
 fn activation_ack_budget(instance_key: &str) -> Duration {
@@ -736,7 +776,7 @@ fn load_preferences_with_fallback() -> (Option<UiPreferencesStore>, UiPreference
                 SessionPreferences::Writable { store, preferences } => (Some(store), preferences),
                 SessionPreferences::ReadOnly { preferences, error } => {
                     eprintln!(
-                        "nrr-launcher: failed to load UI preferences from {}: {error}                          — running read-only this session so the file is not overwritten",
+                        "nrr-launcher: failed to load UI preferences from {}: {error} — running read-only this session so the file is not overwritten",
                         path.display()
                     );
                     (None, preferences)

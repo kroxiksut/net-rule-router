@@ -1,4 +1,4 @@
-//! Block T — per-adapter traffic-statistics store (`nrr_traffic_stats.db`).
+//! Per-adapter traffic-statistics store (`nrr_traffic_stats.db`).
 //!
 //! Rebuildable SQLite store for the traffic counter: daily byte totals bucketed
 //! by route role, the friendly-name identity table, and the resume-safe counter
@@ -65,7 +65,7 @@ pub struct TrafficTotalRow {
     pub out_bytes: u64,
 }
 
-/// Block T Feature 2 — last observed local + external address for one
+/// Last observed local + external address for one
 /// adapter, from a USER-REQUESTED external-IP probe. `adapter_key` matches
 /// the traffic ledger's key (the OS friendly interface name) so a GUI row can
 /// be joined to its last-known addresses.
@@ -335,7 +335,7 @@ impl SqliteTrafficStore {
         tx.commit().map_err(db_err)
     }
 
-    /// Block T Feature 2 — records/refreshes the last observed local +
+    /// Records/refreshes the last observed local +
     /// external address for an adapter. Called only from a USER-REQUESTED
     /// external-IP probe (`interfaces.refresh`) — the routine sampler tick
     /// never calls this, so a row's presence always means the user explicitly
@@ -780,7 +780,7 @@ mod tests {
         assert_eq!(store.adapter_address("eth0").expect("addr"), None);
     }
 
-    // ── adapter_addresses (Block T Feature 2) ────────────────────────────────
+    // ── adapter_addresses ────────────────────────────────────────────────────
 
     #[test]
     fn adapter_address_absent_when_never_recorded() {

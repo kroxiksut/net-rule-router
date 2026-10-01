@@ -6,8 +6,8 @@
 //!
 //! These map 1:1 to four scenarios:
 //!
-//! 1. External tamper → load continues, alert raised, ack re-signs and
-//!    the table "heals" (next boot is clean).
+//! 1. External tamper → load continues, alert raised, ack re-signs the
+//!    shown row and the table "heals" (next boot is clean).
 //! 2. Key deleted + revisions non-empty → silent key regen, blocking
 //!    alert, mutations gated.
 //! 3. Key deleted + revisions empty → silent regen, no alert (fresh
@@ -31,7 +31,9 @@ use nrr_service_runtime::ProductionSecurityAlertsRepository;
 use nrr_storage::migration::SqliteMigrationRunner;
 use nrr_storage::repository::MigrationRunner;
 use nrr_storage::revision_hmac::HmacVerification;
-use nrr_storage::revisions::{RevisionRecord, RevisionsRepository};
+use nrr_storage::revisions::{
+    AdoptionOutcome, AdoptionRequest, RevisionRecord, RevisionsRepository,
+};
 use rusqlite::Connection;
 
 const NOW: i64 = 1_745_000_000_000;
@@ -148,8 +150,8 @@ fn scenario_3_fresh_install_silent() {
 }
 
 /// Scenario 4: full acknowledge cycle. After a tamper alert, the user
-/// acknowledges (which re-signs the table — modelled here via the same
-/// `re_sign_all` the executor's ack path calls); a subsequent restart
+/// acknowledges (which adopts the row it was shown — modelled here via the
+/// same `adopt_rows` the executor's ack path calls); a subsequent restart
 /// finds the table clean, raises no new alert, and the gate is clear.
 #[test]
 fn scenario_4_ack_re_signs_and_restart_is_clean() {
@@ -175,9 +177,7 @@ fn scenario_4_ack_re_signs_and_restart_is_clean() {
         .clone();
 
     // User acknowledges: the alert transitions to Acknowledged and the
-    // service re-signs the table (this is exactly what the
-    // `ProductionMutationExecutor` ack path does via
-    // `coordinator.re_sign_all_revisions`).
+    // service re-signs the row it showed.
     repo.update_state(
         &alert_id,
         SecurityAlertState::Acknowledged,
@@ -189,12 +189,17 @@ fn scenario_4_ack_re_signs_and_restart_is_clean() {
     {
         let g = conn.lock().unwrap();
         let signed = RevisionsRepository::with_signing_key(&g, key());
-        let report = signed.re_sign_all().unwrap();
-        assert_eq!(report.re_signed, 1);
-        // The row was tampered with, so this is an ADOPTION, and the report
-        // names it — the acknowledgement flow logs that rather than reporting a
-        // bare row count.
-        assert_eq!(report.adopted_tampered.len(), 1);
+        let scan = signed.integrity_scan().unwrap();
+        let row = scan.iter().find(|r| r.revision_id() == "rev-1").unwrap();
+        let outcomes = signed
+            .adopt_rows(&[AdoptionRequest {
+                kind: row.kind(),
+                principal: &row.principal,
+                revision_id: row.revision_id(),
+                fingerprint: &row.fingerprint,
+            }])
+            .unwrap();
+        assert_eq!(outcomes, vec![AdoptionOutcome::Adopted]);
     }
     // Gate lifts immediately after ack.
     assert!(!mutations_blocked_by_alert(repo.as_ref()));

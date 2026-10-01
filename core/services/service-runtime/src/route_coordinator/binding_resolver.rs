@@ -116,7 +116,7 @@ pub(super) fn binding_matches_live(
 /// `true` when a whitespace token of an adapter friendly name is purely a
 /// version designator (all digits/dots, optionally a leading `v`): "3.0",
 /// "4.1", "v3", "2". VPN vendors bump these across reinstalls/upgrades
-/// ("swiftvpn VPN OpenVPN Adapter" ↔ "SwiftVPN 3.0 OpenVPN
+/// ("examplevpn VPN OpenVPN Adapter" ↔ "ExampleVPN 3.0 OpenVPN
 /// Adapter"), so a version token must never participate in identity matching.
 pub(super) fn is_version_token(token: &str) -> bool {
     let stripped = token.trim_start_matches(['v', 'V']);
@@ -143,11 +143,11 @@ pub(super) const GENERIC_NAME_TOKENS: &[&str] = &[
 /// stable "family" identity of an adapter description.
 ///
 /// Splits on `_` and `-` as well as whitespace: a vendor writes the same name
-/// both ways across its own products ("swiftvpn VPN OpenVPN Adapter" for
-/// the TAP device, "swiftvpn_VPN" for the WireGuard one), and treating the
+/// both ways across its own products ("examplevpn VPN OpenVPN Adapter" for
+/// the TAP device, "examplevpn_VPN" for the WireGuard one), and treating the
 /// underscore spelling as one opaque token left the family match blind exactly
 /// when the user switched transport. `.` stays a word character — it belongs to
-/// brand names like "swiftvpn".
+/// brand names like "examplevpn".
 pub(super) fn core_tokens(name: &str) -> Vec<String> {
     name.split(|c: char| c.is_whitespace() || c == '_' || c == '-')
         .filter(|t| !t.is_empty() && !is_version_token(t))
@@ -160,7 +160,7 @@ pub(super) fn core_tokens(name: &str) -> Vec<String> {
 /// the SAME adapter family, ignoring version tokens.
 ///
 /// Both sides are reduced to their version-stripped core token set (so
-/// "swiftvpn VPN OpenVPN Adapter" and "SwiftVPN 3.0 OpenVPN Adapter"
+/// "examplevpn VPN OpenVPN Adapter" and "ExampleVPN 3.0 OpenVPN Adapter"
 /// reduce to the same family), then matched by **symmetric** containment:
 /// either core set is a subset of the other. A one-directional subset test
 /// misses the case where the SAVED name carries the version token and the
@@ -332,7 +332,7 @@ pub(super) fn preferred_display_name(info: &AdapterInfo) -> &str {
 /// gateway list and the adapter-gateway lookup finds nothing, even though
 /// the link is up and routing fine. We reuse that peer as the next-hop for
 /// our `/32` overlays so matched traffic travels exactly like the VPN's own
-/// redirected traffic. (Observed on a live swiftvpn OpenVPN link:
+/// redirected traffic. (Observed on a live examplevpn OpenVPN link:
 /// `0.0.0.0/1 -> 10.91.192.1` with no adapter gateway.)
 ///
 /// Default-style routes on `ifindex` with a real (non-unspecified,
@@ -373,14 +373,20 @@ pub(super) fn derive_secondary_next_hop_v6(
 /// adapter. So when no primary is explicitly bound we fall back to the real
 /// internet gateway: the lowest-metric `0.0.0.0/0` whose interface is NOT the
 /// secondary and whose next-hop is a real address (the OS default-route
-/// anchor the secondary adapter leaves on the physical NIC). Returns `None`
-/// when no such default route exists (e.g. a
-/// VPN that replaced `/0` itself) — the caller then logs the actionable gap.
+/// anchor the secondary adapter leaves on the physical NIC).
+///
+/// Failing that, an on-link `/0` (PPPoE has no gateway) routed via `0.0.0.0`,
+/// as a bound gateway-less primary is — but never one on a `foreign_tunnels`
+/// link, whose on-link `/0` would send "direct" traffic into someone else's
+/// tunnel. Returns `None` when neither exists (e.g. a VPN that replaced `/0`
+/// itself) — the caller then logs the actionable gap.
 pub(super) fn derive_primary_target(
     routes: &[RouteEntry],
     secondary_ifindex: u32,
+    foreign_tunnels: &[u32],
 ) -> Option<SecondaryRouteTarget> {
-    let mut best: Option<(u32, Ipv4Addr, u32)> = None; // (metric, gateway, ifindex)
+    // (on-link, metric, gateway, ifindex): any gateway route outranks on-link.
+    let mut best: Option<(bool, u32, Ipv4Addr, u32)> = None;
     for r in routes {
         if r.interface_index == secondary_ifindex {
             continue;
@@ -391,16 +397,20 @@ pub(super) fn derive_primary_target(
         let IpAddr::V4(nh) = r.next_hop else {
             continue; // this probe names the IPv4 gateway
         };
-        if nh.is_unspecified() || nh.is_loopback() {
+        if nh.is_loopback() {
             continue;
         }
-        let cand = (r.metric, nh, r.interface_index);
+        let on_link = nh.is_unspecified();
+        if on_link && (r.is_ours || foreign_tunnels.contains(&r.interface_index)) {
+            continue;
+        }
+        let cand = (on_link, r.metric, nh, r.interface_index);
         best = Some(match best {
-            Some(b) if b.0 <= cand.0 => b,
+            Some(b) if (b.0, b.1) <= (cand.0, cand.1) => b,
             _ => cand,
         });
     }
-    best.map(|(_, gateway, interface_index)| SecondaryRouteTarget {
+    best.map(|(_, _, gateway, interface_index)| SecondaryRouteTarget {
         gateway,
         gateway_v6: derive_secondary_next_hop_v6(routes, interface_index),
         interface_index,

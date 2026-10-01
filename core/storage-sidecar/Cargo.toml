@@ -10,16 +10,16 @@ license = "MPL-2.0"
 #   - rule_metadata (user-typed comments keyed by rule signature)
 #   - passthrough   (raw text of `--- Linux`/`--- MacOS`/etc. sections
 #                    captured during preset import for round-trip export)
-#   - pending_apply (last `_buildRulesJson` snapshot + summary kept until
-#                    the service becomes reachable and the user accepts or
-#                    discards the change; TTL 7 days)
+#   - pending_apply (content hash + summary of parked rules, not the rules,
+#                    kept until the service is reachable and the user accepts
+#                    or discards the change; TTL 7 days)
 #
 # Per-user database lives at `%LOCALAPPDATA%\NetRuleRouter\gui_metadata.db` on
 # Windows — local, not roaming: a WAL database must not travel without its
 # sidecars. Override via `NRR_SIDECAR_PATH` (absolute file path) for tests and
 # headless drivers.
 #
-# Allowed deps: rusqlite (bundled), thiserror.
+# Allowed deps: rusqlite (bundled), thiserror, nrr-sqlite-support (leaf).
 # Forbidden:    nrr-storage (service-side), nrr-shared (wire schemas),
 #               nrr-service-runtime, nrr-platform-windows, any UI crate.
 
@@ -27,6 +27,7 @@ license = "MPL-2.0"
 path = "src/lib.rs"
 
 [dependencies]
+nrr-sqlite-support = { path = "../sqlite-support" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "1"
 

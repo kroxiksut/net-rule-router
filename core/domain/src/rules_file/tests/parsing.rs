@@ -206,6 +206,47 @@ fn a_disabled_program_name_with_a_space_survives_the_round_trip() {
     assert!(!apps[0].enabled);
 }
 
+/// A note that happens to end in a file name is still a note, and saving the
+/// file must not turn it into a disabled rule line.
+#[test]
+fn a_note_ending_in_a_file_name_stays_a_comment_across_an_export() {
+    let section = match HostPlatform::compiled() {
+        HostPlatform::Windows => RulesFileSection::Windows,
+        HostPlatform::Linux => RulesFileSection::Linux,
+        HostPlatform::MacOS => RulesFileSection::MacOS,
+    };
+    let file = format!(
+        "--- {}
+# see readme.txt
+# note v1.2
+# Adobe Reader.exe
+browser.exe
+",
+        section.name()
+    );
+    let first = parse_rules_file(&file).parsed;
+    let values = |parsed: &RulesFileParsed| -> Vec<(String, bool)> {
+        parsed
+            .entries_for(section)
+            .iter()
+            .map(|e| (e.match_value.clone(), e.enabled))
+            .collect()
+    };
+    let expected = vec![
+        ("Adobe Reader.exe".to_string(), false),
+        ("browser.exe".to_string(), true),
+    ];
+    assert_eq!(values(&first), expected);
+
+    let written = write_rules_file(&first, &[], None);
+    assert!(
+        !written.contains("readme.txt") && !written.contains("v1.2"),
+        "a note must not come back as a rule line:
+{written}"
+    );
+    assert_eq!(values(&parse_rules_file(&written).parsed), expected);
+}
+
 #[test]
 fn prose_in_a_section_is_still_a_comment() {
     let file = "--- Windows

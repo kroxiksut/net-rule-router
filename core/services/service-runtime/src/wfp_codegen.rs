@@ -248,7 +248,7 @@ pub struct CodegenOutput {
     /// escapes at the ALE layer (a primary rule permit at `BASE_PRIMARY`
     /// outranks the catch-all block), but the packet-layer named blocks
     /// (ICMP/IGMP/GRE/ESP) are unconditional, so **ping to a known-primary host
-    /// like `ya.ru` was cut** (the 0716 complaint). This set feeds a
+    /// like `primary-host.example` was cut**. This set feeds a
     /// packet-layer proto-agnostic permit per IP so a positively primary-routed
     /// host stays fully reachable while "unknown" traffic is blocked. The
     /// orchestrator subtracts [`Self::secondary_dest_ips`] before use: a
@@ -290,8 +290,8 @@ pub struct CodegenOutput {
     ///
     /// The raw globs must never reach enforcement: the WFP `ALE_APP_ID` condition
     /// keys on a real file path (`FwpmGetAppIdFromFileName0`), so a glob string
-    /// stamped verbatim into `app_pattern` is silently skipped by the apply layer
-    /// (the exact bug HW-0716 fixes). Resolving them here — the SAME path user app
+    /// stamped verbatim into `app_pattern` is silently skipped by the apply layer.
+    /// Resolving them here — the SAME path user app
     /// rules already take — means the orchestrator's fail-closed exemption
     /// (`primary_app_exempt_filters`) only ever stamps real paths. A glob that
     /// resolves to nothing (client not installed) simply contributes nothing; it
@@ -328,8 +328,7 @@ pub enum CodegenDiagnostic {
     SkippedDisabled { rule_id: String },
     /// `ExactFqdn` rule's hostname is not in the FQDN cache (cold
     /// resolution). 0 filters emitted; once the DNS refresh task
-    /// (block 16.12.A.1) lands the resolution, the next apply pass
-    /// will pick it up.
+    /// lands the resolution, the next apply pass will pick it up.
     HostnameUnresolved { rule_id: String, hostname: String },
     /// `Application` rule's process has no observed connections yet (the
     /// connection observer is off, or the app hasn't connected since the
@@ -442,7 +441,7 @@ pub enum CodegenDiagnostic {
         cap: usize,
     },
     /// Rule has neither address-match nor app-match — should be
-    /// impossible after `RulesJsonCodec::decode` (block 16.12.A.2)
+    /// impossible after `RulesJsonCodec::decode`
     /// enforces the invariant, but kept as defence-in-depth.
     SkippedNoMatch { rule_id: String },
     /// The rule's shape cannot be enforced as written (see
@@ -455,7 +454,7 @@ pub enum CodegenDiagnostic {
     /// Fail-closed catch-all `Block` filter was emitted. Exactly
     /// one of these appears per codegen output when
     /// `behavior_mode == StrictSecondaryFailClosed`. Useful for
-    /// risk-scoring (16.12.A.5): a non-empty diagnostic of this
+    /// risk-scoring: a non-empty diagnostic of this
     /// kind signals "everything-else-blocked" mode is active.
     FailClosedDefaultEmitted,
 }
@@ -686,8 +685,8 @@ fn generate_for_rule(
         return;
     }
 
-    // The "≥1 match" invariant is enforced by the rules-json codec
-    // (block 16.12.A.2), but defensively handle the violation here
+    // The "≥1 match" invariant is enforced by the rules-json codec,
+    // but defensively handle the violation here
     // so a hand-crafted CanonicalRule from a future caller can't
     // silently emit zero filters with no explanation.
     if rule.address_match.is_none() && rule.app_match.is_none() {

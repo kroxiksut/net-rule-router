@@ -1,12 +1,9 @@
 //! Canonical mapping from [`IpcClientError`] to a stable kebab-case wire
 //! slug + human-readable message.
 //!
-//! The slug matches the `errors.<slug>` locale-key naming so the GUI can
-//! do a one-shot lookup. This used to live in the launcher's
-//! `rpc_dispatcher`; it was hoisted here (the natural home — it maps this
-//! crate's own error type) so the launcher dispatcher AND the session
-//! elevation broker (`nrr-broker`) share one mapping instead of two
-//! drifting copies.
+//! The slug matches the `errors.<slug>` locale keys. The launcher dispatcher
+//! and the elevation broker share this one mapping. It reads the code only,
+//! never the message: the message is English prose for a person.
 
 use crate::connection::IpcClientError;
 use nrr_shared::ipc_transport::IpcErrorCode;
@@ -27,23 +24,17 @@ pub fn ipc_error_to_wire(err: &IpcClientError) -> (&'static str, String) {
                 // is the slug the rules section keys its read-only state off,
                 // not a one-off toast.
                 IpcErrorCode::RulesLocked => nrr_shared::ipc_transport::RULES_LOCKED_CLIENT_SLUG,
+                // Not `forbidden`: the launcher would retry that through the
+                // elevated broker, and elevation cannot lift the alert gate.
+                IpcErrorCode::SecurityAlertUnacknowledged => {
+                    nrr_shared::ipc_transport::SECURITY_ALERT_UNACKNOWLEDGED_CLIENT_SLUG
+                }
                 IpcErrorCode::InvalidVersion => "invalid-version",
                 IpcErrorCode::MalformedRequest => "malformed-request",
                 IpcErrorCode::BusyConflict => "busy-conflict",
-                IpcErrorCode::PreconditionFailed => {
-                    // The wire schema has no dedicated `ConfirmationExpired`
-                    // code; the server uses `PreconditionFailed` with a
-                    // distinguishing message. Promote the expiration /
-                    // unknown cases so the GUI can react without parsing
-                    // English text on the QML side.
-                    if message.contains("expired") {
-                        "confirmation-expired"
-                    } else if message.contains("unknown") {
-                        "confirmation-unknown"
-                    } else {
-                        "precondition-failed"
-                    }
-                }
+                IpcErrorCode::PreconditionFailed => "precondition-failed",
+                IpcErrorCode::ConfirmationExpired => "confirmation-expired",
+                IpcErrorCode::ConfirmationUnknown => "confirmation-unknown",
                 IpcErrorCode::ServiceDegraded => "service-degraded",
                 IpcErrorCode::RecoveryRequired => "recovery-required",
                 IpcErrorCode::Internal => "internal",
@@ -70,14 +61,38 @@ mod tests {
         assert_eq!(msg, "non-admin");
     }
 
-    #[test]
-    fn precondition_expired_promoted() {
-        let e = IpcClientError::ServerError {
+    fn server_error(code: IpcErrorCode, message: &str) -> IpcClientError {
+        IpcClientError::ServerError {
             op: IpcOperationName::MutationSubmit,
-            code: IpcErrorCode::PreconditionFailed,
-            message: "confirmation token expired — re-run dry-run".into(),
-        };
-        assert_eq!(ipc_error_to_wire(&e).0, "confirmation-expired");
+            code,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn confirmation_codes_map_to_their_slugs() {
+        let expired = server_error(IpcErrorCode::ConfirmationExpired, "any text");
+        assert_eq!(ipc_error_to_wire(&expired).0, "confirmation-expired");
+        let unknown = server_error(IpcErrorCode::ConfirmationUnknown, "any text");
+        assert_eq!(ipc_error_to_wire(&unknown).0, "confirmation-unknown");
+    }
+
+    /// The message is for people: a precondition failure whose text happens to
+    /// say "expired" or "unknown" is still just a precondition failure.
+    #[test]
+    fn precondition_failed_ignores_the_message_wording() {
+        for message in [
+            "operation_id `op-1` is unknown or expired",
+            "unknown link-provider role \"x\"",
+            "confirmation token expired — re-run dry-run",
+        ] {
+            let err = server_error(IpcErrorCode::PreconditionFailed, message);
+            assert_eq!(
+                ipc_error_to_wire(&err).0,
+                "precondition-failed",
+                "{message}"
+            );
+        }
     }
 
     #[test]
@@ -92,6 +107,15 @@ mod tests {
             slug, "rules-locked",
             "the lock must not collapse into the generic forbidden slug"
         );
+    }
+
+    #[test]
+    fn the_alert_gate_keeps_its_own_slug() {
+        let e = server_error(
+            IpcErrorCode::SecurityAlertUnacknowledged,
+            "acknowledge first",
+        );
+        assert_eq!(ipc_error_to_wire(&e).0, "security-alert-unacknowledged");
     }
 
     #[test]

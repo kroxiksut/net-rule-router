@@ -160,13 +160,6 @@ pub enum IpcOperationName {
     /// [`crate::ipc_payloads::ConnTraceEntriesListRequest`] →
     /// [`crate::ipc_payloads::ConnTraceEntriesListResponse`].
     ConnTraceEntriesList,
-    /// Enable/disable "extended diagnostics" mode with
-    /// an optional TTL (1h/4h) or "until restart". Unredacts hostnames/IPs in
-    /// the cache + connection-trace viewers for the session. Command op
-    /// (in-memory session write; no elevation, no mutation queue). GUI-only.
-    /// Payload: [`crate::ipc_payloads::DiagnosticModeSetRequest`] →
-    /// [`crate::diagnostics_dto::DiagnosticModeStateDto`].
-    DiagnosticModeSet,
     /// Read the operational-log + audit NDJSON retention
     /// config (singleton row in `log_retention_config`). Query op.
     LogRetentionConfigGet,
@@ -303,7 +296,7 @@ pub enum IpcOperationName {
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 70] = [
+    pub const ALL: [Self; 69] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -347,7 +340,6 @@ impl IpcOperationName {
         Self::SettingsExportFull,
         Self::RulesMergePreview,
         Self::ConnTraceEntriesList,
-        Self::DiagnosticModeSet,
         Self::LogRetentionConfigGet,
         Self::LogRetentionConfigSet,
         Self::ThirdPartyComponentsList,
@@ -421,7 +413,6 @@ impl IpcOperationName {
             Self::SettingsExportFull => "settings.export.full",
             Self::RulesMergePreview => "rules.merge-preview",
             Self::ConnTraceEntriesList => "conn-trace.entries.list",
-            Self::DiagnosticModeSet => "diagnostics.mode.set",
             Self::LogRetentionConfigGet => "settings.log-retention.get",
             Self::LogRetentionConfigSet => "settings.log-retention.set",
             Self::ThirdPartyComponentsList => "third-party.components.list",

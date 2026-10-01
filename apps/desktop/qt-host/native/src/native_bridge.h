@@ -6,7 +6,10 @@ class NrrNativeBridge : public QObject {
     Q_OBJECT
 
 public:
-    explicit NrrNativeBridge(const QString &applicationDir, QObject *parent = nullptr);
+    /// `logsDirectory` comes from the launch context (`logsDirectoryFromContext`);
+    /// empty leaves "open logs folder" with nothing to open.
+    NrrNativeBridge(const QString &applicationDir, const QString &logsDirectory,
+                    QObject *parent = nullptr);
 
     Q_INVOKABLE void triggerTrayAction(const QString &actionId);
 
@@ -77,15 +80,8 @@ public:
     /// Empty map means "no screen" — the caller keeps its own fallback.
     Q_INVOKABLE QVariantMap trayNoticeScreenGeometry() const;
 
-    /// Return whether the current process is running with elevated
-    /// privileges (Administrator). The service's
-    /// `MutationSubmit` / `RoutePolicyUpdate` IPC ops gate on this via
-    /// the named-pipe identity classifier, so the GUI uses the value
-    /// to render an upfront warning in the review flow — better UX
-    /// than letting the user reach ConfirmActivateDialog only to
-    /// discover the activate phase fails with `forbidden`.
-    /// Defaults to `true` on non-Windows or query failure so the
-    /// warning never falsely fires.
+    /// `nrrProcessIsElevated()`: the service gates privileged ops on the
+    /// same token, so the review flow warns up front instead of at activate.
     Q_INVOKABLE bool isElevated();
 
     /// Open the OS file manager at the folder containing `path`, selecting
@@ -205,6 +201,9 @@ signals:
     /// are populated, `payload` is empty.
     void rpcResponse(QString correlationId, bool ok, QVariant payload,
                      QString errorCode, QString errorMessage);
+    /// Emitted as each request leaves, on the caller's thread, so QML can
+    /// hold the answer to its operation's own deadline.
+    void rpcRequested(QString correlationId, QString operation);
 
 public:
     /// QML uses this to populate the health snapshot on cold start and
@@ -371,7 +370,6 @@ public:
     Q_INVOKABLE QString rpcLogRetentionConfigGet();
     Q_INVOKABLE QString rpcLogRetentionConfigSet(const QVariantMap &payload);
 
-    Q_INVOKABLE QString rpcApplyFailurePolicyGet();
     Q_INVOKABLE QString rpcApplyFailurePolicySet(const QString &policy);
 
     /// On-demand storage usage walk.
@@ -385,7 +383,6 @@ public:
     Q_INVOKABLE QString rpcRoutingPauseGet();
     Q_INVOKABLE QString rpcRoutingPauseToggle(bool paused, const QString &reason);
 
-    Q_INVOKABLE QString rpcAutostartGet();
     Q_INVOKABLE QString rpcAutostartToggle(bool enabled);
 
     /// Report whether the administrative console is already reachable by name
@@ -417,12 +414,13 @@ public:
                                           bool dryRun,
                                           const QString &confirmationToken);
 
-    // Safe rollback: restore the previous (LKG) policy revision via the
-    // `RollbackRequest` recovery action. `targetRevisionId` empty → roll back to
-    // the last-known-good. Class = recovery-action (derived from the op slug by
-    // the client), which requires a non-empty confirmation token + elevation;
-    // the token travels at the envelope root via `_envelope_confirmation_token`.
+    // Safe rollback of the caller's own rules to a previous policy revision.
+    // `targetRevisionId` empty → roll back to the last-known-good. Two-phase
+    // like `rpcProductImpactDisable`: the dry-run returns the token the rollback
+    // itself must carry (at the envelope root, via
+    // `_envelope_confirmation_token`); neither phase needs elevation.
     Q_INVOKABLE QString rpcRollbackRequest(const QString &targetRevisionId,
+                                           bool dryRun,
                                            const QString &confirmationToken);
 
     /// Typed `ProductImpactDisableTemporary` invocation. Two-phase:
@@ -443,16 +441,6 @@ public:
     Q_INVOKABLE QString rpcProductImpactDisable(const QString &reason,
                                                 bool dryRun,
                                                 const QString &confirmationToken);
-
-    /// Read-only preset export. Calls
-    /// `preset.export.get` and returns the correlation id; QML routes
-    /// the `rpcResponse` callback to decode `file-bytes-b64` +
-    /// `content-hash`. `route` is the kebab slug (`"primary"` /
-    /// `"secondary"`); `includeMetadata` toggles the
-    /// `# NetRuleRouter preset — version 1` preamble on the resulting
-    /// txt blob.
-    Q_INVOKABLE QString rpcPresetExport(const QString &route,
-                                        bool includeMetadata);
 
     /// Read-only full settings export. Calls
     /// `settings.export.full` and returns the correlation id. The
@@ -503,6 +491,11 @@ public:
     /// — every exact rule a wildcard rule already covers.
     Q_INVOKABLE QString rpcRulesOverlaps(const QString &rulesJson, bool includeSubdomains = true);
 
+    /// Async wrapper over the launcher-local `local.rule-value-verdict` RPC:
+    /// the Add/Edit rule dialog's gate. The callback gets
+    /// `{status, message-key, args}` — the verdict the rules table shows.
+    Q_INVOKABLE QString rpcRuleValueVerdict(const QString &ruleType, const QString &matchValue);
+
     /// Async wrapper over the launcher-local
     /// `local.vpn.discover` RPC. Scans the machine (running processes +
     /// installed programs) for likely VPN clients; the callback lands on
@@ -549,6 +542,12 @@ public:
     /// A.B.C (vM)". QML calls this on cold-start and on every
     /// disconnect→connect transition.
     Q_INVOKABLE QString rpcServiceInfo();
+
+    /// Async wrapper over the launcher-local `local.update-check.run` RPC: the
+    /// Help menu's "Check for updates". Answers `{status: "update-available",
+    /// latestVersion, url}` or `{status: "up-to-date", currentVersion}`; a
+    /// failed request is `update-check-failed`.
+    Q_INVOKABLE QString rpcUpdateCheckRun();
 
     /// Return the OS user's default locale as a
     /// lowercase ISO-639 / ISO-3166 string ("ru_ru", "en_us", "zh_cn").
@@ -620,18 +619,6 @@ private:
     QString findConfigsPresetsRoot() const;
 
 public:
-    /// Write a file to disk from base64-encoded bytes.
-    /// Used by the GUI's `Qt.labs.platform.FileDialog` Save path to
-    /// persist the `file-bytes-b64` returned by `rpcPresetExport` or
-    /// `rpcSettingsExportFull`.
-    ///
-    /// Returns `true` on success, `false` on any error (invalid
-    /// base64, permission denied, parent directory missing). The 1 MiB
-    /// cap is enforced symmetrically with `readFileBytes`.
-    /// Write a UTF-8 text file directly.
-    /// Used by the local canonical-txt writer for preset export so the
-    /// QML side doesn't have to base64-encode Cyrillic / IDN text just
-    /// to immediately decode it again. Same 1 MiB cap as the bytes path.
     /// Path for a diagnostic file under the runtime directory
     /// (`diagnostics/` beside the launcher logs), creating the folder on
     /// demand.
@@ -642,6 +629,10 @@ public:
     /// studying. Empty string when the folder cannot be created.
     Q_INVOKABLE QString runtimeDiagnosticsPath(const QString &filename);
 
+    /// Write a UTF-8 text file directly.
+    /// Used by the local canonical-txt writer for preset export so the
+    /// QML side doesn't have to base64-encode Cyrillic / IDN text just
+    /// to immediately decode it again. Same 1 MiB cap as the bytes path.
     Q_INVOKABLE bool writeTextFile(const QString &path, const QString &text);
 
     /// The absolute path of the rule sets shipped with the app,
@@ -671,6 +662,13 @@ public:
     Q_INVOKABLE QString createPresetSetDir(const QString &rootDir,
                                            const QString &setName);
 
+    /// Write a file to disk from base64-encoded bytes.
+    /// Used by the GUI's `Qt.labs.platform.FileDialog` Save path to
+    /// persist the `file-bytes-b64` returned by `rpcSettingsExportFull`.
+    ///
+    /// Returns `true` on success, `false` on any error (invalid
+    /// base64, permission denied, parent directory missing). The 1 MiB
+    /// cap is enforced symmetrically with `readFileBytes`.
     Q_INVOKABLE bool writeFileBytes(const QString &path,
                                     const QString &base64);
 
@@ -688,15 +686,6 @@ public:
     // dispatcher applies a per-op timeout budget (Explain=2s, Archive=10s,
     // ServiceStability=1s) automatically — these bridge methods only need to
     // mint the request envelope.
-
-    /// `ExplainGet` by historical decision id. The service
-    /// looks up the persisted `DecisionExplain` (when the snapshot
-    /// store lands — until then it always returns `Unavailable`). The
-    /// optional `detailLevel` slug is one of `"compact-ui"`,
-    /// `"diagnostics"`, `"developer-trace"`; pass an empty string to
-    /// accept the server default (`"compact-ui"`).
-    Q_INVOKABLE QString rpcExplainGetByDecisionId(const QString &decisionId,
-                                                   const QString &detailLevel);
 
     /// `ExplainGet` for a synthetic probe — runs the
     /// decision engine against the active rule set without recording an
@@ -726,24 +715,10 @@ public:
     /// automatic refresh path.
     Q_INVOKABLE QString rpcInterfacesRefresh();
 
-    /// `LogsList`. Paginated query for operational
-    /// log entries. `filter` is a kebab-shaped subset of `LogEntryFilter`
-    /// (the nested DTO itself is snake-case on the wire — `from_ms`,
-    /// `level_min`, `decision_id`, `revision_id`); QML constructs the
-    /// map verbatim using snake_case keys. `cursor` is the opaque
-    /// `next-cursor` echoed back by the previous page (empty for first
-    /// page). `pageSize <= 0` falls back to `PaginationParams::default()`
-    /// server-side (50 entries).
     /// `LogsClear`. Removes rotated
     /// operational NDJSON files. Audit trail is never touched.
     /// `dryRun=true` returns counts without acting.
     Q_INVOKABLE QString rpcLogsClear(bool dryRun, bool includeArchives);
-
-    // Enable/disable extended diagnostics for a bounded session. When
-    // enabled, `untilRestart` overrides `durationMs`; `durationMs <= 0` uses the
-    // service default (1h). Response is the resulting diagnostic-mode state.
-    Q_INVOKABLE QString rpcDiagnosticModeSet(bool enabled, double durationMs,
-                                             bool untilRestart, const QString &scope);
 
     // Clear the rebuildable FQDN/IP resolution cache. `payload` is a full
     // CacheClearRequest ({dry-run?, clear-app-cache? (default true),
@@ -774,6 +749,14 @@ public:
     // and `observer-active` (false when the service is not watching at all).
     Q_INVOKABLE QString rpcConnTraceEntriesList(const QString &cursor, int pageSize);
 
+    // The live diagnostics status; the launch context holds only the copy
+    // taken at start-up.
+    Q_INVOKABLE QString rpcSnapshotDiagnosticsGet();
+
+    // A mutation confirm answers with an operation id only; its result or
+    // error code is read here.
+    Q_INVOKABLE QString rpcOperationStatusGet(const QString &operationId);
+
     // File↔service merge preview (SERVICE Query op). The service
     // reconciles the supplied bound-file text against the caller's active
     // revision (per-SID read-through) and returns the three buckets + conflicts
@@ -800,6 +783,13 @@ public:
         return emitRpcRequest(QStringLiteral("rules.merge-preview"), obj);
     }
 
+    /// `LogsList`. Paginated query for operational log entries. `filter` is
+    /// a snake_case subset of `LogEntryFilter` (`from_ms`, `to_ms`,
+    /// `level_min`, `category`, `kind`, `decision_id`, `revision_id`); QML
+    /// constructs the map verbatim using those keys. `cursor` is the opaque
+    /// `next-cursor` echoed back by the previous page (empty for first
+    /// page). `pageSize <= 0` falls back to `PaginationParams::default()`
+    /// server-side (50 entries).
     Q_INVOKABLE QString rpcLogsList(const QVariantMap &filter,
                                      const QString &cursor,
                                      int pageSize);
@@ -861,19 +851,16 @@ public:
     //
     // These operations are routed locally by the launcher; they never
     // reach the Windows service. Comments, foreign-OS passthrough
-    // sections, and the "Work without service" pending-apply snapshot
-    // all live in a per-user file at `%APPDATA%\NetRuleRouter\
-    // gui_metadata.db` and are owned by the launcher process. See
+    // sections, and the "Work without service" pending-apply marker
+    // live in a per-user file,
+    // `%LOCALAPPDATA%\NetRuleRouter\gui_metadata.db` on Windows,
+    // owned by each launcher process (GUI and tray). See
     // `nrr-storage-sidecar` crate docs for the threat model and
     // privacy rationale.
     //
     // All return the correlation id immediately; the actual SQL runs
     // on a worker thread inside the launcher. QML callers route the
     // eventual `rpcResponse(...)` signal through `registerRpcCallback`.
-
-    Q_INVOKABLE QString rpcSidecarCommentRead(const QString &type_,
-                                              const QString &value,
-                                              const QString &route);
 
     /// Bulk read every stored comment in one RPC.
     /// Returned payload shape: `{ comments: { "<signature>": "<text>", ... } }`.
@@ -912,10 +899,6 @@ public:
     /// objects — one per adapter whose external address the service
     /// just resolved.
     Q_INVOKABLE QString rpcSidecarExternalIpWriteAll(const QVariantList &entries);
-
-    /// `force = true` skips the size/interval throttle and vacuums
-    /// immediately (used by Settings → "Reset application data").
-    Q_INVOKABLE QString rpcSidecarVacuum(bool force);
 
     /// Full reset: wipe every GUI-local
     /// sidecar row (rule comments, foreign-OS passthrough, parked

@@ -75,13 +75,18 @@ impl<'c> AutoRuleDismissalsRepository<'c> {
         if sid.is_empty() || dismissals.is_empty() {
             return Ok(());
         }
+        // One transaction: a failure midway must not keep half the batch or
+        // leave the table above its cap.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| StorageError::Internal(format!("auto_rule_dismissals tx: {e}")))?;
         for d in dismissals {
             if d.candidate_id.is_empty() {
                 continue;
             }
-            self.conn
-                .execute(
-                    "INSERT INTO auto_rule_dismissals
+            tx.execute(
+                "INSERT INTO auto_rule_dismissals
                          (sid, candidate_id, anchor, proposed_match, dto_json, dismissed_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(sid, candidate_id) DO UPDATE SET
@@ -89,29 +94,29 @@ impl<'c> AutoRuleDismissalsRepository<'c> {
                          proposed_match = excluded.proposed_match,
                          dto_json = excluded.dto_json,
                          dismissed_at = excluded.dismissed_at",
-                    params![
-                        sid,
-                        d.candidate_id,
-                        d.anchor,
-                        d.proposed_match,
-                        d.dto_json,
-                        now
-                    ],
-                )
-                .map_err(|e| StorageError::Internal(format!("auto_rule_dismissals insert: {e}")))?;
+                params![
+                    sid,
+                    d.candidate_id,
+                    d.anchor,
+                    d.proposed_match,
+                    d.dto_json,
+                    now
+                ],
+            )
+            .map_err(|e| StorageError::Internal(format!("auto_rule_dismissals insert: {e}")))?;
         }
-        self.conn
-            .execute(
-                "DELETE FROM auto_rule_dismissals WHERE sid = ?1 AND candidate_id IN (
+        tx.execute(
+            "DELETE FROM auto_rule_dismissals WHERE sid = ?1 AND candidate_id IN (
                      SELECT candidate_id FROM auto_rule_dismissals
                      WHERE sid = ?1
                      ORDER BY dismissed_at DESC, candidate_id ASC
                      LIMIT -1 OFFSET ?2
                  )",
-                params![sid, MAX_DISMISSALS_PER_SID as i64],
-            )
-            .map_err(|e| StorageError::Internal(format!("auto_rule_dismissals evict: {e}")))?;
-        Ok(())
+            params![sid, MAX_DISMISSALS_PER_SID as i64],
+        )
+        .map_err(|e| StorageError::Internal(format!("auto_rule_dismissals evict: {e}")))?;
+        tx.commit()
+            .map_err(|e| StorageError::Internal(format!("auto_rule_dismissals commit: {e}")))
     }
 
     /// Every candidate id `sid` has refused. The caller keeps this in memory
@@ -313,5 +318,55 @@ mod tests {
         repo.record("S-A", &[dismissal("arc-1")], 100).expect("a");
         assert!(!repo.forget("S-B", "arc-1").expect("forget wrong sid"));
         assert!(repo.load_ids("S-A").expect("load").contains("arc-1"));
+    }
+
+    fn row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM auto_rule_dismissals", [], |r| {
+            r.get(0)
+        })
+        .expect("count")
+    }
+
+    #[test]
+    fn a_failure_midway_through_the_batch_leaves_the_table_unchanged() {
+        let conn = migrated_conn();
+        let repo = AutoRuleDismissalsRepository::new(&conn);
+        repo.record("S-A", &[dismissal("arc-0")], 50).expect("seed");
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_midway BEFORE INSERT ON auto_rule_dismissals
+             WHEN NEW.candidate_id = 'arc-boom'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .expect("trigger");
+
+        let batch = [
+            dismissal("arc-1"),
+            dismissal("arc-boom"),
+            dismissal("arc-2"),
+        ];
+        assert!(repo.record("S-A", &batch, 100).is_err());
+
+        let ids = repo.load_ids("S-A").expect("load");
+        assert_eq!(ids, HashSet::from(["arc-0".to_string()]));
+    }
+
+    #[test]
+    fn a_failed_eviction_rolls_the_insert_back_so_the_cap_holds() {
+        let conn = migrated_conn();
+        let repo = AutoRuleDismissalsRepository::new(&conn);
+        let full: Vec<_> = (0..MAX_DISMISSALS_PER_SID)
+            .map(|i| dismissal(&format!("arc-{i}")))
+            .collect();
+        repo.record("S-A", &full, 100).expect("fill to cap");
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_evict BEFORE DELETE ON auto_rule_dismissals
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .expect("trigger");
+
+        assert!(repo.record("S-A", &[dismissal("arc-over")], 200).is_err());
+
+        assert_eq!(row_count(&conn), MAX_DISMISSALS_PER_SID as i64);
+        assert!(!repo.load_ids("S-A").expect("load").contains("arc-over"));
     }
 }

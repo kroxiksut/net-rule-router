@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use crate::bounded_set::BoundedRecentSet;
 use nrr_platform_api::conn_observe::live::LiveConnection;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// How recently an app's destination must have been SEEN to keep producing a
@@ -48,6 +49,11 @@ pub const APP_PIN_FRESHNESS_WINDOW: Duration =
 /// [`crate::wfp_codegen::PER_HOSTNAME_IP_CAP`] in spirit). A busy browser can
 /// touch thousands of IPs; we keep the most-recently-observed up to this cap.
 pub const APP_IP_CAP: usize = 256;
+
+/// Applications kept, each with up to [`APP_IP_CAP`] destinations. Observation
+/// records every process on the machine, not only those a rule names; this is
+/// far above what a desktop runs, so the one that gives way has gone quiet.
+pub const APP_KEY_CAP: usize = 1024;
 
 /// Destinations the census remembers, with the processes seen using them.
 ///
@@ -145,6 +151,41 @@ pub struct AppObservationStore {
     pin_ttl: Duration,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     cap_per_app: usize,
+    /// Last sighting per application, picking who gives way at `app_cap`.
+    /// Taken only while `inner` is held.
+    app_recency: Mutex<AppRecency>,
+    app_cap: usize,
+    app_cap_logged: AtomicBool,
+}
+
+/// Sighting order of applications as a counter, so a sighting costs one map
+/// write and only an eviction scans.
+#[derive(Default)]
+struct AppRecency {
+    tick: u64,
+    last: HashMap<String, u64>,
+}
+
+impl AppRecency {
+    fn touch(&mut self, app: &str) {
+        self.tick += 1;
+        match self.last.get_mut(app) {
+            Some(at) => *at = self.tick,
+            None => {
+                self.last.insert(app.to_string(), self.tick);
+            }
+        }
+    }
+
+    fn take_least_recent(&mut self) -> Option<String> {
+        let victim = self
+            .last
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(app, _)| app.clone())?;
+        self.last.remove(&victim);
+        Some(victim)
+    }
 }
 
 impl Default for AppObservationStore {
@@ -168,7 +209,16 @@ impl AppObservationStore {
             pin_ttl: APP_PIN_FRESHNESS_WINDOW,
             clock: Arc::new(Instant::now),
             cap_per_app,
+            app_recency: Mutex::new(AppRecency::default()),
+            app_cap: APP_KEY_CAP,
+            app_cap_logged: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    fn with_app_cap(mut self, cap: usize) -> Self {
+        self.app_cap = cap.max(1);
+        self
     }
 
     /// Override the freshness window. Builder-style; production keeps the
@@ -233,12 +283,21 @@ impl AppObservationStore {
         {
             return false;
         }
-        let seen = {
+        let (seen, dropped_app) = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut recency = self.app_recency.lock().unwrap_or_else(|p| p.into_inner());
+            let dropped_app = if !g.contains_key(&key) && g.len() >= self.app_cap {
+                recency
+                    .take_least_recent()
+                    .and_then(|app| g.remove(&app).map(|set| (app, set)))
+            } else {
+                None
+            };
+            recency.touch(&key);
             let set = g
                 .entry(key.clone())
                 .or_insert_with(|| BoundedRecentSet::new(self.cap_per_app));
-            set.observe(ip)
+            (set.observe(ip), dropped_app)
         };
         {
             let mut stamps = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
@@ -246,6 +305,19 @@ impl AppObservationStore {
             if let Some(old) = seen.evicted {
                 stamps.remove(&(key.clone(), old));
             }
+            if let Some((app, ips)) = &dropped_app {
+                for old in ips.iter() {
+                    stamps.remove(&(app.clone(), *old));
+                }
+            }
+        }
+        if dropped_app.is_some() && !self.app_cap_logged.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                target: "nrr::app-observations",
+                msg_key = "app-observations-app-cap",
+                cap = self.app_cap,
+                "application observation cap reached; the least recently seen application gives way",
+            );
         }
         self.seen_since_flush
             .lock()
@@ -310,6 +382,11 @@ impl AppObservationStore {
                         refreshed.insert((name.clone(), connection.remote));
                     }
                 }
+            }
+            // A program holding its connections is in use, not quiet.
+            let mut recency = self.app_recency.lock().unwrap_or_else(|p| p.into_inner());
+            for (name, _) in &refreshed {
+                recency.touch(name);
             }
         }
         let mut seen = self
@@ -678,6 +755,35 @@ mod tests {
         assert!(!store.destination_used_outside(&friendly(&["assistant.exe"]), addr(10)));
     }
 
+    /// Every process on the machine is recorded, so the number of
+    /// applications is bounded too; the one seen least recently gives way,
+    /// together with its freshness stamps.
+    #[test]
+    fn past_the_app_cap_the_least_recently_seen_application_gives_way() {
+        let store = AppObservationStore::new().with_app_cap(2);
+        store.record("first.exe", addr(1));
+        store.record("second.exe", addr(2));
+        store.record("first.exe", addr(3));
+        store.record("third.exe", addr(4));
+
+        assert_eq!(store.app_count(), 2);
+        assert!(store.ips_for_app("second.exe").is_empty());
+        assert_eq!(store.ips_for_app("first.exe"), vec![addr(1), addr(3)]);
+        assert_eq!(store.ips_for_app("third.exe"), vec![addr(4)]);
+        let stamps = store.last_seen.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!stamps.keys().any(|(app, _)| app == "second.exe"));
+    }
+
+    #[test]
+    fn under_the_app_cap_every_application_is_kept() {
+        let store = AppObservationStore::new().with_app_cap(2);
+        store.record("first.exe", addr(1));
+        store.record("second.exe", addr(2));
+        store.record("second.exe", addr(3));
+        assert_eq!(store.app_count(), 2);
+        assert_eq!(store.ips_for_app("first.exe"), vec![addr(1)]);
+    }
+
     #[test]
     fn the_census_is_bounded_and_drops_the_oldest_destination() {
         let store = AppObservationStore::new();
@@ -792,8 +898,8 @@ mod tests {
         store.record("app.exe", ip(127, 0, 0, 1)); // loopback
         store.record("app.exe", ip(169, 254, 0, 5)); // link-local
         store.record("app.exe", ip(0, 0, 0, 0)); // unspecified
-        store.record("app.exe", ip(8, 8, 8, 8)); // routable
-        assert_eq!(store.ips_for_app("app.exe"), vec![ip(8, 8, 8, 8)]);
+        store.record("app.exe", ip(198, 51, 100, 8)); // routable
+        assert_eq!(store.ips_for_app("app.exe"), vec![ip(198, 51, 100, 8)]);
     }
 
     #[test]
@@ -817,14 +923,17 @@ mod tests {
         // migrates to new servers keeps the destinations of a previous session
         // and never gets the current ones routed until the service restarts.
         let store = AppObservationStore::with_cap(2);
-        store.record("a.exe", ip(1, 1, 1, 1));
-        store.record("a.exe", ip(2, 2, 2, 2));
-        store.record("a.exe", ip(3, 3, 3, 3));
+        store.record("a.exe", ip(198, 51, 100, 1));
+        store.record("a.exe", ip(198, 51, 100, 2));
+        store.record("a.exe", ip(198, 51, 100, 3));
 
         let live = store.ips_for_app("a.exe");
         assert_eq!(live.len(), 2, "the bound still holds");
-        assert!(!live.contains(&ip(1, 1, 1, 1)), "the oldest gave way");
-        assert!(live.contains(&ip(3, 3, 3, 3)), "the newest was admitted");
+        assert!(!live.contains(&ip(198, 51, 100, 1)), "the oldest gave way");
+        assert!(
+            live.contains(&ip(198, 51, 100, 3)),
+            "the newest was admitted"
+        );
     }
 
     /// Test clock: a base instant plus a shared, advanceable offset — crossing
@@ -968,14 +1077,20 @@ mod tests {
         // Freshness is by LAST sighting, not first: an address the app still
         // uses must not be evicted by one it touched once.
         let store = AppObservationStore::with_cap(2);
-        store.record("a.exe", ip(1, 1, 1, 1));
-        store.record("a.exe", ip(2, 2, 2, 2));
-        store.record("a.exe", ip(1, 1, 1, 1)); // still in use
-        store.record("a.exe", ip(3, 3, 3, 3));
+        store.record("a.exe", ip(198, 51, 100, 1));
+        store.record("a.exe", ip(198, 51, 100, 2));
+        store.record("a.exe", ip(198, 51, 100, 1)); // still in use
+        store.record("a.exe", ip(198, 51, 100, 3));
 
         let live = store.ips_for_app("a.exe");
-        assert!(live.contains(&ip(1, 1, 1, 1)), "recently used survives");
-        assert!(!live.contains(&ip(2, 2, 2, 2)), "the stale one gave way");
+        assert!(
+            live.contains(&ip(198, 51, 100, 1)),
+            "recently used survives"
+        );
+        assert!(
+            !live.contains(&ip(198, 51, 100, 2)),
+            "the stale one gave way"
+        );
     }
 
     #[test]
@@ -989,12 +1104,18 @@ mod tests {
         // Drives the conn-observe re-apply trigger (1b): recompute only when a
         // genuinely new destination appears, not on every duplicate tick.
         let store = AppObservationStore::new();
-        assert!(store.record("chrome.exe", ip(8, 8, 8, 8)), "first = new");
         assert!(
-            !store.record("chrome.exe", ip(8, 8, 8, 8)),
+            store.record("chrome.exe", ip(198, 51, 100, 8)),
+            "first = new"
+        );
+        assert!(
+            !store.record("chrome.exe", ip(198, 51, 100, 8)),
             "duplicate = not new"
         );
-        assert!(store.record("chrome.exe", ip(1, 1, 1, 1)), "other ip = new");
+        assert!(
+            store.record("chrome.exe", ip(198, 51, 100, 1)),
+            "other ip = new"
+        );
         assert!(
             !store.record("app.exe", ip(127, 0, 0, 1)),
             "unroutable = not new"
@@ -1006,14 +1127,14 @@ mod tests {
         let store = AppObservationStore::new();
         store.record("myvpnclient.exe", ip(203, 0, 113, 1));
         store.record("openvpn.exe", ip(203, 0, 113, 2));
-        store.record("chrome.exe", ip(8, 8, 8, 8));
+        store.record("chrome.exe", ip(198, 51, 100, 8));
         // `*vpn*.exe` matches both vpn processes (union), not chrome.
         assert_eq!(
             store.ips_for_app("*vpn*.exe"),
             vec![ip(203, 0, 113, 1), ip(203, 0, 113, 2)]
         );
         // exact lookup still works.
-        assert_eq!(store.ips_for_app("chrome.exe"), vec![ip(8, 8, 8, 8)]);
+        assert_eq!(store.ips_for_app("chrome.exe"), vec![ip(198, 51, 100, 8)]);
     }
 
     #[test]
@@ -1031,8 +1152,11 @@ mod tests {
     #[test]
     fn mock_round_trips() {
         let m = MockAppObservationLookup::new();
-        m.set_ips("chrome.exe", vec![ip(1, 2, 3, 4)]);
-        assert_eq!(m.ips_for_app("C:\\path\\Chrome.exe"), vec![ip(1, 2, 3, 4)]);
+        m.set_ips("chrome.exe", vec![ip(192, 0, 2, 4)]);
+        assert_eq!(
+            m.ips_for_app("C:\\path\\Chrome.exe"),
+            vec![ip(192, 0, 2, 4)]
+        );
         assert!(m.ips_for_app("other.exe").is_empty());
     }
 }

@@ -16,14 +16,11 @@
 //! block happened for the audit trail, and [`is_exempt_from_blocking`], the one
 //! answer to "may this address ever be cut" (loopback and link-local: never).
 //!
-//! The filter COMPUTATION that used to live here was a second, earlier
-//! implementation of the kill-switch with no production caller - the live path
-//! is `service-runtime`'s `killswitch_codegen` plus `per_sid_orchestrator`,
-//! which have since grown per-SID scoping, weight bands, packet-layer mirrors,
-//! IPv6 and the address-ownership arbiter. Keeping a divergent copy green under
-//! its own acceptance gate was worse than not having one: the tests passed on
-//! mocks while the shipped behaviour was decided elsewhere. Removed 26.08 along
-//! with `platform/windows/{apply,verify,rollback}`, which had no callers either.
+//! The filter COMPUTATION itself is not here: the live path is
+//! `service-runtime`'s `killswitch_codegen` plus `per_sid_orchestrator`, which
+//! own per-SID scoping, weight bands, packet-layer mirrors, IPv6 and the
+//! address-ownership arbiter. A second, divergent copy here would drift from
+//! that decision.
 //!
 //! ## Existing connections
 //!
@@ -150,7 +147,7 @@ mod tests {
             "::ffff:127.0.0.1".parse::<Ipv6Addr>().expect("literal")
         ));
         assert!(!is_exempt_from_blocking(
-            "::ffff:8.8.8.8".parse::<Ipv6Addr>().expect("literal")
+            "::ffff:198.51.100.8".parse::<Ipv6Addr>().expect("literal")
         ));
     }
 
@@ -174,7 +171,7 @@ mod tests {
     fn regular_ips_are_not_exempt() {
         assert!(!is_exempt_from_blocking(ip(10, 0, 0, 1)));
         assert!(!is_exempt_from_blocking(ip(192, 168, 1, 1)));
-        assert!(!is_exempt_from_blocking(ip(8, 8, 8, 8)));
+        assert!(!is_exempt_from_blocking(ip(198, 51, 100, 8)));
     }
 
     // ── Filter ID determinism ─────────────────────────────────────────────

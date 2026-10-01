@@ -550,17 +550,41 @@ pub trait PolicyEnforcer: Send + Sync {
     fn teardown(&self) -> Result<(), EnforcementFailure>;
 }
 
-/// Why enforcement could not be carried out.
+/// Why enforcement could not be carried out, and whether trying again can help.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnforcementFailure {
     pub reason: String,
+    pub kind: FailureKind,
+}
+
+/// Whether the same plans, handed over again, can succeed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// A hung tool or a racing read: the next pass may go through.
+    Transient,
+    /// Refused for a reason the same plans will meet again — the ruleset, the
+    /// privilege, a missing tool. Only a change (rules, links, an explicit
+    /// request) is worth another attempt; a timer only repeats the refusal.
+    Persistent,
 }
 
 impl EnforcementFailure {
-    pub fn new(reason: impl Into<String>) -> Self {
+    pub fn transient(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
+            kind: FailureKind::Transient,
         }
+    }
+
+    pub fn persistent(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            kind: FailureKind::Persistent,
+        }
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.kind == FailureKind::Persistent
     }
 }
 
@@ -627,7 +651,7 @@ mod tests {
                 ordinal: 0,
             },
             flow: FlowMatch {
-                dst: DstMatch::HostV4(v4(23, 10, 20, 138)),
+                dst: DstMatch::HostV4(v4(203, 0, 113, 138)),
                 dst_port: None,
                 protocol: None,
             },
@@ -640,9 +664,9 @@ mod tests {
         // 2. Secondary suffix/zone fan-out — several resolved /32s pinned to the
         //    secondary (VPN) link, as a domain-suffix rule fans out.
         for (i, ip) in [
-            v4(23, 10, 20, 155),
-            v4(23, 10, 20, 157),
-            v4(23, 10, 20, 129),
+            v4(203, 0, 113, 155),
+            v4(203, 0, 113, 157),
+            v4(203, 0, 113, 129),
         ]
         .into_iter()
         .enumerate()
@@ -818,7 +842,7 @@ mod tests {
         // Routes + policy routing: a /32 pinned to the secondary in a
         // per-principal table, plus per-user AND per-mark policy-routing rules.
         let routes = vec![RouteIntent {
-            dst: DstMatch::HostV4(v4(23, 10, 20, 155)),
+            dst: DstMatch::HostV4(v4(203, 0, 113, 155)),
             egress: EgressRef::Secondary,
             metric: 1,
             table: RouteTableRef::Principal(user.clone()),

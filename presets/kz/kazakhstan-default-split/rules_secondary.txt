@@ -1,93 +1,30 @@
 ﻿# NetRuleRouter preset - version 1
 # name: Kazakhstan Default Split - Secondary Route
-# description: Foreign social, messaging, developer, and AI services routed to secondary
+# description: Platforms whose websites are blocked nationwide in Kazakhstan
 # author: NetRuleRouter contributors
-# preset_version: 1
+# preset_version: 2
 
 --- Zones
 # Keep empty to avoid over-broad routing by TLD
 
 --- Domains
-*.facebook.com
-*.instagram.com
-*.threads.com
-*.x.com
-*.twitter.com
-*.youtube.com
-*.googlevideo.com
-*.tiktok.com
-*.discord.com
-*.reddit.com
-*.linkedin.com
-*.telegram.org
-*.t.me
-*.whatsapp.com
-*.signal.org
-*.openai.com
-*.chatgpt.com
-*.anthropic.com
-*.claude.ai
-*.claude.com
-*.perplexity.ai
-*.mistral.ai
-api.mistral.ai
-*.cohere.com
-*.cursor.com
-*.openrouter.ai
-*.midjourney.com
-*.jetbrains.com
-plugins.jetbrains.com
-*.rutracker.org
-*.rutracker.cc
+# Checked: September 2026. Few general-purpose platforms are blocked in Kazakhstan, and the
+# AI, developer and social services not listed here serve Kazakhstan directly.
+# Add a service yourself if your provider fails to reach it.
+
+*.pinterest.com  # Pinterest: website blocked nationwide since 2020
+*.pinimg.com  # Pinterest: website blocked nationwide since 2020
+
+*.pikabu.ru  # Pikabu: blocked nationwide since October 2025
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 
 --- Windows
-telegram.exe
-WhatsAp*.exe
-discord.exe
-signal.exe
-viber.exe
-line.exe
-skype.exe
-zoom.exe
-slack.exe
-chatgpt.exe
-claude.exe
-poe.exe
-codex.exe
-codex*.exe
-Cursor.exe
-Windsurf.exe
-jetbrains-toolbox.exe
-idea64.exe
-pycharm64.exe
-webstorm64.exe
-clion64.exe
-rider64.exe
-goland64.exe
-fleet.exe
+# No desktop apps are blocked in Kazakhstan as of the check date
 
 --- Linux
-clion
-codex
-codex*
-cursor
-discord
-goland
-idea
-jetbrains-toolbox
-pycharm
-rider
-signal-desktop
-slack
-telegram
-telegram-desktop
-viber
-webstorm
-windsurf
-zoom
+# No desktop apps are blocked in Kazakhstan as of the check date
 
 --- MacOS
 # (reserved - not applied on Windows)

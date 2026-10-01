@@ -7,6 +7,19 @@
 use nrr_platform_api::elevation::PrivilegedRelaunchPort;
 use nrr_platform_api::service_control::ServiceControlPort;
 
+/// Keeps a DLL planted in the current directory or on `PATH` out of this
+/// process — the elevated relay included. Called first in `main`.
+#[cfg(windows)]
+pub fn restrict_dll_search() {
+    if let Err(err) = nrr_platform_windows::dll_search::restrict_dll_search() {
+        eprintln!("{err}");
+    }
+}
+
+/// Elsewhere the loader's search is fixed before `main` runs.
+#[cfg(not(windows))]
+pub fn restrict_dll_search() {}
+
 /// The host's service manager, when this build has one.
 #[cfg(windows)]
 pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
@@ -53,6 +66,25 @@ pub fn offline_reset_verb() -> Option<&'static str> {
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn offline_reset_verb() -> Option<&'static str> {
     None
+}
+
+/// Whether starting a program failed because the OS demands elevation first,
+/// as opposed to anything being wrong with the program.
+///
+/// Windows refuses to start an image whose manifest requires administrator
+/// rights with `ERROR_ELEVATION_REQUIRED`, which std files under no kind of its
+/// own — `PermissionDenied` is a different refusal (the file cannot be run).
+#[cfg(windows)]
+pub fn is_elevation_refusal(err: &std::io::Error) -> bool {
+    const ERROR_ELEVATION_REQUIRED: i32 = 740;
+    err.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED)
+}
+
+/// Elsewhere starting a program is never refused for want of elevation: the
+/// program starts and says so itself.
+#[cfg(not(windows))]
+pub fn is_elevation_refusal(_err: &std::io::Error) -> bool {
+    false
 }
 
 /// Creates the elevated relay's report: a new file, refused when a link could

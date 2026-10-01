@@ -13,13 +13,11 @@
 //! - `SettingsExportFull` YAML matches docs/en/rules-file-format.md Settings Export Format (no
 //!   `ui_preferences:` block).
 
-#![cfg(target_os = "windows")]
-
 use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use nrr_domain::rules_file::{parse_rules_file, RulesFileSection};
+use nrr_domain::rules_file::parse_rules_file;
 use nrr_service_runtime::activation_coordinator::{
     ActivationAuditEmitter, ActivationCoordinator, ApplyFailurePolicy, Clock, IdGenerator,
     RulesApplyDispatcher,
@@ -109,12 +107,23 @@ fn decode_b64(s: &str) -> String {
 
 // ── Round-trip: import preset → export → semantic equal ──────────────────────
 
+/// The application section this build reads as rules; the exporter writes app
+/// rules back under the same one.
+const NATIVE_APP_SECTION: &str = if cfg!(target_os = "windows") {
+    "Windows"
+} else if cfg!(target_os = "linux") {
+    "Linux"
+} else {
+    "MacOS"
+};
+
 #[test]
 fn import_preset_then_export_round_trips_semantically() {
     let conn = open_state_db();
     let (executor, _coord) = build_executor(Arc::clone(&conn));
 
-    let preset_text = "\
+    let preset_text = format!(
+        "\
 --- Zones
 ru
 
@@ -126,12 +135,13 @@ example.com
 --- IP
 203.0.113.7
 
---- Windows
+--- {NATIVE_APP_SECTION}
 chrome.exe
-";
+"
+    );
 
     let payload = serde_json::json!({
-        "primary-bytes-b64": b64(preset_text),
+        "primary-bytes-b64": b64(&preset_text),
         "include-child-processes": false,
         "correlation-id": "round-trip-1",
     });
@@ -153,8 +163,7 @@ chrome.exe
     // tuple appears on both sides; ordering may differ because the
     // canonical sort places `ExactFqdn → SuffixDomain → Zone → IP → App`
     // whereas the file lists `Zones → Domains → IP → Windows`.
-    let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
-        .with_host_app_section(RulesFileSection::Windows);
+    let exporter = ProductionPresetExporter::new(Arc::clone(&conn));
     let out = exporter
         .export_rules_file(
             nrr_storage::BASELINE_PRINCIPAL,
@@ -166,7 +175,7 @@ chrome.exe
 
     // Original preset has 6 entries; exported parse must have the same
     // count (one disabled, five enabled) on the primary route.
-    let parsed_orig = parse_rules_file(preset_text).parsed;
+    let parsed_orig = parse_rules_file(&preset_text).parsed;
     let parsed_back = parse_rules_file(&out.file_bytes_utf8).parsed;
     let total_orig: usize = parsed_orig.sections.iter().map(|s| s.entries.len()).sum();
     let total_back: usize = parsed_back.sections.iter().map(|s| s.entries.len()).sum();
@@ -223,8 +232,7 @@ fn both_routes_import_creates_one_revision_with_both_route_rules() {
     let outcome = executor.execute(stored, nrr_storage::BASELINE_PRINCIPAL);
     assert!(matches!(outcome, MutationOutcome::Completed(_)));
 
-    let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
-        .with_host_app_section(RulesFileSection::Windows);
+    let exporter = ProductionPresetExporter::new(Arc::clone(&conn));
     let primary = exporter
         .export_rules_file(
             nrr_storage::BASELINE_PRINCIPAL,
@@ -356,8 +364,7 @@ fn preset_export_response_bytes_decode_to_canonical_txt() {
     let outcome = executor.execute(stored, nrr_storage::BASELINE_PRINCIPAL);
     assert!(matches!(outcome, MutationOutcome::Completed(_)));
 
-    let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
-        .with_host_app_section(RulesFileSection::Windows);
+    let exporter = ProductionPresetExporter::new(Arc::clone(&conn));
     let out = exporter
         .export_rules_file(
             nrr_storage::BASELINE_PRINCIPAL,
@@ -415,8 +422,7 @@ fn foreign_sections_survive_an_export_only_because_the_caller_carries_them() {
         MutationOutcome::Completed(_)
     ));
 
-    let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
-        .with_host_app_section(RulesFileSection::Windows);
+    let exporter = ProductionPresetExporter::new(Arc::clone(&conn));
 
     // The caller carries the section it kept — the GUI reads it back from its
     // sidecar — and the export puts it where it was.

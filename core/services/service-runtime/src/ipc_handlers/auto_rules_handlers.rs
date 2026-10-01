@@ -16,10 +16,11 @@ use nrr_shared::ipc_payloads::{
     AutoRuleDismissedRestoreResponse,
 };
 
-use crate::auto_rules::{ActionSummary, AutoRulesEngine};
+use crate::auto_rules::{shown_by_default_count, ActionSummary, AutoRulesEngine};
 use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
 };
+use crate::tamper_bootstrap::SECURITY_ALERT_GATE_CODE;
 
 /// Resolves the principal a request acts for.
 ///
@@ -95,8 +96,10 @@ impl IpcHandler for AutoRuleCandidatesListHandler {
     fn handle(&self, _request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let sid = principal(ctx)?;
         let quiet = self.engine.quiet_note_for(sid);
+        let candidates = self.engine.candidates(sid);
         serde_json::to_value(AutoRuleCandidatesListResponse {
-            candidates: self.engine.candidates(sid),
+            pending_count: shown_by_default_count(&candidates) as u64,
+            candidates,
             inert_dropped: quiet.inert,
             inert_sample: quiet.sample,
         })
@@ -131,7 +134,11 @@ impl IpcHandler for AutoRuleCandidatesAcceptHandler {
             // the executor's own code through so the caller can tell the user
             // what to do about it rather than seeing a generic failure.
             Err(e) => Err(IpcError {
-                code: IpcErrorCode::PreconditionFailed,
+                code: if e.code == SECURITY_ALERT_GATE_CODE {
+                    IpcErrorCode::SecurityAlertUnacknowledged
+                } else {
+                    IpcErrorCode::PreconditionFailed
+                },
                 message: format!("{}: {}", e.code, e.message),
                 diagnostics_id: None,
             }),
@@ -298,6 +305,7 @@ mod tests {
             .expect("list");
         let parsed: AutoRuleCandidatesListResponse = serde_json::from_value(value).expect("decode");
         assert!(parsed.candidates.is_empty());
+        assert_eq!(parsed.pending_count, 0);
     }
 
     #[test]

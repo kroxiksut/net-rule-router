@@ -14,24 +14,19 @@
 //! resolves the pair — an administrator who typed a value meant it.
 
 #![cfg(target_os = "windows")]
-#![allow(unsafe_code)]
 
 use std::net::Ipv4Addr;
 
-use nrr_platform_api::dns_scope::{normalize_suffix, InterfaceDnsScope, InterfaceDnsScopePort};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE,
-    KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, REG_SAM_FLAGS, REG_VALUE_TYPE,
+use nrr_platform_api::dns_scope::{
+    is_actionable_scope, normalize_suffix, InterfaceDnsScope, InterfaceDnsScopePort,
 };
+use nrr_platform_api::{AdapterInfo, IfOperStatus, InterfaceType};
+use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+
+use crate::win32_ffi::registry;
 
 /// Per-interface TCP/IP parameters. One subkey per adapter GUID.
 const INTERFACES_KEY: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
-
-/// Longest adapter GUID subkey name we will read. A GUID is 38 characters; the
-/// bound only stops a malformed key from sizing a buffer.
-const MAX_KEY_CHARS: usize = 128;
 
 /// Production implementation.
 #[derive(Debug, Default, Clone, Copy)]
@@ -39,38 +34,57 @@ pub struct WindowsInterfaceDnsScopes;
 
 impl InterfaceDnsScopePort for WindowsInterfaceDnsScopes {
     fn dns_scopes(&self) -> Vec<InterfaceDnsScope> {
-        enum_subkeys(INTERFACES_KEY)
+        registry::enum_subkeys(HKEY_LOCAL_MACHINE, INTERFACES_KEY)
             .into_iter()
             .filter_map(|guid| scope_for_interface(&guid))
             .collect()
     }
 }
 
-/// Claims of the connections the OS is using right now, our own tunnel aside.
+/// Actionable claims of the connections the OS is using right now, our own
+/// tunnel aside — the one set both the NRPT exemptions and the global search
+/// list are built from.
 ///
 /// A disconnected VPN keeps its registry values, and honouring them would send
 /// a namespace to a resolver nothing can reach; our tunnel claiming one would
-/// point it back at us.
-pub fn live_dns_scopes() -> Vec<InterfaceDnsScope> {
+/// point it back at us. A suffix completed into the search list but not exempt
+/// sends internal names (`printer.lan`) to the public upstream.
+pub fn live_actionable_dns_scopes() -> Vec<InterfaceDnsScope> {
     use nrr_platform_api::route_table::RouteTablePort;
-    use nrr_platform_api::{classify_availability, AdapterAvailability};
-    use nrr_shared::product_identity::PRODUCT_NAME;
 
     let live = crate::windows_api::ProductionWindowsApi
         .get_adapter_infos()
         .unwrap_or_default();
-    WindowsInterfaceDnsScopes
-        .dns_scopes()
+    claims_of_live_adapters(WindowsInterfaceDnsScopes.dns_scopes(), &live)
+}
+
+fn claims_of_live_adapters(
+    scopes: Vec<InterfaceDnsScope>,
+    live: &[AdapterInfo],
+) -> Vec<InterfaceDnsScope> {
+    scopes
         .into_iter()
+        .filter(is_actionable_scope)
         .filter(|scope| {
             live.iter().any(|a| {
-                a.adapter_name.eq_ignore_ascii_case(&scope.adapter_id)
-                    && classify_availability(a) == Some(AdapterAvailability::Available)
-                    && !a.description.contains(PRODUCT_NAME)
-                    && !a.friendly_name.contains(PRODUCT_NAME)
+                a.adapter_name.eq_ignore_ascii_case(&scope.adapter_id) && carries_live_claim(a)
             })
         })
         .collect()
+}
+
+/// Up, addressed, and not ours. Not `classify_availability`: it drops every
+/// tunnel-typed or hypervisor adapter, and a corporate VPN is often the first,
+/// a Hyper-V external switch the host's own uplink. Either one carrying a
+/// suffix was given it by whoever configured the link, as for any other.
+fn carries_live_claim(adapter: &AdapterInfo) -> bool {
+    use nrr_shared::product_identity::PRODUCT_NAME;
+
+    adapter.oper_status == IfOperStatus::Up
+        && adapter.has_ipv4_address()
+        && adapter.interface_type != InterfaceType::Loopback
+        && !adapter.description.contains(PRODUCT_NAME)
+        && !adapter.friendly_name.contains(PRODUCT_NAME)
 }
 
 /// Machine-wide DNS client parameters.
@@ -134,127 +148,9 @@ fn parse_servers(raw: &str) -> Vec<Ipv4Addr> {
     out
 }
 
-// ── Registry helpers ─────────────────────────────────────────────────────────
-
-fn open_key(subkey: &str, access: u32) -> Option<HKEY> {
-    let wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut hkey = HKEY::default();
-    // SAFETY: `wide` is NUL-terminated UTF-16 outliving the call; `hkey` is a
-    // fresh out-param; the hive is a Win32 pseudo-handle.
-    let rc = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(wide.as_ptr()),
-            0,
-            REG_SAM_FLAGS(access),
-            &mut hkey,
-        )
-    };
-    (rc == ERROR_SUCCESS).then_some(hkey)
-}
-
-fn close_key(hkey: HKEY) {
-    // SAFETY: `hkey` came from a successful `RegOpenKeyExW`.
-    unsafe {
-        let _ = RegCloseKey(hkey);
-    }
-}
-
-fn enum_subkeys(subkey: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let Some(hkey) = open_key(subkey, KEY_ENUMERATE_SUB_KEYS.0 | KEY_QUERY_VALUE.0) else {
-        return out;
-    };
-    let mut index = 0u32;
-    loop {
-        let mut buf = vec![0u16; MAX_KEY_CHARS];
-        let mut len = buf.len() as u32;
-        // SAFETY: `buf` is owned by this frame and `len` carries its length in
-        // characters, so the call cannot write past it.
-        let rc = unsafe {
-            RegEnumKeyExW(
-                hkey,
-                index,
-                windows::core::PWSTR(buf.as_mut_ptr()),
-                &mut len,
-                None,
-                windows::core::PWSTR::null(),
-                None,
-                None,
-            )
-        };
-        if rc == ERROR_NO_MORE_ITEMS {
-            break;
-        }
-        if rc != ERROR_SUCCESS {
-            // A name longer than the buffer, or a transient failure: skip this
-            // one rather than abandoning the whole enumeration.
-            index += 1;
-            if index > 4096 {
-                break;
-            }
-            continue;
-        }
-        out.push(String::from_utf16_lossy(&buf[..len as usize]));
-        index += 1;
-    }
-    close_key(hkey);
-    out
-}
-
-/// A `REG_SZ` value, or `None` when absent or empty.
+/// A string value under HKLM, or `None` when absent or empty.
 fn read_value(subkey: &str, name: &str) -> Option<String> {
-    let hkey = open_key(subkey, KEY_QUERY_VALUE.0)?;
-    let value = read_open_key_string(hkey, name);
-    close_key(hkey);
-    value.filter(|v| !v.trim().is_empty())
-}
-
-fn read_open_key_string(hkey: HKEY, value_name: &str) -> Option<String> {
-    let name_wide: Vec<u16> = value_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut size: u32 = 0;
-    let mut value_type = REG_VALUE_TYPE::default();
-    // SAFETY: `name_wide` is NUL-terminated and outlives the call; this probe
-    // asks only for the byte length.
-    let rc = unsafe {
-        RegQueryValueExW(
-            hkey,
-            PCWSTR(name_wide.as_ptr()),
-            None,
-            Some(&mut value_type),
-            None,
-            Some(&mut size),
-        )
-    };
-    if rc != ERROR_SUCCESS || size == 0 {
-        return None;
-    }
-    let mut buf: Vec<u16> = vec![0u16; (size as usize) / 2 + 1];
-    let mut read: u32 = (buf.len() * 2) as u32;
-    // SAFETY: `buf` is sized from the probe above and `read` carries its byte
-    // length, so the call cannot write past it.
-    let rc = unsafe {
-        RegQueryValueExW(
-            hkey,
-            PCWSTR(name_wide.as_ptr()),
-            None,
-            Some(&mut value_type),
-            Some(buf.as_mut_ptr().cast()),
-            Some(&mut read),
-        )
-    };
-    if rc != ERROR_SUCCESS {
-        return None;
-    }
-    let chars = (read as usize) / 2;
-    Some(
-        String::from_utf16_lossy(&buf[..chars.min(buf.len())])
-            .trim_end_matches('\0')
-            .to_string(),
-    )
+    registry::read_string(HKEY_LOCAL_MACHINE, subkey, Some(name)).filter(|v| !v.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -288,6 +184,96 @@ mod tests {
         );
         assert!(parse_servers("").is_empty());
         assert!(parse_servers("   ").is_empty());
+    }
+
+    const VPN_GUID: &str = "{00000000-0000-4000-8000-000000000001}";
+
+    fn adapter(description: &str, interface_type: InterfaceType, up: bool) -> AdapterInfo {
+        AdapterInfo {
+            index: 7,
+            adapter_name: VPN_GUID.to_ascii_lowercase(),
+            description: description.into(),
+            friendly_name: "Corp link".into(),
+            mac: None,
+            interface_type,
+            oper_status: if up {
+                IfOperStatus::Up
+            } else {
+                IfOperStatus::Down
+            },
+            ipv4_addresses: vec![Ipv4Addr::new(192, 0, 2, 10)],
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+        }
+    }
+
+    fn corp_claim() -> Vec<InterfaceDnsScope> {
+        vec![InterfaceDnsScope {
+            adapter_id: VPN_GUID.into(),
+            display_name: String::new(),
+            suffix: "corp.example".into(),
+            servers: vec![Ipv4Addr::new(192, 0, 2, 53)],
+        }]
+    }
+
+    #[test]
+    fn a_tunnel_typed_vpn_keeps_its_claim() {
+        let live = [adapter("Corp Client Adapter", InterfaceType::Tunnel, true)];
+        assert_eq!(
+            claims_of_live_adapters(corp_claim(), &live),
+            corp_claim(),
+            "the claim the availability classifier used to drop",
+        );
+    }
+
+    #[test]
+    fn a_hypervisor_adapter_carrying_a_suffix_keeps_its_claim() {
+        let live = [adapter(
+            "Hyper-V Virtual Ethernet Adapter",
+            InterfaceType::Ethernet,
+            true,
+        )];
+        assert_eq!(claims_of_live_adapters(corp_claim(), &live), corp_claim());
+    }
+
+    #[test]
+    fn our_own_tunnel_claims_nothing() {
+        use nrr_shared::product_identity::PRODUCT_NAME;
+        let by_description = adapter(
+            &format!("{PRODUCT_NAME} Tunnel"),
+            InterfaceType::Other(53),
+            true,
+        );
+        let mut by_name = adapter("Wintun Userspace Tunnel", InterfaceType::Other(53), true);
+        by_name.friendly_name = PRODUCT_NAME.into();
+        assert!(claims_of_live_adapters(corp_claim(), &[by_description]).is_empty());
+        assert!(claims_of_live_adapters(corp_claim(), &[by_name]).is_empty());
+    }
+
+    /// A home router's single-label lease and a suffix with no server to ask
+    /// are left out, so neither reaches the search list without an exemption.
+    #[test]
+    fn a_claim_that_is_not_actionable_is_dropped_for_every_consumer() {
+        let live = [adapter("Home Ethernet", InterfaceType::Ethernet, true)];
+        let mut home = corp_claim();
+        home[0].suffix = "lan".into();
+        let mut serverless = corp_claim();
+        serverless[0].servers.clear();
+        assert!(claims_of_live_adapters(home, &live).is_empty());
+        assert!(claims_of_live_adapters(serverless, &live).is_empty());
+    }
+
+    #[test]
+    fn a_disconnected_or_unaddressed_adapter_claims_nothing() {
+        let down = adapter("Corp Client Adapter", InterfaceType::Tunnel, false);
+        let mut unaddressed = adapter("Corp Client Adapter", InterfaceType::Tunnel, true);
+        unaddressed.ipv4_addresses.clear();
+        assert!(claims_of_live_adapters(corp_claim(), &[down]).is_empty());
+        assert!(claims_of_live_adapters(corp_claim(), &[unaddressed]).is_empty());
+        assert!(
+            claims_of_live_adapters(corp_claim(), &[]).is_empty(),
+            "an adapter that is gone"
+        );
     }
 
     /// Reads the real machine. Cannot assert what it finds — that depends on

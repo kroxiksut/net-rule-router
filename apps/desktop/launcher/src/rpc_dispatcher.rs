@@ -21,12 +21,13 @@ use std::process::ChildStdin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nrr_broker::protocol::client_answer_timeout;
 use nrr_broker::BrokerHandle;
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
 use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
 use nrr_shared::launcher_rpc::{
-    encode_push_line, encode_response_line, parse_request_line, LauncherRpcPush,
-    LauncherRpcRequest, LauncherRpcResponse,
+    encode_push_line, encode_response_line, parse_request_line, HostAnswerDeadlines,
+    LauncherRpcPush, LauncherRpcRequest, LauncherRpcResponse,
 };
 
 use crate::local_handlers::handle_local_request;
@@ -76,14 +77,6 @@ const BROKER_REVOKE_OP: &str = "local.broker-revoke";
 /// through ANY path (service control, the generic Forbidden relay, a rules
 /// apply) becomes visible within one tick. Never spawns the broker.
 const BROKER_STATUS_OP: &str = "local.broker-status";
-
-/// Default per-request timeout. Most settings ops finish under 50 ms;
-/// the storage-usage walk is the slowest at ~1 s. The catalogue's
-/// per-op timeout matrix lives in `nrr-ipc-client::backend_facade_impl`
-/// and is consulted on every dispatched call (the matrix wins; this
-/// constant is retained for backwards compat with any downstream that
-/// imports it but is no longer applied in `handle_request`).
-pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared handle to the Qt host's stdin. Wrapped in `Arc<Mutex<_>>` so
 /// concurrent dispatcher threads can serialise their writes.
@@ -214,6 +207,45 @@ pub fn spawn_dispatch_worker(
 /// `ContractNegotiate` round-trip; far below every op's timeout, so the
 /// caller's deadline still dominates.
 const CONNECT_BUDGET: Duration = Duration::from_secs(5);
+
+/// The host's wait on top of the dispatcher's own bound: scheduling, the two
+/// pipe hops and a GUI thread that is busy for a moment.
+const HOST_ANSWER_MARGIN: Duration = Duration::from_secs(5);
+
+/// The host's wait for the launcher's own `local.*` / `sidecar.*` operations,
+/// which have no service budget to derive from.
+const LOCAL_ANSWER_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Longest the dispatcher may take to answer a service operation: a young
+/// lane's connect wait, the call (queue wait included) and one relay through a
+/// live elevated broker after a `Forbidden`. A UAC prompt is the user's time
+/// and is not counted; an answer that outlives it reaches the host late.
+fn dispatcher_answer_bound(op: IpcOperationName) -> Duration {
+    let call = ipc_operation_timeout(op);
+    CONNECT_BUDGET
+        + call
+        + client_answer_timeout(nrr_broker::protocol::BROKER_PING, Duration::ZERO)
+        + client_answer_timeout(op.slug(), call)
+}
+
+/// The deadlines the Qt host holds each request to, handed over in the QML
+/// context. Derived here so the host never gives up on an answer the
+/// dispatcher is still allowed to produce.
+pub fn host_answer_deadlines() -> HostAnswerDeadlines {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    HostAnswerDeadlines {
+        default_ms: ms(LOCAL_ANSWER_DEADLINE),
+        operations_ms: IpcOperationName::ALL
+            .into_iter()
+            .map(|op| {
+                (
+                    op.slug().to_string(),
+                    ms(dispatcher_answer_bound(op) + HOST_ANSWER_MARGIN),
+                )
+            })
+            .collect(),
+    }
+}
 
 /// Block until `client` reports `Connected`, a state that cannot progress
 /// without user action (service stopped / not installed / protocol mismatch),
@@ -372,13 +404,13 @@ pub fn dispatch_request(
         return;
     }
 
-    // `autostart.get` / `autostart.toggle` are answered locally by the
-    // launcher: autostart is a per-user setting, and no background service
-    // runs as that user. On Windows the service is `LocalSystem`, so its
-    // `HKEY_CURRENT_USER` is the SYSTEM hive; on Linux the daemon is root, so
-    // its `$HOME` is `/root`. Either would write an entry the session never
-    // reads. Where no user-context mechanism exists yet (macOS),
-    // `is_local_autostart_op` is false and these fall through to the service.
+    // `autostart.toggle` is answered locally by the launcher: autostart is a
+    // per-user setting, and no background service runs as that user. On
+    // Windows the service is `LocalSystem`, so its `HKEY_CURRENT_USER` is the
+    // SYSTEM hive; on Linux the daemon is root, so its `$HOME` is `/root`.
+    // Either would write an entry the session never reads. Where no
+    // user-context mechanism exists yet (macOS), `is_local_autostart_op` is
+    // false and it falls through to the service.
     if crate::autostart_local::is_local_autostart_op(&parsed.operation) {
         let response = match crate::autostart_local::handle_local_autostart(
             &parsed.operation,
@@ -406,6 +438,21 @@ pub fn dispatch_request(
             Err(e) => {
                 LauncherRpcResponse::err(parsed.correlation_id.clone(), "console-path-error", e)
             }
+        };
+        write_response(stdin, &response);
+        return;
+    }
+
+    // The user's own "Check for updates": a network request, so matched before
+    // the pure `local.*` functions.
+    if parsed.operation == crate::update_check_fetch::MANUAL_CHECK_OP {
+        let response = match crate::update_check_fetch::run_manual_check() {
+            Some(payload) => LauncherRpcResponse::ok(parsed.correlation_id.clone(), payload),
+            None => LauncherRpcResponse::err(
+                parsed.correlation_id.clone(),
+                crate::update_check_fetch::CHECK_FAILED_CODE,
+                "The release page did not answer.".to_string(),
+            ),
         };
         write_response(stdin, &response);
         return;
@@ -1072,13 +1119,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_request_routes_block_16_13_opcodes() {
-        // Sanity check — every opcode added to the catalog resolves
-        // through `from_slug` so the dispatcher forwards (does NOT
-        // emit `unknown-operation`). The actual
-        // payload routing is exercised by the handler-side
-        // integration tests; here we only verify slug-recognition
-        // at the launcher boundary.
+    fn handle_request_routes_catalog_opcodes() {
+        // Sanity check — every opcode added to the catalog resolves through
+        // `from_slug` so the dispatcher forwards (does NOT emit
+        // `unknown-operation`). Payload routing itself is exercised by the
+        // handler-side integration tests; here we only verify
+        // slug-recognition at the launcher boundary.
         for op in [
             IpcOperationName::ExplainGet,
             IpcOperationName::DiagnosticsExportArchive,
@@ -1122,16 +1168,13 @@ mod tests {
     }
 
     #[test]
-    fn handle_request_maps_precondition_failed_expired_to_confirmation_expired() {
-        // The wire schema doesn't yet have a dedicated
-        // `ConfirmationExpired` code; the dispatcher detects the
-        // expiration substring in the server message and promotes
-        // it so QML doesn't need to grep English text.
+    fn handle_request_maps_confirmation_expired_code_to_its_slug() {
+        // QML's review flows re-open the review on this slug.
         use nrr_ipc_client::IpcClientError;
         let client =
             ScriptedClient::new(ScriptedOutcome::ServerError(IpcClientError::ServerError {
                 op: IpcOperationName::MutationSubmit,
-                code: nrr_shared::ipc_transport::IpcErrorCode::PreconditionFailed,
+                code: nrr_shared::ipc_transport::IpcErrorCode::ConfirmationExpired,
                 message: "confirmation token expired — re-run dry-run".into(),
             }));
         let req = LauncherRpcRequest {
@@ -1320,6 +1363,49 @@ mod tests {
         assert_eq!(request_lane("not a request"), RpcLane::Main);
     }
 
+    /// The safe-rollback token fetch is a read; the rollback it authorises
+    /// is a mutation and keeps the ordered lane.
+    #[test]
+    fn the_rollback_dry_run_is_a_read_and_the_rollback_is_not() {
+        assert_eq!(
+            lane_of(
+                IpcOperationName::RollbackRequest,
+                serde_json::json!({ "dry-run": true })
+            ),
+            RpcLane::Side
+        );
+        assert_eq!(
+            lane_of(
+                IpcOperationName::RollbackRequest,
+                serde_json::json!({ "dry-run": false, "_envelope_confirmation_token": "t" })
+            ),
+            RpcLane::Main
+        );
+    }
+
+    /// The safe-rollback button sends the user's own rollback, which the
+    /// service admits unelevated, so no UAC relay stands in its path; only the
+    /// baseline form is one a `Forbidden` can send through the broker.
+    #[test]
+    fn only_the_baseline_rollback_needs_rights() {
+        use nrr_shared::ipc_transport::canonical_operation_class;
+        let own = serde_json::json!({ "dry-run": false, "_envelope_confirmation_token": "t" });
+        let baseline = serde_json::json!({
+            "dry-run": false,
+            "admin-baseline": true,
+            "_envelope_confirmation_token": "t",
+        });
+        let op = IpcOperationName::RollbackRequest;
+        assert!(!canonical_operation_class(op, &own).requires_elevation());
+        assert!(canonical_operation_class(op, &baseline).requires_elevation());
+        assert!(broker_may_retry(
+            op,
+            &baseline,
+            IpcClientProfile::GuiInteractive,
+            &forbidden()
+        ));
+    }
+
     #[test]
     fn each_lane_opens_its_own_connection_once() {
         let mut clients = LaneClients::default();
@@ -1368,5 +1454,46 @@ mod tests {
         let parsed = parse_response_from_buffer(buffer.as_bytes());
         assert_eq!(parsed.correlation_id, "c-x");
         assert!(parsed.ok);
+    }
+
+    #[test]
+    fn the_host_never_gives_up_before_the_dispatcher_answers() {
+        let deadlines = host_answer_deadlines();
+        for op in IpcOperationName::ALL {
+            let host = deadlines.operations_ms[op.slug()];
+            let dispatcher = dispatcher_answer_bound(op) + HOST_ANSWER_MARGIN;
+            assert_eq!(u128::from(host), dispatcher.as_millis(), "{}", op.slug());
+            assert!(
+                u128::from(host) > (CONNECT_BUDGET + ipc_operation_timeout(op)).as_millis(),
+                "{} must outlast the service call and the connect wait",
+                op.slug()
+            );
+        }
+        assert_eq!(
+            deadlines.operations_ms.len(),
+            IpcOperationName::ALL.len(),
+            "one entry per operation, nothing else"
+        );
+    }
+
+    /// Both surfaces must hand the launcher's table to their transport; a
+    /// renamed key would silently fall back to the transport's own guess.
+    #[test]
+    fn both_surfaces_feed_the_answer_deadlines_to_their_transport() {
+        use nrr_shared::launcher_rpc::HOST_ANSWER_DEADLINES_CONTEXT_KEY;
+        let qml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../qml");
+        for surface in ["Main.qml", "Tray.qml"] {
+            let source = std::fs::read_to_string(qml.join(surface)).expect("read surface");
+            let wiring = format!("nrrLaunchContext.{HOST_ANSWER_DEADLINES_CONTEXT_KEY}");
+            assert!(source.contains(&wiring), "{surface} must pass {wiring}");
+        }
+        let transport =
+            std::fs::read_to_string(qml.join("flows/RpcTransport.qml")).expect("read transport");
+        for field in ["defaultMs", "operationsMs"] {
+            assert!(
+                transport.contains(field),
+                "RpcTransport.qml must read {field}"
+            );
+        }
     }
 }

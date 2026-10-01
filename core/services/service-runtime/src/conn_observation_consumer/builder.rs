@@ -20,7 +20,7 @@ impl ConnectionObservationConsumer {
             api,
             coordinator,
             active_sid,
-            log_ndjson,
+            log_ndjson: Arc::new(AtomicBool::new(log_ndjson)),
             app_observations: None,
             app_destination_forget: None,
             routed_apps: None,
@@ -52,6 +52,13 @@ impl ConnectionObservationConsumer {
             stale_flow_reset: None,
             fail_closed_armed: None,
         }
+    }
+
+    /// Share the NDJSON detail switch with whoever flips it at runtime.
+    #[must_use]
+    pub fn with_log_ndjson_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.log_ndjson = flag;
+        self
     }
 
     /// Wire the live fail-closed posture so a drop during an outage window is

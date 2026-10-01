@@ -56,10 +56,6 @@
 
 namespace {
 
-QString pathToFileUrl(const QString &path) {
-    return QUrl::fromLocalFile(QDir::fromNativeSeparators(path)).toString();
-}
-
 QVariantMap loadContextObject(const QString &contextFilePath, QString *errorMessage) {
     if (contextFilePath.isEmpty()) {
         return {};
@@ -162,10 +158,22 @@ void reinforceTaskbarIcon(QWindow *window, const QString &iconPath) {
 } // namespace
 
 int main(int argc, char *argv[]) {
+#ifdef Q_OS_WIN
+    const bool dllSearchRestricted = restrictDllSearch();
+#endif
     // Disable stderr buffering so diagnostic markers reach the parent's
     // pipe even if the process is about to crash (no orphaned line buffer).
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     std::fputs("NRR_HOST_MAIN_ENTER\n", stderr);
+#ifdef Q_OS_WIN
+    if (!dllSearchRestricted) {
+        std::fputs("NRR_HOST_DLL_SEARCH_UNRESTRICTED\n", stderr);
+    }
+#endif
+#ifdef NRR_QT_PINNED_TO_PACKAGE
+    // Before QApplication: its constructor already loads the platform plugin.
+    pinQtPluginPaths(executableDirectory());
+#endif
 
     // Force Fusion style for Qt Quick Controls. The default native Windows
     // style routes Menu/MenuBar popups through Win32 native menus that
@@ -194,21 +202,19 @@ int main(int argc, char *argv[]) {
 
     QApplication application(argc, argv);
     std::fputs("NRR_HOST_QAPP_CONSTRUCTED\n", stderr);
-    const QString applicationFilePath = QCoreApplication::applicationFilePath();
-    const bool trayProductExecutable = isTrayProductExecutable(applicationFilePath);
-    QCoreApplication::setApplicationName(
-        trayProductExecutable ? QStringLiteral("NetRuleRouterTray")
-                              : QStringLiteral("NetRuleRouter"));
+    QCoreApplication::setApplicationName(QStringLiteral("NetRuleRouter"));
     QCoreApplication::setOrganizationName(QStringLiteral("NetRuleRouter"));
 
 #ifdef Q_OS_WIN
-    SetCurrentProcessExplicitAppUserModelID(
-        trayProductExecutable ? L"NetRuleRouter.NetRuleRouterTray"
-                              : L"NetRuleRouter.NetRuleRouter");
+    SetCurrentProcessExplicitAppUserModelID(L"NetRuleRouter.NetRuleRouter");
 #endif
 
     const LaunchOptions options = parseLaunchOptions(QCoreApplication::arguments());
     const QString applicationDir = QCoreApplication::applicationDirPath();
+#ifdef NRR_QT_PINNED_TO_PACKAGE
+    // Construction merges Qt's own defaults back into a list set before it.
+    pinQtPluginPaths(applicationDir);
+#endif
 
     // Adopt the launcher's coordination directory BEFORE the first flag is
     // touched below — every lock and flag path is derived from it.
@@ -230,7 +236,7 @@ int main(int argc, char *argv[]) {
     // duplicate host can only appear if the launcher itself was bypassed.
     // The host itself performs no lock check.
 
-    const QString qmlPath = resolveQmlPath(options, applicationDir, applicationFilePath);
+    const QString qmlPath = resolveQmlPath(options, applicationDir);
     if (qmlPath.isEmpty()) {
         qCritical("Main QML file was not resolved.");
         return 2;
@@ -311,22 +317,26 @@ int main(int argc, char *argv[]) {
     // `Qt.labs.platform.SystemTrayIcon` (native Win32 Shell_NotifyIcon API,
     // not QtWidgets), so right-click context menu rendering does not depend
     // on a top-level QWidget existing.
-    NrrNativeBridge nativeBridge(applicationDir);
+    NrrNativeBridge nativeBridge(applicationDir, logsDirectoryFromContext(contextObject));
 
-    // Start the stdin reader so `NRR_IPC_RESPONSE:` lines
-    // from the launcher are routed to the bridge. The thread runs until
-    // either the launcher drops the pipe (`getline` returns false) or the
-    // event loop exits (the `aboutToQuit` lambda below closes stdin to
-    // unblock the read, then we `wait()` before destruction so Qt6's
-    // debug-build qFatal on "QThread destroyed while running" doesn't
-    // fire on any exit path — including early QML-load failures that
-    // would otherwise return from `main()` with the thread still in
-    // its blocking read).
+    // Routes the launcher's lines from stdin to the bridge. Every exit path
+    // stops it and waits for it: a QThread destroyed while running is a qFatal.
     RpcStdinReader rpcStdinReader(&nativeBridge);
+    // The launcher is gone, and with it RPC, preference persistence and the
+    // single-instance lock. Living on would leave a window whose every action
+    // fails and let the next launch open a second one. `exit`, not `quit`: a
+    // window that refuses to close (close-to-tray) must not keep this alive.
+    bool launcherGone = false;
+    QObject::connect(
+        &rpcStdinReader, &RpcStdinReader::rpcChannelClosed, &application,
+        [&launcherGone]() {
+            launcherGone = true;
+            QCoreApplication::exit(0);
+        });
     rpcStdinReader.start();
     QObject::connect(
         &application, &QCoreApplication::aboutToQuit, &application,
-        [&rpcStdinReader]() { rpcStdinReader.requestStopAndCloseStdin(); });
+        [&rpcStdinReader]() { rpcStdinReader.requestStop(); });
 
     // Service Control Manager bridge. Q_INVOKABLE methods drive the Settings →
     // Service Management panel, the tray status badge, and the first-launch
@@ -348,16 +358,17 @@ int main(int argc, char *argv[]) {
         &application,
         [](const QUrl &) { QCoreApplication::exit(1); },
         Qt::QueuedConnection);
+#ifdef NRR_QT_PINNED_TO_PACKAGE
+    engine.setImportPathList(pinnedQmlImportPaths(engine.importPathList(), applicationDir));
+#endif
+    qWarning().noquote() << "NRR_HOST_QT_PATHS plugins=" << QCoreApplication::libraryPaths()
+                         << "qml=" << engine.importPathList();
     engine.rootContext()->setContextProperty(QStringLiteral("nrrNativeBridge"), &nativeBridge);
     engine.rootContext()->setContextProperty(
         QStringLiteral("nrrServiceController"), &serviceController);
-    if (!contextFilePath.isEmpty()) {
+    if (!contextObject.isEmpty()) {
         engine.rootContext()->setContextProperty(
-            QStringLiteral("nrrContextFileUrl"), pathToFileUrl(contextFilePath));
-        if (!contextObject.isEmpty()) {
-            engine.rootContext()->setContextProperty(
-                QStringLiteral("nrrLaunchContext"), contextObject);
-        }
+            QStringLiteral("nrrLaunchContext"), contextObject);
     }
 
     qWarning().noquote() << "NRR_HOST_LOADING_QML" << qmlPath << "isMainGui=" << isMainGui;
@@ -371,10 +382,8 @@ int main(int argc, char *argv[]) {
             startupSplash->deleteLater();
             startupSplash = nullptr;
         }
-        // Early-exit before `application.exec()`
-        // means the aboutToQuit cleanup never fires. Drain the reader
-        // here so the QThread destructor sees a stopped thread.
-        rpcStdinReader.requestStopAndCloseStdin();
+        // No `exec()`, so no `aboutToQuit` either.
+        rpcStdinReader.requestStop();
         rpcStdinReader.wait(2000);
         return 1;
     }
@@ -467,20 +476,14 @@ int main(int argc, char *argv[]) {
         });
     }
 
-    const int exitCode = application.exec();
+    // Events processed during start-up may already have delivered it, and
+    // `exit` does nothing while no loop runs.
+    const int exitCode = launcherGone ? 0 : application.exec();
 
-    // Drain the stdin reader cleanly so the QThread
-    // destructor doesn't fire on a still-running thread. The
-    // aboutToQuit connection above already closed STDIN, so the
-    // `getline` inside the reader has returned by now in nearly all
-    // cases; the wait with a generous timeout covers the rare race
-    // where the close hasn't propagated yet. If the timeout fires the
-    // thread is still leaked but the process is exiting anyway —
-    // better a deferred leak than a Win32 modal Debug Error dialog.
+    // `aboutToQuit` has already asked the reader to stop; this covers an exit
+    // that bypassed it.
     if (rpcStdinReader.isRunning()) {
-        // If aboutToQuit never fired (e.g. early-exit before exec()),
-        // close stdin defensively here so wait() can return.
-        rpcStdinReader.requestStopAndCloseStdin();
+        rpcStdinReader.requestStop();
         rpcStdinReader.wait(2000);
     }
     return exitCode;

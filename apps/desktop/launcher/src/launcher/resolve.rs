@@ -9,12 +9,19 @@ use nrr_shared::product_identity::BinaryRole;
 
 use super::LauncherSurface;
 
+/// An environment variable naming code or payload to run. A release build never
+/// reads one: whoever can set the variable would choose what the launcher runs.
+fn env_override(allow_env_overrides: bool, name: &str) -> Option<PathBuf> {
+    if !allow_env_overrides {
+        return None;
+    }
+    let path = PathBuf::from(env::var_os(name)?);
+    path.exists().then_some(path)
+}
+
 pub fn resolve_native_host_executable() -> Option<PathBuf> {
-    if let Ok(explicit_path) = env::var("NRR_QT_NATIVE_HOST_EXE") {
-        let path = PathBuf::from(explicit_path);
-        if path.exists() {
-            return Some(path);
-        }
+    if let Some(path) = env_override(cfg!(debug_assertions), "NRR_QT_NATIVE_HOST_EXE") {
+        return Some(path);
     }
 
     let executable_name = if cfg!(windows) {
@@ -45,18 +52,15 @@ pub(super) fn resolve_qml_path(surface: LauncherSurface) -> Option<PathBuf> {
         LauncherSurface::MainGui => ("NRR_QML_MAIN", "apps/desktop/qml/Main.qml"),
         LauncherSurface::Tray => ("NRR_QML_TRAY", "apps/desktop/qml/Tray.qml"),
     };
-    if let Ok(explicit) = env::var(env_var) {
-        let path = PathBuf::from(explicit);
-        if path.exists() {
-            return Some(path);
-        }
+    if let Some(path) = env_override(cfg!(debug_assertions), env_var) {
+        return Some(path);
     }
     bundled_resource(relative)
 }
 
 /// The service binary next to THIS executable, if it is there. Only the
 /// sibling counts — the same trust boundary the host and the broker draw.
-pub(super) fn sibling_service_binary() -> Option<PathBuf> {
+pub(crate) fn sibling_service_binary() -> Option<PathBuf> {
     beside_executable(BinaryRole::Service.host_file_name()).filter(|path| path.is_file())
 }
 
@@ -108,4 +112,24 @@ pub(super) fn find_bundled(
                 .fold(root.to_path_buf(), |path, segment| path.join(segment))
         })
         .find(|candidate| candidate.exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_override;
+
+    #[test]
+    fn env_override_needs_the_gate_and_an_existing_path() {
+        let dir = std::env::temp_dir();
+        std::env::set_var("NRR_TEST_ENV_OVERRIDE_PATH", &dir);
+        assert_eq!(
+            env_override(true, "NRR_TEST_ENV_OVERRIDE_PATH").as_deref(),
+            Some(dir.as_path())
+        );
+        assert_eq!(env_override(false, "NRR_TEST_ENV_OVERRIDE_PATH"), None);
+
+        std::env::set_var("NRR_TEST_ENV_OVERRIDE_PATH", dir.join("no-such-file"));
+        assert_eq!(env_override(true, "NRR_TEST_ENV_OVERRIDE_PATH"), None);
+        std::env::remove_var("NRR_TEST_ENV_OVERRIDE_PATH");
+    }
 }

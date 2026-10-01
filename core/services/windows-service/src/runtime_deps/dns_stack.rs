@@ -53,7 +53,14 @@ pub(super) fn build_dns_resolver_factory(
         route_coordinator,
     };
     let platform = DnsStackPlatform {
-        system_dns: Arc::new(WindowsSystemDnsServers),
+        // One enumeration costs a PowerShell run; built once here, so every
+        // arm and every reader shares one list per network change or DNS
+        // settings change (a DHCP lease, a VPN client's own domain).
+        system_dns: nrr_service_runtime::dns_stack::cached_system_dns(
+            Arc::new(WindowsSystemDnsServers),
+            &nrr_platform_windows::network_change::WindowsNetworkChangeObserver,
+            &nrr_platform_windows::dns_config_change::WindowsDnsConfigChangeObserver,
+        ),
         upstream_pool: upstream_dns_pool(),
         redirect: Arc::new(
             NrptDnsRedirect::new(PowerShellRunner, TransactedNrptStore)
@@ -61,6 +68,13 @@ pub(super) fn build_dns_resolver_factory(
         ),
         listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 53)),
         claimed_namespaces: Arc::new(claimed_namespaces),
+        network_changes: Arc::new(
+            nrr_platform_windows::network_change::WindowsNetworkChangeObserver,
+        ),
+        // A DHCP lease or a VPN client writes its domain without a link event.
+        dns_config_changes: Arc::new(
+            nrr_platform_windows::dns_config_change::WindowsDnsConfigChangeObserver,
+        ),
     };
     Some(nrr_service_runtime::dns_stack::build_dns_resolver_factory(
         inputs, platform,
@@ -333,7 +347,7 @@ pub(super) fn build_fake_ip_stack_factory(
                     Err(e) => tracing::warn!(
                         target: "nrr::fake-ip",
                         msg_key = "svc-dns-fakeip-selfheal-flush-failed",
-                        error = ?e,
+                        error = %e,
                         "DNS flush after a VPN self-heal exclusion failed — the client reconnects on its own TTL",
                     ),
                 }
@@ -462,14 +476,11 @@ pub(super) fn upstream_dns_pool() -> Arc<nrr_service_runtime::dns_upstream::Upst
     }))
 }
 
-pub(super) use nrr_service_runtime::dns_stack::namespace_recheck;
-
 /// The namespaces the product must not answer for, read fresh on every call:
 /// actionable claims of the connections in use, our own tunnel aside.
 fn claimed_namespaces() -> Vec<nrr_platform_api::dns_redirect::DnsNamespaceExemption> {
-    nrr_platform_windows::dns_scope::live_dns_scopes()
+    nrr_platform_windows::dns_scope::live_actionable_dns_scopes()
         .into_iter()
-        .filter(nrr_platform_api::dns_scope::is_actionable_scope)
         .map(
             |scope| nrr_platform_api::dns_redirect::DnsNamespaceExemption {
                 suffix: scope.suffix,

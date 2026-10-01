@@ -314,7 +314,8 @@ pub struct TickSummary {
     pub parked: u32,
     /// Rules authored without asking (`auto` mode).
     pub authored: u32,
-    /// Total pending for this principal after the tick.
+    /// Offers the inbox shows by default after the tick — see
+    /// [`shown_by_default_count`].
     pub pending: usize,
     /// An `AutoRuleCandidatesChanged` push was emitted.
     pub published: bool,
@@ -325,6 +326,7 @@ pub struct TickSummary {
 pub struct ActionSummary {
     pub applied: u32,
     pub unknown: u32,
+    /// Offers left that the inbox shows by default.
     pub pending: usize,
     /// Accept only: the page the rules were offered next to has to be
     /// reloaded by hand.
@@ -654,21 +656,6 @@ fn signal_slug(signal: CompanionSignal) -> &'static str {
     }
 }
 
-/// Wire slug for the primary-route verdict. `Unknown` maps to the empty string:
-/// "nothing conclusive" is the absence of a verdict, not one of its values.
-/// Is this candidate answered by the main link already?
-///
-/// "It answers" is not proof the address is unwanted: a site can complete the
-/// connection and serve a refusal — ChatGPT answers main-link addresses with
-/// "this address is not served" — so a name of the ANCHOR'S OWN brand still
-/// opens the question. A name of someone else's brand does not: a shared CDN,
-/// an advertising or telemetry endpoint that loads nearby works without the
-/// tunnel, and both offering it and routing traffic for it are noise.
-///
-/// One declaration, because two callers must agree: the tray decides whether to
-/// ask, and the answer path decides whether to keep the host on the main link.
-/// A candidate that is not worth asking about must not silently re-route
-/// traffic either.
 /// Is this candidate still waiting for the main link's answer?
 ///
 /// [`settled_by_the_main_link`] one step earlier. A third party on the delivery
@@ -714,6 +701,15 @@ fn settled_self_signed(dto: &AutoRuleCandidateDto) -> bool {
         && dto.primary_behavior == AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS
 }
 
+/// Is this candidate answered by the main link already?
+///
+/// "It answers" is not proof the address is unwanted: a site can complete the
+/// connection and serve a refusal, so a name of the ANCHOR'S OWN brand still
+/// opens the question. A name of someone else's brand does not: a shared CDN
+/// or an ad endpoint that loads nearby works without the tunnel.
+///
+/// One declaration, because two callers must agree: the tray decides whether to
+/// ask, and the answer path decides whether to keep the host on the main link.
 fn settled_by_the_main_link(dto: &AutoRuleCandidateDto) -> bool {
     if dto.primary_behavior != AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS {
         return false;
@@ -744,6 +740,29 @@ fn shares_registrable_domain(anchor: &str, proposed: &str) -> bool {
     }
 }
 
+/// The inbox's "the main route already handles it" mark. A site the user marked
+/// as refusing main-link addresses is the exception: answering with a refusal
+/// is still answering, so its companions stay work — as they do for the popup.
+fn served_by_main_link(dto: &AutoRuleCandidateDto, anchor_refuses_main_link: bool) -> bool {
+    !anchor_refuses_main_link && settled_by_the_main_link(dto)
+}
+
+/// Does the inbox list this offer without being asked to show more?
+///
+/// The one rule behind every count a surface shows — tray menu, sidebar, push,
+/// action replies — so a number never promises rows the list hides.
+fn shown_by_default(dto: &AutoRuleCandidateDto) -> bool {
+    !dto.served_by_main_link
+}
+
+/// How many of the inbox rows [`AutoRulesEngine::candidates`] returned count
+/// as waiting for an answer.
+pub fn shown_by_default_count(rows: &[AutoRuleCandidateDto]) -> usize {
+    rows.iter().filter(|dto| shown_by_default(dto)).count()
+}
+
+/// Wire slug for the primary-route verdict. `Unknown` maps to the empty string:
+/// "nothing conclusive" is the absence of a verdict, not one of its values.
 fn primary_behavior_slug(behavior: PrimaryBehavior) -> &'static str {
     match behavior {
         PrimaryBehavior::Responds => AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,

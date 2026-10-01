@@ -47,7 +47,7 @@ fn fixture_with_route_sync(
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         )
-        .with_kill_switch_resolver(Arc::new(move |_| resolution.clone()))
+        .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
         .with_route_sync(hook),
     );
     (api, orch, source, rules, observed)

@@ -22,6 +22,8 @@
 //! | `local.system-theme`            | The system appearance right now, so a desktop that switches       |
 //! |                                 | light/dark under a running window is answered by the same probe   |
 //! |                                 | the cold start used.                                              |
+//! | `local.rule-value-verdict`      | The Add/Edit rule dialog's gate — the verdict the rules table     |
+//! |                                 | shows for one value, via `rule_value_validation`.                 |
 //!
 //! Slug shape mirrors the IpcOperationName convention
 //! (`<domain>.<resource>.<verb>`) — though `local.*` has no verb tier
@@ -35,6 +37,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::launcher::sibling_service_binary;
 use nrr_ipc_client::IpcClient;
 use nrr_shared::rules_json::{to_canonical_string, CanonicalRulesJsonV1, RulesJsonCodecError};
 
@@ -96,6 +99,7 @@ pub fn handle_local_request(
     match operation {
         "local.canonical-rules-hash" => handle_canonical_rules_hash(payload),
         "local.rules-overlaps" => handle_rules_overlaps(payload),
+        "local.rule-value-verdict" => handle_rule_value_verdict(payload),
         "local.service-info" => handle_service_info(client),
         "local.vpn.discover" => handle_vpn_discover(),
         "local.app-groups.discover" => handle_app_groups_discover(),
@@ -183,7 +187,7 @@ fn discover_app_groups_os() -> Vec<nrr_platform_api::DiscoveredApp> {
 /// so each NAT pin can be read against its current address.
 fn handle_vm_inventory_list(payload: &Value) -> LocalHandlerResult {
     let mut hypervisors = vm_inventory_os();
-    let (host, additional) = host_addresses(&interface_rows_os(), &AdapterRef::from(payload));
+    let (host, additional) = host_addresses(&live_interface_rows(), &AdapterRef::from(payload));
     nrr_platform_api::classify_bindings(&mut hypervisors, &host, additional);
     Ok(json!({ "hypervisors": hypervisors }))
 }
@@ -217,7 +221,8 @@ fn handle_vm_nat_bind(payload: &Value) -> LocalHandlerResult {
     let address = match payload.get("route").and_then(Value::as_str) {
         Some("rules") => None,
         Some("additional") => {
-            let (_, additional) = host_addresses(&interface_rows_os(), &AdapterRef::from(payload));
+            let (_, additional) =
+                host_addresses(&live_interface_rows(), &AdapterRef::from(payload));
             match additional {
                 Some(address) => Some(address),
                 None => return Ok(json!({ "ok": false, "error": "no-additional-address" })),
@@ -274,38 +279,24 @@ fn host_addresses(
             .find_map(|part| part.parse::<std::net::Ipv4Addr>().ok())
     };
     let host = rows.iter().filter_map(ipv4).collect();
-    let is_additional = |row: &&nrr_platform_api::InterfaceRouteRow| {
-        if additional.id.is_empty() {
-            !additional.name.is_empty() && row.windows_name == additional.name
-        } else {
-            row.persistent_id == additional.id
-        }
-    };
-    let address = rows.iter().find(is_additional).and_then(ipv4);
+    // The same resolver the interfaces screen binds roles with.
+    let address = nrr_platform_api::interface_rows::find_adapter_index(
+        rows,
+        Some(additional.id),
+        Some(additional.name),
+        None,
+    )
+    .and_then(|index| ipv4(&rows[index]));
     (host, address)
 }
 
-/// Live adapter rows; the preview rows a failed enumeration falls back to
+/// Live adapter rows; the placeholder rows a failed enumeration falls back to
 /// would pin a machine to an address the host does not have.
-#[cfg(target_os = "windows")]
-fn interface_rows_os() -> Vec<nrr_platform_api::InterfaceRouteRow> {
-    match nrr_platform_windows::collect_interfaces_rows(false) {
-        (nrr_platform_api::InterfacesDataSource::WindowsLive, rows) => rows,
+fn live_interface_rows() -> Vec<nrr_platform_api::InterfaceRouteRow> {
+    match nrr_mock_backend::network_interfaces::local_interface_rows().collect_rows(false) {
+        (source, rows) if source.is_live() => rows,
         _ => Vec::new(),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn interface_rows_os() -> Vec<nrr_platform_api::InterfaceRouteRow> {
-    match nrr_platform_linux::interface_rows::collect_interfaces_rows(false) {
-        (nrr_platform_api::InterfacesDataSource::LinuxLive, rows) => rows,
-        _ => Vec::new(),
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
-fn interface_rows_os() -> Vec<nrr_platform_api::InterfaceRouteRow> {
-    Vec::new()
 }
 
 #[cfg(target_os = "windows")]
@@ -453,18 +444,6 @@ fn binary_is_newer_than_process(
     Some(modified > started + std::time::Duration::from_secs(1))
 }
 
-/// The service binary shipped alongside this application — the one an updated
-/// copy should be running.
-fn sibling_service_binary() -> Option<std::path::PathBuf> {
-    let exe_name = if cfg!(windows) {
-        "nrr-service.exe"
-    } else {
-        "nrr-serviced"
-    };
-    let candidate = std::env::current_exe().ok()?.parent()?.join(exe_name);
-    candidate.is_file().then_some(candidate)
-}
-
 /// Case- and spelling-insensitive path comparison. Canonicalisation resolves
 /// `\\?\` prefixes, 8.3 names and links; a path that cannot be canonicalised
 /// (removed since, permission) falls back to a plain case-insensitive compare.
@@ -542,6 +521,26 @@ fn handle_canonical_rules_hash(payload: &Value) -> LocalHandlerResult {
     }))
 }
 
+/// The verdict on one typed rule value — the one the rules table shows for it,
+/// which for a zone or domain is the service's own import pipeline.
+fn handle_rule_value_verdict(payload: &Value) -> LocalHandlerResult {
+    let text = |field: &'static str| {
+        payload
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or(LocalHandlerError::MissingField(field))
+    };
+    let verdict = nrr_application::rule_value_validation::validate_rule_value(
+        text("rule-type")?,
+        text("match-value")?,
+    );
+    Ok(json!({
+        "status": verdict.status_slug(),
+        "message-key": verdict.message_key(),
+        "args": verdict.args(),
+    }))
+}
+
 /// Every exact rule already covered by a wildcard rule, so the rules screen
 /// can offer the redundant ones for removal, and every pair of rules on the
 /// two routes that claim the same hosts. Local because it is a pure function
@@ -605,6 +604,37 @@ mod tests {
 
     fn empty_client() -> FakeClient {
         FakeClient { negotiate: None }
+    }
+
+    /// The dialog's gate answers with the verdict the rules table shows.
+    #[test]
+    fn the_dialog_gets_the_rules_table_verdict() {
+        let ask = |rule_type: &str, value: &str| {
+            handle_local_request(
+                "local.rule-value-verdict",
+                &json!({ "rule-type": rule_type, "match-value": value }),
+                &empty_client(),
+            )
+            .expect("verdict")
+        };
+        assert_eq!(ask("zone", ".ru")["status"], "valid");
+        assert_eq!(ask("domain", "example.com.")["status"], "valid");
+        let refused = ask("domain", "192.168.1.1");
+        assert_eq!(refused["status"], "error");
+        assert_eq!(
+            refused["message-key"],
+            "rules.validation.match-value-invalid.domain"
+        );
+        let out_of_range = ask("exact-ip", "300.1.1.1");
+        assert_eq!(out_of_range["args"]["octet"], "300");
+        assert!(matches!(
+            handle_local_request(
+                "local.rule-value-verdict",
+                &json!({ "rule-type": "zone" }),
+                &empty_client(),
+            ),
+            Err(LocalHandlerError::MissingField("match-value"))
+        ));
     }
 
     /// The live probe answers with a slug the shell already knows how to
@@ -673,8 +703,8 @@ mod tests {
     /// same routing, different letter case on each side.
     #[test]
     fn the_reported_divergence_folds_away() {
-        let typed = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r1\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"Cloud.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r2\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"DiskO*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r3\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"VendorDis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r4\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"SwiftVPN 3.0.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
-        let service = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r93\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"swiftvpn 3.0.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r92\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"vendordis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r91\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"disko*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r90\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"cloud.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
+        let typed = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r1\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"Cloud.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r2\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"DiskO*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r3\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"VendorDis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r4\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"ExampleVPN 3.0.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
+        let service = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r93\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"examplevpn 3.0.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r92\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"vendordis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r91\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"disko*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r90\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"cloud.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
         assert_eq!(hash_of(&typed), hash_of(&service));
     }
 
@@ -843,7 +873,7 @@ mod tests {
             .next()
             .expect("a preview row");
         row.persistent_id = id.to_string();
-        row.windows_name = name.to_string();
+        row.name = name.to_string();
         row.local_ip = ip.to_string();
         row
     }
@@ -867,6 +897,12 @@ mod tests {
             name: "Tunnel",
         };
         assert_eq!(host_addresses(&rows, &by_name).1, additional);
+        // A setting the interfaces screen resolves must resolve here too.
+        let loosely_named = AdapterRef {
+            id: "",
+            name: "tunnel ",
+        };
+        assert_eq!(host_addresses(&rows, &loosely_named).1, additional);
         let unset = AdapterRef { id: "", name: "" };
         assert_eq!(host_addresses(&rows, &unset).1, None);
     }

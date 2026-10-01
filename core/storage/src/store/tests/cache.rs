@@ -6,7 +6,7 @@ use super::*;
 fn upsert_and_get_by_hostname() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = migrated_cache_store(&dir);
-    let ip = Ipv4Addr::new(23, 10, 20, 138);
+    let ip = Ipv4Addr::new(203, 0, 113, 138);
 
     store
         .upsert_resolution(sample_resolution("example.com", ip))
@@ -46,11 +46,11 @@ fn get_by_hostname_missing_returns_empty() {
 fn upsert_multi_ip_hostname() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = migrated_cache_store(&dir);
-    let ip1 = Ipv4Addr::new(1, 1, 1, 1);
+    let ip1 = Ipv4Addr::new(198, 51, 100, 1);
     let ip2 = Ipv4Addr::new(1, 0, 0, 1);
 
     let entry = ResolutionEntry {
-        canonical_hostname: "cloudflare.com".to_string(),
+        canonical_hostname: "cdn.example.com".to_string(),
         raw_hostname_sample: None,
         resolved_ips: vec![IpAddr::V4(ip1), IpAddr::V4(ip2)],
         ttl_seconds: Some(60),
@@ -62,7 +62,7 @@ fn upsert_multi_ip_hostname() {
 
     let result = store
         .get_by_hostname(
-            "cloudflare.com",
+            "cdn.example.com",
             &FreshnessThresholds::default_production(),
             CachePriorityStrategy::default(),
         )
@@ -99,49 +99,6 @@ fn upsert_updates_existing_entry() {
     assert_eq!(result.resolved_ips[0].ttl_seconds, Some(600));
 }
 
-// ── mark_revision_stale ───────────────────────────────────────────────────
-
-#[test]
-fn mark_revision_stale_transitions_fresh_entries() {
-    let dir = tempfile::tempdir().expect("tmp");
-    let store = migrated_cache_store(&dir);
-
-    // Write with rev-001.
-    store
-        .upsert_resolution(sample_resolution("host.example", Ipv4Addr::new(1, 2, 3, 4)))
-        .expect("upsert");
-
-    // Activate rev-002 — entries from rev-001 should become stale_usable.
-    let updated = store.mark_revision_stale("rev-002").expect("mark");
-    assert_eq!(updated, 1);
-
-    let result = store
-        .get_by_hostname(
-            "host.example",
-            &FreshnessThresholds::default_production(),
-            CachePriorityStrategy::default(),
-        )
-        .expect("get");
-    assert_eq!(
-        result.resolved_ips[0].cache_state,
-        CacheEntryState::StaleUsable
-    );
-}
-
-#[test]
-fn mark_revision_stale_skips_same_revision() {
-    let dir = tempfile::tempdir().expect("tmp");
-    let store = migrated_cache_store(&dir);
-
-    store
-        .upsert_resolution(sample_resolution("h.example", Ipv4Addr::new(5, 6, 7, 8)))
-        .expect("upsert");
-
-    // "New" revision is the same as the one used for writing — no rows updated.
-    let updated = store.mark_revision_stale("rev-test-001").expect("mark");
-    assert_eq!(updated, 0);
-}
-
 // ── negative cache ────────────────────────────────────────────────────────
 
 #[test]
@@ -175,34 +132,6 @@ fn negative_cache_blocks_hostname_lookup() {
     );
 }
 
-// ── record_lookup_event ───────────────────────────────────────────────────
-
-#[test]
-fn record_lookup_event_inserts_row() {
-    use crate::dto::LookupResultState;
-    use nrr_domain::decision_lookup::LookupDirection;
-    let dir = tempfile::tempdir().expect("tmp");
-    let store = migrated_cache_store(&dir);
-    let now = SystemTime::now();
-
-    store
-        .record_lookup_event(LookupEventEntry {
-            direction: LookupDirection::HostnameToIp,
-            result_state: LookupResultState::Hit,
-            error_code: None,
-            duration_ms: 5,
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3600),
-        })
-        .expect("record");
-
-    let conn = store.into_connection();
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM lookup_events", [], |r| r.get(0))
-        .expect("count");
-    assert_eq!(count, 1);
-}
-
 // ── clear_cache ───────────────────────────────────────────────────────────
 
 #[test]
@@ -211,10 +140,16 @@ fn clear_cache_removes_all_data() {
     let store = migrated_cache_store(&dir);
 
     store
-        .upsert_resolution(sample_resolution("h1.example", Ipv4Addr::new(1, 1, 1, 1)))
+        .upsert_resolution(sample_resolution(
+            "h1.example",
+            Ipv4Addr::new(198, 51, 100, 1),
+        ))
         .expect("upsert");
     store
-        .upsert_resolution(sample_resolution("h2.example", Ipv4Addr::new(2, 2, 2, 2)))
+        .upsert_resolution(sample_resolution(
+            "h2.example",
+            Ipv4Addr::new(198, 51, 100, 2),
+        ))
         .expect("upsert");
 
     let summary = store
@@ -299,7 +234,7 @@ fn fake_ip_bindings_roundtrip_and_stamp_wipe() {
 fn forgetting_a_census_host_stops_its_ips_counting_as_shared() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = migrated_cache_store(&dir);
-    let ip = Ipv4Addr::new(23, 10, 20, 156);
+    let ip = Ipv4Addr::new(203, 0, 113, 156);
     store
         .record_shared_ip_direct_host(ip, "static.cdninsta.test", 1, false)
         .expect("census");
@@ -341,14 +276,14 @@ fn purge_ip_range_v4_removes_only_the_range() {
     store
         .upsert_resolution(sample_resolution(
             "real.example",
-            Ipv4Addr::new(23, 10, 20, 138),
+            Ipv4Addr::new(203, 0, 113, 138),
         ))
         .expect("upsert");
     store
         .record_shared_ip_direct_host(Ipv4Addr::new(198, 19, 1, 2), "victim.example", 1, false)
         .expect("census");
     store
-        .record_shared_ip_direct_host(Ipv4Addr::new(8, 8, 8, 8), "kept.example", 1, false)
+        .record_shared_ip_direct_host(Ipv4Addr::new(198, 51, 100, 8), "kept.example", 1, false)
         .expect("census");
 
     let removed = store
@@ -383,8 +318,75 @@ fn purge_ip_range_v4_removes_only_the_range() {
     );
     assert_eq!(
         store
-            .direct_host_count_for_ip(Ipv4Addr::new(8, 8, 8, 8))
+            .direct_host_count_for_ip(Ipv4Addr::new(198, 51, 100, 8))
             .expect("count"),
         1
     );
+}
+
+#[test]
+fn an_unreadable_census_row_fails_the_read_instead_of_shrinking_it() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    store
+        .record_shared_ip_direct_host(Ipv4Addr::new(192, 0, 2, 7), "ok.example", 1, true)
+        .expect("census");
+    store
+        .conn
+        .borrow()
+        .execute(
+            "INSERT INTO shared_ip_direct_hosts (ipv4_packed, hostname, last_seen, primary_ruled)
+             VALUES ('not-an-address', 'broken.example', 1, 1)",
+            [],
+        )
+        .expect("broken row");
+
+    assert!(store.shared_ip_census_primary_ruled_ips().is_err());
+    assert!(store.shared_ip_census_ips().is_err());
+}
+
+#[test]
+fn cleanup_ages_out_census_tenants_not_seen_within_the_policy() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let now = SystemTime::now();
+    let now_ms = system_time_to_ms(now);
+    let max_age_secs = crate::dto::CleanupPolicy::default().max_shared_ip_direct_host_age_secs;
+    let (stale, live) = (Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2));
+    let stale_ms = now_ms - max_age_secs as i64 * 1_000 - 1;
+    store
+        .record_shared_ip_direct_host(stale, "stale.example", stale_ms, false)
+        .expect("census");
+    store
+        .record_shared_ip_direct_host(live, "live.example", now_ms - 1_000, false)
+        .expect("census");
+
+    let summary = store
+        .cleanup_expired(now, &crate::dto::CleanupPolicy::default())
+        .expect("cleanup");
+
+    assert_eq!(summary.shared_ip_direct_hosts_removed, 1);
+    assert_eq!(store.direct_host_count_for_ip(stale).expect("count"), 0);
+    assert_eq!(store.direct_host_count_for_ip(live).expect("count"), 1);
+}
+
+#[test]
+fn clear_cache_empties_the_census() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let ip = Ipv4Addr::new(192, 0, 2, 3);
+    store
+        .record_shared_ip_direct_host(ip, "tenant.example", 1, true)
+        .expect("census");
+
+    let summary = store
+        .clear_cache(CacheResetReason::ManualUserReset)
+        .expect("clear");
+
+    assert_eq!(summary.shared_ip_direct_hosts_removed, 1);
+    assert!(store.shared_ip_census_ips().expect("census").is_empty());
+    assert!(store
+        .shared_ip_census_primary_ruled_ips()
+        .expect("census")
+        .is_empty());
 }

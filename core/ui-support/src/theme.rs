@@ -83,7 +83,7 @@ pub fn resolve_theme_with(
 }
 
 fn detect_system_theme_mode(port: Option<&dyn SystemThemePort>) -> (SystemThemeMode, bool) {
-    if let Some(from_env) = parse_system_theme_hint(env::var("NRR_SYSTEM_THEME").ok().as_deref()) {
+    if let Some(from_env) = debug_system_theme_hint() {
         return (from_env, true);
     }
     // Asked first, because it is the answer that matters most and the one the
@@ -99,6 +99,15 @@ fn detect_system_theme_mode(port: Option<&dyn SystemThemePort>) -> (SystemThemeM
         // caller is told it IS a fallback rather than an observation.
         None => (SystemThemeMode::Light, false),
     }
+}
+
+/// A developer override only: in a release build it would outrank the probe
+/// and keep a high-contrast user on an ordinary palette.
+fn debug_system_theme_hint() -> Option<SystemThemeMode> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    parse_system_theme_hint(env::var("NRR_SYSTEM_THEME").ok().as_deref())
 }
 
 fn parse_system_theme_hint(value: Option<&str>) -> Option<SystemThemeMode> {

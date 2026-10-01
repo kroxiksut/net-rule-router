@@ -318,3 +318,98 @@ fn datagrams_past_the_hold_bound_are_dropped_while_the_dial_runs() {
         "the held datagrams go out oldest first; the overflow was dropped"
     );
 }
+
+impl TwoHostHarness {
+    fn with_max_udp_flows(self, flows: usize) -> Self {
+        Self {
+            stack: self.stack.with_max_udp_flows(flows),
+            ..self
+        }
+    }
+
+    /// A second client socket on another source port, for a second flow to an
+    /// endpoint that already has one.
+    fn second_client(&mut self) -> SocketHandle {
+        let handle = self.client_sockets.add(udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 8192]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 8192]),
+        ));
+        self.client_sockets
+            .get_mut::<udp::Socket>(handle)
+            .bind(51001)
+            .expect("second client udp bind");
+        handle
+    }
+
+    fn send_from(&mut self, handle: SocketHandle, to: std::net::Ipv4Addr, payload: &[u8]) {
+        self.client_sockets
+            .get_mut::<udp::Socket>(handle)
+            .send_slice(payload, (IpAddress::Ipv4(to), 443))
+            .expect("client send");
+    }
+
+    fn tick_until(&mut self, mut done: impl FnMut(&Self) -> bool) {
+        for _ in 0..400 {
+            self.tick();
+            if done(self) {
+                return;
+            }
+        }
+    }
+}
+
+#[test]
+fn past_the_udp_flow_cap_new_clients_are_refused_and_the_live_flow_is_kept() {
+    let (dialer, gate) = gated_dialer();
+    gate.release();
+    let mut harness =
+        TwoHostHarness::new(Arc::clone(&dialer) as Arc<dyn RelayDialer>).with_max_udp_flows(1);
+
+    harness.send(harness.fast, b"fast-initial");
+    harness.tick_until(|_| dialer.sent_to(FAST_HOST).len() == 1);
+    assert_eq!(dialer.sent_to(FAST_HOST), vec![b"fast-initial".to_vec()]);
+
+    // A new endpoint gets no bind, so no dial either.
+    harness.send(harness.slow, b"slow-initial");
+    for _ in 0..20 {
+        harness.tick();
+    }
+    assert!(
+        !gate.entered.load(Ordering::SeqCst),
+        "no dial starts past the cap"
+    );
+
+    // A new client of the endpoint already bound is told port-unreachable.
+    let second = harness.second_client();
+    let unreachable_before = harness.stack.health.udp_unreachable_sent();
+    harness.send_from(second, harness.fast, b"second-client");
+    harness.tick_until(|h| h.stack.health.udp_unreachable_sent() > unreachable_before);
+    assert_eq!(
+        harness.stack.health.udp_unreachable_sent(),
+        unreachable_before + 1
+    );
+    assert_eq!(harness.stack.health.udp_flows_refused_at_capacity(), 2);
+
+    // The flow already carrying traffic is untouched.
+    harness.send(harness.fast, b"fast-again");
+    harness.tick_until(|_| dialer.sent_to(FAST_HOST).len() == 2);
+    assert_eq!(
+        dialer.sent_to(FAST_HOST),
+        vec![b"fast-initial".to_vec(), b"fast-again".to_vec()]
+    );
+}
+
+#[test]
+fn under_the_udp_flow_cap_a_second_endpoint_is_dialed() {
+    let (dialer, gate) = gated_dialer();
+    gate.release();
+    let mut harness =
+        TwoHostHarness::new(Arc::clone(&dialer) as Arc<dyn RelayDialer>).with_max_udp_flows(2);
+
+    harness.send(harness.fast, b"fast-initial");
+    harness.tick_until(|_| dialer.sent_to(FAST_HOST).len() == 1);
+    harness.send(harness.slow, b"slow-initial");
+    harness.tick_until(|_| dialer.sent_to(SLOW_HOST).len() == 1);
+    assert_eq!(dialer.sent_to(SLOW_HOST), vec![b"slow-initial".to_vec()]);
+    assert_eq!(harness.stack.health.udp_flows_refused_at_capacity(), 0);
+}

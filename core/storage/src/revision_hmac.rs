@@ -38,7 +38,7 @@
 //! which feeds the `SecurityAlert` emitter.
 
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -115,17 +115,7 @@ const POINTER_DOMAIN: &str = "active-revision-pointer-v1";
 pub fn compute_pointer_hmac(row: &PointerFields<'_>, key: &[u8]) -> [u8; HMAC_BYTE_LEN] {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
         .unwrap_or_else(|_| unreachable!("HMAC accepts a key of any length"));
-    // Length-prefixed like the row tag: without it `principal="ab"` +
-    // `revision_id="c"` and `"a"` + `"bc"` would feed identical bytes.
-    for part in [
-        POINTER_DOMAIN,
-        row.principal,
-        row.revision_id,
-        &row.activated_at.to_string(),
-        row.apply_attempt_id.unwrap_or(""),
-    ] {
-        feed_label(&mut mac, part.as_bytes());
-    }
+    feed_pointer(&mut mac, row);
     let out = mac.finalize().into_bytes();
     let mut tag = [0u8; HMAC_BYTE_LEN];
     tag.copy_from_slice(&out);
@@ -157,7 +147,7 @@ pub enum HmacVerification {
     /// is intact.
     Verified,
     /// Stored HMAC is the empty blob. The row predates the
-    /// `row_hmac` column (lazy backfill from the v10→v11 migration)
+    /// `row_hmac` column (lazy backfill from the migration that added it)
     /// or was inserted by a path that didn't carry a key. The
     /// service-runtime caller decides whether to surface an alert.
     Unsigned,
@@ -180,24 +170,7 @@ pub fn compute_hmac(row: &RowFields<'_>, key: &[u8]) -> [u8; HMAC_BYTE_LEN] {
     #[allow(clippy::expect_used)]
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
 
-    // Feed every field. Order is alphabetical by column name — see
-    // module doc-comment for the canonical-form rationale. Each
-    // `feed_field` call writes a length-prefixed label and value
-    // so adjacent fields cannot collide.
-    feed_field_i64_opt(&mut mac, b"activated_at", row.activated_at);
-    feed_field_bytes(&mut mac, b"content_hash", row.content_hash.as_bytes());
-    feed_field_bytes(&mut mac, b"correlation_id", row.correlation_id.as_bytes());
-    feed_field_i64(&mut mac, b"created_at", row.created_at);
-    feed_field_bytes(&mut mac, b"principal", row.principal.as_bytes());
-    feed_field_str_opt(&mut mac, b"rejected_reason", row.rejected_reason);
-    feed_field_str_opt(&mut mac, b"review_summary_json", row.review_summary_json);
-    feed_field_bytes(&mut mac, b"revision_id", row.revision_id.as_bytes());
-    feed_field_str_opt(&mut mac, b"risk_level", row.risk_level);
-    feed_field_bytes(&mut mac, b"rules_json", row.rules_json.as_bytes());
-    feed_field_bytes(&mut mac, b"source", row.source.as_bytes());
-    feed_field_bytes(&mut mac, b"status", row.status.as_bytes());
-    feed_field_i64_opt(&mut mac, b"superseded_at", row.superseded_at);
-    feed_field_str_opt(&mut mac, b"superseded_by", row.superseded_by);
+    feed_row(&mut mac, row);
 
     let mut out = [0u8; HMAC_BYTE_LEN];
     out.copy_from_slice(&mac.finalize().into_bytes());
@@ -224,55 +197,129 @@ pub fn verify(row: &RowFields<'_>, stored_hmac: &[u8], key: &[u8]) -> HmacVerifi
     }
 }
 
+/// Key-independent SHA-256 over exactly the bytes [`compute_hmac`] signs.
+///
+/// Names a row's content in an acknowledgement: it survives a key reset, and
+/// any edit to a signed column changes it.
+#[must_use]
+pub fn row_fingerprint(row: &RowFields<'_>) -> String {
+    let mut hasher = Sha256::new();
+    feed_label(&mut hasher, ROW_FINGERPRINT_DOMAIN.as_bytes());
+    feed_row(&mut hasher, row);
+    format!("{:x}", hasher.finalize())
+}
+
+/// [`row_fingerprint`] for a pointer row.
+#[must_use]
+pub fn pointer_fingerprint(row: &PointerFields<'_>) -> String {
+    let mut hasher = Sha256::new();
+    feed_label(&mut hasher, ROW_FINGERPRINT_DOMAIN.as_bytes());
+    feed_pointer(&mut hasher, row);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Keeps a fingerprint from ever equalling a tag computed over the same bytes.
+const ROW_FINGERPRINT_DOMAIN: &str = "row-content-fingerprint-v1";
+
 // ── helpers ─────────────────────────────────────────────────────────────
 
-fn feed_label(mac: &mut HmacSha256, label: &[u8]) {
+/// Where the canonical encoding goes: the keyed tag or the plain fingerprint.
+trait Sink {
+    fn put(&mut self, bytes: &[u8]);
+}
+
+impl Sink for HmacSha256 {
+    fn put(&mut self, bytes: &[u8]) {
+        Mac::update(self, bytes);
+    }
+}
+
+impl Sink for Sha256 {
+    fn put(&mut self, bytes: &[u8]) {
+        Digest::update(self, bytes);
+    }
+}
+
+/// Every field, alphabetical by column name, each length-prefixed so adjacent
+/// fields cannot collide.
+fn feed_row(mac: &mut impl Sink, row: &RowFields<'_>) {
+    feed_field_i64_opt(mac, b"activated_at", row.activated_at);
+    feed_field_bytes(mac, b"content_hash", row.content_hash.as_bytes());
+    feed_field_bytes(mac, b"correlation_id", row.correlation_id.as_bytes());
+    feed_field_i64(mac, b"created_at", row.created_at);
+    feed_field_bytes(mac, b"principal", row.principal.as_bytes());
+    feed_field_str_opt(mac, b"rejected_reason", row.rejected_reason);
+    feed_field_str_opt(mac, b"review_summary_json", row.review_summary_json);
+    feed_field_bytes(mac, b"revision_id", row.revision_id.as_bytes());
+    feed_field_str_opt(mac, b"risk_level", row.risk_level);
+    feed_field_bytes(mac, b"rules_json", row.rules_json.as_bytes());
+    feed_field_bytes(mac, b"source", row.source.as_bytes());
+    feed_field_bytes(mac, b"status", row.status.as_bytes());
+    feed_field_i64_opt(mac, b"superseded_at", row.superseded_at);
+    feed_field_str_opt(mac, b"superseded_by", row.superseded_by);
+}
+
+/// Length-prefixed like the row: without it `principal="ab"` +
+/// `revision_id="c"` and `"a"` + `"bc"` would feed identical bytes.
+fn feed_pointer(mac: &mut impl Sink, row: &PointerFields<'_>) {
+    for part in [
+        POINTER_DOMAIN,
+        row.principal,
+        row.revision_id,
+        &row.activated_at.to_string(),
+        row.apply_attempt_id.unwrap_or(""),
+    ] {
+        feed_label(mac, part.as_bytes());
+    }
+}
+
+fn feed_label(mac: &mut impl Sink, label: &[u8]) {
     let len = (label.len() as u64).to_be_bytes();
-    mac.update(&len);
-    mac.update(label);
+    mac.put(&len);
+    mac.put(label);
 }
 
-fn feed_field_bytes(mac: &mut HmacSha256, label: &[u8], value: &[u8]) {
+fn feed_field_bytes(mac: &mut impl Sink, label: &[u8], value: &[u8]) {
     feed_label(mac, label);
-    mac.update(&[1u8]); // present marker
+    mac.put(&[1u8]); // present marker
     let len = (value.len() as u64).to_be_bytes();
-    mac.update(&len);
-    mac.update(value);
+    mac.put(&len);
+    mac.put(value);
 }
 
-fn feed_field_str_opt(mac: &mut HmacSha256, label: &[u8], value: Option<&str>) {
+fn feed_field_str_opt(mac: &mut impl Sink, label: &[u8], value: Option<&str>) {
     feed_label(mac, label);
     match value {
         Some(v) => {
-            mac.update(&[1u8]); // present
+            mac.put(&[1u8]); // present
             let bytes = v.as_bytes();
             let len = (bytes.len() as u64).to_be_bytes();
-            mac.update(&len);
-            mac.update(bytes);
+            mac.put(&len);
+            mac.put(bytes);
         }
         None => {
-            mac.update(&[0u8]); // null
+            mac.put(&[0u8]); // null
         }
     }
 }
 
-fn feed_field_i64(mac: &mut HmacSha256, label: &[u8], value: i64) {
+fn feed_field_i64(mac: &mut impl Sink, label: &[u8], value: i64) {
     feed_label(mac, label);
-    mac.update(&[1u8]);
+    mac.put(&[1u8]);
     let bytes = value.to_be_bytes();
     // 8 bytes is the fixed wire size — length prefix is implicit.
-    mac.update(&bytes);
+    mac.put(&bytes);
 }
 
-fn feed_field_i64_opt(mac: &mut HmacSha256, label: &[u8], value: Option<i64>) {
+fn feed_field_i64_opt(mac: &mut impl Sink, label: &[u8], value: Option<i64>) {
     feed_label(mac, label);
     match value {
         Some(v) => {
-            mac.update(&[1u8]);
-            mac.update(&v.to_be_bytes());
+            mac.put(&[1u8]);
+            mac.put(&v.to_be_bytes());
         }
         None => {
-            mac.update(&[0u8]);
+            mac.put(&[0u8]);
         }
     }
 }
@@ -348,10 +395,7 @@ mod tests {
         let mut r = sample_row();
         r.principal = "S-1-5-21-1-2-3-1001";
         let h_principal = compute_hmac(&r, &key);
-        assert_ne!(
-            h0, h_principal,
-            "principal re-homing must change HMAC (block 16.19.1)"
-        );
+        assert_ne!(h0, h_principal, "principal re-homing must change HMAC");
     }
 
     #[test]
@@ -414,6 +458,31 @@ mod tests {
             verify(&sample_row(), &truncated, &key),
             HmacVerification::Tampered
         );
+    }
+
+    #[test]
+    fn fingerprint_names_content_not_key() {
+        let fp = row_fingerprint(&sample_row());
+        assert_eq!(fp.len(), 64);
+        assert_eq!(fp, row_fingerprint(&sample_row()), "deterministic");
+        let mut edited = sample_row();
+        edited.rules_json = r#"{"schema-version":2}"#;
+        assert_ne!(fp, row_fingerprint(&edited), "an edit is a new content");
+        let tag = compute_hmac(&sample_row(), &[0x42u8; 32]);
+        let tag_hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        assert_ne!(fp, tag_hex);
+
+        let pointer = PointerFields {
+            principal: "__baseline__",
+            revision_id: "rev-001",
+            activated_at: 1,
+            apply_attempt_id: None,
+        };
+        let moved = PointerFields {
+            revision_id: "rev-002",
+            ..pointer
+        };
+        assert_ne!(pointer_fingerprint(&pointer), pointer_fingerprint(&moved));
     }
 
     #[test]

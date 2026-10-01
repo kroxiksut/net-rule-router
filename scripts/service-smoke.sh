@@ -27,7 +27,9 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
+# shellcheck source=lib/service-paths.sh
+. "$script_dir/lib/service-paths.sh"
+repo_root="$NRR_REPO_ROOT"
 
 profile="dev"
 console_only=0
@@ -56,15 +58,14 @@ case "$profile" in
     ;;
 esac
 
-cyan() { printf '\033[36m%s\033[0m\n' "$1"; }
-green() { printf '\033[32m%s\033[0m\n' "$1"; }
-yellow() { printf '\033[33m%s\033[0m\n' "$1"; }
+cyan() { nrr_cyan "$1"; }
+green() { nrr_green "$1"; }
+yellow() { nrr_yellow "$1"; }
 
-exe_name="nrr-serviced"
-unit_name="netrulerouter.service"
-profile_dir="debug"
-[ "$profile" = "release" ] && profile_dir="release"
-exe_path="$repo_root/target/$profile_dir/$exe_name"
+exe_name="$NRR_SERVICE_EXE_NAME"
+unit_name="$NRR_UNIT_NAME"
+# The target directory may be redirected (CARGO_TARGET_DIR, .cargo/config.toml).
+exe_path="$(nrr_built_service_binary "$(nrr_target_root "$repo_root")" "$profile")"
 
 if [ ! -f "$exe_path" ]; then
   cyan "Building $exe_name ($profile profile)..."
@@ -74,6 +75,11 @@ if [ ! -f "$exe_path" ]; then
     (cd "$repo_root" && cargo build -p nrr-linux-service) >/dev/null
   fi
 fi
+if [ ! -f "$exe_path" ]; then
+  echo "$exe_name not found at $exe_path after the build" >&2
+  exit 1
+fi
+cyan "Using $exe_path"
 
 cyan "==> status verb (no systemd)"
 "$exe_path" status

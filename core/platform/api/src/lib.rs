@@ -38,8 +38,13 @@ pub mod dns;
 // A caller-side deadline over any resolver: the platform ones answer
 // synchronously and cannot be cancelled.
 pub mod dns_budget;
+// DNS settings can change with no link or route moving; this feed says so.
+pub mod dns_config_change;
 pub mod dns_observe;
 pub mod dns_redirect;
+// Server enumeration may be a child process; its answer lives until the
+// network changes.
+pub mod dns_servers_cache;
 // Which connection claims which DNS namespace. A corporate VPN says this
 // itself over DHCP, so the user never has to know their own domain.
 pub mod dns_scope;
@@ -114,15 +119,16 @@ pub mod routing;
 // the service binary's own verbs code against the trait.
 pub mod service_control;
 // Session-scoped single-instance claim for the desktop surfaces. A kernel
-// object on Windows, an abstract socket on Linux — anything the user cannot
-// delete and the OS releases when the owner dies.
+// object on Windows, a socket in the private runtime directory on Linux —
+// anything deleting a file does not end and the OS releases when the owner dies.
 pub mod single_instance;
 // The host's operator log (Windows event log; the journal on Linux, which needs
 // no implementation because stdout already lands there).
 pub mod system_event_log;
-// The host's light/dark preference. A port because the probe is OS mechanism:
-// the one real implementation used to live under `cfg(windows)` inside a
-// neutral UI crate, so every other OS was told "light".
+// The host's display language; same reasoning as the theme probe below.
+pub mod system_locale;
+// The host's light/dark preference. A port because the probe is OS mechanism,
+// not a neutral computation.
 pub mod system_theme;
 // Attribution + provenance of the third-party binaries we ship (today:
 // WireGuard LLC's signed `wintun.dll` on Windows). Neutral descriptors +
@@ -148,7 +154,7 @@ pub mod windows_api;
 // `mock-backend`) can write `nrr_platform_api::RouteEntry` exactly as they
 // wrote `nrr_platform_windows::RouteEntry`. Windows-only concretes
 // (ProductionWindowsApi, the WFP enforcement backend, fail_closed,
-// the Etw*/Wfp*/Dpapi impls, collect_interfaces_rows) are
+// the Etw*/Wfp*/Dpapi impls, the live adapter enumeration) are
 // intentionally NOT re-exported here — they live only in the Windows backend
 // and are consumed under `#[cfg(windows)]`.
 pub use adapters::{
@@ -194,7 +200,8 @@ pub use hosts_file::{
 pub use interface_rows::{
     apply_external_probe, build_derived_assessment, build_observed_facts, external_probe_target,
     fallback_rows, unknown_recommendation, BasicAvailabilityStatus, DerivedInterfaceAssessment,
-    InterfaceRouteRow, InterfacesDataSource, ObservedInterfaceFacts, RouteRoleRecommendation,
+    InterfaceRouteRow, InterfaceRowsPort, InterfacesDataSource, MockInterfaceRows,
+    ObservedInterfaceFacts, PlaceholderInterfaceRows, RouteRoleRecommendation,
 };
 pub use interface_traffic::{
     InterfaceCounterSource, InterfaceCounters, MockInterfaceCounterSource,

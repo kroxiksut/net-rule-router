@@ -14,7 +14,7 @@
 /// How the platform a rule is written for names its executables.
 ///
 /// The rule's platform decides, never the host doing the reducing: a Windows
-/// GUI previewing a `--- Linux` section must leave `telegram` alone.
+/// GUI previewing a `--- Linux` section must leave `messenger` alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutableNaming {
     /// Windows: a program file ends in `.exe`, so a bare name gets it.
@@ -80,7 +80,7 @@ pub fn canonical_glob_process_pattern(raw: &str) -> String {
 /// case, without the `.exe` spelling.
 ///
 /// The suffix is how Windows spells a program, not part of its identity: the
-/// same browser is `firefox` in `/proc/<pid>/exe` and `firefox.exe` in a
+/// same program is `viewer` in `/proc/<pid>/exe` and `viewer.exe` in a
 /// Windows rule. Folding it on both sides lets a rule match whichever spelling
 /// it was stored with — a Linux rule stored with `.exe` included — and lets a
 /// Windows glob that does not end in `.exe` (`*torrent`) match too.
@@ -104,9 +104,11 @@ mod tests {
 
     #[test]
     fn case_and_path_and_suffix_reduce_to_one_spelling() {
-        let (value, changes) =
-            canonical_exact_process_name("C:\\Program Files\\SwiftVPN 3.0\\SwiftVPN 3.0.exe", WIN);
-        assert_eq!(value, "swiftvpn 3.0.exe");
+        let (value, changes) = canonical_exact_process_name(
+            "C:\\Program Files\\ExampleVPN 3.0\\ExampleVPN 3.0.exe",
+            WIN,
+        );
+        assert_eq!(value, "examplevpn 3.0.exe");
         assert!(changes.stripped_path_from.is_some());
         assert_eq!(changes.appended_exe_to, None);
     }
@@ -121,7 +123,7 @@ mod tests {
 
     #[test]
     fn a_unix_name_gets_no_suffix_and_reports_none() {
-        for name in ["telegram-desktop", "signal-desktop", "org.telegram.desktop"] {
+        for name in ["messenger-desktop", "chat-desktop", "org.example.messenger"] {
             let (value, changes) = canonical_exact_process_name(name, UNIX);
             assert_eq!(value, name);
             assert_eq!(changes, ExactNameChanges::default(), "{name}");
@@ -130,13 +132,13 @@ mod tests {
 
     #[test]
     fn a_unix_name_is_folded_exactly_as_its_matcher_folds_it() {
-        let (value, changes) = canonical_exact_process_name("  /usr/bin/Telegram ", UNIX);
-        assert_eq!(value, "telegram");
+        let (value, changes) = canonical_exact_process_name("  /usr/bin/Messenger ", UNIX);
+        assert_eq!(value, "messenger");
         assert!(changes.stripped_path_from.is_some());
         assert_eq!(changes.appended_exe_to, None);
         assert_eq!(
             app_match_key(&value),
-            app_match_key("/opt/Telegram/Telegram")
+            app_match_key("/opt/Messenger/Messenger")
         );
     }
 
@@ -171,27 +173,27 @@ mod tests {
 
     #[test]
     fn a_rule_and_a_linux_process_reduce_to_the_same_key() {
-        let rule = canonical_exact_process_name("Firefox", UNIX).0;
-        assert_eq!(app_match_key(&rule), app_match_key("/usr/bin/firefox"));
+        let rule = canonical_exact_process_name("Viewer", UNIX).0;
+        assert_eq!(app_match_key(&rule), app_match_key("/usr/bin/viewer"));
         // A rule stored with the Windows spelling still names the same program.
-        let legacy = canonical_exact_process_name("Firefox", WIN).0;
-        assert_eq!(app_match_key(&legacy), app_match_key("/usr/bin/firefox"));
+        let legacy = canonical_exact_process_name("Viewer", WIN).0;
+        assert_eq!(app_match_key(&legacy), app_match_key("/usr/bin/viewer"));
     }
 
     #[test]
     fn a_rule_and_a_windows_process_reduce_to_the_same_key() {
-        let rule = canonical_exact_process_name("Firefox", WIN).0;
+        let rule = canonical_exact_process_name("Viewer", WIN).0;
         assert_eq!(
             app_match_key(&rule),
-            app_match_key("C:PATHFirefox.exe".replace("PATH", r"\").as_str())
+            app_match_key("C:PATHViewer.exe".replace("PATH", r"\").as_str())
         );
     }
 
     #[test]
     fn a_glob_without_the_suffix_still_names_a_windows_process() {
         let pattern = canonical_glob_process_pattern("*Torrent");
-        let observed = app_match_key("C:PATHqBittorrent.exe".replace("PATH", r"\").as_str());
-        assert_eq!(observed, "qbittorrent");
+        let observed = app_match_key("C:PATHExampleTorrent.exe".replace("PATH", r"\").as_str());
+        assert_eq!(observed, "exampletorrent");
         assert!(observed.ends_with(pattern.trim_start_matches('*')));
     }
 

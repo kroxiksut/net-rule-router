@@ -93,15 +93,15 @@ impl UpstreamResolver for FixedUpstream {
 
 #[test]
 fn poison_fallback_leaves_clean_answers_alone() {
-    let inner = FixedUpstream::ok(vec![ip(23, 10, 20, 78)]);
-    let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
+    let inner = FixedUpstream::ok(vec![ip(100, 64, 0, 78)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 1, 4)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
     assert_eq!(
         r.resolve("video.example", AddressFamily::Ipv4)
             .expect("clean")
             .addresses,
-        vec![ip(23, 10, 20, 78)]
+        vec![ip(100, 64, 0, 78)]
     );
     assert_eq!(
         fallback.calls.load(Ordering::SeqCst),
@@ -132,13 +132,13 @@ fn the_port_adapter_refuses_to_hand_a_placeholder_to_the_cache() {
 #[test]
 fn the_port_adapter_passes_a_real_answer_through() {
     let port = UpstreamResolverPort::new(
-        FixedUpstream::ok(vec![ip(23, 10, 20, 157)]) as Arc<dyn UpstreamResolver>
+        FixedUpstream::ok(vec![ip(100, 64, 0, 157)]) as Arc<dyn UpstreamResolver>
     );
     let record = port
         .resolve("WWW.Social.Example", AddressFamily::Ipv4)
         .expect("resolved");
     assert_eq!(record.canonical_hostname, "www.social.example");
-    assert_eq!(record.addresses, vec![ip(23, 10, 20, 157)]);
+    assert_eq!(record.addresses, vec![ip(100, 64, 0, 157)]);
 }
 
 #[test]
@@ -148,7 +148,7 @@ fn the_confirming_query_follows_the_egress_policy() {
     // first and nothing is ever pinned. The policy is what moves the query
     // somewhere the provider is not.
     let tunnel_resolver = spawn_fake_dns(|query| {
-        vec![build_a_response(query, &[ip(23, 10, 20, 157)], 60).expect("resp")]
+        vec![build_a_response(query, &[ip(100, 64, 0, 157)], 60).expect("resp")]
     });
     struct ViaTunnel(std::net::SocketAddr);
     impl crate::dns_egress::DnsEgressPolicy for ViaTunnel {
@@ -170,7 +170,7 @@ fn the_confirming_query_follows_the_egress_policy() {
         r.resolve("www.social.example", AddressFamily::Ipv4)
             .expect("confirmed")
             .addresses,
-        vec![ip(23, 10, 20, 157)]
+        vec![ip(100, 64, 0, 157)]
     );
 }
 
@@ -179,30 +179,30 @@ fn poison_fallback_rescues_loopback_stub_answers() {
     // A filtering upstream answers the rule host with 127.0.0.1 — the
     // fallback's clean answer must win.
     let inner = FixedUpstream::ok(vec![ip(127, 0, 0, 1)]);
-    let fallback = FixedUpstream::ok(vec![ip(23, 10, 20, 78)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 0, 78)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
     assert_eq!(
         r.resolve("www.video.example", AddressFamily::Ipv4)
             .expect("rescued")
             .addresses,
-        vec![ip(23, 10, 20, 78)]
+        vec![ip(100, 64, 0, 78)]
     );
 }
 
 #[test]
 fn poison_fallback_rescues_nxdomain() {
-    // The provider NXDOMAINs a rotating googlevideo node; a public resolver
+    // The provider NXDOMAINs a rotating video-CDN node; a public resolver
     // knows it.
     let inner = FixedUpstream::new(Err(ResolveError::NoRecords));
-    let fallback = FixedUpstream::ok(vec![ip(172, 217, 132, 74)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 0, 74)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
     assert_eq!(
         r.resolve("rr5.example", AddressFamily::Ipv4)
             .expect("rescued")
             .addresses,
-        vec![ip(172, 217, 132, 74)]
+        vec![ip(100, 64, 0, 74)]
     );
 }
 
@@ -225,19 +225,30 @@ fn an_empty_answer_and_a_placeholder_answer_both_carry_nothing_to_pin() {
         ttl_seconds: 60,
     };
     let real = ResolvedAddresses {
-        addresses: vec![IpAddr::V4(ip(23, 10, 20, 78))],
+        addresses: vec![IpAddr::V4(ip(100, 64, 0, 78))],
         ttl_seconds: 60,
     };
-    assert!(carries_nothing_to_pin(&empty));
-    assert!(carries_nothing_to_pin(&placeholder));
-    assert!(!carries_nothing_to_pin(&real));
+    assert!(carries_nothing_to_pin(&empty, AddressFamily::Ipv4));
+    assert!(carries_nothing_to_pin(&placeholder, AddressFamily::Ipv4));
+    assert!(!carries_nothing_to_pin(&real, AddressFamily::Ipv4));
     // A real address travelling beside a placeholder still leaves something to
     // enforce on — the screen drops the placeholder, it does not drop the answer.
     let mixed = ResolvedAddresses {
-        addresses: vec![IpAddr::V4(ip(127, 0, 0, 1)), IpAddr::V4(ip(23, 10, 20, 78))],
+        addresses: vec![IpAddr::V4(ip(127, 0, 0, 1)), IpAddr::V4(ip(100, 64, 0, 78))],
         ttl_seconds: 60,
     };
-    assert!(!carries_nothing_to_pin(&mixed));
+    assert!(!carries_nothing_to_pin(&mixed, AddressFamily::Ipv4));
+    // The family is part of the question: v4 addresses pin nothing for an AAAA.
+    assert!(carries_nothing_to_pin(&real, AddressFamily::Ipv6));
+    let loopback6 = ResolvedAddresses {
+        addresses: vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
+        ttl_seconds: 60,
+    };
+    assert!(carries_nothing_to_pin(&loopback6, AddressFamily::Ipv6));
+    assert!(!carries_nothing_to_pin(
+        &v6_answer(&[v6(7)]),
+        AddressFamily::Ipv6
+    ));
 }
 
 #[test]
@@ -267,14 +278,14 @@ fn poison_fallback_returns_the_original_when_fallbacks_fail_too() {
 #[test]
 fn poison_fallback_rescues_a_documentation_space_placeholder() {
     let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)]);
-    let fallback = FixedUpstream::ok(vec![ip(23, 10, 20, 135)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 0, 135)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
     assert_eq!(
         r.resolve("secure.example", AddressFamily::Ipv4)
             .expect("rescued")
             .addresses,
-        vec![ip(23, 10, 20, 135)]
+        vec![ip(100, 64, 0, 135)]
     );
 }
 
@@ -282,8 +293,8 @@ fn poison_fallback_rescues_a_documentation_space_placeholder() {
 /// usable — no second source, no added latency.
 #[test]
 fn poison_fallback_ignores_a_single_suspicious_address() {
-    let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(23, 10, 20, 78)]);
-    let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
+    let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(100, 64, 0, 78)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 1, 4)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
     assert_eq!(
@@ -299,11 +310,11 @@ fn poison_fallback_ignores_a_single_suspicious_address() {
 #[test]
 fn address_reuse_by_an_unrelated_host_asks_a_second_source() {
     let recent = Arc::new(RecentRuleAddressIndex::new());
-    let shared = vec![ip(203, 0, 55, 7), ip(203, 0, 55, 8)];
+    let shared = vec![ip(100, 64, 55, 7), ip(100, 64, 55, 8)];
     recent.record("secure.example", &shared);
 
     let inner = FixedUpstream::ok(shared.clone());
-    let fallback = FixedUpstream::ok(vec![ip(23, 10, 20, 159)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 0, 159)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>])
         .with_recent_addresses(Arc::clone(&recent));
@@ -311,7 +322,7 @@ fn address_reuse_by_an_unrelated_host_asks_a_second_source() {
         r.resolve("assistant.example", AddressFamily::Ipv4)
             .expect("rescued")
             .addresses,
-        vec![ip(23, 10, 20, 159)]
+        vec![ip(100, 64, 0, 159)]
     );
 }
 
@@ -320,11 +331,11 @@ fn address_reuse_by_an_unrelated_host_asks_a_second_source() {
 #[test]
 fn re_resolution_and_shared_front_ends_do_not_ask_a_second_source() {
     let recent = Arc::new(RecentRuleAddressIndex::new());
-    let shared = vec![ip(203, 0, 55, 7), ip(203, 0, 55, 8)];
+    let shared = vec![ip(100, 64, 55, 7), ip(100, 64, 55, 8)];
     recent.record("static.chatapp.test", &shared);
 
     let inner = FixedUpstream::ok(shared.clone());
-    let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 1, 4)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>])
         .with_recent_addresses(Arc::clone(&recent));
@@ -336,7 +347,7 @@ fn re_resolution_and_shared_front_ends_do_not_ask_a_second_source() {
         shared
     );
     // An address nobody remembers ends the scan on the first lookup.
-    let fresh = FixedUpstream::ok(vec![ip(203, 0, 55, 7), ip(198, 41, 30, 9)]);
+    let fresh = FixedUpstream::ok(vec![ip(100, 64, 55, 7), ip(100, 64, 41, 9)]);
     let r2 = PoisonFallbackUpstreamResolver::new(fresh as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>])
         .with_recent_addresses(recent);
@@ -350,7 +361,7 @@ fn re_resolution_and_shared_front_ends_do_not_ask_a_second_source() {
     assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
 }
 
-/// One operator, two registrable domains (`claude.ai` / `api.anthropic.com`,
+/// One operator, two registrable domains (`chatapp.example` / `api.chatapp.test`,
 /// `chatapp.example` / `chatapp.test`) legitimately share a front end, and the
 /// origin check cannot see it. The honest second source then answers with
 /// the very address set that raised the alarm — testing IT for the same
@@ -359,13 +370,13 @@ fn re_resolution_and_shared_front_ends_do_not_ask_a_second_source() {
 #[test]
 fn a_second_source_that_agrees_settles_the_reuse_alarm() {
     let recent = Arc::new(RecentRuleAddressIndex::new());
-    let shared = vec![ip(160, 79, 104, 10)];
-    recent.record("claude.ai", &shared);
+    let shared = vec![ip(100, 64, 79, 10)];
+    recent.record("chatapp.example", &shared);
 
     let inner = FixedUpstream::ok(shared.clone());
     // Same set, listed the other way round: agreement is about the set.
     let agrees = FixedUpstream::ok(shared.clone());
-    let never = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
+    let never = FixedUpstream::ok(vec![ip(100, 64, 1, 4)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![
             Arc::clone(&agrees) as Arc<dyn UpstreamResolver>,
@@ -374,7 +385,7 @@ fn a_second_source_that_agrees_settles_the_reuse_alarm() {
         .with_recent_addresses(recent);
 
     assert_eq!(
-        r.resolve("api.anthropic.com", AddressFamily::Ipv4)
+        r.resolve("api.chatapp.test", AddressFamily::Ipv4)
             .expect("confirmed")
             .addresses,
         shared
@@ -411,15 +422,15 @@ fn agreement_on_an_unusable_set_confirms_nothing() {
 /// fire on a fresh index and never panic.
 #[test]
 fn the_reuse_trigger_is_inert_when_the_memory_is_not_wired() {
-    let inner = FixedUpstream::ok(vec![ip(203, 0, 55, 7)]);
-    let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
+    let inner = FixedUpstream::ok(vec![ip(100, 64, 55, 7)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 1, 4)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
     assert_eq!(
         r.resolve("anything.example", AddressFamily::Ipv4)
             .expect("clean")
             .addresses,
-        vec![ip(203, 0, 55, 7)]
+        vec![ip(100, 64, 55, 7)]
     );
     assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
 }
@@ -447,11 +458,207 @@ fn poison_fallback_does_not_fire_on_transport_failure() {
     // Unavailable = the attempt/egress machinery's job; the fallback must
     // not add three more timeouts on top.
     let inner = FixedUpstream::new(Err(ResolveError::Unavailable("timeout".into())));
-    let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 1, 4)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
         .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
     assert!(r.resolve("x.example", AddressFamily::Ipv4).is_err());
     assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
+}
+
+// ── Address family carried through ────────────────────────────────────────
+
+fn v6(last: u16) -> std::net::Ipv6Addr {
+    std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last)
+}
+
+fn v6_answer(ips: &[std::net::Ipv6Addr]) -> ResolvedAddresses {
+    ResolvedAddresses {
+        addresses: ips.iter().copied().map(IpAddr::V6).collect(),
+        ttl_seconds: 60,
+    }
+}
+
+/// Answers each family from its own list and remembers what it was asked —
+/// a family-blind fake is how a hardcoded `Ipv4` went unnoticed.
+struct ByFamily {
+    v4: Result<ResolvedAddresses, ResolveError>,
+    v6: Result<ResolvedAddresses, ResolveError>,
+    asked: Mutex<Vec<AddressFamily>>,
+}
+impl ByFamily {
+    fn new(
+        v4: Result<ResolvedAddresses, ResolveError>,
+        v6: Result<ResolvedAddresses, ResolveError>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            v4,
+            v6,
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+    fn asked(&self) -> Vec<AddressFamily> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+impl UpstreamResolver for ByFamily {
+    fn resolve_within(
+        &self,
+        _hostname: &str,
+        family: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.asked.lock().unwrap().push(family);
+        match family {
+            AddressFamily::Ipv4 => self.v4.clone(),
+            AddressFamily::Ipv6 => self.v6.clone(),
+        }
+    }
+}
+
+fn v4_answer(ips: &[Ipv4Addr]) -> ResolvedAddresses {
+    ResolvedAddresses {
+        addresses: ips.iter().copied().map(IpAddr::V4).collect(),
+        ttl_seconds: 60,
+    }
+}
+
+#[test]
+fn the_port_upstream_asks_the_port_for_the_family_it_was_asked() {
+    struct Recording(Mutex<Vec<AddressFamily>>);
+    impl DnsResolverPort for Recording {
+        fn resolve(
+            &self,
+            hostname: &str,
+            family: AddressFamily,
+        ) -> Result<ResolvedRecord, DnsResolverError> {
+            self.0.lock().unwrap().push(family);
+            Ok(ResolvedRecord {
+                canonical_hostname: hostname.into(),
+                addresses: vec![match family {
+                    AddressFamily::Ipv4 => IpAddr::V4(ip(100, 64, 0, 159)),
+                    AddressFamily::Ipv6 => IpAddr::V6(v6(9)),
+                }],
+                ttl_seconds: Some(30),
+            })
+        }
+    }
+    let port = Arc::new(Recording(Mutex::new(Vec::new())));
+    let r = PortUpstreamResolver::new(Arc::clone(&port) as Arc<dyn DnsResolverPort>);
+    assert_eq!(
+        r.resolve("assistant.example", AddressFamily::Ipv6)
+            .unwrap()
+            .addresses,
+        vec![IpAddr::V6(v6(9))]
+    );
+    assert_eq!(
+        r.resolve("assistant.example", AddressFamily::Ipv4)
+            .unwrap()
+            .addresses,
+        vec![IpAddr::V4(ip(100, 64, 0, 159))]
+    );
+    assert_eq!(
+        *port.0.lock().unwrap(),
+        vec![AddressFamily::Ipv6, AddressFamily::Ipv4]
+    );
+}
+
+/// A clean AAAA goes up as an AAAA, comes back whole, and costs no second
+/// source — the same "nothing on the answered path" the A path keeps.
+#[test]
+fn poison_fallback_carries_an_aaaa_to_the_upstream() {
+    let inner = ByFamily::new(
+        Ok(v4_answer(&[ip(100, 64, 0, 78)])),
+        Ok(v6_answer(&[v6(1), v6(2)])),
+    );
+    let fallback = FixedUpstream::ok(vec![ip(100, 64, 1, 4)]);
+    let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
+        .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
+    assert_eq!(
+        r.resolve("assistant.example", AddressFamily::Ipv6)
+            .expect("answered")
+            .addresses,
+        vec![IpAddr::V6(v6(1)), IpAddr::V6(v6(2))]
+    );
+    // The A path is unchanged: one upstream question, of its own family.
+    assert_eq!(
+        r.resolve("assistant.example", AddressFamily::Ipv4)
+            .expect("answered")
+            .addresses,
+        vec![IpAddr::V4(ip(100, 64, 0, 78))]
+    );
+    assert_eq!(
+        inner.asked(),
+        vec![AddressFamily::Ipv6, AddressFamily::Ipv4]
+    );
+    assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
+}
+
+/// Most names have no AAAA. Doubting that would put the public resolvers on
+/// nearly every IPv6 query; the A asked beside it carries the doubt instead.
+#[test]
+fn an_empty_aaaa_is_not_doubted() {
+    let inner = ByFamily::new(
+        Ok(v4_answer(&[ip(100, 64, 0, 78)])),
+        Err(ResolveError::NoRecords),
+    );
+    let fallback = ByFamily::new(Ok(v4_answer(&[])), Ok(v6_answer(&[v6(3)])));
+    let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
+        .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
+    assert_eq!(
+        r.resolve("assistant.example", AddressFamily::Ipv6),
+        Err(ResolveError::NoRecords)
+    );
+    assert!(fallback.asked().is_empty());
+}
+
+/// An AAAA answer of placeholders only is doubted like an A one, and the
+/// second source is asked the same question — for an AAAA.
+#[test]
+fn a_placeholder_aaaa_is_confirmed_over_aaaa() {
+    let inner = ByFamily::new(
+        Err(ResolveError::NoRecords),
+        Ok(v6_answer(&[std::net::Ipv6Addr::UNSPECIFIED])),
+    );
+    let fallback = ByFamily::new(Ok(v4_answer(&[ip(100, 64, 1, 4)])), Ok(v6_answer(&[v6(5)])));
+    let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
+        .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
+    assert_eq!(
+        r.resolve("assistant.example", AddressFamily::Ipv6)
+            .expect("rescued")
+            .addresses,
+        vec![IpAddr::V6(v6(5))]
+    );
+    assert_eq!(fallback.asked(), vec![AddressFamily::Ipv6]);
+}
+
+/// The seeder side of the chain: an AAAA answer reaches the cache writer as
+/// v6, screened by the v6 rule rather than emptied by the v4 one.
+#[test]
+fn the_port_adapter_passes_an_aaaa_answer_through() {
+    let upstream = ByFamily::new(
+        Err(ResolveError::NoRecords),
+        Ok(ResolvedAddresses {
+            addresses: vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), IpAddr::V6(v6(6))],
+            ttl_seconds: 60,
+        }),
+    );
+    let port = UpstreamResolverPort::new(upstream as Arc<dyn UpstreamResolver>);
+    let record = port
+        .resolve("assistant.example", AddressFamily::Ipv6)
+        .expect("resolved");
+    assert_eq!(record.addresses, vec![IpAddr::V6(v6(6))]);
+
+    let placeholder = ByFamily::new(
+        Err(ResolveError::NoRecords),
+        Ok(v6_answer(&[std::net::Ipv6Addr::UNSPECIFIED])),
+    );
+    let port = UpstreamResolverPort::new(placeholder as Arc<dyn UpstreamResolver>);
+    assert_eq!(
+        port.resolve("assistant.example", AddressFamily::Ipv6),
+        Err(DnsResolverError::Timeout {
+            hostname: "assistant.example".to_string()
+        })
+    );
 }
 
 #[test]
@@ -460,27 +667,29 @@ fn upstream_maps_record_ttl_and_default() {
     let r = PortUpstreamResolver::new(Arc::new(FakeResolver {
         answer: Ok(ResolvedRecord {
             canonical_hostname: "assistant.example".into(),
-            addresses: vec![IpAddr::V4(ip(23, 10, 20, 159))],
+            addresses: vec![IpAddr::V4(ip(100, 64, 0, 159))],
             ttl_seconds: Some(42),
         }),
     }));
     assert_eq!(
         r.resolve("assistant.example", AddressFamily::Ipv4),
         Ok(ResolvedAddresses {
-            addresses: vec![IpAddr::V4(ip(23, 10, 20, 159))],
+            addresses: vec![IpAddr::V4(ip(100, 64, 0, 159))],
             ttl_seconds: 42,
         })
     );
     // TTL absent → default.
     let r = PortUpstreamResolver::new(Arc::new(FakeResolver {
         answer: Ok(ResolvedRecord {
-            canonical_hostname: "x.com".into(),
-            addresses: vec![IpAddr::V4(ip(1, 2, 3, 4))],
+            canonical_hostname: "short.example".into(),
+            addresses: vec![IpAddr::V4(ip(100, 64, 1, 4))],
             ttl_seconds: None,
         }),
     }));
     assert_eq!(
-        r.resolve("x.com", AddressFamily::Ipv4).unwrap().ttl_seconds,
+        r.resolve("short.example", AddressFamily::Ipv4)
+            .unwrap()
+            .ttl_seconds,
         DEFAULT_TTL_SECS
     );
 }
@@ -554,7 +763,7 @@ fn oracle_matches_secondary_rule_only() {
         !oracle.is_rule_host("example.com"),
         "primary-only match is not a secondary rule host"
     );
-    assert!(!oracle.is_rule_host("random.net"), "unmatched host");
+    assert!(!oracle.is_rule_host("random.example.net"), "unmatched host");
 }
 
 #[test]
@@ -580,7 +789,7 @@ fn oracle_fails_open_when_no_active_user() {
 fn steering_set_stays_armed_so_a_shared_direct_host_is_not_strangled() {
     use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
     use std::time::Instant;
-    let shared = ip(23, 10, 20, 164);
+    let shared = ip(100, 64, 0, 164);
     let fqdn = Arc::new(MockFqdnCacheLookup::new());
     fqdn.set_ips("aistudio.search.example", vec![shared]);
     let rules = Arc::new(FakeRules {
@@ -716,27 +925,65 @@ fn a_panicking_hook_fails_its_round_promptly_and_the_next_round_still_runs() {
     );
 }
 
+type Gate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+/// A hook that counts its runs and holds each one until [`open`] is called, so
+/// a test decides when a run ends instead of guessing how long it takes.
+fn gated_hook() -> (RouteRecomputeHook, Arc<AtomicUsize>, Gate) {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let gate: Gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let hook: RouteRecomputeHook = {
+        let (ran, gate) = (Arc::clone(&ran), Arc::clone(&gate));
+        Arc::new(move || {
+            ran.fetch_add(1, Ordering::SeqCst);
+            let (open, opened) = &*gate;
+            let mut open = open.lock().expect("gate");
+            while !*open {
+                open = opened.wait(open).expect("gate");
+            }
+        })
+    };
+    (hook, ran, gate)
+}
+
+fn open(gate: &Gate) {
+    *gate.0.lock().expect("gate") = true;
+    gate.1.notify_all();
+}
+
+/// Requests registered so far, read from the reconciler itself.
+fn requested(reconciler: &HookSyncReconciler) -> u64 {
+    reconciler.state.0.lock().expect("state").requested
+}
+
+/// Waits for `done`, bounded so a regression fails instead of hanging.
+fn wait_until(done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "never happened");
+        std::thread::yield_now();
+    }
+}
+
+/// The deadline only bounds a hang; every run here is released by the test.
+const NO_DEADLINE: Duration = Duration::from_secs(60);
+
 #[test]
 fn concurrent_reconciles_coalesce_onto_a_shared_run() {
-    // under the armed block-all a burst of direct-host answers
-    // used to spawn a full reconcile EACH, convoying on the orchestrator
-    // lock. Now concurrent callers must share hook runs: with 8 callers and
-    // a 40 ms hook, thread-per-call would take 8 runs; coalescing needs at
-    // most a handful (a run in flight when a caller registers cannot vouch
-    // for it, so up to ~2-3 runs may still start).
-    let ran = Arc::new(AtomicUsize::new(0));
-    let r = Arc::clone(&ran);
-    let hook: RouteRecomputeHook = Arc::new(move || {
-        r.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(40));
-    });
+    // Under the armed block-all a burst of direct-host answers used to spawn
+    // a full reconcile EACH, convoying on the orchestrator lock. The first run
+    // is held until all eight callers have registered: it may cover some of
+    // them, and one more run covers the rest.
+    let (hook, ran, gate) = gated_hook();
     let reconciler = Arc::new(HookSyncReconciler::new(hook));
     let callers: Vec<_> = (0..8)
         .map(|_| {
             let rc = Arc::clone(&reconciler);
-            std::thread::spawn(move || rc.reconcile_now(Duration::from_secs(5)))
+            std::thread::spawn(move || rc.reconcile_now(NO_DEADLINE))
         })
         .collect();
+    wait_until(|| requested(&reconciler) == 8);
+    open(&gate);
     for caller in callers {
         assert_eq!(
             caller.join().expect("caller thread"),
@@ -746,8 +993,8 @@ fn concurrent_reconciles_coalesce_onto_a_shared_run() {
     }
     let runs = ran.load(Ordering::SeqCst);
     assert!(
-        (1..=4).contains(&runs),
-        "8 concurrent callers coalesced into {runs} hook runs (expected ≤4)"
+        (1..=2).contains(&runs),
+        "8 concurrent callers coalesced into {runs} hook runs (expected at most 2)"
     );
 }
 
@@ -755,25 +1002,24 @@ fn concurrent_reconciles_coalesce_onto_a_shared_run() {
 fn a_caller_is_only_satisfied_by_a_run_that_started_after_its_request() {
     // The first call's run is already in flight when the second call
     // registers — the second must NOT be credited by it (its facts landed
-    // mid-run) and instead waits for the next run. Observable effect: both
-    // calls Installed, and the hook ran twice.
-    let ran = Arc::new(AtomicUsize::new(0));
-    let r = Arc::clone(&ran);
-    let hook: RouteRecomputeHook = Arc::new(move || {
-        r.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(60));
-    });
+    // mid-run) and instead waits for the next run.
+    let (hook, ran, gate) = gated_hook();
     let reconciler = Arc::new(HookSyncReconciler::new(hook));
     let rc = Arc::clone(&reconciler);
-    let first = std::thread::spawn(move || rc.reconcile_now(Duration::from_secs(5)));
-    // Let the first run actually start before registering the second.
-    std::thread::sleep(Duration::from_millis(20));
-    let second = reconciler.reconcile_now(Duration::from_secs(5));
+    let first = std::thread::spawn(move || rc.reconcile_now(NO_DEADLINE));
+    wait_until(|| ran.load(Ordering::SeqCst) == 1);
+    let rc = Arc::clone(&reconciler);
+    let second = std::thread::spawn(move || rc.reconcile_now(NO_DEADLINE));
+    wait_until(|| requested(&reconciler) == 2);
+    open(&gate);
     assert_eq!(
         first.join().expect("first caller"),
         ReconcileOutcome::Installed
     );
-    assert_eq!(second, ReconcileOutcome::Installed);
+    assert_eq!(
+        second.join().expect("second caller"),
+        ReconcileOutcome::Installed
+    );
     assert_eq!(
         ran.load(Ordering::SeqCst),
         2,
@@ -781,7 +1027,7 @@ fn a_caller_is_only_satisfied_by_a_run_that_started_after_its_request() {
     );
 }
 
-// ── DirectUdpUpstreamResolver (HW-0714) ───────────────────────────────────
+// ── DirectUdpUpstreamResolver ───────────────────────────────────
 
 use crate::dns_wire::{build_a_response, build_error_response, RCODE_NXDOMAIN};
 use std::net::UdpSocket;
@@ -809,13 +1055,16 @@ fn direct_udp_resolves_answers_and_ttl_from_fake_server() {
     let addr = spawn_fake_dns(|query| {
         // The response builders echo the query's id + question, so the
         // client's id/question match passes without knowing the id here.
-        vec![build_a_response(query, &[ip(1, 2, 3, 4), ip(5, 6, 7, 8)], 90).expect("resp")]
+        vec![build_a_response(query, &[ip(100, 64, 1, 4), ip(100, 64, 5, 8)], 90).expect("resp")]
     });
     let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
     let resolved = r
         .resolve("assistant.example", AddressFamily::Ipv4)
         .expect("resolved");
-    assert_eq!(resolved.addresses, vec![ip(1, 2, 3, 4), ip(5, 6, 7, 8)]);
+    assert_eq!(
+        resolved.addresses,
+        vec![ip(100, 64, 1, 4), ip(100, 64, 5, 8)]
+    );
     assert_eq!(resolved.ttl_seconds, 90);
 }
 
@@ -917,7 +1166,7 @@ fn direct_udp_nxdomain_is_authoritative_no_records() {
 #[test]
 fn direct_udp_ignores_mismatched_datagram_then_accepts_answer() {
     let addr = spawn_fake_dns(|query| {
-        let good = build_a_response(query, &[ip(9, 9, 9, 9)], 60).expect("resp");
+        let good = build_a_response(query, &[ip(100, 64, 9, 9)], 60).expect("resp");
         let mut wrong_id = good.clone();
         wrong_id[0] ^= 0xFF; // late reply of some other query
         vec![wrong_id, good]
@@ -926,7 +1175,7 @@ fn direct_udp_ignores_mismatched_datagram_then_accepts_answer() {
     let resolved = r
         .resolve("assistant.example", AddressFamily::Ipv4)
         .expect("resolved");
-    assert_eq!(resolved.addresses, vec![ip(9, 9, 9, 9)]);
+    assert_eq!(resolved.addresses, vec![ip(100, 64, 9, 9)]);
 }
 
 #[test]
@@ -960,7 +1209,7 @@ fn direct_udp_unencodable_name_is_no_records_without_network() {
     );
 }
 
-// ── HostsBypassDnsResolver (HW-0714) ──────────────────────────────────────
+// ── HostsBypassDnsResolver ──────────────────────────────────────
 
 use nrr_platform_api::dns::MockDnsResolver;
 

@@ -40,8 +40,7 @@ pub const RULES_REVISION_FORMAT_VERSION: u16 = 1;
 /// Versioned content of a single rules revision.
 ///
 /// Serialisation lives in the service layer. Storage persists
-/// pre-serialised JSON strings opaquely (same pattern as
-/// `apply_snapshots.snapshot_json`).
+/// pre-serialised JSON strings opaquely.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RulesRevisionContent {
     /// Rule set — primary and secondary routes.
@@ -225,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn rules_revision_format_version_is_one_at_block_16_9_1() {
+    fn rules_revision_format_version_is_one() {
         assert_eq!(RULES_REVISION_FORMAT_VERSION, 1);
     }
 

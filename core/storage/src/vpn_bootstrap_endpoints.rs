@@ -1,6 +1,6 @@
 //! `vpn_bootstrap_endpoints` persistence.
 //!
-//! Observed (and, in Phase 2, manually-entered) VPN bootstrap server endpoints.
+//! Observed (and, in the future, manually-entered) VPN bootstrap server endpoints.
 //! The catch-all kill-switch refuses to arm without at least one server exemption
 //! — arming a block-everything filter with no hole for the tunnel's own server
 //! would trap its reconnection. Today that server set is derived ONLY from live
@@ -11,12 +11,12 @@
 //! Persisting the observed IPs lets the exemption set survive a restart even
 //! before the VPN reconnects.
 //!
-//! # Phase 1 vs Phase 2
+//! # Observed vs manual endpoints
 //!
-//! Phase 1 (this change) writes only `source = 'observed'` rows carrying `ip`;
-//! `port`, `protocol` and `source = 'manual'` are schema headroom for Phase 2
-//! (letting a user pin a corporate-VPN endpoint by hand). [`upsert_observed`] and
-//! [`load_ips`] are the only Phase-1 surface.
+//! Only `source = 'observed'` rows carrying `ip` are written today;
+//! `port`, `protocol` and `source = 'manual'` are schema headroom for letting
+//! a user pin a corporate-VPN endpoint by hand. [`upsert_observed`] and
+//! [`load_ips`] are the only surface currently in use.
 //!
 //! [`upsert_observed`]: VpnBootstrapEndpointsRepository::upsert_observed
 //! [`load_ips`]: VpnBootstrapEndpointsRepository::load_ips
@@ -27,7 +27,7 @@ use rusqlite::{params, Connection};
 
 use crate::error::{StorageError, StorageResult};
 
-/// The `source` column value for a route-observed endpoint (Phase 1).
+/// The `source` column value for a route-observed endpoint.
 const SOURCE_OBSERVED: &str = "observed";
 
 /// Hard cap on retained endpoints, per source. The exemption set punches
@@ -95,7 +95,7 @@ impl<'c> VpnBootstrapEndpointsRepository<'c> {
 
     /// Load every persisted endpoint IP (all sources), newest first. A row whose
     /// `ip` fails to parse as an IPv4 address is skipped rather than failing the
-    /// whole load — defence-in-depth against a hand-corrupted row (Phase 1 only
+    /// whole load — defence-in-depth against a hand-corrupted row (this writer only
     /// ever writes `ip.to_string()`, so this is a can't-happen guard). `nrr-storage`
     /// carries no logging framework by design, so the skip is silent; the caller
     /// (the route coordinator) is the layer that logs observability for the set.
@@ -247,9 +247,9 @@ mod tests {
 
     #[test]
     fn manual_and_observed_coexist_for_same_ip() {
-        // Phase-2 headroom check: the (ip, source) PK allows an 'observed' and a
-        // 'manual' row for the same IP. Insert the manual row directly (Phase 1 has
-        // no manual writer) and confirm both load.
+        // Schema-headroom check: the (ip, source) PK allows an 'observed' and a
+        // 'manual' row for the same IP. Insert the manual row directly (no manual
+        // writer exists yet) and confirm both load.
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let ip = Ipv4Addr::new(10, 0, 0, 1);

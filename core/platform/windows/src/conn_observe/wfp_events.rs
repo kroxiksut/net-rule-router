@@ -40,10 +40,12 @@ use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineGetOption0, FwpmEngineOpen0, FwpmEngineSetOption0,
     FwpmFilterGetById0, FwpmFreeMemory0, FwpmNetEventSubscribe1, FwpmNetEventUnsubscribe0,
-    FWPM_ENGINE_COLLECT_NET_EVENTS, FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS, FWPM_FILTER0,
-    FWPM_NET_EVENT2, FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW, FWPM_NET_EVENT_SUBSCRIPTION0,
-    FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW, FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWP_IP_VERSION_V4,
-    FWP_IP_VERSION_V6, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0,
+    FWPM_CONDITION_NET_EVENT_TYPE, FWPM_ENGINE_COLLECT_NET_EVENTS,
+    FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
+    FWPM_NET_EVENT2, FWPM_NET_EVENT_ENUM_TEMPLATE0, FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW,
+    FWPM_NET_EVENT_SUBSCRIPTION0, FWPM_NET_EVENT_TYPE, FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW,
+    FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0,
+    FWP_IP_VERSION_V4, FWP_IP_VERSION_V6, FWP_MATCH_EQUAL, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0,
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::PSID;
@@ -150,19 +152,17 @@ pub fn restore_engine_options() {
     // instance left before it was killed. The second case is the whole point:
     // `cleanup` and the uninstall sweep run in a fresh process that changed
     // nothing and would otherwise have nothing to put back.
-    let prior = PRIOR_ENGINE_OPTIONS
+    // No record at all means no instance of ours changed anything: the note is
+    // on disk before the option is touched, so an option found on without one
+    // belongs to someone else and stays as it is.
+    let Some(prior) = PRIOR_ENGINE_OPTIONS
         .get()
         .copied()
         .filter(|p| *p != (None, None))
-        .or_else(read_prior_options_note);
-    // No record at all, from this process or an earlier one. Put the options
-    // back to the Windows default rather than leave them: an instance that was
-    // killed before this file existed left them on, and reading "already at the
-    // value we want" as "somebody else owns it" is what made the setting stick
-    // for good — every start confirmed it and no stop ever undid it. The write
-    // below still only lands while the option holds what WE write, so a product
-    // that took it over after us is not overwritten.
-    let prior = prior.unwrap_or((Some(0), Some(0)));
+        .or_else(read_prior_options_note)
+    else {
+        return;
+    };
     // NOT latched here. Claiming the restore before the engine has even been
     // opened means one failed open — a wedged BFE, the documented reason this
     // project budgets its WFP calls at all — permanently short-circuits every
@@ -202,23 +202,31 @@ pub fn restore_engine_options() {
 }
 
 /// What the machine-wide options should be handed back to when this observer
-/// stops.
+/// stops: per option, what a PREVIOUS instance recorded before it changed it,
+/// else what this one is about to change. `None` = not ours, never touched.
 ///
-/// `note` is what a PREVIOUS instance recorded before it turned them on, and it
-/// outranks anything read now: finding collection already on almost always
-/// means an instance that was killed never put it back. With no note and
-/// nothing changed, the target is the Windows default (off) rather than
-/// "nothing to do" — reading "already at the value we want" as "somebody else
-/// owns it" is what let the setting stick for good, since every start then
-/// confirmed it and no stop ever undid it. The write is still conditional on
-/// the option holding what WE wrote, so a product that took it over after us is
-/// left alone.
+/// The note is written before any option is changed, so "found on, nothing
+/// recorded" cannot be a killed instance of ours — only another product.
 fn restore_target(
     note: Option<(Option<u32>, Option<u32>)>,
-    found_collect: Option<u32>,
-    found_keywords: Option<u32>,
+    changed_collect: Option<u32>,
+    changed_keywords: Option<u32>,
 ) -> (Option<u32>, Option<u32>) {
-    note.unwrap_or((found_collect.or(Some(0)), found_keywords))
+    let (noted_collect, noted_keywords) = note.unwrap_or((None, None));
+    (
+        noted_collect.or(changed_collect),
+        noted_keywords.or(changed_keywords),
+    )
+}
+
+/// Whether an option reading `found` needs a write to hold `wanted`, and the
+/// value to hand back afterwards. An unreadable option is still written but
+/// has no known previous value, so nothing goes back.
+fn planned_change(found: Option<u32>, wanted: u32) -> (bool, Option<u32>) {
+    match found {
+        Some(value) if value == wanted => (false, None),
+        found => (true, found),
+    }
 }
 
 /// Put both options back over an already-open engine handle.
@@ -346,22 +354,18 @@ impl WfpConnectionObserver {
         // that was killed never put them back, not that another product owns
         // them.
         let note = read_prior_options_note();
-        let (found_collect, opt1) =
-            unsafe { set_uint32_option_restorable(engine, FWPM_ENGINE_COLLECT_NET_EVENTS, 1) };
-        let (found_keywords, opt2) = match scope {
-            NetEventScope::DropsAndAllows => unsafe {
-                set_uint32_option_restorable(
-                    engine,
-                    FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS,
-                    FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW,
-                )
-            },
-            NetEventScope::DropsOnly => (None, 0),
+        let (write_collect, changed_collect) = planned_change(
+            unsafe { get_uint32_option(engine, FWPM_ENGINE_COLLECT_NET_EVENTS) },
+            1,
+        );
+        let (write_keywords, changed_keywords) = match scope {
+            NetEventScope::DropsAndAllows => planned_change(
+                unsafe { get_uint32_option(engine, FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS) },
+                FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW,
+            ),
+            NetEventScope::DropsOnly => (false, None),
         };
-        // Record the dependency even when we changed nothing: a note is the
-        // only thing that lets a later `cleanup` — or the next start — undo a
-        // change made by an instance that is long gone.
-        let prior = restore_target(note, found_collect, found_keywords);
+        let prior = restore_target(note, changed_collect, changed_keywords);
         // Say it out loud: the alternative is reading a file only SYSTEM can
         // open to find out whether a stop will hand the machine back.
         tracing::info!(
@@ -369,17 +373,37 @@ impl WfpConnectionObserver {
             msg_key = "win-conn-observe-options-restore-plan",
             source = if note.is_some() {
                 "note-from-an-earlier-instance"
-            } else if found_collect.is_some() {
+            } else if prior != (None, None) {
                 "we-changed-it"
             } else {
-                "found-on-with-nothing-recorded"
+                "not-ours-left-alone"
             },
             collect_restores_to = prior.0,
             keywords_restore_to = prior.1,
             "machine-wide net-event options: what the stop will hand back",
         );
         let _ = PRIOR_ENGINE_OPTIONS.set(prior);
-        write_prior_options_note(prior);
+        // Before the change, so a kill between the two cannot leave an option
+        // on with nothing on disk to say it was ours.
+        if prior != (None, None) {
+            write_prior_options_note(prior);
+        }
+        let opt1 = if write_collect {
+            unsafe { set_uint32_option(engine, FWPM_ENGINE_COLLECT_NET_EVENTS, 1) }
+        } else {
+            0
+        };
+        let opt2 = if write_keywords {
+            unsafe {
+                set_uint32_option(
+                    engine,
+                    FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS,
+                    FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW,
+                )
+            }
+        } else {
+            0
+        };
         if opt1 != 0 || opt2 != 0 {
             // SAFETY: `engine` is open; undo whatever did take, then close.
             unsafe {
@@ -398,24 +422,58 @@ impl WfpConnectionObserver {
         // leaked for the subscription's lifetime and reclaimed on drop.
         let ctx = Arc::into_raw(Arc::clone(&buffer)) as *mut c_void;
 
-        let subscription = FWPM_NET_EVENT_SUBSCRIPTION0 {
-            enumTemplate: std::ptr::null_mut(),
-            flags: 0,
-            sessionKey: GUID::zeroed(),
+        // Filtered in the kernel where one condition can say it, so the
+        // callback is not woken for IKE/IPsec/LPM traffic; the callback
+        // filters again either way.
+        let mut condition = subscription_event_type(scope).map(event_type_condition);
+        let filtered = condition.is_some();
+        let mut template = FWPM_NET_EVENT_ENUM_TEMPLATE0 {
+            startTime: Default::default(),
+            endTime: Default::default(),
+            numFilterConditions: 0,
+            filterCondition: std::ptr::null_mut(),
+        };
+        if let Some(c) = condition.as_mut() {
+            template.numFilterConditions = 1;
+            template.filterCondition = c;
+        }
+        let subscribe = |enum_template: *mut FWPM_NET_EVENT_ENUM_TEMPLATE0, handle: &mut HANDLE| {
+            let subscription = FWPM_NET_EVENT_SUBSCRIPTION0 {
+                enumTemplate: enum_template,
+                flags: 0,
+                sessionKey: GUID::zeroed(),
+            };
+            // SAFETY: `engine` is open; `subscription` and the template it
+            // points to live on this stack for the call; the callback is a
+            // static C-ABI fn; `ctx` is a live leaked Arc ref kept valid
+            // until drop.
+            unsafe {
+                FwpmNetEventSubscribe1(
+                    engine,
+                    &subscription,
+                    Some(net_event_callback),
+                    Some(ctx as *const c_void),
+                    handle,
+                )
+            }
         };
         let mut events_handle = HANDLE::default();
-        // SAFETY: `engine` is open; `subscription` is a valid stack struct
-        // valid for the call; the callback is a static C-ABI fn; `ctx` is a
-        // live leaked Arc ref kept valid until drop.
-        let sub = unsafe {
-            FwpmNetEventSubscribe1(
-                engine,
-                &subscription,
-                Some(net_event_callback),
-                Some(ctx as *const c_void),
-                &mut events_handle,
-            )
+        let mut sub = if filtered {
+            subscribe(&mut template, &mut events_handle)
+        } else {
+            subscribe(std::ptr::null_mut(), &mut events_handle)
         };
+        if sub != 0 && filtered {
+            // The template only saves wake-ups; losing observation over it
+            // would cost far more.
+            tracing::warn!(
+                target: "nrr::conn-observe",
+                code = sub,
+                "WFP refused the net-event type template; subscribing unfiltered",
+            );
+            events_handle = HANDLE::default();
+            sub = subscribe(std::ptr::null_mut(), &mut events_handle);
+        }
         if sub != 0 {
             // SAFETY: reclaim the leaked Arc ref, put the machine-wide options
             // back and close the engine; nothing else holds either.
@@ -577,30 +635,6 @@ unsafe fn get_uint32_option(
     read
 }
 
-/// Set a UINT32 engine option and report what it held before, so the change can
-/// be undone. A previous value comes back only when it differs from `value` and
-/// the write succeeded: there is nothing to restore when the option already
-/// held what we need, and claiming otherwise would have us switch collection
-/// off under a product that switched it on.
-///
-/// # Safety
-/// `engine` must be an open WFP management handle.
-unsafe fn set_uint32_option_restorable(
-    engine: HANDLE,
-    option: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ENGINE_OPTION,
-    value: u32,
-) -> (Option<u32>, u32) {
-    let prior = get_uint32_option(engine, option);
-    if prior == Some(value) {
-        return (None, 0);
-    }
-    let code = set_uint32_option(engine, option, value);
-    if code != 0 {
-        return (None, code);
-    }
-    (prior, 0)
-}
-
 /// Put a machine-wide engine option back, but only while it still holds the
 /// value this process wrote: something else may have taken it over since, and
 /// overwriting that would break a component we know nothing about.
@@ -639,6 +673,10 @@ unsafe extern "system" fn net_event_callback(context: *mut c_void, event: *const
         return;
     }
     let ev = &*event;
+    // Checked before any decoding: most foreign types never get this far.
+    let Some(verdict) = classify_verdict(ev.r#type) else {
+        return;
+    };
     let h = &ev.header;
 
     let protocol = match h.ipProtocol {
@@ -664,12 +702,6 @@ unsafe extern "system" fn net_event_callback(context: *mut c_void, event: *const
     };
     let local = SocketAddr::new(local_ip, h.localPort);
     let remote = SocketAddr::new(remote_ip, h.remotePort);
-
-    let verdict = match ev.r#type {
-        FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW => ConnectionVerdict::Permit,
-        FWPM_NET_EVENT_TYPE_CLASSIFY_DROP => ConnectionVerdict::Block,
-        _ => ConnectionVerdict::Unknown,
-    };
 
     // For a DROP, capture the WFP runtime filter id that dropped it so `drain`
     // can attribute the drop to NetRuleRouter vs a foreign filter. The
@@ -714,6 +746,45 @@ unsafe extern "system" fn net_event_callback(context: *mut c_void, event: *const
         if g.len() < BUFFER_CAP {
             g.push(obs);
         }
+    }
+}
+
+/// The verdict a net event of type `kind` carries, or `None` when it is not a
+/// connection classify.
+///
+/// Every other type (IKE/IPsec failures, capability and MAC drops, LPM) must
+/// be dropped, never forwarded as `Unknown`: an `Unknown` attempt is how the
+/// ETW backend says "the stack established this", so a UWP capability drop
+/// would read as a healthy connection over the main link.
+fn classify_verdict(kind: FWPM_NET_EVENT_TYPE) -> Option<ConnectionVerdict> {
+    match kind {
+        FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW => Some(ConnectionVerdict::Permit),
+        FWPM_NET_EVENT_TYPE_CLASSIFY_DROP => Some(ConnectionVerdict::Block),
+        _ => None,
+    }
+}
+
+/// The one event type the subscription can ask the kernel for, or `None` to
+/// subscribe unfiltered. Template conditions are AND'ed, so "drops or allows"
+/// has no single-condition form; with allows on they dominate the stream and
+/// the callback's own filter is enough.
+fn subscription_event_type(scope: NetEventScope) -> Option<FWPM_NET_EVENT_TYPE> {
+    match scope {
+        NetEventScope::DropsOnly => Some(FWPM_NET_EVENT_TYPE_CLASSIFY_DROP),
+        NetEventScope::DropsAndAllows => None,
+    }
+}
+
+fn event_type_condition(kind: FWPM_NET_EVENT_TYPE) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_NET_EVENT_TYPE,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_UINT32,
+            Anonymous: FWP_CONDITION_VALUE0_0 {
+                uint32: kind.0 as u32,
+            },
+        },
     }
 }
 
@@ -794,13 +865,28 @@ mod tests {
         assert_eq!(filetime_to_unix_ms(&ft), None);
     }
 
-    /// Net-event collection found already on, with nothing recorded: that is an
-    /// instance of ours that was killed, not another product's setting. Taking
-    /// it for foreign is what left BFE recording every classify on the host for
-    /// months — each start confirmed the value and no stop ever undid it.
+    /// Collection found already on with nothing recorded is another product's
+    /// setting: our note always lands before our change.
     #[test]
-    fn collection_found_already_on_is_still_handed_back() {
-        assert_eq!(restore_target(None, None, None), (Some(0), None));
+    fn collection_found_already_on_without_a_note_is_left_alone() {
+        let (write, changed) = planned_change(Some(1), 1);
+        assert!(!write);
+        assert_eq!(restore_target(None, changed, None), (None, None));
+    }
+
+    #[test]
+    fn an_option_we_switch_on_goes_back_to_what_it_held() {
+        assert_eq!(planned_change(Some(0), 1), (true, Some(0)));
+        // Unreadable: written, but there is no known value to put back.
+        assert_eq!(planned_change(None, 1), (true, None));
+    }
+
+    /// Per option: an earlier instance that ran drops-only recorded no
+    /// keywords, so this instance's own keyword change still goes back.
+    #[test]
+    fn a_note_outranks_per_option_not_wholesale() {
+        let note = Some((Some(0), None));
+        assert_eq!(restore_target(note, None, Some(0)), (Some(0), Some(0)));
     }
 
     /// A note from an instance that never got to run its own restore outranks
@@ -809,6 +895,58 @@ mod tests {
     fn a_note_from_an_earlier_instance_outranks_what_we_read() {
         let note = Some((Some(0), Some(0)));
         assert_eq!(restore_target(note, None, None), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn only_classify_events_become_observations() {
+        use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
+            FWPM_NET_EVENT_TYPE_CAPABILITY_ALLOW, FWPM_NET_EVENT_TYPE_CAPABILITY_DROP,
+            FWPM_NET_EVENT_TYPE_CLASSIFY_DROP_MAC, FWPM_NET_EVENT_TYPE_IKEEXT_EM_FAILURE,
+            FWPM_NET_EVENT_TYPE_IKEEXT_MM_FAILURE, FWPM_NET_EVENT_TYPE_IKEEXT_QM_FAILURE,
+            FWPM_NET_EVENT_TYPE_IPSEC_DOSP_DROP, FWPM_NET_EVENT_TYPE_IPSEC_KERNEL_DROP,
+            FWPM_NET_EVENT_TYPE_LPM_PACKET_ARRIVAL,
+        };
+        assert_eq!(
+            classify_verdict(FWPM_NET_EVENT_TYPE_CLASSIFY_DROP),
+            Some(ConnectionVerdict::Block)
+        );
+        assert_eq!(
+            classify_verdict(FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW),
+            Some(ConnectionVerdict::Permit)
+        );
+        for foreign in [
+            FWPM_NET_EVENT_TYPE_IKEEXT_MM_FAILURE,
+            FWPM_NET_EVENT_TYPE_IKEEXT_QM_FAILURE,
+            FWPM_NET_EVENT_TYPE_IKEEXT_EM_FAILURE,
+            FWPM_NET_EVENT_TYPE_IPSEC_KERNEL_DROP,
+            FWPM_NET_EVENT_TYPE_IPSEC_DOSP_DROP,
+            FWPM_NET_EVENT_TYPE_CAPABILITY_DROP,
+            FWPM_NET_EVENT_TYPE_CAPABILITY_ALLOW,
+            FWPM_NET_EVENT_TYPE_CLASSIFY_DROP_MAC,
+            FWPM_NET_EVENT_TYPE_LPM_PACKET_ARRIVAL,
+            FWPM_NET_EVENT_TYPE(42),
+        ] {
+            assert_eq!(classify_verdict(foreign), None, "type {}", foreign.0);
+        }
+    }
+
+    #[test]
+    fn drops_only_asks_the_kernel_for_classify_drops_alone() {
+        let kind = subscription_event_type(NetEventScope::DropsOnly);
+        assert_eq!(kind, Some(FWPM_NET_EVENT_TYPE_CLASSIFY_DROP));
+        let c = event_type_condition(FWPM_NET_EVENT_TYPE_CLASSIFY_DROP);
+        assert_eq!(c.fieldKey, FWPM_CONDITION_NET_EVENT_TYPE);
+        assert_eq!(c.matchType, FWP_MATCH_EQUAL);
+        assert_eq!(c.conditionValue.r#type, FWP_UINT32);
+        // SAFETY: the value was built as UINT32 just above.
+        assert_eq!(unsafe { c.conditionValue.Anonymous.uint32 }, 3);
+    }
+
+    /// AND'ed conditions cannot say "drop or allow"; a second condition
+    /// would silently deliver nothing.
+    #[test]
+    fn drops_and_allows_subscribes_unfiltered() {
+        assert_eq!(subscription_event_type(NetEventScope::DropsAndAllows), None);
     }
 
     #[test]

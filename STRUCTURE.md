@@ -19,9 +19,8 @@ Application entry points and UI shells:
   - `gui` — GUI context and preference round-trip library
   - `tray` — System tray context library
   - `broker` — Elevation broker library: one elevated helper per session, re-entered through `NetRuleRouter.exe --nrr-elevated-broker`, so privileged operations cost one UAC prompt rather than one per action
-  - `qt-host` — Build-only crate; drives CMake build of C++ host
+  - `qt-host` — Build-only crate; drives CMake build of C++ host. The Qt/QML bridge lives in `qt-host/native/src`
   - `qml` — Qt/QML presentation layer: `Main.qml`, `Tray.qml`, `sections/` (+ `sections/settings/`), `flows/` (per-feature controllers), `components/`, `theme/`, `lib/` (shared JS)
-  - `bridge` — Reserved for Qt bridge and tooling integration
 
 ### core/
 Core product domain logic and service runtime:
@@ -34,10 +33,11 @@ Core product domain logic and service runtime:
 - **`core/services/windows-service`** — Windows service entrypoint: SCM/console entry, named-pipe server host, production dependency wiring. Orchestration logic belongs in `service-runtime`
 - **`core/services/linux-service`** — Linux daemon entrypoint; produces `nrr-serviced` with an `nrr-service` alias
 - **`core/services/service-runtime`** — Service orchestration shared by both OS entrypoints: enforcement planning and codegen, route coordination, DNS listener/resolver and fake-IP, kill-switch, auto-rules, IPC handlers, per-SID orchestration, session registry
+- **`core/sqlite-support`** — The one SQLite migration runner and connection setup, shared by `storage` and `storage-sidecar`; depends on no `nrr-*` crate
 - **`core/storage`** — SQLite persistence (domain cache, service state, traffic stats)
 - **`core/storage-sidecar`** — GUI-owned SQLite sidecar (rule labels, passthrough, not-yet-applied edits); never holds routing policy
 - **`core/diagnostics`** — Audit logs, operational logs, retention, archive generation
-- **`core/ipc-client`** — NamedPipe IPC client for GUI/tray communication with service
+- **`core/ipc-client`** — IPC client (named pipe on Windows, `AF_UNIX` socket on Unix) the GUI, tray, console and broker use to reach the service; depends on `contracts` only
 - **`core/ui-support`** — UI-runtime-only modules (theme, first-run flow, preferences, tray)
 - **`core/mock-backend`** — Preview/mock snapshots for development
 
@@ -56,7 +56,7 @@ Configuration schemas and policy templates:
 - **`configs/localization`** — Locale schema, examples, and localization policy documentation
 - **`configs/theme`** — Theme token definitions and dark mode guidance
 - **`configs/presets`** — Built-in rule presets shipped with the product
-- Ownership matrix (`OWNERSHIP.md`), quality policy (`quality-baseline.md`) and seed data (`default.config.yaml`, `doh-dot-resolvers.seed.json`) sit at this level
+- Ownership matrix (`OWNERSHIP.md`), quality policy (`quality-baseline.md`) and seed data (`doh-dot-resolvers.seed.json`) sit at this level
 
 ### docs/
 User-facing and technical documentation:
@@ -96,6 +96,7 @@ Core configuration files:
 - `.gitignore` — Git exclusions
 - `clippy.toml` — Lint configuration
 - `README.md` / `README_RU.md` — Project overview
+- `ROADMAP.md` / `ROADMAP_RU.md` — Order of upcoming work
 - `SECURITY.md` — Security model and trust boundaries
 - `CONTRIBUTING.md` — How to contribute
 - `AGENTS.md` — Working rules for AI assistants
@@ -123,6 +124,7 @@ Cargo workspace with these primary crates:
 - `nrr-service-runtime` — Service orchestration
 - `nrr-windows-service` — Windows service entrypoint
 - `nrr-linux-service` — Linux daemon entrypoint
+- `nrr-sqlite-support` — Shared SQLite migration runner
 - `nrr-storage` — SQLite persistence
 - `nrr-storage-sidecar` — GUI-owned SQLite sidecar
 - `nrr-diagnostics` — Audit and logs
@@ -148,7 +150,8 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `run` — Launch individual components (GUI, tray, service)
 - `check` — Canonical quality gate (fmt, clippy, test, cargo-deny)
 - `clean-sync-duplicates` — Remove file-sync conflict copies
-- `install-service` / `uninstall-service` / `service-status` / `service-smoke` — Service lifecycle for development
+- `install-service` / `uninstall-service` / `service-status` / `service-smoke` — Service lifecycle for development. `install-service.ps1` stages the built binaries into an administrators-only directory and registers the service from there; the SCM never points at `target\`
+- `speed-probe` — Read-only per-adapter reachability and download-speed probe (`curl` pinned to each adapter's source address)
 - `install-desktop` / `uninstall-desktop` — Linux only: desktop entries and hicolor icons, per user or machine-wide
 - `purge-data` — Remove every trace the product leaves on a machine, so the next install starts clean. Shows what it would delete unless `--yes` / `-Yes` is given; keeps the audit trail unless `--purge-audit` / `-PurgeAudit` is given; takes the service down first and deletes nothing while it is still registered
 - `reset-network` — Drop network state an abnormally stopped service left behind; on Linux it prefers the daemon's own `cleanup`
@@ -172,7 +175,9 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `services/*-service` can depend on: `service-runtime/`, `contracts/`, `platform/`
 - `service-runtime` can depend on: `platform/`, `domain/`, `contracts/`, `storage/`, `diagnostics/`
 - `platform-api/` and the per-OS platform crates can depend on: `domain/`, `contracts/`
-- `storage/` can depend on: `domain/`, `platform-api/`
+- `storage/` can depend on: `domain/`, `platform-api/`, `sqlite-support/`
+- `storage-sidecar/` can depend on: `sqlite-support/` only
+- `sqlite-support/` depends on no `nrr-*` crate
 - `domain/` can depend on: `contracts/` only
 
 ### Forbidden Dependencies
@@ -182,7 +187,9 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `platform/windows` and `platform/linux` must not depend on `apps/desktop/*` crates
 - `domain/` must not depend on OS APIs, Qt, QML, or UI storage
 - `storage/` must not depend on shared contracts, UI crates, or application layer
+- `storage-sidecar/` must not depend on `storage/`: the two meet in `sqlite-support/`
 - `ipc-client/` must not depend on `service-runtime` at runtime (forces wire-protocol SSOT in contracts)
+- `apps/cli` and `ipc-client/` must not reach `application/`, `ui-support/`, `mock-backend/` or any desktop crate at any depth (`apps/cli/tests/dependency_boundary.rs`)
 - `nftlink` must not depend on any `nrr-*` crate, so it can be published on its own (enforced by `core/platform/nftlink/tests/independence.rs`)
 
 ## Key Design Invariants

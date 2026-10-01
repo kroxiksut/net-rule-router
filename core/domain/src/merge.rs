@@ -12,11 +12,13 @@
 //!
 //! # Identity and safety model
 //!
-//! Rules are paired by [`rule_identity_key`](crate::review::rule_identity_key)
+//! Rules are grouped by [`rule_identity_key`](crate::review::rule_identity_key)
 //! — the traffic they match (`address_match` + `app_match`), **not** the
-//! synthetic `r-NNNN` id (which is regenerated on every import). The route
-//! role is tracked separately, so the *same* rule assigned to a *different*
-//! route surfaces as a conflict rather than an add/remove churn.
+//! synthetic `r-NNNN` id (which is regenerated on every import) — and paired
+//! inside a group by [`pair_identity_group`], so `x` and `x +block` in one book
+//! stay two rules. The route role is tracked separately, so the *same* rule
+//! assigned to a *different* route surfaces as a conflict rather than an
+//! add/remove churn.
 //!
 //! Pairing follows the reader's subdomain coverage
 //! ([`SubdomainCoverage`](crate::review::SubdomainCoverage)): with it on, `x`
@@ -44,7 +46,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::{CanonicalRule, CanonicalRuleBook, CanonicalRuleSet, RuleAction};
-use crate::review::{rule_attributes_differ, rule_identity_key_under, SubdomainCoverage};
+use crate::review::{
+    pair_identity_group, rule_attributes_differ, rule_identity_key_under, SubdomainCoverage,
+};
 use crate::RouteRole;
 
 /// How a merge resolves rules that exist on both sides but differ.
@@ -207,47 +211,52 @@ impl MergeResult {
     }
 }
 
-/// Per-side view of a rule, keyed by content identity.
-struct Side {
-    rule: CanonicalRule,
-    route: RouteRole,
-}
+/// A rule with the route set it sits in.
+type Placed<'a> = (&'a CanonicalRule, RouteRole);
 
-/// Index a rule book by content identity. Both route sets are walked; the
-/// route role is carried alongside so a retarget can be detected.
-///
-/// One identity gets one entry — that is what makes "the same rule moved to the
-/// other route" expressible at all, and it is why the key cannot also carry the
-/// route. A book CAN name the same match in both sets (validation reports that,
-/// it does not reject it), so the choice is made here rather than left to
-/// whichever copy happened to be met first: **an enabled copy always wins**.
-/// [`normalize_cross_set_duplicates`] has already ensured at most one copy is
-/// enabled, so the rule that is actually enforced is the one that survives, and
-/// the merge cannot drop an enforced rule. Two disabled copies enforce nothing
-/// either way; the first in canonical order wins, deterministically.
-fn index(book: &CanonicalRuleBook, coverage: SubdomainCoverage) -> BTreeMap<String, Side> {
-    let mut map: BTreeMap<String, Side> = BTreeMap::new();
+/// Group a rule book by content identity. Both route sets are walked; the
+/// route role is carried alongside so a retarget can be detected. Every rule
+/// is kept: a group holding `x` and `x +block` is two rules, not one.
+fn index(
+    book: &CanonicalRuleBook,
+    coverage: SubdomainCoverage,
+) -> BTreeMap<String, Vec<Placed<'_>>> {
+    let mut map: BTreeMap<String, Vec<Placed<'_>>> = BTreeMap::new();
     for (set, route) in [
         (&book.primary, RouteRole::Primary),
         (&book.secondary, RouteRole::Secondary),
     ] {
         for rule in set.rules() {
-            let key = rule_identity_key_under(rule, coverage);
-            match map.get(&key) {
-                Some(held) if held.rule.enabled || !rule.enabled => continue,
-                _ => {
-                    map.insert(
-                        key,
-                        Side {
-                            rule: rule.clone(),
-                            route,
-                        },
-                    );
-                }
-            }
+            map.entry(rule_identity_key_under(rule, coverage))
+                .or_default()
+                .push((rule, route));
         }
     }
     map
+}
+
+/// The key a merged entry or conflict is picked by. A group of one keeps the
+/// bare identity key; in a larger group the anchor's spelling, action and route
+/// are appended, or two conflicts in one group would share a single pick.
+fn pair_key(group: &str, multi: bool, (rule, route): Placed<'_>) -> String {
+    if !multi {
+        return group.to_string();
+    }
+    format!(
+        "{group}\u{1}{:?}\u{1}{:?}\u{1}{:?}",
+        rule.address_match, rule.action, route
+    )
+}
+
+/// What makes two enabled copies in opposite route sets one rule named twice:
+/// the identity plus the action. `x` on one route and `x +block` on the other
+/// are two instructions, and neither is switched off for the other.
+fn cross_set_key(rule: &CanonicalRule, coverage: SubdomainCoverage) -> String {
+    let key = rule_identity_key_under(rule, coverage);
+    match rule.action {
+        RuleAction::Route => key,
+        RuleAction::Block => format!("{key}\u{1}block"),
+    }
 }
 
 /// One match that was named in BOTH route sets of a single book, with both
@@ -255,7 +264,8 @@ fn index(book: &CanonicalRuleBook, coverage: SubdomainCoverage) -> BTreeMap<Stri
 /// answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalizedCrossSetRule {
-    /// Content identity of the pair.
+    /// Content identity of the pair (the identity key, plus the action for a
+    /// block pair) — what `keep_secondary` names.
     pub identity_key: String,
     /// The copy left enabled: the one on the primary route.
     pub kept: CanonicalRule,
@@ -278,7 +288,7 @@ pub struct NormalizedCrossSetRule {
 /// mode, every time the tunnel is down — whereas the primary route is the one
 /// that works when nothing else does.
 ///
-/// `keep_secondary` names the identity keys where the user said otherwise, and
+/// `keep_secondary` names the reported keys where the user said otherwise, and
 /// there the roles swap: the secondary copy stays enabled and the primary one
 /// is switched off. It is a default being overridden, not a policy — which is
 /// why it arrives as a set of keys rather than a flag.
@@ -296,7 +306,7 @@ pub fn normalize_cross_set_duplicates(
         .rules()
         .iter()
         .filter(|rule| rule.enabled)
-        .map(|rule| (rule_identity_key_under(rule, coverage), rule))
+        .map(|rule| (cross_set_key(rule, coverage), rule))
         .collect();
     if enabled_primary.is_empty() {
         return (book.clone(), Vec::new());
@@ -306,7 +316,7 @@ pub fn normalize_cross_set_duplicates(
     let mut disable_primary: BTreeSet<String> = BTreeSet::new();
     let mut secondary = Vec::with_capacity(book.secondary.len());
     for rule in book.secondary.rules() {
-        let key = rule_identity_key_under(rule, coverage);
+        let key = cross_set_key(rule, coverage);
         match enabled_primary.get(&key) {
             Some(primary_copy) if rule.enabled => {
                 let user_keeps_secondary = keep_secondary.contains(&key);
@@ -338,7 +348,7 @@ pub fn normalize_cross_set_duplicates(
                 .iter()
                 .map(|rule| {
                     let mut copy = rule.clone();
-                    if disable_primary.contains(&rule_identity_key_under(rule, coverage)) {
+                    if disable_primary.contains(&cross_set_key(rule, coverage)) {
                         copy.enabled = false;
                     }
                     copy
@@ -354,19 +364,6 @@ pub fn normalize_cross_set_duplicates(
         },
         normalized,
     )
-}
-
-/// Place a rule into the primary or secondary accumulator by route.
-fn place(
-    rule: &CanonicalRule,
-    route: RouteRole,
-    primary: &mut Vec<CanonicalRule>,
-    secondary: &mut Vec<CanonicalRule>,
-) {
-    match route {
-        RouteRole::Primary => primary.push(rule.clone()),
-        RouteRole::Secondary => secondary.push(rule.clone()),
-    }
 }
 
 /// Reconcile a linked-file rule book with the service rule book.
@@ -420,10 +417,9 @@ pub fn merge_rule_books_with_resolutions(
     keep_secondary: &BTreeSet<String>,
     coverage: SubdomainCoverage,
 ) -> MergeResult {
-    // Each side is given one enabled copy per match BEFORE anything is paired.
-    // Two enabled copies in one book are that book's problem, not a
-    // file-versus-service disagreement, and letting them reach the pairing is
-    // what made it drop one silently.
+    // Each side is given one enabled copy per match BEFORE anything is paired:
+    // two enabled copies in one book are that book's problem, not a
+    // file-versus-service disagreement.
     let (file, file_normalized) = normalize_cross_set_duplicates(file, keep_secondary, coverage);
     let (service, service_normalized) =
         normalize_cross_set_duplicates(service, keep_secondary, coverage);
@@ -437,101 +433,45 @@ pub fn merge_rule_books_with_resolutions(
     keys.sort();
     keys.dedup();
 
-    let mut primary_rules: Vec<CanonicalRule> = Vec::new();
-    let mut secondary_rules: Vec<CanonicalRule> = Vec::new();
     let mut entries: Vec<MergedRuleEntry> = Vec::new();
     let mut conflicts: Vec<MergeConflict> = Vec::new();
 
-    for key in keys {
-        match (file_idx.get(key), service_idx.get(key)) {
-            // Present only in the file — always kept (never drop).
-            (Some(f), None) => {
-                place(&f.rule, f.route, &mut primary_rules, &mut secondary_rules);
-                entries.push(MergedRuleEntry {
-                    identity_key: key.clone(),
-                    rule: f.rule.clone(),
-                    route: f.route,
-                    origin: MergeOrigin::FileOnly,
-                    was_conflict: false,
-                });
-            }
-            // Present only in the service — always kept (never drop).
-            (None, Some(s)) => {
-                place(&s.rule, s.route, &mut primary_rules, &mut secondary_rules);
-                entries.push(MergedRuleEntry {
-                    identity_key: key.clone(),
-                    rule: s.rule.clone(),
-                    route: s.route,
-                    origin: MergeOrigin::ServiceOnly,
-                    was_conflict: false,
-                });
-            }
-            // Present on both sides.
-            (Some(f), Some(s)) => {
-                let differs = f.route != s.route || rule_attributes_differ(&f.rule, &s.rule);
-                if !differs {
-                    // The service spelling wins when the two sides agree on
-                    // everything but the spelling (`x` versus `*.x`, paired
-                    // only under subdomain coverage). They enforce the same
-                    // traffic, so rewriting the active revision to the file's
-                    // spelling would turn a no-op merge into a rules change the
-                    // user then has to review for nothing.
-                    let same_spelling = f.rule.address_match == s.rule.address_match;
-                    let kept = if same_spelling { &f.rule } else { &s.rule };
-                    place(kept, f.route, &mut primary_rules, &mut secondary_rules);
-                    entries.push(MergedRuleEntry {
-                        identity_key: key.clone(),
-                        rule: kept.clone(),
-                        route: f.route,
-                        origin: MergeOrigin::Both,
-                        was_conflict: false,
-                    });
-                } else {
-                    // A per-conflict user pick (File/Service) overrides the
-                    // policy; an explicit Unresolved or an absent key falls
-                    // back to the policy.
-                    let picked = match resolutions.get(key) {
-                        Some(ConflictSide::File) => Some(ConflictSide::File),
-                        Some(ConflictSide::Service) => Some(ConflictSide::Service),
-                        _ => None,
-                    };
-                    let (chosen, chosen_route, resolved) = match picked {
-                        Some(ConflictSide::File) => (&f.rule, f.route, ConflictSide::File),
-                        Some(ConflictSide::Service) => (&s.rule, s.route, ConflictSide::Service),
-                        // `picked` is only ever File/Service or None.
-                        _ => match policy {
-                            MergePolicy::ServiceWins => (&s.rule, s.route, ConflictSide::Service),
-                            MergePolicy::FileWins => (&f.rule, f.route, ConflictSide::File),
-                            MergePolicy::Union => (&f.rule, f.route, ConflictSide::Unresolved),
-                        },
-                    };
-                    place(
-                        chosen,
-                        chosen_route,
-                        &mut primary_rules,
-                        &mut secondary_rules,
-                    );
-                    entries.push(MergedRuleEntry {
-                        identity_key: key.clone(),
-                        rule: chosen.clone(),
-                        route: chosen_route,
-                        origin: MergeOrigin::Both,
-                        was_conflict: true,
-                    });
-                    conflicts.push(MergeConflict {
-                        identity_key: key.clone(),
-                        rule: f.rule.clone(),
-                        file: ConflictRule::of(&f.rule, f.route),
-                        service: ConflictRule::of(&s.rule, s.route),
-                        resolved,
-                    });
+    for group in keys {
+        let file_group = file_idx.get(group).map(Vec::as_slice).unwrap_or_default();
+        let service_group = service_idx
+            .get(group)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let multi = file_group.len() > 1 || service_group.len() > 1;
+
+        for pair in pair_identity_group(file_group, service_group) {
+            let (one_side, origin) = match pair {
+                (Some(i), Some(j)) => {
+                    let (f, s) = (file_group[i], service_group[j]);
+                    let key = pair_key(group, multi, f);
+                    merge_pair(key, f, s, policy, resolutions, &mut entries, &mut conflicts);
+                    continue;
                 }
-            }
-            (None, None) => {
-                // A key came from one of the two maps, so at least one side
-                // must be present. Unreachable by construction.
-                debug_assert!(false, "merge key present in neither side");
-            }
+                // Present on one side only — always kept (never drop).
+                (Some(i), None) => (file_group[i], MergeOrigin::FileOnly),
+                (None, Some(j)) => (service_group[j], MergeOrigin::ServiceOnly),
+                (None, None) => continue,
+            };
+            entries.push(MergedRuleEntry {
+                identity_key: pair_key(group, multi, one_side),
+                rule: one_side.0.clone(),
+                route: one_side.1,
+                origin,
+                was_conflict: false,
+            });
+        }
+    }
+
+    let (mut primary_rules, mut secondary_rules) = (Vec::new(), Vec::new());
+    for entry in &entries {
+        match entry.route {
+            RouteRole::Primary => primary_rules.push(entry.rule.clone()),
+            RouteRole::Secondary => secondary_rules.push(entry.rule.clone()),
         }
     }
 
@@ -544,6 +484,64 @@ pub fn merge_rule_books_with_resolutions(
         conflicts,
         normalized_duplicates,
     }
+}
+
+/// One rule present on both sides: kept as is when the two agree, otherwise
+/// recorded as a conflict and resolved by the user's pick or the policy.
+fn merge_pair(
+    key: String,
+    (f_rule, f_route): Placed<'_>,
+    (s_rule, s_route): Placed<'_>,
+    policy: MergePolicy,
+    resolutions: &BTreeMap<String, ConflictSide>,
+    entries: &mut Vec<MergedRuleEntry>,
+    conflicts: &mut Vec<MergeConflict>,
+) {
+    if f_route == s_route && !rule_attributes_differ(f_rule, s_rule) {
+        // The service spelling wins when the two sides agree on everything
+        // but the spelling (`x` versus `*.x`, paired only under subdomain
+        // coverage): rewriting the revision to the file's spelling would turn
+        // a no-op merge into a rules change the user has to review for nothing.
+        let kept = if f_rule.address_match == s_rule.address_match {
+            f_rule
+        } else {
+            s_rule
+        };
+        entries.push(MergedRuleEntry {
+            identity_key: key,
+            rule: kept.clone(),
+            route: f_route,
+            origin: MergeOrigin::Both,
+            was_conflict: false,
+        });
+        return;
+    }
+
+    // A per-conflict pick (File/Service) overrides the policy; an explicit
+    // Unresolved or an absent key falls back to it.
+    let (chosen, chosen_route, resolved) = match resolutions.get(&key) {
+        Some(ConflictSide::File) => (f_rule, f_route, ConflictSide::File),
+        Some(ConflictSide::Service) => (s_rule, s_route, ConflictSide::Service),
+        _ => match policy {
+            MergePolicy::ServiceWins => (s_rule, s_route, ConflictSide::Service),
+            MergePolicy::FileWins => (f_rule, f_route, ConflictSide::File),
+            MergePolicy::Union => (f_rule, f_route, ConflictSide::Unresolved),
+        },
+    };
+    entries.push(MergedRuleEntry {
+        identity_key: key.clone(),
+        rule: chosen.clone(),
+        route: chosen_route,
+        origin: MergeOrigin::Both,
+        was_conflict: true,
+    });
+    conflicts.push(MergeConflict {
+        identity_key: key,
+        rule: f_rule.clone(),
+        file: ConflictRule::of(f_rule, f_route),
+        service: ConflictRule::of(s_rule, s_route),
+        resolved,
+    });
 }
 
 /// One report per match across both sides. A match named in both sets of BOTH
@@ -599,8 +597,8 @@ mod tests {
     #[test]
     fn one_match_enabled_in_both_sets_of_a_book_keeps_the_primary_copy() {
         let file = book(
-            vec![ip_rule("r-1", true, [1, 1, 1, 1], "on primary")],
-            vec![ip_rule("r-2", true, [1, 1, 1, 1], "and on secondary")],
+            vec![ip_rule("r-1", true, [192, 0, 2, 1], "on primary")],
+            vec![ip_rule("r-2", true, [192, 0, 2, 1], "and on secondary")],
         );
         let (normalized, reported) =
             normalize_cross_set_duplicates(&file, &BTreeSet::new(), SubdomainCoverage::Off);
@@ -625,8 +623,8 @@ mod tests {
     #[test]
     fn a_copy_that_is_already_disabled_is_not_reported_again() {
         let file = book(
-            vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
-            vec![ip_rule("r-2", false, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-1", true, [192, 0, 2, 1], "")],
+            vec![ip_rule("r-2", false, [192, 0, 2, 1], "")],
         );
         let (normalized, reported) =
             normalize_cross_set_duplicates(&file, &BTreeSet::new(), SubdomainCoverage::Off);
@@ -641,8 +639,8 @@ mod tests {
     #[test]
     fn the_user_can_keep_the_additional_routes_copy_instead() {
         let file = book(
-            vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
-            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-1", true, [192, 0, 2, 1], "")],
+            vec![ip_rule("r-2", true, [192, 0, 2, 1], "")],
         );
         let key = {
             let (_, reported) =
@@ -672,8 +670,8 @@ mod tests {
     #[test]
     fn a_key_that_names_nothing_changes_nothing() {
         let file = book(
-            vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
-            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-1", true, [192, 0, 2, 1], "")],
+            vec![ip_rule("r-2", true, [192, 0, 2, 1], "")],
         );
         let mut keep_secondary = BTreeSet::new();
         keep_secondary.insert("not-a-key-in-this-book".to_string());
@@ -685,15 +683,13 @@ mod tests {
         assert!(!normalized.secondary.rules()[0].enabled);
     }
 
-    /// The whole point: the copy that is actually enforced must survive the
-    /// pairing. Before normalisation the primary copy won only because it was
-    /// walked first — which meant an enabled secondary copy could be dropped in
-    /// favour of a disabled primary one.
+    /// Both copies of one match survive the pairing, the enforced one exactly
+    /// as it was: the disabled row is still the user's row.
     #[test]
-    fn the_enabled_copy_survives_the_pairing_even_when_the_primary_one_is_off() {
+    fn a_disabled_copy_beside_the_enabled_one_is_kept_not_dropped() {
         let file = book(
-            vec![ip_rule("r-1", false, [1, 1, 1, 1], "")],
-            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-1", false, [192, 0, 2, 1], "")],
+            vec![ip_rule("r-2", true, [192, 0, 2, 1], "")],
         );
         let service = book(vec![], vec![]);
         let result = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
@@ -702,11 +698,11 @@ mod tests {
             result.normalized_duplicates.is_empty(),
             "only one copy is enabled, so there is nothing to normalise",
         );
-        assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].route, RouteRole::Secondary);
-        assert!(result.entries[0].rule.enabled);
-        assert_eq!(result.merged.primary.len(), 0);
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.merged.primary.len(), 1);
+        assert!(!result.merged.primary.rules()[0].enabled);
         assert_eq!(result.merged.secondary.len(), 1);
+        assert!(result.merged.secondary.rules()[0].enabled);
     }
 
     /// A book that needed normalising has something to show the user, even when
@@ -714,8 +710,8 @@ mod tests {
     #[test]
     fn a_normalised_book_is_not_a_no_op_merge() {
         let both = book(
-            vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
-            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-1", true, [192, 0, 2, 1], "")],
+            vec![ip_rule("r-2", true, [192, 0, 2, 1], "")],
         );
         let result = merge_rule_books(&both, &both, MergePolicy::Union, SubdomainCoverage::Off);
         assert!(!result.normalized_duplicates.is_empty());
@@ -729,12 +725,12 @@ mod tests {
     #[test]
     fn the_same_pair_on_both_sides_is_reported_once() {
         let file = book(
-            vec![ip_rule("r-1", true, [1, 1, 1, 1], "file wording")],
-            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-1", true, [192, 0, 2, 1], "file wording")],
+            vec![ip_rule("r-2", true, [192, 0, 2, 1], "")],
         );
         let service = book(
-            vec![ip_rule("s-1", true, [1, 1, 1, 1], "file wording")],
-            vec![ip_rule("s-2", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("s-1", true, [192, 0, 2, 1], "file wording")],
+            vec![ip_rule("s-2", true, [192, 0, 2, 1], "")],
         );
         let result = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(result.normalized_duplicates.len(), 1);
@@ -749,8 +745,8 @@ mod tests {
     #[test]
     fn presence_is_always_union_for_every_policy() {
         // File has A on secondary; service has B on secondary. Union of both.
-        let file = book(vec![], vec![ip_rule("r-1", true, [1, 1, 1, 1], "")]);
-        let service = book(vec![], vec![ip_rule("r-9", true, [2, 2, 2, 2], "")]);
+        let file = book(vec![], vec![ip_rule("r-1", true, [192, 0, 2, 1], "")]);
+        let service = book(vec![], vec![ip_rule("r-9", true, [192, 0, 2, 2], "")]);
         for policy in [
             MergePolicy::Union,
             MergePolicy::FileWins,
@@ -772,10 +768,10 @@ mod tests {
     /// Identical rule on both sides → kept once, `Both`, no conflict.
     #[test]
     fn identical_rule_is_not_a_conflict() {
-        let rule = ip_rule("r-1", true, [1, 1, 1, 1], "hi");
+        let rule = ip_rule("r-1", true, [192, 0, 2, 1], "hi");
         // Different ids (regenerated on import) but same content + route.
         let file = book(vec![], vec![rule.clone()]);
-        let service = book(vec![], vec![ip_rule("r-77", true, [1, 1, 1, 1], "hi")]);
+        let service = book(vec![], vec![ip_rule("r-77", true, [192, 0, 2, 1], "hi")]);
         let r = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(r.merged.secondary.len(), 1);
         assert!(r.conflicts.is_empty());
@@ -785,8 +781,8 @@ mod tests {
     /// Same match, different enabled state → conflict; policy decides winner.
     #[test]
     fn enabled_conflict_resolves_per_policy() {
-        let file = book(vec![], vec![ip_rule("r-1", true, [1, 1, 1, 1], "")]);
-        let service = book(vec![], vec![ip_rule("r-1", false, [1, 1, 1, 1], "")]);
+        let file = book(vec![], vec![ip_rule("r-1", true, [192, 0, 2, 1], "")]);
+        let service = book(vec![], vec![ip_rule("r-1", false, [192, 0, 2, 1], "")]);
 
         let union = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(union.conflicts.len(), 1);
@@ -819,8 +815,8 @@ mod tests {
     /// a `Modified`-style conflict, never Add+Remove.
     #[test]
     fn block_vs_route_toggle_is_a_conflict() {
-        let routed = ip_rule("r-1", true, [1, 1, 1, 1], "");
-        let mut blocked = ip_rule("r-1", true, [1, 1, 1, 1], "");
+        let routed = ip_rule("r-1", true, [192, 0, 2, 1], "");
+        let mut blocked = ip_rule("r-1", true, [192, 0, 2, 1], "");
         blocked.action = crate::canonical::RuleAction::Block;
 
         let file = book(vec![], vec![routed]);
@@ -854,9 +850,9 @@ mod tests {
     /// is used and the rule appears in exactly one route set.
     #[test]
     fn route_conflict_uses_winner_route_and_never_duplicates() {
-        // File routes 1.1.1.1 via primary; service routes it via secondary.
-        let file = book(vec![ip_rule("r-1", true, [1, 1, 1, 1], "")], vec![]);
-        let service = book(vec![], vec![ip_rule("r-1", true, [1, 1, 1, 1], "")]);
+        // File routes 192.0.2.1 via primary; service routes it via secondary.
+        let file = book(vec![ip_rule("r-1", true, [192, 0, 2, 1], "")], vec![]);
+        let service = book(vec![], vec![ip_rule("r-1", true, [192, 0, 2, 1], "")]);
 
         let fw = merge_rule_books(
             &file,
@@ -887,11 +883,11 @@ mod tests {
     fn comment_difference_is_a_conflict() {
         let file = book(
             vec![],
-            vec![ip_rule("r-1", true, [1, 1, 1, 1], "from file")],
+            vec![ip_rule("r-1", true, [192, 0, 2, 1], "from file")],
         );
         let service = book(
             vec![],
-            vec![ip_rule("r-1", true, [1, 1, 1, 1], "from service")],
+            vec![ip_rule("r-1", true, [192, 0, 2, 1], "from service")],
         );
         let r = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(r.conflicts.len(), 1);
@@ -922,16 +918,16 @@ mod tests {
         let file_a = book(
             vec![],
             vec![
-                ip_rule("r-1", true, [1, 1, 1, 1], ""),
-                ip_rule("r-2", true, [2, 2, 2, 2], ""),
+                ip_rule("r-1", true, [192, 0, 2, 1], ""),
+                ip_rule("r-2", true, [192, 0, 2, 2], ""),
             ],
         );
         // Same rules (same ids), reversed input order.
         let file_b = book(
             vec![],
             vec![
-                ip_rule("r-2", true, [2, 2, 2, 2], ""),
-                ip_rule("r-1", true, [1, 1, 1, 1], ""),
+                ip_rule("r-2", true, [192, 0, 2, 2], ""),
+                ip_rule("r-1", true, [192, 0, 2, 1], ""),
             ],
         );
         let service = book(vec![], vec![ip_rule("r-3", true, [3, 3, 3, 3], "")]);
@@ -958,8 +954,8 @@ mod tests {
     /// merged entry carries its full rule for bucket rendering.
     #[test]
     fn conflict_carries_action_per_side_and_entry_carries_rule() {
-        let routed = ip_rule("r-1", true, [1, 1, 1, 1], "");
-        let mut blocked = ip_rule("r-1", true, [1, 1, 1, 1], "");
+        let routed = ip_rule("r-1", true, [192, 0, 2, 1], "");
+        let mut blocked = ip_rule("r-1", true, [192, 0, 2, 1], "");
         blocked.action = crate::canonical::RuleAction::Block;
 
         let file = book(vec![], vec![routed.clone()]);
@@ -981,43 +977,43 @@ mod tests {
     /// picked side, keys absent from the map follow the policy.
     #[test]
     fn resolutions_apply_per_conflict() {
-        // Two conflicts: 1.1.1.1 (enabled differs) and 2.2.2.2 (comment differs).
+        // Two conflicts: 192.0.2.1 (enabled differs) and 192.0.2.2 (comment differs).
         let file = book(
             vec![],
             vec![
-                ip_rule("r-1", true, [1, 1, 1, 1], ""),
-                ip_rule("r-2", true, [2, 2, 2, 2], "file"),
+                ip_rule("r-1", true, [192, 0, 2, 1], ""),
+                ip_rule("r-2", true, [192, 0, 2, 2], "file"),
             ],
         );
         let service = book(
             vec![],
             vec![
-                ip_rule("r-1", false, [1, 1, 1, 1], ""),
-                ip_rule("r-2", true, [2, 2, 2, 2], "service"),
+                ip_rule("r-1", false, [192, 0, 2, 1], ""),
+                ip_rule("r-2", true, [192, 0, 2, 2], "service"),
             ],
         );
 
         let base = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(base.conflicts.len(), 2);
-        // Pick Service for 1.1.1.1, File for 2.2.2.2; leave nothing to policy.
+        // Pick Service for 192.0.2.1, File for 192.0.2.2; leave nothing to policy.
         let key_1 = base
             .conflicts
             .iter()
             .find(|c| {
                 matches!(&c.rule.address_match,
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
             })
             .map(|c| c.identity_key.clone())
-            .expect("conflict for 1.1.1.1");
+            .expect("conflict for 192.0.2.1");
         let key_2 = base
             .conflicts
             .iter()
             .find(|c| {
                 matches!(&c.rule.address_match,
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)))
+                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)))
             })
             .map(|c| c.identity_key.clone())
-            .expect("conflict for 2.2.2.2");
+            .expect("conflict for 192.0.2.2");
 
         let mut resolutions = BTreeMap::new();
         resolutions.insert(key_1, ConflictSide::Service);
@@ -1035,43 +1031,43 @@ mod tests {
         for c in &resolved.conflicts {
             match &c.rule.address_match {
                 Some(CanonicalAddressMatch::ExactIp(a))
-                    if *a == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)) =>
+                    if *a == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)) =>
                 {
                     assert_eq!(c.resolved, ConflictSide::Service);
                 }
                 Some(CanonicalAddressMatch::ExactIp(a))
-                    if *a == IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)) =>
+                    if *a == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)) =>
                 {
                     assert_eq!(c.resolved, ConflictSide::File);
                 }
                 other => panic!("unexpected conflict rule {other:?}"),
             }
         }
-        // Service pick for 1.1.1.1 → disabled; File pick for 2.2.2.2 → "file".
+        // Service pick for 192.0.2.1 → disabled; File pick for 192.0.2.2 → "file".
         let rules = resolved.merged.secondary.rules();
         let r1 = rules
             .iter()
             .find(|r| {
                 matches!(&r.address_match,
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
             })
-            .expect("merged 1.1.1.1");
-        assert!(!r1.enabled, "service side (disabled) chosen for 1.1.1.1");
+            .expect("merged 192.0.2.1");
+        assert!(!r1.enabled, "service side (disabled) chosen for 192.0.2.1");
         let r2 = rules
             .iter()
             .find(|r| {
                 matches!(&r.address_match,
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)))
+                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)))
             })
-            .expect("merged 2.2.2.2");
-        assert_eq!(r2.comment, "file", "file side chosen for 2.2.2.2");
+            .expect("merged 192.0.2.2");
+        assert_eq!(r2.comment, "file", "file side chosen for 192.0.2.2");
     }
 
     /// A conflict absent from the resolutions map falls back to the base policy.
     #[test]
     fn unresolved_key_falls_back_to_policy() {
-        let file = book(vec![], vec![ip_rule("r-1", true, [1, 1, 1, 1], "")]);
-        let service = book(vec![], vec![ip_rule("r-1", false, [1, 1, 1, 1], "")]);
+        let file = book(vec![], vec![ip_rule("r-1", true, [192, 0, 2, 1], "")]);
+        let service = book(vec![], vec![ip_rule("r-1", false, [192, 0, 2, 1], "")]);
         let empty = BTreeMap::new();
         let sw = merge_rule_books_with_resolutions(
             &file,
@@ -1187,6 +1183,185 @@ mod tests {
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].kept.id.as_str(), "r-1");
         assert!(!normalized.secondary.rules()[0].enabled);
+    }
+
+    // ── several rules under one identity ────────────────────────────────────
+
+    fn blocked(mut rule: CanonicalRule) -> CanonicalRule {
+        rule.action = RuleAction::Block;
+        rule
+    }
+
+    fn routed_host(id: &str, host: &str, comment: &str) -> CanonicalRule {
+        let mut rule = domain_rule(id, exact(host));
+        rule.comment = comment.to_string();
+        rule
+    }
+
+    /// `x` and `x +block` in one set are opposite instructions; the pairing
+    /// used to hold one rule per address and dropped the other from the book.
+    #[test]
+    fn route_and_block_on_one_host_in_one_set_both_reach_the_merged_book() {
+        let file = book(
+            vec![
+                routed_host("r-1", "shop.test", ""),
+                blocked(routed_host("r-2", "shop.test", "")),
+            ],
+            vec![],
+        );
+        let r = merge_rule_books(
+            &file,
+            &book(vec![], vec![]),
+            MergePolicy::Union,
+            SubdomainCoverage::Off,
+        );
+        assert_eq!(r.entries.len(), 2);
+        assert!(r.entries.iter().all(|e| e.origin == MergeOrigin::FileOnly));
+        let actions: Vec<RuleAction> = r.merged.primary.rules().iter().map(|x| x.action).collect();
+        assert!(actions.contains(&RuleAction::Route) && actions.contains(&RuleAction::Block));
+
+        // Against itself it is a no-op: each copy pairs with its twin.
+        let same = merge_rule_books(&file, &file, MergePolicy::Union, SubdomainCoverage::Off);
+        assert!(same.is_noop());
+        assert_eq!(same.merged.primary.len(), 2);
+    }
+
+    /// The block rule the service does not have is new, not a conflict with
+    /// the route rule it does have.
+    #[test]
+    fn a_block_rule_beside_a_shared_route_rule_is_file_only() {
+        let file = book(
+            vec![
+                routed_host("r-1", "shop.test", ""),
+                blocked(routed_host("r-2", "shop.test", "")),
+            ],
+            vec![],
+        );
+        let service = book(vec![routed_host("s-1", "shop.test", "")], vec![]);
+        let r = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
+
+        assert!(r.conflicts.is_empty());
+        assert_eq!(r.entries.len(), 2);
+        let block = r
+            .entries
+            .iter()
+            .find(|e| e.rule.action == RuleAction::Block)
+            .expect("block entry");
+        assert_eq!(block.origin, MergeOrigin::FileOnly);
+        assert_eq!(r.merged.primary.len(), 2);
+    }
+
+    /// Two conflicts under one identity are two questions: each carries its own
+    /// key, and a pick answers only the one it names.
+    #[test]
+    fn two_conflicts_under_one_identity_are_picked_separately() {
+        let file = book(
+            vec![
+                routed_host("r-1", "shop.test", "file"),
+                blocked(routed_host("r-2", "shop.test", "file")),
+            ],
+            vec![],
+        );
+        let service = book(
+            vec![
+                routed_host("s-1", "shop.test", "service"),
+                blocked(routed_host("s-2", "shop.test", "service")),
+            ],
+            vec![],
+        );
+        let base = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
+        assert_eq!(base.conflicts.len(), 2);
+        assert_ne!(
+            base.conflicts[0].identity_key,
+            base.conflicts[1].identity_key
+        );
+        for c in &base.conflicts {
+            assert_eq!(c.file.action, c.service.action, "like pairs with like");
+        }
+
+        let route_key = base
+            .conflicts
+            .iter()
+            .find(|c| c.file.action == RuleAction::Route)
+            .map(|c| c.identity_key.clone())
+            .expect("route conflict");
+        let mut picks = BTreeMap::new();
+        picks.insert(route_key, ConflictSide::Service);
+        let r = merge_rule_books_with_resolutions(
+            &file,
+            &service,
+            MergePolicy::Union,
+            &picks,
+            &BTreeSet::new(),
+            SubdomainCoverage::Off,
+        );
+        assert_eq!(
+            r.unresolved_conflicts(),
+            1,
+            "the block conflict is still open"
+        );
+        let comment_of = |action| {
+            r.merged
+                .primary
+                .rules()
+                .iter()
+                .find(|x| x.action == action)
+                .map(|x| x.comment.clone())
+                .expect("rule present")
+        };
+        assert_eq!(comment_of(RuleAction::Route), "service");
+        assert_eq!(comment_of(RuleAction::Block), "file");
+    }
+
+    /// `x` and `*.x` side by side in one book: two rules whatever the
+    /// coverage. Under coverage they share an identity, which used to cost the
+    /// book one of them.
+    #[test]
+    fn apex_and_wildcard_in_one_book_both_survive_with_and_without_coverage() {
+        let file = book(
+            vec![
+                domain_rule("r-1", exact("proflcdn.test")),
+                domain_rule("r-2", suffix("proflcdn.test")),
+            ],
+            vec![],
+        );
+        let service = book(vec![domain_rule("s-1", exact("proflcdn.test"))], vec![]);
+        for coverage in [SubdomainCoverage::On, SubdomainCoverage::Off] {
+            let r = merge_rule_books(&file, &service, MergePolicy::Union, coverage);
+            assert_eq!(r.merged.primary.len(), 2, "{coverage:?}");
+            assert!(r.conflicts.is_empty(), "{coverage:?}");
+            let origin_of = |m: CanonicalAddressMatch| {
+                r.entries
+                    .iter()
+                    .find(|e| e.rule.address_match.as_ref() == Some(&m))
+                    .map(|e| e.origin)
+                    .expect("entry present")
+            };
+            assert_eq!(
+                origin_of(exact("proflcdn.test")),
+                MergeOrigin::Both,
+                "{coverage:?}"
+            );
+            assert_eq!(
+                origin_of(suffix("proflcdn.test")),
+                MergeOrigin::FileOnly,
+                "{coverage:?}"
+            );
+        }
+    }
+
+    /// A route rule on one set and a block rule for the same host on the other
+    /// are not one rule named twice, so neither is switched off.
+    #[test]
+    fn route_on_one_set_and_block_on_the_other_are_not_normalised() {
+        let file = book(
+            vec![routed_host("r-1", "shop.test", "")],
+            vec![blocked(routed_host("r-2", "shop.test", ""))],
+        );
+        let (normalized, reported) =
+            normalize_cross_set_duplicates(&file, &BTreeSet::new(), SubdomainCoverage::Off);
+        assert!(reported.is_empty());
+        assert_eq!(normalized, file);
     }
 
     #[test]

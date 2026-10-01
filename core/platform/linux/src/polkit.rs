@@ -161,12 +161,15 @@ pub fn subject_for(pid: u32, uid: u32) -> AuthorizationSubject {
 fn run_with_timeout(args: &[String], timeout: Duration) -> Option<i32> {
     use std::process::Stdio;
 
-    let mut child = Command::new(PKCHECK_PROGRAM)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    let mut child = crate::command::system_tool(PKCHECK_PROGRAM)
+        .and_then(|exe| {
+            Command::new(exe)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        })
         .map_err(|e| {
             tracing::info!(
                 target: "nrr::authorization",

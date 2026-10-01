@@ -16,6 +16,13 @@ struct Link {
 struct FakeResolved {
     links: Arc<Mutex<BTreeMap<String, Link>>>,
     mode: Arc<Mutex<String>>,
+    /// `resolvectl dns <REDIRECT_LINK> …` refuses, simulating the step that
+    /// points the link at the listener failing.
+    fail_dns_claim: Arc<Mutex<bool>>,
+    /// `resolvectl domain <name> …` refuses for this one link, simulating a
+    /// late step (stripping `~.` from another claimant) failing after our own
+    /// link already claimed the catch-all.
+    fail_domain_for: Arc<Mutex<Option<String>>>,
 }
 
 impl FakeResolved {
@@ -25,6 +32,14 @@ impl FakeResolved {
         fake.add("wlp3s0", 3, &["192.0.2.1"], &[]);
         fake.add("wg0", 4, &["198.51.100.1"], &["~.", "~corp.example"]);
         fake
+    }
+
+    fn fail_dns_claim(&self) {
+        *self.fail_dns_claim.lock().expect("lock") = true;
+    }
+
+    fn fail_domain_for(&self, name: &str) {
+        *self.fail_domain_for.lock().expect("lock") = Some(name.to_string());
     }
 
     fn add(&self, name: &str, index: u32, dns: &[&str], domains: &[&str]) {
@@ -125,24 +140,34 @@ impl DnsCommands for FakeResolved {
                 drop(links);
                 ok(self.print(|l| &l.dns))
             }
-            ("resolvectl", ["dns", name, server]) => match links.get_mut(*name) {
-                Some(link) => {
-                    link.dns = vec![(*server).into()];
-                    ok("")
+            ("resolvectl", ["dns", name, server]) => {
+                if *self.fail_dns_claim.lock().expect("lock") {
+                    return failed("Could not set per-interface DNS servers");
                 }
-                None => failed("Failed to resolve interface"),
-            },
-            ("resolvectl", ["domain", name, rest @ ..]) => match links.get_mut(*name) {
-                Some(link) => {
-                    link.domains = rest
-                        .iter()
-                        .filter(|d| !d.is_empty())
-                        .map(|d| d.to_string())
-                        .collect();
-                    ok("")
+                match links.get_mut(*name) {
+                    Some(link) => {
+                        link.dns = vec![(*server).into()];
+                        ok("")
+                    }
+                    None => failed("Failed to resolve interface"),
                 }
-                None => failed("Failed to resolve interface"),
-            },
+            }
+            ("resolvectl", ["domain", name, rest @ ..]) => {
+                if self.fail_domain_for.lock().expect("lock").as_deref() == Some(*name) {
+                    return failed("Could not set per-interface domains");
+                }
+                match links.get_mut(*name) {
+                    Some(link) => {
+                        link.domains = rest
+                            .iter()
+                            .filter(|d| !d.is_empty())
+                            .map(|d| d.to_string())
+                            .collect();
+                        ok("")
+                    }
+                    None => failed("Failed to resolve interface"),
+                }
+            }
             other => panic!("unexpected command {other:?}"),
         }
     }
@@ -268,6 +293,50 @@ fn a_listener_off_the_link_is_refused_before_anything_changes() {
 }
 
 #[test]
+fn a_failure_claiming_the_link_removes_the_link_it_just_created() {
+    // Fails right after `prepare_link` — before any domain is touched — so the
+    // rollback must undo only the link creation, leaving every domain as it was.
+    let fake = FakeResolved::machine();
+    fake.fail_dns_claim();
+    let redirect = redirect(&fake, "early-failure");
+    assert!(redirect.redirect_to(LISTENER_ADDR).is_err());
+    assert!(fake
+        .links
+        .lock()
+        .expect("lock")
+        .get(REDIRECT_LINK)
+        .is_none());
+    assert_eq!(
+        fake.domains("wg0"),
+        Some(vec!["~.".to_string(), "~corp.example".to_string()])
+    );
+    assert!(!redirect.taken_file.exists());
+}
+
+#[test]
+fn a_late_step_failure_rolls_back_the_whole_redirect() {
+    // Fails on the last step — stripping `~.` from the claimant we are
+    // replacing — after our own link already holds the catch-all, the
+    // listener's address, and the default route. Half a redirect (our link
+    // claiming `~.` for a listener about to be torn down) is worse than none.
+    let fake = FakeResolved::machine();
+    fake.fail_domain_for("wg0");
+    let redirect = redirect(&fake, "late-failure");
+    assert!(redirect.redirect_to(LISTENER_ADDR).is_err());
+    assert!(fake
+        .links
+        .lock()
+        .expect("lock")
+        .get(REDIRECT_LINK)
+        .is_none());
+    assert_eq!(
+        fake.domains("wg0"),
+        Some(vec!["~.".to_string(), "~corp.example".to_string()])
+    );
+    assert!(!redirect.taken_file.exists());
+}
+
+#[test]
 fn upstream_servers_come_from_the_links_never_from_our_own() {
     let fake = FakeResolved::machine();
     redirect(&fake, "servers")
@@ -313,7 +382,7 @@ fn only_stub_and_static_mode_put_resolved_between_programs_and_dns() {
 #[test]
 fn link_lines_parse_with_their_index_and_values() {
     let links = parse_resolvectl_links(
-        "Global: 192.0.2.9\nLink 2 (enp4s0f1):\nLink 4 (wg0): 1.1.1.1 192.0.2.3:53#dns.example\n",
+        "Global: 192.0.2.9\nLink 2 (enp4s0f1):\nLink 4 (wg0): 198.51.100.1 192.0.2.3:53#dns.example\n",
     );
     assert_eq!(links.len(), 2);
     assert_eq!(links[0].values, Vec::<String>::new());
@@ -324,6 +393,6 @@ fn link_lines_parse_with_their_index_and_values() {
             .iter()
             .filter_map(|v| server_ip(v))
             .collect::<Vec<_>>(),
-        vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(192, 0, 2, 3)]
+        vec![Ipv4Addr::new(198, 51, 100, 1), Ipv4Addr::new(192, 0, 2, 3)]
     );
 }

@@ -1,4 +1,4 @@
-// Deterministic adapter dataset for previews and off-Windows builds.
+// Deterministic adapter dataset for previews and hosts without an enumeration.
 
 use super::*;
 
@@ -6,10 +6,10 @@ use super::*;
 /// them so the two cannot drift, and public because a binding naming one of
 /// them points at no adapter of this machine: the service refuses it instead of
 /// storing a route that can never apply.
-pub const PREVIEW_ETHERNET_PERSISTENT_ID: &str = "win-adapter:ethernet-fallback";
-pub const PREVIEW_WIFI_PERSISTENT_ID: &str = "win-adapter:wifi-fallback";
-pub const PREVIEW_VPN_PERSISTENT_ID: &str = "win-adapter:vpn-fallback";
-pub const PREVIEW_BLUETOOTH_PAN_PERSISTENT_ID: &str = "win-adapter:bluetooth-pan-fallback";
+pub const PREVIEW_ETHERNET_PERSISTENT_ID: &str = "preview-adapter:ethernet";
+pub const PREVIEW_WIFI_PERSISTENT_ID: &str = "preview-adapter:wifi";
+pub const PREVIEW_VPN_PERSISTENT_ID: &str = "preview-adapter:vpn";
+pub const PREVIEW_BLUETOOTH_PAN_PERSISTENT_ID: &str = "preview-adapter:bluetooth-pan";
 
 /// Every id [`fallback_rows`] produces.
 pub const PREVIEW_PERSISTENT_IDS: [&str; 4] = [
@@ -26,18 +26,17 @@ pub fn is_preview_persistent_id(persistent_id: &str) -> bool {
     PREVIEW_PERSISTENT_IDS.contains(&persistent_id)
 }
 
-/// Deterministic adapter dataset used when no live Windows enumeration is
-/// available (off-Windows builds, dev/test, empty enumeration).
+/// Deterministic adapter dataset used when no live enumeration is available
+/// (an OS without one, dev/test, an empty enumeration). Documentation
+/// addresses only, so a preview never shows a real network.
 pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
     let mut ethernet_observed = build_observed_facts(
         BasicAvailabilityStatus::Available,
-        "192.168.1.20",
-        "192.168.1.1",
+        "192.0.2.20",
+        "192.0.2.1",
     );
-    // NOT `Resolved`: this dataset is a placeholder, and no probe ran. Claiming
-    // a resolved external address made the adapter-check panel print an invented
-    // one ("203.0.113.10") as the result of a successful lookup — the live path
-    // never produces `Resolved` without an actual probe.
+    // NOT `Resolved`: no probe ran, and the live path never claims a resolved
+    // external address without one.
     ethernet_observed.external_ip_status = ExternalIpStatus::NotChecked;
     ethernet_observed.external_ip = None;
     ethernet_observed.external_probe_attempted = false;
@@ -48,24 +47,24 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
         "Ethernet",
         "Fallback Ethernet adapter",
         "{FAKE-ETHERNET-ADAPTER}",
-        "192.168.1.1",
-        "192.168.1.20",
+        "192.0.2.1",
+        "192.0.2.20",
         true,
         ethernet_observed.connectivity_state,
     );
 
     let wifi_observed = build_observed_facts(
         BasicAvailabilityStatus::Available,
-        "10.10.0.15",
-        "10.10.0.1",
+        "198.51.100.15",
+        "198.51.100.1",
     );
     let wifi_derived = build_derived_assessment(
         "Wi-Fi",
         "Wireless",
         "Fallback Wi-Fi adapter",
         "{FAKE-WIFI-ADAPTER}",
-        "10.10.0.1",
-        "10.10.0.15",
+        "198.51.100.1",
+        "198.51.100.15",
         true,
         wifi_observed.connectivity_state,
     );
@@ -83,16 +82,16 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
     );
     let bluetooth_observed = build_observed_facts(
         BasicAvailabilityStatus::Available,
-        "172.20.10.5",
-        "172.20.10.1",
+        "203.0.113.5",
+        "203.0.113.1",
     );
     let bluetooth_derived = build_derived_assessment(
         "Bluetooth PAN",
         "Wireless",
         "Bluetooth Personal Area Network",
         "{FAKE-BLUETOOTH-PAN-ADAPTER}",
-        "172.20.10.1",
-        "172.20.10.5",
+        "203.0.113.1",
+        "203.0.113.5",
         true,
         bluetooth_observed.connectivity_state,
     );
@@ -101,13 +100,13 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
         InterfaceRouteRow {
             persistent_id: PREVIEW_ETHERNET_PERSISTENT_ID.to_string(),
             adapter_name: "{FAKE-ETHERNET-ADAPTER}".to_string(),
-            windows_name: "Ethernet".to_string(),
+            name: "Ethernet".to_string(),
             interface_description: "Fallback Ethernet adapter".to_string(),
             interface_type: "Ethernet".to_string(),
             is_bluetooth_like: false,
-            local_ip: "192.168.1.20".to_string(),
-            gateway: "192.168.1.1".to_string(),
-            dns_servers: "1.1.1.1, 8.8.8.8".to_string(),
+            local_ip: "192.0.2.20".to_string(),
+            gateway: "192.0.2.1".to_string(),
+            dns_servers: "192.0.2.53".to_string(),
             has_default_route: true,
             has_forwarding_path: Some(true),
             runtime_data_unavailable: false,
@@ -121,13 +120,13 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
         InterfaceRouteRow {
             persistent_id: PREVIEW_WIFI_PERSISTENT_ID.to_string(),
             adapter_name: "{FAKE-WIFI-ADAPTER}".to_string(),
-            windows_name: "Wi-Fi".to_string(),
+            name: "Wi-Fi".to_string(),
             interface_description: "Fallback Wi-Fi adapter".to_string(),
             interface_type: "Wireless".to_string(),
             is_bluetooth_like: false,
-            local_ip: "10.10.0.15".to_string(),
-            gateway: "10.10.0.1".to_string(),
-            dns_servers: "9.9.9.9".to_string(),
+            local_ip: "198.51.100.15".to_string(),
+            gateway: "198.51.100.1".to_string(),
+            dns_servers: "198.51.100.53".to_string(),
             has_default_route: true,
             has_forwarding_path: Some(true),
             runtime_data_unavailable: false,
@@ -141,7 +140,7 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
         InterfaceRouteRow {
             persistent_id: PREVIEW_VPN_PERSISTENT_ID.to_string(),
             adapter_name: "{FAKE-VPN-ADAPTER}".to_string(),
-            windows_name: "VPN".to_string(),
+            name: "VPN".to_string(),
             interface_description: "Fallback VPN tunnel".to_string(),
             interface_type: "Tunnel".to_string(),
             is_bluetooth_like: false,
@@ -161,13 +160,13 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
         InterfaceRouteRow {
             persistent_id: PREVIEW_BLUETOOTH_PAN_PERSISTENT_ID.to_string(),
             adapter_name: "{FAKE-BLUETOOTH-PAN-ADAPTER}".to_string(),
-            windows_name: "Bluetooth PAN".to_string(),
+            name: "Bluetooth PAN".to_string(),
             interface_description: "Bluetooth Personal Area Network".to_string(),
             interface_type: "Wireless".to_string(),
             is_bluetooth_like: true,
-            local_ip: "172.20.10.5".to_string(),
-            gateway: "172.20.10.1".to_string(),
-            dns_servers: "8.8.4.4".to_string(),
+            local_ip: "203.0.113.5".to_string(),
+            gateway: "203.0.113.1".to_string(),
+            dns_servers: "203.0.113.53".to_string(),
             has_default_route: true,
             has_forwarding_path: Some(true),
             runtime_data_unavailable: false,

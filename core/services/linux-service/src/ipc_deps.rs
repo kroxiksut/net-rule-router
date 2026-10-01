@@ -121,12 +121,16 @@ impl RulesApplyDispatcher for CycleApplyDispatcher {
 
 impl CycleApplyDispatcher {
     fn run_pass(&self, sid: &str) -> Result<(), DispatchFailure> {
+        // An apply the user asked for is attempted even with plans refused
+        // before: the fix may be one the plans do not show.
+        self.cycle.request_retry();
         match self.cycle.tick_logged("apply") {
             CycleOutcome::Applied { .. } => Ok(()),
-            // Both remaining outcomes mean the machine does NOT match the
+            // Every other outcome means the machine does NOT match the
             // revision that was just approved. Reporting success here would
             // leave the user believing rules are in force that are not.
-            CycleOutcome::EnforcementFailed { reason } => Err(DispatchFailure {
+            CycleOutcome::EnforcementFailed { reason, .. }
+            | CycleOutcome::RefusalStands { reason } => Err(DispatchFailure {
                 sid: sid.to_string(),
                 message: reason,
             }),
@@ -284,7 +288,10 @@ pub(crate) fn build_ipc_surface(
             Arc::clone(&coordinator),
             Arc::clone(&state_conn),
         )),
-        Arc::new(MonitoredAdaptersSnapshotProvider::new(route_table)),
+        Arc::new(MonitoredAdaptersSnapshotProvider::new(
+            route_table,
+            Arc::new(nrr_platform_linux::interface_rows::LinuxInterfaceRows),
+        )),
         Arc::new(ProductionRulesSnapshotProvider::new(Arc::clone(
             &state_conn,
         ))),

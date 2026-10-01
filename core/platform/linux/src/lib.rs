@@ -15,6 +15,8 @@
 //! dev host too; only the syscalls and the `nft`/`loginctl` calls sit behind
 //! `#[cfg(target_os = "linux")]`.
 
+/// Linux implementation of the system display-language probe.
+pub mod system_locale;
 /// Linux implementation of the system light/dark probe.
 pub mod system_theme;
 
@@ -105,11 +107,16 @@ pub mod polkit;
 // asks. Installed under /usr/share/polkit-1/actions.
 pub mod polkit_policy;
 
-/// Graceful-stop signals (`SIGTERM`/`SIGINT`) — the Linux analog of the SCM
-/// stop control. Without it the daemon dies on the default disposition and its
-/// filters and routes outlive the service that installed them.
+/// Graceful-stop signals (`SIGTERM`/`SIGINT`/`SIGHUP`) — the Linux analog of
+/// the SCM stop control. Without it the daemon dies on the default disposition
+/// and its filters and routes outlive the service that installed them.
 #[cfg(target_os = "linux")]
 pub mod signals;
+
+/// One daemon per machine: a private `flock` beside the service socket plus a
+/// liveness probe of the socket, both taken before the socket is touched.
+#[cfg(target_os = "linux")]
+pub mod daemon_lock;
 
 /// Unix mechanism for pointing this process's error stream at a file
 /// (`dup2` onto descriptor 2) — the analog of the Windows standard-handle
@@ -233,6 +240,9 @@ pub mod interface_traffic;
 /// neutral layer guarantees — the one place that key meets a real filesystem.
 pub mod app_path_resolver;
 
+/// DNS settings changes no rtnetlink message carries: inotify on the files the
+/// DNS managers rewrite. Event parsing is pure and tested on every host.
+pub mod dns_config_change;
 /// Linux network-topology change feed behind
 /// `nrr_platform_api::network_change::NetworkChangeObserver`. An rtnetlink
 /// socket on the link/address/route groups, so a tunnel coming up is known when
@@ -263,7 +273,7 @@ pub mod adapters;
 /// a row is the neutral one, only the facts are read here.
 pub mod interface_rows;
 
-/// Abstract-socket mechanism behind
+/// Runtime-directory socket mechanism behind
 /// `nrr_platform_api::single_instance::SingleInstancePort`.
 pub mod single_instance;
 

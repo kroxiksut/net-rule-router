@@ -25,11 +25,9 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, CM_Locate_DevNodeW, CM_DEVNODE_STATUS_FLAGS, CM_LOCATE_DEVNODE_PHANTOM,
     CM_PROB, CM_PROB_DISABLED, CM_PROB_HARDWARE_DISABLED, CR_SUCCESS, DN_HAS_PROBLEM,
 };
-use windows::Win32::Foundation::ERROR_SUCCESS;
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
-    REG_SAM_FLAGS, REG_VALUE_TYPE,
-};
+use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+
+use crate::win32_ffi::registry;
 
 /// The network adapter setup class. Stable since Windows 2000 and the only
 /// place an adapter GUID is mapped to its device instance.
@@ -68,7 +66,8 @@ fn normalize_guid(raw: &str) -> Option<String> {
 /// `PnpInstanceID` of the device behind `guid`, from the network class key.
 fn pnp_instance_id(guid: &str) -> Option<String> {
     let subkey = format!(r"{NET_CLASS_KEY}\{guid}\Connection");
-    read_string_value(&subkey, "PnpInstanceID").filter(|v| !v.trim().is_empty())
+    registry::read_string(HKEY_LOCAL_MACHINE, &subkey, Some("PnpInstanceID"))
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// Ask the configuration manager what state `instance_id` is in.
@@ -120,80 +119,6 @@ fn classify(status: CM_DEVNODE_STATUS_FLAGS, problem: CM_PROB) -> DeviceState {
         // vocabulary without adding an action.
         _ => DeviceState::FailedToStart,
     }
-}
-
-// ── Registry helpers ─────────────────────────────────────────────────────────
-
-fn read_string_value(subkey: &str, value_name: &str) -> Option<String> {
-    let key_wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut hkey = HKEY::default();
-    // SAFETY: `key_wide` is NUL-terminated UTF-16 outliving the call; `hkey` is
-    // a fresh out-param; the hive is a Win32 pseudo-handle.
-    let rc = unsafe {
-        RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(key_wide.as_ptr()),
-            0,
-            REG_SAM_FLAGS(KEY_QUERY_VALUE.0),
-            &mut hkey,
-        )
-    };
-    if rc != ERROR_SUCCESS {
-        return None;
-    }
-    let value = read_open_key_string(hkey, value_name);
-    // SAFETY: `hkey` came from a successful `RegOpenKeyExW`.
-    unsafe {
-        let _ = RegCloseKey(hkey);
-    }
-    value
-}
-
-fn read_open_key_string(hkey: HKEY, value_name: &str) -> Option<String> {
-    let name_wide: Vec<u16> = value_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut size: u32 = 0;
-    let mut value_type = REG_VALUE_TYPE::default();
-    // SAFETY: `name_wide` is NUL-terminated and outlives the call; this probe
-    // asks only for the byte length.
-    let rc = unsafe {
-        RegQueryValueExW(
-            hkey,
-            PCWSTR(name_wide.as_ptr()),
-            None,
-            Some(&mut value_type),
-            None,
-            Some(&mut size),
-        )
-    };
-    if rc != ERROR_SUCCESS || size == 0 {
-        return None;
-    }
-    let mut buf: Vec<u16> = vec![0u16; (size as usize) / 2 + 1];
-    let mut read: u32 = (buf.len() * 2) as u32;
-    // SAFETY: `buf` is sized from the probe above and `read` carries its byte
-    // length, so the call cannot write past it.
-    let rc = unsafe {
-        RegQueryValueExW(
-            hkey,
-            PCWSTR(name_wide.as_ptr()),
-            None,
-            Some(&mut value_type),
-            Some(buf.as_mut_ptr().cast()),
-            Some(&mut read),
-        )
-    };
-    if rc != ERROR_SUCCESS {
-        return None;
-    }
-    let chars = (read as usize) / 2;
-    Some(
-        String::from_utf16_lossy(&buf[..chars.min(buf.len())])
-            .trim_end_matches('\0')
-            .to_string(),
-    )
 }
 
 #[cfg(test)]

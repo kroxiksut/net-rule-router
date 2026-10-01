@@ -82,7 +82,7 @@ pub fn apply_external_probe(facts: &mut ObservedInterfaceFacts, outcome: Externa
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_derived_assessment(
-    windows_name: &str,
+    name: &str,
     interface_type: &str,
     interface_description: &str,
     adapter_name: &str,
@@ -94,7 +94,7 @@ pub fn build_derived_assessment(
     let mut signals = Vec::new();
     let haystack = format!(
         "{} {} {} {}",
-        windows_name, interface_type, interface_description, adapter_name
+        name, interface_type, interface_description, adapter_name
     )
     .to_ascii_lowercase();
 
@@ -189,15 +189,12 @@ pub fn build_derived_assessment(
     }
 }
 
-/// Default recommendation for a freshly-collected row. The preview layer
-/// overwrites this with a scored recommendation; the service path leaves
-/// it as-is (the GUI does not score on a live refresh).
+/// The recommendation slot of a row not yet scored by [`assign_recommendations`].
 pub fn unknown_recommendation() -> RouteRoleRecommendation {
     RouteRoleRecommendation {
         class: RecommendationClass::AllowedButNotRecommended,
         confidence: RecommendationConfidence::Unknown,
         advisory_only: true,
-        summary: "Recommendation pending heuristic evaluation".to_string(),
         key_signals: Vec::new(),
         excluded_alternatives: Vec::new(),
     }
@@ -218,15 +215,12 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 /// Heuristic Bluetooth-PAN classification from an adapter's display strings.
 /// Pure/neutral; `pub` so the Windows live enumeration can consume it.
 pub fn is_bluetooth_like_interface(
-    windows_name: &str,
+    name: &str,
     interface_description: &str,
     adapter_name: &str,
 ) -> bool {
-    let haystack = format!(
-        "{} {} {}",
-        windows_name, interface_description, adapter_name
-    )
-    .to_ascii_lowercase();
+    let haystack =
+        format!("{} {} {}", name, interface_description, adapter_name).to_ascii_lowercase();
     contains_any(
         &haystack,
         &["bluetooth", "bt-pan", "personal area network", "pan"],

@@ -490,7 +490,7 @@ mod tests {
             rule(
                 PrecedenceClass::HardBlock,
                 0,
-                DstMatch::HostV4(v4(1, 1, 1, 1)),
+                DstMatch::HostV4(v4(198, 51, 100, 1)),
                 Verdict::Block,
             ),
             rule(
@@ -520,19 +520,19 @@ mod tests {
             rule(
                 PrecedenceClass::RouteRule(RouteRole::Secondary),
                 2,
-                DstMatch::HostV4(v4(3, 3, 3, 3)),
+                DstMatch::HostV4(v4(198, 51, 100, 3)),
                 Verdict::Permit,
             ),
             rule(
                 PrecedenceClass::RouteRule(RouteRole::Secondary),
                 0,
-                DstMatch::HostV4(v4(1, 1, 1, 1)),
+                DstMatch::HostV4(v4(198, 51, 100, 1)),
                 Verdict::Permit,
             ),
             rule(
                 PrecedenceClass::RouteRule(RouteRole::Secondary),
                 1,
-                DstMatch::HostV4(v4(2, 2, 2, 2)),
+                DstMatch::HostV4(v4(198, 51, 100, 2)),
                 Verdict::Permit,
             ),
         ]);
@@ -562,7 +562,7 @@ mod tests {
         let mut pinned = rule(
             PrecedenceClass::RouteRule(RouteRole::Secondary),
             0,
-            DstMatch::HostV4(v4(23, 10, 20, 138)),
+            DstMatch::HostV4(v4(203, 0, 113, 138)),
             Verdict::Permit,
         );
         pinned.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
@@ -587,7 +587,7 @@ mod tests {
         );
         // Same destination on both — the drop is scoped, not a blanket cut.
         assert!(guard.matches.contains(&NftMatch::DstV4 {
-            net: v4(23, 10, 20, 138),
+            net: v4(203, 0, 113, 138),
             prefix: 32,
         }));
     }
@@ -700,7 +700,7 @@ mod tests {
         let mut pinned = rule(
             PrecedenceClass::RouteRule(RouteRole::Secondary),
             0,
-            DstMatch::HostV4(v4(9, 9, 9, 9)),
+            DstMatch::HostV4(v4(198, 51, 100, 9)),
             Verdict::Permit,
         );
         pinned.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
@@ -765,7 +765,7 @@ mod tests {
         let mut pinned = rule(
             PrecedenceClass::RouteRule(RouteRole::Secondary),
             0,
-            DstMatch::HostV4(v4(9, 9, 9, 9)),
+            DstMatch::HostV4(v4(198, 51, 100, 9)),
             Verdict::Permit,
         );
         pinned.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
@@ -795,7 +795,7 @@ mod tests {
         let mut scoped = rule(
             PrecedenceClass::RouteRule(RouteRole::Primary),
             0,
-            DstMatch::HostV4(v4(8, 8, 8, 8)),
+            DstMatch::HostV4(v4(198, 51, 100, 8)),
             Verdict::Permit,
         );
         scoped.principal = PrincipalScope(Some(UserPrincipal::from_linux_uid(1001)));
@@ -831,13 +831,13 @@ mod tests {
             rule(
                 PrecedenceClass::KillSwitchBlock,
                 0,
-                DstMatch::HostV4(v4(5, 5, 5, 5)),
+                DstMatch::HostV4(v4(198, 51, 100, 5)),
                 Verdict::Block,
             ),
             rule(
                 PrecedenceClass::KillSwitchBlock,
                 0,
-                DstMatch::HostV4(v4(6, 6, 6, 6)),
+                DstMatch::HostV4(v4(198, 51, 100, 6)),
                 Verdict::Block,
             ),
         ];

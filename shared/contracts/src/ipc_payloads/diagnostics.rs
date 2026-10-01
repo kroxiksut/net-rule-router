@@ -437,34 +437,14 @@ pub struct ConnTraceEntriesListResponse {
     pub gui_stream_enabled: bool,
 }
 
-/// Wire request for `DiagnosticModeSet`. The response
-/// is the fresh [`crate::diagnostics_dto::DiagnosticModeStateDto`] — an
-/// authoritative echo of the resulting session state.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct DiagnosticModeSetRequest {
-    /// Enable (true) or disable (false) extended diagnostics. Absent → false
-    /// (a bare payload is a disable request).
-    #[serde(default)]
-    pub enabled: bool,
-    /// TTL in milliseconds (clamped service-side to 4h). Ignored when
-    /// `enabled = false` or `until_restart = true`.
-    #[serde(default)]
-    pub duration_ms: Option<i64>,
-    /// No expiry — active until the service restarts. Overrides `duration_ms`.
-    #[serde(default)]
-    pub until_restart: bool,
-    /// Scope slug (`all` by default).
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DiagnosticsExportArchiveResponse {
-    /// Absolute path to the freshly-written zip. Lives under the
-    /// service's per-user `archives/` directory and inherits the
-    /// `Users:RX` ACL applied to that directory.
+    /// Absolute path to the freshly-written zip, under the service's
+    /// closed `archives/` directory. The directory itself stays
+    /// inaccessible to the requester; `FileHandoffPort::grant_read` grants
+    /// this one file to the requesting principal so it can be opened
+    /// without listing or reaching anything else in the tree.
     pub archive_path: String,
     /// Size of the archive in bytes. Surface in the GUI confirmation
     /// toast so the operator knows roughly what was produced.

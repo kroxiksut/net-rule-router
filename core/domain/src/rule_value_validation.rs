@@ -1,22 +1,15 @@
-//! Strict semantic validation of a rule's `match_value` for one rule type.
+//! The per-row verdict on a rule's `match_value` for one rule type — the
+//! badge the rules table shows and the gate of the Add/Edit rule dialog.
 //!
-//! This module is the single source of truth for "is this match value
-//! semantically valid as a {zone, domain, exact-ip, application} rule?"
-//! It is consumed by:
+//! Consumers: the service's rule rows (`RuleRowEntry::validation_status`) and
+//! its acceptance of a revision, the launcher's preset-import rows and its
+//! `local.rule-value-verdict` answer to the dialog, and the GUI preview snapshot.
 //!
-//! - the rules-file parser pipeline (the service layer wires this on the import
-//!   path so a row with a malformed IPv4 ends up flagged as
-//!   [`RuleValueValidation::Error`] rather than silently coerced);
-//! - the GUI preview snapshot (`apps/desktop/gui/src/ui_surface.rs`), which
-//!   tags every row with a `validationStatus` for the QML red-state badge.
-//!
-//! The validator is **pure**: no I/O, no DNS lookups, no allocations beyond
-//! the small `String` keys/args returned in the message. It encodes the
-//! same rules already enforced by the QML Add-Rule dialog
-//! (`apps/desktop/qml/Main.qml::isMatchValueValid`) so user input that
-//! passed the dialog never produces an `Error` here, and a row imported
-//! from a hand-edited file gets the same diagnosis as if the user had
-//! typed it.
+//! Every value is judged by the rule pipeline itself (`validation`'s
+//! `canonical_host_name`, `canonical_ip_address`, `canonical_app_pattern`), so
+//! what shows as valid is exactly what the service keeps as a live rule, and
+//! the service refuses a new revision by the same verdict
+//! ([`rules_with_refused_values`]). The validator is pure: no I/O, no DNS.
 //!
 //! # Diagnostic shape
 //!
@@ -26,7 +19,18 @@
 //! resolves the key against the active locale and substitutes args.
 //! Domain code never produces user-facing strings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+
+use nrr_shared::rules_json::{AddressMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleDto};
+
+use crate::address_class::AddressClass;
+use crate::rules_file::HostPlatform;
+use crate::rules_json_codec::wire_app_pattern;
+use crate::validation::{
+    canonical_app_pattern, canonical_host_name, canonical_ip_address, HostNameKind,
+    ValidationError, ValidationWarning,
+};
+use crate::RuleId;
 
 /// Result of validating a single rule's `match_value`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,8 +116,8 @@ pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValue
         return RuleValueValidation::error("rules.validation.match-value-empty");
     }
     match rule_type_slug {
-        "zone" => validate_zone(trimmed),
-        "domain" => validate_domain(trimmed),
+        "zone" => validate_host_name(HostNameKind::Zone, trimmed),
+        "domain" => validate_host_name(HostNameKind::Domain, trimmed),
         "exact-ip" => validate_exact_ip(trimmed),
         "application" => validate_application(trimmed),
         _ => {
@@ -129,30 +133,54 @@ pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValue
 
 // ── exact-ip ──────────────────────────────────────────────────────────────────
 
+/// The pipeline's verdict on an address, warnings included: the address class
+/// is judged there, once.
 fn validate_exact_ip(value: &str) -> RuleValueValidation {
-    if let Ok(v6) = value.parse::<std::net::Ipv6Addr>() {
-        return validate_exact_ipv6(v6);
+    let mut warnings = Vec::new();
+    match canonical_ip_address(value, &RuleId(String::new()), &mut warnings) {
+        Ok(_) => {}
+        Err(ValidationError::IpAddressNotADestination { class, .. }) => {
+            return RuleValueValidation::error(match class {
+                AddressClass::Broadcast => {
+                    "rules.validation.match-value-invalid.exact-ip-broadcast"
+                }
+                _ => "rules.validation.match-value-invalid.exact-ip-this-host",
+            });
+        }
+        Err(_) => return exact_ip_refusal(value),
     }
-    // Reject anything that is not exactly four dot-separated decimal octets.
+    let class = warnings.iter().find_map(|w| match w {
+        ValidationWarning::UnusualIpDestination { class, .. } => Some(*class),
+        _ => None,
+    });
+    match class {
+        Some(AddressClass::Loopback) => {
+            RuleValueValidation::warning("rules.validation.match-value-warning.exact-ip-loopback")
+        }
+        Some(AddressClass::Multicast) => {
+            RuleValueValidation::warning("rules.validation.match-value-warning.exact-ip-multicast")
+        }
+        Some(AddressClass::LinkLocal) => {
+            RuleValueValidation::warning("rules.validation.match-value-warning.exact-ip-link-local")
+        }
+        Some(_) | None => RuleValueValidation::Valid,
+    }
+}
+
+/// The most specific existing wording for a refused address: a dotted quad
+/// with an octet past 255 names that octet.
+fn exact_ip_refusal(value: &str) -> RuleValueValidation {
     let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() != 4 {
-        return RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip");
-    }
-    let mut octets = [0u16; 4];
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() || part.len() > 3 {
-            return RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip");
-        }
-        if !part.bytes().all(|b| b.is_ascii_digit()) {
-            return RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip");
-        }
-        // Disallow leading zeros (except a single "0") to avoid the
-        // octal-vs-decimal trap on tools that interpret "010" as 8.
-        if part.len() > 1 && part.starts_with('0') {
-            return RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip");
-        }
-        let n: u16 = part.parse().unwrap_or(u16::MAX);
-        if n > 255 {
+    let dotted_digits = parts.len() == 4
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if dotted_digits {
+        if let Some((i, part)) = parts
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.parse::<u32>().map_or(true, |n| n > 255))
+        {
             let mut args = BTreeMap::new();
             args.insert("octet".to_string(), (*part).to_string());
             args.insert("position".to_string(), (i + 1).to_string());
@@ -162,119 +190,57 @@ fn validate_exact_ip(value: &str) -> RuleValueValidation {
                 args,
             };
         }
-        octets[i] = n;
     }
-    // First octet of zero (0.x.x.x) is the "this network" range — never a
-    // sensible routing target.
-    if octets[0] == 0 {
-        return RuleValueValidation::error(
-            "rules.validation.match-value-invalid.exact-ip-first-octet-zero",
-        );
-    }
-    // 255.255.255.255 — limited broadcast. Routing it doesn't make sense.
-    if octets == [255, 255, 255, 255] {
-        return RuleValueValidation::error(
-            "rules.validation.match-value-invalid.exact-ip-broadcast",
-        );
-    }
-    // Soft warnings for ranges that are technically valid but unusual to
-    // see in a routing rule.
-    if octets[0] == 127 {
-        return RuleValueValidation::warning(
-            "rules.validation.match-value-warning.exact-ip-loopback",
-        );
-    }
-    if octets[0] >= 224 && octets[0] <= 239 {
-        return RuleValueValidation::warning(
-            "rules.validation.match-value-warning.exact-ip-multicast",
-        );
-    }
-    RuleValueValidation::Valid
+    RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip")
 }
 
-/// The IPv6 half: the parser already settled the syntax, so only the addresses
-/// that make no sense as a routing target remain to be named.
-fn validate_exact_ipv6(ip: std::net::Ipv6Addr) -> RuleValueValidation {
-    if ip.is_unspecified() {
-        return RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip");
+// ── zone / domain ─────────────────────────────────────────────────────────────
+
+/// A zone or domain gets the rule pipeline's own verdict, so what shows as
+/// valid is exactly what the service keeps as a live rule.
+fn validate_host_name(kind: HostNameKind, value: &str) -> RuleValueValidation {
+    // A domain value carries its suffix form the way the rules file does.
+    let body = match kind {
+        HostNameKind::Domain => value.strip_prefix("*.").unwrap_or(value),
+        HostNameKind::Zone => value,
+    };
+    match canonical_host_name(kind, body, &RuleId(String::new()), &mut Vec::new()) {
+        Ok(_) => RuleValueValidation::Valid,
+        Err(refusal) => RuleValueValidation::error(refusal_message_key(kind, body, &refusal)),
     }
-    if ip.is_loopback() {
-        return RuleValueValidation::warning(
-            "rules.validation.match-value-warning.exact-ip-loopback",
-        );
-    }
-    if ip.is_multicast() {
-        return RuleValueValidation::warning(
-            "rules.validation.match-value-warning.exact-ip-multicast",
-        );
-    }
-    RuleValueValidation::Valid
 }
 
-// ── domain ────────────────────────────────────────────────────────────────────
-
-fn validate_domain(value: &str) -> RuleValueValidation {
-    // Optional `*.` glob prefix for suffix matches; everything after must
-    // be a valid FQDN.
-    let stripped = value.strip_prefix("*.").unwrap_or(value);
-    if value.starts_with("*.") && stripped.is_empty() {
-        return RuleValueValidation::error("rules.validation.match-value-invalid.domain");
+/// The most specific existing wording for a refusal; the verdict itself is
+/// the pipeline's.
+fn refusal_message_key(kind: HostNameKind, body: &str, refusal: &ValidationError) -> &'static str {
+    if kind == HostNameKind::Zone {
+        return "rules.validation.match-value-invalid.zone";
     }
-    // Total length cap from RFC 1035 (253 octets when the trailing dot is
-    // omitted).
-    if stripped.len() > 253 {
-        return RuleValueValidation::error("rules.validation.match-value-invalid.domain-too-long");
+    if body.contains('*') {
+        return "rules.validation.match-value-invalid.domain-glob-position";
     }
-    // No interior glob beyond the leading `*.` prefix.
-    if stripped.contains('*') {
-        return RuleValueValidation::error(
-            "rules.validation.match-value-invalid.domain-glob-position",
-        );
-    }
-    if is_valid_hostname(stripped) {
-        RuleValueValidation::Valid
+    // The refused ASCII form when there is one; IDNA may give up on a long
+    // name before producing it.
+    let too_long = match refusal {
+        ValidationError::DomainInvalidValue { value, .. } => value.len() > MAX_HOSTNAME_OCTETS,
+        _ => body.len() > MAX_HOSTNAME_OCTETS,
+    };
+    if too_long {
+        "rules.validation.match-value-invalid.domain-too-long"
     } else {
-        RuleValueValidation::error("rules.validation.match-value-invalid.domain")
+        "rules.validation.match-value-invalid.domain"
     }
 }
 
-// ── zone ──────────────────────────────────────────────────────────────────────
+/// RFC 1035 limits, on the ASCII form the wire carries: the whole name without
+/// its trailing dot, and one label. Every check of a host name reads these.
+pub(crate) const MAX_HOSTNAME_OCTETS: usize = 253;
+pub(crate) const MAX_LABEL_OCTETS: usize = 63;
 
-fn validate_zone(value: &str) -> RuleValueValidation {
-    // The GUI dialog forbids dots in zone values to keep the canonical
-    // form "ru" rather than "*.ru" or compound zones. Both bare label and
-    // `*.label` are accepted by the parser per docs/en/rules-file-format.md Match value syntax, but the GUI
-    // dialog stores only the bare label form.
-    let normalized = value.strip_prefix("*.").unwrap_or(value);
-    if normalized.is_empty() {
-        return RuleValueValidation::error("rules.validation.match-value-invalid.zone");
-    }
-    if !is_valid_hostname(normalized) {
-        return RuleValueValidation::error("rules.validation.match-value-invalid.zone");
-    }
-    // Compound zones like `corp.internal` are accepted by the parser but
-    // not by the dialog. Treat them as a warning so the GUI shows the
-    // user what's going on without rejecting the row.
-    if normalized.contains('.') {
-        return RuleValueValidation::warning("rules.validation.match-value-warning.zone-compound");
-    }
-    RuleValueValidation::Valid
-}
-
-/// Validate a hostname (one or more dot-separated DNS labels), IDNA-aware.
-///
-/// ASCII names take the strict per-label LDH path, preserving the exact
-/// diagnostics for hyphen/length/empty-label mistakes. Names containing any
-/// non-ASCII codepoint are validated as an IDN via UTS-46
-/// ([`idna::domain_to_ascii`]): success means every label is a legitimate
-/// internationalized label — the crate enforces the combining-mark, bidi and
-/// confusable rules that a per-`char` test cannot. The value is kept in its
-/// Unicode form; the codegen/cache layer punycode-encodes at the boundary
-/// (see `crate::validation::normalize_domain_label`).
-///
-/// A naive per-`char` `is_alphanumeric` check would reject
-/// Tamil/Devanagari/Arabic labels: their vowel signs and virama are combining
-/// marks (Unicode categories Mn/Mc), not alphanumerics.
+/// One or more dot-separated DNS labels, IDNA-aware: ASCII names take the
+/// per-label LDH check, anything else must pass UTS-46 ([`idna::domain_to_ascii`]),
+/// since combining-mark scripts (Tamil, Devanagari) fail a per-`char` test.
+/// Length of the whole name is the caller's check.
 pub(crate) fn is_valid_hostname(host: &str) -> bool {
     if host.is_ascii() {
         host.split('.').all(is_valid_ascii_dns_label)
@@ -288,7 +254,7 @@ pub(crate) fn is_valid_hostname(host: &str) -> bool {
 /// or ending with a hyphen, not empty (which also catches consecutive dots).
 /// Non-ASCII labels are handled by IDNA in [`is_valid_hostname`].
 fn is_valid_ascii_dns_label(label: &str) -> bool {
-    if label.is_empty() || label.len() > 63 {
+    if label.is_empty() || label.len() > MAX_LABEL_OCTETS {
         return false;
     }
     if label.starts_with('-') || label.ends_with('-') {
@@ -301,23 +267,127 @@ fn is_valid_ascii_dns_label(label: &str) -> bool {
 
 // ── application ───────────────────────────────────────────────────────────────
 
+/// The pipeline's verdict on an application value, written as a pattern when
+/// it carries a `*` — the way the rules file reads it.
 fn validate_application(value: &str) -> RuleValueValidation {
-    // Accept any non-empty filename or glob that does not contain
-    // Windows-illegal characters or ASCII control codes. The actual
-    // platform-specific match (windows .exe, linux process name, macos
-    // bundle id) happens at decision time, not at validation.
-    if value.len() > 260 {
-        return RuleValueValidation::error("rules.validation.match-value-invalid.application");
+    match canonical_app_pattern(
+        value,
+        value.contains('*'),
+        HostPlatform::compiled().executable_naming(),
+        &RuleId(String::new()),
+        &mut Vec::new(),
+    ) {
+        Ok(_) => RuleValueValidation::Valid,
+        Err(_) => RuleValueValidation::error("rules.validation.match-value-invalid.application"),
     }
-    for c in value.chars() {
-        if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?') {
-            return RuleValueValidation::error("rules.validation.match-value-invalid.application");
+}
+
+// ── a revision's rules ────────────────────────────────────────────────────────
+
+/// Every value a wire rule carries, as `(rule type, value)` the way the rules
+/// table shows it: the address first, then the application.
+pub fn wire_rule_values(rule: &RuleDto) -> impl Iterator<Item = (&'static str, String)> + '_ {
+    let address = rule.address_match.as_ref().map(|m| match m {
+        AddressMatchDto::ExactFqdn { value } => ("domain", value.clone()),
+        AddressMatchDto::SuffixDomain { suffix } => ("domain", format!("*.{suffix}")),
+        AddressMatchDto::Zone { name } => ("zone", name.clone()),
+        AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
+            ("exact-ip", address.clone())
         }
-        if (c as u32) < 0x20 {
-            return RuleValueValidation::error("rules.validation.match-value-invalid.application");
+    });
+    let app = rule.app_match.as_ref().map(|m| match &m.pattern {
+        AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => {
+            ("application", value.clone())
+        }
+    });
+    address.into_iter().chain(app)
+}
+
+/// A rule the per-row verdict refuses, with the value as the rules table
+/// shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedRuleValue {
+    pub rule_id: String,
+    pub value: String,
+}
+
+/// The rules in `book` whose value the per-row verdict refuses, in book order.
+/// A value `carried` (the book in force) already holds is spared: a stored book
+/// written before the check must stay editable, and refusing it would also stop
+/// every automatic edit of that book. A rule refused outright is never spared:
+/// reading the book in force drops it ([`drop_rules_refused_outright`]).
+pub fn rules_with_refused_values(
+    book: &CanonicalRulesJsonV1,
+    carried: Option<&CanonicalRulesJsonV1>,
+) -> Vec<RefusedRuleValue> {
+    let held: HashSet<(&'static str, String)> = carried
+        .into_iter()
+        .flat_map(|c| c.primary.iter().chain(&c.secondary))
+        .filter(|rule| refused_outright(rule).is_none())
+        .flat_map(wire_rule_values)
+        .collect();
+    book.primary
+        .iter()
+        .chain(&book.secondary)
+        .filter_map(|rule| {
+            wire_rule_values(rule)
+                .find(|entry| {
+                    validate_rule_value(entry.0, &entry.1).is_error() && !held.contains(entry)
+                })
+                .map(|(_, value)| RefusedRuleValue {
+                    rule_id: rule.id.clone(),
+                    value,
+                })
+        })
+        .collect()
+}
+
+/// Removes from a stored `book` every rule no book may hold and returns them,
+/// in book order: an address that is never a destination ("this host", the
+/// limited broadcast), or an application value the pipeline refuses (too long,
+/// a control character, the bare `*`). Such a rule is refused anew everywhere;
+/// one already stored is gone once read, and the rest of the book loads.
+pub fn drop_rules_refused_outright(book: &mut CanonicalRulesJsonV1) -> Vec<RefusedRuleValue> {
+    let mut dropped = Vec::new();
+    for rules in [&mut book.primary, &mut book.secondary] {
+        rules.retain(|rule| match refused_outright(rule) {
+            None => true,
+            Some(value) => {
+                dropped.push(RefusedRuleValue {
+                    rule_id: rule.id.clone(),
+                    value,
+                });
+                false
+            }
+        });
+    }
+    dropped
+}
+
+/// The value that puts `rule` beyond any book, as the rules table shows it.
+fn refused_outright(rule: &RuleDto) -> Option<String> {
+    let no_rule = RuleId(String::new());
+    if let Some(AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address }) =
+        &rule.address_match
+    {
+        if matches!(
+            canonical_ip_address(address, &no_rule, &mut Vec::new()),
+            Err(ValidationError::IpAddressNotADestination { .. })
+        ) {
+            return Some(address.clone());
         }
     }
-    RuleValueValidation::Valid
+    let app = rule.app_match.as_ref()?;
+    // The refusal does not depend on the platform's spelling of names.
+    wire_app_pattern(
+        &app.pattern,
+        HostPlatform::compiled().executable_naming(),
+        &no_rule,
+    )
+    .is_err()
+    .then(|| match &app.pattern {
+        AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => value.clone(),
+    })
 }
 
 // ── network domain ────────────────────────────────────────────────────────────
@@ -327,8 +397,11 @@ fn validate_application(value: &str) -> RuleValueValidation {
 /// not a usable domain. ASCII only — it goes into a DNS question as typed.
 pub fn normalize_network_domain(raw: &str) -> Option<String> {
     let domain = raw.trim().trim_matches('.').to_ascii_lowercase();
-    (!domain.is_empty() && domain.is_ascii() && domain.len() <= 253 && is_valid_hostname(&domain))
-        .then_some(domain)
+    (!domain.is_empty()
+        && domain.is_ascii()
+        && domain.len() <= MAX_HOSTNAME_OCTETS
+        && is_valid_hostname(&domain))
+    .then_some(domain)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -395,17 +468,34 @@ mod tests {
 
     #[test]
     fn ipv4_valid_addresses() {
-        ok("exact-ip", "1.2.3.4");
+        ok("exact-ip", "198.51.100.4");
         ok("exact-ip", "192.168.1.1");
         ok("exact-ip", "203.0.113.7");
-        ok("exact-ip", "8.8.8.8");
+        ok("exact-ip", "198.51.100.8");
         ok("exact-ip", "100.64.0.1");
     }
 
     #[test]
-    fn ipv4_first_octet_zero_rejected() {
-        err("exact-ip", "0.0.0.0", "first-octet-zero");
-        err("exact-ip", "0.1.2.3", "first-octet-zero");
+    fn an_address_that_is_never_a_destination_is_refused() {
+        for ip in [
+            "0.0.0.0",
+            "0.1.2.3",
+            "0.255.255.255",
+            "::",
+            "::ffff:0.0.0.0",
+        ] {
+            err("exact-ip", ip, "exact-ip-this-host");
+        }
+        err("exact-ip", "255.255.255.255", "exact-ip-broadcast");
+        ok("exact-ip", "::ffff:192.0.2.1");
+        ok("exact-ip", "1.0.0.1");
+        warn("exact-ip", "::ffff:127.0.0.1", "loopback");
+    }
+
+    #[test]
+    fn a_link_local_address_warns() {
+        warn("exact-ip", "169.254.1.1", "link-local");
+        warn("exact-ip", "fe80::1", "link-local");
     }
 
     #[test]
@@ -413,11 +503,6 @@ mod tests {
         err("exact-ip", "300.1.1.1", "octet-out-of-range");
         err("exact-ip", "1.999.1.1", "octet-out-of-range");
         err("exact-ip", "1.1.1.256", "octet-out-of-range");
-    }
-
-    #[test]
-    fn ipv4_broadcast_rejected() {
-        err("exact-ip", "255.255.255.255", "broadcast");
     }
 
     #[test]
@@ -452,7 +537,18 @@ mod tests {
         ok("exact-ip", "2001:db8::7");
         warn("exact-ip", "::1", "loopback");
         warn("exact-ip", "ff02::1", "multicast");
-        err("exact-ip", "::", "exact-ip");
+    }
+
+    #[test]
+    fn a_subnet_a_range_or_a_name_is_not_an_address() {
+        for value in [
+            "192.168.1.0/24",
+            "10.0.0.1-10.0.0.9",
+            "abc.def",
+            "fe80::1%3",
+        ] {
+            err("exact-ip", value, "match-value-invalid.exact-ip");
+        }
     }
 
     #[test]
@@ -513,7 +609,12 @@ mod tests {
     fn domain_consecutive_dots_rejected() {
         err("domain", "example..com", "domain");
         err("domain", ".example.com", "domain");
-        err("domain", "example.com.", "domain");
+    }
+
+    #[test]
+    fn a_trailing_dot_is_the_fully_qualified_spelling() {
+        ok("domain", "example.com.");
+        ok("domain", "*.example.com.");
     }
 
     #[test]
@@ -538,8 +639,18 @@ mod tests {
     }
 
     #[test]
-    fn zone_compound_warns() {
-        warn("zone", "corp.internal", "zone-compound");
+    fn every_spelling_of_a_zone_the_pipeline_folds_is_valid() {
+        for zone in ["corp.internal", ".ru", "ru.", "*.ru", ".рф", "RU"] {
+            ok("zone", zone);
+        }
+    }
+
+    #[test]
+    fn a_zone_the_pipeline_refuses_is_an_error() {
+        err("zone", "123", "zone");
+        err("zone", ".", "zone");
+        err("zone", "..ru", "zone");
+        err("zone", &("abcdef.".repeat(40) + "com"), "zone");
     }
 
     #[test]
@@ -569,16 +680,17 @@ mod tests {
 
     #[test]
     fn idn_structural_errors_still_rejected() {
-        // The structural guards still apply with non-ASCII content. (UTS-46
-        // `domain_to_ascii` is deliberately lenient on the label *content* —
-        // it maps away ignorable codepoints rather than erroring — and it does
-        // NOT do confusable/mixed-script detection; that is out of scope for a
-        // routing-rule validator. The goal here is to stop wrongly rejecting
-        // valid IDN, while keeping the length/glob/empty structural checks.)
-        let long = "ந".repeat(200); // 600 bytes > 253 — caught before IDNA
-        assert!(long.len() > 253);
-        err("domain", &long, "domain-too-long");
-        // Interior glob is still rejected even with non-ASCII labels present.
+        // UTS-46 is lenient on label content and does no confusable
+        // detection; the length and glob checks still apply to an IDN.
+        // 600 bytes as typed, but one label: refused for the label, whose
+        // punycode stays under 253 octets.
+        let long_label = "ந".repeat(200);
+        assert!(long_label.len() > 253);
+        err("domain", &long_label, "match-value-invalid.domain");
+        // Short as typed, longer than 253 octets once punycoded.
+        let long_punycode = ["中"; 40].join(".");
+        assert!(long_punycode.len() <= 253);
+        err("domain", &long_punycode, "domain-too-long");
         err("domain", "ந.*.ந", "domain-glob-position");
     }
 
@@ -595,10 +707,18 @@ mod tests {
         ok("application", "браузер.exe");
     }
 
+    /// The pipeline keeps the file name of a path, so the row does too.
     #[test]
-    fn application_with_path_separators_rejected() {
-        err("application", "C:\\Program Files\\app.exe", "application");
-        err("application", "/usr/bin/app", "application");
+    fn an_application_path_is_valid() {
+        ok("application", "C:\\Program Files\\app.exe");
+        ok("application", "/usr/bin/app");
+    }
+
+    #[test]
+    fn an_application_the_pipeline_refuses_is_an_error() {
+        err("application", "*", "application");
+        err("application", &"a".repeat(261), "application");
+        ok("application", &"a".repeat(260));
     }
 
     #[test]

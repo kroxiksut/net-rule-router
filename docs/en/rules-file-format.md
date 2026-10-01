@@ -183,7 +183,7 @@ The following priority order is fixed (highest to lowest):
    Domains and IP tiers, so a top-level address rule for the same address wins.
 6. **Default route** — determined by `ActiveConfiguration.behavior_mode`.
 
-Both the primary and secondary rule files are evaluated independently. The
+Both the primary and additional rule files are evaluated independently. The
 first match across both files determines the route.
 
 ### 1.6 Child process tracking (`+children`)
@@ -341,13 +341,13 @@ information is lost when a file travels through this version.
 
 Routing is **destination-based**: a route is keyed by the remote address, not by
 the originating process. An application rule therefore cannot, by itself, send a
-process's traffic out the secondary adapter. What it does is tell NetRuleRouter
+process's traffic out the additional adapter. What it does is tell NetRuleRouter
 which application to watch: the destinations that application contacts are
 learned by observation and routed via the rule's route (the file the rule lives
 in — `rules_primary.txt` or `rules_secondary.txt`) on subsequent connections.
 
 > True per-process *isolation* (only **this** application's traffic to a shared
-> address rides the secondary; other applications contacting the same address do
+> address rides the additional route; other applications contacting the same address do
 > not) requires a kernel driver and is out of scope for now. A destination
 > learned from an application is an ordinary destination route — it applies
 > wherever that address is contacted. The first connection to an address the
@@ -394,7 +394,7 @@ converting a block into an accidental route.
 
 By default a rule *routes* its destination through the adapter bound to the
 file the rule lives in (`rules_primary.txt` → primary, `rules_secondary.txt` →
-secondary; §1.10). Appending the flag **`+block`** after the match value
+additional; §1.10). Appending the flag **`+block`** after the match value
 instead **drops** all traffic to that destination — it is enforced by a hard
 WFP `FWP_ACTION_BLOCK` filter (both the connect layer for TCP/UDP and the
 packet layer for ICMP/ping and other protocols) and installs **no** route.
@@ -426,7 +426,7 @@ Key properties:
 - **The containing file is irrelevant for a blocked rule.** A `+block` rule
   drops its destination whether it lives in `rules_primary.txt` or
   `rules_secondary.txt` — the block action overrides the route. (Editors
-  typically keep block rules in the secondary file by convention.)
+  typically keep block rules in the additional file by convention.)
 - `+block` works uniformly across every section: `Zones`, `Domains`, `IP`, and
   the application sections (`Windows` / `Linux` / `MacOS`). A blocked
   application rule drops that process's connect-layer traffic.
@@ -617,7 +617,7 @@ A preset consists of **two files**, one per route:
 | Filename | Content |
 |---|---|
 | `rules_primary.txt` | Rules for the primary route |
-| `rules_secondary.txt` | Rules for the secondary route |
+| `rules_secondary.txt` | Rules for the additional route |
 
 Either file may be omitted when a route has no rules to share.
 
@@ -629,7 +629,7 @@ any section headers. All keys are optional.
 ```
 # NetRuleRouter preset — version 4
 # name: Corporate VPN Rules
-# description: Routes corporate traffic via the secondary (VPN) interface
+# description: Routes corporate traffic via the additional (VPN) interface
 # author: Jane Doe
 # preset_version: 1
 ```

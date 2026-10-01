@@ -1,9 +1,0 @@
-﻿schema_version: 1
-profile:
-  id: default
-  name: "Default Local Config"
-routes:
-  primary: auto
-  secondary: auto
-default_route: primary
-rules: []

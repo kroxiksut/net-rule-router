@@ -715,13 +715,13 @@ mod tests {
     }
 
     /// The live case: `*.search.example` on the main link, `docs.search.example`
-    /// on the additional one, and Google hands both hosts the SAME address.
+    /// on the additional one, and a CDN hands both hosts the SAME address.
     /// Pinning it into the tunnel takes translate.search.example with it, which the
     /// user routed over the main link and which then breaks whenever the tunnel
     /// misbehaves.
     #[test]
     fn a_shared_address_stays_on_the_main_link() {
-        let shared = Ipv4Addr::new(23, 10, 20, 161);
+        let shared = Ipv4Addr::new(203, 0, 113, 161);
         let cache = MockFqdnCacheLookup::new();
         cache.set_ips("translate.search.example", vec![shared]);
         cache.set_ips("docs.search.example", vec![shared]);
@@ -752,7 +752,7 @@ mod tests {
     /// tie-break then swallowed the rule the user wrote.
     #[test]
     fn a_more_specific_rule_keeps_the_address_only_its_host_has() {
-        let private = Ipv4Addr::new(23, 10, 20, 150);
+        let private = Ipv4Addr::new(203, 0, 113, 150);
         let cache = MockFqdnCacheLookup::new();
         cache.set_ips("docs.search.example", vec![private]);
         let book = book(

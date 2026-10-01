@@ -18,6 +18,14 @@ impl FakeIpStack {
         if self.udp_binds.contains_key(&key) {
             return;
         }
+        // A bind outlives a step only while it carries a flow, so the bind count
+        // is bounded by the flow cap. Refusing here spares a pair of socket
+        // buffers per packet, and with no socket bound smoltcp answers
+        // port-unreachable itself.
+        if self.udp_binds.len() >= self.max_udp_flows {
+            self.refuse_udp_at_capacity(self.udp_binds.len());
+            return;
+        }
         let (_hostname, target) = match self.relay.decide(packet) {
             RelayDecision::Relay { hostname, target } => (hostname, target),
             refusal => {
@@ -106,6 +114,14 @@ impl FakeIpStack {
 
             self.reap_idle_udp(&key, now_ms);
         }
+        // Re-armed only well under the cap, so a table hovering at it stays one
+        // line in the log.
+        if self.udp_capacity_warned {
+            let (pending, live) = self.udp_flow_counts();
+            if pending + live < self.max_udp_flows / 2 {
+                self.udp_capacity_warned = false;
+            }
+        }
     }
 
     /// Route one client datagram: straight upstream for a live flow, into the
@@ -146,8 +162,13 @@ impl FakeIpStack {
         client: SocketAddr,
         payload: Vec<u8>,
     ) {
-        let in_flight: usize = self.udp_binds.values().map(|bind| bind.pending.len()).sum();
+        let (in_flight, live) = self.udp_flow_counts();
         if in_flight >= MAX_PENDING_UDP_DIALS {
+            return;
+        }
+        if in_flight + live >= self.max_udp_flows {
+            self.refuse_udp_at_capacity(in_flight + live);
+            self.send_port_unreachable(*key, client, payload.len());
             return;
         }
         let Some(target) = self.udp_binds.get(key).map(|bind| bind.target.clone()) else {
@@ -243,6 +264,32 @@ impl FakeIpStack {
                 }
             }
         }
+    }
+
+    /// Dialing and live UDP client flows across every bind.
+    fn udp_flow_counts(&self) -> (usize, usize) {
+        self.udp_binds
+            .values()
+            .fold((0, 0), |(pending, live), bind| {
+                (pending + bind.pending.len(), live + bind.clients.len())
+            })
+    }
+
+    /// Counted per refusal, logged once per episode: at the cap refusals come
+    /// as fast as clients retransmit.
+    fn refuse_udp_at_capacity(&mut self, active: usize) {
+        self.health.record_udp_flow_refused_at_capacity();
+        if self.udp_capacity_warned {
+            return;
+        }
+        self.udp_capacity_warned = true;
+        tracing::warn!(
+            target: "nrr::fake-ip",
+            msg_key = "fakeip-udp-flow-capacity-reached",
+            active,
+            cap = self.max_udp_flows,
+            "fake-IP is carrying its maximum number of UDP flows — new clients are told port-unreachable until some go idle",
+        );
     }
 
     fn record_udp_dial_failure(

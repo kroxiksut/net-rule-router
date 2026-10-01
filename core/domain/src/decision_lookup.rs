@@ -488,7 +488,7 @@ mod tests {
     fn lookup_result_has_usable_ip_when_fresh_entry_selected() {
         let result = LookupResult {
             selected_ip: Some(make_entry(
-                Ipv4Addr::new(23, 10, 20, 138),
+                Ipv4Addr::new(203, 0, 113, 138),
                 CacheEntryState::Fresh,
             )),
             is_multi_ip: false,
@@ -501,7 +501,7 @@ mod tests {
     fn lookup_result_has_usable_ip_when_stale_usable_selected() {
         let result = LookupResult {
             selected_ip: Some(make_entry(
-                Ipv4Addr::new(1, 1, 1, 1),
+                Ipv4Addr::new(192, 0, 2, 1),
                 CacheEntryState::StaleUsable,
             )),
             is_multi_ip: false,

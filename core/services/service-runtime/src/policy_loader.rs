@@ -1,42 +1,26 @@
-//! Active revision load + integrity verification + LKG
-//! coordination.
-//!
-//! State machine (matches `ServicePolicyState` in `state.rs`):
+//! Boot-time load of the active pointer and the keyless integrity check.
 //!
 //! ```text
-//!  NoState ── (no active pointer, no LKG, fresh install)
-//!     │
-//!  LoadingActive
-//!     │
-//!     ├── active OK ─────────────────────────────► ActiveReady
-//!     ├── active corrupt + LKG OK + audit OK ────► LkgReady
-//!     │           (active pointer is rewritten to LKG via the
-//!     │            audited recovery flow; see `try_lkg_fallback`)
-//!     ├── active corrupt + LKG corrupt ───────────► RecoveryRequired
-//!     ├── active corrupt + LKG missing ───────────► RecoveryRequired
-//!     ├── active corrupt + audit write failure ──► RecoveryRequired
-//!     │           (we do NOT silently mutate the active pointer
-//!     │            without an audit record)
-//!     └── active missing + LKG missing ───────────► NoState
-//!         (first-run path; tamper detection lives in the health
-//!          aggregator that combines this with security_alerts)
+//!  active OK ───────────────────────────► ActiveReady
+//!  corruption found (any principal) ─────► ActiveInvalid  (reported, nothing moved)
+//!  schema newer than this binary ────────► RecoveryRequired
+//!  no active pointer ────────────────────► NoState
 //! ```
 //!
-//! Invariants enforced here:
-//! - No `ActiveReady`/`LkgReady` outcome ever returns until both the
-//!   integrity check passes (delegated to `nrr_storage::check_integrity`)
-//!   AND the audit emitter has accepted the recovery event (when a
-//!   recovery happened).
-//! - `set_active_revision` is only called by the loader itself, and only
-//!   inside `try_lkg_fallback` after the audit emitter signals success.
-//! - The candidate/pending revision flow is **not** in this module —
-//!   a separate controlled flow owns it with its own audit chain.
+//! The loader only reports. It runs before the signing key is loaded, so it
+//! cannot tell whose revision to trust, and the one pointer it could move is
+//! the baseline's: moving it for another principal's corruption left the
+//! pointer and the `active` status naming different rows, and the next
+//! activation undid the "recovery". Recovery is
+//! `ActivationCoordinator::enforce_active_integrity_all`, keyed and per
+//! principal, moving status and pointer together.
 
 use std::sync::{Arc, Mutex};
 
 use nrr_domain::revision::RevisionId;
 use nrr_storage::dto::{IntegrityCheckResult, RecoveryAction};
 use nrr_storage::repository::RevisionMetadataRepository;
+use sha2::{Digest, Sha256};
 
 use crate::state::{ActiveRevisionState, ServicePolicyState};
 
@@ -47,23 +31,16 @@ use crate::state::{ActiveRevisionState, ServicePolicyState};
 /// right audit/health events.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyLoadResult {
-    /// Active revision loaded and validated. Carries a summary the
-    /// runtime publishes through `HealthReporter`.
+    /// Active revision loaded and validated.
     ActiveLoaded(ActiveRevisionState),
-    /// Active loaded after the recovery flow flipped the active
-    /// pointer to the LKG revision. The summary's `provenance` is
-    /// `recovery-fallback` so the GUI can surface the fact.
-    LkgFallbackApplied(ActiveRevisionState),
-    /// No active revision is set and there is no LKG either. Treated
-    /// as a fresh install.
+    /// The keyless check found corruption and changed nothing; the keyed
+    /// per-principal sweep that runs later in the same boot recovers.
+    IntegrityFailureReported(String),
+    /// No active revision is set. Treated as a fresh install.
     NoActiveRevision,
-    /// Active revision is broken and the runtime cannot proceed without
-    /// user action. The string carries the human-readable detail (used
-    /// for audit + GUI).
+    /// The runtime cannot proceed without user action.
     RecoveryRequired(String),
-    /// Underlying storage call failed. Caller should surface this
-    /// alongside a Blocking severity and let the runtime stay in
-    /// `RecoveryRequired`.
+    /// Underlying storage call failed.
     StorageError(String),
 }
 
@@ -73,7 +50,7 @@ impl PolicyLoadResult {
     pub fn to_policy_state(&self) -> ServicePolicyState {
         match self {
             Self::ActiveLoaded(_) => ServicePolicyState::ActiveReady,
-            Self::LkgFallbackApplied(_) => ServicePolicyState::LkgReady,
+            Self::IntegrityFailureReported(_) => ServicePolicyState::ActiveInvalid,
             Self::NoActiveRevision => ServicePolicyState::NoState,
             Self::RecoveryRequired(_) | Self::StorageError(_) => {
                 ServicePolicyState::RecoveryRequired
@@ -83,7 +60,7 @@ impl PolicyLoadResult {
 
     pub fn current_revision(&self) -> Option<&ActiveRevisionState> {
         match self {
-            Self::ActiveLoaded(s) | Self::LkgFallbackApplied(s) => Some(s),
+            Self::ActiveLoaded(s) => Some(s),
             _ => None,
         }
     }
@@ -91,26 +68,13 @@ impl PolicyLoadResult {
 
 // ── Audit emitter abstraction ────────────────────────────────────────────────
 
-/// Outcome the loader sends to the audit emitter when it considers an
-/// LKG fallback. The emitter must persist the event durably *before*
-/// returning `Ok`. If persistence fails, returning `Err` causes the
-/// loader to fall through to `RecoveryRequired` rather than silently
-/// mutate the active pointer.
+/// What the loader records. The emitter must persist the event durably
+/// before returning `Ok`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryAuditEvent {
-    /// Active revision found corrupt; about to switch to LKG.
-    LkgFallbackStarted {
-        broken_active: String,
-        lkg_target: String,
-        details: String,
-    },
-    /// LKG target validated, active pointer rewritten.
-    LkgFallbackCompleted {
-        broken_active: String,
-        new_active: String,
-    },
-    /// Active is corrupt and no usable LKG is available; user must
-    /// take action.
+    /// The keyless check found corruption; nothing was changed.
+    IntegrityFailureReported { details: String },
+    /// The runtime cannot proceed without user action.
     RecoveryRequired { details: String },
 }
 
@@ -143,10 +107,8 @@ impl RecoveryAuditEmitter for NoopAuditEmitter {
 
 // ── Loader ───────────────────────────────────────────────────────────────────
 
-/// Pulls active revision state, verifies integrity, executes LKG
-/// fallback when necessary. Stateless — `load()` can be called multiple
-/// times and the outcome is deterministic given the same store + audit
-/// emitter behaviour.
+/// Reads the active pointer and reports what the keyless integrity check
+/// finds. Never writes the store.
 pub struct PolicyLoader<R, A>
 where
     R: RevisionMetadataRepository,
@@ -183,49 +145,33 @@ where
         self
     }
 
-    /// Walk the state machine end-to-end. Returns the final outcome.
-    /// Updates the cached `current` summary on `ActiveLoaded` /
-    /// `LkgFallbackApplied`.
+    /// Walk the state machine end-to-end. Updates the cached `current`
+    /// summary on `ActiveLoaded`.
     pub fn load(&self) -> PolicyLoadResult {
         let active = match self.repo.get_active_revision() {
             Ok(v) => v,
             Err(e) => return PolicyLoadResult::StorageError(e.to_string()),
         };
-        let lkg = match self.repo.get_last_known_good() {
-            Ok(v) => v,
-            Err(e) => return PolicyLoadResult::StorageError(e.to_string()),
-        };
-
-        // Run the storage-layer integrity check. It validates SQLite
-        // structural integrity AND the SHA-256 hashes of both the
-        // active pointer and the LKG.
         let integrity = match self.repo.check_integrity() {
             Ok(t) => t,
             Err(e) => return PolicyLoadResult::StorageError(e.to_string()),
         };
 
         match (active, integrity) {
-            // Happy path: active OK and integrity OK. `OkNoRollbackTarget` is
-            // the same load — it only says there is nothing to fall back to,
-            // which is the normal state right after the first activation.
-            (
-                Some(active_id),
-                (IntegrityCheckResult::Ok | IntegrityCheckResult::OkNoRollbackTarget, _),
-            ) => {
-                let summary = self.summary_for(&active_id, "active");
+            // Before the baseline pointer: the corruption may belong to any
+            // principal, including one the baseline has nothing to do with.
+            (_, (IntegrityCheckResult::PolicyIntegrityFailed { details }, action)) => {
+                self.report_integrity_failure(details, action)
+            }
+            (Some(active_id), (IntegrityCheckResult::Ok, _)) => {
+                let summary = self.summary_for(&active_id);
                 self.set_current(Some(summary.clone()));
                 PolicyLoadResult::ActiveLoaded(summary)
             }
-            // No active pointer at all.
             (None, _) => {
                 self.set_current(None);
                 PolicyLoadResult::NoActiveRevision
             }
-            // Active corrupt — try the LKG.
-            (
-                Some(active_id),
-                (IntegrityCheckResult::PolicyIntegrityFailed { details }, action),
-            ) => self.try_lkg_fallback(&active_id, lkg, &details, action),
             (
                 Some(_),
                 (
@@ -249,10 +195,8 @@ where
                 self.set_current(None);
                 PolicyLoadResult::StorageError(msg)
             }
+            // Cache integrity does not affect policy load.
             (Some(_), (IntegrityCheckResult::CacheCorruptRebuildable, _)) => {
-                // Cache integrity does not affect policy load —
-                // `check_integrity` already handled the rebuild. Treat as Ok
-                // for the policy state machine.
                 self.try_active_after_cache_only_failure()
             }
         }
@@ -261,7 +205,7 @@ where
     fn try_active_after_cache_only_failure(&self) -> PolicyLoadResult {
         match self.repo.get_active_revision() {
             Ok(Some(id)) => {
-                let summary = self.summary_for(&id, "active");
+                let summary = self.summary_for(&id);
                 self.set_current(Some(summary.clone()));
                 PolicyLoadResult::ActiveLoaded(summary)
             }
@@ -273,80 +217,36 @@ where
         }
     }
 
-    fn try_lkg_fallback(
+    fn report_integrity_failure(
         &self,
-        broken_active: &RevisionId,
-        lkg: Option<RevisionId>,
-        details: &str,
+        details: String,
         action: RecoveryAction,
     ) -> PolicyLoadResult {
-        // Without an LKG pointer we cannot recover automatically. This
-        // also covers `RequireUserAction` from `check_integrity` — even
-        // if an LKG row exists, its hash failed, so we must not switch.
-        let lkg_id = match lkg {
-            Some(id) if !matches!(action, RecoveryAction::RequireUserAction(_)) => id,
-            _ => {
-                let msg = format!("active revision integrity failed and no usable LKG: {details}");
-                let _ = self.audit.emit(RecoveryAuditEvent::RecoveryRequired {
-                    details: msg.clone(),
-                });
-                self.set_current(None);
-                return PolicyLoadResult::RecoveryRequired(msg);
-            }
+        let details = match action {
+            RecoveryAction::RequireUserAction(why) => format!("{details}; {why}"),
+            _ => details,
         };
-
-        // 1. Audit the *intent* before mutating anything. Failure to
-        // audit means we MUST NOT change the active pointer.
-        if let Err(e) = self.audit.emit(RecoveryAuditEvent::LkgFallbackStarted {
-            broken_active: broken_active.as_str().to_string(),
-            lkg_target: lkg_id.as_str().to_string(),
-            details: details.to_string(),
-        }) {
-            self.set_current(None);
-            return PolicyLoadResult::RecoveryRequired(format!(
-                "LKG fallback aborted because audit write failed: {e}"
-            ));
-        }
-
-        // 2. Switch the active pointer to the LKG revision.
-        if let Err(e) = self.repo.set_active_revision(&lkg_id) {
-            // The audit "started" event is now orphaned, but that is
-            // acceptable — the audit chain is append-only and the
-            // forensic trail is preserved.
-            self.set_current(None);
-            return PolicyLoadResult::RecoveryRequired(format!(
-                "LKG fallback aborted: failed to write active pointer: {e}"
-            ));
-        }
-
-        // 3. Audit completion. Failure here is non-fatal — the active
-        // pointer is already on the LKG, the runtime can proceed in
-        // LkgReady, and the operational health snapshot surfaces the
-        // audit drop.
-        let _ = self.audit.emit(RecoveryAuditEvent::LkgFallbackCompleted {
-            broken_active: broken_active.as_str().to_string(),
-            new_active: lkg_id.as_str().to_string(),
-        });
-
-        let summary = self.summary_for(&lkg_id, "recovery-fallback");
-        self.set_current(Some(summary.clone()));
-        PolicyLoadResult::LkgFallbackApplied(summary)
+        // A lost audit line does not change the outcome: nothing was mutated,
+        // and the health snapshot carries the same text.
+        let _ = self
+            .audit
+            .emit(RecoveryAuditEvent::IntegrityFailureReported {
+                details: details.clone(),
+            });
+        self.set_current(None);
+        PolicyLoadResult::IntegrityFailureReported(details)
     }
 
-    fn summary_for(&self, id: &RevisionId, provenance: &str) -> ActiveRevisionState {
-        let hash = nrr_storage::compute_revision_hash(id.as_str());
-        let activated_at_iso = (self.clock)();
+    fn summary_for(&self, id: &RevisionId) -> ActiveRevisionState {
         ActiveRevisionState {
             revision_id: id.as_str().to_string(),
-            provenance: provenance.to_string(),
-            // This loader's scope is the active-pointer state machine. The
-            // canonical-profile load (rule_count, behavior_mode) is wired
-            // in by the caller once the rule engine context is available;
-            // stable defaults here keep the DTO shape pinned meanwhile.
+            provenance: "active".to_string(),
+            // The canonical-profile load (rule_count, behavior_mode) belongs to
+            // the caller once the rule engine context exists.
             rule_count: 0,
             behavior_mode: "auto".to_string(),
-            content_hash_hex: hash,
-            activated_at_iso,
+            content_hash_hex: sha256_hex(id.as_str()),
+            activated_at_iso: (self.clock)(),
         }
     }
 
@@ -360,6 +260,16 @@ where
     pub fn current(&self) -> Option<ActiveRevisionState> {
         self.current.lock().ok().and_then(|g| g.clone())
     }
+}
+
+fn sha256_hex(s: &str) -> String {
+    use std::fmt::Write as _;
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
 }
 
 // ── Default clock ────────────────────────────────────────────────────────────
@@ -383,47 +293,48 @@ fn default_clock() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nrr_storage::revisions::{ActiveRevisionPointer, RevisionsRepository};
     use nrr_storage::{
         open_connection, repository::MigrationRunner, SqliteMigrationRunner, SqliteStateStore,
+        BASELINE_PRINCIPAL,
     };
+    use rusqlite::Connection;
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
     // ── Test scaffolding ────────────────────────────────────────────────
 
-    /// Open + migrate a state DB in a temp dir. Returns the store and the
-    /// dir so it stays alive for the test.
-    fn fresh_state_store() -> (TempDir, SqliteStateStore) {
+    /// Integrity rests on `row_hmac`, so a "corrupt" revision is a signed row
+    /// edited afterwards — what tampering does.
+    const TEST_SIGNING_KEY: &[u8] = b"policy-loader-test-key-0123456789";
+
+    const OTHER_PRINCIPAL: &str = "S-1-5-21-1000-1000-1000-1001";
+
+    fn fresh_db() -> (TempDir, Connection) {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("nrr_service_state.db");
-        let conn = open_connection(&path).unwrap();
+        let conn = open_connection(&dir.path().join("nrr_service_state.db")).unwrap();
         let runner = SqliteMigrationRunner::for_state_db(conn);
         runner.run_pending_migrations().unwrap();
         runner.verify_schema().unwrap();
-        (
-            dir,
-            SqliteStateStore::new(runner.into_connection())
-                .with_signing_key(TEST_SIGNING_KEY.to_vec()),
-        )
+        (dir, runner.into_connection())
     }
 
-    /// The key the fixtures sign rows with. Integrity now rests on
-    /// `revisions.row_hmac`, so a test that wants a "corrupt active revision"
-    /// signs a row and then edits it — the same thing tampering does.
-    const TEST_SIGNING_KEY: &[u8] = b"policy-loader-test-key-0123456789";
+    fn keyed(conn: Connection) -> SqliteStateStore {
+        SqliteStateStore::new(conn).with_signing_key(TEST_SIGNING_KEY.to_vec())
+    }
 
-    /// Recording audit emitter — records every event. The closure-driven
-    /// variant lets tests force a write failure.
+    fn repo(conn: &Connection) -> RevisionsRepository<'_> {
+        RevisionsRepository::with_signing_key(conn, TEST_SIGNING_KEY.to_vec())
+    }
+
     #[derive(Default)]
     struct RecordingAudit {
         events: StdMutex<Vec<RecoveryAuditEvent>>,
-        fail_on_started: bool,
+        fail: bool,
     }
     impl RecoveryAuditEmitter for RecordingAudit {
         fn emit(&self, event: RecoveryAuditEvent) -> Result<(), String> {
-            if self.fail_on_started
-                && matches!(event, RecoveryAuditEvent::LkgFallbackStarted { .. })
-            {
+            if self.fail {
                 return Err("simulated audit write failure".into());
             }
             self.events.lock().unwrap().push(event);
@@ -435,89 +346,97 @@ mod tests {
         RevisionId::from_prefixed_string(format!("rev-{s}")).unwrap()
     }
 
-    /// Give the store a revision history. Revisions must exist before the
-    /// active pointer can name one — the pointer carries a foreign key into
-    /// `revisions` — and the LKG is now READ from this history rather than
-    /// promoted into a table of its own: the most recently superseded row is
-    /// the rollback target.
-    fn seed_revisions(
-        store: SqliteStateStore,
-        rows: &[(&RevisionId, &str, i64)],
-    ) -> SqliteStateStore {
-        let conn = store.into_connection();
+    /// Signed revision rows for `principal`; `superseded_at > 0` marks history.
+    fn seed(conn: &Connection, principal: &str, rows: &[(&RevisionId, &str, i64)]) {
         for (id, status, superseded_at) in rows {
             conn.execute(
                 "INSERT INTO revisions (principal, revision_id, content_hash, rules_json,
                                         status, source, correlation_id, created_at,
                                         superseded_at)
-                 VALUES (?1, ?2, 'h', '{}', ?3, 'gui-rules-edit', 'c', 0, ?4)",
+                 VALUES (?1, ?2, ?3, '{}', ?4, 'gui-rules-edit', 'c', 0, ?5)",
                 rusqlite::params![
-                    nrr_storage::BASELINE_PRINCIPAL,
+                    principal,
                     id.as_str(),
+                    format!("h-{}", id.as_str()),
                     status,
                     (*superseded_at > 0).then_some(*superseded_at)
                 ],
             )
             .unwrap();
+            repo(conn).re_sign_row(id.as_str()).unwrap();
         }
-        {
-            let repo = nrr_storage::revisions::RevisionsRepository::with_signing_key(
-                &conn,
-                TEST_SIGNING_KEY.to_vec(),
-            );
-            for (id, _, _) in rows {
-                repo.re_sign_row(id.as_str()).unwrap();
-            }
-        }
-        SqliteStateStore::new(conn).with_signing_key(TEST_SIGNING_KEY.to_vec())
     }
 
-    /// Edit a signed row behind the store's back — what an external editor or a
-    /// hand-patched database does, and what `check_integrity` must catch.
-    fn tamper_row(store: SqliteStateStore, id: &RevisionId) -> SqliteStateStore {
-        let conn = store.into_connection();
+    fn point(conn: &Connection, principal: &str, id: &RevisionId) {
+        repo(conn)
+            .set_active_pointer_for(
+                principal,
+                &ActiveRevisionPointer {
+                    revision_id: id.as_str().to_string(),
+                    activated_at: 1,
+                    apply_attempt_id: None,
+                },
+            )
+            .unwrap();
+    }
+
+    fn tamper(conn: &Connection, id: &RevisionId) {
         conn.execute(
             "UPDATE revisions SET rules_json = '{\"tampered\":true}' WHERE revision_id = ?1",
             rusqlite::params![id.as_str()],
         )
         .unwrap();
-        SqliteStateStore::new(conn).with_signing_key(TEST_SIGNING_KEY.to_vec())
     }
 
-    fn loader_for(
+    fn pointer_of(conn: &Connection, principal: &str) -> Option<String> {
+        repo(conn)
+            .get_active_pointer_for(principal)
+            .unwrap()
+            .map(|p| p.revision_id)
+    }
+
+    fn status_active_of(conn: &Connection, principal: &str) -> Option<String> {
+        repo(conn)
+            .get_active_for(principal)
+            .unwrap()
+            .map(|r| r.revision_id)
+    }
+
+    fn load(
         store: SqliteStateStore,
         audit: RecordingAudit,
-    ) -> (
-        Arc<SqliteStateStore>,
-        Arc<RecordingAudit>,
-        PolicyLoader<SqliteStateStore, RecordingAudit>,
-    ) {
+    ) -> (PolicyLoadResult, Arc<SqliteStateStore>, Arc<RecordingAudit>) {
         #[allow(clippy::arc_with_non_send_sync)] // test fixture: single-threaded store
-        let repo = Arc::new(store);
-        let aud = Arc::new(audit);
-        let loader = PolicyLoader::new(repo.clone(), aud.clone())
+        let store = Arc::new(store);
+        let audit = Arc::new(audit);
+        let loader = PolicyLoader::new(Arc::clone(&store), Arc::clone(&audit))
             .with_clock(Arc::new(|| "fixed-test-time".to_string()));
-        (repo, aud, loader)
+        (loader.load(), store, audit)
+    }
+
+    fn into_conn(store: Arc<SqliteStateStore>) -> Connection {
+        Arc::try_unwrap(store)
+            .unwrap_or_else(|_| panic!("store still shared"))
+            .into_connection()
     }
 
     // ── Cases ────────────────────────────────────────────────────────────
 
     #[test]
     fn first_run_with_no_active_returns_no_state() {
-        let (_dir, store) = fresh_state_store();
-        let (_, _, loader) = loader_for(store, RecordingAudit::default());
-        assert_eq!(loader.load(), PolicyLoadResult::NoActiveRevision);
-        assert_eq!(loader.load().to_policy_state(), ServicePolicyState::NoState);
+        let (_dir, conn) = fresh_db();
+        let (outcome, _, _) = load(keyed(conn), RecordingAudit::default());
+        assert_eq!(outcome, PolicyLoadResult::NoActiveRevision);
+        assert_eq!(outcome.to_policy_state(), ServicePolicyState::NoState);
     }
 
     #[test]
-    fn active_present_with_valid_hash_loads_active_ready() {
-        let (_dir, store) = fresh_state_store();
+    fn active_present_with_valid_signature_loads_active_ready() {
+        let (_dir, conn) = fresh_db();
         let id = rev("11111111-2222-3333-4444-555555555555");
-        let store = seed_revisions(store, &[(&id, "active", 0)]);
-        store.set_active_revision(&id).unwrap();
-        let (_, _, loader) = loader_for(store, RecordingAudit::default());
-        match loader.load() {
+        seed(&conn, BASELINE_PRINCIPAL, &[(&id, "active", 0)]);
+        point(&conn, BASELINE_PRINCIPAL, &id);
+        match load(keyed(conn), RecordingAudit::default()).0 {
             PolicyLoadResult::ActiveLoaded(summary) => {
                 assert_eq!(summary.revision_id, id.as_str());
                 assert_eq!(summary.provenance, "active");
@@ -527,153 +446,187 @@ mod tests {
         }
     }
 
+    /// The bug this loader was cut down for: corruption at one principal made
+    /// the loader rewrite the BASELINE pointer onto the baseline's superseded
+    /// row while the baseline's `active` status stayed where it was.
     #[test]
-    fn active_with_lkg_recovery_flips_pointer_to_lkg() {
-        let (_dir, store) = fresh_state_store();
-        let active = rev("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
-        let lkg = rev("bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
-        let store = seed_revisions(
-            store,
-            &[(&lkg, "superseded", 1_000), (&active, "active", 0)],
+    fn corruption_at_another_principal_leaves_the_baseline_untouched() {
+        let (_dir, conn) = fresh_db();
+        let b1 = rev("b1b1b1b1-0000-0000-0000-000000000001");
+        let b2 = rev("b2b2b2b2-0000-0000-0000-000000000002");
+        let x1 = rev("c1c1c1c1-0000-0000-0000-000000000003");
+        seed(
+            &conn,
+            BASELINE_PRINCIPAL,
+            &[(&b1, "superseded", 1_000), (&b2, "active", 0)],
         );
-        store.set_active_revision(&active).unwrap();
-        // An edited active row is what makes check_integrity report
-        // PolicyIntegrityFailed for the active pointer.
-        let store = tamper_row(store, &active);
+        seed(&conn, OTHER_PRINCIPAL, &[(&x1, "active", 0)]);
+        point(&conn, BASELINE_PRINCIPAL, &b2);
+        point(&conn, OTHER_PRINCIPAL, &x1);
+        tamper(&conn, &x1);
 
-        let (repo, audit, loader) = loader_for(store, RecordingAudit::default());
-        match loader.load() {
-            PolicyLoadResult::LkgFallbackApplied(summary) => {
-                assert_eq!(summary.revision_id, lkg.as_str());
-                assert_eq!(summary.provenance, "recovery-fallback");
+        let (outcome, store, audit) = load(keyed(conn), RecordingAudit::default());
+        assert!(
+            matches!(outcome, PolicyLoadResult::IntegrityFailureReported(_)),
+            "got {outcome:?}"
+        );
+        assert_eq!(outcome.to_policy_state(), ServicePolicyState::ActiveInvalid);
+        assert!(matches!(
+            audit.events.lock().unwrap().as_slice(),
+            [RecoveryAuditEvent::IntegrityFailureReported { .. }]
+        ));
+
+        let conn = into_conn(store);
+        for (principal, expected) in [(BASELINE_PRINCIPAL, &b2), (OTHER_PRINCIPAL, &x1)] {
+            assert_eq!(
+                pointer_of(&conn, principal).as_deref(),
+                Some(expected.as_str())
+            );
+            assert_eq!(
+                pointer_of(&conn, principal),
+                status_active_of(&conn, principal),
+                "pointer and status of {principal} must still agree"
+            );
+        }
+    }
+
+    /// The production shape: the boot store has no key, and the only thing it
+    /// can see is a pointer whose revision was deleted behind its back.
+    #[test]
+    fn a_keyless_store_reports_a_dangling_pointer_and_moves_nothing() {
+        let (_dir, conn) = fresh_db();
+        let b1 = rev("b1b1b1b1-0000-0000-0000-000000000001");
+        let b2 = rev("b2b2b2b2-0000-0000-0000-000000000002");
+        let x1 = rev("c1c1c1c1-0000-0000-0000-000000000003");
+        seed(
+            &conn,
+            BASELINE_PRINCIPAL,
+            &[(&b1, "superseded", 1_000), (&b2, "active", 0)],
+        );
+        seed(&conn, OTHER_PRINCIPAL, &[(&x1, "active", 0)]);
+        point(&conn, BASELINE_PRINCIPAL, &b2);
+        point(&conn, OTHER_PRINCIPAL, &x1);
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM revisions WHERE revision_id = '{}';
+             PRAGMA foreign_keys = ON;",
+            x1.as_str()
+        ))
+        .unwrap();
+
+        let (outcome, store, _) = load(SqliteStateStore::new(conn), RecordingAudit::default());
+        match &outcome {
+            PolicyLoadResult::IntegrityFailureReported(details) => {
+                assert!(details.contains("is missing"), "details = {details}");
             }
             other => panic!("unexpected: {other:?}"),
         }
-        // Active pointer was flipped to the LKG.
-        let now_active = repo.get_active_revision().unwrap().unwrap();
-        assert_eq!(now_active.as_str(), lkg.as_str());
-        // Audit emitted started + completed.
-        let events = audit.events.lock().unwrap().clone();
-        assert!(matches!(
-            events.first(),
-            Some(RecoveryAuditEvent::LkgFallbackStarted { .. })
-        ));
-        assert!(matches!(
-            events.last(),
-            Some(RecoveryAuditEvent::LkgFallbackCompleted { .. })
-        ));
+        let conn = into_conn(store);
+        assert_eq!(
+            pointer_of(&conn, BASELINE_PRINCIPAL).as_deref(),
+            Some(b2.as_str())
+        );
+        assert_eq!(
+            pointer_of(&conn, OTHER_PRINCIPAL).as_deref(),
+            Some(x1.as_str())
+        );
     }
 
     #[test]
-    fn active_corrupt_with_missing_lkg_requires_recovery() {
-        let (_dir, store) = fresh_state_store();
+    fn a_tampered_active_row_is_reported_and_its_pointer_stays() {
+        let (_dir, conn) = fresh_db();
         let active = rev("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
-        // The only revision there has ever been: nothing superseded behind it,
-        // so there is no rollback target.
-        let store = seed_revisions(store, &[(&active, "active", 0)]);
-        store.set_active_revision(&active).unwrap();
-        let store = tamper_row(store, &active);
+        let lkg = rev("bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        seed(
+            &conn,
+            BASELINE_PRINCIPAL,
+            &[(&lkg, "superseded", 1_000), (&active, "active", 0)],
+        );
+        point(&conn, BASELINE_PRINCIPAL, &active);
+        tamper(&conn, &active);
 
-        let (repo, audit, loader) = loader_for(store, RecordingAudit::default());
-        match loader.load() {
-            PolicyLoadResult::RecoveryRequired(msg) => {
-                assert!(msg.contains("no usable LKG"), "msg = {msg}");
+        let (outcome, store, _) = load(keyed(conn), RecordingAudit::default());
+        assert!(matches!(
+            outcome,
+            PolicyLoadResult::IntegrityFailureReported(_)
+        ));
+        assert!(outcome.current_revision().is_none());
+        let conn = into_conn(store);
+        assert_eq!(
+            pointer_of(&conn, BASELINE_PRINCIPAL).as_deref(),
+            Some(active.as_str())
+        );
+        assert_eq!(
+            status_active_of(&conn, BASELINE_PRINCIPAL).as_deref(),
+            Some(active.as_str())
+        );
+    }
+
+    /// A tampered rollback target is reported like any other finding: the
+    /// keyed sweep skips it when it looks for a trusted revision.
+    #[test]
+    fn a_tampered_rollback_target_is_reported_with_its_hint() {
+        let (_dir, conn) = fresh_db();
+        let active = rev("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        let lkg = rev("bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        seed(
+            &conn,
+            OTHER_PRINCIPAL,
+            &[(&lkg, "superseded", 1_000), (&active, "active", 0)],
+        );
+        point(&conn, OTHER_PRINCIPAL, &active);
+        tamper(&conn, &lkg);
+
+        match load(keyed(conn), RecordingAudit::default()).0 {
+            PolicyLoadResult::IntegrityFailureReported(details) => {
+                assert!(details.contains("fallback target"), "details = {details}");
             }
             other => panic!("unexpected: {other:?}"),
         }
-        // Active pointer is NOT silently mutated.
-        let now_active = repo.get_active_revision().unwrap().unwrap();
-        assert_eq!(now_active.as_str(), active.as_str());
-        // Audit emitted RecoveryRequired (not LkgFallbackStarted).
-        let events = audit.events.lock().unwrap().clone();
-        assert!(matches!(
-            events.first(),
-            Some(RecoveryAuditEvent::RecoveryRequired { .. })
-        ));
     }
 
     #[test]
-    fn audit_write_failure_during_fallback_blocks_pointer_mutation() {
-        let (_dir, store) = fresh_state_store();
+    fn a_failed_audit_write_does_not_turn_a_report_into_a_mutation() {
+        let (_dir, conn) = fresh_db();
         let active = rev("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
-        let lkg = rev("bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
-        let store = seed_revisions(
-            store,
-            &[(&lkg, "superseded", 1_000), (&active, "active", 0)],
-        );
-        store.set_active_revision(&active).unwrap();
-        let store = tamper_row(store, &active);
+        seed(&conn, BASELINE_PRINCIPAL, &[(&active, "active", 0)]);
+        point(&conn, BASELINE_PRINCIPAL, &active);
+        tamper(&conn, &active);
 
         let audit = RecordingAudit {
-            fail_on_started: true,
+            fail: true,
             ..Default::default()
         };
-        let (repo, _audit, loader) = loader_for(store, audit);
-        match loader.load() {
-            PolicyLoadResult::RecoveryRequired(msg) => {
-                assert!(msg.contains("audit write failed"), "msg = {msg}");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        // Active pointer must remain on the broken active — we refuse to
-        // touch it without a durable audit event.
-        let now_active = repo.get_active_revision().unwrap().unwrap();
-        assert_eq!(now_active.as_str(), active.as_str());
-    }
-
-    #[test]
-    fn lkg_with_corrupt_hash_blocks_silent_fallback() {
-        let (_dir, store) = fresh_state_store();
-        let active = rev("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
-        let lkg = rev("bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
-        let store = seed_revisions(
-            store,
-            &[(&lkg, "superseded", 1_000), (&active, "active", 0)],
+        let (outcome, store, _) = load(keyed(conn), audit);
+        assert!(matches!(
+            outcome,
+            PolicyLoadResult::IntegrityFailureReported(_)
+        ));
+        let conn = into_conn(store);
+        assert_eq!(
+            pointer_of(&conn, BASELINE_PRINCIPAL).as_deref(),
+            Some(active.as_str())
         );
-        store.set_active_revision(&active).unwrap();
-        // The rollback TARGET is the edited row this time: the active revision
-        // is intact, so the guard has to refuse falling back to a target it
-        // cannot vouch for rather than installing edited policy.
-        let store = tamper_row(store, &lkg);
-
-        let (repo, _audit, loader) = loader_for(store, RecordingAudit::default());
-        match loader.load() {
-            PolicyLoadResult::RecoveryRequired(msg) => {
-                assert!(msg.contains("no usable LKG"), "msg = {msg}");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-        // Active pointer is unchanged.
-        let now_active = repo.get_active_revision().unwrap().unwrap();
-        assert_eq!(now_active.as_str(), active.as_str());
     }
 
     #[test]
     fn policy_state_mapping_is_total() {
-        // Mapping covers every variant; future PolicyLoadResult variants
-        // will fail to compile here unless added to to_policy_state.
+        let ready = ActiveRevisionState {
+            revision_id: "rev-x".into(),
+            provenance: "active".into(),
+            rule_count: 0,
+            behavior_mode: "auto".into(),
+            content_hash_hex: "deadbeef".into(),
+            activated_at_iso: "t".into(),
+        };
         let cases = [
             (
-                PolicyLoadResult::ActiveLoaded(ActiveRevisionState {
-                    revision_id: "rev-x".into(),
-                    provenance: "active".into(),
-                    rule_count: 0,
-                    behavior_mode: "auto".into(),
-                    content_hash_hex: "deadbeef".into(),
-                    activated_at_iso: "t".into(),
-                }),
+                PolicyLoadResult::ActiveLoaded(ready),
                 ServicePolicyState::ActiveReady,
             ),
             (
-                PolicyLoadResult::LkgFallbackApplied(ActiveRevisionState {
-                    revision_id: "rev-y".into(),
-                    provenance: "recovery-fallback".into(),
-                    rule_count: 0,
-                    behavior_mode: "auto".into(),
-                    content_hash_hex: "deadbeef".into(),
-                    activated_at_iso: "t".into(),
-                }),
-                ServicePolicyState::LkgReady,
+                PolicyLoadResult::IntegrityFailureReported("x".into()),
+                ServicePolicyState::ActiveInvalid,
             ),
             (
                 PolicyLoadResult::NoActiveRevision,

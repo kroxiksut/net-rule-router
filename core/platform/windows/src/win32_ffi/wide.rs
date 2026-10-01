@@ -114,9 +114,9 @@ mod tests {
 
     #[test]
     fn pwstr_ascii_roundtrip() {
-        let buf = null_terminate_u16("Intel(R) Wi-Fi 6 AX201");
+        let buf = null_terminate_u16("Wi-Fi 6 Adapter");
         let s = unsafe { pwstr_lossy(buf.as_ptr()) };
-        assert_eq!(s, "Intel(R) Wi-Fi 6 AX201");
+        assert_eq!(s, "Wi-Fi 6 Adapter");
     }
 
     #[test]

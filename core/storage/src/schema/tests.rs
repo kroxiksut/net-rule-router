@@ -236,7 +236,7 @@ fn cache_db_resolution_unique_constraint() {
     .expect("hostname");
     conn.execute(
             "INSERT INTO ip_addresses (address_family, canonical_ip, ipv4_packed, first_seen_at, last_seen_at)
-             VALUES ('ipv4', '1.2.3.4', 16909060, 0, 0)",
+             VALUES ('ipv4', '192.0.2.4', 3221225988, 0, 0)",
             [],
         )
         .expect("ip");

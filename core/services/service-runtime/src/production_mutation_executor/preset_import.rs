@@ -29,12 +29,13 @@ impl ProductionMutationExecutor {
     ) -> ReviewSummaryResponse {
         let assembled = match self.assemble_preset_import(payload, principal) {
             Ok(a) => a,
-            Err(e) => return preset_failure_summary(&e),
+            Err(e) => return refused_summary(&e),
         };
-        if let Err(e) = Self::enforce_free_rule_cap(&assembled.rules_json)
-            .and_then(|()| Self::enforce_submission_gates(&assembled.rules_json))
-        {
-            return malformed_summary(&e.message);
+        if let Err(e) = self.enforce_free_rule_cap(&assembled.rules_json, principal) {
+            return refused_summary(&e);
+        }
+        if let Some(refusal) = self.submission_gate_refusal(&assembled.rules_json, principal) {
+            return refusal;
         }
         let scored = self.score_candidate_for_payload(&assembled.rules_json, principal);
         // Planned from the assembled rules, not from a stored candidate — see
@@ -58,7 +59,7 @@ impl ProductionMutationExecutor {
             Ok(a) => a,
             Err(e) => return MutationOutcome::Failed(e),
         };
-        if let Err(e) = Self::enforce_free_rule_cap(&assembled.rules_json) {
+        if let Err(e) = self.enforce_free_rule_cap(&assembled.rules_json, principal) {
             return MutationOutcome::Failed(e);
         }
         let correlation = assembled
@@ -108,7 +109,7 @@ impl ProductionMutationExecutor {
                     target: "nrr::mutation::preset",
                     msg_key = "prod-preset-activate-failed",
                     revision_id = %revision_id,
-                    error = ?e,
+                    error = %e,
                     "preset activate FAILED"
                 );
                 policy_error_outcome(&e)

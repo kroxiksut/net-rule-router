@@ -67,8 +67,6 @@ pub struct DiagnosticsStatusDto {
     pub cache_health: CacheHealthCard,
     /// Log storage health card.
     pub log_health: LogHealthCard,
-    /// Current diagnostic mode state.
-    pub diagnostic_mode: DiagnosticModeStateDto,
     /// Whether this snapshot may be stale (service unreachable).
     pub stale: bool,
     /// Provenance of the snapshot. Older services do not send it; their
@@ -96,6 +94,7 @@ impl DiagnosticsStatusDto {
                 audit_chain_ok: false,
                 active_alert_count: 0,
                 audit_write_healthy: false,
+                alerts_readable: false,
             },
             active_alerts: Vec::new(),
             cache_health: CacheHealthCard {
@@ -110,7 +109,6 @@ impl DiagnosticsStatusDto {
                 dropped_count: 0,
                 last_cleanup_at: None,
             },
-            diagnostic_mode: DiagnosticModeStateDto::inactive(),
             stale: true,
             origin: DiagnosticsDataOrigin::Unavailable,
         }
@@ -156,6 +154,11 @@ pub struct SecurityStatusCard {
     pub active_alert_count: u32,
     /// Whether the audit NDJSON writer is healthy.
     pub audit_write_healthy: bool,
+    /// Whether the alert store answered. `false` means `active_alert_count`
+    /// and the status's `active_alerts` say nothing, not that there are none;
+    /// an answer without the field claims no read either.
+    #[serde(default)]
+    pub alerts_readable: bool,
 }
 
 /// Cache health card.
@@ -197,31 +200,12 @@ pub struct LogHealthCard {
     pub last_cleanup_at: Option<i64>,
 }
 
-/// Current diagnostic mode state.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DiagnosticModeStateDto {
-    /// Whether diagnostic mode is currently active.
-    pub active: bool,
-    /// UTC ms when the session expires (if active).
-    pub expires_at: Option<i64>,
-    /// Remaining milliseconds until session expiry.
-    pub remaining_ms: Option<i64>,
-    /// Scope label of the active session.
-    pub scope_key: Option<String>,
-}
-
-impl DiagnosticModeStateDto {
-    pub fn inactive() -> Self {
-        Self {
-            active: false,
-            expires_at: None,
-            remaining_ms: None,
-            scope_key: None,
-        }
-    }
-}
-
 // ── SecurityAlertDto ──────────────────────────────────────────────────────────
+
+/// Id of the entry standing in for alerts about other principals' rules. Never
+/// stored; acknowledging it is refused, since only an administrator, who sees
+/// the alerts themselves, can clear them — so the GUI offers no button for it.
+pub const OTHER_PRINCIPAL_ALERT_ID: &str = "alt-other-principal";
 
 /// A security alert entry for the GUI alert list.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -334,15 +318,18 @@ pub struct AuditEntryDto {
 // ── Filter types ──────────────────────────────────────────────────────────────
 
 /// Filter for `ListLogEntries` queries.
+///
+/// A level or category the service does not know matches nothing: a filter
+/// must never widen to the whole log because it was misspelt.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LogEntryFilter {
     pub from_ms: Option<i64>,
     pub to_ms: Option<i64>,
-    /// Minimum level (inclusive): `"info"`, `"warn"`, `"error"`.
+    /// Minimum level (inclusive): `"trace"` .. `"error"`.
     pub level_min: Option<String>,
-    /// Category filter: `"service"`, `"decision"`, etc.
+    /// Exact category: `"service"`, `"decision"`, etc.
     pub category: Option<String>,
-    /// Exact kind match.
+    /// Case-insensitive substring of the kind.
     pub kind: Option<String>,
     /// Decision id to correlate by.
     pub decision_id: Option<String>,
@@ -405,23 +392,6 @@ impl DiagnosticsAudience {
 pub struct AcknowledgeAlertRequest {
     pub alert_id: String,
     pub reason: Option<String>,
-}
-
-/// Request to set or clear diagnostic mode.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SetDiagnosticModeRequest {
-    pub enabled: bool,
-    /// Duration in milliseconds (clamped to the engine-side
-    /// `DiagnosticSession::MAX_DURATION_MS`). Ignored when `enabled = false`
-    /// or when `until_restart = true`.
-    pub duration_ms: Option<i64>,
-    /// Scope label: `"all"`, `"decision_and_cache"`, `"process_and_adapter"`.
-    pub scope: Option<String>,
-    /// When `true`, the session has no expiry and stays active until the
-    /// service restarts (the "until restart" TTL radio). Overrides
-    /// `duration_ms`. Ignored when `enabled = false`.
-    #[serde(default)]
-    pub until_restart: bool,
 }
 
 /// Request to clear operational logs.
@@ -494,6 +464,7 @@ mod tests {
                 audit_chain_ok: true,
                 active_alert_count: 0,
                 audit_write_healthy: true,
+                alerts_readable: true,
             },
             active_alerts: Vec::new(),
             cache_health: CacheHealthCard {
@@ -508,7 +479,6 @@ mod tests {
                 dropped_count: 0,
                 last_cleanup_at: None,
             },
-            diagnostic_mode: DiagnosticModeStateDto::inactive(),
             stale: false,
             origin: DiagnosticsDataOrigin::Service,
         };

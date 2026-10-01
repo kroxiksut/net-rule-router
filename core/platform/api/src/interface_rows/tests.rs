@@ -67,13 +67,13 @@ fn a_gateway_less_tunnel_forwards_through_its_split_default_routes() {
     // see this as usable, not as "nowhere to forward to" — the whole reason
     // this signal exists instead of reading `has_default_route`.
     let routes = vec![
-        route([0, 0, 0, 0], 1, [10, 91, 192, 1], 23, 1),
-        route([128, 0, 0, 0], 1, [10, 91, 192, 1], 23, 1),
-        route([10, 91, 193, 99], 32, [0, 0, 0, 0], 23, 256), // on-link, ignored
+        route([0, 0, 0, 0], 1, [10, 7, 192, 1], 23, 1),
+        route([128, 0, 0, 0], 1, [10, 7, 192, 1], 23, 1),
+        route([10, 7, 193, 99], 32, [0, 0, 0, 0], 23, 256), // on-link, ignored
     ];
     assert_eq!(
         derive_forwarding_next_hop(&routes, 23),
-        Some(Ipv4Addr::new(10, 91, 192, 1))
+        Some(Ipv4Addr::new(10, 7, 192, 1))
     );
 }
 
@@ -120,10 +120,10 @@ fn a_loopback_next_hop_or_a_narrow_on_link_route_never_counts_as_a_way_out() {
 
 #[test]
 fn a_peerless_tunnel_covering_the_internet_on_link_forwards_through_the_interface() {
-    // swiftvpn over WireGuard (Wintun), 10.88.0.191/32, ifindex 66: no
+    // A WireGuard client (Wintun), 10.8.0.191/32, ifindex 66: no
     // gateway, no /0, no /1 halves — the client covers the internet with a
-    // redirect SET of on-link prefixes, and traffic flows fine (170 MiB in
-    // one session). The old rule saw "only on-link routes" and failed
+    // redirect SET of on-link prefixes, and traffic flows fine. The
+    // old rule saw "only on-link routes" and failed
     // closed on a working tunnel.
     let routes = vec![
         route([0, 0, 0, 0], 5, [0, 0, 0, 0], 66, 0),
@@ -136,7 +136,7 @@ fn a_peerless_tunnel_covering_the_internet_on_link_forwards_through_the_interfac
         route([128, 0, 0, 0], 2, [0, 0, 0, 0], 66, 0),
         route([192, 0, 0, 0], 9, [0, 0, 0, 0], 66, 0),
         route([224, 0, 0, 0], 3, [0, 0, 0, 0], 66, 0), // multicast, ignored
-        route([10, 88, 0, 191], 32, [0, 0, 0, 0], 66, 256), // own address
+        route([10, 8, 0, 191], 32, [0, 0, 0, 0], 66, 256), // own address
         route([0, 0, 0, 0], 0, [192, 168, 0, 1], 19, 10), // primary NIC
     ];
     assert_eq!(
@@ -153,31 +153,31 @@ fn a_peerless_tunnel_covering_the_internet_on_link_forwards_through_the_interfac
     // A split-tunnel WireGuard profile routing ONE corporate /16 is not a
     // way out for the rest of the internet.
     let split = vec![
-        route([10, 200, 0, 0], 16, [0, 0, 0, 0], 66, 0),
-        route([10, 88, 0, 191], 32, [0, 0, 0, 0], 66, 256),
+        route([10, 30, 0, 0], 16, [0, 0, 0, 0], 66, 0),
+        route([10, 8, 0, 191], 32, [0, 0, 0, 0], 66, 256),
     ];
     assert_eq!(derive_forwarding_next_hop(&split, 66), None);
     // A real peer, when there is one, still wins over on-link coverage.
     let mixed = vec![
         route([0, 0, 0, 0], 0, [0, 0, 0, 0], 66, 0),
-        route([0, 0, 0, 0], 1, [10, 88, 0, 1], 66, 1),
+        route([0, 0, 0, 0], 1, [10, 8, 0, 1], 66, 1),
     ];
     assert_eq!(
         derive_forwarding_next_hop(&mixed, 66),
-        Some(Ipv4Addr::new(10, 88, 0, 1))
+        Some(Ipv4Addr::new(10, 8, 0, 1))
     );
 }
 
 #[test]
 fn a_tunnel_with_only_on_link_routes_derives_nothing_yet() {
-    // swiftvpn OpenVPN, 10.88.1.41/24, ifindex 60: the
+    // an OpenVPN client, 10.8.1.41/24, ifindex 60: the
     // adapter is Up with IPv4 but the client has not yet installed any
     // gateway route — the table holds only on-link entries. There is
     // genuinely nothing to derive; the state resolves itself seconds
     // later when the client installs its split-default catch-alls.
     let routes = vec![
-        route([10, 88, 1, 0], 24, [0, 0, 0, 0], 60, 256),
-        route([10, 88, 1, 41], 32, [0, 0, 0, 0], 60, 256),
+        route([10, 8, 1, 0], 24, [0, 0, 0, 0], 60, 256),
+        route([10, 8, 1, 41], 32, [0, 0, 0, 0], 60, 256),
         route([0, 0, 0, 0], 0, [192, 168, 0, 1], 16, 25), // primary NIC
     ];
     assert_eq!(derive_forwarding_next_hop(&routes, 60), None);
@@ -188,16 +188,16 @@ fn a_gateway_style_host_route_recovers_the_peer_when_catch_alls_are_absent() {
     // Same tunnel after the routing layer stripped the VPN's catch-alls
     // and (say) a service restart lost the in-memory next-hop cache: the
     // /32 overlays installed earlier still name the tunnel peer, so the
-    // last-resort rank recovers 10.88.0.1 from them.
+    // last-resort rank recovers 10.8.0.1 from them.
     let routes = vec![
-        route([10, 88, 1, 0], 24, [0, 0, 0, 0], 60, 256), // on-link, ignored
-        route([23, 10, 20, 78], 32, [10, 88, 0, 1], 60, 5),
-        route([23, 10, 20, 128], 32, [10, 88, 0, 1], 60, 5),
+        route([10, 8, 1, 0], 24, [0, 0, 0, 0], 60, 256), // on-link, ignored
+        route([198, 51, 100, 78], 32, [10, 8, 0, 1], 60, 5),
+        route([198, 51, 100, 128], 32, [10, 8, 0, 1], 60, 5),
         route([0, 0, 0, 0], 0, [192, 168, 0, 1], 16, 25), // primary NIC
     ];
     assert_eq!(
         derive_forwarding_next_hop(&routes, 60),
-        Some(Ipv4Addr::new(10, 88, 0, 1))
+        Some(Ipv4Addr::new(10, 8, 0, 1))
     );
 }
 
@@ -206,13 +206,13 @@ fn catch_all_routes_outrank_the_last_resort_host_routes() {
     // A live split-default names the CURRENT peer; stale host routes from
     // a previous session must never outvote it, whatever their metric.
     let routes = vec![
-        route([23, 10, 20, 78], 32, [10, 88, 0, 1], 60, 1), // stale peer
-        route([0, 0, 0, 0], 1, [10, 89, 0, 1], 60, 30),     // current peer
-        route([128, 0, 0, 0], 1, [10, 89, 0, 1], 60, 30),
+        route([198, 51, 100, 78], 32, [10, 8, 0, 1], 60, 1), // stale peer
+        route([0, 0, 0, 0], 1, [10, 9, 0, 1], 60, 30),       // current peer
+        route([128, 0, 0, 0], 1, [10, 9, 0, 1], 60, 30),
     ];
     assert_eq!(
         derive_forwarding_next_hop(&routes, 60),
-        Some(Ipv4Addr::new(10, 89, 0, 1))
+        Some(Ipv4Addr::new(10, 9, 0, 1))
     );
 }
 
@@ -239,10 +239,7 @@ fn data_source_round_trips_and_unknown_reads_as_placeholder() {
 fn fallback_rows_are_deterministic_and_enriched() {
     let rows = fallback_rows();
     assert_eq!(rows.len(), 4);
-    let vpn = rows
-        .iter()
-        .find(|r| r.windows_name == "VPN")
-        .expect("vpn row");
+    let vpn = rows.iter().find(|r| r.name == "VPN").expect("vpn row");
     assert_eq!(
         vpn.derived_assessment.vpn_tunnel_likelihood,
         DerivedLikelihood::Likely
@@ -337,7 +334,7 @@ fn probe_outcomes_fold_into_honest_observed_facts() {
 fn a_resolved_row_survives_the_wire_round_trip() {
     let mut row = fallback_rows()
         .into_iter()
-        .find(|r| r.windows_name == "Wi-Fi")
+        .find(|r| r.name == "Wi-Fi")
         .expect("wifi row");
     apply_external_probe(
         &mut row.observed_facts,
@@ -367,10 +364,10 @@ fn dto_projection_matches_cold_start_slug_shape() {
     let rows = fallback_rows();
     let ethernet = rows
         .iter()
-        .find(|r| r.windows_name == "Ethernet")
+        .find(|r| r.name == "Ethernet")
         .expect("ethernet row");
     let dto = nrr_shared::ipc_payloads::InterfaceRowDto::from(ethernet);
-    assert_eq!(dto.windows_name, "Ethernet");
+    assert_eq!(dto.name, "Ethernet");
     assert_eq!(dto.availability, "available");
     assert_eq!(dto.route_state, "not-selected");
     assert_eq!(dto.selected_role, None);
@@ -379,7 +376,7 @@ fn dto_projection_matches_cold_start_slug_shape() {
     assert_eq!(dto.derived_assessment.classification, "regular-interface");
     // kebab-case wire round-trip preserves the nested shape.
     let json = serde_json::to_value(&dto).expect("serialize");
-    assert_eq!(json["windows-name"], "Ethernet");
+    assert_eq!(json["name"], "Ethernet");
     assert_eq!(json["has-default-route"], true);
     assert_eq!(json["observed-facts"]["external-ip-status"], "not-checked");
     assert_eq!(
@@ -391,16 +388,13 @@ fn dto_projection_matches_cold_start_slug_shape() {
 #[test]
 fn wire_dto_round_trip_preserves_display_and_scoring_fields() {
     let rows = fallback_rows();
-    let vpn = rows
-        .iter()
-        .find(|r| r.windows_name == "VPN")
-        .expect("vpn row");
+    let vpn = rows.iter().find(|r| r.name == "VPN").expect("vpn row");
     let dto = nrr_shared::ipc_payloads::InterfaceRowDto::from(vpn);
     let back = InterfaceRouteRow::from_wire_dto(&dto);
 
     // Identity + display fields survive the slug round-trip.
     assert_eq!(back.persistent_id, vpn.persistent_id);
-    assert_eq!(back.windows_name, "VPN");
+    assert_eq!(back.name, "VPN");
     assert_eq!(back.interface_type, vpn.interface_type);
     assert_eq!(back.dns_servers, vpn.dns_servers);
     assert_eq!(back.is_bluetooth_like, vpn.is_bluetooth_like);

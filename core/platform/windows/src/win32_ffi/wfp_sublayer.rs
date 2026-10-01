@@ -6,10 +6,9 @@
 //!
 //! [`ensure_sublayer`] is idempotent: `FWP_E_ALREADY_EXISTS` (`0x8032_0009`,
 //! from the [`win32_codes`](nrr_platform_api::error::win32_codes) SSOT table)
-//! is mapped to success so the apply path can call it once per filter
-//! batch without first probing for existence. Production callers
-//! invoke it inside the same WFP transaction as the subsequent
-//! `FwpmFilterAdd0` calls.
+//! is mapped to success, so no existence probe is needed. The filter path goes
+//! through [`ensure_sublayer_once`], which pays the RPC once per transaction
+//! rather than once per filter.
 //!
 //! ⚠ Never re-declare Win32 error codes locally — a plausible NAME on the
 //! wrong NUMBER (e.g. `FWP_E_ALREADY_EXISTS` misdeclared as
@@ -30,6 +29,7 @@
 #![allow(unsafe_code)]
 
 use std::mem::MaybeUninit;
+use std::sync::Mutex;
 
 use windows::core::{GUID, PWSTR};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
@@ -139,6 +139,63 @@ pub fn ensure_sublayer(token: &WfpEngineToken) -> Result<(), PlatformError> {
     })
 }
 
+/// Engine handles whose open transaction has already ensured the sub-layer.
+///
+/// `FwpmSubLayerAdd0` is an RPC taken under BFE's global lock; asked once per
+/// filter it lengthens every batch by hundreds of round trips. The mark lives
+/// only until the transaction ends or the engine closes: an aborted transaction
+/// takes a sub-layer it created with it, and a new session must not trust an
+/// old one's answer.
+static ENSURED: EnsuredHandles = EnsuredHandles::new();
+
+struct EnsuredHandles(Mutex<Vec<u64>>);
+
+impl EnsuredHandles {
+    const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    fn handles(&self) -> std::sync::MutexGuard<'_, Vec<u64>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Runs `add` unless `handle` is already marked; marks it only on success.
+    /// The lock is not held across `add`, which is an RPC.
+    fn ensure_once(
+        &self,
+        handle: u64,
+        add: impl FnOnce() -> Result<(), PlatformError>,
+    ) -> Result<(), PlatformError> {
+        if self.handles().contains(&handle) {
+            return Ok(());
+        }
+        add()?;
+        let mut handles = self.handles();
+        if !handles.contains(&handle) {
+            handles.push(handle);
+        }
+        Ok(())
+    }
+
+    fn forget(&self, handle: u64) {
+        self.handles().retain(|marked| *marked != handle);
+    }
+}
+
+/// [`ensure_sublayer`], at most once per transaction on this engine handle.
+pub fn ensure_sublayer_once(token: &WfpEngineToken) -> Result<(), PlatformError> {
+    ENSURED.ensure_once(token.raw, || ensure_sublayer(token))
+}
+
+/// Drops the mark for `token`. Called when a transaction begins or aborts and
+/// when an engine handle is opened or closed, so a mark never outlives the
+/// transaction it was earned in.
+pub fn forget_ensured_sublayer(token: &WfpEngineToken) {
+    ENSURED.forget(token.raw);
+}
+
 /// Remove our sub-layer.
 ///
 /// The counterpart to [`ensure_sublayer`], for the one moment it is wanted:
@@ -149,6 +206,7 @@ pub fn ensure_sublayer(token: &WfpEngineToken) -> Result<(), PlatformError> {
 /// Idempotent: `FWP_E_SUBLAYER_NOT_FOUND` is success. Fails while any filter
 /// still references the sub-layer, so the filter sweep has to run first.
 pub fn delete_sublayer(token: &WfpEngineToken) -> Result<(), PlatformError> {
+    forget_ensured_sublayer(token);
     let handle = token_to_handle(token);
     // SAFETY: `handle` is valid for the lifetime of `token`; `NRR_SUBLAYER_GUID`
     // is a `'static` constant, so the pointer outlives the call.
@@ -194,6 +252,58 @@ mod tests {
         assert_eq!(g.data2.to_be_bytes(), [packed[4], packed[5]]);
         assert_eq!(g.data3.to_be_bytes(), [packed[6], packed[7]]);
         assert_eq!(g.data4, packed[8..16]);
+    }
+
+    fn counting_add(
+        calls: &std::cell::Cell<u32>,
+    ) -> impl FnOnce() -> Result<(), PlatformError> + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_batch_asks_for_the_sublayer_once() {
+        let marks = EnsuredHandles::new();
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..500 {
+            marks.ensure_once(7, counting_add(&calls)).expect("ensure");
+        }
+        assert_eq!(calls.get(), 1);
+        // Another engine handle is another session and asks for itself.
+        marks.ensure_once(8, counting_add(&calls)).expect("ensure");
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// An aborted transaction removes a sub-layer it created, and a sub-layer
+    /// deleted between sessions is gone for the next one: after either, the
+    /// next filter must ask again.
+    #[test]
+    fn a_forgotten_mark_asks_again() {
+        let marks = EnsuredHandles::new();
+        let calls = std::cell::Cell::new(0);
+        marks.ensure_once(7, counting_add(&calls)).expect("ensure");
+        marks.forget(7);
+        marks.ensure_once(7, counting_add(&calls)).expect("ensure");
+        marks.ensure_once(7, counting_add(&calls)).expect("ensure");
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_registration_is_not_remembered() {
+        let marks = EnsuredHandles::new();
+        let failed = marks.ensure_once(7, || {
+            Err(PlatformError::Win32 {
+                operation: ADD_OP,
+                code: 5,
+                message: "denied".into(),
+            })
+        });
+        assert!(failed.is_err());
+        let calls = std::cell::Cell::new(0);
+        marks.ensure_once(7, counting_add(&calls)).expect("ensure");
+        assert_eq!(calls.get(), 1);
     }
 
     /// Smoke test: idempotent add-or-already-exists on a real Windows

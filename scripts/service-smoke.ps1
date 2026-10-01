@@ -13,6 +13,10 @@
 #
 # Out of scope here: bootstrap pipeline, policy load, IPC server, apply
 # attempts, Event Log writes.
+#
+# From a package it smokes the nrr-service.exe beside scripts\; from a checkout,
+# the build under the Cargo target directory (built first when missing).
+# Needs lib\service-paths.ps1 beside it.
 
 [CmdletBinding()]
 param(
@@ -27,22 +31,29 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'lib\service-paths.ps1')
+
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
 try {
-    $exeName = 'nrr-service.exe'
-    $profileDir = if ($Profile -eq 'release') { 'release' } else { 'debug' }
-    $exePath = Join-Path $root "target\$profileDir\$exeName"
-
-    if (-not (Test-Path $exePath)) {
-        Write-Host "Building $exeName ($Profile profile)..." -ForegroundColor Cyan
-        if ($Profile -eq 'release') {
-            cargo build --release -p nrr-windows-service | Out-Null
-        }
-        else {
-            cargo build -p nrr-windows-service | Out-Null
+    $exeName = $NrrServiceExeName
+    $isCheckout = Test-Path (Join-Path $root 'Cargo.toml')
+    if ($isCheckout) {
+        $profileDir = if ($Profile -eq 'release') { 'release' } else { 'debug' }
+        $exePath = Join-Path (Resolve-TargetRoot $root) "$profileDir\$exeName"
+        if (-not (Test-Path $exePath)) {
+            Write-Host "Building $exeName ($Profile profile)..." -ForegroundColor Cyan
+            $cargoArgs = @('build', '-p', 'nrr-windows-service')
+            if ($Profile -eq 'release') { $cargoArgs += '--release' }
+            $buildExit = Invoke-NativeCommand -FilePath 'cargo' -ArgumentList $cargoArgs
+            if ($buildExit -ne 0) { throw "cargo build returned $buildExit" }
         }
     }
+    else {
+        $exePath = Join-Path $root $exeName
+    }
+    if (-not (Test-Path $exePath)) { throw "$exeName not found at $exePath" }
+    Write-Host "Using $exePath" -ForegroundColor DarkGray
 
     Write-Host "==> status subcommand (no SCM)" -ForegroundColor Cyan
     & $exePath status
@@ -66,29 +77,29 @@ try {
     & $exePath install
     if ($LASTEXITCODE -ne 0) { throw "install returned $LASTEXITCODE" }
 
-    Write-Host "==> sc query NetRuleRouter (post-install)" -ForegroundColor Cyan
-    sc.exe query NetRuleRouter
+    Write-Host "==> sc query $NrrServiceName (post-install)" -ForegroundColor Cyan
+    sc.exe query $NrrServiceName
 
-    Write-Host "==> sc start NetRuleRouter" -ForegroundColor Cyan
-    sc.exe start NetRuleRouter
+    Write-Host "==> sc start $NrrServiceName" -ForegroundColor Cyan
+    sc.exe start $NrrServiceName
     Start-Sleep -Seconds 2
 
-    Write-Host "==> sc query NetRuleRouter (post-start)" -ForegroundColor Cyan
-    sc.exe query NetRuleRouter
+    Write-Host "==> sc query $NrrServiceName (post-start)" -ForegroundColor Cyan
+    sc.exe query $NrrServiceName
 
-    Write-Host "==> sc stop NetRuleRouter" -ForegroundColor Cyan
-    sc.exe stop NetRuleRouter
+    Write-Host "==> sc stop $NrrServiceName" -ForegroundColor Cyan
+    sc.exe stop $NrrServiceName
     Start-Sleep -Seconds 2
 
-    Write-Host "==> sc query NetRuleRouter (post-stop)" -ForegroundColor Cyan
-    sc.exe query NetRuleRouter
+    Write-Host "==> sc query $NrrServiceName (post-stop)" -ForegroundColor Cyan
+    sc.exe query $NrrServiceName
 
     Write-Host "==> uninstall" -ForegroundColor Cyan
     & $exePath uninstall
     if ($LASTEXITCODE -ne 0) { throw "uninstall returned $LASTEXITCODE" }
 
-    Write-Host "==> sc query NetRuleRouter (post-uninstall, expected: not found)" -ForegroundColor Cyan
-    $null = sc.exe query NetRuleRouter 2>&1
+    Write-Host "==> sc query $NrrServiceName (post-uninstall, expected: not found)" -ForegroundColor Cyan
+    $null = sc.exe query $NrrServiceName 2>&1
     if ($LASTEXITCODE -eq 0) {
         throw "service still registered after uninstall"
     }

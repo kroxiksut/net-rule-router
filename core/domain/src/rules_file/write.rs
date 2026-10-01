@@ -71,7 +71,7 @@ pub fn write_rules_file_with_passthrough(
     // Preamble: preset header + metadata, when supplied.
     if let Some(meta) = metadata {
         out.push_str("# NetRuleRouter preset \u{2014} version ");
-        out.push_str(&CURRENT_PRESET_FORMAT_VERSION.to_string());
+        out.push_str(&CURRENT_RULES_FILE_FORMAT_VERSION.to_string());
         out.push('\n');
         for (key, value) in [
             ("name", &meta.name),

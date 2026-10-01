@@ -14,7 +14,6 @@ name = "nrr_desktop_tray"
 path = "src/lib.rs"
 
 [dependencies]
-nrr-application = { path = "../../../core/application" }
 nrr-ui-support = { path = "../../../core/ui-support" }
 nrr-shared = { path = "../../../shared/contracts" }
 # The coordination directory and the private-file creator — the same exception

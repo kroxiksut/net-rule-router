@@ -8,6 +8,15 @@ use super::*;
 
 impl AutoRulesEngine {
     pub fn candidates(&self, sid: &str) -> Vec<AutoRuleCandidateDto> {
+        self.candidates_under(sid, self.rules.active_rules_for(sid).as_ref())
+    }
+
+    /// [`Self::candidates`] against a rules snapshot the caller already holds.
+    pub(super) fn candidates_under(
+        &self,
+        sid: &str,
+        snapshot: Option<&ActiveRulesSnapshot>,
+    ) -> Vec<AutoRuleCandidateDto> {
         let refusing: Vec<String> = self
             .refusing_anchors
             .as_ref()
@@ -19,14 +28,13 @@ impl AutoRulesEngine {
         // user accepting the offer itself. `suppressed_ids` only closes the
         // same-session race — this is the check the read path was documented to
         // make and did not, which left an accepted suggestion standing forever.
-        let snapshot = self.rules.active_rules_for(sid);
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(sid)
             .map(|v| {
                 v.iter()
-                    .filter(|c| !offer_covered(snapshot.as_ref(), &c.dto))
+                    .filter(|c| !offer_covered(snapshot, &c.dto))
                     .filter_map(|c| {
                         let mut dto = c.dto.clone();
                         self.refresh_self_signed_behavior(&mut dto);
@@ -53,7 +61,8 @@ impl AutoRulesEngine {
                         // presenting it as ordinary in the other is how a host
                         // the main route already serves read as "your site
                         // needs this".
-                        dto.served_by_main_link = settled_by_the_main_link(&dto);
+                        dto.served_by_main_link =
+                            served_by_main_link(&dto, dto.anchor_refuses_main_link);
                         // Only an offer with a real anchor can answer this: a
                         // self-signed one IS its own anchor, so the comparison
                         // would say "the site's own name" about every host.
@@ -67,9 +76,8 @@ impl AutoRulesEngine {
     }
 
     /// Durable half of the read-path checks: drop offers with nothing left to
-    /// ask, so they stop being counted (the tray badge reads `pending_count`)
-    /// and do not come back after a restart. Runs on the tick, which owns a
-    /// clock.
+    /// ask, so they do not come back after a restart. Runs on the tick, which
+    /// owns a clock.
     ///
     /// Two ways an offer runs out of question: a rule now covers its address,
     /// or — for one a host made about itself — the main link started carrying
@@ -226,8 +234,8 @@ impl AutoRulesEngine {
                     msg_key = "autorules-inbox-accept-failed",
                     sid = %sid,
                     code = %e.code,
-                    "could not add the accepted addresses: {}",
-                    e.message,
+                    error = %e.message,
+                    "could not add the accepted addresses",
                 );
                 Err(e)
             }

@@ -84,24 +84,30 @@ pub(super) fn derive_app_id(
     WfpFilterId::from_raw(h)
 }
 
-/// Deterministic id for a packed-set filter. The chunk's id segment digests
-/// the membership, so a membership change mints a new id and the reconcile
-/// swaps the filter make-before-break; `weight` keeps the two halves of a
-/// pair (and different bands over one chunk) apart.
-pub(super) fn derive_set_id(
-    sid: Option<&str>,
-    layer: WfpLayerKey,
-    action: WfpAction,
-    seg: &str,
-    weight: u64,
-) -> WfpFilterId {
+/// Deterministic id for a packed-set filter. It digests every condition the
+/// filter carries: two filters differing in any one of them must not share an
+/// id, since the second add then returns `FWP_E_ALREADY_EXISTS`, which the
+/// batch counts as success while nothing enforces it. The chunk's segment
+/// digests the membership, so a membership change mints a new id and the
+/// reconcile swaps the filter.
+pub(super) fn derive_set_id(sid: Option<&str>, spec: SetFilterKey<'_>) -> WfpFilterId {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let SetFilterKey {
+        layer,
+        action,
+        seg,
+        proto,
+        egress_luid,
+        weight,
+    } = spec;
     let seed = format!(
-        "set|{}|{}|{}|{seg}|{weight}",
+        "set|{}|{}|{}|{seg}|{}|{}|{weight}",
         sid.unwrap_or(""),
         nrr_platform_api::wfp_behavioral::layer_ord(layer),
         nrr_platform_api::wfp_behavioral::action_ord(action),
+        proto.map_or_else(String::new, |p| p.to_string()),
+        egress_luid.map_or_else(String::new, |l| l.to_string()),
     );
     let mut h = FNV_OFFSET;
     for b in seed.bytes() {
@@ -109,6 +115,17 @@ pub(super) fn derive_set_id(
         h = h.wrapping_mul(FNV_PRIME);
     }
     WfpFilterId::from_raw(h)
+}
+
+/// The conditions of a packed-set filter that its id must tell apart.
+#[derive(Clone, Copy)]
+pub(super) struct SetFilterKey<'a> {
+    pub layer: WfpLayerKey,
+    pub action: WfpAction,
+    pub seg: &'a str,
+    pub proto: Option<u8>,
+    pub egress_luid: Option<u64>,
+    pub weight: u64,
 }
 
 /// Deterministic filter id (FNV-1a of the fields that make a filter unique in a

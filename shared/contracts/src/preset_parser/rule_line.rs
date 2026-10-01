@@ -2,18 +2,14 @@
 
 use super::*;
 
-/// Parse one rule line. Returns `None` when the line is blank, a free
-/// comment, or otherwise rejected by the docs/en/rules-file-format.md rules. Mirrors the
-/// QML implementation exactly so that the parser change is invisible
-/// at the rule level (passthrough is the only new behaviour).
 /// Is a `#`-prefixed line inside a rule section a DISABLED RULE, or prose?
 ///
-/// A value without whitespace is always a rule value. Whitespace is the whole
-/// ambiguity: `# this is a note about example.com` is prose, while
-/// `# Adobe Reader.exe` is a real rule — program names carry spaces. Calling
-/// the second one prose loses the rule outright, because the GUI rewrites the
-/// file from its parsed model, so a space is allowed where a program name is
-/// expected and still looks like a file name.
+/// Prose is ruled out first: a value with whitespace is a comment, with one
+/// exception — `# Adobe Reader.exe` is a real rule, because program names carry
+/// spaces, and calling it prose loses the rule outright when the GUI rewrites
+/// the file from its parsed model. The exception is a program IMAGE name, not
+/// any file name: `# see readme.txt` or `# note v1.2` reads as a file name too,
+/// and taking it for a rule writes the note back out as a rule line.
 ///
 /// One predicate for both parsers of this format, so the two cannot disagree
 /// about which lines survive a round-trip.
@@ -21,7 +17,7 @@ pub fn is_disabled_rule_value(rule_type: ParsedRuleType, value: &str) -> bool {
     if looks_like_a_rule_value(value) {
         return true;
     }
-    rule_type == ParsedRuleType::Application && has_file_extension(value)
+    rule_type == ParsedRuleType::Application && names_a_program_image(value.trim())
 }
 
 /// The half of [`is_disabled_rule_value`] that needs no rule type: a value with
@@ -66,14 +62,22 @@ pub fn neutralize_field(field: &str) -> std::borrow::Cow<'_, str> {
     )
 }
 
-pub(super) fn has_file_extension(value: &str) -> bool {
+/// Extensions a running program's image carries, lowercase. What an
+/// application rule matches is a process, so a spaced value ending in anything
+/// else — a document, a version number — is a note about one.
+const PROGRAM_IMAGE_EXTENSIONS: &[&str] = &["exe", "com", "app", "appimage"];
+
+fn names_a_program_image(value: &str) -> bool {
     value.rsplit_once('.').is_some_and(|(stem, ext)| {
         !stem.trim().is_empty()
-            && (1..=8).contains(&ext.chars().count())
-            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && PROGRAM_IMAGE_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
     })
 }
 
+/// Parse one rule line. Returns `None` when the line is blank, a free
+/// comment, or otherwise rejected by the docs/en/rules-file-format.md rules.
 pub(super) fn parse_rule_line(
     raw: &str,
     rule_type: ParsedRuleType,

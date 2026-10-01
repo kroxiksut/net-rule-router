@@ -10,7 +10,8 @@
 //! - **Dry run:** envelope class = `ReadSnapshot`. Mints a
 //!   confirmation token, returns review summary.
 //! - **Confirm:** envelope class = `SafeDisable`. Token mandatory;
-//!   router enforces it before dispatch and audit fires.
+//!   router enforces it before dispatch and audit fires. The token must
+//!   have been issued by this operation's dry-run to the same principal.
 //!
 //! The reason string is captured both in the stored mutation (used at
 //! confirm) and in the executor invocation, so the audit trail carries
@@ -19,32 +20,24 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nrr_shared::ipc::IpcOperationName;
+
 use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcOperationClass, IpcRequestContext,
     IpcRequestEnvelope,
 };
 use crate::ipc_handlers::mutation_token_store::{
-    ConsumeError, MutationTokenStore, StoredMutation, DEFAULT_MUTATION_TOKEN_TTL,
+    MutationTokenStore, StoredMutation, DEFAULT_MUTATION_TOKEN_TTL,
 };
 use crate::ipc_handlers::operation_status_store::OperationStatusStore;
 use crate::ipc_handlers::payloads::{
-    MutationKind, ProductImpactDisableConfirmResponse, ProductImpactDisableDryRunResponse,
+    ProductImpactDisableConfirmResponse, ProductImpactDisableDryRunResponse,
     ProductImpactDisableRequest, ReviewRiskLevel, ReviewSummaryResponse,
 };
 use crate::ipc_handlers::providers::{MutationExecutor, MutationOutcome};
 
-/// Marker we stash in the token store so the confirm path can recover
-/// the original `reason` after consume. We reuse `MutationKind` /
-/// `StoredMutation` rather than introducing a parallel type — the
-/// payload is JSON-shaped and `kind` is the enum tag distinguishing
-/// safe-disable from a normal rules/preset mutation.
-///
-/// Wire-level `MutationKind` does not currently carry a `SafeDisable`
-/// variant — adding one to a serde-derived enum that is in the public
-/// wire schema is a contract change. We sidestep this by
-/// stashing the `reason` directly in the JSON payload under a private
-/// key; the confirm path reads it back to invoke
-/// [`MutationExecutor::safe_disable`].
+/// Where the reviewed `reason` waits for the confirm, which refuses a
+/// different one.
 const SAFE_DISABLE_REASON_KEY: &str = "_nrr_safe_disable_reason";
 
 pub struct ProductImpactDisableTemporaryHandler {
@@ -79,7 +72,7 @@ impl IpcHandler for ProductImpactDisableTemporaryHandler {
             })?;
 
         if body.dry_run {
-            self.handle_dry_run(request, body)
+            self.handle_dry_run(request, body, ctx)
         } else {
             self.handle_confirm(request, body, ctx)
         }
@@ -91,6 +84,7 @@ impl ProductImpactDisableTemporaryHandler {
         &self,
         request: &IpcRequestEnvelope,
         body: ProductImpactDisableRequest,
+        ctx: &IpcRequestContext,
     ) -> HandlerOutcome {
         if request.operation_class != IpcOperationClass::ReadSnapshot {
             return Err(IpcError {
@@ -120,27 +114,17 @@ impl ProductImpactDisableTemporaryHandler {
             cross_set_duplicates: Vec::new(),
         };
 
-        let stored_payload = serde_json::json!({
-            SAFE_DISABLE_REASON_KEY: body.reason,
-        });
-        let stored = StoredMutation {
-            // Reuse `RulesUpdate` as a placeholder kind — the confirm
-            // path keys off `_nrr_safe_disable_reason` to recognise
-            // safe-disable, not off `kind`. This keeps the wire-level
-            // `MutationKind` enum stable.
-            kind: MutationKind::RulesUpdate,
-            payload: stored_payload,
-            correlation_id: None,
-            // Safe-disable is its own elevated `SafeDisable`-class flow;
-            // it does not key off the per-principal issuer binding.
-            issuer_sid: String::new(),
-            // The `SafeDisable` class is elevation-gated by the router, and
-            // the confirm path calls `safe_disable`, never `execute` — the
-            // flag is carried for completeness, not consulted here.
-            caller_is_elevated: true,
-        };
+        let stored = StoredMutation::confirmation_of(
+            serde_json::json!({ SAFE_DISABLE_REASON_KEY: body.reason }),
+            ctx.caller_stored(),
+            ctx.caller_is_elevated,
+        );
         let now = Instant::now();
-        let token = self.token_store.issue(stored, now + self.token_ttl);
+        let token = self.token_store.issue(
+            IpcOperationName::ProductImpactDisableTemporary,
+            stored,
+            now + self.token_ttl,
+        );
 
         let resp = ProductImpactDisableDryRunResponse {
             review_risk_level: summary.risk_level,
@@ -184,18 +168,15 @@ impl ProductImpactDisableTemporaryHandler {
             })?;
 
         let now = Instant::now();
-        let stored = self.token_store.consume(token, now).map_err(|e| match e {
-            ConsumeError::NotFound => IpcError {
-                code: IpcErrorCode::PreconditionFailed,
-                message: "confirmation token unknown — re-run dry-run".into(),
-                diagnostics_id: None,
-            },
-            ConsumeError::Expired => IpcError {
-                code: IpcErrorCode::PreconditionFailed,
-                message: "confirmation token expired — re-run dry-run".into(),
-                diagnostics_id: None,
-            },
-        })?;
+        let stored = self
+            .token_store
+            .consume_for(
+                token,
+                IpcOperationName::ProductImpactDisableTemporary,
+                ctx.caller_stored(),
+                now,
+            )
+            .map_err(IpcError::from)?;
 
         let stored_reason = stored
             .payload
@@ -399,8 +380,62 @@ mod tests {
         assert_eq!(err.code, IpcErrorCode::MalformedRequest);
     }
 
+    fn ctx_sid(sid: &str) -> IpcRequestContext {
+        IpcRequestContext {
+            caller_principal: crate::UserPrincipal::from_windows_sid(sid).ok(),
+            ..ctx()
+        }
+    }
+
+    /// The token is the reviewing principal's; another one cannot spend it.
     #[test]
-    fn confirm_unknown_token_returns_precondition_failed() {
+    fn confirm_refuses_a_token_issued_to_another_principal() {
+        let (h, _tokens, _ops, exec) = make_handler();
+        let body = serde_json::json!({ "reason": "r", "dry-run": true });
+        let dry: ProductImpactDisableDryRunResponse = serde_json::from_value(
+            h.handle(&dry_run_envelope(body), &ctx_sid("S-1-5-21-A"))
+                .unwrap(),
+        )
+        .unwrap();
+        let confirm = serde_json::json!({ "reason": "r", "dry-run": false });
+        let err = h
+            .handle(
+                &confirm_envelope(confirm.clone(), &dry.confirmation_token),
+                &ctx_sid("S-1-5-21-B"),
+            )
+            .expect_err("a foreign principal must be refused");
+        assert_eq!(err.code, IpcErrorCode::ConfirmationUnknown);
+        assert_eq!(exec.safe_disable_count(), 0);
+    }
+
+    /// A token another operation minted in the shared store is not one.
+    #[test]
+    fn confirm_refuses_a_token_of_another_operation() {
+        let (h, tokens, _ops, exec) = make_handler();
+        let foreign = tokens.issue(
+            IpcOperationName::RollbackRequest,
+            StoredMutation::confirmation_of(
+                serde_json::json!({ SAFE_DISABLE_REASON_KEY: "r" }),
+                "",
+                true,
+            ),
+            Instant::now() + DEFAULT_MUTATION_TOKEN_TTL,
+        );
+        let err = h
+            .handle(
+                &confirm_envelope(
+                    serde_json::json!({ "reason": "r", "dry-run": false }),
+                    &foreign,
+                ),
+                &ctx(),
+            )
+            .expect_err("a rollback token must not disable protection");
+        assert_eq!(err.code, IpcErrorCode::ConfirmationUnknown);
+        assert_eq!(exec.safe_disable_count(), 0);
+    }
+
+    #[test]
+    fn confirm_unknown_token_returns_confirmation_unknown() {
         let (h, _tokens, _ops, _exec) = make_handler();
         let err = h
             .handle(
@@ -411,6 +446,6 @@ mod tests {
                 &ctx(),
             )
             .expect_err("must reject");
-        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+        assert_eq!(err.code, IpcErrorCode::ConfirmationUnknown);
     }
 }

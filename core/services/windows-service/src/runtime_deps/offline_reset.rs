@@ -1,8 +1,8 @@
 //! What `cleanup` does on a machine whose service is not running.
 //!
 //! The boot wiring next door builds a service; this builds nothing and only
-//! takes away — filters, routes, the NRPT redirect, the machine-wide engine
-//! options. It is the path a user reaches after a hard kill or a crash, so
+//! takes away — filters, routes, the NRPT redirect, the DNS suffix list, the
+//! machine-wide engine options. It is the path a user reaches after a hard kill or a crash, so
 //! every step is best-effort and says what it could not do rather than
 //! stopping at the first refusal.
 
@@ -61,7 +61,8 @@ fn strip_orphaned_blocks_unless_runtime_armed(
                 Err(e) => tracing::warn!(
                     target: "nrr::runtime",
                     msg_key = "svc-offline-standalone-strip-failed",
-                    "standalone block-filter strip failed: {e:?}",
+                    error = %e,
+                    "standalone block-filter strip failed",
                 ),
             }
         }
@@ -115,14 +116,16 @@ fn strip_orphaned_block_filters_blocking() {
                 Err(e) => tracing::warn!(
                     target: "nrr::runtime",
                     msg_key = "svc-offline-standalone-strip-failed",
-                    "standalone block-filter strip failed: {e:?}",
+                    error = %e,
+                    "standalone block-filter strip failed",
                 ),
             }
         }
         Err(e) => tracing::warn!(
             target: "nrr::runtime",
             msg_key = "svc-offline-standalone-engine-open-failed",
-            "standalone block-filter strip: WFP engine open failed: {e:?}",
+            error = %e,
+            "standalone block-filter strip: WFP engine open failed",
         ),
     }
     tracing::debug!(target: "nrr::runtime", "startup: orphaned-filter strip finished");
@@ -240,29 +243,28 @@ pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
             }
         };
 
-    // ── NRPT / DNS-redirect sweep (the DNS-lockout risk) ───────────────
-    // A crashed Mode-B (Resolver) session leaves an NRPT catch-all rule
-    // pointing ALL name resolution at our loopback :53 listener. With the
-    // service dead that listener is gone, so EVERY DNS query fails until the
-    // rule is removed or the machine reboots — a worse lockout than the WFP
-    // filters (no name resolves at all). `clear_orphan_redirect` removes only
-    // rules carrying our marker, so an admin's or a VPN's own NRPT rule is
-    // untouched. Same sweep the service runs at boot; here it runs offline.
-    // Best-effort — the marker-scoped removal is safe to attempt regardless of
-    // whether a rule exists.
-    let nrpt_cleared = match nrr_platform_windows::dns_redirect::clear_orphan_redirect(
+    // ── DNS sweep: NRPT redirect + suffix search list ─────────────────
+    // A crashed Mode-B (Resolver) session leaves an NRPT catch-all pointing ALL
+    // name resolution at our dead loopback :53 — no name resolves until it
+    // goes or the machine reboots. A suffix list we wrote outlives even a
+    // reboot. Both removals are scoped to what we wrote; the same sweep the
+    // service runs at boot and the uninstall runs.
+    let dns_sweep = nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
         &nrr_platform_windows::dns_redirect::TransactedNrptStore,
-    ) {
-        Ok(removed) => Some(removed),
-        Err(e) => {
-            eprintln!(
-                "cleanup: NRPT/DNS-redirect sweep failed ({e:?}); if DNS is broken, remove the \
-                 rule manually (`Get-DnsClientNrptRule | Where Comment -eq \
-                 'NetRuleRouter-ModeB-DnsRedirect' | Remove-DnsClientNrptRule -Force`) or reboot."
-            );
-            None
-        }
-    };
+        &nrr_platform_windows::dns_redirect::WindowsSearchList,
+    );
+    if let Err(e) = &dns_sweep.nrpt_rules {
+        eprintln!(
+            "cleanup: NRPT/DNS-redirect sweep failed ({e}); if DNS is broken, remove the \
+             rule manually (`Get-DnsClientNrptRule | Where Comment -eq \
+             'NetRuleRouter-ModeB-DnsRedirect' | Remove-DnsClientNrptRule -Force`) or reboot."
+        );
+    }
+    if let Err(e) = &dns_sweep.search_list {
+        eprintln!(
+            "cleanup: DNS suffix search list sweep failed ({e}); check the list with              `Get-DnsClientGlobalSetting` and remove suffixes NetRuleRouter added."
+        );
+    }
 
     // ── Summary ────────────────────────────────────────────────────────
     println!("NetRuleRouter offline reset complete.");
@@ -271,12 +273,17 @@ pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
         Some(n) => println!("  routes removed: {n}"),
         None => println!("  routes removed: <sweep skipped — clears on reboot>"),
     }
-    match nrpt_cleared {
-        Some(n) => println!("  DNS redirect (NRPT) rules removed: {n}"),
-        None => println!("  DNS redirect (NRPT) rules: <sweep failed — see above>"),
+    match &dns_sweep.nrpt_rules {
+        Ok(n) => println!("  DNS redirect (NRPT) rules removed: {n}"),
+        Err(_) => println!("  DNS redirect (NRPT) rules: <sweep failed — see above>"),
+    }
+    match &dns_sweep.search_list {
+        Ok(true) => println!("  DNS suffix search list: restored"),
+        Ok(false) => println!("  DNS suffix search list: nothing of ours"),
+        Err(_) => println!("  DNS suffix search list: <sweep failed — see above>"),
     }
     println!("Reboot to fully clear any remainder.");
-    if nrpt_cleared.is_some() {
+    if dns_sweep.is_clean() {
         SweepOutcome::Done
     } else {
         SweepOutcome::Failed

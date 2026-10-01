@@ -121,6 +121,24 @@ pub trait MutationExecutor: Send + Sync {
         principal: &str,
     ) -> ReviewSummaryResponse;
 
+    /// For a security-alert dry-run: the rows acknowledging it would adopt,
+    /// from a live integrity scan. Read-only, like [`Self::preview`].
+    fn unverified_rows(
+        &self,
+        _kind: MutationKind,
+        _payload: &serde_json::Value,
+    ) -> Vec<nrr_shared::ipc_payloads::UnverifiedRowDto> {
+        Vec::new()
+    }
+
+    /// The dry-run of an audit chain restart: what it would paper over.
+    fn audit_chain_preview(
+        &self,
+        _kind: MutationKind,
+    ) -> Option<nrr_shared::ipc_payloads::AuditChainRestartPreviewDto> {
+        None
+    }
+
     /// Execute a confirmed mutation against `principal`'s revision
     /// partition. The submit handler derives `principal`
     /// from the envelope class + `IpcRequestContext.caller_stored()`.
@@ -244,6 +262,9 @@ pub enum RoutePolicyWriteError {
     /// The short-name domain is not a usable DNS domain. Handler maps to
     /// `IpcErrorCode::PreconditionFailed`.
     InvalidNetworkDomain,
+    /// The leak-protection protocol mask selects no protocol or names an
+    /// unknown one. Handler maps to `IpcErrorCode::PreconditionFailed`.
+    InvalidKillSwitchProtocols { bits: u16 },
     /// Storage layer reported an error. Handler maps to
     /// `IpcErrorCode::Internal`.
     Storage(String),
@@ -271,6 +292,11 @@ impl std::fmt::Display for RoutePolicyWriteError {
             Self::InvalidNetworkDomain => {
                 write!(f, "the short-name domain is not a valid DNS domain")
             }
+            Self::InvalidKillSwitchProtocols { bits } => write!(
+                f,
+                "leak protection protocol mask {bits:#x} selects no known protocol; \
+                 switch leak protection off instead of unticking every protocol"
+            ),
             Self::Storage(m) => write!(f, "storage write failed: {m}"),
         }
     }

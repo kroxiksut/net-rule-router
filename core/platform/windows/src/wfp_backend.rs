@@ -30,8 +30,8 @@ use nrr_platform_api::enforcement::{
     ApplyReport, EnforcementBackend, EnforcementCapabilities, EnforcementPlan,
 };
 use nrr_platform_api::error::PlatformError;
-use nrr_platform_api::types::{WfpFilterAction, WfpFilterSpec};
-use nrr_platform_api::wfp::{FilterFailureMode, WfpSession};
+use nrr_platform_api::types::WfpFilterId;
+use nrr_platform_api::wfp::{FilterFailureMode, RetireHeld, WfpSession};
 
 use crate::lower_windows::{lower_plan, EgressLuids};
 
@@ -85,31 +85,41 @@ impl EnforcementBackend for WfpEnforcement {
         // On Windows the stored principal IS the SID string, which is what the
         // `ALE_USER_ID` condition carries back on enumeration.
         let sid = plan.principal.as_stored();
-        let removals: Vec<WfpFilterAction> = self
+        let removals: Vec<WfpFilterId> = self
             .session
             .enumerate_our_filters()?
             .into_iter()
             .filter(|record| {
                 record.user_sid.as_deref() == Some(sid) && !desired.contains(&record.id.raw)
             })
-            .map(|record| WfpFilterAction::DeleteFilter(record.id))
+            .map(|record| record.id)
             .collect();
 
-        let mut actions = removals;
-        actions.extend(additions(filters));
-
+        // Adds before deletes: a filter whose id changed is replaced, and
+        // deleting first left a committed state with neither copy.
         let outcome = self
             .session
-            .execute_wfp_plan_resilient(&actions, self.mode)?;
+            .execute_replacement(&filters, &removals, self.mode)?;
 
         // What could not be materialized is REPORTED, never dropped in silence:
         // a backend that quietly enforces less than it was given is
         // indistinguishable from one that enforced all of it.
-        let notes = outcome
+        let mut notes = outcome
             .skipped
             .iter()
             .map(|s| format!("filter {} was not materialized: {}", s.id.raw, s.reason))
             .collect::<Vec<_>>();
+        match &outcome.retire_held {
+            None => {}
+            Some(RetireHeld::ReplacementSkipped) => notes.push(format!(
+                "{} superseded filter(s) kept: a replacement block was not materialized",
+                removals.len()
+            )),
+            Some(RetireHeld::Failed(e)) => notes.push(format!(
+                "{} superseded filter(s) kept: delete failed: {e}",
+                removals.len()
+            )),
+        }
 
         Ok(ApplyReport {
             applied: requested.saturating_sub(outcome.skipped.len()),
@@ -145,14 +155,6 @@ impl EnforcementBackend for WfpEnforcement {
     }
 }
 
-/// Turn lowered filters into the add-actions the session executes.
-fn additions(filters: Vec<WfpFilterSpec>) -> Vec<WfpFilterAction> {
-    filters
-        .into_iter()
-        .map(WfpFilterAction::AddFilter)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,20 +170,89 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_plan_lowers_to_no_actions() {
-        assert!(additions(lower_plan(&empty_plan(), EgressLuids::default())).is_empty());
+    fn an_empty_plan_lowers_to_no_filters() {
+        assert!(lower_plan(&empty_plan(), EgressLuids::default()).is_empty());
     }
 
+    /// A filter whose id changed (an update re-derives ids) is replaced
+    /// add-first: no recorded state lacks both the old and the new copy.
     #[test]
-    fn every_lowered_filter_becomes_an_add_action() {
-        // The session's plan executor is add/remove-driven; a lowering that
-        // produced anything else would silently drop rules here.
-        let filters = lower_plan(&empty_plan(), EgressLuids { secondary: 7 });
-        let actions = additions(filters.clone());
-        assert_eq!(actions.len(), filters.len());
-        assert!(actions
+    fn a_filter_whose_id_changed_is_never_absent_during_reconcile() {
+        use nrr_platform_api::enforcement::{
+            AppScope, Coverage, DstMatch, EgressConstraint, FlowMatch, FlowRule, Precedence,
+            PrecedenceClass, PrincipalScope, Verdict,
+        };
+        use nrr_platform_api::types::WfpFilterRecord;
+        use nrr_platform_api::windows_api::MockWindowsApi;
+        use nrr_platform_api::WindowsApiPort;
+        use nrr_shared::RouteRole;
+
+        let sid = "S-1-5-21-1-2-3-1001";
+        let mut plan = empty_plan();
+        plan.flows.push(FlowRule {
+            verdict: Verdict::Permit,
+            precedence: Precedence {
+                class: PrecedenceClass::RouteRule(RouteRole::Secondary),
+                ordinal: 0,
+            },
+            flow: FlowMatch {
+                dst: DstMatch::HostV4(std::net::Ipv4Addr::new(192, 0, 2, 7)),
+                dst_port: None,
+                protocol: None,
+            },
+            principal: PrincipalScope(UserPrincipal::from_windows_sid(sid).ok()),
+            app: AppScope::Any,
+            egress: EgressConstraint::Any,
+            coverage: Coverage::ConnectOnly,
+        });
+        let new = lower_plan(&plan, EgressLuids::default());
+        assert!(!new.is_empty());
+        let old: Vec<WfpFilterRecord> = new
             .iter()
-            .all(|a| matches!(a, WfpFilterAction::AddFilter(_))));
+            .map(|f| WfpFilterRecord {
+                id: WfpFilterId { raw: f.id.raw ^ 1 },
+                layer: f.layer,
+                action: f.action,
+                remote_ip: f.remote_ip,
+                remote_ip_set: f.remote_ip_set.clone(),
+                remote_ip_set_v6: f.remote_ip_set_v6.clone(),
+                remote_port: f.remote_port,
+                weight: f.weight,
+                user_sid: Some(sid.to_string()),
+                app_pattern: f.app_pattern.clone(),
+                local_interface_luid: f.local_interface_luid,
+                remote_subnet: f.remote_subnet,
+                remote_subnet_v6: f.remote_subnet_v6,
+                ip_protocol: f.ip_protocol,
+            })
+            .collect();
+        let old_ids: Vec<u64> = old.iter().map(|r| r.id.raw).collect();
+        let new_ids: Vec<u64> = new.iter().map(|f| f.id.raw).collect();
+
+        let api = Arc::new(MockWindowsApi::new());
+        *api.wfp_filters.lock().expect("lock") = old;
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).expect("open"));
+        api.record_wfp_history();
+        WfpEnforcement::new(session, EgressLuids::default())
+            .reconcile(&plan)
+            .expect("reconcile");
+
+        for (step, state) in api.wfp_history().iter().enumerate() {
+            let holds = |ids: &[u64]| ids.iter().all(|id| state.contains(id));
+            assert!(
+                holds(&old_ids) || holds(&new_ids),
+                "step {step}: neither copy of the filter set is installed",
+            );
+        }
+        let live: Vec<u64> = api
+            .wfp_filters
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|f| f.id.raw)
+            .collect();
+        assert_eq!(live, new_ids);
     }
     /// Reconcile REMOVES what the plan no longer lists.
     ///

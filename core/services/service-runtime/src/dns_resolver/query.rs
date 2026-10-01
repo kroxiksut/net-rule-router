@@ -94,12 +94,12 @@ pub fn handle_a_query(
         }
     };
 
-    // Rule host: install enforcement BEFORE answering. П0-D — answer (and
+    // Rule host: install enforcement BEFORE answering. Answer (and
     // record) a small STABLE subset of the fresh addresses, preferring ones
     // already cached: the client only ever connects to what we enforce, and
     // the pinned set converges to a few addresses instead of the CDN's whole
-    // rotating pool (which is what dragged the Google front-end into the
-    // kill-switch on 0719). Record the answered subset only, then drive the
+    // rotating pool (which is what dragged the CDN front-end into the
+    // kill-switch). Record the answered subset only, then drive the
     // synchronous bounded reconcile.
     // Remember the FULL answer, not just the subset we are about to hand out.
     // An app with its own address cache may connect to one of the addresses we
@@ -132,7 +132,7 @@ pub fn handle_a_query(
         },
     );
 
-    // Block D (fake-IP, slice 4) — if this host is in fake-IP scope, hand the
+    // Fake-IP: if this host is in fake-IP scope, hand the
     // application its VIRTUAL address instead of the real ones. The real
     // addresses were just recorded, so the relay can reach the upstream; the app
     // connects to the fake address, the TUN catches the flow, and the relay

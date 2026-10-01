@@ -5,7 +5,7 @@
 //! paths so regressions in the integration boundary are visible.
 
 use nrr_desktop_gui::app_shell::parse_launch_request_arguments;
-use nrr_shared::{ActivationSource, AppSection, FirstRunScenarioId};
+use nrr_shared::{ActivationSource, AppSection};
 
 #[test]
 fn defaults_without_arguments() {
@@ -15,7 +15,6 @@ fn defaults_without_arguments() {
     assert!(!request.open_about);
     assert!(!request.open_license);
     assert!(request.first_run_completed_override.is_none());
-    assert!(request.first_run_scenario_override.is_none());
 }
 
 #[test]
@@ -44,15 +43,6 @@ fn first_run_completed_override_accepts_aliases() {
 
     let req_required = parse_launch_request_arguments(["--first-run=required".to_string()]);
     assert_eq!(req_required.first_run_completed_override, Some(false));
-}
-
-#[test]
-fn scenario_override_supports_short_alias() {
-    let request = parse_launch_request_arguments(["--scenario=quick".to_string()]);
-    assert_eq!(
-        request.first_run_scenario_override,
-        Some(FirstRunScenarioId::QuickStart)
-    );
 }
 
 #[test]

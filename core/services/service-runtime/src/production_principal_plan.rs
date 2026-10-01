@@ -45,6 +45,7 @@ use crate::enforcement_planner::{
     plan_fail_closed_destinations,
 };
 use crate::killswitch_codegen::KillSwitchProtocols;
+use crate::machine_reading::MachineReading;
 use crate::per_sid_orchestrator::PerSidPolicySnapshot;
 
 use crate::app_observation_lookup::AppObservationLookup;
@@ -93,11 +94,6 @@ struct MachineFacts {
     routes: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
     adapters: Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
     reading: Mutex<Option<Arc<MachineReading>>>,
-}
-
-struct MachineReading {
-    routes: Vec<nrr_platform_api::types::RouteEntry>,
-    adapters: Vec<nrr_platform_api::adapters::AdapterInfo>,
 }
 
 impl ProductionPrincipalPlanSource {
@@ -166,7 +162,10 @@ impl ProductionPrincipalPlanSource {
                 );
             })
             .ok()?;
-        let reading = Arc::new(MachineReading { routes, adapters });
+        let reading = Arc::new(MachineReading {
+            routes: Ok(routes),
+            adapters: Ok(adapters),
+        });
         *cached = Some(Arc::clone(&reading));
         Some(reading)
     }
@@ -309,6 +308,7 @@ impl ProductionPrincipalPlanSource {
             crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
                 policy.zone_priority_over_ip,
             ),
+            &self.tunnel_catch_alls(&policy),
         );
 
         let coverage = PlanCoverage {
@@ -396,8 +396,6 @@ impl ProductionPrincipalPlanSource {
         }
     }
 
-    /// What this principal's blanket block must not cut, from the pass's reading
-    /// of the machine.
     /// What policy may do about IPv6 for this principal's bindings.
     ///
     /// Unreadable machine state answers [`Ipv6Guard::Off`]: without knowing
@@ -408,20 +406,51 @@ impl ProductionPrincipalPlanSource {
         let Some(reading) = self.machine_reading() else {
             return Ipv6Guard::Off;
         };
+        let adapters = reading.adapters().unwrap_or_default();
         let secondary = crate::catch_all_exemptions::bound_adapter(
-            &reading.adapters,
+            adapters,
             policy.secondary.as_ref().map(|b| b.display_name.as_str()),
         );
-        Ipv6Guard::from_links(&reading.adapters, secondary)
+        Ipv6Guard::from_links(adapters, secondary)
     }
 
+    /// The prefixes the bound tunnel steers the internet with, which mode A's
+    /// counter-overlay has to out-specific. Empty when the machine cannot be
+    /// read, which falls back to the classic `/2` set.
+    fn tunnel_catch_alls(&self, policy: &PerSidPolicySnapshot) -> Vec<(std::net::Ipv4Addr, u8)> {
+        let Some(reading) = self.machine_reading() else {
+            return Vec::new();
+        };
+        let Some(tunnel) = crate::catch_all_exemptions::bound_adapter(
+            reading.adapters().unwrap_or_default(),
+            policy.secondary.as_ref().map(|b| b.display_name.as_str()),
+        ) else {
+            return Vec::new();
+        };
+        // No reconciler here to say which rows we installed; our signature does.
+        // Without it the mode-B overlay left in the table would pass for the
+        // tunnel's own.
+        let routes: Vec<nrr_platform_api::RouteEntry> = reading
+            .routes()
+            .unwrap_or_default()
+            .iter()
+            .map(|r| nrr_platform_api::RouteEntry {
+                is_ours: r.is_ours || crate::route_codegen::is_owned_route(r),
+                ..r.clone()
+            })
+            .collect();
+        crate::route_codegen::tunnel_catch_all_prefixes(&routes, tunnel.index)
+    }
+
+    /// What this principal's blanket block must not cut, from the pass's reading
+    /// of the machine.
     fn exemptions_for(&self, policy: &PerSidPolicySnapshot) -> CatchAllExemptions {
         let Some(reading) = self.machine_reading() else {
             return CatchAllExemptions::default();
         };
         collect_exemptions(
-            &reading.routes,
-            &reading.adapters,
+            reading.routes().unwrap_or_default(),
+            reading.adapters().unwrap_or_default(),
             policy.primary.as_ref().map(|b| b.display_name.as_str()),
             policy.secondary.as_ref().map(|b| b.display_name.as_str()),
         )
@@ -1041,7 +1070,7 @@ mod tests {
         .plan_for(&user(), availability(false));
         assert!(
             planned.is_some(),
-            "a principal in a tunnel mode must reach the caller, which is what              decides whether they count as unprotected",
+            "a principal in a tunnel mode must reach the caller, which is what decides whether they count as unprotected",
         );
     }
 
@@ -1424,5 +1453,71 @@ mod tests {
     fn a_disarmed_guard_leaves_that_v6_alone() {
         let (plan, _) = plan_with_v6_on_the_main_link_only(Policy::disarmed());
         assert_eq!(blocks_v6(&plan), 0);
+    }
+
+    /// The field regression on the neutral path: a tunnel that redirects with
+    /// a SET of prefixes beats a fixed `/2` counter-overlay, and every non-rule
+    /// connection rides it. The plan answers the tunnel it reads, and does not
+    /// mistake our own leftover overlay for the tunnel's.
+    #[test]
+    fn mode_a_counter_overlay_out_specifics_the_tunnels_own_redirect_set() {
+        use nrr_platform_api::enforcement::EgressRef;
+        let (api, links) = machine(false);
+        let on = |dst: Ipv4Addr, prefix: u8, ifindex: u32, metric: u32| {
+            nrr_platform_api::types::RouteEntry {
+                destination: IpAddr::V4(dst),
+                prefix_length: prefix,
+                next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                interface_index: ifindex,
+                metric,
+                is_ours: false,
+                table: nrr_platform_api::RouteTableRef::Main,
+            }
+        };
+        let redirect_set = [
+            (Ipv4Addr::new(0, 0, 0, 0), 5),
+            (Ipv4Addr::new(8, 0, 0, 0), 7),
+            (Ipv4Addr::new(64, 0, 0, 0), 2),
+            (Ipv4Addr::new(192, 0, 0, 0), 9),
+        ];
+        let mut table = vec![
+            on(Ipv4Addr::new(192, 168, 1, 0), 24, 2, 0),
+            on(Ipv4Addr::UNSPECIFIED, 0, 2, 0),
+            // Ours, left on the tunnel by the always-on mode.
+            on(
+                Ipv4Addr::new(128, 0, 0, 0),
+                1,
+                5,
+                crate::route_codegen::SECONDARY_ROUTE_METRIC,
+            ),
+        ];
+        table.extend(redirect_set.iter().map(|&(d, n)| on(d, n, 5, 0)));
+        api.set_route_table(table);
+
+        let (plan, _) = source(
+            Arc::new(OneSecondaryRule(RouteBehaviorMode::PreferPrimary)),
+            Arc::new(Policy::armed()),
+        )
+        .with_machine_facts(
+            api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+            links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+        )
+        .plan_with_coverage(&user(), availability(true))
+        .expect("the rule must plan");
+
+        let mut overlay: Vec<(Ipv4Addr, u8)> = plan
+            .routes
+            .iter()
+            .filter(|r| r.egress == EgressRef::Primary)
+            .filter_map(|r| match r.dst {
+                DstMatch::SubnetV4 { net, prefix } => Some((net, prefix)),
+                _ => None,
+            })
+            .collect();
+        overlay.sort_unstable_by_key(|&(d, n)| (u32::from(d), n));
+        assert_eq!(
+            overlay,
+            crate::route_codegen::counter_overlay_for(&redirect_set)
+        );
     }
 }

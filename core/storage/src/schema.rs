@@ -1,4 +1,4 @@
-//! SQLite schema definitions for the two storage databases.
+//! SQLite schema definitions for the service databases.
 //!
 //! # Entity-Relationship Diagram — `nrr_fqdn_ip_cache.db`
 //!
@@ -35,9 +35,12 @@
 //!
 //! # Schema — `nrr_service_state.db`
 //!
-//! ```text
-//!  active_revision   last_known_good   integrity_log
-//! ```
+//! Policy lives in `revisions` (one signed row per revision, per principal)
+//! with `active_revision_pointer` naming each principal's active row; the
+//! rollback target is read off that history, not stored. The rest are
+//! per-feature tables, each introduced by its own migration in
+//! `schema/state_ddl.rs`. `active_revision` and `last_known_good` are gone
+//! since v60.
 //!
 //! # Timestamp convention
 //!

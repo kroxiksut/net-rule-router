@@ -12,8 +12,7 @@ Frame {
     padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
     background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
 
-    // Interactive explain probe. Replaces the
-    // static `diag.explainSample` read with a live `ExplainGet` query.
+    // Interactive explain probe, backed by a live `ExplainGet` query.
     // `_probeResultRoute` slugs match `ExplainCompactViewDto.route`:
     // `"primary" | "secondary" | "none" | "blocked"`. This is the
     // SYNTHETIC path (`rpcExplainGetBySample`): the service runs the REAL
@@ -70,7 +69,7 @@ Frame {
         if (route === "primary")
             return root.tr("diag.explain.route.primary", "primary route")
         if (route === "secondary")
-            return root.tr("diag.explain.route.secondary", "secondary route")
+            return root.tr("diag.explain.route.secondary", "additional route")
         return route
     }
     // Main probe verdict, spoken as a "route — status" pair
@@ -89,7 +88,7 @@ Frame {
             return panel._explainRouteLabel(route)
         var routeWord = route === "primary"
             ? root.tr("label.primary", "Primary")
-            : root.tr("label.secondary", "Secondary")
+            : root.tr("label.secondary", "Additional")
         // Only genuinely-blocking caveats flip the status:
         // the smart-exempt and risk slugs describe a caveat on an ALLOWED flow.
         var blocking = panel._probeEnforcement === "blocked-unknown-under-block-all"
@@ -186,7 +185,10 @@ Frame {
         })
     }
     function probe(input, sampleIp, sampleProcess) {
-        _probeInputText = String(input || "")
+        // Through the field: typing broke its binding, and the field, the
+        // verdict and the button must name the same host.
+        probeInput.text = String(input || "")
+        _probeInputText = probeInput.text
         _probeSampleIp = String(sampleIp || "")
         _probeSampleProcess = String(sampleProcess || "")
         _runExplainProbe()

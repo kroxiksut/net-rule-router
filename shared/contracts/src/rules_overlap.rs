@@ -16,9 +16,11 @@
 //! The risk-scoring counterpart in `nrr_domain::review` answers a different
 //! question — "does THIS change create an overlap" — and is scoped to a diff.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::rules_json::{AddressMatchDto, CanonicalRulesJsonV1, RuleAction, RuleDto};
+use crate::rules_json::{folded_rule_name, AddressMatchDto, CanonicalRulesJsonV1, RuleDto};
 
 mod across_routes;
 
@@ -48,36 +50,38 @@ pub struct OverlapPair {
 /// Every exact rule covered by a suffix rule of the same route, in a
 /// deterministic order (by apex, then by covered host).
 pub fn find_overlaps(dto: &CanonicalRulesJsonV1) -> Vec<OverlapPair> {
-    let suffixes: Vec<(&RuleDto, &str, &str)> = collect(dto, |m| match m {
+    let suffixes = collect(dto, |m| match m {
         AddressMatchDto::SuffixDomain { suffix } => Some(suffix.as_str()),
         _ => None,
     });
-    let exacts: Vec<(&RuleDto, &str, &str)> = collect(dto, |m| match m {
+    let exacts = collect(dto, |m| match m {
         AddressMatchDto::ExactFqdn { value } => Some(value.as_str()),
         _ => None,
     });
+    let suffixes_by_name = index_by_name(&suffixes, |s| s.name.as_str());
 
     let mut out: Vec<OverlapPair> = Vec::new();
-    for (apex_rule, apex_route, apex) in &suffixes {
-        let dotted = format!(".{apex}");
-        for (covered_rule, covered_route, host) in &exacts {
-            if apex_route != covered_route || (host != apex && !host.ends_with(&dotted)) {
+    for covered in &exacts {
+        for apex in ancestors_in(&covered.name, &suffixes_by_name) {
+            if apex.route != covered.route {
                 continue;
             }
             // An app filter narrows a rule to one process, so the two never
             // describe the same traffic and neither one is spare.
-            let same_app = apex_rule.app_match == covered_rule.app_match;
+            let same_app = apex.rule.app_match == covered.rule.app_match;
+            // Written values, not folded names: the pair key a user kept is
+            // stored in these spellings.
             out.push(OverlapPair {
-                apex: (*apex).to_string(),
-                apex_route: (*apex_route).to_string(),
-                apex_rule_id: apex_rule.id.clone(),
-                covered_host: (*host).to_string(),
-                covered_route: (*covered_route).to_string(),
-                covered_rule_id: covered_rule.id.clone(),
+                apex: apex.written.to_string(),
+                apex_route: apex.route.to_string(),
+                apex_rule_id: apex.rule.id.clone(),
+                covered_host: covered.written.to_string(),
+                covered_route: covered.route.to_string(),
+                covered_rule_id: covered.rule.id.clone(),
                 redundant: same_app
-                    && action_of(apex_rule) == action_of(covered_rule)
-                    && apex_rule.enabled
-                    && covered_rule.enabled,
+                    && apex.rule.action == covered.rule.action
+                    && apex.rule.enabled
+                    && covered.rule.enabled,
             });
         }
     }
@@ -90,13 +94,42 @@ pub fn find_overlaps(dto: &CanonicalRulesJsonV1) -> Vec<OverlapPair> {
     out
 }
 
-fn action_of(rule: &RuleDto) -> RuleAction {
-    rule.action
+/// Rules grouped by their folded name, so an ancestor walk finds the rules
+/// covering a host in one lookup per label.
+fn index_by_name<'r, T>(
+    items: &'r [T],
+    name: impl Fn(&'r T) -> &'r str,
+) -> HashMap<&'r str, Vec<&'r T>> {
+    let mut by_name: HashMap<&str, Vec<&T>> = HashMap::new();
+    for item in items {
+        by_name.entry(name(item)).or_default().push(item);
+    }
+    by_name
 }
 
-/// Rules of one address kind across both routes, each paired with its route
-/// slug and the matched value.
-fn collect<'a, F>(dto: &'a CanonicalRulesJsonV1, pick: F) -> Vec<(&'a RuleDto, &'a str, &'a str)>
+/// Entries named `name` itself or one of its parent domains.
+fn ancestors_in<'r, T>(name: &str, by_name: &HashMap<&'r str, Vec<&'r T>>) -> Vec<&'r T> {
+    let mut found = Vec::new();
+    let mut current = Some(name);
+    while let Some(candidate) = current {
+        if let Some(items) = by_name.get(candidate) {
+            found.extend(items.iter().copied());
+        }
+        current = candidate.split_once('.').map(|(_, parent)| parent);
+    }
+    found
+}
+
+/// One name rule as the same-route pass sees it.
+struct Named<'a> {
+    rule: &'a RuleDto,
+    route: &'static str,
+    written: &'a str,
+    name: String,
+}
+
+/// Rules of one address kind across both routes, with an empty name dropped.
+fn collect<'a, F>(dto: &'a CanonicalRulesJsonV1, pick: F) -> Vec<Named<'a>>
 where
     F: Fn(&'a AddressMatchDto) -> Option<&'a str>,
 {
@@ -106,8 +139,18 @@ where
             let Some(address) = rule.address_match.as_ref() else {
                 continue;
             };
-            if let Some(value) = pick(address) {
-                out.push((rule, route, value));
+            let Some(written) = pick(address) else {
+                continue;
+            };
+            // Rules on screen may not be canonical yet.
+            let name = folded_rule_name(address).unwrap_or_default();
+            if !name.is_empty() {
+                out.push(Named {
+                    rule,
+                    route,
+                    written,
+                    name,
+                });
             }
         }
     }
@@ -117,7 +160,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules_json::RULES_JSON_SCHEMA_VERSION;
+    use crate::rules_json::{RuleAction, RULES_JSON_SCHEMA_VERSION};
 
     fn rule(id: &str, address: AddressMatchDto) -> RuleDto {
         RuleDto {
@@ -245,6 +288,93 @@ mod tests {
         let dto = book(
             vec![],
             vec![suffix("r-1", "example.com"), exact("r-2", "notexample.com")],
+        );
+        assert!(find_overlaps(&dto).is_empty());
+    }
+
+    /// The spellings a rule on screen may still carry before the service
+    /// canonicalises it; the Overlaps pass has always folded them.
+    #[test]
+    fn case_wildcard_and_dots_are_folded_as_the_route_pass_folds_them() {
+        for (apex, host) in [
+            ("Example.COM", "api.example.com"),
+            ("*.example.com", "api.example.com"),
+            (".example.com", "API.Example.com."),
+            ("example.com.", "example.com"),
+        ] {
+            let dto = book(vec![], vec![suffix("r-1", apex), exact("r-2", host)]);
+            let found = find_overlaps(&dto);
+            assert_eq!(found.len(), 1, "{apex} / {host}");
+            assert!(found[0].redundant);
+            assert_eq!(found[0].apex, apex, "the written spelling keys a kept pair");
+            assert_eq!(found[0].covered_host, host);
+
+            let across = book(vec![exact("r-2", host)], vec![suffix("r-1", apex)]);
+            assert!(find_overlaps(&across).is_empty());
+            assert_eq!(
+                find_route_overlaps(&across, false).len(),
+                1,
+                "{apex} / {host}"
+            );
+        }
+    }
+
+    /// The drift hash and both overlap passes read one folding: two spellings
+    /// name the same host to all three, or to none. Pairs that only a looser
+    /// folding would join are here too — the matcher keeps them apart.
+    #[test]
+    fn every_comparison_folds_a_name_the_same_way() {
+        type Make = fn(&str, &str) -> RuleDto;
+        let cases: [(Make, &str, &str, bool); 9] = [
+            (suffix, "Example.COM.", "example.com", true),
+            (suffix, " *.example.com ", "example.com", true),
+            (suffix, ".example.com", "example.com", true),
+            (suffix, "*.*.example.com", "example.com", false),
+            (suffix, "..example.com", "example.com", false),
+            (
+                suffix,
+                "\u{041F}\u{0420}.example",
+                "\u{043F}\u{0440}.example",
+                true,
+            ),
+            (exact, "API.Example.com.", "api.example.com", true),
+            (exact, ".api.example.com", "api.example.com", false),
+            (exact, "*.api.example.com", "api.example.com", false),
+        ];
+        for (make, a, b, same) in cases {
+            let folded = |value: &str| {
+                let mut dto = book(vec![], vec![make("r", value)]);
+                crate::rules_json::fold_for_comparison(&mut dto);
+                dto
+            };
+            assert_eq!(folded(a) == folded(b), same, "drift hash: {a} / {b}");
+
+            let across = book(vec![make("r-1", a)], vec![make("r-2", b)]);
+            let duplicate = find_route_overlaps(&across, false)
+                .iter()
+                .any(|o| o.kind == RouteOverlapKind::Duplicate);
+            assert_eq!(duplicate, same, "route pass: {a} / {b}");
+
+            let within = book(vec![], vec![suffix("r-1", a), exact("r-2", b)]);
+            let names_b = folded_rule_name(&AddressMatchDto::ExactFqdn {
+                value: b.to_string(),
+            });
+            let names_a = folded_rule_name(&AddressMatchDto::SuffixDomain {
+                suffix: a.to_string(),
+            });
+            assert_eq!(
+                !find_overlaps(&within).is_empty(),
+                names_a == names_b,
+                "same-route pass: {a} / {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_name_pairs_with_nothing() {
+        let dto = book(
+            vec![],
+            vec![suffix("r-1", "*."), exact("r-2", "example.com")],
         );
         assert!(find_overlaps(&dto).is_empty());
     }

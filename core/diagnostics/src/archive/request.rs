@@ -110,7 +110,7 @@ pub const MAX_ARCHIVE_SIZE_BYTES: u64 = 50 * 1024 * 1024;
 /// Request to build a diagnostic archive.
 ///
 /// The archive **never** includes raw DB files, private keys, full policy
-/// content, or `SecretNeverLog` fields.
+/// content, or events classed `PrivacyClass::SecretNeverLog`.
 #[derive(Clone, Debug)]
 pub struct DiagnosticArchiveRequest {
     /// Privacy redaction applied to all sections.

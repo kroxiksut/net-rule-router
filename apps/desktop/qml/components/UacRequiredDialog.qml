@@ -63,9 +63,7 @@ Dialog {
             Item { Layout.fillWidth: true }
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.mode === "declined"
-                    ? root.tr("dialog.review-diff.cancel", "Cancel")
-                    : root.tr("dialog.uac-required.cancel", "Cancel")
+                text: root.tr("action.cancel", "Cancel")
                 visible: root.mode !== "declined"
                 onClicked: { root.cancelled(); root.close() }
             }

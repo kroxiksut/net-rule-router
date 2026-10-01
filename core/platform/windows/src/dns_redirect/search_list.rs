@@ -22,9 +22,6 @@ pub struct SearchListView {
     pub global: Vec<String>,
     /// The primary DNS suffix.
     pub primary: Option<String>,
-    /// Suffixes of the connections in use, which the catch-all makes the DNS
-    /// client skip.
-    pub connections: Vec<String>,
     /// A domain policy owns the list.
     pub policy_managed: bool,
 }
@@ -62,25 +59,34 @@ fn push_unique(list: &mut Vec<String>, suffix: &str) {
 }
 
 /// Bring the global list to what completion needs now: the primary suffix
-/// first, as the DNS client puts it, then the connections', then `extra`.
+/// first, as the DNS client puts it, then `connections`, then `extra`.
+///
+/// `connections` are the suffixes of the connections exempt from the
+/// catch-all — the DNS client skips those when completing, and a suffix not
+/// exempt would send internal names to the public upstream. The caller passes
+/// the set it exempted, so the machine is enumerated once for both.
 ///
 /// With nothing but the primary suffix to add the list stays empty — the DNS
 /// client applies that one on its own.
 pub fn sync_search_list(
     store: &dyn SearchListStore,
+    connections: &[String],
     extra: &[String],
 ) -> Result<SearchListOutcome, PlatformError> {
     let view = store.read()?;
     let noted = store.noted();
     let ours = is_ours(&view.global, &noted);
     if view.policy_managed || (!view.global.is_empty() && !ours) {
-        if !noted.is_empty() {
+        // A policy only hides the local list: ours comes back into force when
+        // the policy goes, so the note stays until the local list itself
+        // leaves what we wrote.
+        if !ours && !noted.is_empty() {
             store.note(&[])?;
         }
         return Ok(SearchListOutcome::NotOurs);
     }
     let mut wanted = Vec::new();
-    for suffix in view.connections.iter().chain(extra) {
+    for suffix in connections.iter().chain(extra) {
         push_unique(&mut wanted, suffix);
     }
     if let Some(primary) = view.primary.as_deref() {
@@ -113,14 +119,15 @@ pub fn sync_search_list(
 /// Take back a list we wrote. `Ok(true)` when there was one.
 ///
 /// Reads the note first and touches nothing else without it, so the common
-/// case — nothing written — costs one file probe.
+/// case — nothing written — costs one file probe. Our local list is cleared
+/// under a policy too: nothing would take it back once the policy goes.
 pub fn release_search_list(store: &dyn SearchListStore) -> Result<bool, PlatformError> {
     let noted = store.noted();
     if noted.is_empty() {
         return Ok(false);
     }
     let view = store.read()?;
-    let ours = !view.policy_managed && is_ours(&view.global, &noted);
+    let ours = is_ours(&view.global, &noted);
     if ours {
         store.write(&[])?;
     }
@@ -139,16 +146,29 @@ fn is_plain_suffix(suffix: &str) -> bool {
 }
 
 #[cfg(any(target_os = "windows", test))]
-/// The script that makes `suffixes` the list in force. Through the DNS
-/// client's own cmdlet: it re-reads the list only when told, and a registry
-/// write alone stays unseen until the next reboot.
-pub fn write_script(suffixes: &[String]) -> Result<String, PlatformError> {
-    if let Some(bad) = suffixes.iter().find(|s| !is_plain_suffix(s)) {
-        return Err(PlatformError::Transient {
+fn validated(suffixes: &[String]) -> Result<(), PlatformError> {
+    match suffixes.iter().find(|s| !is_plain_suffix(s)) {
+        Some(bad) => Err(PlatformError::Transient {
             operation: "dns.search_list.validate",
             detail: format!("not a DNS suffix: {bad:?}"),
-        });
+        }),
+        None => Ok(()),
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+/// The list as `SetDnsSettings` takes it: comma-separated, empty to clear.
+pub fn comma_list(suffixes: &[String]) -> Result<String, PlatformError> {
+    validated(suffixes)?;
+    Ok(suffixes.join(","))
+}
+
+#[cfg(any(target_os = "windows", test))]
+/// The script that makes `suffixes` the list in force, for Windows builds
+/// without `SetDnsSettings`. Through the DNS client's own cmdlet: a registry
+/// write alone stays unseen until the next reboot.
+pub fn write_script(suffixes: &[String]) -> Result<String, PlatformError> {
+    validated(suffixes)?;
     let list = if suffixes.is_empty() {
         "''".to_string()
     } else {
@@ -168,7 +188,7 @@ pub use live::WindowsSearchList;
 
 #[cfg(target_os = "windows")]
 mod live {
-    use super::{write_script, SearchListStore, SearchListView};
+    use super::{comma_list, write_script, SearchListStore, SearchListView};
     use crate::dns_redirect::{CommandRunner, PowerShellRunner};
     use crate::error::PlatformError;
 
@@ -184,21 +204,20 @@ mod live {
 
     impl SearchListStore for WindowsSearchList {
         fn read(&self) -> Result<SearchListView, PlatformError> {
-            let mut connections = Vec::new();
-            for scope in crate::dns_scope::live_dns_scopes() {
-                if !connections.contains(&scope.suffix) {
-                    connections.push(scope.suffix);
-                }
-            }
             Ok(SearchListView {
                 global: crate::dns_scope::global_search_list(),
                 primary: crate::dns_scope::primary_dns_suffix(),
-                connections,
                 policy_managed: crate::dns_scope::search_list_is_policy_managed(),
             })
         }
 
         fn write(&self, suffixes: &[String]) -> Result<(), PlatformError> {
+            // No child process: the resolver stop path clears the list within
+            // a budget a PowerShell start alone can exceed.
+            let list = comma_list(suffixes)?;
+            if let Some(applied) = crate::win32_ffi::dns_settings::set_global_search_list(&list) {
+                return applied;
+            }
             let out = PowerShellRunner.run_powershell(&write_script(suffixes)?)?;
             if out.success {
                 Ok(())
@@ -249,84 +268,85 @@ mod live {
     }
 }
 
+/// The store in memory, for the tests of this module and of the redirect.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FakeList {
+    view: std::sync::Mutex<SearchListView>,
+    noted: std::sync::Mutex<Vec<String>>,
+    writes: std::sync::Mutex<Vec<Vec<String>>>,
+    fail_write: bool,
+}
+
+#[cfg(test)]
+impl FakeList {
+    fn with(view: SearchListView) -> Self {
+        Self {
+            view: std::sync::Mutex::new(view),
+            ..Self::default()
+        }
+    }
+    fn global(&self) -> Vec<String> {
+        self.view
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .global
+            .clone()
+    }
+    fn noted_now(&self) -> Vec<String> {
+        self.noted.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+    fn writes(&self) -> usize {
+        self.writes.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+#[cfg(test)]
+impl SearchListStore for FakeList {
+    fn read(&self) -> Result<SearchListView, PlatformError> {
+        Ok(self.view.lock().unwrap_or_else(|p| p.into_inner()).clone())
+    }
+    fn write(&self, suffixes: &[String]) -> Result<(), PlatformError> {
+        if self.fail_write {
+            return Err(PlatformError::Transient {
+                operation: "test",
+                detail: "refused".into(),
+            });
+        }
+        self.writes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(suffixes.to_vec());
+        self.view.lock().unwrap_or_else(|p| p.into_inner()).global = suffixes.to_vec();
+        Ok(())
+    }
+    fn noted(&self) -> Vec<String> {
+        self.noted_now()
+    }
+    fn note(&self, suffixes: &[String]) -> Result<(), PlatformError> {
+        *self.noted.lock().unwrap_or_else(|p| p.into_inner()) = suffixes.to_vec();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    #[derive(Default)]
-    struct FakeList {
-        view: Mutex<SearchListView>,
-        noted: Mutex<Vec<String>>,
-        writes: Mutex<Vec<Vec<String>>>,
-        fail_write: bool,
-    }
-
-    impl FakeList {
-        fn with(view: SearchListView) -> Self {
-            Self {
-                view: Mutex::new(view),
-                ..Self::default()
-            }
-        }
-        fn global(&self) -> Vec<String> {
-            self.view
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .global
-                .clone()
-        }
-        fn noted_now(&self) -> Vec<String> {
-            self.noted.lock().unwrap_or_else(|p| p.into_inner()).clone()
-        }
-        fn writes(&self) -> usize {
-            self.writes.lock().unwrap_or_else(|p| p.into_inner()).len()
-        }
-    }
-
-    impl SearchListStore for FakeList {
-        fn read(&self) -> Result<SearchListView, PlatformError> {
-            Ok(self.view.lock().unwrap_or_else(|p| p.into_inner()).clone())
-        }
-        fn write(&self, suffixes: &[String]) -> Result<(), PlatformError> {
-            if self.fail_write {
-                return Err(PlatformError::Transient {
-                    operation: "test",
-                    detail: "refused".into(),
-                });
-            }
-            self.writes
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(suffixes.to_vec());
-            self.view.lock().unwrap_or_else(|p| p.into_inner()).global = suffixes.to_vec();
-            Ok(())
-        }
-        fn noted(&self) -> Vec<String> {
-            self.noted_now()
-        }
-        fn note(&self, suffixes: &[String]) -> Result<(), PlatformError> {
-            *self.noted.lock().unwrap_or_else(|p| p.into_inner()) = suffixes.to_vec();
-            Ok(())
-        }
-    }
-
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_string()).collect()
     }
 
-    fn corp_connected() -> SearchListView {
-        SearchListView {
-            connections: strings(&["branch.corp.example"]),
-            ..SearchListView::default()
-        }
+    fn corp() -> Vec<String> {
+        strings(&["branch.corp.example"])
     }
 
     /// The field case: a VPN suffix, no global list, no primary suffix.
     #[test]
     fn a_connections_suffix_goes_into_an_empty_global_list_and_is_noted() {
-        let store = FakeList::with(corp_connected());
-        let outcome = sync_search_list(&store, &[]).expect("sync");
+        let store = FakeList::default();
+        let outcome = sync_search_list(&store, &corp(), &[]).expect("sync");
         assert_eq!(
             outcome,
             SearchListOutcome::Written(strings(&["branch.corp.example"]))
@@ -335,7 +355,7 @@ mod tests {
         assert_eq!(store.noted_now(), strings(&["branch.corp.example"]));
 
         assert_eq!(
-            sync_search_list(&store, &[]).expect("again"),
+            sync_search_list(&store, &corp(), &[]).expect("again"),
             SearchListOutcome::Unchanged
         );
         assert_eq!(store.writes(), 1, "an unchanged machine writes nothing");
@@ -347,9 +367,9 @@ mod tests {
     fn the_primary_suffix_leads_and_the_users_suffix_follows() {
         let store = FakeList::with(SearchListView {
             primary: Some("hq.example".into()),
-            ..corp_connected()
+            ..SearchListView::default()
         });
-        sync_search_list(&store, &strings(&["lab.example", "hq.example"])).expect("sync");
+        sync_search_list(&store, &corp(), &strings(&["lab.example", "hq.example"])).expect("sync");
         assert_eq!(
             store.global(),
             strings(&["hq.example", "branch.corp.example", "lab.example"])
@@ -363,7 +383,7 @@ mod tests {
             ..SearchListView::default()
         });
         assert_eq!(
-            sync_search_list(&store, &[]).expect("sync"),
+            sync_search_list(&store, &[], &[]).expect("sync"),
             SearchListOutcome::Unchanged
         );
         assert_eq!(store.writes(), 0);
@@ -373,10 +393,10 @@ mod tests {
     fn a_list_someone_else_set_is_left_alone() {
         let store = FakeList::with(SearchListView {
             global: strings(&["admin.example"]),
-            ..corp_connected()
+            ..SearchListView::default()
         });
         assert_eq!(
-            sync_search_list(&store, &[]).expect("sync"),
+            sync_search_list(&store, &corp(), &[]).expect("sync"),
             SearchListOutcome::NotOurs
         );
         assert_eq!(store.global(), strings(&["admin.example"]));
@@ -388,27 +408,75 @@ mod tests {
     fn a_policy_owned_list_is_never_written() {
         let store = FakeList::with(SearchListView {
             policy_managed: true,
-            ..corp_connected()
+            ..SearchListView::default()
         });
         assert_eq!(
-            sync_search_list(&store, &[]).expect("sync"),
+            sync_search_list(&store, &corp(), &[]).expect("sync"),
             SearchListOutcome::NotOurs
         );
         assert_eq!(store.writes(), 0);
     }
 
-    #[test]
-    fn a_disconnected_vpn_takes_its_suffix_back_out() {
-        let store = FakeList::with(corp_connected());
-        sync_search_list(&store, &[]).expect("arm");
+    fn set_policy(store: &FakeList, managed: bool) {
         store
             .view
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .connections
-            .clear();
+            .policy_managed = managed;
+    }
+
+    /// Our list outlives a policy laid over it, and is ours again after.
+    #[test]
+    fn a_policy_over_our_list_keeps_the_note_until_the_policy_goes() {
+        let store = FakeList::default();
+        sync_search_list(&store, &corp(), &[]).expect("arm");
+        set_policy(&store, true);
         assert_eq!(
-            sync_search_list(&store, &[]).expect("sync"),
+            sync_search_list(&store, &corp(), &[]).expect("under policy"),
+            SearchListOutcome::NotOurs
+        );
+        assert_eq!(store.noted_now(), corp());
+        assert_eq!(store.writes(), 1);
+
+        set_policy(&store, false);
+        assert_eq!(
+            sync_search_list(&store, &[], &[]).expect("policy gone"),
+            SearchListOutcome::Cleared
+        );
+        assert!(store.global().is_empty());
+    }
+
+    #[test]
+    fn a_local_list_replaced_under_a_policy_drops_the_note() {
+        let store = FakeList::default();
+        sync_search_list(&store, &corp(), &[]).expect("arm");
+        set_policy(&store, true);
+        store.view.lock().unwrap_or_else(|p| p.into_inner()).global = strings(&["admin.example"]);
+        assert_eq!(
+            sync_search_list(&store, &corp(), &[]).expect("sync"),
+            SearchListOutcome::NotOurs
+        );
+        assert!(store.noted_now().is_empty());
+        assert_eq!(store.global(), strings(&["admin.example"]));
+    }
+
+    #[test]
+    fn release_under_a_policy_still_clears_our_local_list() {
+        let store = FakeList::default();
+        sync_search_list(&store, &corp(), &[]).expect("arm");
+        set_policy(&store, true);
+        sync_search_list(&store, &corp(), &[]).expect("under policy");
+        assert!(release_search_list(&store).expect("release"));
+        assert!(store.global().is_empty());
+        assert!(store.noted_now().is_empty());
+    }
+
+    #[test]
+    fn a_disconnected_vpn_takes_its_suffix_back_out() {
+        let store = FakeList::default();
+        sync_search_list(&store, &corp(), &[]).expect("arm");
+        assert_eq!(
+            sync_search_list(&store, &[], &[]).expect("sync"),
             SearchListOutcome::Cleared
         );
         assert!(store.global().is_empty());
@@ -418,8 +486,8 @@ mod tests {
     /// A user who replaced our list while we ran keeps theirs, at every exit.
     #[test]
     fn a_list_replaced_while_we_ran_is_not_ours_to_clear() {
-        let store = FakeList::with(corp_connected());
-        sync_search_list(&store, &[]).expect("arm");
+        let store = FakeList::default();
+        sync_search_list(&store, &corp(), &[]).expect("arm");
         store.view.lock().unwrap_or_else(|p| p.into_inner()).global = strings(&["admin.example"]);
         assert!(!release_search_list(&store).expect("release"));
         assert_eq!(store.global(), strings(&["admin.example"]));
@@ -428,8 +496,8 @@ mod tests {
 
     #[test]
     fn release_clears_our_list_and_the_note() {
-        let store = FakeList::with(corp_connected());
-        sync_search_list(&store, &[]).expect("arm");
+        let store = FakeList::default();
+        sync_search_list(&store, &corp(), &[]).expect("arm");
         assert!(release_search_list(&store).expect("release"));
         assert!(store.global().is_empty());
         assert!(store.noted_now().is_empty());
@@ -440,23 +508,20 @@ mod tests {
     /// a failed write leaves a list the next release still recognises.
     #[test]
     fn a_failed_write_leaves_a_note_covering_what_may_be_in_force() {
-        let store = FakeList::with(corp_connected());
-        sync_search_list(&store, &[]).expect("arm");
+        let store = FakeList::default();
+        sync_search_list(&store, &corp(), &[]).expect("arm");
         let failing = FakeList {
             view: Mutex::new(SearchListView {
                 global: strings(&["branch.corp.example"]),
-                connections: strings(&["branch.corp.example", "lab.example"]),
                 ..SearchListView::default()
             }),
             noted: Mutex::new(store.noted_now()),
             fail_write: true,
             ..FakeList::default()
         };
-        assert!(sync_search_list(&failing, &[]).is_err());
-        assert_eq!(
-            failing.noted_now(),
-            strings(&["branch.corp.example", "lab.example"])
-        );
+        let widened = strings(&["branch.corp.example", "lab.example"]);
+        assert!(sync_search_list(&failing, &widened, &[]).is_err());
+        assert_eq!(failing.noted_now(), widened);
     }
 
     #[test]
@@ -472,8 +537,18 @@ mod tests {
 
     #[test]
     fn anything_but_a_plain_suffix_never_reaches_the_script() {
-        for bad in ["a'b.example", "a;b", "a b", "a$b", ""] {
+        for bad in ["a'b.example", "a;b", "a b", "a$b", "", "a,b.example"] {
             assert!(write_script(&strings(&[bad])).is_err(), "{bad:?}");
+            assert!(comma_list(&strings(&[bad])).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_api_list_is_comma_separated_and_clears_when_empty() {
+        assert_eq!(
+            comma_list(&strings(&["a.example", "b-c.example"])).expect("list"),
+            "a.example,b-c.example"
+        );
+        assert_eq!(comma_list(&[]).expect("list"), "");
     }
 }

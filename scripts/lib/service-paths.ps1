@@ -1,5 +1,5 @@
 # Shared names and lookups for the Windows service scripts (reset-network,
-# uninstall-service, purge-data, install-dev-service). Dot-sourced, never run.
+# uninstall-service, purge-data, install-service). Dot-sourced, never run.
 # Windows counterpart of service-paths.sh.
 
 # Keep in sync with product_identity.rs: PRODUCT_NAME (which is also the SCM
@@ -15,7 +15,7 @@ $NrrServiceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$NrrServiceName"
 $NrrAutostartKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $NrrAutostartValueName = 'NetRuleRouter'
 
-# Where install-dev-service.ps1 stages the service unless told otherwise.
+# Where install-service.ps1 stages the service unless told otherwise.
 $NrrDevStageDir = if ($env:ProgramW6432) { Join-Path $env:ProgramW6432 'NetRuleRouter-dev' } else { $null }
 
 # Honour `.cargo/config.toml::build.target-dir`, which may move builds off the

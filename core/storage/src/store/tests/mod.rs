@@ -43,6 +43,24 @@ fn migrated_state_store(dir: &tempfile::TempDir) -> SqliteStateStore {
     SqliteStateStore::new(runner.into_connection())
 }
 
+/// Point the baseline at `revision_id`, signed with the store's key when it
+/// has one — what an activation leaves behind.
+fn point_baseline(store: &SqliteStateStore, revision_id: &str) -> StorageResult<()> {
+    let conn = store.conn.borrow();
+    let repo = match store.signing_key.clone() {
+        Some(key) => crate::revisions::RevisionsRepository::with_signing_key(&conn, key),
+        None => crate::revisions::RevisionsRepository::new(&conn),
+    };
+    repo.set_active_pointer_for(
+        crate::BASELINE_PRINCIPAL,
+        &crate::revisions::ActiveRevisionPointer {
+            revision_id: revision_id.to_string(),
+            activated_at: 1,
+            apply_attempt_id: None,
+        },
+    )
+}
+
 fn sample_resolution(hostname: &str, ip: Ipv4Addr) -> ResolutionEntry {
     ResolutionEntry {
         canonical_hostname: hostname.to_string(),

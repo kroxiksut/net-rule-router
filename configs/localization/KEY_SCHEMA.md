@@ -1,4 +1,4 @@
-# Localization Key Schema (Block 3.5)
+# Localization Key Schema
 
 This document fixes the key contract for shared QML/Rust localization.
 
@@ -36,7 +36,7 @@ Canonical domains:
 
 Legacy compatibility note:
 
-- `theme` remains as legacy block-2 domain and is accepted as alias during migration.
+- `theme` remains as a legacy domain and is accepted as alias during migration.
 
 ## Domain Examples (3-4 per domain)
 
@@ -99,13 +99,13 @@ Forbidden practices:
 
 ## Legacy Migration Rules
 
-- keep legacy block-2 keys as aliases only where immediate rename is risky
+- keep legacy keys as aliases only where immediate rename is risky
 - new strings must use canonical `<domain>.<surface>.<element>.<state>` form
 - whenever a legacy key is touched in code, migrate call-sites to canonical key in the same change
 - remove alias only after all QML/Rust references are migrated and runtime checks pass
 
-## Block-2 Groups and Mapping
+## Legacy Groups and Mapping
 
-Current block-2 key groups and planned mapping are documented in:
+Current legacy key groups and planned mapping are documented in:
 
-- `configs/localization/KEY_MAPPING_BLOCK2.md`
+- `configs/localization/LEGACY_KEY_MAPPING.md`

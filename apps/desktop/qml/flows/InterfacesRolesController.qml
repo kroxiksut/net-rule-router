@@ -73,7 +73,7 @@ QtObject {
         }
         externalIpProbeBusy = true
         // [extip] lines land in the launcher log via the host's stdout —
-        // the client half of the probe was invisible in the HW-0730 triage.
+        // the client half of the probe is otherwise invisible there.
         console.log("[extip] external-address refresh requested")
         var corr = nrrNativeBridge.rpcInterfacesRefresh()
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
@@ -304,7 +304,7 @@ QtObject {
     /// every whitespace token of the STORED name must appear (case-insensitive
     /// substring) somewhere in the live adapter text. This is looser than exact
     /// equality on purpose — a VPN that reinstalls under a longer name
-    /// ("swiftvpn VPN OpenVPN Adapter" → "SwiftVPN 3.0 OpenVPN
+    /// ("examplevpn VPN OpenVPN Adapter" → "ExampleVPN 3.0 OpenVPN
     /// Adapter") still matches, so the GUI heals in lock-step with the service
     /// instead of painting the row unbound while the service is actively
     /// routing through it. The "exactly one available
@@ -365,7 +365,7 @@ QtObject {
     /// uses to heal (`Pure.storedNameMatchesLive`). Using the same matcher means a
     /// ghost row never appears while the service has already healed the binding
     /// to a live sibling under a slightly different name (e.g. "…VPN…" ↔
-    /// "…VPN 3.0…"). This is exactly the VPN-TAP case: swiftvpn removes its
+    /// "…VPN 3.0…"). This is exactly the VPN-TAP case: examplevpn removes its
     /// TAP adapter when the tunnel is down, so the remembered secondary maps to
     /// no live adapter and the Interfaces section paints a muted ghost row so
     /// the user can confirm NRR still remembers it. Empty array when every
@@ -435,7 +435,7 @@ QtObject {
         rebuildInterfacesModel()
         root.routePolicyController.pushRouteBindingToService()
         root.statusLine = root.tr("status.secondary-rebound",
-            "Secondary adapter re-confirmed.")
+            "Additional adapter re-confirmed.")
     }
 
     /// Auto-confirm path for a reinstalled secondary adapter.
@@ -608,7 +608,7 @@ QtObject {
 
     /// Rename-tolerant ack for the VPN-split
     /// explainer. The dismiss is stored as the secondary's display name, but a
-    /// VPN like swiftvpn OpenVPN reinstalls under a longer name each connect
+    /// VPN like examplevpn OpenVPN reinstalls under a longer name each connect
     /// ("… VPN OpenVPN Adapter" → "… VPN 3.0 OpenVPN Adapter"), so an exact
     /// compare re-showed the banner every launch. Treat the
     /// ack as still valid when the stored name and the live name refer to the

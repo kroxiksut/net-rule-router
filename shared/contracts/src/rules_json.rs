@@ -446,16 +446,19 @@ fn fold_rule(rule: &mut RuleDto) {
     rule.comment.clear();
     rule.origin = None;
     if let Some(address) = rule.address_match.as_mut() {
-        match address {
-            AddressMatchDto::ExactFqdn { value } => *value = fold_host(value),
-            AddressMatchDto::SuffixDomain { suffix } => *suffix = fold_suffix(suffix),
-            AddressMatchDto::Zone { name } => *name = fold_suffix(name),
+        let folded = folded_rule_name(address);
+        match (address, folded) {
+            (AddressMatchDto::ExactFqdn { value: written }, Some(name))
+            | (AddressMatchDto::SuffixDomain { suffix: written }, Some(name))
+            | (AddressMatchDto::Zone { name: written }, Some(name)) => *written = name,
             // An address has one spelling already: the validator rejects
             // leading zeros rather than folding them, so trimming is all a
             // comparison may do without inventing a difference of its own.
-            AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
-                *address = address.trim().to_string()
-            }
+            (
+                AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address },
+                _,
+            ) => *address = address.trim().to_string(),
+            _ => {}
         }
     }
     if let Some(app) = rule.app_match.as_mut() {
@@ -474,6 +477,23 @@ fn fold_rule(rule: &mut RuleDto) {
                 *value = crate::app_identity::canonical_glob_process_pattern(value)
             }
         }
+    }
+}
+
+/// The name a host rule is compared under, `None` for an address rule.
+///
+/// The one folding every rule-book comparison in this crate uses — the drift
+/// hash and both overlap passes — so two surfaces never disagree about whether
+/// two rules name the same host. It is the matcher's canonical spelling
+/// (`nrr_domain`'s `canonical_host_name`) short of IDNA and validation: on
+/// every value the service accepts the two agree, and a stored rule is already
+/// in that spelling, so folding it changes nothing.
+pub fn folded_rule_name(address: &AddressMatchDto) -> Option<String> {
+    match address {
+        AddressMatchDto::ExactFqdn { value } => Some(fold_host(value)),
+        AddressMatchDto::SuffixDomain { suffix } => Some(fold_suffix(suffix)),
+        AddressMatchDto::Zone { name } => Some(fold_suffix(name)),
+        AddressMatchDto::ExactIpv4 { .. } | AddressMatchDto::ExactIpv6 { .. } => None,
     }
 }
 
@@ -919,7 +939,7 @@ mod tests {
                 id: "r-ip".into(),
                 enabled: true,
                 address_match: Some(AddressMatchDto::ExactIpv4 {
-                    address: "1.2.3.4".into(),
+                    address: "192.0.2.4".into(),
                 }),
                 app_match: None,
                 comment: String::new(),

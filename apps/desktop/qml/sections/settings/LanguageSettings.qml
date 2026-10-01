@@ -91,8 +91,8 @@ GroupBox {
                     theme: root.uiTheme
                     flat: true
                     text: localeDiagnosticsBlock.expanded
-                        ? root.tr("settings.routing.show-less", "Hide details")
-                        : root.tr("settings.routing.show-more", "Show details")
+                        ? root.tr("action.hide-details", "Hide details")
+                        : root.tr("action.show-details", "Show details")
                     onClicked: localeDiagnosticsBlock.expanded = !localeDiagnosticsBlock.expanded
                 }
             }

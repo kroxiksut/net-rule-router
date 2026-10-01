@@ -10,7 +10,7 @@ impl From<&InterfaceRouteRow> for nrr_shared::ipc_payloads::InterfaceRowDto {
         nrr_shared::ipc_payloads::InterfaceRowDto {
             persistent_id: row.persistent_id.clone(),
             adapter_name: row.adapter_name.clone(),
-            windows_name: row.windows_name.clone(),
+            name: row.name.clone(),
             interface_description: row.interface_description.clone(),
             interface_type: row.interface_type.clone(),
             is_bluetooth_like: row.is_bluetooth_like,
@@ -58,7 +58,6 @@ impl From<&InterfaceRouteRow> for nrr_shared::ipc_payloads::InterfaceRowDto {
                 class: row.recommendation.class.title().to_string(),
                 confidence: row.recommendation.confidence.title().to_string(),
                 advisory_only: row.recommendation.advisory_only,
-                summary: row.recommendation.summary.clone(),
                 key_signals: row.recommendation.key_signals.clone(),
                 excluded_alternatives: row.recommendation.excluded_alternatives.clone(),
             },
@@ -67,21 +66,15 @@ impl From<&InterfaceRouteRow> for nrr_shared::ipc_payloads::InterfaceRowDto {
 }
 
 impl InterfaceRouteRow {
-    /// Reconstruct an enriched row from its wire DTO. Display and
-    /// scoring-input fields (identity, IP/gateway/DNS, availability,
-    /// observed connectivity, derived classification) are faithfully
-    /// parsed back from their slug form. The *decoration* slots —
-    /// `recommendation`, `selected_role`, `route_state` — are reset to
-    /// their undecorated defaults: the IPC facade re-runs the advisory
-    /// recommendation engine and re-applies the user's role bindings via
-    /// `decorate_interface_rows`, so the service-sourced row ends up
-    /// decorated exactly like a locally-enumerated one (the service does
-    /// not run the preview engine itself).
+    /// Reconstruct a row from its wire DTO. Every scoring input round-trips;
+    /// the derived slots (`recommendation`, `selected_role`, `route_state`)
+    /// come back unset, for the receiver to derive with the same functions
+    /// the sender used.
     pub fn from_wire_dto(dto: &nrr_shared::ipc_payloads::InterfaceRowDto) -> Self {
         InterfaceRouteRow {
             persistent_id: dto.persistent_id.clone(),
             adapter_name: dto.adapter_name.clone(),
-            windows_name: dto.windows_name.clone(),
+            name: dto.name.clone(),
             interface_description: dto.interface_description.clone(),
             interface_type: dto.interface_type.clone(),
             is_bluetooth_like: dto.is_bluetooth_like,

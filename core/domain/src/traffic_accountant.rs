@@ -1,4 +1,4 @@
-//! Traffic-counter accounting core (Block T) — pure, deterministic, no I/O.
+//! Traffic-counter accounting core — pure, deterministic, no I/O.
 //!
 //! Turns per-interface cumulative octet readings into per-interval deltas,
 //! bucketed by **role** (`primary` / `secondary` / `loopback` / `virtual`).
@@ -158,7 +158,7 @@ fn reset_aware_delta(current: u64, last: u64) -> u64 {
     }
 }
 
-// ── tunnel_overlap_adjust (Block T Feature 1) ───────────────────────────────
+// ── tunnel_overlap_adjust ────────────────────────────────────────────────────
 
 /// Subtracts a tunnel secondary's tick delta from the primary's tick delta,
 /// so a VPN's traffic is not counted twice: once decrypted on the tunnel
@@ -473,7 +473,7 @@ mod tests {
         assert!(deltas.is_empty(), "idle interface emits no delta");
     }
 
-    // ── tunnel_overlap_adjust (Block T Feature 1) ────────────────────────────
+    // ── tunnel_overlap_adjust ────────────────────────────────────────────────
 
     #[test]
     fn tunnel_secondary_subtracts_from_primary() {

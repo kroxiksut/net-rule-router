@@ -1,7 +1,6 @@
-//! Housekeeping tasks: log and audit cleanup, revision retention, the WAL
-//! checkpoint and operation-result GC. None of them affect routing.
-//!
-//! Split out of `service_tasks`; the code is unchanged.
+//! Housekeeping tasks: log and audit cleanup, revision retention, the cache
+//! sweep with the WAL checkpoint, and operation-result GC. Only the cache
+//! sweep reaches routing, and only by aging the shared-IP census.
 
 use super::*;
 
@@ -180,7 +179,8 @@ impl StorageCheckpointDeps {
     }
 }
 
-/// Periodic WAL checkpoint over every open database.
+/// Periodic cache sweep plus WAL checkpoint over every open database. The
+/// sweep goes first so the checkpoint folds its deletions in the same pass.
 ///
 /// The connection factory truncates the journal on open, which is enough for
 /// a process that restarts often and nothing at all for a service that runs for
@@ -199,6 +199,7 @@ pub fn build_storage_checkpoint_task(deps: StorageCheckpointDeps) -> ServiceTask
         move |_stop| {
             if let Some(cache) = deps.cache.as_ref() {
                 if let Ok(c) = cache.lock() {
+                    sweep_cache(&*c, SystemTime::now());
                     checkpoint_logged("fqdn-cache", c.periodic_vacuum());
                 }
             }
@@ -218,6 +219,36 @@ pub fn build_storage_checkpoint_task(deps: StorageCheckpointDeps) -> ServiceTask
             TaskOutcome::Continue
         },
     )
+}
+
+/// Ages out what the cache would otherwise keep forever. Batched by the
+/// default policy, so one pass holds the cache lock for a bounded delete.
+pub(crate) fn sweep_cache(cache: &dyn nrr_storage::repository::CacheRepository, now: SystemTime) {
+    match cache.cleanup_expired(now, &nrr_storage::dto::CleanupPolicy::default()) {
+        Ok(s) => {
+            let removed = s.expired_resolutions_removed
+                + s.negative_cache_entries_removed
+                + s.lookup_events_removed
+                + s.shared_ip_direct_hosts_removed;
+            if removed > 0 {
+                tracing::debug!(
+                    target: "nrr::retention",
+                    msg_key = "svctask-cache-swept",
+                    resolutions = s.expired_resolutions_removed,
+                    negative = s.negative_cache_entries_removed,
+                    lookup_events = s.lookup_events_removed,
+                    shared_hosts = s.shared_ip_direct_hosts_removed,
+                    "cache sweep removed aged rows",
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            target: "nrr::retention",
+            msg_key = "svctask-cache-sweep-failed",
+            error = %e,
+            "cache sweep failed; retrying next pass",
+        ),
+    }
 }
 
 fn checkpoint_logged(database: &str, outcome: nrr_storage::StorageResult<()>) {

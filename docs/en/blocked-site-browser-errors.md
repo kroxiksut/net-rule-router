@@ -2,7 +2,7 @@
 
 **English** · [Русский](../ru/blocked-site-browser-errors.md)
 
-When leak protection (the kill-switch) is active and the additional adapter
+When leak protection is active and the additional adapter
 is down, sites that are routed through that adapter are deliberately
 blocked instead of being allowed to leak onto your main link. In that
 state the browser shows one of its own error pages:
@@ -72,5 +72,5 @@ a private/incognito window, which has no local cache to fall back on.
   was blocked, and **Hide addresses in these notifications** keeps the
   destination off screen while you share or record it.
 - If you want such sites to open without protection while the additional
-  adapter is down, that is a policy choice — review the kill-switch
+  adapter is down, that is a policy choice — review the leak protection
   settings rather than treating the error page as a bug.

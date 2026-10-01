@@ -10,7 +10,7 @@ license = "MPL-2.0"
 path = "src/lib.rs"
 
 [dependencies]
-# Block 16.4: payload types and diagnostics DTOs moved into this crate as
+# Payload types and diagnostics DTOs moved into this crate as
 # wire-protocol SSOT (so `nrr-ipc-client` can build typed requests without
 # pulling in `nrr-diagnostics`). Hence `serde` derive is now needed here.
 serde      = { version = "1", features = ["derive"] }

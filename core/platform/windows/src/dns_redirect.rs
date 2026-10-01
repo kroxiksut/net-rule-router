@@ -304,7 +304,7 @@ struct CandidateLine<'a> {
     friendly_name: &'a str,
 }
 
-/// `"17\t192.168.0.1\tIntel(R) I219-V\tEthernet"` → columns. A bare address, or
+/// `"17\t192.168.0.1\tPCI Ethernet\tEthernet"` → columns. A bare address, or
 /// the older space-separated `<index> <addr>` shape, still parses (with no
 /// names), so a degraded emitter never silently yields nothing.
 fn parse_candidate_line(line: &str) -> Option<CandidateLine<'_>> {
@@ -385,6 +385,36 @@ pub fn clear_orphan_redirect<S: NrptRuleStore>(store: &S) -> Result<usize, Platf
     let own = usize::from(store.delete_rule(NRPT_RULE_KEY)?);
     let exemptions = store.sweep_orphans(NRPT_EXEMPT_MARKER, "")?;
     Ok(own + exemptions + store.sweep_orphans(NRPT_MARKER, "")?)
+}
+
+/// What [`sweep_orphan_dns_state`] took back from a dead instance.
+#[derive(Debug)]
+pub struct OrphanDnsSweep {
+    /// Rules removed, as [`clear_orphan_redirect`] counts them.
+    pub nrpt_rules: Result<usize, PlatformError>,
+    /// Whether a suffix list of ours was there, as [`release_search_list`] says.
+    pub search_list: Result<bool, PlatformError>,
+}
+
+impl OrphanDnsSweep {
+    /// Both halves succeeded: nothing of ours is known to be left behind.
+    pub fn is_clean(&self) -> bool {
+        self.nrpt_rules.is_ok() && self.search_list.is_ok()
+    }
+}
+
+/// Take back the DNS state a dead instance left: the NRPT redirect and the
+/// suffix search list. Both halves run whatever the other returned — with the
+/// service gone, nothing else would take back the one skipped.
+pub fn sweep_orphan_dns_state<S: NrptRuleStore>(
+    nrpt: &S,
+    search_list: &dyn SearchListStore,
+) -> OrphanDnsSweep {
+    let nrpt_rules = clear_orphan_redirect(nrpt);
+    OrphanDnsSweep {
+        nrpt_rules,
+        search_list: release_search_list(search_list),
+    }
 }
 
 /// Echo the namespace our redirect governs iff the OS is ACTUALLY resolving
@@ -487,8 +517,9 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
                 tracing::warn!(
                     target: "nrr::dns-redirect",
                     msg_key = "win-dns-redirect-verify-unconfirmed",
+                    error = %error,
                     "NRPT redirect installed but could not be confirmed against the \
-                     effective policy table ({error}); proceeding as armed",
+                     effective policy table; proceeding as armed",
                 );
                 Ok(handle)
             }
@@ -509,7 +540,8 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
             tracing::warn!(
                 target: "nrr::dns-redirect",
                 msg_key = "win-dns-redirect-exemption-sweep-failed",
-                "could not remove the namespace exemptions: {error:?}",
+                error = %error,
+                "could not remove the namespace exemptions",
             );
         }
         if let Some(search_list) = self.search_list.as_deref() {
@@ -517,7 +549,8 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
                 tracing::warn!(
                     target: "nrr::dns-redirect",
                     msg_key = "win-dns-search-list-release-failed",
-                    "could not take back the DNS suffix search list: {error:?}",
+                    error = %error,
+                    "could not take back the DNS suffix search list",
                 );
             }
         }
@@ -589,7 +622,8 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
                     target: "nrr::dns-redirect",
                     msg_key = "win-dns-redirect-exemption-write-failed",
                     suffix = %exemption.suffix,
-                    "could not leave this namespace to its own resolver: {error:?}",
+                    error = %error,
+                    "could not leave this namespace to its own resolver",
                 ),
             }
         }
@@ -605,11 +639,16 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         Ok(written)
     }
 
-    fn keep_short_names(&self, extra: &[String]) -> Result<(), PlatformError> {
+    fn keep_short_names(
+        &self,
+        claimed: &[DnsNamespaceExemption],
+        extra: &dyn Fn() -> Vec<String>,
+    ) -> Result<(), PlatformError> {
         let Some(search_list) = self.search_list.as_deref() else {
             return Ok(());
         };
-        match sync_search_list(search_list, extra)? {
+        let connections: Vec<String> = claimed.iter().map(|c| c.suffix.clone()).collect();
+        match sync_search_list(search_list, &connections, &extra())? {
             SearchListOutcome::Written(suffixes) => tracing::info!(
                 target: "nrr::dns-redirect",
                 msg_key = "win-dns-search-list-written",
@@ -636,7 +675,7 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
             .flush_resolver_cache()
             .map_err(|error| PlatformError::Transient {
                 operation: "nrpt.flush_cache",
-                detail: format!("resolver cache flush failed: {error:?}"),
+                detail: format!("resolver cache flush failed: {error}"),
             })
     }
 }
@@ -646,78 +685,32 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
 #[cfg(target_os = "windows")]
 pub struct PowerShellRunner;
 
-/// Longest one NRPT cmdlet may take before it is given up on and killed.
-///
-/// Generous on purpose: a cold `powershell.exe` plus the WMI round-trip these
-/// cmdlets make is seconds, not milliseconds, and killing a healthy-but-slow
-/// call would leave the redirect half-applied. Bounded all the same — every
-/// caller here is a boot step, a stop step or a recovery command, and each of
-/// them turns an unbounded wait into the failure it is trying to prevent.
+/// Longest one NRPT cmdlet may take before it is killed. Generous on purpose: a
+/// cold `powershell.exe` plus the WMI round-trip is seconds, and killing a
+/// healthy-but-slow call would leave the redirect half-applied.
 #[cfg(target_os = "windows")]
 const POWERSHELL_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// How often the spawned process is checked while waiting.
-#[cfg(target_os = "windows")]
-const POWERSHELL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[cfg(target_os = "windows")]
 impl CommandRunner for PowerShellRunner {
     fn run_powershell(&self, script: &str) -> Result<CommandOutput, PlatformError> {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW — never flash a console window from the background
-        // service. (Not `unsafe`: it is a plain process-creation flag.)
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // Spawned rather than `output()`ed: `output()` waits forever, and every
-        // caller of this runner is a boot step, a stop step or a recovery
-        // command. A `powershell.exe` that never returns would hang the very
-        // paths that exist to unstick a machine.
-        let mut child = std::process::Command::new(crate::system_shell::system_powershell())
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| PlatformError::Transient {
-                operation: "nrpt.powershell.spawn",
-                detail: e.to_string(),
-            })?;
-
-        // Polling rather than draining the pipes concurrently: every script in
-        // this module answers with a marker or a count, far below the pipe
-        // buffer, so the child cannot block on a full pipe while we wait.
-        let deadline = std::time::Instant::now() + POWERSHELL_BUDGET;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if std::time::Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(PlatformError::Transient {
-                        operation: "nrpt.powershell.timeout",
-                        detail: format!(
-                            "powershell did not answer within {:?}; the call was killed",
-                            POWERSHELL_BUDGET
-                        ),
-                    });
-                }
-                Ok(None) => std::thread::sleep(POWERSHELL_POLL),
-                Err(e) => {
-                    let _ = child.kill();
-                    return Err(PlatformError::Transient {
-                        operation: "nrpt.powershell.wait",
-                        detail: e.to_string(),
-                    });
-                }
-            }
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| PlatformError::Transient {
-                operation: "nrpt.powershell.output",
-                detail: e.to_string(),
-            })?;
+        let output = crate::bounded_command::output_within(
+            std::process::Command::new(crate::system_shell::system_powershell()).args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ]),
+            POWERSHELL_BUDGET,
+        )
+        .map_err(|e| PlatformError::Transient {
+            operation: if e.kind() == std::io::ErrorKind::TimedOut {
+                "nrpt.powershell.timeout"
+            } else {
+                "nrpt.powershell.run"
+            },
+            detail: e.to_string(),
+        })?;
         Ok(CommandOutput {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

@@ -43,6 +43,11 @@ fn is_root() -> bool {
 
 const IFACE_ENV: &str = "NRR_LIVE_TEST_IFACE";
 
+/// Above every login and `DynamicUser` range: a live rule must never catch the
+/// machine's real user. `skuid` matches the number, no account is needed.
+const TEST_UID: u32 = 999_999;
+const OTHER_TEST_UID: u32 = 999_998;
+
 fn list_tables() -> String {
     let output = Command::new("nft")
         .args(["list", "tables"])
@@ -209,7 +214,7 @@ fn the_leak_guard_reaches_the_kernel_as_a_drop() {
 
     let guarded = std::net::Ipv4Addr::new(198, 51, 100, 66);
     enforcer
-        .enforce(&[guarded_plan(1000, guarded)])
+        .enforce(&[guarded_plan(TEST_UID, guarded)])
         .expect("the kernel must accept the guard");
 
     let installed = list_our_table(&table);
@@ -220,7 +225,7 @@ fn the_leak_guard_reaches_the_kernel_as_a_drop() {
 
     // And the platform must report the missing link as unavailable rather than
     // claim a channel that is gone.
-    let availability = enforcer.channel_availability(&UserPrincipal::from_linux_uid(1000));
+    let availability = enforcer.channel_availability(&UserPrincipal::from_linux_uid(TEST_UID));
     assert!(!availability.secondary && !availability.primary);
 
     enforcer.teardown().expect("teardown must succeed");
@@ -242,7 +247,7 @@ fn two_principals_survive_one_apply_on_a_live_kernel() {
     let enforcer =
         NftPolicyEnforcer::new(Arc::new(BoundToLink(link)), adapters).with_table(table.clone());
     let report = enforcer
-        .enforce(&[plan_for(1000, 7), plan_for(1001, 8)])
+        .enforce(&[plan_for(TEST_UID, 7), plan_for(OTHER_TEST_UID, 8)])
         .expect("the kernel must accept the plans");
 
     assert_eq!(report.skipped, 0, "notes: {:?}", report.notes);
@@ -250,7 +255,8 @@ fn two_principals_survive_one_apply_on_a_live_kernel() {
 
     let installed = list_our_table(&table);
     assert!(
-        installed.contains("skuid 1000") && installed.contains("skuid 1001"),
+        installed.contains(&format!("skuid {TEST_UID}"))
+            && installed.contains(&format!("skuid {OTHER_TEST_UID}")),
         "both users must be enforced after ONE apply; got:\n{installed}",
     );
     assert!(
@@ -262,7 +268,7 @@ fn two_principals_survive_one_apply_on_a_live_kernel() {
     // idempotent by construction, and this is where that claim is tested.
     let before = installed.matches("skuid").count();
     enforcer
-        .enforce(&[plan_for(1000, 7), plan_for(1001, 8)])
+        .enforce(&[plan_for(TEST_UID, 7), plan_for(OTHER_TEST_UID, 8)])
         .expect("re-apply must succeed");
     let after = list_our_table(&table).matches("skuid").count();
     assert_eq!(before, after, "re-apply duplicated rules");

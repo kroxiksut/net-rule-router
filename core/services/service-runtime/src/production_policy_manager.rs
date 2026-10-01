@@ -99,26 +99,9 @@ fn query_pending(conn: &Connection, principal: &str, limit: usize) -> Vec<Revisi
 }
 
 fn record_to_summary(rec: nrr_storage::revisions::RevisionRecord) -> RevisionSummary {
-    use nrr_domain::rules_revision::RevisionStatus;
-    let status_slug: &'static str = match rec.status {
-        RevisionStatus::Candidate => "candidate",
-        RevisionStatus::Active => "active",
-        RevisionStatus::Superseded => "superseded",
-        RevisionStatus::RolledBack => "rolled-back",
-        RevisionStatus::Rejected => "rejected",
-    };
-    let source_slug: &'static str = match rec.source {
-        nrr_domain::rules_revision::RulesRevisionSource::GuiRulesEdit => "gui-rules-edit",
-        nrr_domain::rules_revision::RulesRevisionSource::PresetImport => "preset-import",
-        nrr_domain::rules_revision::RulesRevisionSource::RecoveryLkg => "recovery-lkg",
-        nrr_domain::rules_revision::RulesRevisionSource::Rollback => "rollback",
-    };
-    let risk_level_slug: Option<&'static str> = rec.risk_level.map(|level| match level {
-        nrr_domain::revision::RiskLevel::Low => "low",
-        nrr_domain::revision::RiskLevel::Medium => "medium",
-        nrr_domain::revision::RiskLevel::High => "high",
-        nrr_domain::revision::RiskLevel::Critical => "critical",
-    });
+    let status_slug: &'static str = rec.status.as_slug();
+    let source_slug: &'static str = rec.source.as_slug();
+    let risk_level_slug: Option<&'static str> = rec.risk_level.map(|level| level.as_slug());
     RevisionSummary {
         revision_id: rec.revision_id,
         status_slug,
@@ -135,15 +118,7 @@ fn record_to_summary(rec: nrr_storage::revisions::RevisionRecord) -> RevisionSum
 fn record_to_active_state(record: nrr_storage::revisions::RevisionRecord) -> ActiveRevisionState {
     ActiveRevisionState {
         revision_id: record.revision_id,
-        // Provenance is currently the source slug; a future revision
-        // may surface a richer label.
-        provenance: match record.source {
-            nrr_domain::rules_revision::RulesRevisionSource::GuiRulesEdit => "gui-rules-edit",
-            nrr_domain::rules_revision::RulesRevisionSource::PresetImport => "preset-import",
-            nrr_domain::rules_revision::RulesRevisionSource::RecoveryLkg => "recovery-lkg",
-            nrr_domain::rules_revision::RulesRevisionSource::Rollback => "rollback",
-        }
-        .to_string(),
+        provenance: record.source.as_slug().to_string(),
         // Rule count is opaque to the coordinator (rules_json
         // stays in storage). A future revision may parse + count when
         // this field becomes user-visible.

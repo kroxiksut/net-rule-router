@@ -2,8 +2,8 @@
 //!
 //! A [`CanonicalProfile`] is the normalized, validated form of an
 //! [`ActiveConfiguration`]. It is produced by the validation pipeline in
-//! [`crate::validation`] and consumed by the revision system as input to
-//! `PolicyRevision`.
+//! [`crate::validation`] and consumed by the review diff
+//! ([`crate::review::compute_diff`]).
 //!
 //! # Canonical ordering
 //!
@@ -425,12 +425,11 @@ impl CanonicalRuleBook {
 ///   are UI preferences stored in `UiPreferences`, not routing policy.
 /// - **Rule insertion order** — `CanonicalRuleBook` uses deterministic ordering
 ///   regardless of the file's display order.
-/// - **Import metadata** (source path, import timestamp) — tracked separately
-///   by `ImportedArtifact`.
+/// - **Import metadata** (source path, import timestamp) — provenance, not policy.
 ///
 /// # SHA-256 content hash
 ///
-/// The hash in `PolicyRevision` is computed over the canonical serialized form:
+/// A revision's content hash is computed over the canonical serialized form:
 /// `primary + secondary + behavior_mode + rule_book`. Display labels and import
 /// metadata are excluded from the hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -600,10 +599,10 @@ mod tests {
         let rules_a = vec![
             exact_fqdn_rule("r-1", "example.com"),
             exact_fqdn_rule("r-2", "api.example.com"),
-            ip_rule("r-3", Ipv4Addr::new(1, 1, 1, 1)),
+            ip_rule("r-3", Ipv4Addr::new(192, 0, 2, 1)),
         ];
         let rules_b = vec![
-            ip_rule("r-3", Ipv4Addr::new(1, 1, 1, 1)),
+            ip_rule("r-3", Ipv4Addr::new(192, 0, 2, 1)),
             exact_fqdn_rule("r-2", "api.example.com"),
             exact_fqdn_rule("r-1", "example.com"),
         ];
@@ -714,8 +713,8 @@ mod tests {
         let suffix = CanonicalAddressMatch::SuffixDomain("example.com".to_string());
         assert_eq!(suffix.to_display_string(), "*.example.com");
 
-        let ip = CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
-        assert_eq!(ip.to_display_string(), "1.2.3.4");
+        let ip = CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4)));
+        assert_eq!(ip.to_display_string(), "192.0.2.4");
     }
 
     // ── subdomain-coverage expansion ──────────────────────────────────────────
@@ -724,21 +723,21 @@ mod tests {
     fn subdomain_coverage_adds_suffix_and_keeps_apex() {
         let book = CanonicalRuleBook {
             primary: CanonicalRuleSet::default(),
-            secondary: CanonicalRuleSet::from_rules(vec![exact_fqdn_rule("r1", "whatismyip.com")]),
+            secondary: CanonicalRuleSet::from_rules(vec![exact_fqdn_rule("r1", "site.example")]),
         };
         let expanded = book.with_subdomain_coverage();
         let sec = expanded.secondary.rules();
         assert!(
             sec.iter().any(|r| matches!(
                 &r.address_match,
-                Some(CanonicalAddressMatch::ExactFqdn(d)) if d == "whatismyip.com"
+                Some(CanonicalAddressMatch::ExactFqdn(d)) if d == "site.example"
             )),
             "apex ExactFqdn must be preserved",
         );
         assert!(
             sec.iter().any(|r| matches!(
                 &r.address_match,
-                Some(CanonicalAddressMatch::SuffixDomain(d)) if d == "whatismyip.com"
+                Some(CanonicalAddressMatch::SuffixDomain(d)) if d == "site.example"
             )),
             "a SuffixDomain sibling must be added",
         );
@@ -769,7 +768,7 @@ mod tests {
     fn subdomain_coverage_leaves_non_fqdn_rules_untouched() {
         let set = CanonicalRuleSet::from_rules(vec![
             zone_rule("z", "ru"),
-            ip_rule("i", Ipv4Addr::new(1, 2, 3, 4)),
+            ip_rule("i", Ipv4Addr::new(192, 0, 2, 4)),
             app_rule("a", "chrome.exe"),
         ]);
         let book = CanonicalRuleBook {

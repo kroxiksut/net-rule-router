@@ -34,12 +34,11 @@
 //! rendered on every status-bar tick while the user decides, so the
 //! counts are computed once, at write time.
 
-use std::time::SystemTime;
-
 use rusqlite::{params, OptionalExtension};
 
 use crate::db::SidecarDb;
 use crate::error::{SidecarError, SidecarResult};
+use nrr_sqlite_support::unix_now_ms;
 
 /// Pre-computed counts surfaced by the "Apply pending changes?" toast.
 ///
@@ -87,7 +86,7 @@ impl SidecarDb {
 
     /// Test-friendly variant that accepts an explicit "now" timestamp
     /// (milliseconds since epoch). Production code goes through
-    /// [`read_pending_apply`] which calls `SystemTime::now()`.
+    /// [`read_pending_apply`] which reads the clock.
     pub fn read_pending_apply_at(&self, now_ms: i64) -> SidecarResult<Option<PendingApplyEntry>> {
         let conn = self.conn_mut();
         conn.execute(
@@ -152,17 +151,6 @@ impl SidecarDb {
         conn.execute("DELETE FROM pending_apply WHERE id = 1", [])?;
         Ok(())
     }
-}
-
-/// Current Unix epoch in milliseconds. Mirrors the helper in other
-/// DAO modules; kept private here so each table file remains
-/// self-contained.
-fn unix_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

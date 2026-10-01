@@ -22,6 +22,11 @@
 //! batches committed; the next reconcile converges on the intended set, and
 //! `cleanup_all` deletes every filter of ours by provider GUID on stop.
 //!
+//! Because a batch boundary is visible to traffic, replacing one filter set
+//! with another goes through [`WfpSession::execute_replacement`]: every add
+//! commits before the first delete, so each committed state holds the old
+//! set or the new one whole.
+//!
 //! ## Idempotency (error classification)
 //!
 //! - `FWP_E_DUPLICATE_OBJECT` on AddFilter → already added → treat as success.
@@ -91,6 +96,29 @@ pub struct SkippedFilter {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WfpApplyOutcome {
     pub skipped: Vec<SkippedFilter>,
+}
+
+/// What [`WfpSession::execute_replacement`] did.
+#[derive(Debug, Default)]
+pub struct WfpReplaceOutcome {
+    /// Adds skipped as un-materializable (best-effort only).
+    pub skipped: Vec<SkippedFilter>,
+    /// Filters retired. Empty unless the whole retire pass committed.
+    pub retired: Vec<WfpFilterId>,
+    /// Why the retire pass did not complete, when it did not. Everything it
+    /// was asked to retire is then still to be treated as installed.
+    pub retire_held: Option<RetireHeld>,
+}
+
+/// Why a replacement kept the filters it was asked to retire.
+#[derive(Debug)]
+pub enum RetireHeld {
+    /// A replacement block that guards traffic was skipped; retiring what it
+    /// replaces would open the gap the block exists to close.
+    ReplacementSkipped,
+    /// The engine refused a delete. Part of the set may be gone already;
+    /// deleting a missing filter is idempotent, so the whole set is retried.
+    Failed(PlatformError),
 }
 
 // ── WfpSession ────────────────────────────────────────────────────────────────
@@ -176,10 +204,78 @@ impl WfpSession {
         // enforcement. `begin_transaction` is a low-level primitive NOT guarded by
         // this lock — production mutations funnel through here / `execute_wfp_plan`.
         let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
-        for batch in actions.chunks(MAX_FILTERS_PER_TRANSACTION) {
-            self.execute_batch(batch, mode, &mut outcome)?;
+        self.execute_batches(actions, mode, &mut outcome)?;
+        Ok(outcome)
+    }
+
+    /// Replace filters make-before-break: every one of `adds` commits before
+    /// the first of `retire` is deleted, so no committed state lacks both the
+    /// old filter and its replacement — batching included. A failed add
+    /// retires nothing.
+    ///
+    /// The retire pass is held back when a guarding block among `adds` was
+    /// skipped, and an id that is also being added is never retired: over-
+    /// coverage until the next pass is the safe side of both.
+    pub fn execute_replacement(
+        &self,
+        adds: &[WfpFilterSpec],
+        retire: &[WfpFilterId],
+        mode: FilterFailureMode,
+    ) -> Result<WfpReplaceOutcome, PlatformError> {
+        let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let add_actions: Vec<WfpFilterAction> = adds
+            .iter()
+            .cloned()
+            .map(WfpFilterAction::AddFilter)
+            .collect();
+        let mut added = WfpApplyOutcome::default();
+        self.execute_batches(&add_actions, mode, &mut added)?;
+
+        let adding: HashSet<u64> = adds.iter().map(|s| s.id.raw).collect();
+        let retire: Vec<WfpFilterId> = retire
+            .iter()
+            .copied()
+            .filter(|id| !adding.contains(&id.raw))
+            .collect();
+        let skipped: HashSet<u64> = added.skipped.iter().map(|s| s.id.raw).collect();
+        let mut outcome = WfpReplaceOutcome {
+            skipped: added.skipped,
+            ..WfpReplaceOutcome::default()
+        };
+        if retire.is_empty() {
+            return Ok(outcome);
+        }
+        if adds
+            .iter()
+            .any(|s| skipped.contains(&s.id.raw) && s.guards_traffic())
+        {
+            outcome.retire_held = Some(RetireHeld::ReplacementSkipped);
+            return Ok(outcome);
+        }
+        let delete_actions: Vec<WfpFilterAction> = retire
+            .iter()
+            .copied()
+            .map(WfpFilterAction::DeleteFilter)
+            .collect();
+        let mut deleted = WfpApplyOutcome::default();
+        match self.execute_batches(&delete_actions, FilterFailureMode::Strict, &mut deleted) {
+            Ok(()) => outcome.retired = retire,
+            Err(e) => outcome.retire_held = Some(RetireHeld::Failed(e)),
         }
         Ok(outcome)
+    }
+
+    /// Caller holds `apply_lock`.
+    fn execute_batches(
+        &self,
+        actions: &[WfpFilterAction],
+        mode: FilterFailureMode,
+        outcome: &mut WfpApplyOutcome,
+    ) -> Result<(), PlatformError> {
+        for batch in actions.chunks(MAX_FILTERS_PER_TRANSACTION) {
+            self.execute_batch(batch, mode, outcome)?;
+        }
+        Ok(())
     }
 
     /// Execute one batch of filter actions within a single WFP transaction.
@@ -791,6 +887,145 @@ mod tests {
             .collect();
         s.execute_wfp_plan(&actions).unwrap();
         assert_eq!(api.wfp_filters.lock().unwrap().len(), n);
+    }
+
+    // ── execute_replacement ───────────────────────────────────────────────────
+
+    fn ids(range: std::ops::Range<u64>) -> Vec<WfpFilterId> {
+        range.map(|raw| WfpFilterId { raw }).collect()
+    }
+
+    fn install(s: &WfpSession, range: std::ops::Range<u64>) {
+        let actions: Vec<WfpFilterAction> =
+            range.map(|i| WfpFilterAction::AddFilter(spec(i))).collect();
+        s.execute_wfp_plan(&actions).unwrap();
+    }
+
+    /// Every recorded state holds the old set or the new one whole.
+    fn assert_never_uncovered(api: &MockWindowsApi, old: &[WfpFilterId], new: &[WfpFilterId]) {
+        let history = api.wfp_history();
+        assert!(!history.is_empty(), "nothing was recorded");
+        for (step, state) in history.iter().enumerate() {
+            let holds = |set: &[WfpFilterId]| set.iter().all(|id| state.contains(&id.raw));
+            assert!(
+                holds(old) || holds(new),
+                "step {step}: neither the old nor the new set is complete",
+            );
+        }
+    }
+
+    /// Ids re-derived by an update replace every filter at once, in more
+    /// than one transaction; no state in between may lack both sets.
+    #[test]
+    fn a_replacement_across_batches_never_uncovers() {
+        let api = mock_api();
+        let s = session(&api);
+        let n = MAX_FILTERS_PER_TRANSACTION as u64 + 20;
+        install(&s, 0..n);
+        api.record_wfp_history();
+
+        let adds: Vec<WfpFilterSpec> = (n..2 * n).map(spec).collect();
+        let outcome = s
+            .execute_replacement(&adds, &ids(0..n), FilterFailureMode::BestEffort)
+            .unwrap();
+
+        assert!(outcome.retire_held.is_none());
+        assert_eq!(outcome.retired.len(), n as usize);
+        assert_never_uncovered(&api, &ids(0..n), &ids(n..2 * n));
+        let live: Vec<u64> = api
+            .wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.id.raw)
+            .collect();
+        assert_eq!(live, (n..2 * n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_failed_add_retires_nothing() {
+        let api = mock_api();
+        let s = session(&api);
+        install(&s, 0..3);
+        let late = MAX_FILTERS_PER_TRANSACTION as u64 + 110;
+        api.set_fail_add_win32(&[late], "FwpmFilterAdd0", 0x5);
+
+        let adds: Vec<WfpFilterSpec> = (100..late + 1).map(spec).collect();
+        assert!(s
+            .execute_replacement(&adds, &ids(0..3), FilterFailureMode::BestEffort)
+            .is_err());
+        let live = api.wfp_filters.lock().unwrap();
+        assert!((0..3).all(|raw| live.iter().any(|f| f.id.raw == raw)));
+    }
+
+    #[test]
+    fn a_skipped_guarding_block_holds_the_retirement() {
+        let api = mock_api();
+        api.set_fail_add_unmaterializable(&[11]);
+        let s = session(&api);
+        install(&s, 0..2);
+
+        let outcome = s
+            .execute_replacement(
+                &[spec(10), spec(11)],
+                &ids(0..2),
+                FilterFailureMode::BestEffort,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome.retire_held,
+            Some(RetireHeld::ReplacementSkipped)
+        ));
+        assert!(outcome.retired.is_empty());
+        assert_eq!(api.wfp_filters.lock().unwrap().len(), 3);
+    }
+
+    /// An app-only block whose executable is absent covers no destination,
+    /// so skipping it must not keep a superseded set armed forever.
+    #[test]
+    fn a_skipped_app_only_block_does_not_hold_the_retirement() {
+        let api = mock_api();
+        api.set_fail_add_unmaterializable(&[11]);
+        let s = session(&api);
+        install(&s, 0..2);
+        let app_only = WfpFilterSpec {
+            remote_ip: None,
+            app_pattern: Some("absent.exe".into()),
+            ..spec(11)
+        };
+
+        let outcome = s
+            .execute_replacement(
+                &[spec(10), app_only],
+                &ids(0..2),
+                FilterFailureMode::BestEffort,
+            )
+            .unwrap();
+
+        assert!(outcome.retire_held.is_none());
+        assert_eq!(outcome.retired, ids(0..2));
+    }
+
+    #[test]
+    fn an_id_being_added_is_never_retired() {
+        let api = mock_api();
+        let s = session(&api);
+        install(&s, 0..2);
+
+        let outcome = s
+            .execute_replacement(&[spec(1)], &ids(0..2), FilterFailureMode::BestEffort)
+            .unwrap();
+
+        assert_eq!(outcome.retired, ids(0..1));
+        let live: Vec<u64> = api
+            .wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.id.raw)
+            .collect();
+        assert_eq!(live, vec![1]);
     }
 
     // ── cleanup_all ───────────────────────────────────────────────────────────

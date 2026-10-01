@@ -1,11 +1,11 @@
 //! `WfpEnginePort` — the WFP filter engine — plus the neutral `MockWindowsApi`.
 //!
-//! The route table and adapter half of what used to be one `WindowsApiPort`
-//! now lives in [`crate::route_table::RouteTablePort`]: every OS can answer it,
-//! and keeping it here forced a Linux backend to stub the filter engine in
-//! order to reach it. What remains below is genuinely Windows-shaped — a WFP
-//! engine handle, its transactions, and filters keyed by GUID — and no other
-//! platform implements it.
+//! The route table and adapter half of `WindowsApiPort` lives in
+//! [`crate::route_table::RouteTablePort`] instead: every OS can answer it, and
+//! a Linux backend should never have to stub a filter engine just to reach it.
+//! What remains below is genuinely Windows-shaped — a WFP engine handle, its
+//! transactions, and filters keyed by GUID — and no other platform implements
+//! it.
 //!
 //! Per the policy/mechanism seam, the port DEFINITION and its always-compiled
 //! test double (`MockWindowsApi`, plus the deterministic `mock_luid_for_index`
@@ -134,14 +134,18 @@ pub struct MockWindowsApi {
     /// and it needs its own switch to exercise.
     pub fail_route_table_read: Mutex<Option<String>>,
     /// Filter ids (raw) whose `wfp_filter_add` returns
-    /// `FWP_E_CONDITION_NOT_FOUND` (an un-materializable filter) — used to
-    /// exercise the best-effort / strict apply policies selectively.
+    /// `FWP_E_CONDITION_NOT_FOUND` (an un-materializable filter) — for
+    /// exercising the best-effort / strict apply policies selectively.
     fail_add_ids: Mutex<std::collections::HashSet<u64>>,
     /// Filter ids (raw) whose `wfp_filter_add` returns an arbitrary
-    /// `PlatformError::Win32 { operation, code }` — used to exercise
+    /// `PlatformError::Win32 { operation, code }` — for exercising
     /// error-classification seams (e.g. the sub-layer-stage vs
     /// duplicate-filter distinction) without a real WFP engine.
     fail_add_win32: Mutex<Option<(std::collections::HashSet<u64>, &'static str, u32)>>,
+    /// The live filter ids after every add and delete, once
+    /// [`Self::record_wfp_history`] is called. Per operation rather than per
+    /// commit: stricter than what traffic can observe.
+    wfp_history: Mutex<Option<Vec<Vec<u64>>>>,
     next_engine_token: Mutex<u64>,
     #[allow(dead_code)]
     next_filter_id: Mutex<u64>,
@@ -164,6 +168,7 @@ impl MockWindowsApi {
             fail_route_table_read: Mutex::new(None),
             fail_add_ids: Mutex::new(std::collections::HashSet::new()),
             fail_add_win32: Mutex::new(None),
+            wfp_history: Mutex::new(None),
             next_engine_token: Mutex::new(1),
             next_filter_id: Mutex::new(1),
             console_user_sid: Mutex::new(None),
@@ -193,6 +198,29 @@ impl MockWindowsApi {
     pub fn set_fail_add_win32(&self, ids: &[u64], operation: &'static str, code: u32) {
         *self.fail_add_win32.lock().unwrap() =
             Some((ids.iter().copied().collect(), operation, code));
+    }
+
+    /// Start recording the live filter ids after every mutation.
+    pub fn record_wfp_history(&self) {
+        *self.wfp_history.lock().unwrap() = Some(Vec::new());
+    }
+
+    /// Every state recorded since [`Self::record_wfp_history`], oldest first.
+    pub fn wfp_history(&self) -> Vec<Vec<u64>> {
+        self.wfp_history.lock().unwrap().clone().unwrap_or_default()
+    }
+
+    fn note_wfp_state(&self) {
+        if let Some(history) = self.wfp_history.lock().unwrap().as_mut() {
+            let ids = self
+                .wfp_filters
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|f| f.id.raw)
+                .collect();
+            history.push(ids);
+        }
     }
 
     pub fn set_route_table(&self, routes: Vec<RouteEntry>) {
@@ -411,6 +439,7 @@ impl WfpEnginePort for MockWindowsApi {
             remote_subnet_v6: spec.remote_subnet_v6,
             ip_protocol: spec.ip_protocol,
         });
+        self.note_wfp_state();
         Ok(id)
     }
 
@@ -421,6 +450,7 @@ impl WfpEnginePort for MockWindowsApi {
     ) -> Result<(), PlatformError> {
         self.check_error()?;
         self.wfp_filters.lock().unwrap().retain(|f| f.id != id);
+        self.note_wfp_state();
         Ok(())
     }
 
@@ -456,7 +486,7 @@ mod tests {
         WfpFilterSpec {
             layer: WfpLayerKey::AleAuthConnectV4,
             action: WfpAction::Block,
-            remote_ip: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            remote_ip: Some(Ipv4Addr::new(192, 0, 2, 4)),
             remote_ip_set: Vec::new(),
             remote_ip_set_v6: Vec::new(),
             remote_port: None,

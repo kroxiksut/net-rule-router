@@ -24,6 +24,9 @@ ColumnLayout {
     //
     // Manual Refresh resets the accumulator to a fresh first page via
     // RPC (cursor=""); changing filters re-runs the same path.
+    //
+    // The operational filters are applied by the service: hiding rows here
+    // left pages of nothing with the matches further back.
     property var _logEntries: []
     property var _auditEntries: []
     property string _logsCursor: ""
@@ -32,7 +35,13 @@ ColumnLayout {
     property bool _auditLoading: false
     property string _logsError: ""
     property string _auditError: ""
+    // The filter the listed rows were fetched with, so "Load more" continues
+    // that listing; a newer request makes an older answer stale.
+    property var _logsQuery: ({})
+    property int _logsGeneration: 0
     property bool _seeded: false
+    // Wall clock for the verbose-logging banner below; ticks only while shown.
+    property real _verboseNowMs: Date.now()
 
     property string activeTab: "operational"
     // Opt-in read-only security-audit viewer ("Show security audit tab" in
@@ -161,19 +170,46 @@ ColumnLayout {
             && typeof nrrNativeBridge.rpcLogsList === "function"
             && typeof nrrNativeBridge.rpcAuditList === "function"
     }
+    // `LogEntryFilter` on the wire (snake_case). Empty fields are left out:
+    // the service reads an empty category as one no event has.
+    function _logsFilter() {
+        var filter = {}
+        if (section.logRange === "current-session") {
+            var cutoff = Math.floor(Number(root.appSessionStartMs || 0))
+            if (cutoff > 0) filter.from_ms = cutoff
+        }
+        if (section.filterLevel !== "all") filter.level_min = section.filterLevel
+        if (section.filterCategory !== "") filter.category = section.filterCategory
+        if (section.filterKind !== "") filter.kind = section.filterKind
+        return filter
+    }
     function _refreshLogs() {
         if (_logsLoading) return
+        _requestFirstLogsPage()
+    }
+    // Supersedes a request in flight: a filter change must not wait behind,
+    // or be overwritten by, the answer to the previous filter.
+    function _requestFirstLogsPage() {
         if (!_bridgeHasPagination()) {
             _logsError = "bridge-unavailable"
             return
         }
+        var query = section._logsFilter()
+        var generation = ++section._logsGeneration
         _logsLoading = true
         _logsError = ""
-        var corr = nrrNativeBridge.rpcLogsList({}, "", 50)
+        var corr = nrrNativeBridge.rpcLogsList(query, "", 50)
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+            if (generation !== section._logsGeneration) return
             section._logsLoading = false
             if (!ok) {
                 section._logsError = String(errorCode || "unknown")
+                // Rows of the previous filter must not stand under the new one.
+                if (JSON.stringify(query) !== JSON.stringify(section._logsQuery)) {
+                    section._logEntries = []
+                    section._logsCursor = ""
+                    section._logsQuery = query
+                }
                 return
             }
             var items = (payload && payload.items) || []
@@ -181,6 +217,7 @@ ColumnLayout {
             for (var i = 0; i < items.length; i++) {
                 converted.push(section._logEntryFromWire(items[i]))
             }
+            section._logsQuery = query
             section._logEntries = converted
             section._logsCursor = String((payload && payload.next_cursor) || "")
         })
@@ -192,10 +229,12 @@ ColumnLayout {
             _logsError = "bridge-unavailable"
             return
         }
+        var generation = section._logsGeneration
         _logsLoading = true
         _logsError = ""
-        var corr = nrrNativeBridge.rpcLogsList({}, _logsCursor, 50)
+        var corr = nrrNativeBridge.rpcLogsList(section._logsQuery, _logsCursor, 50)
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+            if (generation !== section._logsGeneration) return
             section._logsLoading = false
             if (!ok) {
                 section._logsError = String(errorCode || "unknown")
@@ -260,31 +299,8 @@ ColumnLayout {
         })
     }
 
-    // Prime the shared verbose-logging flag from the service so the
-    // filter-bar checkbox is accurate the first time the Logs view is
-    // opened (the Settings -> Diagnostics twin may not have loaded yet).
-    // A pure GET — never a Set — so it raises no elevation prompt. Also
-    // re-run whenever the user navigates back to this section (see the
-    // Connections block below) so it never drifts from a change made
-    // elsewhere while the resident section stayed loaded.
-    function _fetchVerboseLogging() {
-        var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        if (!root.serviceStabilitySupported || !root.bridgeAvailable || bridge === null
-                || typeof bridge.rpcServiceStabilityConfigGet !== "function") {
-            return
-        }
-        var corr = bridge.rpcServiceStabilityConfigGet()
-        root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-            if (!ok || !payload) return
-            var verbose = payload["verbose-logging"]
-            if (verbose === undefined) verbose = payload.verbose_logging
-            root.serviceVerboseLogging = !!verbose
-        })
-    }
-
     Component.onCompleted: {
         _seedFromSnapshot()
-        _fetchVerboseLogging()
         // Opened at launch, the section is visible from birth and never sees
         // a visibility change; next tick, so the window's RPC wiring is in place.
         if (visible) Qt.callLater(_loadIfEmpty)
@@ -301,6 +317,18 @@ ColumnLayout {
         if (_logEntries.length === 0) _refreshLogs()
         if (_auditEntries.length === 0) _refreshAudit()
     }
+
+    // One reload for a burst of filter edits: leaving the category box by
+    // clicking the level list finishes one edit and starts another.
+    Timer {
+        id: logsFilterDebounce
+        interval: 300
+        onTriggered: section._requestFirstLogsPage()
+    }
+    onLogRangeChanged: logsFilterDebounce.restart()
+    onFilterLevelChanged: logsFilterDebounce.restart()
+    onFilterCategoryChanged: logsFilterDebounce.restart()
+    onFilterKindChanged: logsFilterDebounce.restart()
 
     // Wide enough for the timestamp as rendered (the zone suffix included) in
     // the current font; a fixed width let the suffix run into the next column.
@@ -337,35 +365,45 @@ ColumnLayout {
         // fallback, then the area it came from.
         var fallback = String(entry.message || "") || String(entry.kind || "")
         var text = root.tr(String(entry.messageKey || ""), fallback)
-        var args = entry.args || {}
-        for (var name in args) {
-            text = text.split("{" + name + "}").join(String(args[name]))
-        }
-        var corr = entry.correlationSummary || []
-        for (var i = 0; i < corr.length; i += 1) {
-            text = text.replace("{" + i + "}", String(corr[i]))
-        }
-        return text
-    }
-    function passesFilter(entry) {
-        // Session range: hide entries recorded before the current app session
-        // (matches the archive "session only" cutoff). "all" disables it.
-        if (section.logRange === "current-session") {
-            var cutoff = Number(root.appSessionStartMs || 0)
-            if (cutoff > 0 && Number(entry.createdAt || 0) < cutoff) return false
-        }
-        if (filterLevel !== "all") {
-            var levelOrder = { "trace": 0, "debug": 1, "info": 2, "warn": 3, "error": 4 }
-            var min = levelOrder[filterLevel]
-            var cur = levelOrder[String(entry.level || "info")]
-            if (min === undefined || cur === undefined || cur < min) return false
-        }
-        if (filterCategory !== "" && filterCategory !== String(entry.category || "")) return false
-        if (filterKind !== "" && String(entry.kind || "").indexOf(filterKind) < 0) return false
-        return true
+        return Pure.formatLogLine(text, fallback, entry.args, entry.correlationSummary)
     }
 
     Label { text: root.sectionTitle("logs"); color: root.textColor; font.bold: true }
+
+    // Verbose-logging state: the exact wording Settings -> Diagnostics and
+    // logs shows in its closed dropdown (`root.verboseLoggingStateText`), so
+    // this line and that one never drift apart. Hidden once the window is
+    // over; "Open settings" is where the mode is changed or extended.
+    RowLayout {
+        id: verboseLoggingBanner
+        Layout.fillWidth: true
+        visible: root.uiRevision >= 0 ? root.verboseLoggingIsActive() : false
+        spacing: root.uiTheme.spacingSm
+        Label {
+            id: verboseLoggingBannerLabel
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            color: root.mutedTextColor
+            text: root.uiRevision >= 0 ? root.verboseLoggingStateText(section._verboseNowMs) : ""
+            wrapMode: Text.WordWrap
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+        ThemedButton {
+            theme: root.uiTheme
+            text: root.tr("action.open-settings", "Open settings")
+            Accessible.role: Accessible.Button
+            Accessible.name: text
+            onClicked: root.openSettingsCategory("diagnostics")
+        }
+        Timer {
+            interval: 20000
+            repeat: true
+            running: verboseLoggingBanner.visible
+            triggeredOnStart: true
+            onTriggered: section._verboseNowMs = Date.now()
+        }
+    }
 
     // D1: TabBar
     TabBar {
@@ -415,12 +453,6 @@ ColumnLayout {
         function onUiRevisionChanged() {
             if (!root.prefs.showAuditTab && section.activeTab === "audit")
                 section.activeTab = "operational"
-        }
-        // Resident-section refresh: the Logs view stays loaded once opened,
-        // so re-read the shared verbose-logging flag each time the user
-        // navigates back to it to reflect a change made elsewhere.
-        function onSectionChanged() {
-            if (root.section === "logs") section._fetchVerboseLogging()
         }
     }
 
@@ -496,40 +528,6 @@ ColumnLayout {
         Layout.fillWidth: true
         visible: activeTab === "operational"
         spacing: root.uiTheme.spacingSm
-        // Duplicate of the Settings -> Diagnostics "Verbose service logging"
-        // toggle, surfaced here so the user can flip it right where they read
-        // the logs. Bound to the shared `root.serviceVerboseLogging` (a Binding
-        // re-asserts `checked` from it, restoring the visual state if a live
-        // apply fails), applied through the same live path used by Settings.
-        CheckBox {
-            id: verboseLoggingCheck
-            // Rides the service-stability config; where that has no handler the
-            // toggle would flip and change nothing.
-            visible: root.serviceStabilitySupported
-            text: root.tr(
-                "settings.diagnostics.service-stability.verbose.label",
-                "Verbose service logging")
-            onToggled: root.applyVerboseLogging(checked, "user:logs-verbose-toggle")
-            Binding {
-                target: verboseLoggingCheck
-                property: "checked"
-                value: root.serviceVerboseLogging
-            }
-            contentItem: Text {
-                text: verboseLoggingCheck.text
-                leftPadding: verboseLoggingCheck.indicator.width
-                    + verboseLoggingCheck.spacing
-                verticalAlignment: Text.AlignVCenter
-                color: root.textColor
-            }
-            ToolTip.visible: hovered
-            ToolTip.delay: 400
-            ToolTip.text: root.tr(
-                "settings.diagnostics.service-stability.verbose.tooltip",
-                "When enabled, the service writes tracing::debug events to operational NDJSON. Applies immediately, no restart required.")
-            Accessible.role: Accessible.CheckBox
-            Accessible.name: text
-        }
         Label {
             visible: section._logsError !== ""
             text: root.tr("logs.pagination.error-prefix", "Load failed")
@@ -752,8 +750,7 @@ ColumnLayout {
         delegate: Frame {
             id: opRow
             width: ListView.view ? ListView.view.width : 0
-            visible: passesFilter(modelData)
-            height: visible ? rowBody.implicitHeight + padding * 2 : 0
+            height: rowBody.implicitHeight + padding * 2
             padding: root.uiTheme.spacingSm
             background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
             readonly property string _rowPlainText:
@@ -868,7 +865,7 @@ ColumnLayout {
             enabled: !section._logsLoading
             text: section._logsLoading
                 ? root.tr("logs.pagination.loading", "Loading...")
-                : root.tr("logs.pagination.load-more", "Load more")
+                : root.tr("action.load-more", "Load more")
             onClicked: section._loadMoreLogs()
         }
     }
@@ -1038,7 +1035,7 @@ ColumnLayout {
             enabled: !section._auditLoading
             text: section._auditLoading
                 ? root.tr("logs.pagination.loading", "Loading...")
-                : root.tr("logs.pagination.load-more", "Load more")
+                : root.tr("action.load-more", "Load more")
             onClicked: section._loadMoreAudit()
         }
     }

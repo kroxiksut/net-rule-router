@@ -214,7 +214,7 @@ Popup {
                                 // resolving it (e.g. turning off strict kill-switch);
                                 // omit its Dismiss button. Undefined ⇒ dismissible.
                                 visible: card.modelData.dismissible !== false
-                                text: root.tr("notifications.dismiss", "Dismiss")
+                                text: root.tr("action.dismiss", "Dismiss")
                                 onClicked: {
                                     if (root.ownerRoot) {
                                         root.ownerRoot.notificationsController.dismissNotification(card.modelData.id)

@@ -46,8 +46,8 @@ pub const STATE_DB_V1_DDL: &[&str] = &[
     IDX_INTEGRITY_LOG_CHECKED,
 ];
 
-/// DDL for `nrr_service_state.db` schema v2: adds `integrity_hash` columns to
-/// the revision pointer tables so that `check_integrity()` can detect tampering.
+/// Schema v2: `integrity_hash` on the machine-wide pointer tables. Both tables
+/// were dropped in v60; tampering is caught by `revisions.row_hmac`.
 pub const STATE_DB_V2_DDL: &[&str] = &[
     "ALTER TABLE active_revision  ADD COLUMN integrity_hash TEXT",
     "ALTER TABLE last_known_good  ADD COLUMN integrity_hash TEXT",
@@ -90,9 +90,8 @@ CREATE TABLE IF NOT EXISTS security_alerts (
 /// for forward-compatibility: a snapshot with an unknown schema version is
 /// rejected with `RecoveryRequired` rather than silently ignored.
 ///
-/// Max 2 rows are kept (current + previous LKG) — rotation is enforced by
-/// `ApplySnapshotRepository::rotate_keeping_latest_n(2)` after every
-/// successful apply.
+/// Nothing writes it: the repository over it was removed unused, and the
+/// table stays because dropping it needs a migration of its own.
 pub const STATE_DB_V4_DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS apply_snapshots (
     attempt_id      TEXT    PRIMARY KEY,
@@ -175,10 +174,9 @@ pub const STATE_DB_V5_DDL: &[&str] = &[
 /// different threads serialize through this constraint plus the SQL
 /// transaction the activation coordinator opens.
 ///
-/// `active_revision_pointer` is a singleton row tracking which revision
-/// is currently applied plus the in-flight `apply_attempt_id` (links to
-/// `apply_snapshots` from v4). On successful Phase 3a commit the pointer
-/// flips to the new revision and `apply_attempt_id` is cleared.
+/// `active_revision_pointer` tracks which revision is currently applied (one
+/// row per principal since the per-principal migration). `apply_attempt_id`
+/// is never written.
 ///
 /// `mutation_tokens` persists confirmation tokens across service restart
 /// so a user with an open review dialog does not lose their token if the
@@ -843,7 +841,7 @@ CHECK(browser_history_auto_seed IN (0, 1))"];
 /// "smart"): an IP the shared-IP census has seen on a direct (non-rule) host is
 /// EXCLUDED from the kill-switch per-IP pin/block set, so blocking a
 /// secondary-routed CDN address cannot cut an innocent co-tenant site
-/// (e.g. gemini/video-site sharing Google front-end IPs with www.search.example).
+/// (e.g. ai-site/video-site sharing CDN front-end IPs with www.search.example).
 /// `1` ("strict"): pin/block every secondary-destined IP regardless of
 /// sharing; no leak, accepts the collateral.
 ///
@@ -863,7 +861,7 @@ pub const STATE_DB_V34_DDL: &[&str] = &["ALTER TABLE service_stability_config \
 ADD COLUMN fake_ip_enabled INTEGER NOT NULL DEFAULT 0 \
 CHECK(fake_ip_enabled IN (0, 1))"];
 
-/// Block T (traffic counter) — service-global traffic-statistics settings
+/// Service-global traffic-statistics settings
 /// singleton. Lives in the service-critical state DB (NOT the rebuildable
 /// `nrr_traffic_stats.db`) so a rebuild of the ledger never loses the user's
 /// config. `enabled` is the master accounting toggle (default ON);
@@ -1226,7 +1224,7 @@ pub const STATE_DB_V54_DDL: &[&str] = &[
 /// Sites the user says answer the MAIN link with a refusal — v55.
 ///
 /// A connection that completes proves the packet arrives, not that the service
-/// serves us: ChatGPT answers a main-link address with "this address is not
+/// serves us: an assistant service answers a main-link address with "this address is not
 /// served". Nothing on this machine can tell those apart without reading the
 /// traffic, which we will not do — so the user says it, once, per site. The
 /// consequence is narrow: that site's companion addresses stop being quietened
@@ -1426,3 +1424,22 @@ pub const STATE_DB_V64_DDL: &[&str] = &[
 /// DEV schema; wiped freely.
 pub const STATE_DB_V65_DDL: &[&str] = &["ALTER TABLE block_notice_journal ADD COLUMN launched_by \
      TEXT NOT NULL DEFAULT '' CHECK(length(launched_by) <= 2048)"];
+
+/// Drop `integrity_log` and `apply_snapshots`. Neither table has had a
+/// production writer since `record_integrity_check` and the snapshot
+/// repository above it were removed unused.
+pub const STATE_DB_V66_DDL: &[&str] = &[
+    "DROP INDEX IF EXISTS idx_integrity_log_checked",
+    "DROP INDEX IF EXISTS idx_apply_snapshots_created",
+    "DROP TABLE IF EXISTS integrity_log",
+    "DROP TABLE IF EXISTS apply_snapshots",
+];
+
+/// Verbose logging becomes a window with an end instead of a switch left on.
+/// The flag goes; a timed window keeps its absolute deadline, and "until the
+/// service restarts" is never stored. A flag that was on reads as normal
+/// logging afterwards. DEV schema; wiped freely.
+pub const STATE_DB_V67_DDL: &[&str] = &[
+    "ALTER TABLE service_stability_config DROP COLUMN verbose_logging",
+    "ALTER TABLE service_stability_config ADD COLUMN verbose_until_ms INTEGER      CHECK(verbose_until_ms IS NULL OR verbose_until_ms > 0)",
+];

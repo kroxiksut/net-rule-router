@@ -1,26 +1,22 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::unimplemented)]
-//! Integration tests for the diagnostics IPC surfaces:
+//! Integration tests for the diagnostics IPC surfaces, handler to facade:
 //!
-//! - explain probe round-trip (currently `Unavailable` until the
-//!   `ExplainSnapshotRepository` lands; the wire surface is still
-//!   well-formed);
-//! - logs.list cursor pagination across multiple pages with no
-//!   duplicates;
-//! - archive export produces a real zip file on disk.
+//! - a historical explain probe answers "decision not found" on the wire;
+//! - logs.list cursor pagination walks every page with no duplicates;
+//! - an archive export carries the manifest and the service's own log files.
 //!
-//! These tests exercise the handler layer end-to-end against either the
-//! crate-published `MockDiagnosticsFacade` (where its fixture data
-//! shape matches) or a tiny test-local paginating fake (when the mock
-//! shortcuts pagination to a single page).
+//! Explain and archive run against the production facade over a temporary
+//! data tree; pagination uses a test-local paginating fake.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use nrr_diagnostics::audit::alert::{InMemorySecurityAlertsRepository, SecurityAlertsRepository};
 use nrr_diagnostics::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, ClearLogsRequest, ClearLogsResult,
-    DiagnosticsFacade, DiagnosticsResult, DiagnosticsStatusDto, ExplainQuery, ExplainResponse,
-    LogEntryDto, LogEntryFilter, MockDiagnosticsFacade, PageCursor, PageResult, PaginationParams,
-    SecurityAlertDto, SetDiagnosticModeRequest,
+    DiagnosticsFacade, DiagnosticsResult, DiagnosticsStatusDto, ExplainDataAvailability,
+    ExplainQuery, ExplainResponse, LogEntryDto, LogEntryFilter, MockDiagnosticsFacade, PageCursor,
+    PageResult, PaginationParams, SecurityAlertDto,
 };
 use nrr_domain::decision_explain::ExplainDetailLevel;
 use nrr_service_runtime::ipc::{
@@ -29,6 +25,7 @@ use nrr_service_runtime::ipc::{
 use nrr_service_runtime::ipc_handlers::{
     DiagnosticsExportArchiveHandler, ExplainGetHandler, LogsListHandler,
 };
+use nrr_service_runtime::ProductionDiagnosticsFacade;
 use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -52,6 +49,20 @@ fn req(op: IpcOperationName, payload: serde_json::Value) -> IpcRequestEnvelope {
         confirmation_token: None,
         payload,
     }
+}
+
+/// The production facade over `<root>/logs` and `<root>/audit`, the layout the
+/// archive handler assumes when it looks for `logs/` beside `archives/`.
+fn production_facade(root: &std::path::Path) -> Arc<dyn DiagnosticsFacade> {
+    let logs_dir = root.join("logs");
+    let audit_dir = root.join("audit");
+    std::fs::create_dir_all(&logs_dir).expect("logs dir");
+    std::fs::create_dir_all(&audit_dir).expect("audit dir");
+    let alerts: Arc<dyn SecurityAlertsRepository> =
+        Arc::new(InMemorySecurityAlertsRepository::new());
+    Arc::new(ProductionDiagnosticsFacade::new(
+        logs_dir, audit_dir, None, alerts, None,
+    ))
 }
 
 /// A minimal `AdaptersSnapshotProvider`
@@ -84,18 +95,12 @@ impl nrr_service_runtime::ipc_handlers::providers::RoutePolicyProvider for NoopR
     }
 }
 
-// ── Test 1: explain probe historical decision → Unavailable wire payload ────
+// ── Test 1: explain probe for an unknown decision → DecisionNotFound ─────────
 
 #[test]
-fn explain_probe_historical_decision_returns_compact_unavailable_view() {
-    // `get_explain` returns
-    // `Unavailable::DecisionNotFound` for any decision_id until the
-    // ExplainSnapshotRepository lands. The wire surface MUST
-    // still respond with a well-formed `ExplainGetResponse` carrying
-    // a compact view whose `reason_key` flags the unavailable state
-    // — that's what the GUI's DiagnosticsSection.qml probe renders.
-    let facade: Arc<dyn DiagnosticsFacade> = Arc::new(MockDiagnosticsFacade::healthy());
-    let handler = ExplainGetHandler::new(facade);
+fn explain_probe_for_an_unknown_decision_answers_decision_not_found() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let handler = ExplainGetHandler::new(production_facade(tmp.path()));
 
     let envelope = req(
         IpcOperationName::ExplainGet,
@@ -108,23 +113,15 @@ fn explain_probe_historical_decision_returns_compact_unavailable_view() {
         .handle(&envelope, &ctx())
         .expect("explain.get must respond OK even when decision is unknown");
 
-    // The handler's compact view uses `rename_all = "kebab-case"` on
-    // its DTO — both kebab and snake are accepted as resilience hedge.
-    let compact = response
-        .get("compact")
-        .expect("response must carry compact view");
-    let reason_key = compact
-        .get("reason-key")
-        .or_else(|| compact.get("reason_key"))
-        .and_then(|v| v.as_str())
-        .expect("compact.reason_key must be a string");
-    // The wire MUST carry SOME reason key — exact value depends on
-    // which Unavailable variant the facade picked. Once the snapshot
-    // store is real, this assertion can tighten to a specific success
-    // key for known decision-ids.
-    assert!(
-        !reason_key.is_empty(),
-        "reason_key must not be empty; explain handler must surface SOME state",
+    let expected = ExplainDataAvailability::DecisionNotFound.ui_key();
+    assert_eq!(
+        response["compact"]["reason-key"], expected,
+        "the probe must say the decision is unknown: {response}"
+    );
+    assert_eq!(response["full"]["availability_key"], expected);
+    assert_eq!(
+        response["compact"]["route"], "none",
+        "no verdict is invented"
     );
 }
 
@@ -140,8 +137,12 @@ struct PaginatingFakeDiagnostics {
 }
 
 impl DiagnosticsFacade for PaginatingFakeDiagnostics {
-    fn get_status(&self) -> DiagnosticsStatusDto {
-        MockDiagnosticsFacade::healthy().get_status()
+    fn get_status(
+        &self,
+        _audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
+    ) -> DiagnosticsStatusDto {
+        MockDiagnosticsFacade::healthy()
+            .get_status(&nrr_shared::diagnostics_dto::DiagnosticsAudience::Machine)
     }
     fn list_log_entries(
         &self,
@@ -189,13 +190,14 @@ impl DiagnosticsFacade for PaginatingFakeDiagnostics {
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>> {
         Ok(PageResult::empty())
     }
-    fn list_active_alerts(&self) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
+    fn list_alerts(
+        &self,
+        _filter: nrr_diagnostics::facade::service::AlertListFilter,
+        _audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
         Ok(Vec::new())
     }
     fn acknowledge_alert(&self, _r: &AcknowledgeAlertRequest) -> DiagnosticsResult<()> {
-        Ok(())
-    }
-    fn set_diagnostic_mode(&self, _r: &SetDiagnosticModeRequest) -> DiagnosticsResult<()> {
         Ok(())
     }
     fn clear_logs(&self, _r: &ClearLogsRequest) -> DiagnosticsResult<ClearLogsResult> {
@@ -289,13 +291,32 @@ fn logs_list_cursor_pagination_walks_all_pages_without_duplicates() {
     assert_eq!(sorted.len(), 10, "no duplicates across pages");
 }
 
-// ── Test 3: archive export produces a real zip file ─────────────────────────
+// ── Test 3: archive export carries the manifest and the service logs ────────
+
+/// One machine-level operational log file, named like the service's own.
+fn write_service_log(logs_dir: &std::path::Path, event_id: &str) -> String {
+    use std::io::Write;
+    let date = nrr_diagnostics::audit::writer::local_date_string(std::time::SystemTime::now());
+    let name = format!("nrr_service_{date}-1.ndjson");
+    let event = nrr_diagnostics::LogEvent::new(
+        event_id.to_string(),
+        1_745_000_000_000,
+        nrr_diagnostics::EventLevel::Info,
+        nrr_diagnostics::reason::service::STARTED,
+    );
+    let mut file = std::fs::File::create(logs_dir.join(&name)).expect("create log file");
+    writeln!(file, "{}", event.to_ndjson().expect("serialize")).expect("write log line");
+    name
+}
 
 #[test]
-fn diagnostics_export_archive_creates_real_zip_file() {
+fn diagnostics_export_archive_carries_manifest_and_service_logs() {
+    use std::io::Read;
+
     let tmp = tempfile::tempdir().expect("temp dir");
+    let facade = production_facade(tmp.path());
+    let log_name = write_service_log(&tmp.path().join("logs"), "evt-e2e-archive");
     let archives_dir: PathBuf = tmp.path().join("archives");
-    let facade: Arc<dyn DiagnosticsFacade> = Arc::new(MockDiagnosticsFacade::healthy());
     let handler = DiagnosticsExportArchiveHandler::new(
         facade,
         archives_dir.clone(),
@@ -317,39 +338,36 @@ fn diagnostics_export_archive_creates_real_zip_file() {
     );
     let response = handler
         .handle(&envelope, &ctx())
-        .expect("export-archive must succeed against mock facade");
+        .expect("export-archive must succeed against the production facade");
 
-    let archive_path = response
-        .get("archive-path")
-        .or_else(|| response.get("archive_path"))
-        .and_then(|v| v.as_str())
+    let archive_path = response["archive-path"]
+        .as_str()
         .expect("response must carry archive-path");
-    let size_bytes = response
-        .get("size-bytes")
-        .or_else(|| response.get("size_bytes"))
-        .and_then(|v| v.as_u64())
-        .expect("response must carry size-bytes");
-
     assert!(
-        std::path::Path::new(archive_path).exists(),
-        "zip file must exist on disk at {archive_path}",
-    );
-    assert!(size_bytes > 0, "archive must be non-empty");
-    assert!(
-        archives_dir.exists(),
-        "handler must create the destination directory",
+        std::path::Path::new(archive_path).starts_with(&archives_dir),
+        "the archive lands in the service's archives dir: {archive_path}"
     );
 
-    // Verify the zip magic header (`PK\x03\x04`) — proves the file
-    // is a real zip rather than an empty stub or a different format.
-    // Avoids pulling the full `zip` crate as a dev-dep just for this
-    // single check; the manifest layout is exercised by
-    // `nrr-diagnostics::archive`'s own unit tests.
-    let head = std::fs::read(archive_path).expect("read zip header");
-    assert!(head.len() >= 4, "zip must be at least 4 bytes");
-    assert_eq!(
-        &head[..4],
-        b"PK\x03\x04",
-        "file must start with the local-file-header zip magic",
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(archive_path).expect("open archive"))
+        .expect("the export must be a readable zip");
+    let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    assert!(
+        names.iter().any(|n| n == "manifest.json"),
+        "manifest.json missing: {names:?}"
+    );
+    let log_entry = format!("service-logs/{log_name}");
+    assert!(
+        names.contains(&log_entry),
+        "the service's log file must ship under service-logs/: {names:?}"
+    );
+
+    let mut body = String::new();
+    zip.by_name(&log_entry)
+        .expect("service log entry")
+        .read_to_string(&mut body)
+        .expect("read service log entry");
+    assert!(
+        body.contains("evt-e2e-archive"),
+        "the shipped file must be the one the service wrote: {body}"
     );
 }

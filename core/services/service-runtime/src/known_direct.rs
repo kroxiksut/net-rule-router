@@ -134,9 +134,9 @@ mod tests {
     #[test]
     fn re_registering_known_addresses_adds_nothing() {
         let r = KnownDirectRegistry::new(16);
-        assert_eq!(r.register(&[ip(1, 1, 1, 1)]), 1);
+        assert_eq!(r.register(&[ip(198, 51, 100, 1)]), 1);
         assert_eq!(
-            r.register(&[ip(1, 1, 1, 1)]),
+            r.register(&[ip(198, 51, 100, 1)]),
             0,
             "0 ⇒ caller skips its sync reconcile"
         );
@@ -146,10 +146,21 @@ mod tests {
     #[test]
     fn snapshot_is_sorted_and_stable() {
         let r = KnownDirectRegistry::new(16);
-        r.register(&[ip(9, 9, 9, 9), ip(1, 1, 1, 1), ip(5, 5, 5, 5)]);
+        r.register(&[
+            ip(198, 51, 100, 9),
+            ip(198, 51, 100, 1),
+            ip(198, 51, 100, 5),
+        ]);
         let a = r.snapshot();
         let b = r.snapshot();
-        assert_eq!(a, vec![ip(1, 1, 1, 1), ip(5, 5, 5, 5), ip(9, 9, 9, 9)]);
+        assert_eq!(
+            a,
+            vec![
+                ip(198, 51, 100, 1),
+                ip(198, 51, 100, 5),
+                ip(198, 51, 100, 9)
+            ]
+        );
         assert_eq!(a, b, "identical registry ⇒ identical desired set");
     }
 
@@ -159,15 +170,19 @@ mod tests {
         // after the cap stayed BLOCKED under the block-all for the rest of the
         // session — sites that work until they suddenly do not.
         let r = KnownDirectRegistry::new(2);
-        assert_eq!(r.register(&[ip(1, 1, 1, 1), ip(2, 2, 2, 2)]), 2);
-        assert_eq!(r.register(&[ip(3, 3, 3, 3)]), 1, "the new host is admitted");
+        assert_eq!(r.register(&[ip(198, 51, 100, 1), ip(198, 51, 100, 2)]), 2);
+        assert_eq!(
+            r.register(&[ip(198, 51, 100, 3)]),
+            1,
+            "the new host is admitted"
+        );
         assert_eq!(r.len(), 2, "the bound still holds");
         assert_eq!(
             r.snapshot(),
-            vec![ip(2, 2, 2, 2), ip(3, 3, 3, 3)],
+            vec![ip(198, 51, 100, 2), ip(198, 51, 100, 3)],
             "the coldest gave way",
         );
         // Re-registering something present is still a no-op.
-        assert_eq!(r.register(&[ip(3, 3, 3, 3)]), 0);
+        assert_eq!(r.register(&[ip(198, 51, 100, 3)]), 0);
     }
 }

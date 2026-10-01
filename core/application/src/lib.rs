@@ -1,9 +1,5 @@
-// Security alerts are persisted in the SQLite-backed `security_alerts`
-// table owned by the service. See
-// `nrr_service_runtime::ProductionSecurityAlertsRepository`.
 pub mod backend_facade;
 pub mod mock_backend;
-pub mod route_bindings;
 
 // Re-export the domain-level rule-value validator so UI-adjacent crates
 // (`apps/desktop/gui`, `nrr-launcher`) can use it without taking a direct
@@ -17,34 +13,24 @@ pub use nrr_domain::rule_value_validation;
 // user has chosen what to do with its contents.
 pub use nrr_domain::preset_validation;
 
-pub const APPLICATION_LAYER_NOTE: &str =
-    "Transport-agnostic application workflows are composed here.";
-
-// Moved into `nrr-shared`: the service needed these two strings and nothing
-// else from this crate, and that lone edge dragged the UI and preview crates
-// into its binary. Re-exported so the desktop runtimes, which legitimately
-// depend on this crate, keep the same path.
+// Re-exported from `nrr-shared` so desktop runtimes that legitimately depend
+// on this crate keep one path; the service reads these two strings straight
+// from `nrr-shared` and stays off this crate's dependency graph.
 pub use nrr_shared::{runtime_boot_banner, runtime_boot_role_message};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AboutWindowInfo {
     pub product_name: &'static str,
-    pub edition: &'static str,
     pub version: &'static str,
     pub license: &'static str,
     pub build_profile: &'static str,
     pub rust_toolchain: &'static str,
 }
 
-/// The edition this build ships. One value today; it exists as a field because
-/// the About window shows it and Pro is a planned second value.
-pub const EDITION: &str = "Free";
-
 pub const fn about_window_info() -> AboutWindowInfo {
     AboutWindowInfo {
         // Read from the product-identity SSOT, never retyped.
         product_name: nrr_shared::product_identity::PRODUCT_NAME,
-        edition: EDITION,
         version: env!("CARGO_PKG_VERSION"),
         license: env!("CARGO_PKG_LICENSE"),
         build_profile: if cfg!(debug_assertions) {
@@ -52,23 +38,14 @@ pub const fn about_window_info() -> AboutWindowInfo {
         } else {
             "release"
         },
-        // Baked from `rust-version` at compile time rather than the word
-        // "stable", which was neither the pinned toolchain nor ever updated.
-        rust_toolchain: env!("CARGO_PKG_RUST_VERSION"),
+        // The compiler that built this, not the declared minimum `rust-version`.
+        rust_toolchain: env!("NRR_BUILD_RUSTC_VERSION"),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        about_window_info, runtime_boot_banner, runtime_boot_role_message, APPLICATION_LAYER_NOTE,
-        EDITION,
-    };
-
-    #[test]
-    fn application_note_is_not_empty() {
-        assert!(!APPLICATION_LAYER_NOTE.is_empty());
-    }
+    use super::{about_window_info, runtime_boot_banner, runtime_boot_role_message};
 
     #[test]
     fn boot_banner_mentions_component_name() {
@@ -96,12 +73,9 @@ mod tests {
             info.product_name,
             nrr_shared::product_identity::PRODUCT_NAME
         );
-        assert_eq!(info.edition, EDITION);
         assert_eq!(info.license, "MPL-2.0");
         assert!(!info.version.is_empty());
-        // The toolchain shown to the user is the pinned one, not the word
-        // "stable" — that literal never matched and never updated.
-        assert_eq!(info.rust_toolchain, env!("CARGO_PKG_RUST_VERSION"));
+        // The version `rustc -V` reported, e.g. "1.94.1 (hash date)".
         assert!(
             info.rust_toolchain.starts_with('1'),
             "{}",

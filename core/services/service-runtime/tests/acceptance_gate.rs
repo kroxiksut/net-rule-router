@@ -13,25 +13,20 @@
 //! 2. Service-owned state — covered by bootstrap.rs
 //! 3. Safe GUI/tray IPC — gates 3–6 below
 //! 4. Bootstrap/integrity/recovery — gates 1–2 + existing module tests
-//! 5. Apply layer without UI deps — dependency_boundary.rs + gate 10
-//! 6. Least-privilege justification — service_lifecycle.rs + gate 8
+//! 5. Apply layer without UI deps — dependency_boundary.rs
 
 use nrr_service_runtime::{
     // crash_recovery
     decide_recovery,
     execute_safe_disable,
-    required_service_identity,
     ActiveRevisionState,
     ApplyAttemptMarker,
     ApplyMarkerStore,
     ApplyPhase,
-    CrashCounter,
     DegradedMode,
     DegradedModeStatus,
     // ipc
     HandlerOutcome,
-    // service_lifecycle
-    IdentityRequirement,
     IpcAuditEmitter,
     IpcClientProfile,
     IpcErrorCode,
@@ -50,16 +45,11 @@ use nrr_service_runtime::{
     RecoveryAuditRecord,
     RecoveryAuditSink,
     RecoveryDecision,
-    RecoveryPolicy,
     SafeDisableRequest,
-    SecurityChecklist,
-    ServiceIdentityDecision,
     // state
     ServicePolicyState,
     StartupRecoveryCoordinator,
     IPC_PROTOCOL_VERSION,
-    PRELIMINARY_IDENTITY,
-    PRIVILEGE_MATRIX,
 };
 use std::sync::{Arc, Mutex};
 
@@ -216,7 +206,7 @@ fn no_silent_policy_activation_with_incomplete_marker() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Gate 2: Integrity check precedes any policy activation
 //
-// Only ActiveLoaded and LkgFallbackApplied produce policy-ready states.
+// Only ActiveLoaded produces a policy-ready state.
 // All error outcomes must NOT yield a ready state — there is no shortcut
 // into active-policy territory.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -231,25 +221,19 @@ fn only_loaded_outcomes_can_produce_policy_ready_state() {
         activated_at_iso: "t".into(),
     };
     assert_eq!(
-        PolicyLoadResult::ActiveLoaded(ready.clone()).to_policy_state(),
+        PolicyLoadResult::ActiveLoaded(ready).to_policy_state(),
         ServicePolicyState::ActiveReady
-    );
-    assert_eq!(
-        PolicyLoadResult::LkgFallbackApplied(ready).to_policy_state(),
-        ServicePolicyState::LkgReady
     );
 
     for outcome in &[
+        PolicyLoadResult::IntegrityFailureReported("tampered".into()),
         PolicyLoadResult::NoActiveRevision,
         PolicyLoadResult::RecoveryRequired("broken".into()),
         PolicyLoadResult::StorageError("io".into()),
     ] {
         let state = outcome.to_policy_state();
         assert!(
-            !matches!(
-                state,
-                ServicePolicyState::ActiveReady | ServicePolicyState::LkgReady
-            ),
+            !matches!(state, ServicePolicyState::ActiveReady),
             "{outcome:?} must not produce a ready policy state, got {state:?}"
         );
     }
@@ -365,51 +349,58 @@ fn the_tray_may_still_subscribe_to_push_events() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Gate 6: GUI/tray can reconnect (stateless IPC router)
+// Gate 6: A finished call leaves nothing behind for the next one
 //
-// Three consecutive read requests from the same client must all succeed.
+// The router's only cross-call state is the mutation queue. A client that
+// reconnects after a mutation — even one its handler refused — must not find
+// the slot still taken, or every later mutation is BusyConflict.
 // ─────────────────────────────────────────────────────────────────────────────
-#[test]
-fn ipc_read_requests_are_stateless_across_calls() {
-    let router = make_router();
-    for i in 0..3u32 {
-        let mut req = read_req();
-        req.request_id = format!("req-{i}");
-        let resp = router.dispatch(req, unprivileged_tray());
-        assert!(resp.ok, "reconnect attempt {i} failed: {:?}", resp.error);
+/// Refuses the request whose id is `req-refused`, echoes every other one.
+struct RefusingHandler;
+impl IpcHandler for RefusingHandler {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        if request.request_id == "req-refused" {
+            return Err(nrr_service_runtime::IpcError {
+                code: IpcErrorCode::Internal,
+                message: "refused by handler".into(),
+                diagnostics_id: None,
+            });
+        }
+        EchoHandler.handle(request, ctx)
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Gate 7: Crash threshold aligns with SCM recovery policy
-//
-// The service-side CrashCounter.threshold must equal
-// RecoveryPolicy::max_auto_restarts so both counters agree on when to stop.
-// ─────────────────────────────────────────────────────────────────────────────
 #[test]
-fn crash_counter_threshold_matches_recovery_policy_max_restarts() {
-    let policy = RecoveryPolicy::production();
-    let counter = CrashCounter::new(
-        policy.max_auto_restarts as u32,
-        policy.reset_period_secs as u64,
+fn a_finished_mutation_releases_its_slot_for_the_next_caller() {
+    let mut reg = IpcHandlerRegistry::new();
+    reg.register(IpcOperationName::MutationSubmit, RefusingHandler);
+    // One slot: a leaked guard shows up as BusyConflict on the very next call.
+    let router = IpcRouter::new(reg, Arc::new(NoopIpcAuditEmitter::default()), 1);
+
+    let first = router.dispatch(mutation_req(), elevated_gui());
+    assert!(first.ok, "first mutation: {:?}", first.error);
+    assert_eq!(
+        first.payload,
+        Some(serde_json::json!({ "echo": IpcOperationName::MutationSubmit.slug() })),
+        "the handler itself must have answered"
     );
-    assert_eq!(counter.threshold, policy.max_auto_restarts as u32);
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Gate 8: Preliminary service identity is not LocalSystem
-// ─────────────────────────────────────────────────────────────────────────────
-#[test]
-fn preliminary_identity_is_local_service_for_historical_reference() {
-    assert!(!PRELIMINARY_IDENTITY.is_full_local_privilege());
-}
+    let mut refused = mutation_req();
+    refused.request_id = "req-refused".into();
+    let refused = router.dispatch(refused, elevated_gui());
+    assert_eq!(
+        refused.error.map(|e| e.code),
+        Some(IpcErrorCode::Internal),
+        "the handler's own refusal must come back, not a queue conflict"
+    );
 
-#[test]
-fn required_identity_is_local_system_after_block_15_2() {
-    let id = required_service_identity();
+    let mut after = mutation_req();
+    after.request_id = "req-after".into();
+    let after = router.dispatch(after, elevated_gui());
     assert!(
-        id.is_full_local_privilege(),
-        "resolved identity must be LocalSystem: {id:?}"
+        after.ok,
+        "slot leaked by a refused mutation: {:?}",
+        after.error
     );
 }
 
@@ -431,62 +422,4 @@ fn safe_disable_audit_first_invariant() {
         ),
         "safe-disable must not proceed when audit write fails: {result:?}"
     );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Gate 10: Privilege matrix has no placeholder identity entries
-//
-// WFP and route-table operations must resolve to a concrete identity
-// requirement rather than an unresolved placeholder — filling them in
-// without a full privilege analysis would be a security risk.
-// ─────────────────────────────────────────────────────────────────────────────
-#[test]
-fn privilege_matrix_has_no_tbd_after_block_15_2() {
-    // Every entry must have a concrete identity resolved.
-    for entry in PRIVILEGE_MATRIX {
-        assert!(
-            !entry.justification.starts_with("TODO(block-15)"),
-            "entry '{}' still has unresolved TODO(block-15)",
-            entry.operation
-        );
-    }
-}
-
-#[test]
-fn routing_and_wfp_require_local_system_privilege() {
-    let route = PRIVILEGE_MATRIX
-        .iter()
-        .find(|e| e.operation.contains("routing table"))
-        .expect("routing table entry must exist");
-    assert_eq!(route.min_identity, IdentityRequirement::LocalSystem);
-    let wfp = PRIVILEGE_MATRIX
-        .iter()
-        .find(|e| e.operation.contains("WFP"))
-        .expect("WFP entry must exist");
-    assert_eq!(wfp.min_identity, IdentityRequirement::LocalSystem);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Manual Windows checklist (documented, not executable)
-//
-// The following items require a real Windows environment and are verified
-// manually. Listed here so the review can confirm each was considered:
-//
-// [ ] install: creates SCM entry, sets AutoStart (delayed), configures 2 restarts
-// [ ] service starts automatically after reboot
-// [ ] GUI closed → service keeps running; tray shows "service connected" on reopen
-// [ ] tray "Exit" writes shutdown flag; service stops within STOP_TIMEOUT
-// [ ] `status` prints banner without SCM (exits 0 from shell)
-// [ ] uninstall: stops service, removes entry, preserves data dir (keep_data default)
-// [ ] update: drains, backs up state DB; installer replaces binary; restarts
-// [ ] service runs as NT AUTHORITY\LocalService (pending sign-off);
-//     until then it runs as LocalSystem with a documented TODO
-// [ ] after 3 consecutive crashes, SCM stops auto-restarting; Event Log records it
-// [ ] uninstall with remove_data=true: removes %ProgramData%\NetRuleRouter\,
-//     leaves user rule files intact
-// ─────────────────────────────────────────────────────────────────────────────
-#[test]
-fn manual_windows_checklist_is_documented() {
-    // Presence of SecurityChecklist type confirms the doc is in scope.
-    let _ = std::mem::size_of::<SecurityChecklist>();
 }

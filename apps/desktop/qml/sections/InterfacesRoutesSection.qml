@@ -49,8 +49,7 @@ ColumnLayout {
         && section._secondaryRouteState.failClosedActive === true
 
     /// Is the adapter bound as the additional route missing right now? Drives
-    /// the on-screen explanation for every behaviour mode, not just the strict
-    /// one the service reports as fail-closed.
+    /// the on-screen explanation even when leak protection is not blocking.
     readonly property bool _secondaryAdapterAbsent:
         root.uiRevision >= 0
         && root.interfacesRolesController.rememberedAbsentBindings()
@@ -274,8 +273,8 @@ ColumnLayout {
     }
 
     // Why traffic is being blocked, stated on the screen the user is sent to.
-    // Two sources: the service's own fail-closed posture (strict mode), and the
-    // plain fact that the bound additional adapter is absent -- the second
+    // Two sources: the service reporting that leak protection is blocking, and
+    // the plain fact that the bound additional adapter is absent -- the second
     // covers every other mode, where the window banner is the only explanation
     // and can be dismissed for good.
     Frame {
@@ -290,7 +289,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 text: section._failClosedReported
                     ? root.tr("interfaces.fail-closed.banner-title",
-                        "Fail-Closed mode active")
+                        "Leak protection is blocking traffic")
                     : root.tr("interfaces.secondary-absent.banner-title",
                         "The additional route is not available")
                 color: root.uiTheme.colorAccent
@@ -301,7 +300,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 text: section._failClosedReported
                     ? root.tr("interfaces.fail-closed.banner-body",
-                        "Secondary route is unavailable. Matched traffic is being blocked instead of leaking to the primary.")
+                        "Additional route is unavailable. Matched traffic is being blocked instead of leaking to the primary.")
                     : root.tr("interfaces.secondary-absent.banner-body",
                         "The adapter you bound as the additional route is not present right now. Traffic your rules send there is blocked rather than leaked to the main route. Bring the connection back up, or assign another adapter to the role below.")
                 color: root.textColor
@@ -317,7 +316,8 @@ ColumnLayout {
     }
     Label {
         Layout.fillWidth: true
-        text: (root.context.interfaces || {}).roleExplanation || ""
+        text: root.tr("interfaces.role-explanation",
+            "The primary route uses the default interface; the additional route carries the traffic your rules send to it.")
         color: root.mutedTextColor
         wrapMode: Text.WordWrap
     }
@@ -1067,7 +1067,7 @@ ColumnLayout {
                                 text: root.uiRevision >= 0
                                     ? (_holdsSecondary
                                         ? root.tr("interfaces.action.unassign-secondary",
-                                            "Unassign secondary")
+                                            "Unassign additional")
                                         : root.routeLabel("secondary"))
                                     : ""
                                 ToolTip.visible: hovered && !cardFrame.isAvailable && !_holdsSecondary && enabled

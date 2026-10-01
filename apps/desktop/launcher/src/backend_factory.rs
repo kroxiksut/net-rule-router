@@ -10,17 +10,17 @@
 //!   degradation through [`BackendConnectionStatus::Disconnected`] so
 //!   the connection banner in QML can paint.
 //!
-//! Mode selection: the `NRR_BACKEND` env var. Unset / unrecognised →
-//! default IPC mode. Recognised slugs are case-insensitive.
+//! Mode selection: the `NRR_BACKEND` env var, honoured in debug builds only.
+//! Unset / unrecognised / release → default IPC mode. Recognised slugs are
+//! case-insensitive.
 //!
 //! ## Why this lives in the launcher (and not GUI lib)
 //!
-//! The launcher is the only process that has both `nrr-application`
+//! The launcher is the only crate that has both `nrr-application`
 //! (`MockBackendFacade`, `BackendFacade` trait) and `nrr-ipc-client`
-//! (`ServiceIpcClient`, `IpcBackendFacade`) in scope. The GUI lib
-//! (`nrr-desktop-gui`) consumes the resulting `Arc<dyn BackendFacade>`
-//! through its public function signatures; it never instantiates a
-//! facade itself.
+//! (`ServiceIpcClient`) in scope, so `IpcBackendFacade` lives here too. The
+//! GUI lib (`nrr-desktop-gui`) consumes the resulting `Arc<dyn BackendFacade>`
+//! and never instantiates a facade itself.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 use nrr_application::backend_facade::{
     BackendConnectionStatus, BackendFacade, MockBackendFacade, PreviewLocalBackendFacade,
 };
-use nrr_ipc_client::{ConnectionStatus, IpcBackendFacade, ServiceIpcClient};
+use nrr_ipc_client::{ConnectionStatus, ServiceIpcClient};
+
+use crate::ipc_backend_facade::IpcBackendFacade;
 
 /// How long the launcher waits for the named-pipe client to reach
 /// `Connected` before deciding the service is unreachable. The IPC
@@ -74,15 +76,33 @@ impl BackendChoice {
     /// runs on FABRICATED data with the GUI reporting a healthy connection.
     /// Neither is discoverable from the outside; a line each is.
     pub fn from_env() -> Self {
-        let Ok(raw) = std::env::var("NRR_BACKEND") else {
-            return Self::Ipc;
-        };
-        let raw = raw.trim();
-        let choice = Self::from_slug(raw);
-        if let Some(notice) = backend_choice_notice(raw, choice) {
+        let raw = std::env::var("NRR_BACKEND").ok();
+        let (choice, notice) = Self::decide(cfg!(debug_assertions), raw.as_deref());
+        if let Some(notice) = notice {
             crate::launcher::diag_log("backend", &notice);
         }
         choice
+    }
+
+    /// The choice and what to log about it. A release build ignores the
+    /// variable: a fabricated-data window must not be one environment variable
+    /// away in a shipped binary.
+    fn decide(allow_env_overrides: bool, raw: Option<&str>) -> (Self, Option<String>) {
+        let Some(raw) = raw else {
+            return (Self::Ipc, None);
+        };
+        if !allow_env_overrides {
+            return (
+                Self::Ipc,
+                Some(
+                    "NRR_BACKEND is ignored in a release build; using the real service backend"
+                        .to_owned(),
+                ),
+            );
+        }
+        let raw = raw.trim();
+        let choice = Self::from_slug(raw);
+        (choice, backend_choice_notice(raw, choice))
     }
 
     /// Case-insensitive slug parser for use by `from_env` and by tests
@@ -136,12 +156,12 @@ pub struct BackendBundle {
 pub fn create_backend(choice: BackendChoice) -> BackendBundle {
     match choice {
         BackendChoice::Mock => BackendBundle {
-            facade: Arc::new(MockBackendFacade) as Arc<dyn BackendFacade>,
+            facade: Arc::new(MockBackendFacade::default()) as Arc<dyn BackendFacade>,
             status: BackendConnectionStatus::Connected,
             choice,
         },
         BackendChoice::PreviewLocal => BackendBundle {
-            facade: Arc::new(PreviewLocalBackendFacade) as Arc<dyn BackendFacade>,
+            facade: Arc::new(PreviewLocalBackendFacade::default()) as Arc<dyn BackendFacade>,
             status: BackendConnectionStatus::Connected,
             choice,
         },
@@ -226,7 +246,7 @@ fn try_demand_start_on_this_os(_client: &Arc<ServiceIpcClient>) -> Option<Backen
 
 fn fallback_with_status(status: BackendConnectionStatus) -> BackendBundle {
     BackendBundle {
-        facade: Arc::new(MockBackendFacade) as Arc<dyn BackendFacade>,
+        facade: Arc::new(MockBackendFacade::default()) as Arc<dyn BackendFacade>,
         status,
         choice: BackendChoice::Ipc,
     }
@@ -250,7 +270,7 @@ fn wait_for_connect(client: &ServiceIpcClient, deadline: Duration) -> bool {
     false
 }
 
-fn ipc_status_to_backend_status(s: ConnectionStatus) -> BackendConnectionStatus {
+pub(crate) fn ipc_status_to_backend_status(s: ConnectionStatus) -> BackendConnectionStatus {
     match s {
         ConnectionStatus::Connected => BackendConnectionStatus::Connected,
         ConnectionStatus::Connecting => BackendConnectionStatus::Connecting,
@@ -295,6 +315,21 @@ mod tests {
     }
 
     #[test]
+    fn env_override_is_honoured_only_when_allowed() {
+        let (allowed, _) = BackendChoice::decide(true, Some("mock"));
+        assert_eq!(allowed, BackendChoice::Mock);
+
+        let (ignored, notice) = BackendChoice::decide(false, Some("mock"));
+        assert_eq!(ignored, BackendChoice::Ipc);
+        assert!(notice.is_some_and(|n| n.contains("ignored")));
+
+        assert_eq!(
+            BackendChoice::decide(false, None),
+            (BackendChoice::Ipc, None)
+        );
+    }
+
+    #[test]
     fn from_slug_unknown_falls_through_to_ipc() {
         assert_eq!(BackendChoice::from_slug(""), BackendChoice::Ipc);
         assert_eq!(BackendChoice::from_slug("ipc"), BackendChoice::Ipc);
@@ -335,8 +370,8 @@ mod tests {
         let bundle = create_backend(BackendChoice::Mock);
         assert_eq!(bundle.choice, BackendChoice::Mock);
         assert_eq!(bundle.status, BackendConnectionStatus::Connected);
-        // Smoke: status snapshot is callable and returns the mock data.
-        let _ = bundle.facade.status_snapshot();
+        // Smoke: the mock answers.
+        let _ = bundle.facade.diagnostics_status_snapshot();
     }
 
     #[test]
@@ -344,7 +379,7 @@ mod tests {
         let bundle = create_backend(BackendChoice::PreviewLocal);
         assert_eq!(bundle.choice, BackendChoice::PreviewLocal);
         assert_eq!(bundle.status, BackendConnectionStatus::Connected);
-        let _ = bundle.facade.status_snapshot();
+        let _ = bundle.facade.diagnostics_status_snapshot();
     }
 
     /// Tested on the mapping, not on the machine: the live path opens the real
@@ -359,7 +394,7 @@ mod tests {
             bundle.status
         );
         // Mock fallback must still be callable.
-        let _ = bundle.facade.status_snapshot();
+        let _ = bundle.facade.diagnostics_status_snapshot();
     }
 
     #[test]

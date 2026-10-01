@@ -186,6 +186,7 @@ fn the_housekeeping_tick_collects_expired_confirmation_tokens() {
     let store = Arc::new(OperationStatusStore::default());
     let tokens = Arc::new(MutationTokenStore::new());
     tokens.issue(
+        nrr_shared::ipc::IpcOperationName::MutationSubmit,
         crate::ipc_handlers::mutation_token_store::StoredMutation {
             kind: crate::ipc_handlers::payloads::MutationKind::RulesUpdate,
             payload: serde_json::json!({}),
@@ -201,6 +202,43 @@ fn the_housekeeping_tick_collects_expired_confirmation_tokens() {
     let stop = StopToken::new();
     let _ = (task.tick)(&stop);
     assert_eq!(tokens.len(), 0, "the expired token must be collected");
+}
+
+#[test]
+fn the_maintenance_tick_ages_the_shared_ip_census_out() {
+    use nrr_storage::repository::{CacheRepository, MigrationRunner};
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    let runner = nrr_storage::migration::SqliteMigrationRunner::for_cache_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    let store = nrr_storage::store::SqliteCacheStore::new(
+        runner.into_connection(),
+        nrr_domain::decision_lookup::FreshnessThresholds::default_production(),
+    );
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .expect("clock");
+    let (stale, live) = (
+        std::net::Ipv4Addr::new(192, 0, 2, 1),
+        std::net::Ipv4Addr::new(192, 0, 2, 2),
+    );
+    store
+        .record_shared_ip_direct_host(stale, "stale.example", 1, false)
+        .expect("census");
+    store
+        .record_shared_ip_direct_host(live, "live.example", now_ms, false)
+        .expect("census");
+    let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
+
+    let mut task = build_storage_checkpoint_task(StorageCheckpointDeps {
+        cache: Some(Arc::clone(&cache)),
+        ..Default::default()
+    });
+    assert_eq!((task.tick)(&StopToken::new()), TaskOutcome::Continue);
+
+    let guard = cache.lock().expect("lock");
+    assert_eq!(guard.direct_host_count_for_ip(stale).expect("count"), 0);
+    assert_eq!(guard.direct_host_count_for_ip(live).expect("count"), 1);
 }
 
 #[test]
@@ -568,7 +606,7 @@ fn an_observed_connection_becomes_a_destination_the_rule_can_route() {
     };
     source.push(observed(
         Some("/usr/bin/messenger"),
-        Ipv4Addr::new(23, 10, 20, 154),
+        Ipv4Addr::new(203, 0, 113, 154),
     ));
     // Nothing to attribute this one to: counted for nobody, or it would widen
     // every enabled app rule.
@@ -584,14 +622,14 @@ fn an_observed_connection_becomes_a_destination_the_rule_can_route() {
     assert_eq!(fold_observations(&wiring), 1);
     assert_eq!(
         store.ips_for_app("messenger"),
-        vec![Ipv4Addr::new(23, 10, 20, 154)],
+        vec![Ipv4Addr::new(203, 0, 113, 154)],
     );
 
     // A destination already known is not news: re-driving policy for it
     // would make every poll of a busy program a policy pass.
     source.push(observed(
         Some("/usr/bin/messenger"),
-        Ipv4Addr::new(23, 10, 20, 154),
+        Ipv4Addr::new(203, 0, 113, 154),
     ));
     assert_eq!(fold_observations(&wiring), 0);
 }
@@ -655,7 +693,7 @@ fn an_observed_resolution_is_applied_for_every_present_principal() {
     }
 
     let source = Arc::new(MockDnsObservationSource::new());
-    source.push("example.com", vec![Ipv4Addr::new(23, 10, 20, 138)]);
+    source.push("example.com", vec![Ipv4Addr::new(203, 0, 113, 138)]);
 
     let applied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&applied);

@@ -55,6 +55,24 @@ pub enum PauseError {
     EmptySid,
 }
 
+impl std::fmt::Display for PauseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage { operation, message } => {
+                write!(f, "pause state storage failed in {operation}: {message}")
+            }
+            Self::Dispatch {
+                operation,
+                sid,
+                message,
+            } => write!(f, "{operation} for {sid} failed: {message}"),
+            Self::EmptySid => f.write_str("no user was named"),
+        }
+    }
+}
+
+impl std::error::Error for PauseError {}
+
 // ── Audit ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,7 +230,8 @@ impl RoutingPauseCoordinator {
             Err(e) => tracing::warn!(
                 target: "nrr::routing-pause",
                 msg_key = "routingpause-route-teardown-failed",
-                "routing-pause route teardown failed (best-effort): {e:?}",
+                error = %e,
+                "routing-pause route teardown failed (best-effort)",
             ),
         }
     }
@@ -860,7 +879,7 @@ mod tests {
             ServiceStabilityConfigRepository::new(&guard)
                 .set(
                     &IpcAcceptPolicyWrite::Critical,
-                    false,
+                    None,
                     false,
                     false,
                     true,
@@ -879,7 +898,7 @@ mod tests {
                 )
                 .expect("set persist policy");
         }
-        let host = route_entry([1, 1, 1, 1], 32, [10, 0, 0, 1], 7);
+        let host = route_entry([198, 51, 100, 1], 32, [10, 0, 0, 1], 7);
         let overlay = route_entry([64, 0, 0, 0], 2, [192, 168, 0, 1], 9);
         fx.api.set_route_table(vec![host.clone(), overlay.clone()]);
         fx.route_coord.adopt_owned(vec![host, overlay]);
@@ -912,7 +931,7 @@ mod tests {
             ServiceStabilityConfigRepository::new(&guard)
                 .set(
                     &IpcAcceptPolicyWrite::Critical,
-                    false,
+                    None,
                     false,
                     false,
                     true,
@@ -931,7 +950,7 @@ mod tests {
                 )
                 .expect("set stop policy");
         }
-        let host = route_entry([1, 1, 1, 1], 32, [10, 0, 0, 1], 7);
+        let host = route_entry([198, 51, 100, 1], 32, [10, 0, 0, 1], 7);
         let overlay = route_entry([64, 0, 0, 0], 2, [192, 168, 0, 1], 9);
         fx.api.set_route_table(vec![host.clone(), overlay.clone()]);
         fx.route_coord.adopt_owned(vec![host, overlay]);
@@ -958,7 +977,7 @@ mod tests {
         // Simulate routes present when resume runs; resume clears the flag then
         // recomputes → with no bound secondary the recompute resolves to "no
         // target" and clears them, proving the recompute ran.
-        let host = route_entry([1, 1, 1, 1], 32, [10, 0, 0, 1], 7);
+        let host = route_entry([198, 51, 100, 1], 32, [10, 0, 0, 1], 7);
         fx.api.set_route_table(vec![host.clone()]);
         fx.route_coord.adopt_owned(vec![host]);
         assert_eq!(fx.route_coord.owned_count(), 1);

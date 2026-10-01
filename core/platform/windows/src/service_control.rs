@@ -113,11 +113,7 @@ impl ServiceControlPort for WindowsServiceControl {
                     dirs_created.push(path);
                 }
             }
-            acl_applied = Some(match apply_data_dir_acl(&root) {
-                Ok(()) => true,
-                Err(refused @ ServiceControlError::InvalidState { .. }) => return Err(refused),
-                Err(_) => false,
-            });
+            acl_applied = Some(adopt_data_tree(&root, &dirs_created)?);
         }
 
         let info = ServiceInfo {
@@ -289,7 +285,7 @@ impl ServiceControlPort for WindowsServiceControl {
                 ServiceState::Running => return Ok(()),
                 ServiceState::Stopped => {
                     return Err(ServiceControlError::Mechanism {
-                        detail: "start: the service stopped again on its own;                                  its own log says why"
+                        detail: "start: the service stopped again on its own; its own log says why"
                             .to_string(),
                     })
                 }
@@ -570,6 +566,62 @@ pub fn apply_data_dir_acl(root: &Path) -> Result<(), ServiceControlError> {
     })
 }
 
+/// Take over a data tree that may predate this install, then lock it down.
+///
+/// `%ProgramData%` lets any user create the tree first: the lockdown hands its
+/// permissions back, but not what was planted inside or handles held open, and
+/// the service would start on that state. So a tree holding anything owned
+/// outside SYSTEM/Administrators is refused, as is anything that appears while
+/// it is being locked down. What this install just `created` is its own,
+/// whoever the installing admin's objects default to. `Ok(false)`: adopted,
+/// but the lockdown failed.
+fn adopt_data_tree(root: &Path, created: &[PathBuf]) -> Result<bool, ServiceControlError> {
+    use crate::trusted_location::tree_ownership;
+    ensure_under_program_data(root)?;
+    let census = |root: &Path| {
+        tree_ownership(root).map_err(|e| ServiceControlError::InvalidState {
+            detail: format!("cannot verify who owns the data directory: {e}"),
+        })
+    };
+    let before = census(root)?;
+    adoption_verdict(root, created, &before, None)?;
+    let locked = match apply_data_dir_acl(root) {
+        Ok(()) => true,
+        Err(refused @ ServiceControlError::InvalidState { .. }) => return Err(refused),
+        Err(_) => false,
+    };
+    adoption_verdict(root, created, &before, Some(&census(root)?))?;
+    Ok(locked)
+}
+
+/// The refusal, if any, for a tree read `before` the lockdown and `after` it.
+fn adoption_verdict(
+    root: &Path,
+    created: &[PathBuf],
+    before: &crate::trusted_location::TreeOwnership,
+    after: Option<&crate::trusted_location::TreeOwnership>,
+) -> Result<(), ServiceControlError> {
+    let refuse = |what: String| ServiceControlError::InvalidState {
+        detail: format!(
+            "{what}; remove {} as an administrator and install again",
+            root.display()
+        ),
+    };
+    if let Some(foreign) = before.foreign.iter().find(|path| !created.contains(path)) {
+        return Err(refuse(format!(
+            "{} is owned by an account other than SYSTEM or Administrators",
+            foreign.display()
+        )));
+    }
+    if let Some(stray) = after.and_then(|after| after.entries.difference(&before.entries).next()) {
+        return Err(refuse(format!(
+            "{} appeared while the data directory was being secured",
+            stray.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Poll SCM until the service reports `Stopped` or the budget expires.
 fn wait_for_stopped(service: &Service, timeout: Duration) -> Result<(), ServiceControlError> {
     let deadline = Instant::now() + timeout;
@@ -673,21 +725,57 @@ fn sweep_enforcement_state() -> bool {
     ) {
         tracing::debug!(
             target: "nrr::autostart",
-            error = ?e,
+            error = %e,
             "no autostart entry of ours to remove for this user",
         );
     }
-    let dns_swept =
-        crate::dns_redirect::clear_orphan_redirect(&crate::dns_redirect::TransactedNrptStore)
-            .is_ok()
-            && crate::dns_redirect::release_search_list(&crate::dns_redirect::WindowsSearchList)
-                .is_ok();
+    let dns_swept = crate::dns_redirect::sweep_orphan_dns_state(
+        &crate::dns_redirect::TransactedNrptStore,
+        &crate::dns_redirect::WindowsSearchList,
+    )
+    .is_clean();
     filters_swept && dns_swept
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn census(entries: &[&str], foreign: &[&str]) -> crate::trusted_location::TreeOwnership {
+        crate::trusted_location::TreeOwnership {
+            entries: entries.iter().map(PathBuf::from).collect(),
+            foreign: foreign.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    #[test]
+    fn a_tree_with_a_foreign_owned_entry_is_not_adopted() {
+        let root = Path::new("root");
+        let before = census(
+            &["root", "root/nrr_service_state.db"],
+            &["root", "root/nrr_service_state.db"],
+        );
+        let refused = adoption_verdict(root, &[PathBuf::from("root")], &before, None);
+        assert!(
+            matches!(&refused, Err(ServiceControlError::InvalidState { detail }) if detail.contains("nrr_service_state.db")),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn an_entry_planted_during_the_lockdown_is_not_adopted() {
+        let root = Path::new("root");
+        // Created by this install under the installing admin's own SID.
+        let created = [PathBuf::from("root"), PathBuf::from("root/logs")];
+        let before = census(&["root", "root/logs"], &["root", "root/logs"]);
+        assert!(adoption_verdict(root, &created, &before, None).is_ok());
+        let after = census(&["root", "root/logs", "root/logs/planted"], &[]);
+        assert!(matches!(
+            adoption_verdict(root, &created, &before, Some(&after)),
+            Err(ServiceControlError::InvalidState { .. })
+        ));
+        assert!(adoption_verdict(root, &created, &before, Some(&before)).is_ok());
+    }
 
     #[test]
     fn a_folder_counts_as_within_only_by_whole_components() {

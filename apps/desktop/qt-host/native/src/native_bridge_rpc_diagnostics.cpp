@@ -6,16 +6,6 @@ QString NrrNativeBridge::rpcStatusUpdatesSubscribe(const QString &clientId) {
     return emitRpcRequest(QStringLiteral("status.updates.subscribe"), obj);
 }
 
-QString NrrNativeBridge::rpcExplainGetByDecisionId(const QString &decisionId,
-                                                   const QString &detailLevel) {
-    QJsonObject obj;
-    obj.insert(QStringLiteral("decision-id"), decisionId);
-    if (!detailLevel.isEmpty()) {
-        obj.insert(QStringLiteral("detail-level"), detailLevel);
-    }
-    return emitRpcRequest(QStringLiteral("diagnostics.explain.get"), obj);
-}
-
 QString NrrNativeBridge::rpcExplainGetBySample(const QString &hostname,
                                                const QString &observedIp,
                                                const QString &processName,
@@ -55,20 +45,6 @@ QString NrrNativeBridge::rpcLogsClear(bool dryRun, bool includeArchives) {
     return emitRpcRequest(QStringLiteral("logs.clear"), obj);
 }
 
-QString NrrNativeBridge::rpcDiagnosticModeSet(bool enabled, double durationMs,
-                                             bool untilRestart, const QString &scope) {
-    QJsonObject obj;
-    obj.insert(QStringLiteral("enabled"), enabled);
-    if (durationMs > 0) {
-        obj.insert(QStringLiteral("duration-ms"), durationMs);
-    }
-    obj.insert(QStringLiteral("until-restart"), untilRestart);
-    if (!scope.isEmpty()) {
-        obj.insert(QStringLiteral("scope"), scope);
-    }
-    return emitRpcRequest(QStringLiteral("diagnostics.mode.set"), obj);
-}
-
 QString NrrNativeBridge::rpcCacheClear(const QVariantMap &payload) {
     return emitRpcRequest(QStringLiteral("cache.clear"),
                           QJsonObject::fromVariantMap(payload));
@@ -102,6 +78,17 @@ QString NrrNativeBridge::rpcConnTraceEntriesList(const QString &cursor, int page
     QJsonObject obj;
     obj.insert(QStringLiteral("pagination"), pagination);
     return emitRpcRequest(QStringLiteral("conn-trace.entries.list"), obj);
+}
+
+QString NrrNativeBridge::rpcSnapshotDiagnosticsGet() {
+    return emitRpcRequest(QStringLiteral("snapshot.diagnostics.get"),
+                          QJsonObject());
+}
+
+QString NrrNativeBridge::rpcOperationStatusGet(const QString &operationId) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("operation-id"), operationId);
+    return emitRpcRequest(QStringLiteral("operation.status.get"), obj);
 }
 
 QString NrrNativeBridge::rpcLogsList(const QVariantMap &filter,
@@ -182,16 +169,6 @@ QString NrrNativeBridge::rpcServiceStabilityConfigSet(const QVariantMap &config,
         QStringLiteral("settings.service-stability.set"), obj);
 }
 
-QString NrrNativeBridge::rpcSidecarCommentRead(const QString &type_,
-                                              const QString &value,
-                                              const QString &route) {
-    QJsonObject obj;
-    obj.insert(QStringLiteral("type"), type_);
-    obj.insert(QStringLiteral("value"), value);
-    obj.insert(QStringLiteral("route"), route);
-    return emitRpcRequest(QStringLiteral("sidecar.comment.read"), obj);
-}
-
 QString NrrNativeBridge::rpcSidecarCommentReadAll() {
     return emitRpcRequest(QStringLiteral("sidecar.comment.read-all"),
                           QJsonObject());
@@ -265,12 +242,6 @@ QString NrrNativeBridge::rpcSidecarExternalIpWriteAll(const QVariantList &entrie
     QJsonObject obj;
     obj.insert(QStringLiteral("entries"), arr);
     return emitRpcRequest(QStringLiteral("sidecar.external-ip.write-all"), obj);
-}
-
-QString NrrNativeBridge::rpcSidecarVacuum(bool force) {
-    QJsonObject obj;
-    obj.insert(QStringLiteral("force"), force);
-    return emitRpcRequest(QStringLiteral("sidecar.vacuum"), obj);
 }
 
 QString NrrNativeBridge::rpcSidecarReset() {

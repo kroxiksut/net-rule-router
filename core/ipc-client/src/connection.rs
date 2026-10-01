@@ -74,15 +74,16 @@ impl ConnectionStatus {
     }
 
     /// True when the underlying issue requires user action (install
-    /// service, update one side, start service from Settings).
+    /// service, update one side, start service from Settings). The one
+    /// definition; exhaustive so a new state has to be classified here.
     pub fn requires_user_action(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::NotInstalled
-                | Self::ServiceStopped
-                | Self::ProtocolMismatch { .. }
-                | Self::Refused { .. }
-        )
+            | Self::ServiceStopped
+            | Self::ProtocolMismatch { .. }
+            | Self::Refused { .. } => true,
+            Self::Connected | Self::Connecting | Self::Disconnected { .. } => false,
+        }
     }
 }
 
@@ -133,15 +134,11 @@ impl std::fmt::Display for IpcClientError {
 
 impl std::error::Error for IpcClientError {}
 
-/// Abstract sink the [`crate::IpcBackendFacade`] talks to.
+/// The client surface its callers drive: [`crate::ServiceIpcClient`] in
+/// production, a fake in tests that exercise the callers without an OS channel.
 ///
-/// In production this is implemented by [`crate::NamedPipeIpcClient`].
-/// In tests, [`crate::IpcBackendFacade`] consumes a
-/// fake implementation so the cache-fallback semantics can be exercised
-/// without spinning up a real Win32 named pipe.
-///
-/// `Send + Sync` because the facade lives behind an `Arc` and is
-/// shared between the GUI worker thread and the QML render thread.
+/// `Send + Sync` because callers keep it behind an `Arc` shared between the
+/// GUI worker thread and the QML render thread.
 pub trait IpcClient: Send + Sync {
     /// Issue one operation and block up to `timeout` for the response
     /// payload (already extracted from the IPC envelope).
@@ -363,6 +360,15 @@ mod tests {
         };
         assert!(p.requires_user_action());
         assert!(!p.is_connected());
+    }
+
+    /// A refusal is the service's final answer; waiting it out as "still
+    /// connecting" would burn the caller's whole budget.
+    #[test]
+    fn refused_requires_user_action_and_is_not_reconnecting() {
+        let r = ConnectionStatus::Refused { reason: "x".into() };
+        assert!(r.requires_user_action());
+        assert!(!r.is_reconnecting());
     }
 
     #[test]

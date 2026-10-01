@@ -2,7 +2,7 @@
 //!
 //! How NetRuleRouter treats an IPv4 address that a **secondary** (VPN) rule
 //! routes but that is SHARED with other, non-secondary hostnames (the classic
-//! shared-CDN case: `assistant.example` and `www.whatismyip.com` both on
+//! shared-CDN case: `assistant.example` and `www.neighbour.example` both on
 //! `192.0.2.0`). IP-level routing cannot separate two hostnames on one address,
 //! so committing a shared IP to the secondary link drags the innocent
 //! co-tenants onto the secondary link (collateral), while NOT committing it leaks the
@@ -132,6 +132,19 @@ mod tests {
         }
         assert_eq!(SharedIpPolicy::from_slug("nope"), None);
         assert_eq!(SharedIpPolicy::from_code(99), None);
+    }
+
+    /// The mirrors validate against the wire list; a policy missing from it
+    /// would be reverted by every preferences load.
+    #[test]
+    fn the_wire_slug_list_names_every_policy() {
+        let ours = [
+            SharedIpPolicy::MajorityOfIp,
+            SharedIpPolicy::MajorityOfRules,
+            SharedIpPolicy::AnyRuleDomain,
+        ]
+        .map(SharedIpPolicy::as_slug);
+        assert_eq!(ours, nrr_shared::ipc_payloads::SHARED_IP_POLICY_SLUGS);
     }
 
     #[test]

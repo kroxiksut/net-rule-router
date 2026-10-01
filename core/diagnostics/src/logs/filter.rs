@@ -284,7 +284,7 @@ mod tests {
         }
         assert!(
             DEFAULT_MODE_SILENCED.is_empty(),
-            "adding a category here removes it from the running product's log —              say why in the constant's doc"
+            "adding a category here removes it from the running product's log — say why in the constant's doc"
         );
     }
 
