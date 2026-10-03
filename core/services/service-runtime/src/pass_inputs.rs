@@ -9,7 +9,10 @@
 //! changed behind our back.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,8 +29,36 @@ struct Readings {
     /// hash of the pass's own part.
     seen: Vec<Option<u64>>,
     seen_extra: u64,
+    /// The last [`PassInputs::is_settled`] answered `false` to a requested full pass.
+    forced: bool,
     /// The fingerprint applied last, when, and what it was made of.
     settled: Option<Settled>,
+}
+
+/// A caller's demand that the next pass run in full whatever its inputs say:
+/// it brings a fact no source can see, or it must not return before the pass.
+#[derive(Clone, Default)]
+pub struct FullPassRequest(Arc<AtomicBool>);
+
+impl FullPassRequest {
+    pub fn request(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// `hook`, preceded by a request that the pass it starts run in full.
+pub fn forcing(
+    request: FullPassRequest,
+    hook: Arc<dyn Fn() + Send + Sync>,
+) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        request.request();
+        hook();
+    })
 }
 
 struct Settled {
@@ -41,6 +72,7 @@ struct Settled {
 pub struct PassInputs {
     sources: Vec<(&'static str, InputGeneration)>,
     full_every: Duration,
+    full_request: FullPassRequest,
     readings: Mutex<Readings>,
 }
 
@@ -50,8 +82,16 @@ impl PassInputs {
         Self {
             sources: Vec::new(),
             full_every: FULL_PASS_EVERY,
+            full_request: FullPassRequest::default(),
             readings: Mutex::new(Readings::default()),
         }
+    }
+
+    /// Share the request a caller raises before asking for a pass.
+    #[must_use]
+    pub fn with_full_pass_request(mut self, request: FullPassRequest) -> Self {
+        self.full_request = request;
+        self
     }
 
     /// Add an input. `name` is what [`Self::moved`] reports it as.
@@ -83,13 +123,19 @@ impl PassInputs {
         let mut readings = self.lock();
         readings.seen = values;
         readings.seen_extra = extra;
+        readings.forced = false;
         known.then(|| hasher.finish())
     }
 
     /// Whether `fingerprint` is the one last applied, recently enough that a
-    /// full pass is not yet due.
+    /// full pass is not yet due, and nobody asked for one. Consumes the request.
     pub fn is_settled(&self, fingerprint: u64) -> bool {
-        self.lock().settled.as_ref().is_some_and(|settled| {
+        let mut readings = self.lock();
+        if self.full_request.take() {
+            readings.forced = true;
+            return false;
+        }
+        readings.settled.as_ref().is_some_and(|settled| {
             settled.fingerprint == fingerprint && settled.at.elapsed() < self.full_every
         })
     }
@@ -112,9 +158,13 @@ impl PassInputs {
 
     /// Why the last fingerprint did not match the applied one: the names of
     /// the sources that moved, `extra` for the pass's own part, `due` when only
-    /// the periodic full pass came round, `first` before anything was applied.
+    /// the periodic full pass came round, `first` before anything was applied,
+    /// `forced` when a caller asked for the pass.
     pub fn moved(&self) -> String {
         let readings = self.lock();
+        if readings.forced {
+            return "forced".to_string();
+        }
         let Some(settled) = readings.settled.as_ref() else {
             return "first".to_string();
         };
@@ -146,12 +196,62 @@ impl Default for PassInputs {
     }
 }
 
-/// A SQLite connection's change number.
-pub fn sqlite_generation(conn: Arc<Mutex<rusqlite::Connection>>) -> InputGeneration {
-    Arc::new(move || {
-        let guard = conn.lock().ok()?;
-        nrr_storage::change_generation::of(&guard)
-    })
+/// State tables no enforcement pass reads: journals, suggestions, tokens and
+/// alerts. The service writes them on nearly every event, and counting them
+/// re-ran the whole pass after each one. A table missing here is counted, so a
+/// new table costs passes, never a stale plan.
+pub const PLAN_BLIND_STATE_TABLES: &[&str] = &[
+    "block_notice_journal",
+    "block_notice_mutes",
+    "auto_rule_evidence",
+    "auto_rule_pending_candidates",
+    "auto_rule_dismissals",
+    "mutation_tokens",
+    "explain_snapshots",
+    "apply_snapshots",
+    "security_alerts",
+    "integrity_log",
+];
+
+/// Row changes this process made to the database at `path` outside `ignored`.
+pub fn table_writes(path: PathBuf, ignored: &'static [&'static str]) -> InputGeneration {
+    Arc::new(move || Some(nrr_storage::write_ledger::changes_outside(&path, ignored)))
+}
+
+/// Which counted tables moved between two reports, for the slow-pass line.
+pub struct TableWriteDiff {
+    path: PathBuf,
+    ignored: &'static [&'static str],
+    last: Mutex<HashMap<String, u64>>,
+}
+
+impl TableWriteDiff {
+    #[must_use]
+    pub fn new(path: PathBuf, ignored: &'static [&'static str]) -> Self {
+        let last = Mutex::new(nrr_storage::write_ledger::snapshot(&path));
+        Self {
+            path,
+            ignored,
+            last,
+        }
+    }
+
+    /// `table+n` for each counted table written since the previous call.
+    pub fn since_last(&self) -> String {
+        let now = nrr_storage::write_ledger::snapshot(&self.path);
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let mut moved: Vec<String> = now
+            .iter()
+            .filter(|(table, _)| !self.ignored.contains(&table.as_str()))
+            .filter_map(|(table, n)| {
+                let delta = n.saturating_sub(last.get(table).copied().unwrap_or(0));
+                (delta > 0).then(|| format!("{table}+{delta}"))
+            })
+            .collect();
+        moved.sort_unstable();
+        *last = now;
+        moved.join(",")
+    }
 }
 
 /// The hash of whatever `read` returns; `None` when it fails.
@@ -214,6 +314,37 @@ mod tests {
         inputs.settle(fp);
         assert!(!inputs.is_settled(fp));
         assert_eq!(inputs.moved(), "due");
+    }
+
+    #[test]
+    fn a_requested_full_pass_runs_once_however_still_the_inputs() {
+        let (_, source) = counter();
+        let request = FullPassRequest::default();
+        let inputs = PassInputs::new()
+            .with_source("cache", source)
+            .with_full_pass_request(request.clone());
+        let fp = inputs.fingerprint(&()).expect("fingerprint");
+        inputs.settle(fp);
+
+        let hook_ran = Arc::new(AtomicU64::new(0));
+        let ran = Arc::clone(&hook_ran);
+        forcing(
+            request,
+            Arc::new(move || {
+                ran.fetch_add(1, Ordering::Relaxed);
+            }),
+        )();
+        assert_eq!(hook_ran.load(Ordering::Relaxed), 1);
+
+        let fp = inputs.fingerprint(&()).expect("fingerprint");
+        assert!(!inputs.is_settled(fp), "the request was ignored");
+        assert_eq!(inputs.moved(), "forced");
+        inputs.settle(fp);
+        let fp = inputs.fingerprint(&()).expect("fingerprint");
+        assert!(
+            inputs.is_settled(fp),
+            "one request forced more than one pass"
+        );
     }
 
     #[test]

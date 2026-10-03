@@ -50,6 +50,10 @@ pub struct EstablishedFlow {
     /// `unix:uid:<n>`). `None` when the owner could not be resolved — the
     /// process exited, or the OS refused to say.
     pub owner: Option<String>,
+    /// The owning process, when the OS says so.
+    pub pid: Option<u32>,
+    /// File name of that process's image, resolved while it was still alive.
+    pub image: Option<String>,
 }
 
 /// Tear down established TCP connections aimed at a range of addresses.
@@ -218,6 +222,8 @@ mod tests {
             local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000),
             remote: SocketAddrV4::new(POOL, 443),
             owner: None,
+            pid: None,
+            image: None,
         };
         assert_eq!(NoopStaleFlowReset.reset_established(&[flow]), 0);
     }
@@ -229,6 +235,8 @@ mod tests {
             local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000),
             remote: SocketAddrV4::new(ip, 443),
             owner: Some("S-1-5-21-1-2-3-1001".into()),
+            pid: None,
+            image: None,
         };
         let wanted = Ipv4Addr::new(203, 0, 113, 1);
         mock.set_flows(vec![to(wanted), to(Ipv4Addr::new(203, 0, 113, 2))]);

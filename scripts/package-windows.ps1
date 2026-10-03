@@ -13,6 +13,7 @@
           NetRuleRouter.exe     start here
           README.txt  README.ru.txt
           <tray, service, console, Qt host, the Qt runtime, wintun.dll>
+          <*.pdb>               line tables, so a panic names file:line
           qml\                  Qt's own modules, written by windeployqt
           apps\desktop\qml\     the app's own QML
           locales\  presets\  configs\  assets\
@@ -318,8 +319,15 @@ foreach ($exe in $executables) {
         throw "'$exe' is missing from '$releaseDir'. Run without -SkipBuild."
     }
     Copy-Item -Path $source -Destination $binDir -Force
+    # Line tables for the panic message; the backtrace looks beside the exe.
+    # Cargo names the PDB after the crate-style name: `nrr-cli` -> `nrr_cli.pdb`.
+    $pdb = Join-Path $releaseDir (([IO.Path]::GetFileNameWithoutExtension($exe) -replace '-', '_') + '.pdb')
+    if (-not (Test-Path $pdb)) {
+        throw "'$(Split-Path $pdb -Leaf)' is missing from '$releaseDir'. Run without -SkipBuild."
+    }
+    Copy-Item -Path $pdb -Destination $binDir -Force
 }
-Write-Step "copied $($executables.Count) executables"
+Write-Step "copied $($executables.Count) executables with their symbols"
 
 $nativeHost = Resolve-NativeHost -ReleaseDir $releaseDir
 Copy-Item -Path $nativeHost -Destination $binDir -Force

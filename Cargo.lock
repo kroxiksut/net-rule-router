@@ -1003,8 +1003,10 @@ dependencies = [
  "nftables",
  "nrr-platform-api",
  "nrr-shared",
+ "rusqlite",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "tracing",
 ]

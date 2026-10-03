@@ -144,17 +144,28 @@ impl StaleFlowReset for WindowsStaleFlowReset {
                 }
             }
         }
-        // A browser holds many connections to one front; ask for its token once.
-        let mut owners: HashMap<u32, Option<String>> = HashMap::new();
+        // A browser holds many connections to one front; ask for its token and image
+        // name once; the image is read now, the process may be gone after the reset.
+        let mut owners: HashMap<u32, (Option<String>, Option<String>)> = HashMap::new();
         matched
             .into_iter()
-            .map(|(local, remote, pid)| EstablishedFlow {
-                local,
-                remote,
-                owner: owners
+            .map(|(local, remote, pid)| {
+                let (owner, image) = owners
                     .entry(pid)
-                    .or_insert_with(|| process_user_sid(pid))
-                    .clone(),
+                    .or_insert_with(|| {
+                        (
+                            process_user_sid(pid),
+                            crate::app_path_resolver::image_name_for_pid(pid),
+                        )
+                    })
+                    .clone();
+                EstablishedFlow {
+                    local,
+                    remote,
+                    owner,
+                    pid: Some(pid),
+                    image,
+                }
             })
             .collect()
     }
@@ -336,6 +347,8 @@ mod tests {
             local,
             remote,
             owner: None,
+            pid: None,
+            image: None,
         };
         let from_flow = delete_tcb_entry_for(&flow);
         let from_row = delete_tcb_entry(&row);

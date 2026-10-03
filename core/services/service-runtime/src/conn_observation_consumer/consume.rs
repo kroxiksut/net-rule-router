@@ -454,6 +454,9 @@ impl ConnectionObservationConsumer {
                 self.note_torn_down(ip);
             }
             if torn_down > 0 {
+                crate::flow_reset_log::log_reset_flows(None, &flows, |_| {
+                    (None, crate::flow_reset_log::ResetCause::PinDrop)
+                });
                 tracing::info!(
                     target: "nrr::conn-trace",
                     msg_key = "connobs-stale-flows-torn-down",

@@ -290,6 +290,19 @@ impl ProductionRefusingAnchors {
     }
 }
 
+/// The reader the suggestion engine asks "which sites refuse main-link
+/// addresses?" — the rows this writer records.
+pub fn refusing_anchors_reader(
+    state_conn: Arc<Mutex<Connection>>,
+) -> crate::auto_rules::RefusingAnchorsFn {
+    Arc::new(move |sid: &str| {
+        let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
+        nrr_storage::refusing_anchors::RefusingAnchorsRepository::new(&guard)
+            .list_for_sid(sid)
+            .unwrap_or_default()
+    })
+}
+
 impl crate::ipc_handlers::providers::RefusingAnchorsWriter for ProductionRefusingAnchors {
     fn set(
         &self,

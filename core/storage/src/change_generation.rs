@@ -1,17 +1,10 @@
-//! A cheap "has this database been written since I last looked" number.
+//! A cheap "has another connection written this database" number.
 
 use rusqlite::Connection;
 
-/// Combines `PRAGMA data_version`, which moves on commits from OTHER
-/// connections, with `total_changes`, which counts this connection's own. Either
-/// alone misses half the writers. `None` when the pragma cannot be read.
-#[must_use]
-pub fn of(conn: &Connection) -> Option<u64> {
-    Some((outside_writes(conn)? << 32) ^ conn.total_changes())
-}
-
-/// The half of [`of`] that moves only on commits from other connections — for a
+/// `PRAGMA data_version`: moves only on commits from other connections — for a
 /// store that counts its own writes by what they mean rather than by rows.
+/// `None` when the pragma cannot be read.
 #[must_use]
 pub fn outside_writes(conn: &Connection) -> Option<u64> {
     let others: i64 = conn
@@ -25,7 +18,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn own_and_outside_writes_both_move_it() {
+    fn only_another_connections_write_moves_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("g.db");
         let mine = Connection::open(&path).expect("open");
@@ -33,20 +26,17 @@ mod tests {
             .expect("schema");
         let other = Connection::open(&path).expect("open other");
 
-        let start = of(&mine).expect("generation");
-        assert_eq!(of(&mine), Some(start), "a read moved it");
-
+        let start = outside_writes(&mine).expect("generation");
         mine.execute("INSERT INTO t VALUES (1)", [])
             .expect("own write");
-        let after_own = of(&mine).expect("generation");
-        assert_ne!(after_own, start, "this connection's write did not move it");
+        assert_eq!(outside_writes(&mine), Some(start), "an own write moved it");
 
         other
             .execute("INSERT INTO t VALUES (2)", [])
             .expect("outside write");
         assert_ne!(
-            of(&mine),
-            Some(after_own),
+            outside_writes(&mine),
+            Some(start),
             "another connection's write did not move it"
         );
     }

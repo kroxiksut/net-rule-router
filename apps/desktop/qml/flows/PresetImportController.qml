@@ -345,11 +345,16 @@ QtObject {
         // clears any previously-recorded passthrough for this route,
         // which is the right behaviour when the user re-imports a
         // preset that no longer has foreign-OS sections.
-        // Register a discard callback for the returned correlation id so
-        // the response is consumed instead of surfacing as a scary "rpc: unknown
-        // correlation id" in the launcher log (this write is otherwise fire-and-forget).
         var corr = nrrNativeBridge.rpcSidecarPassthroughWrite(route, sections)
-        root.rpc.registerRpcCallback(corr, function() {})
+        root.rpc.registerRpcCallback(corr, function(ok, payload) {
+            // The import notice already named every section as preserved;
+            // the store refuses one too large to keep, and the user must hear it.
+            var dropped = (ok && payload && payload.dropped) || []
+            if (dropped.length === 0) return
+            root.setStatus(root.tr("status.preset-import-passthrough-dropped",
+                "Not preserved, too large to store: {sections}.")
+                .replace("{sections}", dropped.join(", ")))
+        })
     }
 
     // Map a `preset.parse` response payload to the rulesModel row

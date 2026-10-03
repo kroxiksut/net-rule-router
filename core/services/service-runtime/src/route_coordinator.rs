@@ -47,11 +47,15 @@ mod notice_latches;
 // `adapter_entry_binding_matches` are called from `production_handlers_misc`
 // as `route_coordinator::…`, and moving a file should not move a caller.
 use binding_resolver::{
-    adapter_answers_to_saved_name, binding_matches_live, derive_primary_target,
-    derive_secondary_next_hop, derive_secondary_next_hop_v6, diagnostic_tally, mac_anchor_id,
-    preferred_display_name, replacement_candidates,
+    adapter_answers_to_saved_name, binding_matches_live, derive_secondary_next_hop,
+    derive_secondary_next_hop_v6, diagnostic_tally, mac_anchor_id, preferred_display_name,
+    replacement_candidates,
 };
 pub use binding_resolver::{adapter_binding_matches, adapter_entry_binding_matches};
+// The main-link derivation, for a platform that resolves egress without this
+// coordinator; one definition either way.
+pub(crate) use binding_resolver::derive_primary_target;
+pub(crate) use exemptions::foreign_tunnel_indexes;
 // Read only by this module's tests, which sit in a sibling file and reach it
 // through `super::`.
 #[cfg(test)]

@@ -32,7 +32,7 @@ pub(crate) use diag_log::{diag_log, user_diagnostics_dir};
 pub use nrr_desktop_gui::ui_surface::path_to_file_url;
 pub use resolve::resolve_native_host_executable;
 pub(crate) use resolve::sibling_service_binary;
-pub use single_instance::SingleInstanceGuard;
+pub use single_instance::{BuildMismatchNote, SingleInstanceGuard};
 
 use child_process::{apply_no_window, spawn_line_reader};
 use context::{cleanup_temp_leftovers, emit_context, take_tray_status_argument};
@@ -583,19 +583,39 @@ fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryO
         ),
     );
     // A different build holding the lock is never a duplicate launch: it is the
-    // previous build still running. Handing it the activation would raise ITS
-    // window, which looks exactly like a rebuild that changed nothing — the
-    // trap that cost a developer six hours. Say which build answered instead.
+    // previous build still running. A plain activation would raise ITS window and
+    // look exactly like a rebuild that changed nothing, so the request carries a
+    // note and the running window names both builds. The lock is never taken
+    // over: that build is still alive.
     if let Some((running, ours)) = foreign_build_in_lock(config.single_instance_key) {
         diag_log(
             tag,
             &format!(
                 "NRR_LAUNCHER[secondary] ANOTHER BUILD of {} holds the single-instance lock; \
-                 not activating it. running: [{running}] this: [{ours}]. \
+                 not taking it over. running: [{running}] this: [{ours}]. \
                  Close the running instance before starting this one.",
                 config.app_name
             ),
         );
+        if matches!(config.surface, LauncherSurface::MainGui) {
+            let note = BuildMismatchNote::new(&running, &ours);
+            let path = default_activation_request_path();
+            let written = nrr_platform_api::paths::ensure_user_runtime_dir()
+                .and_then(|_| write_activation_request_with_note(request, &path, Some(&note)));
+            match written {
+                Ok(()) => {
+                    wait_for_consumption(
+                        tag,
+                        &path,
+                        activation_ack_budget(config.single_instance_key),
+                    );
+                }
+                Err(error) => diag_log(
+                    tag,
+                    &format!("NRR_LAUNCHER[secondary] build-mismatch note not written: {error}"),
+                ),
+            }
+        }
         return SecondaryOutcome::Handled(ExitCode::from(EXIT_BUILD_MISMATCH));
     }
 
@@ -657,6 +677,30 @@ fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryO
     SecondaryOutcome::TakeOver
 }
 
+/// Waits for the primary to take the request file; a request nobody read is
+/// removed so a later start does not replay it.
+fn wait_for_consumption(tag: &str, path: &Path, budget: Duration) {
+    let waited_from = Instant::now();
+    while waited_from.elapsed() < budget {
+        if !path.exists() {
+            diag_log(
+                tag,
+                &format!(
+                    "NRR_LAUNCHER[secondary] build-mismatch note consumed after {} ms",
+                    waited_from.elapsed().as_millis()
+                ),
+            );
+            return;
+        }
+        std::thread::sleep(ACTIVATION_ACK_POLL);
+    }
+    diag_log(
+        tag,
+        "NRR_LAUNCHER[secondary] build-mismatch note NOT consumed; the running build shows no window",
+    );
+    let _ = fs::remove_file(path);
+}
+
 /// Wires the OS appearance probe — light/dark and the high-contrast switch —
 /// into `nrr-ui-support`, which is neutral and must not name an OS itself.
 /// Without this the theme resolver answers "undetected", and the GUI shows its
@@ -713,6 +757,16 @@ pub fn write_activation_request_to_default_path(request: &LaunchRequest) -> io::
 }
 
 pub fn write_activation_request(request: &LaunchRequest, path: &Path) -> io::Result<()> {
+    write_activation_request_with_note(request, path, None)
+}
+
+/// Like [`write_activation_request`], plus `buildMismatch` when the running
+/// instance is a different build; older hosts ignore the unknown key.
+pub fn write_activation_request_with_note(
+    request: &LaunchRequest,
+    path: &Path,
+    note: Option<&BuildMismatchNote>,
+) -> io::Result<()> {
     let mut payload = serde_json::Map::new();
     payload.insert("activate".to_string(), serde_json::Value::Bool(true));
     if let Some(section) = request.section {
@@ -752,6 +806,17 @@ pub fn write_activation_request(request: &LaunchRequest, path: &Path) -> io::Res
         payload.insert(
             "focusContext".to_string(),
             serde_json::to_value(context).map_err(io::Error::other)?,
+        );
+    }
+    if let Some(note) = note {
+        payload.insert(
+            "buildMismatch".to_string(),
+            serde_json::json!({
+                "runningVersion": note.running_version,
+                "runningFingerprint": note.running_fingerprint,
+                "ourVersion": note.our_version,
+                "ourFingerprint": note.our_fingerprint,
+            }),
         );
     }
 

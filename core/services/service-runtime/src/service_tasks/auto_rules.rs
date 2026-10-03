@@ -20,6 +20,26 @@ pub struct AutoProbeCadence {
     pub repeat: Duration,
 }
 
+/// Each principal's own opt-in and repeat window, read from their stored
+/// policy. An unreadable policy is not consent.
+pub fn stored_auto_probe_cadence(
+    state_conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+) -> Arc<dyn Fn(&str) -> AutoProbeCadence + Send + Sync> {
+    Arc::new(move |sid: &str| {
+        let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
+        match nrr_storage::route_bindings::RouteBindingsRepository::new(&guard).load_for_sid(sid) {
+            Ok(record) => AutoProbeCadence {
+                enabled: record.primary_probe_auto,
+                repeat: Duration::from_secs(u64::from(record.primary_probe_repeat_secs)),
+            },
+            Err(_) => AutoProbeCadence {
+                enabled: false,
+                repeat: Duration::from_secs(300),
+            },
+        }
+    })
+}
+
 /// The automatic "does it answer on the main link?" pass.
 ///
 /// The manual button and this share one runner: the pass is the same question,

@@ -27,5 +27,6 @@ pub mod update_check_fetch;
 pub use launcher::{
     apply_qt_preferences_payload, default_activation_request_path, path_to_file_url,
     preferences_to_persist, resolve_native_host_executable, run, write_activation_request,
-    write_activation_request_to_default_path, LauncherConfig, LauncherSurface, SingleInstanceGuard,
+    write_activation_request_to_default_path, write_activation_request_with_note,
+    BuildMismatchNote, LauncherConfig, LauncherSurface, SingleInstanceGuard,
 };

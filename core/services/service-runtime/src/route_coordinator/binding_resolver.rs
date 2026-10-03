@@ -380,7 +380,7 @@ pub(super) fn derive_secondary_next_hop_v6(
 /// link, whose on-link `/0` would send "direct" traffic into someone else's
 /// tunnel. Returns `None` when neither exists (e.g. a VPN that replaced `/0`
 /// itself) — the caller then logs the actionable gap.
-pub(super) fn derive_primary_target(
+pub(crate) fn derive_primary_target(
     routes: &[RouteEntry],
     secondary_ifindex: u32,
     foreign_tunnels: &[u32],

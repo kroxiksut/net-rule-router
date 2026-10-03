@@ -80,9 +80,7 @@ windows = { version = "0.58", features = [
 tempfile = "3"
 
 [target.'cfg(windows)'.build-dependencies]
-# Compiles `resources/app.rc` (the app icon) into the PE resource section
-# so the service executable carries the NetRuleRouter icon. Same crate and
-# single icon source as the launcher (`apps/desktop/launcher`).
+# Icon and version block from `packaging/windows/app.rc.in`.
 embed-resource = "2"
 
 [lints]

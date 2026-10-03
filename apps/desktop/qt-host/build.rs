@@ -31,9 +31,16 @@ fn main() {
     // own mtime, which (on Windows) does NOT change when a file *inside* it is
     // edited in place. So edits to the resource template / CMake / C++ source
     // were silently not picked up. Track the load-bearing files explicitly.
-    for rel in ["resources/app.rc.in", "CMakeLists.txt"] {
-        println!("cargo:rerun-if-changed={}", native_dir.join(rel).display());
-    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("CMakeLists.txt").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir
+            .join("../../../packaging/windows/app.rc.in")
+            .display()
+    );
     if let Ok(entries) = std::fs::read_dir(native_dir.join("src")) {
         for entry in entries.flatten() {
             println!("cargo:rerun-if-changed={}", entry.path().display());
@@ -121,6 +128,10 @@ fn main() {
     // Single-config generators take the build type at configure time; the
     // multi-config ones ignore it and take `--build --config` instead.
     configure.arg(format!("-DCMAKE_BUILD_TYPE={config}"));
+    configure.arg(format!(
+        "-DNRR_VERSION={}",
+        env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION")
+    ));
     // The C++ build type is RelWithDebInfo in both profiles, so NDEBUG cannot
     // tell a dev host from a shipped one; the cargo profile can. Passed either
     // way, because CMake would otherwise keep a previous run's cached value.

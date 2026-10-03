@@ -297,8 +297,11 @@ you lost network access, proceed step by step:
    and apply the changes.
 2. **Stop the service** — Settings → Service management → Stop service.
    When the service stops, it removes its routes and protection, every
-   connection returns to the main channel. The same from PowerShell as
-   administrator:
+   connection returns to the main channel. A connection that was open at
+   that moment may drop once, because its path changed; reconnecting fixes
+   it, and new connections work right away. The service log names the
+   programs that had connections open when it stopped. The same from
+   PowerShell as administrator:
 
    ```powershell
    Stop-Service NetRuleRouter        # or: sc.exe stop NetRuleRouter

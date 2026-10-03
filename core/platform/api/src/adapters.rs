@@ -38,7 +38,9 @@
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::Arc,
+    time::Duration,
 };
 
 use crate::error::PlatformError;
@@ -386,7 +388,16 @@ pub struct AdapterMonitor {
     // Which identity each connection name last carried, and which name each
     // identity last answered to — see `note_identity_drift`.
     identity_seen: std::sync::Mutex<IdentityLedger>,
+    /// Interval between reads of a quiet link once the OS change feed is live;
+    /// `None` reads on every call.
+    quiet_read_every_ms: Option<u64>,
+    feed_live: AtomicBool,
+    change_reported: AtomicBool,
+    last_read_ms: AtomicU64,
 }
+
+/// `last_read_ms` before the first read.
+const NEVER_READ: u64 = u64::MAX;
 
 /// Bounded name-to-identity memory behind [`AdapterMonitor::note_identity_drift`].
 ///
@@ -469,7 +480,56 @@ impl AdapterMonitor {
             confirmed: std::sync::Mutex::new(HashMap::new()),
             pending: std::sync::Mutex::new(HashMap::new()),
             identity_seen: std::sync::Mutex::new(IdentityLedger::default()),
+            quiet_read_every_ms: None,
+            feed_live: AtomicBool::new(false),
+            change_reported: AtomicBool::new(false),
+            last_read_ms: AtomicU64::new(NEVER_READ),
         }
+    }
+
+    /// Once [`Self::change_feed_live`] is called, [`Self::update_if_due`] reads
+    /// the source only after an OS change, while a transition is settling, or
+    /// once per `quiet_every`. The quiet read is what catches a missed event.
+    pub fn reading_on_change(mut self, quiet_every: Duration) -> Self {
+        self.quiet_read_every_ms = Some(u64::try_from(quiet_every.as_millis()).unwrap_or(u64::MAX));
+        self
+    }
+
+    /// The OS change feed is subscribed; without it every call reads.
+    pub fn change_feed_live(&self) {
+        self.feed_live.store(true, Ordering::Release);
+    }
+
+    /// The OS reported an interface, address or route change.
+    pub fn note_os_change(&self) {
+        self.change_reported.store(true, Ordering::Release);
+    }
+
+    /// [`Self::update`] when a read is due, no changes otherwise.
+    pub fn update_if_due(&self, now_ms: u64) -> Vec<AdapterAvailabilityChange> {
+        if self.read_due(now_ms) {
+            self.update(now_ms)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn read_due(&self, now_ms: u64) -> bool {
+        let Some(quiet) = self.quiet_read_every_ms else {
+            return true;
+        };
+        if !self.feed_live.load(Ordering::Acquire) {
+            return true;
+        }
+        // A debounced transition only completes on a later read.
+        if self.change_reported.swap(false, Ordering::AcqRel)
+            || !self.pending.lock().unwrap().is_empty()
+        {
+            return true;
+        }
+        let last = self.last_read_ms.load(Ordering::Acquire);
+        // A clock that stepped back proves nothing about how long it has been.
+        last == NEVER_READ || now_ms < last || now_ms - last >= quiet
     }
 
     /// Report an adapter that came back wearing a different identity, or the
@@ -539,6 +599,7 @@ impl AdapterMonitor {
     /// `now_ms` is a monotonic millisecond counter (wall clock or injected in
     /// tests). Returns changes whose debounce window has elapsed.
     pub fn update(&self, now_ms: u64) -> Vec<AdapterAvailabilityChange> {
+        self.last_read_ms.store(now_ms, Ordering::Release);
         let infos = match self.source.enumerate_all() {
             Ok(v) => v,
             Err(_) => return Vec::new(), // source unavailable — no changes
@@ -956,6 +1017,62 @@ mod tests {
     fn present_no_ip_needs_fail_closed() {
         assert!(AdapterAvailability::PresentNoIp.needs_fail_closed());
         assert!(!AdapterAvailability::Available.needs_fail_closed());
+    }
+
+    // ── AdapterMonitor read pacing ────────────────────────────────────────
+
+    /// A monitor on a live change feed that has settled on one Available link.
+    fn settled_on_feed(quiet_ms: u64) -> (Arc<MockAdapterEventSource>, AdapterMonitor) {
+        let src = Arc::new(MockAdapterEventSource::new());
+        let mon = AdapterMonitor::new(Arc::clone(&src) as Arc<dyn AdapterEventSource>, 500)
+            .reading_on_change(Duration::from_millis(quiet_ms));
+        mon.change_feed_live();
+        src.set(vec![eth_up_with_ip(5)]);
+        assert!(mon.update_if_due(0).is_empty());
+        assert_eq!(mon.update_if_due(1_000).len(), 1, "the first link settles");
+        (src, mon)
+    }
+
+    #[test]
+    fn without_a_live_feed_every_call_reads() {
+        let src = Arc::new(MockAdapterEventSource::new());
+        let mon = AdapterMonitor::new(Arc::clone(&src) as Arc<dyn AdapterEventSource>, 500)
+            .reading_on_change(Duration::from_secs(15));
+        src.set(vec![eth_up_with_ip(5)]);
+        assert!(mon.update_if_due(0).is_empty());
+        assert_eq!(mon.update_if_due(600).len(), 1);
+    }
+
+    #[test]
+    fn a_quiet_link_is_not_read_until_the_os_reports_a_change() {
+        let (src, mon) = settled_on_feed(15_000);
+        src.set(vec![eth_down(5)]);
+        assert!(mon.update_if_due(2_000).is_empty());
+        assert!(
+            mon.update_if_due(3_000).is_empty(),
+            "nothing read, nothing pending"
+        );
+
+        mon.note_os_change();
+        assert!(
+            mon.update_if_due(4_000).is_empty(),
+            "the read starts the debounce"
+        );
+        let changes = mon.update_if_due(5_000);
+        assert_eq!(changes.len(), 1, "a settling transition keeps being read");
+        assert_eq!(changes[0].new, AdapterAvailability::PresentDown);
+    }
+
+    #[test]
+    fn a_missed_event_is_caught_by_the_quiet_read() {
+        let (src, mon) = settled_on_feed(15_000);
+        src.set(vec![eth_down(5)]);
+        assert!(mon.update_if_due(15_999).is_empty());
+        assert!(
+            mon.update_if_due(16_000).is_empty(),
+            "quiet read starts the debounce"
+        );
+        assert_eq!(mon.update_if_due(17_000).len(), 1);
     }
 
     // ── AdapterMonitor debounce ───────────────────────────────────────────

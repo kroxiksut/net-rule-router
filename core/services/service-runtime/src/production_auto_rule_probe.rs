@@ -13,8 +13,12 @@
 //! may sit on, and the GUI already learns the outcome from the
 //! suggestion-changed push.
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
+use nrr_platform_api::adapters::AdapterInfo;
+use nrr_platform_api::route_table::RouteTablePort;
+use nrr_platform_api::types::RouteEntry;
 use nrr_shared::ipc_payloads::AutoRuleCandidatesProbeResponse;
 
 use crate::auto_rules::AutoRulesEngine;
@@ -23,6 +27,7 @@ use crate::ipc_handlers::providers::AutoRuleProbeRunner;
 use crate::main_route_verdicts::{MainRouteVerdict, MainRouteVerdicts};
 use crate::observed_host_names::ObservedHostNames;
 use crate::path_probe::{PathProber, ProbeLimits, ProbeTarget};
+use crate::per_sid_orchestrator::RoutePolicySource;
 use crate::route_coordinator::SecondaryRouteCoordinator;
 
 /// Port 443 is where a companion host lives in practice — these are CDN, media
@@ -34,10 +39,22 @@ const PROBE_PORT: u16 = 443;
 /// the first one that answers either way, so a few only cover one that is down.
 const MAX_OBSERVED_ADDRESSES: usize = 4;
 
+/// Where a probe's packets leave from: the principal's main link and, when
+/// one is bound, its additional link — each as the IPv4 address it carries.
+pub trait EgressSources: Send + Sync {
+    fn egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>);
+}
+
+impl EgressSources for SecondaryRouteCoordinator {
+    fn egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
+        self.resolve_egress_source_ips(sid)
+    }
+}
+
 pub struct ProductionAutoRuleProbe {
     engine: Arc<AutoRulesEngine>,
     cache: Arc<dyn FqdnCacheLookup>,
-    coordinator: Arc<SecondaryRouteCoordinator>,
+    egress: Arc<dyn EgressSources>,
     prober: Arc<PathProber>,
     limits_for: Arc<dyn Fn(&str) -> ProbeLimits + Send + Sync>,
     /// Where a rule-host pass leaves its answers. `None` keeps the runner
@@ -62,10 +79,22 @@ impl ProductionAutoRuleProbe {
         prober: Arc<PathProber>,
         limits_for: Arc<dyn Fn(&str) -> ProbeLimits + Send + Sync>,
     ) -> Self {
+        Self::over(engine, cache, coordinator, prober, limits_for)
+    }
+
+    /// As [`Self::new`], with the egress addresses from any source — a
+    /// platform without the route coordinator reads the stored bindings.
+    pub fn over(
+        engine: Arc<AutoRulesEngine>,
+        cache: Arc<dyn FqdnCacheLookup>,
+        egress: Arc<dyn EgressSources>,
+        prober: Arc<PathProber>,
+        limits_for: Arc<dyn Fn(&str) -> ProbeLimits + Send + Sync>,
+    ) -> Self {
         Self {
             engine,
             cache,
-            coordinator,
+            egress,
             prober,
             limits_for,
             verdicts: None,
@@ -170,7 +199,7 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
         let accepted = targets.len().min(limits.max_targets) as u32;
         // The main link's own address — without it the OS would route by the
         // pin, which points at the tunnel and would answer a different question.
-        let (source, secondary_source) = self.coordinator.resolve_egress_source_ips(sid);
+        let (source, secondary_source) = self.egress.egress_source_ips(sid);
         let engine = Arc::clone(&self.engine);
         let prober = Arc::clone(&self.prober);
         let sid_owned = sid.to_string();
@@ -305,5 +334,155 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
             accepted,
             over_limit,
         }
+    }
+}
+
+/// [`EgressSources`] from the principal's stored bindings and the live links,
+/// for a platform without the route coordinator. A link answers to a binding
+/// by name; an unbound main link is derived from the default route exactly as
+/// the coordinator derives it.
+pub struct StoredBindingEgress {
+    policy: Arc<dyn RoutePolicySource>,
+    api: Arc<dyn RouteTablePort>,
+}
+
+impl StoredBindingEgress {
+    pub fn new(policy: Arc<dyn RoutePolicySource>, api: Arc<dyn RouteTablePort>) -> Self {
+        Self { policy, api }
+    }
+}
+
+impl EgressSources for StoredBindingEgress {
+    fn egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
+        let Some(policy) = self.policy.load_for_sid(sid) else {
+            return (None, None);
+        };
+        let Ok(links) = self.api.get_adapter_infos() else {
+            return (None, None);
+        };
+        let routes = self.api.get_ip_forward_table().unwrap_or_default();
+        egress_sources_from(
+            policy.primary.as_ref().map(|b| b.display_name.as_str()),
+            policy.secondary.as_ref().map(|b| b.display_name.as_str()),
+            &links,
+            &routes,
+        )
+    }
+}
+
+/// The address each bound link carries. A bound link that is absent yields
+/// `None` — the probe then does not run rather than measure another path.
+pub fn egress_sources_from(
+    primary: Option<&str>,
+    secondary: Option<&str>,
+    links: &[AdapterInfo],
+    routes: &[RouteEntry],
+) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
+    let named = |name: &str| {
+        links
+            .iter()
+            .find(|l| l.friendly_name == name || l.adapter_name == name)
+    };
+    let secondary_link = secondary.and_then(named);
+    let primary_link = match primary {
+        Some(name) => named(name),
+        None => {
+            let ours: Vec<u32> = secondary_link.map(|l| l.index).into_iter().collect();
+            let foreign = crate::route_coordinator::foreign_tunnel_indexes(links, &ours, routes);
+            crate::route_coordinator::derive_primary_target(
+                routes,
+                secondary_link.map_or(0, |l| l.index),
+                &foreign,
+            )
+            .and_then(|t| links.iter().find(|l| l.index == t.interface_index))
+        }
+    };
+    let address = |link: Option<&AdapterInfo>| link.and_then(|l| l.ipv4_addresses.first().copied());
+    (address(primary_link), address(secondary_link))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nrr_platform_api::adapters::{IfOperStatus, InterfaceType};
+    use std::net::IpAddr;
+
+    fn link(name: &str, index: u32, address: [u8; 4]) -> AdapterInfo {
+        AdapterInfo {
+            index,
+            adapter_name: name.into(),
+            description: name.into(),
+            friendly_name: name.into(),
+            mac: None,
+            interface_type: InterfaceType::Ethernet,
+            oper_status: IfOperStatus::Up,
+            ipv4_addresses: vec![Ipv4Addr::from(address)],
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+        }
+    }
+
+    fn default_via(index: u32, gateway: [u8; 4], metric: u32) -> RouteEntry {
+        RouteEntry {
+            destination: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            prefix_length: 0,
+            next_hop: IpAddr::V4(Ipv4Addr::from(gateway)),
+            interface_index: index,
+            metric,
+            is_ours: false,
+            table: nrr_platform_api::RouteTableRef::Main,
+        }
+    }
+
+    fn machine() -> (Vec<AdapterInfo>, Vec<RouteEntry>) {
+        (
+            vec![
+                link("eth0", 2, [192, 0, 2, 10]),
+                link("wlan0", 3, [192, 0, 2, 20]),
+                link("tun0", 9, [198, 51, 100, 7]),
+            ],
+            vec![
+                default_via(9, [198, 51, 100, 1], 1),
+                default_via(3, [192, 0, 2, 1], 600),
+                default_via(2, [192, 0, 2, 1], 100),
+            ],
+        )
+    }
+
+    #[test]
+    fn bound_links_answer_by_name() {
+        let (links, routes) = machine();
+        assert_eq!(
+            egress_sources_from(Some("wlan0"), Some("tun0"), &links, &routes),
+            (
+                Some(Ipv4Addr::new(192, 0, 2, 20)),
+                Some(Ipv4Addr::new(198, 51, 100, 7))
+            )
+        );
+    }
+
+    /// The common setup binds only the tunnel: the main link is the best
+    /// default route that is not the tunnel's.
+    #[test]
+    fn an_unbound_main_link_is_the_default_route_off_the_tunnel() {
+        let (links, routes) = machine();
+        assert_eq!(
+            egress_sources_from(None, Some("tun0"), &links, &routes),
+            (
+                Some(Ipv4Addr::new(192, 0, 2, 10)),
+                Some(Ipv4Addr::new(198, 51, 100, 7))
+            )
+        );
+    }
+
+    /// A bound link that is gone must not be swapped for another one: the
+    /// answer would be about a path the user did not name.
+    #[test]
+    fn a_missing_bound_link_yields_no_address() {
+        let (links, routes) = machine();
+        assert_eq!(
+            egress_sources_from(Some("eth9"), Some("tun9"), &links, &routes),
+            (None, None)
+        );
     }
 }

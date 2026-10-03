@@ -328,10 +328,10 @@ impl ProductionPrincipalPlanSource {
             availability.primary,
             self.fqdn_cache.as_ref(),
             self.app_observations.as_ref(),
-            // No shared-IP census on this path yet, so nothing is declined. An
-            // empty denylist is the permissive answer, and the census exists to
-            // TAKE addresses away — its absence cannot invent a block.
-            &std::collections::HashSet::new(),
+            // The same addresses the filters were planned without: a route to
+            // the tunnel for an address the policy declined would carry a
+            // direct host's traffic there, as the route codegen elsewhere avoids.
+            &secondary_ip_denylist,
             ipv6.route_families(),
             crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
                 policy.zone_priority_over_ip,
@@ -738,18 +738,14 @@ impl EgressBindingSource for StoredEgressBindings {
 
 /// Open the state database for the enforcement path.
 ///
-/// Its own connection, matching the storage-layer pragmas, so a read here never
-/// races the writer that owns the store.
+/// Its own connection, so a read here never races the writer that owns the
+/// store; opened like every other so its writes reach the write ledger.
 pub fn open_state_connection(path: &std::path::Path) -> Option<Arc<Mutex<rusqlite::Connection>>> {
     if !path.exists() {
         return None;
     }
-    match rusqlite::Connection::open(path) {
-        Ok(conn) => {
-            let _: rusqlite::Result<()> =
-                conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
-            Some(Arc::new(Mutex::new(conn)))
-        }
+    match nrr_storage::migration::open_connection(path) {
+        Ok(conn) => Some(Arc::new(Mutex::new(conn))),
         Err(e) => {
             tracing::error!(
                 target: "nrr::enforcement",

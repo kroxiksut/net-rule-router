@@ -132,7 +132,7 @@ cargo clean -p nrr-qt-host; cargo build -p nrr-qt-host
 `target\<профиль>\build\nrr-qt-host-*\out\qt-native-host-build\<конфигурация>\`.
 В `target\<профиль>\` он намеренно не копируется — лаунчер находит его по
 абсолютному пути, зашитому при сборке. Правки `CMakeLists.txt`,
-`src\main.cpp` и `resources\app.rc.in` подхватываются без `cargo clean`.
+`src\main.cpp` и общего `packaging\windows\app.rc.in` подхватываются без `cargo clean`.
 
 В dev-сборке C++ хост собирается как `RelWithDebInfo`, а не `Debug`: символы
 сохраняются, а приложение линкуется с теми же библиотеками Qt, что и у

@@ -124,6 +124,8 @@ fn collect_windows_rows_from_snapshot(
                 has_default_route,
                 observed_facts.connectivity_state,
             );
+            let device_technology =
+                crate::adapter_kind::device_technology(&adapter.interface_description);
             let kind = kind_facts
                 .get(&adapter_name_key)
                 .map_or(AdapterKind::Other, |facts| classify_adapter_kind(*facts));
@@ -142,8 +144,7 @@ fn collect_windows_rows_from_snapshot(
                 interface_description: adapter.interface_description,
                 interface_type: adapter.interface_type,
                 kind,
-                // The driver description already names TAP-Windows or Wintun.
-                device_technology: None,
+                device_technology,
                 is_bluetooth_like,
                 local_ip,
                 gateway,

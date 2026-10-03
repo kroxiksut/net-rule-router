@@ -255,6 +255,43 @@ impl BuildStamp {
     }
 }
 
+impl BuildStamp {
+    /// Short, stable tag a person can compare across two windows: FNV-1a over
+    /// the size and mtime that make up the identity.
+    pub(super) fn fingerprint(&self) -> String {
+        let mut hash: u32 = 0x811c_9dc5;
+        for byte in self
+            .exe_size
+            .to_le_bytes()
+            .into_iter()
+            .chain(self.exe_mtime_secs.to_le_bytes())
+        {
+            hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+        }
+        format!("{hash:08x}")
+    }
+}
+
+/// Two builds named for the person who has to choose which one to keep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildMismatchNote {
+    pub running_version: String,
+    pub running_fingerprint: String,
+    pub our_version: String,
+    pub our_fingerprint: String,
+}
+
+impl BuildMismatchNote {
+    pub(super) fn new(running: &BuildStamp, ours: &BuildStamp) -> Self {
+        Self {
+            running_version: running.version.clone(),
+            running_fingerprint: running.fingerprint(),
+            our_version: ours.version.clone(),
+            our_fingerprint: ours.fingerprint(),
+        }
+    }
+}
+
 impl fmt::Display for BuildStamp {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

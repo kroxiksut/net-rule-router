@@ -179,42 +179,10 @@ fn thunderbird_server_hostnames(roots: &AppDataRoots, principal: &str) -> Vec<St
         let Ok(text) = String::from_utf8(bytes) else {
             continue;
         };
-        hosts.extend(parse_mail_server_hostnames(&text));
+        hosts.extend(nrr_platform_api::browser_history::mail_server_hostnames_from_prefs(&text));
     }
     hosts.sort_unstable();
     hosts.dedup();
-    hosts
-}
-
-/// Extract account-server hostnames from a Thunderbird `prefs.js`. Matches
-/// the incoming (`mail.server.serverN.hostname`) and outgoing
-/// (`mail.smtpserver.smtpN.hostname`) prefs only — nothing else in the file
-/// is looked at, so account names, addresses, and credentials never cross.
-/// Pure and total: any line that does not match the shape is skipped.
-fn parse_mail_server_hostnames(prefs_js: &str) -> Vec<String> {
-    let mut hosts = Vec::new();
-    for line in prefs_js.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("user_pref(\"") else {
-            continue;
-        };
-        let mut parts = rest.split('"');
-        let Some(key) = parts.next() else { continue };
-        let is_server_host = (key.starts_with("mail.server.server")
-            || key.starts_with("mail.smtpserver.smtp"))
-            && key.ends_with(".hostname");
-        if !is_server_host {
-            continue;
-        }
-        // After the key quote: `, ` then the quoted value.
-        let Some(_separator) = parts.next() else {
-            continue;
-        };
-        let Some(value) = parts.next() else { continue };
-        let host = value.trim().to_ascii_lowercase();
-        if !host.is_empty() {
-            hosts.push(host);
-        }
-    }
     hosts
 }
 
@@ -991,7 +959,7 @@ user_pref("mail.smtpserver.smtp1.username", "someone@example.com");
 user_pref("mail.identity.id1.useremail", "someone@example.com");
 user_pref("network.dns.disableIPv6", true);
 "#;
-        let hosts = parse_mail_server_hostnames(prefs);
+        let hosts = nrr_platform_api::browser_history::mail_server_hostnames_from_prefs(prefs);
         assert_eq!(
             hosts,
             vec![

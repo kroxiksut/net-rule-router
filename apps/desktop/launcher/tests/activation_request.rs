@@ -8,7 +8,9 @@
 //! that the production code uses.
 
 use nrr_desktop_gui::app_shell::{FocusContext, LaunchRequest};
-use nrr_launcher::write_activation_request;
+use nrr_launcher::{
+    write_activation_request, write_activation_request_with_note, BuildMismatchNote,
+};
 use nrr_shared::{ActivationSource, AppSection};
 use std::fs;
 use tempfile::tempdir;
@@ -203,4 +205,29 @@ fn cold_start_context_carries_the_launch_action() {
     assert!(
         deadlines["operationsMs"]["mutation.submit"].as_u64() > deadlines["defaultMs"].as_u64()
     );
+}
+
+#[test]
+fn build_mismatch_note_is_written_under_camel_case_keys_and_absent_otherwise() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("activation.json");
+    let request = make_request(None, false, false);
+
+    write_activation_request(&request, &path).expect("write must succeed");
+    assert!(read_payload(&path).get("buildMismatch").is_none());
+
+    let note = BuildMismatchNote {
+        running_version: "0.4.0".into(),
+        running_fingerprint: "0a1b2c3d".into(),
+        our_version: "0.4.1".into(),
+        our_fingerprint: "4e5f6a7b".into(),
+    };
+    write_activation_request_with_note(&request, &path, Some(&note)).expect("write must succeed");
+    let object = read_payload(&path);
+    assert_eq!(object.get("activate"), Some(&serde_json::Value::Bool(true)));
+    let mismatch = object.get("buildMismatch").expect("note present");
+    assert_eq!(mismatch["runningVersion"], "0.4.0");
+    assert_eq!(mismatch["runningFingerprint"], "0a1b2c3d");
+    assert_eq!(mismatch["ourVersion"], "0.4.1");
+    assert_eq!(mismatch["ourFingerprint"], "4e5f6a7b");
 }

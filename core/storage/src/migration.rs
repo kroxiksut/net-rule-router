@@ -758,6 +758,7 @@ pub fn open_connection(path: &Path) -> StorageResult<Connection> {
     // an intact-looking database behind. Best-effort by design: with another
     // connection open, SQLite refuses to truncate and the next open retries.
     let _ = checkpoint_wal_truncate(&conn);
+    crate::write_ledger::watch(&conn, path);
 
     Ok(conn)
 }

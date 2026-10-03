@@ -128,7 +128,8 @@ pub fn build_traffic_sample_task(deps: TrafficTickDeps) -> ServiceTask {
 
 // ── Adapter monitor ──────────────────────────────────────────────────────────
 
-/// Periodic adapter-availability poll. Wraps `AdapterMonitor::update`
+/// Periodic adapter-availability poll. Wraps `AdapterMonitor::update_if_due`
+/// (a read on every tick unless the monitor is paced by an OS change feed),
 /// which itself is idempotent and never panics; on internal source
 /// errors it returns an empty `Vec<AdapterAvailabilityChange>` so a
 /// single transient enumeration glitch does not propagate as a task
@@ -155,7 +156,7 @@ pub fn build_adapter_monitor_task(
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let changes = monitor.update(now_ms);
+            let changes = monitor.update_if_due(now_ms);
             // An adapter coming up/down (the secondary adapter connecting
             // mid-session, or dropping) must PROMPTLY re-drive the route table:
             // secondary traffic should start flowing through the tunnel the

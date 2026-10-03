@@ -38,12 +38,13 @@
 //! Both the address count and the per-suffix expansion are capped so a broad
 //! rule over a warm cache cannot turn into an unbounded sweep.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use nrr_platform_api::fake_ip::stale_flows::{EstablishedFlow, StaleFlowReset, StaleFlowSweep};
 
+use crate::flow_reset_log::{log_reset_flows, ResetCause};
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 
 /// Addresses torn down in one pass. Reached only by a suffix rule over a warm
@@ -126,6 +127,8 @@ pub fn flows_to_reset(
 struct RefreshTargets {
     addresses: Vec<Ipv4Addr>,
     anchors: HashSet<Ipv4Addr>,
+    /// The hostname each address was reached through, for the per-connection log.
+    hosts: HashMap<Ipv4Addr, String>,
 }
 
 /// Tears down established connections to hosts whose route just changed.
@@ -148,7 +151,11 @@ impl RoutedHostFlowRefresh {
     /// the application reconnect over the route that is still in force.
     pub fn refresh(&self, principal: &str, hosts: &[RoutedHost]) -> FlowRefreshOutcome {
         let has_anchor = hosts.iter().any(|h| matches!(h, RoutedHost::Anchor(_)));
-        let RefreshTargets { addresses, anchors } = self.addresses_behind(hosts);
+        let RefreshTargets {
+            addresses,
+            anchors,
+            hosts: host_of,
+        } = self.addresses_behind(hosts);
         let candidates = self.reset.established_flows_to(&addresses);
         if candidates.is_empty() {
             tracing::debug!(
@@ -182,6 +189,14 @@ impl RoutedHostFlowRefresh {
             torn_down: self.reset.reset_established(&decision.reset),
         };
         if sweep.found > 0 {
+            log_reset_flows(Some(principal), &decision.reset, |ip| {
+                let cause = if anchors.contains(&ip) {
+                    ResetCause::Anchor
+                } else {
+                    ResetCause::RoutedHost
+                };
+                (host_of.get(&ip).map(String::as_str), cause)
+            });
             tracing::info!(
                 target: "nrr::auto-rules",
                 msg_key = "flowrefresh-torn-down",
@@ -213,17 +228,17 @@ impl RoutedHostFlowRefresh {
     }
 
     /// Cached addresses behind `hosts`, deduplicated and capped, the anchors'
-    /// first so the cap never drops them. Sorted because `BTreeSet` makes the
+    /// first so the cap never drops them. Sorted because `BTreeMap` makes the
     /// pass order deterministic, which keeps a log line from one run
     /// comparable with the next.
     fn addresses_behind(&self, hosts: &[RoutedHost]) -> RefreshTargets {
-        let mut anchors = BTreeSet::new();
+        let mut anchors = BTreeMap::new();
         for host in hosts {
             if let RoutedHost::Anchor(name) = host {
                 self.collect_into(&mut anchors, name);
             }
         }
-        let mut addresses = BTreeSet::new();
+        let mut addresses = BTreeMap::new();
         for host in hosts {
             match host {
                 RoutedHost::Exact(name) => {
@@ -245,8 +260,10 @@ impl RoutedHostFlowRefresh {
                 break;
             }
         }
-        let anchors: Vec<Ipv4Addr> = anchors.into_iter().take(MAX_ADDRESSES_PER_PASS).collect();
-        let rest = addresses.into_iter().filter(|a| !anchors.contains(a));
+        let mut names: HashMap<Ipv4Addr, String> = addresses.clone().into_iter().collect();
+        names.extend(anchors.clone());
+        let anchors: Vec<Ipv4Addr> = anchors.into_keys().take(MAX_ADDRESSES_PER_PASS).collect();
+        let rest = addresses.into_keys().filter(|a| !anchors.contains(a));
         RefreshTargets {
             addresses: anchors
                 .iter()
@@ -255,13 +272,16 @@ impl RoutedHostFlowRefresh {
                 .take(MAX_ADDRESSES_PER_PASS)
                 .collect(),
             anchors: anchors.into_iter().collect(),
+            hosts: names,
         }
     }
 
-    fn collect_into(&self, addresses: &mut BTreeSet<Ipv4Addr>, hostname: &str) {
+    fn collect_into(&self, addresses: &mut BTreeMap<Ipv4Addr, String>, hostname: &str) {
         // Routed-host flow refresh acts on the v4 flows the relay tracks.
         for address in crate::dns_wire::only_v4(&self.cache.ips_for_hostname(hostname)) {
-            addresses.insert(address);
+            addresses
+                .entry(address)
+                .or_insert_with(|| hostname.to_owned());
         }
     }
 }
@@ -322,6 +342,8 @@ mod tests {
             local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), local_port),
             remote: SocketAddrV4::new(ip(remote), 443),
             owner: owner.map(str::to_string),
+            pid: None,
+            image: None,
         }
     }
 

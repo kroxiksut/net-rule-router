@@ -4888,6 +4888,19 @@ ApplicationWindow {
         window.show()
         window.raise()
         window.requestActivate()
+        // A second launch of a different build never starts; it names both
+        // builds here so the raised window is not mistaken for the new one.
+        var mismatch = request.buildMismatch
+        if (mismatch && typeof mismatch === "object") {
+            showNotice(
+                tr("dialog.build-mismatch.title", "Another build is already running"),
+                tr("dialog.build-mismatch.body",
+                    "NetRuleRouter is already open and it is a different build: {running}. The one you just started is {ours}. Close the open NetRuleRouter window (quit it from the tray icon too), then start the application again.")
+                    .replace("{running}", String(mismatch.runningVersion || "?")
+                        + " (" + String(mismatch.runningFingerprint || "?") + ")")
+                    .replace("{ours}", String(mismatch.ourVersion || "?")
+                        + " (" + String(mismatch.ourFingerprint || "?") + ")"))
+        }
         // Secondary launchers can carry an `action`
         // slug beyond a plain section switch. Known slugs:
         // `safe-disable` (tray menu, after "Safe disable (temporary)…")

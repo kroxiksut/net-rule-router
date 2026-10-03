@@ -1,0 +1,36 @@
+// Icon and version block of every Windows executable. Filled in by each
+// crate's build.rs (`app_resource.rs`) and by the Qt host's CMake
+// `configure_file`, which share the @VAR@ syntax.
+IDI_APP_ICON ICON "@APP_ICON_PATH@"
+
+// Task Manager shows FileDescription instead of the file name. The id is the
+// literal `1`: without <windows.h>, `VS_VERSION_INFO` becomes a resource NAME
+// and every field reads back empty.
+1 VERSIONINFO
+ FILEVERSION @NRR_VERSION_COMMAS@
+ PRODUCTVERSION @NRR_VERSION_COMMAS@
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "NetRuleRouter"
+            VALUE "FileDescription", "@NRR_FILE_DESCRIPTION@"
+            VALUE "InternalName", "@NRR_FILE_DESCRIPTION@"
+            VALUE "OriginalFilename", "@NRR_ORIGINAL_FILENAME@"
+            VALUE "ProductName", "NetRuleRouter"
+            VALUE "FileVersion", "@NRR_VERSION@"
+            VALUE "ProductVersion", "@NRR_VERSION@"
+            VALUE "LegalCopyright", "MPL-2.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

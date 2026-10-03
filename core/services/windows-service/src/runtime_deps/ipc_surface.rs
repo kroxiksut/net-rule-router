@@ -800,28 +800,12 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             // The user's own opt-in decides whether the tick runs the pass; the
             // stored repeat window is what keeps it a check rather than a
             // stream of connections.
-            let cadence_conn = Arc::clone(conn_for_probe);
             auto_probe_wiring = Some(nrr_service_runtime::service_tasks::AutoProbeWiring {
                 runner: Arc::clone(&probe_runner)
                     as Arc<dyn nrr_service_runtime::ipc_handlers::providers::AutoRuleProbeRunner>,
-                cadence: Arc::new(move |sid: &str| {
-                    use nrr_service_runtime::service_tasks::AutoProbeCadence;
-                    let guard = cadence_conn.lock().unwrap_or_else(|p| p.into_inner());
-                    let repo = nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
-                    match repo.load_for_sid(sid) {
-                        Ok(record) => AutoProbeCadence {
-                            enabled: record.primary_probe_auto,
-                            repeat: std::time::Duration::from_secs(u64::from(
-                                record.primary_probe_repeat_secs,
-                            )),
-                        },
-                        // Unreadable policy is not consent.
-                        Err(_) => AutoProbeCadence {
-                            enabled: false,
-                            repeat: std::time::Duration::from_secs(300),
-                        },
-                    }
-                }),
+                cadence: nrr_service_runtime::service_tasks::stored_auto_probe_cadence(Arc::clone(
+                    conn_for_probe,
+                )),
             });
             deps = deps.with_auto_rule_probe(probe_runner);
         }

@@ -1172,6 +1172,12 @@ impl PerSidApplyOrchestrator {
         );
         let torn_down = reset.reset_established(&decision.reset);
         if torn_down > 0 {
+            let cause = if tunnel_came_up {
+                crate::flow_reset_log::ResetCause::TunnelCameUp
+            } else {
+                crate::flow_reset_log::ResetCause::NewDestination
+            };
+            crate::flow_reset_log::log_reset_flows(Some(sid), &decision.reset, |_| (None, cause));
             let reason = if tunnel_came_up {
                 "tore down connections still running beside the additional link that just came up — the application reconnects through it instead of finishing on the main one"
             } else {

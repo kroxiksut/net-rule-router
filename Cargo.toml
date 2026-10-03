@@ -61,5 +61,7 @@ debug = 1
 # Thin LTO: cross-crate inlining without whole-program analysis.
 lto = "thin"
 codegen-units = 1
-# Debug symbols stay out of shipped binaries.
-strip = "debuginfo"
+# Line tables only: a tester's panic names file:line, the code stays release.
+# The symbols live in the PDB beside each exe, not in the binary. Back to
+# `strip = "debuginfo"` for the public release.
+debug = "line-tables-only"

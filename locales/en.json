@@ -1109,6 +1109,10 @@
     "notice": {
       "ok": "OK"
     },
+    "build-mismatch": {
+      "title": "Another build is already running",
+      "body": "NetRuleRouter is already open and it is a different build: {running}. The one you just started is {ours}. Close the open NetRuleRouter window (quit it from the tray icon too), then start the application again."
+    },
     "nothing-to-apply": {
       "title": "Nothing to apply",
       "body": "There are no changes to apply — the current rules already match what is active."
@@ -1698,6 +1702,7 @@
     "preset-import-failed": "Failed to import preset: ",
     "preset-import-completed": "Preset imported and activated ({count} rules).",
     "preset-import-passthrough-suffix": "Preserved foreign-OS sections: {sections}.",
+    "preset-import-passthrough-dropped": "Not preserved, too large to store: {sections}.",
     "preset-import-newer-format": "The file declares format version {found}; this build reads version {supported}. Rules in sections it does not know were kept but not applied.",
     "preset-import-refused": "This file cannot be imported as a rule set.",
     "preset-import-too-large": "The file is {size} bytes, over the {limit}-byte limit for a rule set.",
@@ -3299,6 +3304,8 @@
       "logon-step-running": "A user signed in — running the deferred step {step}.",
       "seclive-unprobeable-baseline-missing": "The additional route's next hop on interface {ifindex} has never answered the liveness probe; treating it as unreachable-by-probe rather than dead.",
       "flowrefresh-torn-down": "Reset {torn_down} of {found} connection(s) still running on the previous route across {addresses} address(es); affected applications will reconnect under the new rule.",
+      "flowreset-connection": "Reset a connection of {image} (pid {pid}) from local port {local_port} to {remote} (host: {host}, cause: {cause}).",
+      "flowreset-connections-omitted": "{omitted} more connection(s) were reset in the same batch; only the first {shown} are listed.",
       "routerecon-teardown-refused": "Service is stopping — refused {refused} route addition(s) so nothing is added after shutdown begins.",
       "stallreg-destination-stalling": "{hostname} does not answer on the main link — connections start and nothing comes back ({stalls} stall(s)).",
       "nft-apply-cost": "Applying the nft ruleset ({rules} rules) took {lower_ms} ms to build and {nft_ms} ms in nft.",
@@ -3397,6 +3404,9 @@
       "linux-rtnetlink-poll-failed": "Polling the network change feed failed ({error}); the reader is stopping.",
       "linux-rtnetlink-overflowed": "The network change feed overflowed; some change messages were lost, so current state is being re-read.",
       "linux-rtnetlink-reader-stopped": "The network change reader stopped ({error}); only the periodic check remains.",
+      "linux-flow-reset-dump-failed": "Could not read the kernel's connection table ({error}); no connection was reset.",
+      "linux-flow-reset-unsupported": "The kernel cannot close connections on request (built without CONFIG_INET_DIAG_DESTROY): {refused} connection(s) stay on their previous route until they close.",
+      "linux-flow-reset-refused": "The kernel refused to close {refused} connection(s) ({error}); they stay on their previous route until they close.",
       "dns-config-watch-stopped": "The DNS settings watch stopped ({error}); changes are noticed only by the periodic check.",
       "linux-interfaces-empty": "No network interfaces were found; showing the placeholder set instead.",
       "linux-interfaces-enumeration-failed": "Network interface enumeration failed ({error}); showing the placeholder set instead.",
@@ -3440,6 +3450,8 @@
       "win-fakeip-packet-too-large": "An inbound packet of {packet_len} bytes exceeded the {buf_len}-byte read buffer and was dropped.",
       "win-browserhistory-discovery-finished": "Browser history discovery finished ({sources}).",
       "win-browserhistory-mail-hosts-discovered": "Discovered {hosts} mail-client account server(s) from local mail client data.",
+      "linux-browserhistory-discovery-finished": "Browser history discovery finished ({sources}).",
+      "linux-browserhistory-mail-hosts-discovered": "Discovered {hosts} mail-client account server(s) from local mail client data.",
       "win-tun-renamed": "Windows filed the tunnel adapter as a new network named \"{now}\" (previously \"{was}\"); renamed it back.",
       "win-tun-rename-failed": "Could not rename the tunnel adapter's network (was \"{was}\"): {error}.",
       "win-svcctl-untrusted-binary-location": "Registering a service binary in a location non-administrators can change ({problem}) — allowed only in a development build.",

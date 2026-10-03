@@ -40,6 +40,14 @@ libc = "0.2"
 # footer line ("2 users listed.") as a user id.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# The browser-history reader opens a private COPY of a browser's History
+# database. Same version and bundling as the Windows reader and the stores, so
+# the graph keeps one SQLite.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# The main-link probe pins its socket to a link (`SO_BINDTODEVICE`); binding a
+# source address alone does not choose the egress interface on Linux. `all`
+# exposes `bind_device`; the crate is already in the graph via the service.
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 # Discovery and inventory tests read their roots from temp dirs.

@@ -633,6 +633,8 @@ fn activation_tears_down_only_the_owners_connections_off_shared_addresses() {
         local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), port),
         remote: SocketAddrV4::new(remote, 443),
         owner: owner.map(str::to_owned),
+        pid: None,
+        image: None,
     };
     let owners = flow(routed, 50_001, Some("s-1-5-21-a"));
     reset.set_flows(vec![

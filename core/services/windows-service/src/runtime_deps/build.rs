@@ -202,14 +202,19 @@ pub(crate) fn build_supervised_runtime_deps(
             )) as Arc<dyn RecoveryAuditSink>
         });
 
+    // Raised by callers whose pass may not be skipped as unchanged: they bring
+    // a fact no pass input sees, or they wait for the pass to land.
+    let full_pass = nrr_service_runtime::pass_inputs::FullPassRequest::default();
     // Filled once the recompute hook exists: work that outlives its caller (a
     // seed past its wait, a background disk walk) calls back into the hook.
     let recompute_slot: Arc<std::sync::OnceLock<std::sync::Weak<dyn Fn() + Send + Sync>>> =
         Arc::new(std::sync::OnceLock::new());
     let recompute_later: Arc<dyn Fn() + Send + Sync> = {
         let slot = Arc::clone(&recompute_slot);
+        let full_pass = full_pass.clone();
         Arc::new(move || {
             if let Some(hook) = slot.get().and_then(std::sync::Weak::upgrade) {
+                full_pass.request();
                 hook();
             }
         })
@@ -442,20 +447,50 @@ pub(crate) fn build_supervised_runtime_deps(
     // timer or an event that changed nothing then costs a few reads.
     let pass_inputs = {
         use nrr_platform_api::adapters::AdapterEventSource;
-        use nrr_service_runtime::pass_inputs::{hashed, sqlite_generation, PassInputs};
-        let settings = settings_conn.clone();
+        use nrr_service_runtime::pass_inputs::{
+            hashed, table_writes, PassInputs, PLAN_BLIND_STATE_TABLES,
+        };
+        let state_db = artifacts.topology.state_db_path.clone();
         let cache = cache_store.clone();
         let observations = nrr_service_runtime::app_observation_lookup::global_app_observations();
         let walks = Arc::clone(&app_walk_generation);
         let routes_api = Arc::clone(&api);
         let adapters = WindowsApiAdapterSource::new(Arc::clone(&api));
         let liveness = Arc::clone(&liveness_tracker);
+        let known_direct = known_direct_registry.clone();
+        let vpn_endpoints = Arc::clone(&learned_vpn_endpoints);
+        let vpn_clients = Arc::clone(&learned_vpn_client_apps);
+        let fake_ip = Arc::clone(&fake_ip_controller);
         Arc::new(
             PassInputs::new()
+                .with_full_pass_request(full_pass.clone())
+                // Learned in memory, and not every learner asks for a pass: the
+                // reverse-DNS one leaves the exemption to the next reconcile.
                 .with_source(
-                    "state",
-                    Arc::new(move || sqlite_generation(Arc::clone(settings.as_ref()?))()),
+                    "known-direct",
+                    Arc::new(move || Some(known_direct.as_ref().map_or(0, |r| r.generation()))),
                 )
+                .with_source(
+                    "vpn-endpoints",
+                    hashed(move || {
+                        let mut ips = vpn_endpoints.current(std::time::SystemTime::now());
+                        ips.sort_unstable();
+                        Ok::<_, std::convert::Infallible>(ips)
+                    }),
+                )
+                .with_source(
+                    "vpn-clients",
+                    hashed(move || {
+                        let mut paths = vpn_clients.current();
+                        paths.sort_unstable();
+                        Ok::<_, std::convert::Infallible>(paths)
+                    }),
+                )
+                .with_source(
+                    "fake-ip",
+                    Arc::new(move || Some(u64::from(fake_ip.is_running()))),
+                )
+                .with_source("state", table_writes(state_db, PLAN_BLIND_STATE_TABLES))
                 .with_source(
                     "cache",
                     Arc::new(move || cache.as_ref()?.lock().ok()?.change_generation()),
@@ -492,6 +527,11 @@ pub(crate) fn build_supervised_runtime_deps(
             let coord = Arc::clone(coord);
             let registry = Arc::clone(&sid_registry);
             let leak_guard_log_state = Arc::clone(&leak_guard_log_state);
+            // Names the tables behind a `state` move in the slow-pass line.
+            let state_tables = nrr_service_runtime::pass_inputs::TableWriteDiff::new(
+                artifacts.topology.state_db_path.clone(),
+                nrr_service_runtime::pass_inputs::PLAN_BLIND_STATE_TABLES,
+            );
             // This hook fires on the DNS warm-up
             // tick, the adapter-monitor tick (secondary up/down/reconnect) AND the 30 s
             // route-reconcile safety tick. It (a) grows the route table + the
@@ -553,7 +593,10 @@ pub(crate) fn build_supervised_runtime_deps(
                     dns_ctl.tick();
                     return;
                 }
-                let moved = pass_inputs.moved();
+                let mut moved = pass_inputs.moved();
+                if moved.split(',').any(|source| source == "state") {
+                    moved = format!("{moved}:{}", state_tables.since_last());
+                }
                 // Settled only by a pass that went through without an error.
                 let mut clean = true;
                 if let Some(seeder) = seeder.as_ref() {
@@ -698,6 +741,11 @@ pub(crate) fn build_supervised_runtime_deps(
     if let Some(hook) = route_recompute_hook.as_ref() {
         let _ = recompute_slot.set(Arc::downgrade(hook));
     }
+    // The resolver waits on this one before it answers: an exemption it just
+    // registered must be installed, not judged unchanged.
+    let route_recompute_now = route_recompute_hook
+        .clone()
+        .map(|hook| nrr_service_runtime::pass_inputs::forcing(full_pass.clone(), hook));
 
     // Fast liveness-probe hook: probes each active user's
     // bound secondary tunnel next-hop and feeds the result to the tracker (a
@@ -1329,7 +1377,7 @@ pub(crate) fn build_supervised_runtime_deps(
         settings_conn.as_ref(),
         cache_store.as_ref(),
         active_routing_sid.as_ref(),
-        route_recompute_hook.as_ref(),
+        route_recompute_now.as_ref(),
         known_direct_registry.as_ref(),
         block_all_armed,
         fail_closed_armed,

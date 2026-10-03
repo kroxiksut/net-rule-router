@@ -551,6 +551,8 @@ fn established(
         local,
         remote: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 50), remote_port),
         owner: owner.map(str::to_owned),
+        pid: None,
+        image: None,
     }
 }
 

@@ -96,6 +96,33 @@ fn a_rebuilt_executable_reads_as_a_different_build() {
     }
 }
 
+#[test]
+fn the_fingerprint_is_short_stable_and_follows_the_build() {
+    let stamp = |size: &str, mtime: &str| {
+        parse_build_stamp_from_lock_content(&format!(
+            "version=0.4.0
+exe_size={size}
+exe_mtime={mtime}
+"
+        ))
+        .expect("stamp")
+    };
+    let base = stamp("4823040", "1758500000");
+    assert_eq!(
+        base.fingerprint(),
+        stamp("4823040", "1758500000").fingerprint()
+    );
+    assert_eq!(base.fingerprint().len(), 8);
+    assert_ne!(
+        base.fingerprint(),
+        stamp("4823041", "1758500000").fingerprint()
+    );
+    assert_ne!(
+        base.fingerprint(),
+        stamp("4823040", "1758500001").fingerprint()
+    );
+}
+
 mod reclaim {
     use super::super::single_instance::SingleInstanceGuard;
     use super::parse_pid_from_lock_content;

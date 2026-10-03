@@ -170,6 +170,9 @@ pub struct PrincipalEnforcementCycle {
     /// What lets a pass asked for by a timer or an event be skipped when none of
     /// its inputs moved. `None` = every pass plans and applies.
     inputs: Option<crate::pass_inputs::PassInputs>,
+    /// Breaks the connections a pass left on their old path. `None` leaves
+    /// them to finish there.
+    flow_reset: Option<Arc<crate::plan_flow_reset::PlanFlowReset>>,
 }
 
 /// Whether this plan asks for something the packet layer will apply to the
@@ -256,7 +259,17 @@ impl PrincipalEnforcementCycle {
             stopped: AtomicBool::new(false),
             last_pass_at: AtomicU64::new(epoch_secs()),
             inputs: None,
+            flow_reset: None,
         }
+    }
+
+    /// Tear down, after each pass that changes what a destination's traffic
+    /// does, the plan owner's connections that predate the change: a socket
+    /// keeps the path it was opened on.
+    #[must_use]
+    pub fn with_flow_reset(mut self, reset: Arc<crate::plan_flow_reset::PlanFlowReset>) -> Self {
+        self.flow_reset = Some(reset);
+        self
     }
 
     /// Let passes asked for by a timer or an event skip when `inputs` say nothing
@@ -429,6 +442,20 @@ impl PrincipalEnforcementCycle {
                     })
                 });
                 timings.mark("routes");
+
+                if let Some(flow_reset) = self.flow_reset.as_ref() {
+                    if routes.as_ref().is_some_and(|r| r.failure.is_some()) {
+                        flow_reset.defer();
+                    } else {
+                        flow_reset.after_apply(&plans, changed, |principal| {
+                            active
+                                .iter()
+                                .zip(&availability)
+                                .any(|(p, a)| p == principal && a.secondary)
+                        });
+                    }
+                    timings.mark("flow-reset");
+                }
 
                 if changed {
                     self.notify_coverage(&unprotected, &wants_machine_wide_cut);
@@ -1157,6 +1184,82 @@ mod tests {
 
         assert_eq!(enforcer.overlaps.load(Ordering::Acquire), 0);
         assert_eq!(enforcer.calls().len(), 12);
+    }
+
+    /// A pass that puts a destination under a rule breaks the owner's
+    /// connections to it; the identical re-apply that follows reads nothing.
+    #[test]
+    fn a_pass_that_steers_a_new_destination_tears_down_its_connections() {
+        use nrr_platform_api::enforcement::{
+            AppScope, Coverage, DstMatch, EgressConstraint, FlowMatch, FlowRule, Precedence,
+            PrecedenceClass, PrincipalScope, Verdict,
+        };
+        use nrr_platform_api::fake_ip::stale_flows::{
+            EstablishedFlow, MockStaleFlowReset, StaleFlowReset,
+        };
+
+        struct PlanOneHost;
+        impl PrincipalPlanSource for PlanOneHost {
+            fn plan_for(
+                &self,
+                principal: &UserPrincipal,
+                _availability: ChannelAvailability,
+            ) -> Option<PlannedPolicy> {
+                let host = std::net::Ipv4Addr::new(203, 0, 113, 5);
+                Some(PlannedPolicy {
+                    plan: EnforcementPlan {
+                        principal: principal.clone(),
+                        flows: vec![FlowRule {
+                            verdict: Verdict::Permit,
+                            precedence: Precedence {
+                                class: PrecedenceClass::RouteRule(nrr_shared::RouteRole::Secondary),
+                                ordinal: 0,
+                            },
+                            flow: FlowMatch {
+                                dst: DstMatch::HostV4(host),
+                                dst_port: None,
+                                protocol: None,
+                            },
+                            principal: PrincipalScope(Some(principal.clone())),
+                            app: AppScope::Any,
+                            egress: EgressConstraint::Any,
+                            coverage: Coverage::ConnectOnly,
+                        }],
+                        routes: Vec::new(),
+                        policy_rules: Vec::new(),
+                    },
+                    protection_complete: true,
+                    fail_closed_blocks: 0,
+                })
+            }
+        }
+
+        let mock = Arc::new(MockStaleFlowReset::new());
+        let mine = EstablishedFlow {
+            local: std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(192, 0, 2, 1), 50_000),
+            remote: std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(203, 0, 113, 5), 443),
+            owner: Some(uid(1000).as_stored().to_owned()),
+            pid: None,
+            image: None,
+        };
+        mock.set_flows(vec![mine.clone()]);
+        let c = PrincipalEnforcementCycle::new(
+            Arc::new(ScriptedPrincipals {
+                answer: Some(vec![uid(1000)]),
+            }),
+            Arc::new(PlanOneHost),
+            Arc::new(RecordingEnforcer::new(false)),
+        )
+        .with_flow_reset(Arc::new(crate::plan_flow_reset::PlanFlowReset::new(
+            Arc::clone(&mock) as Arc<dyn StaleFlowReset>,
+            Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new()),
+        )));
+
+        assert!(matches!(c.tick(), CycleOutcome::Applied { .. }));
+        assert_eq!(mock.reset_flows(), vec![mine]);
+        let read = mock.queried().len();
+        c.tick();
+        assert_eq!(mock.queried().len(), read);
     }
 
     /// Teardown removes the policy, and a task released after the stop drain

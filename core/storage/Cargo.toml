@@ -16,7 +16,7 @@ nrr-domain = { path = "../domain" }
 nrr-platform-api = { path = "../platform/api" }
 # The migration runner and connection setup, shared with the GUI sidecar.
 nrr-sqlite-support = { path = "../sqlite-support" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 bitflags = "2"
 sha2 = "0.10"
 # HMAC-SHA256 over canonical revision row content

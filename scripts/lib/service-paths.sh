@@ -60,6 +60,7 @@ nrr_user_footprint_paths() {
     "$data/$NRR_PRODUCT_NAME/gui_metadata.db-shm" \
     "$state/$NRR_PRODUCT_NAME_UNIX" \
     "$config/autostart/$NRR_TRAY_AUTOSTART_FILE" \
+    "${TMPDIR:-/tmp}/$NRR_PRODUCT_NAME_UNIX/managed" \
     "${TMPDIR:-/tmp}/$NRR_PRODUCT_NAME/managed"
   if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     printf '%s\n' "$XDG_RUNTIME_DIR/$NRR_PRODUCT_NAME_UNIX"

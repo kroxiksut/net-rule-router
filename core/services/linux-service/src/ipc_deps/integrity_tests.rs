@@ -98,6 +98,13 @@ impl Machine {
 
     /// One daemon start, through the same builder `run` uses.
     fn boot(&self) -> IpcSurface {
+        self.boot_with(None)
+    }
+
+    fn boot_with(
+        &self,
+        auto_rules: Option<Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
+    ) -> IpcSurface {
         let cache_db = self.state_dir().join("nrr_fqdn_ip_cache.db");
         let audit_dir = self.state_dir().join("audit");
         let cycle = Arc::new(PrincipalEnforcementCycle::new(
@@ -122,7 +129,7 @@ impl Machine {
             Arc::new(nrr_service_runtime::HealthAggregator::new()),
             Arc::new(EventBus::new()),
             PathBuf::from("gui"),
-            None,
+            auto_rules,
             None,
             nrr_service_runtime::production_principal_plan::open_cache_store(&cache_db)
                 .expect("cache"),
@@ -131,6 +138,7 @@ impl Machine {
             Arc::new(|_| {}),
             None,
             Arc::new(FileKeyStore::in_state_dir(&self.state_dir())),
+            Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
         )
     }
 
@@ -396,4 +404,53 @@ fn the_running_daemon_rolls_back_a_revision_edited_from_outside_and_needs_one_ac
         1
     );
     one_acknowledgement_settles(&machine, &surface, &edited);
+}
+
+/// The state-database handlers the GUI reaches for without a platform flag
+/// (save to file, drift merge, settings export, full reset, DoH list) are real
+/// on this daemon, not the unimplemented stub.
+#[test]
+fn the_state_database_handlers_are_wired() {
+    let machine = Machine::new();
+    let surface = machine.boot();
+    let deps = &surface.deps;
+    assert!(deps.preset_export_source.is_some());
+    assert!(deps.merge_preview_source.is_some());
+    assert!(deps.settings_export_source.is_some() && deps.settings_export_clock.is_some());
+    assert!(deps.link_provider_writer.is_some());
+    assert!(deps.principal_data_purger.is_some());
+    assert!(deps.doh_resolver_store.is_some());
+    assert!(deps.state_schema_version.is_some());
+}
+
+/// The three button actions that used to answer "not implemented" here: the
+/// browser-history import, the "site refuses" mark and the main-link check.
+#[test]
+fn the_button_actions_are_wired() {
+    use nrr_service_runtime::auto_rules::{
+        AutoRulesEngine, SqliteDismissalStore, SqlitePendingStore,
+    };
+    use nrr_service_runtime::production_rules_provider::ProductionRulesProvider;
+
+    let machine = Machine::new();
+    let surface = machine.boot();
+    assert!(surface.deps.browser_history_seeder.is_some());
+    assert!(surface.deps.refusing_anchors.is_some());
+    assert!(
+        surface.deps.auto_rule_probe.is_none(),
+        "the check needs the suggestion engine"
+    );
+    drop(surface);
+
+    let state = machine.open_state();
+    let engine = Arc::new(AutoRulesEngine::new(
+        Arc::new(ProductionRulesProvider::new(Arc::clone(&state))),
+        Arc::new(|_: &str| nrr_storage::auto_rules::AutoRulesMode::default()),
+        Arc::new(SqliteDismissalStore::new(Arc::clone(&state))),
+        Arc::new(SqlitePendingStore::new(state)),
+        std::time::SystemTime::now(),
+    ));
+    let surface = machine.boot_with(Some(engine));
+    assert!(surface.deps.auto_rule_probe.is_some());
+    assert!(surface.deps.auto_rules.is_some());
 }

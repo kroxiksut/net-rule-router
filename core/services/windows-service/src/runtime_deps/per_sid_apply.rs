@@ -639,15 +639,11 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     // every address already travels the main link, so there is
                     // no half-loaded page to offer a fix for. Same resolve the
                     // reconcile does, once per 10 s tick.
-                    .with_refusing_anchors({
-                        let conn = Arc::clone(state_conn);
-                        Arc::new(move |sid: &str| {
-                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                            nrr_storage::refusing_anchors::RefusingAnchorsRepository::new(&guard)
-                                .list_for_sid(sid)
-                                .unwrap_or_default()
-                        })
-                    })
+                    .with_refusing_anchors(
+                        nrr_service_runtime::production_local_networks::refusing_anchors_reader(
+                            Arc::clone(state_conn),
+                        ),
+                    )
                     // A third-party host is only worth a question once the
                     // main link has answered for it, so the offer waits while
                     // an answer can still arrive. Read live: switching the pass

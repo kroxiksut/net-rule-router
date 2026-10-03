@@ -124,7 +124,7 @@ fn category_of_area(area: &str) -> EventCategory {
         // Putting policy onto the machine, and taking it off again.
         "enforcement" | "enforcement-plan" | "killswitch" | "killswitch-codegen" | "routes"
         | "route-codegen" | "route-coordinator" | "wfp" | "wfp-codegen" | "wfp-ledger" | "nft"
-        | "nftlink" | "activation" | "rules-provider" | "rule-seed" | "apply" => {
+        | "nftlink" | "flow-reset" | "activation" | "rules-provider" | "rule-seed" | "apply" => {
             EventCategory::Apply
         }
 

@@ -137,9 +137,65 @@ pub fn hostname_from_history_url(raw: &str) -> Option<String> {
     Some(host)
 }
 
+/// Account-server hostnames in a Thunderbird `prefs.js`: the incoming
+/// (`mail.server.serverN.hostname`) and outgoing
+/// (`mail.smtpserver.smtpN.hostname`) prefs only, lower-cased, so account
+/// names, addresses and credentials never cross. A mail host is dialed by a
+/// background client that never touches a browser, which is why it rides the
+/// history port. Pure and total: a line of any other shape is skipped.
+pub fn mail_server_hostnames_from_prefs(prefs_js: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for line in prefs_js.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("user_pref(\"") else {
+            continue;
+        };
+        let mut parts = rest.split('"');
+        let Some(key) = parts.next() else { continue };
+        let is_server_host = (key.starts_with("mail.server.server")
+            || key.starts_with("mail.smtpserver.smtp"))
+            && key.ends_with(".hostname");
+        if !is_server_host {
+            continue;
+        }
+        // After the key quote: `, ` then the quoted value.
+        let Some(_separator) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next() else { continue };
+        let host = value.trim().to_ascii_lowercase();
+        if !host.is_empty() {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mail_prefs_parser_keeps_only_server_hostnames() {
+        let prefs = r#"
+user_pref("mail.server.server1.hostname", "imap.mail.example");
+user_pref("mail.server.server2.hostname", "MAIL.UNIV.EXAMPLE");
+user_pref("mail.server.server2.name", "work account");
+user_pref("mail.smtpserver.smtp1.hostname", "smtp.mail.example");
+user_pref("mail.smtpserver.smtp1.username", "someone@example.com");
+user_pref("mail.identity.id1.useremail", "someone@example.com");
+user_pref("network.dns.disableIPv6", true);
+"#;
+        assert_eq!(
+            mail_server_hostnames_from_prefs(prefs),
+            vec![
+                "imap.mail.example",
+                "mail.univ.example",
+                "smtp.mail.example"
+            ],
+            "only *.hostname prefs may cross, lower-cased; identities and \
+             usernames must never leak"
+        );
+    }
 
     #[test]
     fn extracts_bare_hostname_from_urls() {

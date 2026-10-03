@@ -209,18 +209,18 @@ impl PlatformProfile {
                 hosts_pin: true,
                 background_service: true,
                 autostart: true,
-                // The daemon keeps `ServiceStabilityConfig::default()` and never
-                // reads the stored row; it has no route coordinator and no
-                // connection observer, so all three answer `false` rather than
-                // let the GUI ask for handlers that are not registered.
+                // The full stability panel is route-coordinator and
+                // connection-observer settings this daemon does not have; the
+                // two keys it does apply have capabilities of their own below.
                 service_stability_config: false,
                 // The daemon applies a verbose window live and resumes it on
                 // start, whatever happens to the rest of the stored row.
                 verbose_logging: true,
                 local_network_exceptions: false,
                 block_notices: false,
-                // The daemon wires no integrity key into the coordinator.
-                audit_chain_restart: false,
+                // The coordinator signs with the daemon's key, and the restart
+                // is authorised with it as on Windows.
+                audit_chain_restart: true,
                 // The observer tee writes the operational log behind the same
                 // live switch as on Windows.
                 conn_trace_log: true,
@@ -315,8 +315,14 @@ mod tests {
             assert!(!supports.service_stability_config);
             assert!(!supports.local_network_exceptions);
             assert!(!supports.block_notices);
-            assert!(!supports.audit_chain_restart);
         }
+        assert!(!PlatformProfile::macos().supports.audit_chain_restart);
+    }
+
+    /// Both services hold the signing key the restart is authorised with.
+    #[test]
+    fn the_audit_chain_restart_is_offered_where_the_key_is_wired() {
+        assert!(PlatformProfile::linux().supports.audit_chain_restart);
     }
 
     /// Linux writes the connection trace to the service log; macOS has no

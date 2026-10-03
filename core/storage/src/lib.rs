@@ -79,6 +79,7 @@ pub mod vpn_bootstrap_endpoints;
 // Learned VPN client apps — persisted exe paths of role-verified
 // VPN client processes; pre-seeds the proactive kill-switch app exemption.
 pub mod vpn_client_apps;
+pub mod write_ledger;
 
 // Re-export the most commonly used types so callers can write
 // `use nrr_storage::{StorageError, StorageProfile, StorageResolutionSource}`

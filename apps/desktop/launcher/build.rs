@@ -1,17 +1,18 @@
-//! Embeds the Windows application icon into the launcher binaries.
-//!
-//! The icon file lives at `<repo>/assets/icons/app/app.ico`.  The `.rc`
-//! resource descriptor references it with a path relative to the `.rc`
-//! file location, and the Windows Resource Compiler bundles the icon into
-//! the PE resource section at link time.
+//! Embeds the icon and version block (`packaging/windows/app.rc.in`) into
+//! both launcher binaries.
+
+#[cfg(target_os = "windows")]
+mod app_resource {
+    include!("../../../packaging/windows/app_resource.rs");
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=resources/app.rc");
-    println!("cargo:rerun-if-changed=../../../assets/icons/app/app.ico");
 
     #[cfg(target_os = "windows")]
     {
-        embed_resource::compile("resources/app.rc", embed_resource::NONE);
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        app_resource::embed(&repo_root, "NetRuleRouter", "NetRuleRouter");
+        app_resource::embed(&repo_root, "NetRuleRouterTray", "NetRuleRouter (tray)");
     }
 }

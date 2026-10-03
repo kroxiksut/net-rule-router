@@ -25,6 +25,7 @@
 
 use crate::bounded_set::BoundedRecentSet;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::net_filter::is_non_routable_v4;
@@ -45,6 +46,8 @@ pub struct KnownDirectRegistry {
     /// suddenly do not. Evicting the coldest entry instead costs at most one
     /// re-registration - the next resolution of that host puts it back.
     ips: Mutex<BoundedRecentSet<Ipv4Addr>>,
+    /// Moves whenever the set does, so an enforcement pass can tell it changed.
+    generation: AtomicU64,
 }
 
 impl Default for KnownDirectRegistry {
@@ -57,6 +60,7 @@ impl KnownDirectRegistry {
     pub fn new(cap: usize) -> Self {
         Self {
             ips: Mutex::new(BoundedRecentSet::new(cap)),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -88,7 +92,15 @@ impl KnownDirectRegistry {
             }
             added += 1;
         }
+        if added > 0 {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
         added
+    }
+
+    /// A number that moves whenever an address joins (or is evicted from) the set.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Sorted snapshot for the codegen. Sorted so the desired filter set is
@@ -129,6 +141,17 @@ mod tests {
         ]);
         assert_eq!(added, 1);
         assert_eq!(r.snapshot(), vec![ip(203, 0, 113, 68)]);
+    }
+
+    #[test]
+    fn only_a_new_address_moves_the_generation() {
+        let r = KnownDirectRegistry::new(16);
+        let start = r.generation();
+        r.register(&[ip(203, 0, 113, 68)]);
+        let after_new = r.generation();
+        assert_ne!(after_new, start);
+        r.register(&[ip(203, 0, 113, 68), ip(127, 0, 0, 1)]);
+        assert_eq!(r.generation(), after_new, "a repeat moved it");
     }
 
     #[test]

@@ -74,7 +74,8 @@ Bundled baseline locale files (`en.json`, `ru.json`) — the source of truth for
 Vendored third-party components redistributed with the product, with their licences
 
 ### packaging/
-Files a platform's delivery installs but the build does not produce:
+Per-platform files the build stamps into binaries or the delivery installs:
+- **`packaging/windows`** — `app.rc.in`, the icon and version block every Windows executable carries (Task Manager shows its FileDescription), and `app_resource.rs`, which the crates' `build.rs` include to fill it; the Qt host fills the same template from CMake.
 - **`packaging/linux`** — the two XDG desktop entries (`netrulerouter.desktop`, `netrulerouter-tray.desktop`). Their basenames are the Wayland `app_id` the Qt host declares via `setDesktopFileName`, which is how a compositor finds the window's name and icon.
 
 ### scripts/

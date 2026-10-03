@@ -35,6 +35,7 @@ use nrr_service_runtime::activation_coordinator::{
     SidActionPlanSummary,
 };
 use nrr_service_runtime::boot_integrity::AuditTrail;
+use nrr_service_runtime::browser_history_seeder::BrowserHistorySeeder;
 use nrr_service_runtime::ipc_handlers::event_bus::EventBus;
 use nrr_service_runtime::ipc_handlers::IpcHandlerDeps;
 use nrr_service_runtime::principal_enforcement::{CycleOutcome, PrincipalEnforcementCycle};
@@ -43,17 +44,28 @@ use nrr_service_runtime::production_coordinator::{
 };
 use nrr_service_runtime::production_diagnostics::ProductionDiagnosticsFacade;
 use nrr_service_runtime::production_handlers_misc::{
-    MonitoredAdaptersSnapshotProvider, ProductionMigrationCompletionWriter,
-    ProductionMigrationStatusProvider, ProductionRoutePolicyProvider, ProductionRoutePolicyWriter,
+    MonitoredAdaptersSnapshotProvider, ProductionDohResolverListStore,
+    ProductionMigrationCompletionWriter, ProductionMigrationStatusProvider,
+    ProductionPrincipalDataPurger, ProductionRoutePolicyProvider, ProductionRoutePolicyWriter,
     ProductionRulesSnapshotProvider,
+};
+use nrr_service_runtime::production_merge_preview::{
+    MergePreviewSource, ProductionMergePreviewSource,
 };
 use nrr_service_runtime::production_mutation_executor::ProductionMutationExecutor;
 use nrr_service_runtime::production_policy_manager::CoordinatorPolicyManager;
+use nrr_service_runtime::production_preset_exporter::{
+    PresetExportSource, ProductionPresetExporter,
+};
+use nrr_service_runtime::production_rules_provider::ProductionRulesProvider;
 use nrr_service_runtime::production_security_alerts::ProductionSecurityAlertsRepository;
 use nrr_service_runtime::production_settings::{
     ProductionApplyFailurePolicy, ProductionAutostart, ProductionLogRetentionConfig,
     ProductionRetentionSettings, ProductionRoutingPause, ProductionServiceStability,
     ProductionStorageUsage,
+};
+use nrr_service_runtime::production_settings_exporter::{
+    ProductionSettingsExporter, SettingsExportSource,
 };
 use nrr_service_runtime::revision_signing::RevisionSigning;
 use nrr_service_runtime::revision_watch::RevisionWatch;
@@ -82,6 +94,9 @@ pub(crate) struct IpcSurface {
     /// The recheck after an outside write to the state database. `None`
     /// without a signing key.
     pub revision_watch: Option<RevisionWatch>,
+    /// The automatic main-link pass over the SAME runner the button uses, so
+    /// both share one repeat suppression. `None` without the suggestions engine.
+    pub auto_probe: Option<nrr_service_runtime::service_tasks::AutoProbeWiring>,
 }
 
 /// Turns an approved revision into kernel state by running one enforcement pass.
@@ -226,6 +241,9 @@ pub(crate) fn build_ipc_surface(
     conn_trace_log_apply: Arc<dyn Fn(bool) + Send + Sync>,
     verbosity: Option<nrr_service_runtime::TracingVerbosityHandle>,
     key_store: Arc<dyn KeyStore>,
+    // The daemon's own resolver: under the DNS redirect `/etc/resolv.conf`
+    // leads back into our listener.
+    dns_resolver: Arc<dyn nrr_platform_api::dns::DnsResolverPort>,
 ) -> IpcSurface {
     // Cloned before the facade takes ownership: storage usage counts the same
     // log directory the diagnostics reader serves from, and on Linux that lives
@@ -328,6 +346,13 @@ pub(crate) fn build_ipc_surface(
         });
     let autostart_helper = Arc::new(nrr_platform_api::autostart::AutostartHelper::new(registry));
 
+    // The main-link check writes its verdicts here; the rules table reads them.
+    let main_route_verdicts =
+        Arc::new(nrr_service_runtime::main_route_verdicts::MainRouteVerdicts::new());
+    let probe_route_table = Arc::clone(&route_table);
+    let seed_cache = Arc::clone(&cache_store);
+    let probe_cache = Arc::clone(&cache_store);
+
     let deps = IpcHandlerDeps::new(
         Arc::clone(&audit),
         health,
@@ -339,9 +364,10 @@ pub(crate) fn build_ipc_surface(
             route_table,
             Arc::new(nrr_platform_linux::interface_rows::LinuxInterfaceRows),
         )),
-        Arc::new(ProductionRulesSnapshotProvider::new(Arc::clone(
-            &state_conn,
-        ))),
+        Arc::new(
+            ProductionRulesSnapshotProvider::new(Arc::clone(&state_conn))
+                .with_main_route_verdicts(Arc::clone(&main_route_verdicts)),
+        ),
         Arc::new(
             ProductionDiagnosticsFacade::new(
                 logs_dir,
@@ -415,7 +441,45 @@ pub(crate) fn build_ipc_surface(
         .with_file_handoff(Arc::new(nrr_platform_linux::file_handoff::ChownFileHandoff))
         .with_conn_trace_ring(conn_trace_ring)
         // The same status the planner publishes rule conflicts into.
-        .with_app_enforcement_status(app_enforcement);
+        .with_app_enforcement_status(app_enforcement)
+        .with_state_schema_version(
+            stats_state_conn
+                .lock()
+                .ok()
+                .and_then(|guard| nrr_storage::migration::read_schema_version(&guard).ok()),
+        );
+    // OS-neutral handlers over the state database. Left unwired, "Save to
+    // file", the drift merge, the full settings export, the full reset and the
+    // DoH list each came back as an unimplemented operation.
+    let deps = deps
+        .with_preset_export_source(Arc::new(ProductionPresetExporter::new(Arc::clone(
+            &stats_state_conn,
+        ))) as Arc<dyn PresetExportSource>)
+        .with_merge_preview_source(Arc::new(ProductionMergePreviewSource::new(Arc::clone(
+            &stats_state_conn,
+        ))) as Arc<dyn MergePreviewSource>)
+        .with_settings_export_source(
+            Arc::new(ProductionSettingsExporter::new(Arc::clone(
+                &stats_state_conn,
+            ))) as Arc<dyn SettingsExportSource>,
+            Arc::new(nrr_service_runtime::production_settings::SystemClock)
+                as Arc<dyn nrr_service_runtime::activation_coordinator::Clock>,
+        )
+        .with_link_provider_writer(Arc::new(ProductionRoutePolicyWriter::new(Arc::clone(
+            &stats_state_conn,
+        )))
+            as Arc<dyn nrr_service_runtime::ipc_handlers::providers::LinkProviderWriter>)
+        .with_principal_data_purger(Arc::new(ProductionPrincipalDataPurger::new(Arc::clone(
+            &stats_state_conn,
+        )))
+            as Arc<dyn nrr_service_runtime::ipc_handlers::providers::PrincipalDataPurger>)
+        // The planner reads this list for the DoH lockdown on this OS too.
+        .with_doh_resolver_store(Arc::new(ProductionDohResolverListStore::new(Arc::clone(
+            &stats_state_conn,
+        )))
+            as Arc<
+                dyn nrr_service_runtime::ipc_handlers::doh_resolvers::DohResolverListStore,
+            >);
     // The stability fields this daemon applies live are the verbose window,
     // resumed here from the stored deadline, and the connection trace's log
     // switch; the rest of the row is stored and not read.
@@ -432,11 +496,43 @@ pub(crate) fn build_ipc_surface(
         Arc::clone(&stability) as Arc<dyn nrr_service_runtime::ServiceStabilityConfigProvider>,
         stability as Arc<dyn nrr_service_runtime::ServiceStabilityConfigWriter>,
     );
+    // The user's own history, read only on their request or opt-in.
+    let seeder = browser_history_seeder(
+        Arc::clone(&stats_state_conn),
+        seed_cache,
+        data_dir.join("browser-history"),
+        dns_resolver,
+    );
+    spawn_boot_auto_seed(Arc::clone(&seeder), Arc::clone(&stats_state_conn));
+    let deps = deps
+        .with_browser_history_seeder(seeder)
+        // "This site refuses main-link addresses": a fact only the user knows.
+        .with_refusing_anchors(Arc::new(
+            nrr_service_runtime::production_local_networks::ProductionRefusingAnchors::new(
+                Arc::clone(&stats_state_conn),
+            ),
+        ));
     // The SAME engine the observation consumer feeds. Without it the
     // `autorules.candidates.*` operations stay registered as unimplemented and
     // the GUI's suggestions page has nothing to read.
+    let mut auto_probe = None;
     let deps = match auto_rules {
-        Some(engine) => deps.with_auto_rules(engine),
+        Some(engine) => {
+            let runner = main_link_probe(
+                Arc::clone(&engine),
+                probe_cache,
+                Arc::clone(&stats_state_conn),
+                probe_route_table,
+                main_route_verdicts,
+            );
+            auto_probe = Some(nrr_service_runtime::service_tasks::AutoProbeWiring {
+                runner: Arc::clone(&runner),
+                cadence: nrr_service_runtime::service_tasks::stored_auto_probe_cadence(Arc::clone(
+                    &stats_state_conn,
+                )),
+            });
+            deps.with_auto_rule_probe(runner).with_auto_rules(engine)
+        }
         None => deps,
     };
     // The SAME sampler the housekeeping tick counts into, so the traffic page
@@ -470,6 +566,161 @@ pub(crate) fn build_ipc_surface(
         audit,
         coordinator,
         revision_watch,
+        auto_probe,
+    }
+}
+
+/// The opt-in browser-history import: the user's own profiles, their own rules,
+/// the cache the planner reads.
+fn browser_history_seeder(
+    state_conn: Arc<Mutex<rusqlite::Connection>>,
+    cache: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
+    copy_dir: PathBuf,
+    dns_resolver: Arc<dyn nrr_platform_api::dns::DnsResolverPort>,
+) -> Arc<BrowserHistorySeeder> {
+    let resolver: Arc<dyn nrr_platform_api::dns::DnsResolverPort> = Arc::new(
+        nrr_platform_api::dns_budget::BudgetedDnsResolver::new(dns_resolver),
+    );
+    Arc::new(BrowserHistorySeeder::new(
+        Arc::new(nrr_platform_linux::browser_history::LinuxBrowserHistoryRead::new(copy_dir)),
+        Arc::new(ProductionRulesProvider::new(state_conn)),
+        resolver,
+        cache,
+    ))
+}
+
+/// One seed pass at start for each signed-in user who opted in, retried while
+/// logind reports nobody: sessions come up after the daemon.
+fn spawn_boot_auto_seed(
+    seeder: Arc<BrowserHistorySeeder>,
+    state_conn: Arc<Mutex<rusqlite::Connection>>,
+) {
+    use nrr_platform_api::active_principals::ActivePrincipalSource;
+
+    let spawned = std::thread::Builder::new()
+        .name("nrr-bh-autoseed".into())
+        .spawn(move || {
+            for _ in 0..12 {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let principals = nrr_platform_linux::logind::LogindActivePrincipals
+                    .active_principals()
+                    .unwrap_or_default();
+                if principals.is_empty() {
+                    continue;
+                }
+                for principal in principals {
+                    let sid = principal.as_stored();
+                    let opted_in = state_conn
+                        .lock()
+                        .ok()
+                        .and_then(|guard| {
+                            nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+                                .load_for_sid(sid)
+                                .ok()
+                        })
+                        .is_some_and(|record| record.browser_history_auto_seed);
+                    if !opted_in {
+                        continue;
+                    }
+                    tracing::info!(
+                        target: "nrr::browser-history",
+                        msg_key = "svc-ipc-browser-history-autoseed-run",
+                        "auto-seed opt-in enabled — running boot browser-history seed",
+                    );
+                    // A manual import already running covers it.
+                    if let Some(run) = seeder.try_begin(sid) {
+                        let _ = run.run(std::time::SystemTime::now());
+                    }
+                }
+                break;
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(
+            target: "nrr::browser-history",
+            msg_key = "svc-ipc-browser-history-autoseed-spawn-failed",
+            error = %e,
+            "could not spawn boot browser-history auto-seed worker",
+        );
+    }
+}
+
+/// The "does it answer on the main link?" pass. The main link is the user's
+/// bound one, or the default route when none is bound.
+fn main_link_probe(
+    engine: Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>,
+    cache: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
+    state_conn: Arc<Mutex<rusqlite::Connection>>,
+    route_table: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+    verdicts: Arc<nrr_service_runtime::main_route_verdicts::MainRouteVerdicts>,
+) -> Arc<dyn nrr_service_runtime::ipc_handlers::providers::AutoRuleProbeRunner> {
+    use nrr_service_runtime::path_probe::{PathProber, ProbeLimits};
+    use nrr_service_runtime::production_auto_rule_probe::{
+        ProductionAutoRuleProbe, StoredBindingEgress,
+    };
+
+    let egress = Arc::new(StoredBindingEgress::new(
+        Arc::new(
+            nrr_service_runtime::production_handlers_misc::ProductionRoutePolicySource::new(
+                Arc::clone(&state_conn),
+            ),
+        ),
+        route_table,
+    ));
+    // The user's own bounds, clamped by `ProbeLimits::new`.
+    let limits_for = Arc::new(move |sid: &str| {
+        let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
+        match nrr_storage::route_bindings::RouteBindingsRepository::new(&guard).load_for_sid(sid) {
+            Ok(record) => ProbeLimits::new(
+                std::time::Duration::from_millis(u64::from(record.primary_probe_timeout_ms)),
+                record.primary_probe_max_targets as usize,
+                std::time::Duration::from_secs(u64::from(record.primary_probe_repeat_secs)),
+            ),
+            Err(_) => ProbeLimits::default(),
+        }
+    });
+    Arc::new(
+        ProductionAutoRuleProbe::over(
+            engine,
+            nrr_service_runtime::production_principal_plan::cache_lookup_over(cache),
+            egress,
+            Arc::new(PathProber::new(Arc::new(LinkBoundPathProbe))),
+            limits_for,
+        )
+        .with_verdicts(verdicts)
+        // Its own prober: repeat-suppression is per instance.
+        .with_secondary_prober(Arc::new(PathProber::new(Arc::new(LinkBoundPathProbe))))
+        .with_observed_names(
+            nrr_service_runtime::observed_host_names::global_observed_host_names(),
+        ),
+    )
+}
+
+/// The neutral probe over a socket pinned to the link that carries the source
+/// address.
+struct LinkBoundPathProbe;
+
+impl nrr_service_runtime::path_probe::PathProbe for LinkBoundPathProbe {
+    fn probe(
+        &self,
+        target: std::net::Ipv4Addr,
+        port: u16,
+        source: Option<std::net::Ipv4Addr>,
+        timeout: std::time::Duration,
+    ) -> nrr_service_runtime::path_probe::PathVerdict {
+        use nrr_platform_linux::link_probe::{connect_over_link, LinkProbeOutcome};
+        use nrr_service_runtime::path_probe::PathVerdict;
+
+        // Unpinned, the kernel routes by destination, through the tunnel for a
+        // routed host, and the answer would be about the wrong link.
+        let Some(source) = source else {
+            return PathVerdict::Indeterminate;
+        };
+        match connect_over_link(target, port, source, timeout) {
+            LinkProbeOutcome::Connected => PathVerdict::Answered,
+            LinkProbeOutcome::NoAnswer => PathVerdict::Silent,
+            LinkProbeOutcome::NotRun => PathVerdict::Indeterminate,
+        }
     }
 }
 

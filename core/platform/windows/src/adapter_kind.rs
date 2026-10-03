@@ -10,7 +10,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use nrr_platform_api::adapters::text_indicates_vpn_tunnel;
-use nrr_platform_api::interface_rows::{AdapterKindFacts, LinkMedium};
+use nrr_platform_api::interface_rows::{AdapterKindFacts, DeviceTechnology, LinkMedium};
 
 const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_PPP: u32 = 23;
@@ -60,10 +60,52 @@ pub(crate) fn kind_facts(facts: &WindowsIfFacts<'_>) -> AdapterKindFacts {
     }
 }
 
+/// The tun/tap driver behind an adapter, from its driver description. Only the
+/// two drivers whose layer is certain are named: Wintun is layer 3, TAP-Windows
+/// layer 2. Anything else (WireGuardNT, DCO, Hyper-V) stays unnamed, as on Linux.
+pub(crate) fn device_technology(description: &str) -> Option<DeviceTechnology> {
+    let text = description.to_ascii_lowercase();
+    if text.contains("wintun") {
+        Some(DeviceTechnology::Tun)
+    } else if ["tap-windows", "tap0901", "tap-win32"]
+        .iter()
+        .any(|marker| text.contains(marker))
+    {
+        Some(DeviceTechnology::Tap)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nrr_platform_api::interface_rows::{classify_adapter_kind, AdapterKind};
+
+    #[test]
+    fn tun_and_tap_are_named_only_by_their_known_drivers() {
+        assert_eq!(
+            device_technology("Wintun Userspace Tunnel"),
+            Some(DeviceTechnology::Tun)
+        );
+        assert_eq!(
+            device_technology("TAP-Windows Adapter V9"),
+            Some(DeviceTechnology::Tap)
+        );
+        assert_eq!(
+            device_technology("Example TAP0901 Device"),
+            Some(DeviceTechnology::Tap)
+        );
+        for other in [
+            "WireGuard Tunnel",
+            "OpenVPN Data Channel Offload",
+            "Hyper-V Virtual Ethernet Adapter",
+            "Example Gigabit Controller",
+            "",
+        ] {
+            assert_eq!(device_technology(other), None, "{other}");
+        }
+    }
 
     fn kind(if_type: u32, physical_medium: i32, hardware: bool, description: &str) -> AdapterKind {
         classify_adapter_kind(kind_facts(&WindowsIfFacts {

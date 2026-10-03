@@ -211,6 +211,12 @@ pub mod app_group_discovery;
 /// `vboxnet*` host adapters, and NAT pinning through `VBoxManage`.
 pub mod vm_inventory;
 
+/// Closing established TCP connections on request, behind
+/// `nrr_platform_api::fake_ip::stale_flows::StaleFlowReset`: `sock_diag` lists
+/// them with their owning uid, `SOCK_DESTROY` closes them. The netlink codec is
+/// pure and tested on every host; only the socket half is Linux-only.
+pub mod stale_flows;
+
 /// Linux fake-IP TUN seam. The kernel provides
 /// `/dev/net/tun` natively, so unlike Windows there is no third-party driver to
 /// ship or attribute; the stub fails closed until it can be verified on a real
@@ -260,6 +266,17 @@ pub mod route_table;
 /// unprivileged datagram ICMP socket. The packet codec is pure and tested on
 /// every host; only the socket half is Linux-only.
 pub mod reachability;
+
+/// "Does this address answer over this link?" — a TCP connect pinned to the
+/// link (`SO_BINDTODEVICE`). The outcome classifier is pure and tested on every
+/// host; the connect is Linux-only.
+pub mod link_probe;
+
+/// Browser-history read behind
+/// `nrr_platform_api::browser_history::BrowserHistoryReadPort`: the user's
+/// browser databases, reached without following any link below the home.
+#[cfg(target_os = "linux")]
+pub mod browser_history;
 
 /// ICMP echo with a chosen hop limit and source address, over a raw socket.
 pub mod icmp_echo;

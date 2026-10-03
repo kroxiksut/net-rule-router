@@ -202,9 +202,9 @@ fn established_ipv4(sockets: &[ProcSocket]) -> Vec<(&ProcSocket, Ipv4Addr)> {
         .collect()
 }
 
-struct SocketOwner {
-    pid: u32,
-    exe: Option<String>,
+pub(crate) struct SocketOwner {
+    pub(crate) pid: u32,
+    pub(crate) exe: Option<String>,
 }
 
 /// Map socket inodes to the processes holding them, by walking `/proc/<pid>/fd`.
@@ -220,7 +220,7 @@ struct SocketOwner {
 /// unattributed connection is still worth reporting — it carries the
 /// destination, which is what the routing path needs — so a miss yields
 /// `pid = 0` rather than a dropped event.
-fn socket_owners(wanted: &HashMap<u64, u32>) -> HashMap<u64, SocketOwner> {
+pub(crate) fn socket_owners(wanted: &HashMap<u64, u32>) -> HashMap<u64, SocketOwner> {
     use std::os::unix::fs::MetadataExt;
 
     let mut owners: HashMap<u64, SocketOwner> = HashMap::new();

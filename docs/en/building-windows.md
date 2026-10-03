@@ -135,7 +135,7 @@ The result is `nrr_qt_native_host.exe` under
 `target\<profile>\build\nrr-qt-host-*\out\qt-native-host-build\<config>\`.
 It is deliberately not copied into `target\<profile>\` — the launcher finds
 it by the absolute path baked in at build time. Changes to `CMakeLists.txt`,
-`src\main.cpp` and `resources\app.rc.in` are picked up without `cargo clean`.
+`src\main.cpp` and the shared `packaging\windows\app.rc.in` are picked up without `cargo clean`.
 
 Dev builds compile the C++ host as `RelWithDebInfo`, not `Debug`: symbols are
 kept, and the app links the same Qt libraries a user runs. Set

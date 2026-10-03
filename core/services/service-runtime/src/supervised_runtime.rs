@@ -164,8 +164,8 @@ pub struct SupervisedRuntimeDeps {
     /// CreateEvent failure surfaces as a health record before the
     /// supervisor starts ticking.
     pub ipc_server: Arc<dyn IpcServer>,
-    /// Adapter availability monitor. Polled at 1 s by
-    /// `adapter-monitor-tick`.
+    /// Adapter availability monitor, ticked at 1 s by `adapter-monitor-tick`;
+    /// a monitor built `reading_on_change` reads only when the change feed says so.
     pub adapter_monitor: Arc<AdapterMonitor>,
     /// Operation-status records — GC'd at 5 min.
     pub operation_results: Arc<OperationStatusStore>,
@@ -620,22 +620,26 @@ pub fn run_supervised_runtime(
             }
         }
 
-        // subscribe the OS network-change observer so a
-        // secondary up/down re-arms routing + kill-switch via the SAME recompute hook
-        // within ~debounce, not the 1 s poll / 30 s safety tick. Best-effort: a
-        // failed OS registration leaves the polling fallbacks in place. Held
-        // until the Stopping phase (dropped there — cancels the OS notification
-        // and stops the debounce thread).
-        if let (Some(observer), Some(hook)) = (
-            deps.network_change_observer.as_ref(),
-            deps.route_recompute_hook.as_ref(),
-        ) {
+        // An OS network change re-reads the adapters and re-arms routing within
+        // the debounce instead of the poll / safety tick. Best-effort: a failed
+        // registration leaves the monitor reading every tick. Dropped in the
+        // Stopping phase.
+        if let Some(observer) = deps.network_change_observer.as_ref() {
+            let monitor = Arc::clone(&deps.adapter_monitor);
+            let hook = deps.route_recompute_hook.clone();
+            let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                monitor.note_os_change();
+                if let Some(hook) = &hook {
+                    hook();
+                }
+            });
             match crate::network_rearm::NetworkChangeRearm::start(
                 observer.as_ref(),
-                Arc::clone(hook),
+                on_change,
                 crate::network_rearm::NETWORK_CHANGE_DEBOUNCE,
             ) {
                 Ok(rearm) => {
+                    deps.adapter_monitor.change_feed_live();
                     tracing::info!(
                         target: "nrr::route-coordinator",
                         msg_key = "supervised-network-change-observer-active",

@@ -314,9 +314,10 @@ int main(int argc, char *argv[]) {
     //
     // Both surfaces (Main.qml and Tray.qml) load through the same
     // QQmlApplicationEngine path. Tray.qml's root is a
-    // `Qt.labs.platform.SystemTrayIcon` (native Win32 Shell_NotifyIcon API,
-    // not QtWidgets), so right-click context menu rendering does not depend
-    // on a top-level QWidget existing.
+    // `Qt.labs.platform.SystemTrayIcon`: native on Windows, and on Linux the
+    // D-Bus StatusNotifier icon, falling back to the Widgets tray where the
+    // desktop has no watcher. That fallback, like the splash, is why this is a
+    // QApplication and not a QGuiApplication.
     NrrNativeBridge nativeBridge(applicationDir, logsDirectoryFromContext(contextObject));
 
     // Routes the launcher's lines from stdin to the bridge. Every exit path
