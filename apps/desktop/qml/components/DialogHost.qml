@@ -280,6 +280,9 @@ Item {
     VpnOnboardingDialog {
         id: vpnOnboardingDialog
         ownerRoot: dialogHost.ownerRoot
+        onKernelTunnelAdapterRequested: function(interfaceName) {
+            ownerRoot.focusAdapter(interfaceName)
+        }
         onVpnConfirmed: function(displayName, exePath) {
             // Single add (the manual file picker). We store the confirmed
             // executable as a device-local preference (the offline display

@@ -31,10 +31,10 @@ use nrr_domain::decision_lookup::{FreshnessThresholds, LookupResult};
 use nrr_domain::revision::RevisionId;
 
 use crate::dto::{
-    CacheEntryRow, CacheLookupRequest, CacheLookupResult, CacheResetReason, CacheResetSummary,
-    CacheStats, CleanupPolicy, CleanupSummary, ExpiredHostname, IntegrityCheckResult,
-    MigrationSummary, NegativeCacheEntry, NegativeCacheReason, RecoveryAction, ResolutionEntry,
-    SchemaVerification,
+    AddressNames, CacheEntryRow, CacheLookupRequest, CacheLookupResult, CacheResetReason,
+    CacheResetSummary, CacheStats, CleanupPolicy, CleanupSummary, ExpiredHostname,
+    IntegrityCheckResult, MigrationSummary, NegativeCacheEntry, NegativeCacheReason,
+    RecoveryAction, ResolutionEntry, SchemaVerification,
 };
 use crate::error::StorageResult;
 use crate::resolution_source::StorageResolutionSource;
@@ -46,6 +46,13 @@ use crate::resolution_source::StorageResolutionSource;
 /// All methods operate synchronously on a single connection (WAL mode).
 /// Callers in async context must wrap calls in `tokio::task::spawn_blocking`.
 pub trait CacheRepository {
+    /// A number that moves whenever the cache is written, by this connection or
+    /// any other. `None` means it cannot tell, and a caller must then assume
+    /// every read may differ from the last one.
+    fn change_generation(&self) -> Option<u64> {
+        None
+    }
+
     // ── Lookup ────────────────────────────────────────────────────────────────
 
     /// Look up all cached IPv4 entries for a hostname.
@@ -233,6 +240,17 @@ pub trait CacheRepository {
     /// Count distinct **direct** (non-secondary) hostnames observed on `ip`
     /// (`direct_on_ip`). `0` ⇒ the IP is not (observably) shared.
     fn direct_host_count_for_ip(&self, ip: std::net::Ipv4Addr) -> StorageResult<u32>;
+
+    /// Hostnames seen at `ip` since `seen_since` — resolutions plus census
+    /// tenants — most recently seen first (ties by name), at most `limit`, with
+    /// the total distinct count beside them. Index lookups only: it is asked
+    /// once per newly observed connection address.
+    fn names_for_address(
+        &self,
+        ip: std::net::IpAddr,
+        seen_since: SystemTime,
+        limit: usize,
+    ) -> StorageResult<AddressNames>;
 
     /// Every IP the shared-IP census has seen on at
     /// least one direct (non-rule) hostname, in one query. The "smart"

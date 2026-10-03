@@ -203,6 +203,14 @@ pub struct InterfaceRowDto {
     pub name: String,
     pub interface_description: String,
     pub interface_type: String,
+    /// Human adapter kind slug (`wifi` / `ethernet` / `tunnel` / `virtual` /
+    /// `bluetooth` / `other`), decided from OS facts. Empty from a sender
+    /// predating it.
+    #[serde(default)]
+    pub kind: String,
+    /// `tun` / `tap` for a link the OS names no driver for; display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_technology: Option<String>,
     pub is_bluetooth_like: bool,
     pub local_ip: String,
     pub gateway: String,
@@ -866,10 +874,31 @@ pub struct RollbackRequest {
     pub admin_baseline: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One of three answers: a `target` with the token that rolls back to it;
+/// neither (there is nothing to roll back to); or the `error` that stops it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RollbackDryRunResponse {
-    pub confirmation_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RollbackTargetDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<OperationErrorResponse>,
+}
+
+/// The revision a rollback restores, as the user remembers it: when it was
+/// in effect and how many rules of their own it held.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RollbackTargetDto {
+    pub revision_id: String,
+    /// Unix epoch seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_at: Option<i64>,
+    pub rule_count: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

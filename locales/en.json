@@ -91,6 +91,9 @@
     "copy-row": "Copy row",
     "copy-message": "Copy message",
     "copy-value": "Copy: ",
+    "copy-address": "Copy address",
+    "copy-name": "Copy name",
+    "copy-all-names": "Copy all names",
     "next": "Next",
     "back": "Back",
     "finish": "Finish",
@@ -281,6 +284,7 @@
         "prompt": "The current rules of both routes are saved as a new set in your folder. Name it so you can tell it apart later, for example \"work\" or \"home\".",
         "name-placeholder": "Set name",
         "name-invalid": "A name cannot contain \\ / : or \"..\" — it is a folder name, not a path.",
+        "folder-missing": "Choose a folder for the set.",
         "confirm": "Save set",
         "folder-label": "Folder:",
         "choose-folder": "Change..."
@@ -842,6 +846,7 @@
       "conn-trace": {
         "heading": "Connection trace (diagnostic)",
         "intro": "Records outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Observation itself is always on — these two switches decide where it is shown and whether it is written down.",
+        "intro-no-log": "Shows outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Observation itself is always on — this switch decides whether it is shown. On this platform the trace is never written to disk.",
         "ndjson": {
           "label": "Write connection trace to service log (NDJSON)",
           "tooltip": "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary or additional adapter). Takes effect immediately, no service restart."
@@ -850,7 +855,8 @@
           "label": "Show connection trace in Diagnostics",
           "tooltip": "Lets the connection-trace panel in Diagnostics show what was observed. Takes effect immediately, no service restart. Switching it off hides the panel's contents only — it does not stop observation, which app routing and rule suggestions rely on."
         },
-        "help": "Privacy-sensitive: the trace carries per-connection process names and remote addresses. Writing it to disk is the part worth leaving off in normal operation."
+        "help": "Privacy-sensitive: the trace carries per-connection process names and remote addresses. Writing it to disk is the part worth leaving off in normal operation.",
+        "help-no-log": "Privacy-sensitive: the trace carries per-connection process names and remote addresses. It is kept in memory only and is gone when the service restarts."
       },
       "rule-scope": {
         "heading": "When routing rules are enforced",
@@ -946,7 +952,10 @@
     "confirmed-status-multi": "NetRuleRouter will keep your {count} VPN programs working over your main link while leak protection is on.",
     "skipped-status": "No VPN set up. You can set one up later from Settings -> Routing.",
     "service-write-failed": "Could not save to the routing service — will retry on next apply.",
-    "manual-pick-status": "Choose your VPN program file…"
+    "manual-pick-status": "Choose your VPN program file…",
+    "kernel-tunnel-assign": "Kernel tunnel {name} — assign adapter {interface} as the additional link",
+    "kernel-tunnel-down": "Tunnel {name} is not up",
+    "kernel-tunnel-why": "The system itself runs this tunnel, so no program rule can carry it — it is routed by its adapter."
   },
   "app-groups": {
     "title": "Application and device routes",
@@ -1247,7 +1256,10 @@
     },
     "safe-rollback": {
       "title": "Roll back to the previous configuration?",
-      "body": "The service will restore the last-known-good routing configuration and re-apply it. Your current active rules will be replaced. This requires administrator rights. Continue?",
+      "body-loading": "Looking for the previous version of your rules…",
+      "body-ready": "Your current rules will be replaced by the ones you applied on {time} ({count} rules), and routing will follow them right away.",
+      "body-none": "There is nothing to roll back to: no earlier version of your rules has been applied.",
+      "body-error": "Cannot roll back: ",
       "confirm": "Roll back"
     },
     "service-not-running": {
@@ -1635,6 +1647,8 @@
     "presets-hidden": "Bundled presets hidden. Re-enable them in Settings → Presets.",
     "admin-revoked": "Administrator approval revoked. The next change will ask for approval again.",
     "admin-auto-revoked": "Administrator approval was revoked automatically after sitting unused.",
+    "admin-consent-pending": "Waiting for you to approve administrator rights…",
+    "service-started-on-launch": "The service was stopped, so it has been started again.",
     "route-mode-applied": "Default route for unmatched traffic updated.",
     "route-mode-uac-declined": "Administrator approval was declined; the default route was not changed.",
     "route-mode-failed": "Could not update the default route: ",
@@ -1655,6 +1669,7 @@
     "save-as-set-failed": "Could not save the set. See logs for details.",
     "save-as-set-done": "Saved as a set: ",
     "save-as-set-name-invalid": "Choose a plain file name for the set — it becomes the set's folder name.",
+    "save-as-set-folder-missing": "Choose a folder for the set first.",
     "save-as-set-overwrite-cancelled": "Nothing was saved — the set already had files there.",
     "defaults-restored": "Defaults restored",
     "rule-removed": "Rule removed",
@@ -1743,6 +1758,7 @@
     "rollback-submitting": "Submitting safe rollback…",
     "rollback-submitted": "Safe rollback submitted. The service is restoring the previous configuration.",
     "rollback-failed": "Safe rollback failed: ",
+    "rollback-completed": "Rolled back to the rules you applied on {time}.",
     "logs-folder-preview": "Logs folder opening is in preview mode.",
     "update-check-running": "Checking for updates…",
     "update-check-up-to-date": "You have the latest version ({version}).",
@@ -2061,7 +2077,28 @@
     },
     "role": {
       "primary": "Main connection",
-      "secondary": "Additional connection"
+      "secondary": "Additional connection",
+      "taken": {
+        "primary": "already the main connection",
+        "secondary": "already the additional connection"
+      },
+      "exclusive-note": "One adapter cannot carry both routes: to use it for the other one, unassign its current role first."
+    },
+    "kind": {
+      "wifi": "Wi-Fi",
+      "ethernet": "Wired (Ethernet)",
+      "tunnel": "VPN / tunnel",
+      "virtual": "Virtual (VM, container)",
+      "bluetooth": "Bluetooth",
+      "other": "Other"
+    },
+    "device-technology": {
+      "tun": "TUN device",
+      "tap": "TAP device"
+    },
+    "hint": {
+      "looks-primary": "looks like the main connection",
+      "looks-vpn": "looks like a VPN"
     }
   },
   "rules": {
@@ -2968,12 +3005,17 @@
       "entries-no-match": "No connections match the current filters",
       "entries-from": "from",
       "relay-for": "relay for %1",
+      "remote-host-others": "%1 (+%2)",
+      "remote-hosts-tip": "Names this address was answered for (%1):",
+      "fake-ip": "fake-IP",
+      "via-fake-ip": "Via fake-IP: a virtual address the service gave this name.",
+      "fake-ip-recycled-tip": "A virtual (fake-IP) address. The name it stood for is no longer in the pool.",
       "col-process": "Process",
       "col-remote": "Remote",
       "col-egress": "Egress",
       "col-verdict": "Verdict",
       "col-process-tip": "The application that opened the connection. Hover a row's process name to see its full path.",
-      "col-remote-tip": "The destination address and port the connection went to.",
+      "col-remote-tip": "The destination address and port the connection went to. Below it, the name this address was answered for, when one was seen; \"(+N)\" means N more names share the address — hover the name for the full list.",
       "col-egress-tip": "Which network link the connection actually left through: Primary (your main link), Additional (the additional link, usually a VPN), Loopback (local, never leaves the PC), Other (another adapter), Unknown (couldn't be determined). This is observation only — it never changes routing.",
       "col-verdict-tip": "Whether the connection was allowed or dropped. A \"Blocked\" row may be a Windows Firewall or antivirus drop — not necessarily NetRuleRouter.",
       "show-blocked": "Show blocked",
@@ -3259,6 +3301,7 @@
       "flowrefresh-torn-down": "Reset {torn_down} of {found} connection(s) still running on the previous route across {addresses} address(es); affected applications will reconnect under the new rule.",
       "routerecon-teardown-refused": "Service is stopping — refused {refused} route addition(s) so nothing is added after shutdown begins.",
       "stallreg-destination-stalling": "{hostname} does not answer on the main link — connections start and nothing comes back ({stalls} stall(s)).",
+      "nft-apply-cost": "Applying the nft ruleset ({rules} rules) took {lower_ms} ms to build and {nft_ms} ms in nft.",
       "phase-pass-slow": "The {pass} pass took {total_ms} ms — breakdown: {phases}.",
       "localns-resolved-via-local": "A resolver on this machine ({server}) knows {host}, which the main upstream reported as non-existent.",
       "dnsegress-tunnel-cooldown": "DNS over the additional route stopped answering after {failures} failures; queries go straight to the regular resolver for {cooldown_secs} seconds.",
@@ -3761,6 +3804,7 @@
       "app-rule-unenforceable": "No installed program matches these application rules, so they do nothing: {executables}",
       "additional-adapter-unresolved": "The additional route's adapter is not found right now: the rules apply, and its traffic stays blocked until the adapter returns",
       "apply-will-be-refused": "The service's consistency check rejects this change, so it will not be applied. The reason is in the service log",
+      "apply-in-several-batches": "Too many filters to install in one step: the change is applied in several steps, each complete on its own, so a failure partway leaves the earlier steps in effect",
       "invalid-rule-value": "A rule contains an invalid value: {rules}"
     }
   },
@@ -3780,6 +3824,11 @@
     "malformed-request": "Request was rejected as malformed",
     "busy-conflict": "Service is busy with another operation",
     "activation-not-recorded": "The change could not be saved, so it was not applied. The previous rules stay in effect. Review the changes and apply again.",
+    "no-last-known-good": "There is no earlier version of your rules to roll back to.",
+    "revision-not-found": "That version of the rules no longer exists.",
+    "revision-integrity-rejected": "That version of the rules failed the integrity check and was not used.",
+    "storage-failure": "The service could not read or write its rules storage.",
+    "not-implemented": "This is not available on this system yet.",
     "precondition-failed": "Operation precondition not met",
     "confirmation-expired": "Confirmation token expired — re-run review",
     "confirmation-unknown": "Confirmation token unknown — re-run review",

@@ -25,8 +25,8 @@ use crate::ipc_handlers::mutation_token_store::StoredMutation;
 use crate::ipc_handlers::operation_status_store::OperationError;
 use crate::ipc_handlers::payloads::{
     AdapterEntry, MigrationStatusGetResponse, MutationKind, ReviewRiskLevel, ReviewSummaryResponse,
-    RoutePolicyDto, RoutePolicyUpdateRequest, RulesListResponse, RulesRouteFilter,
-    SnapshotInterfacesResponse,
+    RollbackTargetDto, RoutePolicyDto, RoutePolicyUpdateRequest, RulesListResponse,
+    RulesRouteFilter, SnapshotInterfacesResponse,
 };
 use crate::ipc_handlers::providers::{
     AdaptersSnapshotProvider, MigrationCompletionRecord, MigrationCompletionWriter,
@@ -290,7 +290,12 @@ pub struct FakeMutationExecutor {
     /// SID was derived correctly from the envelope class + `caller_sid`.
     pub last_principal: Mutex<Option<String>>,
     pub fail_with: Option<OperationError>,
+    /// What `rollback_target` answers: `None` is "nothing to roll back to".
+    pub rollback_target: Result<Option<RollbackTargetDto>, OperationError>,
 }
+
+/// The revision the fake rolls back to when asked for the LKG.
+pub const FAKE_LKG_REVISION: &str = "rev-lkg";
 
 impl Default for FakeMutationExecutor {
     fn default() -> Self {
@@ -303,6 +308,12 @@ impl Default for FakeMutationExecutor {
             last_executed: Mutex::new(None),
             last_principal: Mutex::new(None),
             fail_with: None,
+            rollback_target: Ok(Some(RollbackTargetDto {
+                revision_id: FAKE_LKG_REVISION.into(),
+                activated_at: Some(1_000),
+                superseded_at: Some(2_000),
+                rule_count: 3,
+            })),
         }
     }
 }
@@ -375,6 +386,20 @@ impl MutationExecutor for FakeMutationExecutor {
         }
         MutationOutcome::Completed(serde_json::json!({
             "rolled-back-to": target_revision_id,
+        }))
+    }
+
+    fn rollback_target(
+        &self,
+        _principal: &str,
+        target_revision_id: Option<&str>,
+    ) -> Result<Option<RollbackTargetDto>, OperationError> {
+        let target = self.rollback_target.clone()?;
+        Ok(target.map(|mut target| {
+            if let Some(id) = target_revision_id {
+                target.revision_id = id.into();
+            }
+            target
         }))
     }
 

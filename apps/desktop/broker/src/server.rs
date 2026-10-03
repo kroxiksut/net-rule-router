@@ -903,6 +903,16 @@ install failed: no PROGRAMDATA
     #[test]
     fn a_user_owned_log_directory_is_refused() {
         let dir = tempfile::tempdir().expect("temp dir");
+        // An elevated admin (as on CI) would otherwise create it owned by Administrators.
+        let sid = crate::windows_sys::current_process_user_sid().expect("own SID");
+        let owned = std::process::Command::new(nrr_platform_windows::system_shell::system32_exe(
+            "icacls.exe",
+        ))
+        .arg(dir.path())
+        .args(["/setowner", &format!("*{sid}"), "/Q"])
+        .output()
+        .expect("run icacls");
+        assert!(owned.status.success(), "icacls /setowner: {owned:?}");
         let logs = dir.path().join("logs");
         let refused = super::prepare_trusted_log_dir(&logs, dir.path());
         assert!(

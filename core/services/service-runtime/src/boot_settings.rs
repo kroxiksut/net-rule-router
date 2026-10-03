@@ -5,6 +5,8 @@
 //! nothing. A missing row, a failed read or a poisoned lock all resolve to the
 //! documented defaults — boot has no one to ask.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -137,6 +139,67 @@ pub fn read_boot_settings(conn: Option<&Arc<Mutex<Connection>>>) -> BootSettings
     }
 }
 
+/// The file whose presence in the service's data root forces the connection
+/// trace into the operational log.
+pub const CONN_TRACE_SENTINEL: &str = "conn-trace.enabled";
+
+/// Whether the connection trace is forced into the operational log for the
+/// life of the process: the `NRR_CONN_TRACE` variable, or the sentinel file in
+/// `data_root`. The file is the service-friendly knob — a service manager
+/// caches its environment, a file needs only a restart.
+#[must_use]
+pub fn conn_trace_forced(data_root: Option<&Path>) -> bool {
+    std::env::var_os("NRR_CONN_TRACE").is_some()
+        || data_root.is_some_and(|root| root.join(CONN_TRACE_SENTINEL).exists())
+}
+
+/// The live switch for writing observed connections to the operational log.
+///
+/// Seeded from the saved row at boot; a later save reaches it through
+/// [`Self::apply_hook`] without a restart. A forced trace stays on whatever
+/// the save says. The disk sink is privacy-sensitive, so every failure to read
+/// the row leaves it off.
+#[derive(Clone)]
+pub struct ConnTraceLogSwitch {
+    flag: Arc<AtomicBool>,
+    forced: bool,
+}
+
+impl ConnTraceLogSwitch {
+    #[must_use]
+    pub fn at_boot(conn: Option<&Arc<Mutex<Connection>>>, forced: bool) -> Self {
+        let saved = conn.is_some_and(read_conn_trace_ndjson);
+        Self {
+            flag: Arc::new(AtomicBool::new(saved || forced)),
+            forced,
+        }
+    }
+
+    /// The flag the observer reads on every batch.
+    #[must_use]
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
+
+    /// What the settings writer calls with the saved value.
+    #[must_use]
+    pub fn apply_hook(&self) -> Arc<dyn Fn(bool) + Send + Sync> {
+        let flag = Arc::clone(&self.flag);
+        let forced = self.forced;
+        Arc::new(move |on: bool| flag.store(on || forced, Ordering::Relaxed))
+    }
+}
+
+fn read_conn_trace_ndjson(conn: &Arc<Mutex<Connection>>) -> bool {
+    use nrr_storage::service_stability_config::ServiceStabilityConfigRepository;
+    let Ok(guard) = conn.lock() else {
+        return false;
+    };
+    ServiceStabilityConfigRepository::new(&guard)
+        .get_or_default()
+        .is_ok_and(|r| r.conn_trace_ndjson)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +273,70 @@ mod tests {
         assert_eq!(settings.audit_retention.max_age_days, 400);
         assert_eq!(settings.audit_retention.max_total_size_bytes, 2_097_152);
         assert_ne!(settings, BootSettings::default());
+    }
+
+    fn save_conn_trace_ndjson(conn: &Arc<Mutex<Connection>>, on: bool) {
+        let guard = conn.lock().expect("lock");
+        let repo = ServiceStabilityConfigRepository::new(&guard);
+        let r = repo.get_or_default().expect("read stability");
+        repo.set(
+            &IpcAcceptPolicyWrite::Critical,
+            r.verbose_until_ms,
+            on,
+            r.conn_trace_gui,
+            r.rule_scope_service_driven,
+            r.routing_stop_policy,
+            r.cache_refresh_interval_secs,
+            r.enforcement_mode,
+            r.secondary_liveness_window_secs,
+            r.fake_ip_enabled,
+            r.dns_via_secondary,
+            r.dns_fast_answers,
+            r.fake_ip_udp_relay,
+            r.fake_ip_instant_rst,
+            r.allow_user_rule_edits,
+            None,
+            0,
+        )
+        .expect("save stability");
+    }
+
+    /// The disk sink starts where the operator left it and follows a later
+    /// save without a restart.
+    #[test]
+    fn the_conn_trace_switch_starts_saved_and_follows_saves() {
+        let (_dir, conn) = state_db();
+        let off = ConnTraceLogSwitch::at_boot(Some(&conn), false);
+        assert!(
+            !off.flag().load(Ordering::Relaxed),
+            "opt-in: off by default"
+        );
+
+        save_conn_trace_ndjson(&conn, true);
+        let switch = ConnTraceLogSwitch::at_boot(Some(&conn), false);
+        let flag = switch.flag();
+        assert!(flag.load(Ordering::Relaxed));
+        (switch.apply_hook())(false);
+        assert!(!flag.load(Ordering::Relaxed), "a save reaches the observer");
+        (switch.apply_hook())(true);
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_forced_conn_trace_survives_a_save_that_turns_it_off() {
+        let switch = ConnTraceLogSwitch::at_boot(None, true);
+        (switch.apply_hook())(false);
+        assert!(switch.flag().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_sentinel_file_forces_the_conn_trace() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        if std::env::var_os("NRR_CONN_TRACE").is_none() {
+            assert!(!conn_trace_forced(Some(dir.path())));
+            assert!(!conn_trace_forced(None));
+        }
+        std::fs::write(dir.path().join(CONN_TRACE_SENTINEL), b"").expect("sentinel");
+        assert!(conn_trace_forced(Some(dir.path())));
     }
 }

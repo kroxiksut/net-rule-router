@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use crate::bounded_set::BoundedRecentSet;
 use nrr_platform_api::conn_observe::live::LiveConnection;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// How recently an app's destination must have been SEEN to keep producing a
@@ -156,6 +156,13 @@ pub struct AppObservationStore {
     app_recency: Mutex<AppRecency>,
     app_cap: usize,
     app_cap_logged: AtomicBool,
+    /// Moves whenever something a plan reads from here changes membership — not
+    /// on a restamp, whose only effect is through time.
+    generation: AtomicU64,
+    /// The patterns a plan has asked about. Every program's connections are
+    /// recorded, but only the ones an application rule names change a plan;
+    /// counting the rest would make every browser tab look like new policy.
+    watched: Mutex<Vec<String>>,
 }
 
 /// Sighting order of applications as a counter, so a sighting costs one map
@@ -212,6 +219,8 @@ impl AppObservationStore {
             app_recency: Mutex::new(AppRecency::default()),
             app_cap: APP_KEY_CAP,
             app_cap_logged: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            watched: Mutex::new(Vec::new()),
         }
     }
 
@@ -318,6 +327,14 @@ impl AppObservationStore {
                 cap = self.app_cap,
                 "application observation cap reached; the least recently seen application gives way",
             );
+        }
+        let membership_changed = seen.is_new || seen.evicted.is_some();
+        if (membership_changed && self.planned(&key))
+            || dropped_app
+                .as_ref()
+                .is_some_and(|(app, _)| self.planned(app))
+        {
+            self.generation.fetch_add(1, Ordering::Relaxed);
         }
         self.seen_since_flush
             .lock()
@@ -444,6 +461,9 @@ impl AppObservationStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .observe((key, ip));
+        if removed {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
         removed
     }
 
@@ -461,14 +481,28 @@ impl AppObservationStore {
         if key.is_empty() || key == own_process_key() {
             return;
         }
+        // The census only matters to a plan for an address a planned
+        // application's set holds; asked before the census lock, never under it.
+        let pinned = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|(app, set)| set.contains(&ip) && self.planned(app));
         let mut g = self.census.lock().unwrap_or_else(|p| p.into_inner());
         match g.seen.get_mut(&ip) {
             Some(keys) => {
                 if keys.len() < CENSUS_KEYS_PER_IP && !keys.iter().any(|k| k == &key) {
                     keys.push(key);
+                    if pinned {
+                        self.generation.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             None => {
+                if pinned {
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                }
                 g.seen.insert(ip, vec![key]);
                 g.order.push_back(ip);
                 while g.order.len() > CENSUS_IP_CAP {
@@ -501,6 +535,32 @@ impl AppObservationStore {
                 .iter()
                 .any(|pattern| pattern_matches(pattern, seen))
         })
+    }
+
+    /// Moves whenever something a plan has read from here changes, so a pass can
+    /// tell "nothing here is new" without reading it.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Whether `key` is a program some plan has asked about.
+    fn planned(&self, key: &str) -> bool {
+        self.watched
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|pattern| pattern_matches(pattern, key))
+    }
+
+    /// Remember that a plan reads `key`. The first ask is itself a change: what
+    /// the store already holds for the pattern has not reached any plan yet.
+    fn watch(&self, key: &str) {
+        let mut watched = self.watched.lock().unwrap_or_else(|p| p.into_inner());
+        if !watched.iter().any(|known| known == key) {
+            watched.push(key.to_string());
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Number of apps with at least one observation (diagnostics / tests).
@@ -559,6 +619,7 @@ impl AppObservationLookup for AppObservationStore {
         if key.is_empty() {
             return Vec::new();
         }
+        self.watch(&key);
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         // Glob pattern (e.g. `*vpn*.exe`) → union the IPs of every observed
         // process whose name matches; exact name → a single lookup. Stale
@@ -1097,6 +1158,36 @@ mod tests {
     fn unknown_app_is_empty() {
         let store = AppObservationStore::new();
         assert!(store.ips_for_app("nothing.exe").is_empty());
+    }
+
+    /// Every program's connections are recorded, but only what a plan reads may
+    /// move the generation — otherwise any browser tab re-plans the policy.
+    #[test]
+    fn only_what_a_plan_reads_moves_the_generation() {
+        let store = AppObservationStore::new();
+        let start = store.generation();
+        store.record("browser.example", ip(198, 51, 100, 8));
+        store.note_process_destination("browser.example", ip(198, 51, 100, 8));
+        assert_eq!(store.generation(), start, "an unruled program moved it");
+
+        let _ = store.ips_for_app("client.example");
+        let watched = store.generation();
+        assert_ne!(watched, start, "the first ask is new input for the plan");
+
+        store.record("client.example", ip(198, 51, 100, 9));
+        assert_ne!(
+            store.generation(),
+            watched,
+            "a ruled program's new address did not move it"
+        );
+
+        let before_census = store.generation();
+        store.note_process_destination("other.example", ip(198, 51, 100, 9));
+        assert_ne!(
+            store.generation(),
+            before_census,
+            "a stranger on a pinned address did not move it"
+        );
     }
 
     #[test]

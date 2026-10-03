@@ -289,7 +289,7 @@ pub struct FlowRule {
 /// system's single main table — what Windows uses today, and the only value the
 /// Windows lowering acts on; `Principal` / `Tagged` are per-principal / marked
 /// tables the Linux lowering populates.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RouteTableRef {
     /// The system main routing table (the only one Windows uses).
     #[default]
@@ -601,7 +601,7 @@ impl std::error::Error for EnforcementFailure {}
 /// `false` means the binding does not currently resolve — the adapter is absent,
 /// down, or renamed. It deliberately does not distinguish those: for the policy
 /// above, "cannot send over it" is the whole fact.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ChannelAvailability {
     pub primary: bool,
     pub secondary: bool,

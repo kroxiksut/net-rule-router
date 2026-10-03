@@ -81,6 +81,7 @@ fn emit_main_gui_context(
         request,
         backend_bundle.facade.as_ref(),
         &backend_bundle.status,
+        backend_bundle.service_started,
         &crate::rpc_dispatcher::host_answer_deadlines(),
     )?;
 

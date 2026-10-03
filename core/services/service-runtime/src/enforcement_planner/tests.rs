@@ -302,6 +302,39 @@ fn plans_fqdn_fanout_and_block() {
     assert_eq!(blk.coverage, Coverage::AllPackets);
 }
 
+/// The cache answers most-recent first, and every refresh reorders it. A plan
+/// built in that order renumbered the same addresses on every pass, so the
+/// platform saw a changed policy where nothing had changed.
+#[test]
+fn the_same_addresses_in_another_recency_order_plan_the_same() {
+    let plan_with = |ips: Vec<IpAddr>| {
+        let mut cache = MapCache::default();
+        cache.hosts.insert("cdn.example.com".into(), ips);
+        let rb = book(
+            vec![],
+            vec![rule(
+                "s-fqdn",
+                CanonicalAddressMatch::ExactFqdn("cdn.example.com".into()),
+                RuleAction::Route,
+            )],
+        );
+        plan_route_rules(
+            &rb,
+            "S-1-5-21-A",
+            RouteBehaviorMode::PreferPrimary,
+            &planner_input(&cache, &MapResolver::default(), &MapObs::default()),
+        )
+        .0
+    };
+    let a = v4(198, 51, 100, 7);
+    let b = v4(198, 51, 100, 3);
+    let c = v4(203, 0, 113, 9);
+    let first = plan_with(vec![a, b, c]);
+    assert_eq!(first.len(), 3);
+    assert_eq!(first, plan_with(vec![c, a, b]));
+    assert_eq!(first, plan_with(vec![b, c, a]));
+}
+
 /// An IPv6 exact-address rule is named only when a link carries the family;
 /// under `Off` the plan is exactly what it was before the rule existed.
 #[test]
@@ -1879,7 +1912,7 @@ fn an_app_and_address_rule_plans_nothing_and_is_reported() {
             .iter()
             .any(|f| f.flow.dst == DstMatch::HostV4(plain_ip)));
         assert_eq!(
-            report.unsupported_shapes,
+            report.unsupported_shapes(),
             vec![("s-combined".to_string(), reason)]
         );
     }

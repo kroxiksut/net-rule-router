@@ -1,5 +1,6 @@
 import QtQuick 2.15
 import "../lib/rules.js" as Rules
+import "../lib/pure.js" as Pure
 
 // Non-visual controller for rules-file persistence + the close-flow, extracted
 // from Main.qml (thin-shell rule). Owns: the "rules changed since last file
@@ -326,8 +327,8 @@ QtObject {
     }
 
     /// Where a new set lands by default: the user's rule-set folder, else the
-    /// folder the currently bound route file lives in, else nothing (the
-    /// picker then opens wherever the OS defaults to).
+    /// folder the currently bound route file lives in, else the product folder
+    /// under Documents.
     function _defaultSetContainerDir() {
         var configured = String(root.userPresetsDir || "")
         if (configured !== "") return configured
@@ -340,7 +341,13 @@ QtObject {
             var up = setDir.lastIndexOf("/")
             return up > 0 ? setDir.substring(0, up) : setDir
         }
-        return ""
+        return _documentsSetDir(false)
+    }
+
+    function _documentsSetDir(create) {
+        return (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+                && typeof nrrNativeBridge.defaultRuleSetsDir === "function")
+            ? String(nrrNativeBridge.defaultRuleSetsDir(create) || "") : ""
     }
 
     /// The set the rules came from, so re-saving suggests the same name.
@@ -356,13 +363,28 @@ QtObject {
 
     /// The dialog's answer: create `<folder>/<name>/` and write both routes.
     function writeSetNamed(containerDir, setName) {
-        if (String(containerDir || "") === "" || !isUsableSetName(setName)) {
+        var folder = String(containerDir || "")
+        if (folder === "") {
+            root.statusLine = root.tr("status.save-as-set-folder-missing",
+                "Choose a folder for the set first.")
+            _settleExportSet(false)
+            return
+        }
+        if (!isUsableSetName(setName)) {
             root.statusLine = root.tr("status.save-as-set-name-invalid",
                 "Choose a plain file name for the set — it becomes the set's folder name.")
             _settleExportSet(false)
             return
         }
-        _createAndWriteSet(String(containerDir), String(setName), _settleExportSet)
+        // The Documents folder is offered before it exists; it is made only now.
+        if (folder === _documentsSetDir(false)) _documentsSetDir(true)
+        _createAndWriteSet(folder, String(setName), function(ok) {
+            // The first folder a set is saved to becomes the user's rule-set
+            // folder — unless it is the shipped one, which an update overwrites.
+            if (ok && !root.hasRulesFolder && !root.isFactoryPresetPath(folder + "/" + setName))
+                root.setUserPresetsDir(folder)
+            _settleExportSet(ok)
+        })
     }
 
     /// Pending target of `exportCurrentRulesInteractive`, resolved by
@@ -689,37 +711,71 @@ QtObject {
             })
     }
 
-    // Safe rollback: restore the user's own last-known-good revision and
-    // re-apply it, without elevation. The dry-run is silent — the
-    // user already confirmed in the dialog; it only fetches the token the
-    // service binds to this operation and user. Either phase failing lands on
-    // the same localized status line.
-    function _performSafeRollback() {
-        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
-                || typeof nrrNativeBridge.rpcRollbackRequest !== "function") {
-            root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
+    // Safe rollback of the user's own rules, no elevation. Opening asks the
+    // service what it would restore, so the dialog names it — or says there
+    // is nothing — before anything is confirmed.
+    property string _rollbackToken: ""
+    property var _rollbackTarget: null
+
+    function openSafeRollback() {
+        var dialog = root.safeRollbackConfirmDialog
+        _rollbackToken = ""
+        _rollbackTarget = null
+        dialog.phase = "loading"
+        dialog.target = null
+        dialog.errorText = ""
+        dialog.open()
+        var corr = (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+                    && typeof nrrNativeBridge.rpcRollbackRequest === "function")
+            ? nrrNativeBridge.rpcRollbackRequest("", true, "") : ""
+        if (!corr) {
+            dialog.errorText = root.tr("status.bridge-unavailable", "Native bridge unavailable")
+            dialog.phase = "error"
             return
         }
+        root.rpc.registerRpcCallback(corr, function(ok, p, code) {
+            var verdict = Pure.rollbackDryRunVerdict(ok, p, code)
+            _rollbackToken = verdict.token
+            _rollbackTarget = verdict.target
+            dialog.target = verdict.target
+            dialog.errorText = verdict.code === "" ? "" : root.ipcErrorLabel(verdict.code)
+            dialog.phase = verdict.phase
+        })
+    }
+
+    function _performSafeRollback() {
+        var token = _rollbackToken
+        var target = _rollbackTarget
+        _rollbackToken = ""
         var fail = function(code) {
             root.statusLine = root.tr("status.rollback-failed", "Safe rollback failed: ")
                 + root.ipcErrorLabel(code)
         }
+        if (token === "") {
+            fail("precondition-failed")
+            return
+        }
         root.statusLine = root.tr("status.rollback-submitting", "Submitting safe rollback…")
-        var dryCorr = nrrNativeBridge.rpcRollbackRequest("", true, "")
-        root.rpc.registerRpcCallback(dryCorr, function(ok, p, code, msg) {
-            var token = ok ? String((p && p["confirmation-token"]) || "") : ""
-            if (token === "") {
-                fail(ok ? "bad-response" : code)
+        var corr = nrrNativeBridge.rpcRollbackRequest("", false, token)
+        root.rpc.registerRpcCallback(corr, function(ok, p, code) {
+            if (!ok) {
+                fail(code)
                 return
             }
-            var corr = nrrNativeBridge.rpcRollbackRequest("", false, token)
-            root.rpc.registerRpcCallback(corr, function(ok2, p2, code2, msg2) {
-                if (!ok2) {
-                    fail(code2)
-                    return
+            // The rollback runs before the answer; an own operation record is
+            // always readable, so "no verdict" means only the bridge is gone.
+            root.rpc.readMutationOutcome(p, function(done) { done(null) }, function(failure) {
+                if (failure === null) {
+                    root.statusLine = root.tr("status.rollback-submitted",
+                        "Safe rollback submitted. The service is restoring the previous configuration.")
+                } else if (failure !== "") {
+                    fail(failure)
+                } else {
+                    var at = target ? Number(target["activated-at"] || 0) * 1000 : 0
+                    root.statusLine = root.tr("status.rollback-completed",
+                        "Rolled back to the rules you applied on {time}.")
+                        .replace("{time}", Pure.formatTimestamp(at))
                 }
-                root.statusLine = root.tr("status.rollback-submitted",
-                    "Safe rollback submitted. The service is restoring the previous configuration.")
             })
         })
     }

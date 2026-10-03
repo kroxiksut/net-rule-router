@@ -38,6 +38,8 @@
 //! | `interface_manager` | Adapter enumeration |
 
 pub mod adapters;
+// IfType / medium / hardware flag -> the neutral facts the kind is decided from.
+mod adapter_kind;
 #[cfg(test)]
 mod alloc_count;
 pub mod app_path_resolver;

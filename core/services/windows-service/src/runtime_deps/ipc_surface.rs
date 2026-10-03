@@ -112,17 +112,26 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
     // sink is the privacy-sensitive output and stays opt-in; its switch is
     // shared with the settings writer so a save applies without a restart.
     // The dev sentinel forces it on for the life of the process.
-    let (conn_trace_persisted_ndjson, _conn_trace_gui) =
-        read_conn_trace_flags(settings_conn.as_ref());
-    let conn_trace_forced = conn_trace_requested();
-    let conn_trace_ndjson = Arc::new(std::sync::atomic::AtomicBool::new(
-        conn_trace_persisted_ndjson || conn_trace_forced,
-    ));
+    let conn_trace_log = nrr_service_runtime::boot_settings::ConnTraceLogSwitch::at_boot(
+        settings_conn.as_ref(),
+        nrr_service_runtime::boot_settings::conn_trace_forced(
+            std::env::var_os("ProgramData")
+                .map(|root| std::path::PathBuf::from(root).join("NetRuleRouter"))
+                .as_deref(),
+        ),
+    );
+    let conn_trace_ndjson = conn_trace_log.flag();
     let conn_trace_ring: Option<
         Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>,
     > = Some(Arc::new(
         nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(1000),
     ));
+    if let (Some(ring), Some(cache)) = (conn_trace_ring.as_ref(), cache_store.as_ref()) {
+        ring.attach_namer(Arc::new(
+            nrr_service_runtime::conn_trace_names::ConnTraceNamer::production(Arc::clone(cache))
+                .with_fake_ip_pool(fake_ip_assembly.binding_view()),
+        ));
+    }
 
     // Filled while the IPC handlers are wired (the probe runner is built
     // there) and read when the supervised tasks are assembled below.
@@ -371,15 +380,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 .with_instant_rst_flag(
                     nrr_service_runtime::fake_ip::global_instant_rst_enabled(),
                 )
-                .with_conn_trace_ndjson_apply({
-                    let flag = Arc::clone(&conn_trace_ndjson);
-                    Arc::new(move |on: bool| {
-                        flag.store(
-                            on || conn_trace_forced,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    })
-                });
+                .with_conn_trace_ndjson_apply(conn_trace_log.apply_hook());
             // The live tracing filter: a verbose-logging request applies at
             // once and a window ends on time. `None` on a boot without a log
             // writer.
@@ -515,25 +516,13 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             ) as Arc<dyn AutostartWriter>,
         )
         .with_alerts_repo(Arc::clone(&alerts_repo))
-        // Clearing a blocking integrity alert re-signs every revision row, so
-        // it speaks for whoever owns them. Asked live, per acknowledgement: on
-        // the ordinary single-user machine the answer is "nobody else" and the
-        // user clears their own alert unaided.
-        .with_other_principals_reader({
-            let conn = Arc::clone(conn);
-            Arc::new(move |caller: &str| {
-                let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                nrr_storage::revisions::RevisionsRepository::new(&guard)
-                    .distinct_principals()
-                    .map(|principals| {
-                        principals
-                            .iter()
-                            .any(|p| p != caller && p != nrr_storage::BASELINE_PRINCIPAL)
-                    })
-                    // Unreadable is not consent to speak for others.
-                    .unwrap_or(true)
-            })
-        })
+        // On the ordinary single-user machine the answer is "nobody else" and
+        // the user clears their own integrity alert unaided.
+        .with_other_principals_reader(
+            nrr_service_runtime::revision_signing::other_principals_hold_revisions(Arc::clone(
+                conn,
+            )),
+        )
         .with_service_stability(
             Arc::clone(&service_stability) as Arc<dyn ServiceStabilityConfigProvider>,
             service_stability as Arc<dyn ServiceStabilityConfigWriter>,

@@ -210,8 +210,11 @@ pub fn plan_route_rules(
                 nrr_domain::rule_shape::rule_verdict(rule, shapes)
             {
                 report
-                    .unsupported_shapes
-                    .push((rule.id.as_str().to_string(), reason));
+                    .conflicts
+                    .push(crate::rule_conflicts::RuleConflict::UnsupportedRuleShape {
+                        rule_id: rule.id.as_str().to_string(),
+                        reason,
+                    });
                 continue;
             }
             let (verdict, class, coverage) = match rule.action {
@@ -245,23 +248,36 @@ pub fn plan_route_rules(
             };
 
             if let Some(addr_match) = rule.address_match.as_ref() {
-                let targets = resolve_targets(addr_match, cache_for_role, families);
-                note_address_resolution(&mut report, rule, addr_match, &targets, cache_for_role);
-                for (fanout_idx, ip) in targets {
-                    // A Block yields an address a narrower rule names. A route:
-                    // an address the main link's own rules name is not this
-                    // link's to take, however specific this rule is about the
-                    // HOST — the flow acts on the ADDRESS, and it carries the
-                    // main link's hosts too.
-                    let keep = match rule.action {
-                        RuleAction::Block => !ownership.block_yields(ip, addr_match),
-                        RuleAction::Route => ownership.address_rule_may_steer(ip, link),
-                    };
-                    if !keep {
-                        continue;
-                    }
-                    flows.push(host_flow(fanout_idx, ip));
-                }
+                // The same walk the codegen asks: a Block yields an address a
+                // narrower rule names, and a route may not take an address the
+                // main link's rules name — the flow acts on the ADDRESS, which
+                // carries the main link's hosts too.
+                let mut walk = crate::rule_conflicts::AddressRuleWalk::new(
+                    &ownership,
+                    rule.action,
+                    addr_match,
+                    link,
+                );
+                let mut resolved_any = false;
+                for_each_target(
+                    addr_match,
+                    cache_for_role,
+                    families,
+                    |fanout_idx, host, ip| {
+                        resolved_any = true;
+                        if walk.keeps(host, ip) {
+                            flows.push(host_flow(fanout_idx, ip));
+                        }
+                    },
+                );
+                note_address_resolution(
+                    &mut report,
+                    rule,
+                    addr_match,
+                    resolved_any,
+                    cache_for_role,
+                );
+                report.conflicts.extend(walk.finish(rule.id.as_str()));
             } else if let Some(app) = rule.app_match.as_ref() {
                 let pattern = match &app.pattern {
                     CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.as_str(),
@@ -354,47 +370,46 @@ pub fn plan_route_rules(
     (flows, report)
 }
 
-/// Resolve an address match to its `(fanout_index, IPv4)` targets, replicating
-/// `wfp_codegen`'s fan-out order + bounds exactly: `ExactIp` is a single target;
-/// `ExactFqdn` fans out over the cached IPs (≤ `PER_HOSTNAME_IP_CAP`);
-/// `SuffixDomain` / `Zone` fan out over cached subdomains — plus the apex for
-/// `SuffixDomain` — (≤ `SUFFIX_FANOUT_BACKSTOP`) then each host's IPs (≤
-/// `PER_HOSTNAME_IP_CAP`). The running fan-out index CLAMPS at
-/// `SLOTS_PER_RULE - 1` instead of stopping (mirrors `emit_suffix_fanout`):
-/// targets beyond the band share its top ordinal slot, so no host is dropped
-/// while adjacent rules' bands stay disjoint.
-fn resolve_targets(
+/// Visit an address match's `(fanout_index, host, address)` targets, replicating
+/// `wfp_codegen`'s fan-out order + bounds exactly: `ExactIp` is a single target
+/// with no host; `ExactFqdn` fans out over the cached IPs (≤
+/// `PER_HOSTNAME_IP_CAP`); `SuffixDomain` / `Zone` fan out over cached
+/// subdomains — plus the apex for `SuffixDomain` — (≤ `SUFFIX_FANOUT_BACKSTOP`)
+/// then each host's IPs (≤ `PER_HOSTNAME_IP_CAP`). The running fan-out index
+/// CLAMPS at `SLOTS_PER_RULE - 1` instead of stopping (mirrors
+/// `emit_suffix_fanout`): targets beyond the band share its top ordinal slot,
+/// so no host is dropped while adjacent rules' bands stay disjoint.
+fn for_each_target(
     addr_match: &CanonicalAddressMatch,
     cache: &dyn FqdnCacheLookup,
     families: FamilyScope,
-) -> Vec<(u32, IpAddr)> {
-    let mut out = Vec::new();
+    mut visit: impl FnMut(u32, Option<&str>, IpAddr),
+) {
     match addr_match {
         // A rule can only name an IPv4 literal today; the v6 form arrives with
         // address rules over that family.
-        CanonicalAddressMatch::ExactIp(ip) if families.admits(*ip) => out.push((0, *ip)),
+        CanonicalAddressMatch::ExactIp(ip) if families.admits(*ip) => visit(0, None, *ip),
         CanonicalAddressMatch::ExactIp(_) => {}
         CanonicalAddressMatch::ExactFqdn(host) => {
             for (i, ip) in capped_for_host(cache, host, families).enumerate() {
-                out.push((i as u32, ip));
+                visit(i as u32, Some(host), ip);
             }
         }
         // `SuffixDomain` covers its apex, `Zone` does not — the same split
         // `wfp_codegen::emit_suffix_fanout` makes, so the two views agree.
-        CanonicalAddressMatch::SuffixDomain(suffix) => push_suffix_targets(
+        CanonicalAddressMatch::SuffixDomain(suffix) => visit_suffix_targets(
             &cache.hostnames_for_suffix_domain(suffix, SUFFIX_FANOUT_BACKSTOP),
             cache,
             families,
-            &mut out,
+            &mut visit,
         ),
-        CanonicalAddressMatch::Zone(zone) => push_suffix_targets(
+        CanonicalAddressMatch::Zone(zone) => visit_suffix_targets(
             &cache.hostnames_under_suffix(zone, SUFFIX_FANOUT_BACKSTOP),
             cache,
             families,
-            &mut out,
+            &mut visit,
         ),
     }
-    out
 }
 
 /// A single-host destination match for `ip` — `/32` or `/128` by family.
@@ -508,39 +523,48 @@ impl FamilyScope {
 ///
 /// Per family rather than per host: a shared cap would let a dual-stacked CDN's
 /// IPv6 records push out IPv4 pins that are carrying traffic today, which is a
-/// regression dressed as a new feature. IPv4 first keeps the fan-out ordinals
-/// of a v4-only host exactly as they were, so nothing about today's machine
-/// moves.
+/// regression dressed as a new feature.
+///
+/// The cap keeps the most recently confirmed addresses; the kept ones are then
+/// laid out in address order. Their position is the fan-out ordinal, and every
+/// refresh reorders the cache by recency — so recency order made the same set
+/// of addresses a different plan on every pass, on both platforms.
 pub(crate) fn capped_for_host<'a>(
     cache: &'a dyn FqdnCacheLookup,
     host: &str,
     families: FamilyScope,
 ) -> impl Iterator<Item = IpAddr> + 'a {
     let all = cache.ips_for_hostname(host);
-    let v4 = all
+    let mut v4: Vec<IpAddr> = all
         .iter()
         .copied()
         .filter(|ip| ip.is_ipv4())
-        .take(PER_HOSTNAME_IP_CAP);
-    let v6 = all
+        .take(PER_HOSTNAME_IP_CAP)
+        .collect();
+    let mut v6: Vec<IpAddr> = all
         .iter()
         .copied()
         .filter(move |ip| !ip.is_ipv4() && families.admits(*ip))
-        .take(PER_HOSTNAME_IP_CAP);
-    v4.chain(v6).collect::<Vec<_>>().into_iter()
+        .take(PER_HOSTNAME_IP_CAP)
+        .collect();
+    v4.sort_unstable();
+    v6.sort_unstable();
+    v4.extend(v6);
+    v4.into_iter()
 }
 
-/// Fan a resolved host list out to `(clamped fanout ordinal, address)` targets.
-fn push_suffix_targets(
+/// Fan a resolved host list out to `(clamped fanout ordinal, host, address)`
+/// targets.
+fn visit_suffix_targets(
     hosts: &[String],
     cache: &dyn FqdnCacheLookup,
     families: FamilyScope,
-    out: &mut Vec<(u32, IpAddr)>,
+    visit: &mut impl FnMut(u32, Option<&str>, IpAddr),
 ) {
     let mut fanout_idx: u32 = 0;
     for host in hosts {
         for ip in capped_for_host(cache, host, families) {
-            out.push((fanout_idx.min(SLOTS_PER_RULE - 1), ip));
+            visit(fanout_idx.min(SLOTS_PER_RULE - 1), Some(host), ip);
             fanout_idx += 1;
         }
     }

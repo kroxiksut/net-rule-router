@@ -77,6 +77,10 @@ fn collect_windows_rows_from_snapshot(
         }
     };
 
+    // Unreadable, every row claims no kind rather than a guessed one.
+    let kind_facts =
+        crate::win32_ffi::interface_counters::read_interface_kind_facts().unwrap_or_default();
+
     // Which adapters can actually forward traffic out: a classic gateway, or a
     // default-style route with a real next-hop (the gateway-less OpenVPN /
     // WireGuard shape). Computed here, where the route table is available,
@@ -120,11 +124,16 @@ fn collect_windows_rows_from_snapshot(
                 has_default_route,
                 observed_facts.connectivity_state,
             );
-            let is_bluetooth_like = is_bluetooth_like_interface(
-                &adapter.name,
-                &adapter.interface_description,
-                &adapter.identity.adapter_name,
-            );
+            let kind = kind_facts
+                .get(&adapter_name_key)
+                .map_or(AdapterKind::Other, |facts| classify_adapter_kind(*facts));
+            // The medium the OS reports catches a Bluetooth link with a neutral name.
+            let is_bluetooth_like = kind == AdapterKind::Bluetooth
+                || is_bluetooth_like_interface(
+                    &adapter.name,
+                    &adapter.interface_description,
+                    &adapter.identity.adapter_name,
+                );
 
             InterfaceRouteRow {
                 persistent_id: adapter.identity.persistent_id,
@@ -132,6 +141,9 @@ fn collect_windows_rows_from_snapshot(
                 name: adapter.name,
                 interface_description: adapter.interface_description,
                 interface_type: adapter.interface_type,
+                kind,
+                // The driver description already names TAP-Windows or Wintun.
+                device_technology: None,
                 is_bluetooth_like,
                 local_ip,
                 gateway,

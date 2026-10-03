@@ -215,6 +215,9 @@ pub struct SupervisedRuntimeDeps {
     /// `ApplyFailurePolicyWriter` (forward) and the `CoordinatorPolicyManager`
     /// (read-side queries via `current_active`).
     pub activation_coordinator: Option<Arc<crate::activation_coordinator::ActivationCoordinator>>,
+    /// Recheck of the active revisions after an outside write. `None` where
+    /// no signing key exists to check against.
+    pub revision_watch: Option<crate::revision_watch::RevisionWatch>,
     /// DNS refresh orchestrator. `None` when the
     /// cache DB couldn't be opened (recovery-blocked path); the
     /// supervisor then skips the `dns-refresh-tick` task and the
@@ -515,7 +518,7 @@ pub fn run_supervised_runtime(
     controller: &dyn ServiceController,
     stop: &StopToken,
     artifacts: BootstrapArtifacts,
-    deps: SupervisedRuntimeDeps,
+    mut deps: SupervisedRuntimeDeps,
 ) {
     // A second runtime in the same process (tests, console restart) must not be
     // born already tearing down.
@@ -605,6 +608,17 @@ pub fn run_supervised_runtime(
         }
         controller.report(ServiceRuntimeState::Running);
         spawn_optional_tasks(&supervisor, &deps);
+        // Owned by its task: it remembers the database version it last saw.
+        if let Some(watch) = deps.revision_watch.take() {
+            if let Err(e) = supervisor.spawn(crate::service_tasks::build_revision_watch_task(watch))
+            {
+                tracing::warn!(
+                    target: "nrr::supervisor",
+                    error = %e,
+                    "spawn revision-integrity-watch failed",
+                );
+            }
+        }
 
         // subscribe the OS network-change observer so a
         // secondary up/down re-arms routing + kill-switch via the SAME recompute hook
@@ -706,11 +720,9 @@ pub fn run_supervised_runtime(
     }
 
     // Cooperative wait. The supervisor's tasks honour the same stop
-    // token; flipping it via SCM Stop / Ctrl+C / shutdown propagates to
-    // every spawned thread within ~50 ms (sleep_observing_stop granularity).
-    while !stop.is_stop_requested() {
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // token; flipping it via SCM Stop / Ctrl+C / shutdown wakes every
+    // sleeping task at once.
+    while !stop.wait_for(Duration::from_secs(3600)) {}
 
     let teardown_began = Instant::now();
     // Latch BEFORE anything is stripped: workers that never got a stop-token

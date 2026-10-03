@@ -57,7 +57,7 @@ pub const FILTER_WEIGHT_BASE: u64 = 0x0010_0000;
 /// by [`RouteEntry::family`], which the per-OS lowering consults before it
 /// touches the kernel: a mismatch is a bug in our own planner, and it must
 /// surface there rather than be handed to the OS.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RouteEntry {
     /// Destination network address.
     pub destination: IpAddr,

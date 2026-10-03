@@ -103,10 +103,12 @@ impl ActivationCoordinator {
                     })?
                     .ok_or(PolicyError::NoLastKnownGood)?,
                 RollbackTarget::Specific(id) => {
+                    // Another principal's revision is "not found": a rollback
+                    // must not copy someone else's rules into this chain.
                     let rec = repo
-                        .get_by_id(id.as_str())
+                        .get_by_id_for(principal, id.as_str())
                         .map_err(|e| PolicyError::StorageFailure {
-                            operation: "get_by_id",
+                            operation: "get_by_id_for",
                             message: e.to_string(),
                         })?
                         .ok_or_else(|| PolicyError::RevisionNotFound(id.clone()))?;
@@ -206,6 +208,53 @@ impl ActivationCoordinator {
             })
             .collect();
         Ok(outcomes)
+    }
+
+    /// The running service's counterpart of [`Self::enforce_active_integrity_all`],
+    /// for after the database was written from outside: one signature check
+    /// per active row, and the full check with its rollback only for a
+    /// principal whose active row no longer passes.
+    pub fn recheck_active_integrity(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Vec<(String, ActiveIntegrityOutcome)>, PolicyError> {
+        if self.signing_key.is_none() {
+            return Ok(Vec::new());
+        }
+        let storage = |operation: &'static str| {
+            move |e: nrr_storage::StorageError| PolicyError::StorageFailure {
+                operation,
+                message: e.to_string(),
+            }
+        };
+        let suspect = {
+            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let repo = self.revisions_repo(&conn);
+            let passes = |principal: &str| -> Result<bool, nrr_storage::StorageError> {
+                let Some(record) = repo.get_active_for(principal)? else {
+                    return Ok(true);
+                };
+                let verification = repo
+                    .verify_row_hmac(&record.revision_id)?
+                    .unwrap_or(HmacVerification::Unsigned);
+                Ok(classify_reject_reason(&record, verification).is_none())
+            };
+            // A row that cannot be read goes to the full check, which reports it.
+            repo.distinct_principals()
+                .map_err(storage("distinct_principals(recheck)"))?
+                .into_iter()
+                .filter(|principal| !matches!(passes(principal), Ok(true)))
+                .collect::<Vec<_>>()
+        };
+        Ok(suspect
+            .into_iter()
+            .map(|principal| {
+                let outcome = self
+                    .enforce_active_integrity_for(&principal, correlation_id)
+                    .unwrap_or_else(|error| ActiveIntegrityOutcome::CheckFailed { error });
+                (principal, outcome)
+            })
+            .collect())
     }
 
     /// Single-principal integrity check. See [`Self::enforce_active_integrity_all`].

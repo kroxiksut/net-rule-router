@@ -6,10 +6,11 @@
 //! [`generate_signing_key`] (OS CSPRNG via `getrandom`, portable) and
 //! [`InMemKeyStore`], the in-memory test double used on every OS.
 //!
-//! The real mechanism (Windows per-user DPAPI + a SYSTEM-only DACL) lives in the
-//! per-OS backend (`nrr_platform_windows::key_store::WindowsDpapiKeyStore`) and
-//! `impl`s this trait. Linux/macOS get their own impls later (e.g. `libsecret` /
-//! Keychain).
+//! The real mechanism lives in the per-OS backend and `impl`s this trait:
+//! Windows per-user DPAPI + a SYSTEM-only DACL
+//! (`nrr_platform_windows::key_store::WindowsDpapiKeyStore`), Linux a root-only
+//! file beside the state database (`nrr_platform_linux::key_store::FileKeyStore`).
+//! macOS gets its own later.
 
 use crate::error::PlatformError;
 
@@ -66,7 +67,7 @@ pub fn generate_signing_key() -> Result<Vec<u8>, PlatformError> {
 
 // ── InMemKeyStore ───────────────────────────────────────────────────────────
 
-/// In-memory [`KeyStore`] for tests and non-Windows builds. Holds the
+/// In-memory [`KeyStore`] for tests. Holds the
 /// key in plaintext behind a mutex — never use in production.
 #[derive(Default)]
 pub struct InMemKeyStore {

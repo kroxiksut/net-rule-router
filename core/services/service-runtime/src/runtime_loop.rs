@@ -564,19 +564,10 @@ impl ShutdownReport {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Sleep up to `total`, returning early if the stop token flips. Used
-/// by both the periodic loop and the post-failure backoff path so a
-/// stop request is observed within ~50ms even mid-sleep.
+/// Sleep up to `total`, returning as soon as the stop token flips. Used by
+/// both the periodic loop and the post-failure backoff path.
 fn sleep_observing_stop(stop: &StopToken, total: Duration) {
-    let granularity = Duration::from_millis(50);
-    let deadline = Instant::now() + total;
-    while Instant::now() < deadline {
-        if stop.is_stop_requested() {
-            return;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        thread::sleep(remaining.min(granularity));
-    }
+    stop.wait_for(total);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

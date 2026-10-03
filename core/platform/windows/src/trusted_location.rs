@@ -366,6 +366,18 @@ impl Drop for SecurityDescriptor {
 mod tests {
     use super::*;
 
+    /// An elevated admin's new objects belong to Administrators (CI runners
+    /// run so), which would make "a user's directory" trusted.
+    fn own_by_this_user(root: &Path) {
+        let sid = crate::win32_ffi::console_session::current_process_user_sid().expect("own SID");
+        let done = std::process::Command::new(crate::system_shell::system32_exe("icacls.exe"))
+            .arg(root)
+            .args(["/setowner", &format!("*{sid}"), "/T", "/Q"])
+            .output()
+            .expect("run icacls");
+        assert!(done.status.success(), "icacls /setowner: {done:?}");
+    }
+
     #[test]
     fn a_system_tool_is_out_of_reach_of_ordinary_accounts() {
         let tool = crate::system_shell::system32_exe("icacls.exe");
@@ -412,6 +424,7 @@ mod tests {
         let system32 = system32.parent().expect("System32");
         assert_eq!(owner_is_trusted(system32), Ok(true));
         let dir = tempfile::tempdir().expect("tempdir");
+        own_by_this_user(dir.path());
         assert_eq!(owner_is_trusted(dir.path()), Ok(false));
     }
 
@@ -421,6 +434,7 @@ mod tests {
         let file = dir.path().join("logs").join("planted.db");
         std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         std::fs::write(&file, b"x").expect("write");
+        own_by_this_user(dir.path());
         let census = tree_ownership(dir.path()).expect("readable");
         assert_eq!(census.entries.len(), 3);
         assert_eq!(census.foreign, census.entries);

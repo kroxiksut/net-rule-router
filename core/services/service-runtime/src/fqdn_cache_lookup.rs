@@ -127,6 +127,10 @@ pub trait FqdnCacheLookup: Send + Sync {
     /// `limit` caps the result set — the codegen passes a sane
     /// default (e.g. 1024) to keep an oversize suffix from emitting
     /// a runaway filter set.
+    ///
+    /// The cap keeps the most recently seen hosts; the result is in NAME order,
+    /// because a host's position is its fan-out ordinal and recency order would
+    /// renumber the plan on every observation.
     fn hostnames_under_suffix(&self, suffix: &str, limit: usize) -> Vec<String>;
 
     /// Every cached hostname a `SuffixDomain(label)` rule covers: the
@@ -435,7 +439,10 @@ impl FqdnCacheLookup for SqliteFqdnCacheLookup {
             }
         };
         match guard.list_hostnames_under_suffix(suffix, limit) {
-            Ok(v) => v,
+            Ok(mut v) => {
+                v.sort_unstable();
+                v
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::wfp-codegen",
@@ -625,12 +632,15 @@ impl FqdnCacheLookup for FqdnCacheSnapshot {
         // here would quietly drop hosts the query returns. The leading dot is
         // what keeps the apex out of its own suffix.
         let needle = format!(".{normalised}");
-        self.hostnames_by_recency
+        let mut hosts: Vec<String> = self
+            .hostnames_by_recency
             .iter()
             .filter(|h| h.to_ascii_lowercase().ends_with(&needle))
             .take(limit)
             .cloned()
-            .collect()
+            .collect();
+        hosts.sort_unstable();
+        hosts
     }
 
     fn direct_host_count_for_ip(&self, ip: Ipv4Addr) -> u32 {
@@ -841,6 +851,57 @@ mod tests {
             subs,
             vec!["api.example.com".to_string(), "www.example.com".to_string()]
         );
+    }
+
+    /// Recency picks WHICH hosts a capped suffix keeps; the order they come
+    /// back in is their names'. A host seen again must not renumber the plan.
+    #[test]
+    fn suffix_hosts_are_chosen_by_recency_and_listed_by_name() {
+        use nrr_storage::dto::ResolutionEntry;
+        use nrr_storage::migration::SqliteMigrationRunner;
+        use nrr_storage::repository::MigrationRunner;
+        use nrr_storage::resolution_source::StorageResolutionSource;
+        use nrr_storage::store::SqliteCacheStore;
+
+        let runner = SqliteMigrationRunner::for_cache_db(
+            rusqlite::Connection::open_in_memory().expect("open"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        let thresholds = FreshnessThresholds::default_production();
+        let store = SqliteCacheStore::new(runner.into_connection(), thresholds.clone());
+        let now = std::time::SystemTime::now();
+        // `www` is the most recently seen of the two.
+        for (h, ip, ago) in [
+            ("www.example.com", Ipv4Addr::new(203, 0, 113, 2), 10),
+            ("api.example.com", Ipv4Addr::new(203, 0, 113, 1), 60),
+        ] {
+            store
+                .upsert_resolution(ResolutionEntry {
+                    canonical_hostname: h.into(),
+                    raw_hostname_sample: None,
+                    resolved_ips: vec![IpAddr::V4(ip)],
+                    ttl_seconds: Some(300),
+                    source: StorageResolutionSource::Dns,
+                    resolved_at: now - Duration::from_secs(ago),
+                    active_revision_id: None,
+                })
+                .expect("upsert");
+        }
+        let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
+        let live = SqliteFqdnCacheLookup::new(cache, thresholds);
+        let snapshot = live.snapshot_for_compute().expect("snapshot");
+
+        for view in [&live as &dyn FqdnCacheLookup, &snapshot] {
+            assert_eq!(
+                view.hostnames_under_suffix("example.com", 16),
+                vec!["api.example.com".to_string(), "www.example.com".to_string()]
+            );
+            assert_eq!(
+                view.hostnames_under_suffix("example.com", 1),
+                vec!["www.example.com".to_string()],
+                "the cap keeps the host in use"
+            );
+        }
     }
 
     // ── Snapshot parity ──────────────────────────────────────────────────────

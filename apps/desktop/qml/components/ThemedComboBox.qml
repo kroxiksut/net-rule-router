@@ -11,6 +11,10 @@ ComboBox {
     id: root
     property var theme
     property var labelResolver: null
+    // Optional `function(item) -> bool`: an item it rejects is shown but cannot
+    // be picked with the mouse. Keyboard stepping still lands on it, so the
+    // caller also gates whatever acts on the selection.
+    property var itemEnabledResolver: null
 
     // Accessible baseline, declared once here instead of at 34 call sites.
     // Qt derives a name from `text` only for `AbstractButton`, and a combo box
@@ -29,6 +33,9 @@ ComboBox {
         if (typeof item === "object" && root.textRole && item[root.textRole] !== undefined)
             return String(item[root.textRole])
         return String(item)
+    }
+    function _itemEnabled(item) {
+        return typeof itemEnabledResolver === "function" ? !!itemEnabledResolver(item) : true
     }
 
     contentItem: Text {
@@ -67,7 +74,9 @@ ComboBox {
     }
 
     delegate: ItemDelegate {
+        id: themedDelegate
         width: ListView.view ? ListView.view.width : root.popup.width
+        enabled: root._itemEnabled(typeof modelData !== "undefined" ? modelData : model)
         highlighted: root.highlightedIndex === index
         background: Rectangle {
             color: highlighted ? theme.colorAccent : theme.colorPanel
@@ -78,7 +87,9 @@ ComboBox {
             leftPadding: theme.spacingSm
             rightPadding: theme.spacingSm
             text: root._labelFor(typeof modelData !== "undefined" ? modelData : model)
-            color: highlighted ? theme.colorOnAccent : theme.colorText
+            color: highlighted ? theme.colorOnAccent
+                : themedDelegate.enabled ? theme.colorText
+                : Qt.rgba(theme.colorText.r, theme.colorText.g, theme.colorText.b, 0.55)
             verticalAlignment: Text.AlignVCenter
             wrapMode: Text.WordWrap
             maximumLineCount: 3

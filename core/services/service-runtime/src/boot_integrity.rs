@@ -15,14 +15,18 @@ use std::sync::{Arc, Mutex};
 use nrr_diagnostics::audit::alert::{SecurityAlertState, SecurityAlertsRepository};
 use nrr_diagnostics::reason::integrity;
 use nrr_diagnostics::{ActorKind, AuditEventInput, AuditEventKind, AuditEventResult, AuditSink};
+use nrr_domain::rules_revision::RevisionStatus;
 use nrr_platform_api::key_store::KeyStore;
+use nrr_storage::revision_hmac::HmacVerification;
+use nrr_storage::revisions::{ScannedContent, ScannedRow};
 use rusqlite::Connection;
 
 use crate::activation_coordinator::{ActivationCoordinator, ActiveIntegrityOutcome};
 use crate::health::{HealthAggregator, HealthComponent};
 use crate::state::ServiceHealthSeverity;
 use crate::tamper_bootstrap::{
-    emit_alert, run_tamper_bootstrap, TamperBootstrapError, TamperBootstrapOutcome,
+    emit_alert, raise_tamper_alerts, run_tamper_bootstrap, TamperBootstrapError,
+    TamperBootstrapOutcome,
 };
 
 /// The audit trail as the boot sees it.
@@ -122,31 +126,107 @@ impl BootIntegrity<'_> {
         }
     }
 
-    /// Runs the active-revision sweep and raises an alert for every principal
-    /// it rolled back or cleared. A principal the sweep could not check is
-    /// logged on its own and reported as an outage.
+    /// Runs the active-revision sweep and reports it ([`Self::report_sweep`]),
+    /// then raises the tamper alerts the boot found. In that order: a rollback
+    /// rewrites the row it rejects, and an alert keyed by the content before it
+    /// would list nothing to acknowledge. Raised whatever became of the sweep.
     pub fn enforce_active(
         &self,
         coordinator: &ActivationCoordinator,
         bootstrap: &TamperBootstrapOutcome,
     ) {
-        let outcomes = match coordinator
-            .enforce_active_integrity_at_boot(bootstrap, "svc-boot-integrity-scan")
-        {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(
-                    target: "nrr::tamper",
-                    msg_key = "svc-boot-integrity-sweep-failed",
-                    error = %e,
-                    "active-revision integrity sweep failed",
-                );
-                self.report_outage(OutageSource::Sweep, &e.to_string());
-                return;
+        match coordinator.enforce_active_integrity_at_boot(bootstrap, "svc-boot-integrity-scan") {
+            Ok(outcomes) => self.report_sweep(&outcomes),
+            Err(e) => self.report_sweep_failure(&e.to_string()),
+        }
+        if bootstrap.pending_tamper_alerts.is_empty() {
+            return;
+        }
+        let current = self.scan_after_sweep(coordinator);
+        raise_tamper_alerts(
+            self.alerts,
+            &bootstrap.pending_tamper_alerts,
+            current.as_deref(),
+            self.now_ms,
+        );
+    }
+
+    /// The live recheck's counterpart of the tamper alerts in
+    /// [`Self::enforce_active`], after its sweep: every row it rejected, and
+    /// every active row that still fails, gets the alert for the content it
+    /// holds now. A failed rollback leaves its row active, so it is covered.
+    /// `outcomes` is `None` when the recheck could not run at all.
+    pub fn raise_after_recheck(
+        &self,
+        coordinator: &ActivationCoordinator,
+        outcomes: Option<&[(String, ActiveIntegrityOutcome)]>,
+    ) {
+        let mut rejected: Vec<&str> = Vec::new();
+        let mut unsettled = outcomes.is_none();
+        for (_, outcome) in outcomes.unwrap_or_default() {
+            match outcome {
+                ActiveIntegrityOutcome::RolledBack {
+                    rejected_revision_id,
+                    ..
+                }
+                | ActiveIntegrityOutcome::ClearedNoTrustedFallback {
+                    rejected_revision_id,
+                    ..
+                } => rejected.push(rejected_revision_id),
+                ActiveIntegrityOutcome::CheckFailed { .. } => unsettled = true,
+                _ => {}
             }
+        }
+        if rejected.is_empty() && !unsettled {
+            return;
+        }
+        // Unreadable: the row keeps failing, and the next start alerts it.
+        let Some(current) = self.scan_after_sweep(coordinator) else {
+            return;
         };
+        let owed: Vec<ScannedRow> = current
+            .into_iter()
+            .filter(|row| {
+                row.verification == HmacVerification::Tampered
+                    && matches!(&row.content, ScannedContent::Revision(r)
+                        if r.status == RevisionStatus::Active
+                            || rejected.contains(&r.revision_id.as_str()))
+            })
+            .collect();
+        raise_tamper_alerts(self.alerts, &owed, None, self.now_ms);
+    }
+
+    /// `None` when the rows cannot be read now.
+    fn scan_after_sweep(&self, coordinator: &ActivationCoordinator) -> Option<Vec<ScannedRow>> {
+        coordinator
+            .integrity_scan()
+            .inspect_err(|e| {
+                tracing::warn!(
+                    target: "nrr::tamper",
+                    error = %e,
+                    "could not rescan revisions after the integrity sweep",
+                );
+            })
+            .ok()
+    }
+
+    /// The sweep could not run at all.
+    pub fn report_sweep_failure(&self, detail: &str) {
+        tracing::error!(
+            target: "nrr::tamper",
+            msg_key = "svc-boot-integrity-sweep-failed",
+            error = %detail,
+            "active-revision integrity sweep failed",
+        );
+        self.report_outage(OutageSource::Sweep, detail);
+    }
+
+    /// An alert for every principal the sweep rolled back or cleared; a
+    /// principal it could not check is logged on its own and reported as an
+    /// outage.
+    pub fn report_sweep(&self, outcomes: &[(String, ActiveIntegrityOutcome)]) {
         let mut unchecked = 0usize;
-        for (principal, outcome) in &outcomes {
+        for (principal, outcome) in outcomes {
             match outcome {
                 ActiveIntegrityOutcome::RolledBack {
                     rejected_revision_id,

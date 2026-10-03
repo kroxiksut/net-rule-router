@@ -3,9 +3,10 @@
 //!
 //! Two-phase like [`ProductImpactDisableTemporary`](super::product_impact_disable):
 //!
-//! - **Dry run:** envelope class = `ReadSnapshot`. Mints a confirmation
-//!   token bound to this operation, the caller's principal and what is rolled
-//!   back.
+//! - **Dry run:** envelope class = `ReadSnapshot`. Names the revision the
+//!   rollback restores and mints a confirmation token bound to this
+//!   operation, the caller's principal and that revision; with nothing to
+//!   roll back to it answers so, with no token.
 //! - **Rollback:** the caller's own chain is `UserScopedMutation` (token +
 //!   audit, no elevation); the shared baseline is `MutationRequest`, the
 //!   class of any edit of it, which the router holds to elevation. Spends
@@ -26,7 +27,9 @@ use crate::ipc_handlers::mutation_token_store::{
     MutationTokenStore, StoredMutation, DEFAULT_MUTATION_TOKEN_TTL,
 };
 use crate::ipc_handlers::operation_status_store::OperationStatusStore;
-use crate::ipc_handlers::payloads::{RollbackDryRunResponse, RollbackRequest, RollbackResponse};
+use crate::ipc_handlers::payloads::{
+    OperationErrorResponse, RollbackDryRunResponse, RollbackRequest, RollbackResponse,
+};
 use crate::ipc_handlers::providers::{
     rule_edits_allowed_for, MutationExecutor, MutationOutcome, ServiceStabilityConfigProvider,
     RULES_LOCKED_MESSAGE,
@@ -36,6 +39,9 @@ use crate::ipc_handlers::providers::{
 /// refuses any other.
 const ROLLBACK_TARGET_KEY: &str = "_nrr_rollback_target";
 const ROLLBACK_BASELINE_KEY: &str = "_nrr_rollback_admin_baseline";
+/// The revision the dry-run showed: the rollback restores it even if the
+/// last-known-good moved on in between.
+const ROLLBACK_RESOLVED_KEY: &str = "_nrr_rollback_resolved";
 
 pub struct RollbackHandler {
     executor: Arc<dyn MutationExecutor>,
@@ -127,23 +133,43 @@ impl IpcHandler for RollbackHandler {
 
 impl RollbackHandler {
     fn handle_dry_run(&self, body: RollbackRequest, ctx: &IpcRequestContext) -> HandlerOutcome {
-        let stored = StoredMutation::confirmation_of(
-            serde_json::json!({
-                ROLLBACK_TARGET_KEY: body.target_revision_id,
-                ROLLBACK_BASELINE_KEY: body.admin_baseline,
-            }),
-            ctx.caller_stored(),
-            ctx.caller_is_elevated,
-        );
-        let token = self.token_store.issue(
-            IpcOperationName::RollbackRequest,
-            stored,
-            Instant::now() + self.token_ttl,
-        );
-        serde_json::to_value(RollbackDryRunResponse {
-            confirmation_token: token,
-        })
-        .map_err(|e| IpcError {
+        let principal =
+            resolve_confirm_principal(rollback_class(body.admin_baseline), ctx.caller_stored())?;
+        let response = match self
+            .executor
+            .rollback_target(&principal, body.target_revision_id.as_deref())
+        {
+            Err(error) => RollbackDryRunResponse {
+                error: Some(OperationErrorResponse {
+                    code: error.code,
+                    message: error.message,
+                }),
+                ..RollbackDryRunResponse::default()
+            },
+            Ok(None) => RollbackDryRunResponse::default(),
+            Ok(Some(target)) => {
+                let stored = StoredMutation::confirmation_of(
+                    serde_json::json!({
+                        ROLLBACK_TARGET_KEY: body.target_revision_id,
+                        ROLLBACK_BASELINE_KEY: body.admin_baseline,
+                        ROLLBACK_RESOLVED_KEY: target.revision_id,
+                    }),
+                    ctx.caller_stored(),
+                    ctx.caller_is_elevated,
+                );
+                let token = self.token_store.issue(
+                    IpcOperationName::RollbackRequest,
+                    stored,
+                    Instant::now() + self.token_ttl,
+                );
+                RollbackDryRunResponse {
+                    confirmation_token: Some(token),
+                    target: Some(target),
+                    error: None,
+                }
+            }
+        };
+        serde_json::to_value(response).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
             message: format!("rollback.request dry-run response serialisation failed: {e}"),
             diagnostics_id: None,
@@ -185,6 +211,17 @@ impl RollbackHandler {
             .get(ROLLBACK_BASELINE_KEY)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let Some(resolved) = stored
+            .payload
+            .get(ROLLBACK_RESOLVED_KEY)
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(IpcError {
+                code: IpcErrorCode::PreconditionFailed,
+                message: "the dry-run found nothing to roll back to".into(),
+                diagnostics_id: None,
+            });
+        };
         if reviewed_target != body.target_revision_id.as_deref()
             || reviewed_baseline != body.admin_baseline
         {
@@ -197,9 +234,7 @@ impl RollbackHandler {
         let op_id = self
             .operation_store
             .enqueue_for(crate::ipc_handlers::operation_status_store::owner_of(ctx));
-        let outcome = self
-            .executor
-            .rollback(&principal, body.target_revision_id.as_deref());
+        let outcome = self.executor.rollback(&principal, Some(resolved));
         match outcome {
             MutationOutcome::Completed(result) => {
                 self.operation_store
@@ -221,12 +256,21 @@ impl RollbackHandler {
     }
 }
 
+/// The class the rollback itself carries, so the dry-run reads the partition
+/// the rollback will write.
+fn rollback_class(admin_baseline: bool) -> crate::ipc::IpcOperationClass {
+    canonical_operation_class(
+        IpcOperationName::RollbackRequest,
+        &serde_json::json!({ "admin-baseline": admin_baseline }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ipc::{IpcOperationClass, IPC_PROTOCOL_VERSION};
-    use crate::ipc_handlers::operation_status_store::OperationState;
-    use crate::ipc_handlers::test_fakes::{FakeMutationExecutor, FakeRulesLock};
+    use crate::ipc_handlers::operation_status_store::{OperationError, OperationState};
+    use crate::ipc_handlers::test_fakes::{FakeMutationExecutor, FakeRulesLock, FAKE_LKG_REVISION};
     use nrr_shared::ipc::IpcClientProfile;
 
     const SID: &str = "S-1-5-21-ROLLER";
@@ -267,15 +311,22 @@ mod tests {
         (h, ops)
     }
 
+    fn dry_run_answer(
+        h: &RollbackHandler,
+        payload: serde_json::Value,
+        ctx: &IpcRequestContext,
+    ) -> RollbackDryRunResponse {
+        serde_json::from_value(h.handle(&envelope(None, payload), ctx).expect("dry-run")).unwrap()
+    }
+
     fn dry_run_with(
         h: &RollbackHandler,
         payload: serde_json::Value,
         ctx: &IpcRequestContext,
     ) -> String {
-        let resp: RollbackDryRunResponse =
-            serde_json::from_value(h.handle(&envelope(None, payload), ctx).expect("dry-run"))
-                .unwrap();
-        resp.confirmation_token
+        dry_run_answer(h, payload, ctx)
+            .confirmation_token
+            .expect("a target, so a token")
     }
 
     fn dry_run(h: &RollbackHandler, target: Option<&str>, ctx: &IpcRequestContext) -> String {
@@ -305,7 +356,73 @@ mod tests {
         let rec = ops.get(&resp.operation_id).unwrap();
         assert_eq!(rec.state, OperationState::Completed);
         assert_eq!(exec.rollback_count(), 1);
-        assert_eq!(*exec.last_rollback_target.lock().unwrap(), None);
+        assert_eq!(
+            exec.last_rollback_target.lock().unwrap().as_deref(),
+            Some(FAKE_LKG_REVISION),
+            "the revision the dry-run showed, not whatever the LKG is by now"
+        );
+    }
+
+    /// The dry-run names what will be restored, so the dialog can show it.
+    #[test]
+    fn the_dry_run_names_the_revision_it_restores() {
+        let exec = Arc::new(FakeMutationExecutor::default());
+        let (h, _ops) = handler(&exec);
+        let answer = dry_run_answer(&h, serde_json::json!({ "dry-run": true }), &ctx());
+        let target = answer.target.expect("a target");
+        assert_eq!(target.revision_id, FAKE_LKG_REVISION);
+        assert_eq!(target.rule_count, 3);
+        assert!(answer.error.is_none());
+    }
+
+    /// Nothing to roll back to is an answer, not a token for a rollback that
+    /// would fail after the user confirmed it.
+    #[test]
+    fn with_no_earlier_revision_the_dry_run_says_so_and_mints_nothing() {
+        let exec = Arc::new(FakeMutationExecutor {
+            rollback_target: Ok(None),
+            ..FakeMutationExecutor::default()
+        });
+        let (h, _ops) = handler(&exec);
+        let answer = dry_run_answer(&h, serde_json::json!({ "dry-run": true }), &ctx());
+        assert!(answer.confirmation_token.is_none());
+        assert!(answer.target.is_none());
+        assert!(answer.error.is_none());
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_read_is_reported_by_its_code() {
+        let exec = Arc::new(FakeMutationExecutor {
+            rollback_target: Err(OperationError {
+                code: "revision-integrity-rejected".into(),
+                message: "x".into(),
+            }),
+            ..FakeMutationExecutor::default()
+        });
+        let (h, _ops) = handler(&exec);
+        let answer = dry_run_answer(&h, serde_json::json!({ "dry-run": true }), &ctx());
+        assert!(answer.confirmation_token.is_none());
+        assert_eq!(
+            answer.error.map(|e| e.code).as_deref(),
+            Some("revision-integrity-rejected")
+        );
+    }
+
+    /// A failed rollback is answered as accepted with its operation id; the
+    /// verdict is on the operation record the GUI reads next.
+    #[test]
+    fn a_failed_rollback_is_recorded_as_failed() {
+        let exec = Arc::new(FakeMutationExecutor::always_fail(
+            "activation-not-recorded",
+            "x",
+        ));
+        let (h, ops) = handler(&exec);
+        let token = dry_run(&h, None, &ctx());
+        let resp: RollbackResponse =
+            serde_json::from_value(rollback(&h, &token, serde_json::json!({}), &ctx()).unwrap())
+                .unwrap();
+        let rec = ops.get(&resp.operation_id).unwrap();
+        assert_eq!(rec.state, OperationState::Failed);
     }
 
     #[test]
@@ -398,7 +515,10 @@ mod tests {
         let (h, _ops) = handler(&exec);
         let token = dry_run(&h, None, &ctx());
         rollback(&h, &token, serde_json::Value::Null, &ctx()).unwrap();
-        assert_eq!(*exec.last_rollback_target.lock().unwrap(), None);
+        assert_eq!(
+            exec.last_rollback_target.lock().unwrap().as_deref(),
+            Some(FAKE_LKG_REVISION)
+        );
     }
 
     /// The caller's own chain needs no rights, and it is the caller's own.
@@ -462,9 +582,14 @@ mod tests {
         let exec = Arc::new(FakeMutationExecutor::default());
         let (h, _ops) = handler(&exec);
         let anonymous = ctx_as(true, None);
-        let token = dry_run(&h, None, &anonymous);
-        let err =
-            rollback(&h, &token, serde_json::json!({}), &anonymous).expect_err("no principal");
+        let err = h
+            .handle(
+                &envelope(None, serde_json::json!({ "dry-run": true })),
+                &anonymous,
+            )
+            .expect_err("no principal to read a chain of");
+        assert_eq!(err.code, IpcErrorCode::Forbidden);
+        let err = rollback(&h, "x", serde_json::json!({}), &anonymous).expect_err("no principal");
         assert_eq!(err.code, IpcErrorCode::Forbidden);
         assert_eq!(exec.rollback_count(), 0);
     }

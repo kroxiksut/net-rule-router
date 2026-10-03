@@ -19,6 +19,23 @@ ColumnLayout {
     // DNS / type). Empty string shows everything; matching is case-insensitive.
     property string adapterSearchFilter: ""
 
+    // `root.adapterFocusRequest`: another surface asked to show one adapter.
+    // Built lazily, so a request made before the first visit is already waiting.
+    property int _adapterFocusSerialHandled: 0
+    function _takeAdapterFocusRequest() {
+        var request = root.adapterFocusRequest || {}
+        var serial = Number(request.serial || 0)
+        if (serial === 0 || serial === section._adapterFocusSerialHandled) return
+        section._adapterFocusSerialHandled = serial
+        section.adapterSearchFilter = String(request.name || "")
+        // The Clear button assigns the field imperatively, which drops its binding.
+        adapterSearchField.text = section.adapterSearchFilter
+    }
+    Connections {
+        target: root
+        function onAdapterFocusRequestChanged() { section._takeAdapterFocusRequest() }
+    }
+
     // Fast-poll gate for TrafficStatsController: this section renders the
     // per-adapter "Received/Sent" line, so raise the controller's cadence
     // from 60 s to 3 s only while this section is the one actually on
@@ -90,7 +107,10 @@ ColumnLayout {
         })
     }
 
-    Component.onCompleted: _refreshSecondaryState()
+    Component.onCompleted: {
+        _refreshSecondaryState()
+        _takeAdapterFocusRequest()
+    }
     Connections {
         target: root.refreshAction
         function onTriggered() { section._refreshSecondaryState() }
@@ -784,15 +804,40 @@ ColumnLayout {
                                 font.bold: true
                                 elide: Text.ElideRight
                             }
-                            // Driver / hardware description from the adapter
-                            // snapshot (e.g. "Intel(R) Wi-Fi 6 AX201"). Only
-                            // shown when present and distinct from `name`.
+                            // What the device is and which role the
+                            // recommendation sees in it: a system name such as
+                            // `enp4s0f1` is not something to choose by.
                             Label {
                                 Layout.fillWidth: true
                                 visible: text !== ""
                                 text: {
+                                    var parts = []
+                                    var kind = String(model.kind || "")
+                                    if (kind !== "")
+                                        parts.push(root.tr("interfaces.kind." + kind, kind))
+                                    var hint = Pure.adapterRoleHintSlug(model)
+                                    if (hint !== "")
+                                        parts.push(root.tr("interfaces.hint." + hint, hint))
+                                    return parts.join(" · ")
+                                }
+                                color: root.textColor
+                                elide: Text.ElideRight
+                            }
+                            // Driver / hardware description from the adapter
+                            // snapshot (e.g. "Intel(R) Wi-Fi 6 AX201"), shown
+                            // when distinct from `name`, then the tun/tap device
+                            // a driverless link is.
+                            Label {
+                                Layout.fillWidth: true
+                                visible: text !== ""
+                                text: {
+                                    var parts = []
                                     var d = String(model.description || "")
-                                    return d !== "" && d !== String(model.name || "") ? d : ""
+                                    if (d !== "" && d !== String(model.name || "")) parts.push(d)
+                                    var tech = String(model.deviceTechnology || "")
+                                    if (tech !== "" && root.uiRevision >= 0)
+                                        parts.push(root.tr("interfaces.device-technology." + tech, tech))
+                                    return parts.join(" · ")
                                 }
                                 color: root.mutedTextColor
                                 wrapMode: Text.WordWrap
@@ -837,6 +882,17 @@ ColumnLayout {
                                     font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                                 }
                             }
+                            // Why the other role's button is off on this card.
+                            Label {
+                                Layout.fillWidth: true
+                                Layout.preferredWidth: 0
+                                visible: String(model.selectedRole || "") !== ""
+                                text: root.tr("interfaces.role.exclusive-note",
+                                    "One adapter cannot carry both routes: to use it for the other one, unassign its current role first.")
+                                color: root.mutedTextColor
+                                wrapMode: Text.WordWrap
+                                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                            }
                         }
 
                         // Availability badge (right column, top). Green dot
@@ -872,8 +928,13 @@ ColumnLayout {
 
                         Label {
                             Layout.fillWidth: true
+                            // The kind when the service reports one, else the
+                            // raw OS type: two different words for one device
+                            // would contradict each other.
                             text: root.tr("interfaces.row.summary", "Type: %1 | IP: %2 | Gateway: %3")
-                                .arg(root.tr("interfaces.type." + String(model.type).toLowerCase(), model.type))
+                                .arg(String(model.kind || "") !== ""
+                                    ? root.tr("interfaces.kind." + model.kind, model.kind)
+                                    : root.tr("interfaces.type." + String(model.type).toLowerCase(), model.type))
                                 .arg(model.ip).arg(model.gateway)
                             color: root.textColor
                             wrapMode: Text.WordWrap
@@ -1030,17 +1091,16 @@ ColumnLayout {
                                     ? root.interfacesRolesController.adapterIndexHoldingRole("primary") : -1
                                 readonly property bool _someoneElseHoldsPrimary:
                                     _primaryHolderIndex >= 0 && !_holdsPrimary
-                                // Assignment is allowed
-                                // even for an unavailable adapter (e.g. a
-                                // disconnected ethernet port). The role
-                                // binding is stored and takes effect when
-                                // the adapter comes back up. ToolTip below
-                                // warns the user that the adapter is offline.
-                                // Placeholder rows name no adapter of this
-                                // machine; binding a role to one produces an
-                                // apply that changes nothing.
+                                // One adapter never carries both routes.
+                                readonly property bool _holdsSecondaryHere: model.selectedRole === "secondary"
+                                // An unavailable adapter may be bound: the role
+                                // takes effect when it comes back up. Placeholder
+                                // rows name no adapter of this machine.
                                 enabled: root.interfacesAreLive
-                                    && (_holdsPrimary ? true : !_someoneElseHoldsPrimary)
+                                    && (_holdsPrimary ? true : !_someoneElseHoldsPrimary && !_holdsSecondaryHere)
+                                Accessible.description: _holdsSecondaryHere
+                                    ? root.tr("interfaces.role.taken.secondary", "already the additional connection")
+                                    : ToolTip.text
                                 text: root.uiRevision >= 0
                                     ? (_holdsPrimary
                                         ? root.tr("interfaces.action.unassign-primary",
@@ -1062,8 +1122,12 @@ ColumnLayout {
                                     ? root.interfacesRolesController.adapterIndexHoldingRole("secondary") : -1
                                 readonly property bool _someoneElseHoldsSecondary:
                                     _secondaryHolderIndex >= 0 && !_holdsSecondary
+                                readonly property bool _holdsPrimaryHere: model.selectedRole === "primary"
                                 enabled: root.interfacesAreLive
-                                    && (_holdsSecondary ? true : !_someoneElseHoldsSecondary)
+                                    && (_holdsSecondary ? true : !_someoneElseHoldsSecondary && !_holdsPrimaryHere)
+                                Accessible.description: _holdsPrimaryHere
+                                    ? root.tr("interfaces.role.taken.primary", "already the main connection")
+                                    : ToolTip.text
                                 text: root.uiRevision >= 0
                                     ? (_holdsSecondary
                                         ? root.tr("interfaces.action.unassign-secondary",

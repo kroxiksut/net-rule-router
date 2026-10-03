@@ -232,13 +232,16 @@ fn pre_flight_findings_reach_the_review_as_one_signal_per_kind() {
         subjects: subjects.iter().map(|s| s.to_string()).collect(),
         message: String::new(),
     };
-    let signals = pre_flight_signals(&[
-        warning(PreFlightCategory::AppRuleUnenforceable, &["b.exe", "a.exe"]),
-        warning(PreFlightCategory::AppRuleUnenforceable, &["a.exe"]),
-        warning(PreFlightCategory::BindingUnresolved, &[]),
-        warning(PreFlightCategory::BatchOverflow, &[]),
-        warning(PreFlightCategory::FilterIdCollision, &[]),
-    ]);
+    let signals = pre_flight_signals(
+        &[
+            warning(PreFlightCategory::AppRuleUnenforceable, &["b.exe", "a.exe"]),
+            warning(PreFlightCategory::AppRuleUnenforceable, &["a.exe"]),
+            warning(PreFlightCategory::BindingUnresolved, &[]),
+            warning(PreFlightCategory::BatchOverflow, &[]),
+            warning(PreFlightCategory::FilterIdCollision, &[]),
+        ],
+        ApplyFailurePolicy::PreFlightThenAllOrNothing,
+    );
     assert_eq!(
         signals,
         vec![
@@ -249,31 +252,65 @@ fn pre_flight_findings_reach_the_review_as_one_signal_per_kind() {
             },
         ]
     );
-    assert!(pre_flight_signals(&[]).is_empty());
+    assert!(pre_flight_signals(&[], ApplyFailurePolicy::AllOrNothing).is_empty());
 }
 
+const POLICIES: [ApplyFailurePolicy; 3] = [
+    ApplyFailurePolicy::AllOrNothing,
+    ApplyFailurePolicy::BestEffort,
+    ApplyFailurePolicy::PreFlightThenAllOrNothing,
+];
+
 /// The review promises a refusal for exactly the findings the coordinator
-/// refuses on.
+/// refuses on under the policy in force.
 #[test]
-fn the_review_says_refused_for_exactly_the_blocking_categories() {
-    for category in [
-        PreFlightCategory::FilterIdCollision,
-        PreFlightCategory::BatchOverflow,
-        PreFlightCategory::InvalidRulesContent,
-        PreFlightCategory::AppRuleUnenforceable,
-        PreFlightCategory::BindingUnresolved,
-    ] {
-        let signals = pre_flight_signals(&[PreFlightWarning {
-            sid: "S".into(),
-            category,
-            subjects: Vec::new(),
-            message: String::new(),
-        }]);
-        assert_eq!(
-            signals.contains(&RiskSignalDto::ApplyWillBeRefused),
-            category.blocks_activation(),
-            "{category:?}"
+fn the_review_says_refused_for_exactly_what_the_policy_refuses() {
+    for policy in POLICIES {
+        for category in [
+            PreFlightCategory::FilterIdCollision,
+            PreFlightCategory::BatchOverflow,
+            PreFlightCategory::InvalidRulesContent,
+            PreFlightCategory::AppRuleUnenforceable,
+            PreFlightCategory::BindingUnresolved,
+        ] {
+            let signals = pre_flight_signals(
+                &[PreFlightWarning {
+                    sid: "S".into(),
+                    category,
+                    subjects: Vec::new(),
+                    message: String::new(),
+                }],
+                policy,
+            );
+            assert_eq!(
+                signals.contains(&RiskSignalDto::ApplyWillBeRefused),
+                category.refuses_activation(policy),
+                "{category:?} under {policy:?}"
+            );
+        }
+    }
+}
+
+/// A rule pack past one transaction is refused only by the strict policy;
+/// under the others it applies, in several steps.
+#[test]
+fn a_batch_overflow_is_a_refusal_only_under_the_strict_policy() {
+    for policy in POLICIES {
+        let signals = pre_flight_signals(
+            &[PreFlightWarning {
+                sid: "S".into(),
+                category: PreFlightCategory::BatchOverflow,
+                subjects: Vec::new(),
+                message: String::new(),
+            }],
+            policy,
         );
+        let expected = if policy == ApplyFailurePolicy::PreFlightThenAllOrNothing {
+            RiskSignalDto::ApplyWillBeRefused
+        } else {
+            RiskSignalDto::ApplyInSeveralBatches
+        };
+        assert_eq!(signals, vec![expected], "{policy:?}");
     }
 }
 
@@ -1052,7 +1089,7 @@ fn dry_run_to_review_summary_aggregates_per_sid() {
         pre_flight_warnings: Vec::new(),
         estimated_duration_ms: 50,
     };
-    let review = dry_run_to_review_summary(&summary, None);
+    let review = dry_run_to_review_summary(&summary, None, ApplyFailurePolicy::AllOrNothing);
     assert!(review.diff_summary.contains("+5"));
     assert!(review.diff_summary.contains("-1"));
     assert_eq!(review.changed_fields.len(), 2);

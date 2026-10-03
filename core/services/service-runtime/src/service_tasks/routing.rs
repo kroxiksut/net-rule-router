@@ -32,7 +32,7 @@ pub fn build_principal_enforcement_task(
         PRINCIPAL_ENFORCEMENT_INTERVAL,
         RECOVERABLE_DEFAULT_MAX_RESTARTS,
         move |_stop| {
-            cycle.tick_logged("timer");
+            cycle.tick_if_changed_logged("timer");
             TaskOutcome::Continue
         },
     )

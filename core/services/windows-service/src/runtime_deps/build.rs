@@ -214,6 +214,18 @@ pub(crate) fn build_supervised_runtime_deps(
             }
         })
     };
+    // A finished disk walk changes what app rules resolve to, and nothing it
+    // finds is stored anywhere a pass's inputs can see, so it is an input of
+    // its own.
+    let app_walk_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let app_walk_found: Arc<dyn Fn() + Send + Sync> = {
+        let generation = Arc::clone(&app_walk_generation);
+        let later = Arc::clone(&recompute_later);
+        Arc::new(move || {
+            generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            later();
+        })
+    };
 
     // ── Per-SID apply orchestrator ──────────────────────────────────
     // Lives in `runtime_deps::per_sid_apply`; see that module for why it moved
@@ -244,7 +256,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 app_destination_memory,
             ),
     } = per_sid_apply::build(per_sid_apply::PerSidApplyInputs {
-        app_walk_found: Arc::clone(&recompute_later),
+        app_walk_found,
         artifacts,
         cache_refresh_secs,
         cache_store: cache_store.clone(),
@@ -263,6 +275,7 @@ pub(crate) fn build_supervised_runtime_deps(
     // Lives in `runtime_deps::storage_integrity`.
     let storage_integrity::StorageIntegrity {
         activation_coordinator,
+        revision_watch,
         block_notice_rule_author,
     } = storage_integrity::build(storage_integrity::StorageIntegrityInputs {
         artifacts,
@@ -425,8 +438,57 @@ pub(crate) fn build_supervised_runtime_deps(
     // Recompute the active user's routes after a DNS
     // refresh tick warms the FQDN cache (a previously-cold domain/zone rule
     // can now produce routes). Closes over the coordinator + registry.
+    // Everything the recompute reads, as change numbers: a pass asked for by a
+    // timer or an event that changed nothing then costs a few reads.
+    let pass_inputs = {
+        use nrr_platform_api::adapters::AdapterEventSource;
+        use nrr_service_runtime::pass_inputs::{hashed, sqlite_generation, PassInputs};
+        let settings = settings_conn.clone();
+        let cache = cache_store.clone();
+        let observations = nrr_service_runtime::app_observation_lookup::global_app_observations();
+        let walks = Arc::clone(&app_walk_generation);
+        let routes_api = Arc::clone(&api);
+        let adapters = WindowsApiAdapterSource::new(Arc::clone(&api));
+        let liveness = Arc::clone(&liveness_tracker);
+        Arc::new(
+            PassInputs::new()
+                .with_source(
+                    "state",
+                    Arc::new(move || sqlite_generation(Arc::clone(settings.as_ref()?))()),
+                )
+                .with_source(
+                    "cache",
+                    Arc::new(move || cache.as_ref()?.lock().ok()?.change_generation()),
+                )
+                .with_source("apps", Arc::new(move || Some(observations.generation())))
+                .with_source(
+                    "app-walks",
+                    Arc::new(move || Some(walks.load(std::sync::atomic::Ordering::Relaxed))),
+                )
+                .with_source("routes", hashed(move || routes_api.get_ip_forward_table()))
+                // A dead-but-Up tunnel changes the plan without changing the
+                // adapter, so each link's liveness verdict is read with it.
+                .with_source(
+                    "adapters",
+                    hashed(move || {
+                        let now = std::time::Instant::now();
+                        adapters.enumerate_all().map(|links| {
+                            links
+                                .into_iter()
+                                .map(|link| {
+                                    let dead = liveness.is_dead(link.index, now);
+                                    (link, dead)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    }),
+                ),
+        )
+    };
+
     let route_recompute_hook: Option<nrr_service_runtime::supervised_runtime::RouteRecomputeHook> =
         route_coordinator.as_ref().map(|coord| {
+            let pass_inputs = Arc::clone(&pass_inputs);
             let coord = Arc::clone(coord);
             let registry = Arc::clone(&sid_registry);
             let leak_guard_log_state = Arc::clone(&leak_guard_log_state);
@@ -486,6 +548,14 @@ pub(crate) fn build_supervised_runtime_deps(
                 // leave the WFP half completely unarmed while the route half
                 // enforced normally.
                 let active = coord.effective_enforcement_sids(&tray_active);
+                let fingerprint = pass_inputs.fingerprint(&(&tray_active, &active));
+                if fingerprint.is_some_and(|fp| pass_inputs.is_settled(fp)) {
+                    dns_ctl.tick();
+                    return;
+                }
+                let moved = pass_inputs.moved();
+                // Settled only by a pass that went through without an error.
+                let mut clean = true;
                 if let Some(seeder) = seeder.as_ref() {
                     seeder.seed_within(
                         active.clone(),
@@ -495,6 +565,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 }
                 timings.mark("seed");
                 if let Err(e) = coord.recompute_active(&tray_active) {
+                    clean = false;
                     tracing::error!(
                         target: "nrr::route-coordinator",
                         msg_key = "svc-boot-route-recompute-failed",
@@ -518,7 +589,7 @@ pub(crate) fn build_supervised_runtime_deps(
                     // the filters in place fails SAFE (they block, never leak).
                     if active.is_empty() {
                         dns_ctl.tick();
-                        report_recompute_cost(&timings);
+                        report_recompute_cost(&timings, &moved);
                         return;
                     }
                     // Boot self-apply: reconcile the
@@ -540,7 +611,7 @@ pub(crate) fn build_supervised_runtime_deps(
                                 "pause-state read failed; skipping enforcement reconcile",
                             );
                             dns_ctl.tick();
-                            report_recompute_cost(&timings);
+                            report_recompute_cost(&timings, &moved);
                             return;
                         }
                     };
@@ -550,6 +621,7 @@ pub(crate) fn build_supervised_runtime_deps(
                         .cloned()
                         .collect();
                     if let Err(e) = orch.reconcile(&unpaused) {
+                        clean = false;
                         tracing::error!(
                             target: "nrr::per_sid_orchestrator",
                             msg_key = "svc-boot-enforcement-reconcile-failed",
@@ -585,13 +657,16 @@ pub(crate) fn build_supervised_runtime_deps(
                                     );
                                 }
                             }
-                            Err(e) => tracing::warn!(
-                                target: "nrr::per_sid_orchestrator",
-                                msg_key = "svc-boot-leak-guard-reconcile-failed",
-                                sid = %sid,
-                                error = %e,
-                                "leak-guard reconcile failed",
-                            ),
+                            Err(e) => {
+                                clean = false;
+                                tracing::warn!(
+                                    target: "nrr::per_sid_orchestrator",
+                                    msg_key = "svc-boot-leak-guard-reconcile-failed",
+                                    sid = %sid,
+                                    error = %e,
+                                    "leak-guard reconcile failed",
+                                );
+                            }
                         }
                     }
                 }
@@ -611,7 +686,11 @@ pub(crate) fn build_supervised_runtime_deps(
                 // resolver if it is enabled but its serve thread has died.
                 dns_ctl.tick();
                 timings.mark("dns-watchdog");
-                report_recompute_cost(&timings);
+                report_recompute_cost(&timings, &moved);
+                match fingerprint {
+                    Some(fp) if clean => pass_inputs.settle(fp),
+                    _ => pass_inputs.unsettle(),
+                }
             }) as nrr_service_runtime::supervised_runtime::RouteRecomputeHook
         });
     let route_recompute_hook =
@@ -1443,6 +1522,7 @@ pub(crate) fn build_supervised_runtime_deps(
         principal_enforcement: None,
         traffic_tick,
         activation_coordinator,
+        revision_watch,
         dns_refresh_orchestrator,
         route_recompute_hook,
         route_teardown_hook,

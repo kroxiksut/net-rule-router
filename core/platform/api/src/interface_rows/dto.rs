@@ -13,6 +13,8 @@ impl From<&InterfaceRouteRow> for nrr_shared::ipc_payloads::InterfaceRowDto {
             name: row.name.clone(),
             interface_description: row.interface_description.clone(),
             interface_type: row.interface_type.clone(),
+            kind: row.kind.slug().to_string(),
+            device_technology: row.device_technology.map(|tech| tech.slug().to_string()),
             is_bluetooth_like: row.is_bluetooth_like,
             local_ip: row.local_ip.clone(),
             gateway: row.gateway.clone(),
@@ -77,6 +79,11 @@ impl InterfaceRouteRow {
             name: dto.name.clone(),
             interface_description: dto.interface_description.clone(),
             interface_type: dto.interface_type.clone(),
+            kind: AdapterKind::from_slug(&dto.kind),
+            device_technology: dto
+                .device_technology
+                .as_deref()
+                .and_then(DeviceTechnology::from_slug),
             is_bluetooth_like: dto.is_bluetooth_like,
             local_ip: dto.local_ip.clone(),
             gateway: dto.gateway.clone(),

@@ -1029,6 +1029,56 @@ fn rollback_to_lkg_no_lkg_returns_error() {
 }
 
 #[test]
+fn the_rollback_target_is_none_without_an_earlier_revision_and_the_lkg_with_one() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let principal = nrr_storage::BASELINE_PRINCIPAL;
+    assert_eq!(
+        fx.coordinator
+            .rollback_target_for(principal, &RollbackTarget::Lkg)
+            .expect("read"),
+        None
+    );
+    let id_a = submit(&fx, "h-A");
+    fx.coordinator
+        .activate(&id_a, &issue_token(&fx, &id_a), "c1")
+        .expect("act a");
+    let id_b = submit(&fx, "h-B");
+    fx.coordinator
+        .activate(&id_b, &issue_token(&fx, &id_b), "c2")
+        .expect("act b");
+    let target = fx
+        .coordinator
+        .rollback_target_for(principal, &RollbackTarget::Lkg)
+        .expect("read")
+        .expect("A is the LKG");
+    assert_eq!(target.revision_id, id_a.as_str());
+}
+
+/// A revision id is global; the rollback that names one must not clone
+/// another principal's rules into the caller's chain.
+#[test]
+fn a_specific_rollback_to_another_principals_revision_is_not_found() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let theirs = submit_for(&fx, "S-1-5-21-OTHER", "h-other");
+    fx.coordinator
+        .activate(&theirs, &issue_token(&fx, &theirs), "c1")
+        .expect("act theirs");
+    let replacement = submit_for(&fx, "S-1-5-21-OTHER", "h-other-2");
+    fx.coordinator
+        .activate(&replacement, &issue_token(&fx, &replacement), "c2")
+        .expect("supersede theirs");
+    let err = fx
+        .coordinator
+        .rollback_to(
+            "S-1-5-21-MINE",
+            RollbackTarget::Specific(theirs.clone()),
+            "c3",
+        )
+        .expect_err("another principal's revision");
+    assert!(matches!(err, PolicyError::RevisionNotFound(id) if id == theirs));
+}
+
+#[test]
 fn prepare_rollback_candidate_returns_new_revision_id_without_activating() {
     let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
     fx.registry

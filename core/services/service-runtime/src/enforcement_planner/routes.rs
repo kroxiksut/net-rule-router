@@ -408,7 +408,7 @@ pub(super) fn note_address_resolution(
     report: &mut PlanReport,
     rule: &CanonicalRule,
     addr_match: &CanonicalAddressMatch,
-    targets: &[(u32, IpAddr)],
+    resolved_any: bool,
     cache: &dyn FqdnCacheLookup,
 ) {
     let name = match addr_match {
@@ -417,7 +417,7 @@ pub(super) fn note_address_resolution(
         CanonicalAddressMatch::SuffixDomain(suffix) => suffix,
         CanonicalAddressMatch::Zone(zone) => zone,
     };
-    if targets.is_empty() {
+    if !resolved_any {
         report.unresolved_hosts.push(name.clone());
         return;
     }
@@ -460,7 +460,25 @@ pub struct PlanReport {
     pub claimed_by_main: Vec<(String, Ipv4Addr)>,
     /// Suffix/zone fan-outs stopped at the backstop: `(rule_id, suffix, cap)`.
     pub truncated_suffixes: Vec<(String, String, usize)>,
-    /// Rules skipped because their shape cannot be enforced as written:
-    /// `(rule_id, reason)`. The twin of `CodegenDiagnostic::UnsupportedRuleShape`.
-    pub unsupported_shapes: Vec<(String, nrr_domain::rule_shape::UnsupportedShapeReason)>,
+    /// Where the user's rules contradict each other, unsupported shapes
+    /// included, in rule order — what the Overlaps screen lists.
+    pub conflicts: Vec<crate::rule_conflicts::RuleConflict>,
+}
+
+impl PlanReport {
+    /// Rules skipped because their shape cannot be enforced as written.
+    #[must_use]
+    pub fn unsupported_shapes(
+        &self,
+    ) -> Vec<(String, nrr_domain::rule_shape::UnsupportedShapeReason)> {
+        self.conflicts
+            .iter()
+            .filter_map(|c| match c {
+                crate::rule_conflicts::RuleConflict::UnsupportedRuleShape { rule_id, reason } => {
+                    Some((rule_id.clone(), *reason))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }

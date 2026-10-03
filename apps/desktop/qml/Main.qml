@@ -26,7 +26,7 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, localNetworkExceptions: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
     // Unknown feature or missing profile → true (show it), which is why the
@@ -41,6 +41,16 @@ ApplicationWindow {
     // before every request: an unregistered handler answers "not yet
     // implemented", and a poll asking anyway filled a day's log with refusals.
     readonly property bool serviceStabilitySupported: supports("serviceStabilityConfig")
+    // The verbose window alone, where the service applies it without the rest.
+    readonly property bool verboseLoggingSupported: supports("verboseLogging")
+    // Some stability key reaches the service here, if not the whole row.
+    readonly property bool stabilityAnyKeySupported:
+        Pure.stabilityAnyKeyApplies(platformProfile ? platformProfile.supports : null)
+    /// The part of a stability patch this platform's service applies.
+    function stabilityPatchForPlatform(partial) {
+        return Pure.stabilityPatchForPlatform(partial,
+            platformProfile ? platformProfile.supports : null)
+    }
     readonly property bool localNetworksSupported: supports("localNetworkExceptions")
     readonly property bool blockNoticesSupported: supports("blockNotices")
     /// Why a section keyed off one of the flags above renders inert. One
@@ -1407,6 +1417,21 @@ ApplicationWindow {
         }
         openSettingsCategory(category)
         return true
+    }
+
+    /// An adapter another surface asked to show (`{ name, serial }`): the
+    /// Interfaces section narrows its list to it, where its role is assigned.
+    property var adapterFocusRequest: ({ name: "", serial: 0 })
+
+    function focusAdapter(name) {
+        var target = String(name || "")
+        if (target === "") return
+        requestSectionChange("interfaces-routes", function() {
+            window.adapterFocusRequest = {
+                name: target,
+                serial: Number(window.adapterFocusRequest.serial || 0) + 1
+            }
+        })
     }
 
     /// Disclosure ("Show details" / expand-a-list) state for the sections
@@ -2840,18 +2865,38 @@ ApplicationWindow {
             var revokeSecs = (prefs && prefs.adminAutoRevokeDisabled === true)
                 ? 0
                 : Math.max(1, Number((prefs && prefs.adminAutoRevokeMinutes) || 15)) * 60
-            var brokerCorr = nrrNativeBridge.rpcBrokerStatus(
-                { "auto-revoke-idle-secs": revokeSecs })
-            rpcTransport.registerRpcCallback(brokerCorr, function(ok, payload) {
-                if (!ok || !payload || payload.elevated === undefined) return
-                window._brokerSessionElevated = payload.elevated === true
-                if (payload["auto-revoked"] === true) {
-                    window.logProgress(
-                        tr("status.admin-auto-revoked",
-                           "Administrator approval was revoked automatically after sitting unused."),
-                        "info")
-                }
-            })
+            // One poll at a time: an unanswered one is not joined by another
+            // every tick.
+            var brokerCorr = window._brokerStatusCorr === ""
+                ? String(nrrNativeBridge.rpcBrokerStatus(
+                    { "auto-revoke-idle-secs": revokeSecs }) || "")
+                : ""
+            if (brokerCorr !== "") {
+                window._brokerStatusCorr = brokerCorr
+                rpcTransport.registerRpcCallback(brokerCorr, function(ok, payload) {
+                    window._brokerStatusCorr = ""
+                    if (!ok || !payload || payload.elevated === undefined) {
+                        // Unknown is not "still asking": deadlines run again.
+                        rpcTransport.consentPending = false
+                        return
+                    }
+                    window._brokerSessionElevated = payload.elevated === true
+                    var awaiting = payload["awaiting-consent"] === true
+                    if (awaiting !== rpcTransport.consentPending) {
+                        rpcTransport.consentPending = awaiting
+                        if (awaiting) {
+                            window.statusLine = tr("status.admin-consent-pending",
+                                "Waiting for you to approve administrator rights…")
+                        }
+                    }
+                    if (payload["auto-revoked"] === true) {
+                        window.logProgress(
+                            tr("status.admin-auto-revoked",
+                               "Administrator approval was revoked automatically after sitting unused."),
+                            "info")
+                    }
+                })
+            }
         }
         var corr = nrrNativeBridge.rpcServiceHealthGet()
         rpcTransport.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
@@ -4022,6 +4067,13 @@ ApplicationWindow {
         currentLanguage = prefs.language
         backendStatus = context.backendStatus || { kind: "connected" }
         backendServiceBacked = context.backendServiceBacked !== false
+        // Whoever stopped the service may have meant it: say it runs again.
+        if (context.serviceStartedOnLaunch === true) {
+            Qt.callLater(function() {
+                statusLine = tr("status.service-started-on-launch",
+                    "The service was stopped, so it has been started again.")
+            })
+        }
         // Before `section`: opening Diagnostics right away must see whether
         // the launch snapshot already counts as a fresh live answer.
         diagnosticsSnapshot = context.diagnostics || ({})
@@ -4638,12 +4690,15 @@ ApplicationWindow {
     // ("user:enforcement-mode", "user:verbose-toggle", …) the service logs
     // with the write, so a clobbered toggle is diagnosable from the NDJSON.
     function applyServiceStabilityPatch(partial, onDone, origin) {
-        // Refused before anything is queued: a decision for a config this OS
-        // never reads would be replayed on every connect edge forever.
-        if (!serviceStabilitySupported) {
+        // Only keys this OS's service applies are sent, and a patch with none
+        // is refused before anything is queued: a decision for a config this
+        // OS never reads would be replayed on every connect edge forever.
+        var applicable = stabilityPatchForPlatform(partial)
+        if (Object.keys(applicable).length === 0 && Object.keys(partial || {}).length > 0) {
             if (typeof onDone === "function") onDone(false, "unsupported-platform", null)
             return
         }
+        partial = applicable
         var originText = String(origin || "")
         // Every user-driven change to a service-owned setting funnels through
         // here, so this is the one place that can record intent without having
@@ -6115,7 +6170,7 @@ ApplicationWindow {
             ])
             ShortcutMenuItem { theme: uiTheme; labelText: refreshAction.text; shortcutText: "F5"; onTriggered: refreshAction.trigger() }
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.check-service-status", "Check service status"); shortcutText: "Ctrl+Shift+D"; onTriggered: { diagnosticsAction.trigger(); refreshBackendStatus() } }
-            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.safe-rollback", "Safe rollback"); shortcutText: "Ctrl+Shift+R"; onTriggered: safeRollbackConfirmDialog.open() }
+            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.safe-rollback", "Safe rollback"); shortcutText: "Ctrl+Shift+R"; onTriggered: boundFilesController.openSafeRollback() }
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.temporary-disable-product-impact", "Temporarily disable product impact"); shortcutText: "Ctrl+Shift+P"; onTriggered: setRoutingPauseEnabled(!routingState.routingPaused, "") }
         }
         Menu {
@@ -7195,6 +7250,8 @@ ApplicationWindow {
     /// session". Resets on app restart (the broker dies with the app) OR when
     /// the user explicitly revokes it via `revokeAdminApproval()`.
     property bool _brokerSessionElevated: false
+    // Correlation id of the broker-status poll in flight, "" when none.
+    property string _brokerStatusCorr: ""
 
     // Which review flow currently owns the shared
     // `reviewDiffDialog` instance. Used by `_retryReviewFlow` to dispatch

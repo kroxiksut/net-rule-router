@@ -416,6 +416,20 @@ QString NrrNativeBridge::createPresetSetDir(const QString &rootDir,
     return target;
 }
 
+QString NrrNativeBridge::defaultRuleSetsDir(bool create) {
+    const QString documents = QStandardPaths::writableLocation(
+        QStandardPaths::DocumentsLocation);
+    if (documents.isEmpty()) {
+        return QString();
+    }
+    const QString dir = QDir(documents).filePath(QCoreApplication::applicationName());
+    if (create && !QDir().mkpath(dir)) {
+        qWarning() << "defaultRuleSetsDir: mkpath failed for" << dir;
+        return QString();
+    }
+    return QDir::toNativeSeparators(dir);
+}
+
 bool NrrNativeBridge::writeFileBytes(const QString &path,
                                     const QString &base64) {
     constexpr qint64 MAX_BYTES = 1024 * 1024;

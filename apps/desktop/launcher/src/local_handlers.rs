@@ -128,26 +128,27 @@ fn handle_system_theme() -> Value {
 
 /// Scan the machine for likely VPN clients (running processes + installed
 /// programs) and return the merged candidate list for
-/// the onboarding UI. Runs LOCALLY in the launcher: process enumeration and
-/// HKCU/HKLM reads need no elevation and no background service, so onboarding
-/// works before the service is installed. The OS mechanism is
-/// [`nrr_platform_windows::WindowsVpnDiscovery`] on Windows, a Noop elsewhere
-/// (the neutral port keeps the seam — the Linux backend fills it in later).
+/// the onboarding UI. Runs LOCALLY in the launcher: every source is readable
+/// without elevation or the background service, so onboarding works before the
+/// service is installed. macOS finds nothing until its backend fills the seam.
 fn handle_vpn_discover() -> LocalHandlerResult {
     let candidates = discover_vpn_candidates_os();
     Ok(json!({ "candidates": candidates }))
 }
 
-/// Windows mechanism. The other-OS branch returns nothing until the Linux /
-/// macOS backends implement the port (the seam is already in
-/// `nrr_platform_api::VpnDiscoveryPort`).
 #[cfg(target_os = "windows")]
 fn discover_vpn_candidates_os() -> Vec<nrr_platform_api::VpnCandidate> {
     use nrr_platform_windows::VpnDiscoveryPort;
     nrr_platform_windows::WindowsVpnDiscovery::new().discover_vpn_candidates()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn discover_vpn_candidates_os() -> Vec<nrr_platform_api::VpnCandidate> {
+    use nrr_platform_api::VpnDiscoveryPort;
+    nrr_platform_linux::vpn_discovery::LinuxVpnDiscovery::new().discover_vpn_candidates()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn discover_vpn_candidates_os() -> Vec<nrr_platform_api::VpnCandidate> {
     Vec::new()
 }

@@ -20,6 +20,7 @@ pub mod local_handlers;
 pub(crate) mod prefs_persistence;
 pub mod preset_handlers;
 pub mod rpc_dispatcher;
+pub mod service_control_linux;
 pub mod sidecar_handlers;
 pub mod update_check_fetch;
 

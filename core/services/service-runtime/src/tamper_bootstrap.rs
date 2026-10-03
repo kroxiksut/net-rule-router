@@ -4,8 +4,9 @@
 //! Run once at service startup, after the storage migrations and before
 //! the IPC server accepts mutations. It ties together three components:
 //!
-//! - **Key loading** [`KeyStore`] — load the DPAPI-protected signing key,
-//!   or generate + persist a fresh one on first start.
+//! - **Key loading** [`KeyStore`] — load the signing key from the platform
+//!   store (DPAPI on Windows, a root-only file on Linux), or generate +
+//!   persist a fresh one on first start.
 //! - **HMAC verification** [`RevisionsRepository`] — compare the stored
 //!   `row_hmac` of every revision against a fresh recomputation.
 //! - **Tamper alerting** [`SecurityAlertsRepository`] — raise a tamper /
@@ -19,14 +20,21 @@
 //!  ├─ yes → load key; verify every row:
 //!  │         Verified → ok
 //!  │         Unsigned → lazy backfill (legacy v10→v11 row; re-sign)
-//!  │         Tampered → emit DbTamperDetected (one per row content),
-//!  │                    block; none while a key reset is pending
+//!  │         Tampered → DbTamperDetected (one per row content) once the
+//!  │                    active-revision sweep has run, block; none while
+//!  │                    a key reset is pending
 //!  └─ no  → generate + save key:
 //!            revisions empty     → fresh install, no alert
 //!            revisions non-empty → write the re-sign marker, emit a new
 //!                                  KeyResetWithExistingData, block;
 //!                                  no rollback until acknowledged
 //! ```
+//!
+//! The tamper alert waits for the sweep because rolling a revision back
+//! rewrites its row: an alert keyed by the content before the rollback would
+//! list nothing to acknowledge, and the row would need a second one. The
+//! verdict itself is taken here, before anything changes, and carried in
+//! [`TamperBootstrapOutcome::pending_tamper_alerts`].
 //!
 //! The "no rollback" hold is the re-sign marker in the [`KeyStore`], never an
 //! alert row: `security_alerts` is not MAC-protected, so a forged active alert
@@ -45,9 +53,9 @@
 //! `row_hmac` to make a tampered row read as `Unsigned` rather than
 //! `Tampered`, and the lazy backfill would then bless it. Closing this
 //! fully needs persistent "backfill already ran" state; accepted because
-//! the same attacker can reach the key only by impersonating `LocalSystem`
-//! (`psexec -s`), which is already an explicit non-goal of the threat
-//! model.
+//! the same attacker can reach the key only with the service's own rights
+//! (`LocalSystem`, root), which is already an explicit non-goal of the
+//! threat model.
 
 use std::sync::{Arc, Mutex};
 
@@ -58,7 +66,7 @@ use nrr_platform_api::key_store::{generate_signing_key, KeyStore};
 use nrr_storage::revision_hmac::HmacVerification;
 use nrr_storage::revisions::{RevisionsRepository, ScannedContent, ScannedRow};
 
-use crate::integrity_review::{row_label, tamper_alert_id};
+use crate::integrity_review::{row_label, row_ref, same_row, tamper_alert_id};
 use crate::ipc_handlers::payloads::MutationKind;
 use rusqlite::Connection;
 
@@ -127,6 +135,10 @@ pub struct TamperBootstrapOutcome {
     pub key_reset_unacknowledged: bool,
     /// Revisions whose `row_hmac` failed verification at load.
     pub tampered_revision_ids: Vec<String>,
+    /// The failing rows as found, each owed a tamper alert: raised by
+    /// [`raise_tamper_alerts`] once the sweep has rewritten what it rolls
+    /// back. Empty while a key reset is pending.
+    pub pending_tamper_alerts: Vec<ScannedRow>,
     /// Number of legacy `Unsigned` rows that were lazily backfilled.
     pub backfilled_rows: usize,
     /// `true` when this boot reached a blocking verdict (tamper or key reset),
@@ -313,10 +325,7 @@ pub fn run_tamper_bootstrap(
                     revision_id = %row_label(row),
                     "revision row failed HMAC verification; raising tamper alert",
                 );
-                log_unrecorded_alert(
-                    AuditEventKind::DbTamperDetected.as_str(),
-                    raise_tamper_alert(alerts_repo, row, now_ms),
-                );
+                outcome.pending_tamper_alerts.push(row.clone());
             }
         }
     }
@@ -356,9 +365,35 @@ impl TamperBootstrapOutcome {
             key_was_reset: false,
             key_reset_unacknowledged: false,
             tampered_revision_ids: Vec::new(),
+            pending_tamper_alerts: Vec::new(),
             backfilled_rows: 0,
             raised_blocking_alert: false,
         }
+    }
+}
+
+/// Raises the alert owed to every row in `found`, keyed by the content it holds
+/// in `current` — a scan taken after the sweep — so the acknowledgement dialog
+/// lists exactly that row. A row that verifies or is gone in `current`, or no
+/// `current` at all, keeps the content it was found with: the incident is
+/// reported either way, and a sweep that failed has changed nothing.
+pub fn raise_tamper_alerts(
+    alerts_repo: &Arc<dyn SecurityAlertsRepository>,
+    found: &[ScannedRow],
+    current: Option<&[ScannedRow]>,
+    now_ms: i64,
+) {
+    for row in found {
+        let found_ref = row_ref(row);
+        let still_failing = current.and_then(|rows| {
+            rows.iter().find(|r| {
+                r.verification == HmacVerification::Tampered && same_row(&row_ref(r), &found_ref)
+            })
+        });
+        log_unrecorded_alert(
+            AuditEventKind::DbTamperDetected.as_str(),
+            raise_tamper_alert(alerts_repo, still_failing.unwrap_or(row), now_ms),
+        );
     }
 }
 
@@ -659,6 +694,14 @@ mod tests {
         assert!(!out.key_was_reset);
         assert_eq!(out.tampered_revision_ids, vec!["rev-bad".to_string()]);
         assert!(out.raised_blocking_alert);
+        assert!(
+            repo.list_by_state(SecurityAlertState::Active)
+                .unwrap()
+                .is_empty(),
+            "the alert waits for the sweep"
+        );
+
+        raise_tamper_alerts(&repo, &out.pending_tamper_alerts, None, NOW);
         let active = repo.list_by_state(SecurityAlertState::Active).unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].kind, AuditEventKind::DbTamperDetected.as_str());
@@ -714,8 +757,10 @@ mod tests {
         let ks = InMemKeyStore::with_key(key());
         let repo = alerts();
         // Two consecutive boots over the same tampered DB.
-        run_tamper_bootstrap(&conn, &ks, &repo, NOW).expect("boot1");
-        run_tamper_bootstrap(&conn, &ks, &repo, NOW + 1000).expect("boot2");
+        for now in [NOW, NOW + 1000] {
+            let out = run_tamper_bootstrap(&conn, &ks, &repo, now).expect("boot");
+            raise_tamper_alerts(&repo, &out.pending_tamper_alerts, None, now);
+        }
         // Only one alert exists despite two scans.
         let active = repo.list_by_state(SecurityAlertState::Active).unwrap();
         assert_eq!(
@@ -723,6 +768,52 @@ mod tests {
             1,
             "tamper alert must be deduped by revision id"
         );
+    }
+
+    /// The alert names the row as it stands after the sweep, not as found.
+    #[test]
+    fn the_alert_follows_the_content_the_sweep_left() {
+        let conn = open_state();
+        {
+            let guard = conn.lock().unwrap();
+            RevisionsRepository::with_signing_key(&guard, key())
+                .insert_candidate(&record("rev-bad", "h-bad"))
+                .expect("insert");
+            guard
+                .execute(
+                    "UPDATE revisions SET rules_json = '{\"x\":1}' WHERE revision_id = 'rev-bad'",
+                    [],
+                )
+                .expect("tamper");
+        }
+        let ks = InMemKeyStore::with_key(key());
+        let repo = alerts();
+        let out = run_tamper_bootstrap(&conn, &ks, &repo, NOW).expect("bootstrap");
+        let found = out.pending_tamper_alerts[0].clone();
+        conn.lock()
+            .unwrap()
+            .execute(
+                "UPDATE revisions SET status = 'rejected' WHERE revision_id = 'rev-bad'",
+                [],
+            )
+            .expect("rewritten as a rollback would");
+        let current = {
+            let guard = conn.lock().unwrap();
+            RevisionsRepository::with_signing_key(&guard, key())
+                .integrity_scan()
+                .unwrap()
+        };
+
+        raise_tamper_alerts(&repo, &out.pending_tamper_alerts, Some(&current), NOW);
+
+        let active = repo.list_by_state(SecurityAlertState::Active).unwrap();
+        assert_eq!(active.len(), 1);
+        let now = current
+            .iter()
+            .find(|r| r.revision_id() == "rev-bad")
+            .unwrap();
+        assert_ne!(now.fingerprint, found.fingerprint);
+        assert_eq!(active[0].alert_id, tamper_alert_id(now));
     }
 
     #[test]

@@ -376,19 +376,7 @@ impl ConnectionObservationConsumer {
                 EgressRole::Unknown => summary.unknown += 1,
             }
             if log_ndjson {
-                tracing::info!(
-                    target: "nrr::conn-trace",
-                    msg_key = "connobs-outbound-connection-observed",
-                    process = rec.process_path.as_deref().unwrap_or("?"),
-                    sid = rec.user_sid.as_deref().unwrap_or("?"),
-                    proto = proto_str(rec.protocol),
-                    remote = %rec.remote,
-                    local = %rec.local,
-                    egress_ifindex = rec.egress.ifindex,
-                    egress = role_str(rec.egress.role),
-                    verdict = verdict_str(rec.verdict),
-                    "observed outbound connection",
-                );
+                log_observed_connection(&rec);
             }
             // Retain for the Diagnostics panel (last use of `rec`).
             if let Some(ring) = self.trace_ring.as_ref() {

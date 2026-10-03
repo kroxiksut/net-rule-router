@@ -38,8 +38,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::activation_coordinator::{
-    ActivationCoordinator, ActivationOutcome, CandidateSubmission, ConfirmationToken,
-    DryRunSummary, PolicyError, PreFlightCategory, PreFlightWarning, RollbackTarget,
+    ActivationCoordinator, ActivationOutcome, ApplyFailurePolicy, CandidateSubmission,
+    ConfirmationToken, DryRunSummary, PolicyError, PreFlightCategory, PreFlightWarning,
+    RollbackTarget,
 };
 use crate::crash_recovery::{
     execute_safe_disable, RecoveryAuditSink, SafeDisableOutcome, SafeDisableRequest,
@@ -72,7 +73,7 @@ use nrr_domain::{AdapterIdentity, BindingSource, RouteBehaviorMode, RouteBinding
 use nrr_shared::ipc_payloads::RiskSignalDto;
 use nrr_shared::ipc_payloads::{
     CrossSetDuplicateDto, PresetImportPayload, PresetImportPayloadError, PresetImportTarget,
-    StatusUpdateEvent,
+    RollbackTargetDto, StatusUpdateEvent,
 };
 use nrr_shared::rules_json;
 use nrr_storage::revisions::RevisionsRepository;
@@ -432,7 +433,8 @@ impl ProductionMutationExecutor {
         let summary = self
             .coordinator
             .dry_run_rules(principal, &parsed.rules_json, "ipc-dry-run");
-        let mut response = dry_run_to_review_summary(&summary, scored);
+        let mut response =
+            dry_run_to_review_summary(&summary, scored, self.coordinator.failure_policy());
         response.cross_set_duplicates =
             cross_set_duplicates_of(&parsed.rules_json, self.host_platform);
         response
@@ -735,20 +737,10 @@ impl MutationExecutor for ProductionMutationExecutor {
     }
 
     fn rollback(&self, principal: &str, target_revision_id: Option<&str>) -> MutationOutcome {
-        let target = match target_revision_id {
-            None => RollbackTarget::Lkg,
-            Some(raw) => match RevisionId::from_prefixed_string(raw.to_string()) {
-                Ok(id) => RollbackTarget::Specific(id),
-                Err(e) => {
-                    return MutationOutcome::Failed(OperationError {
-                        code: "malformed-revision-id".into(),
-                        message: format!("invalid target revision id: {e}"),
-                    });
-                }
-            },
+        let target = match rollback_target_of(target_revision_id) {
+            Ok(target) => target,
+            Err(error) => return MutationOutcome::Failed(error),
         };
-        // Rollback is scoped to the caller's principal,
-        // threaded from the rollback handler's `IpcRequestContext.caller_stored()`.
         match self
             .coordinator
             .rollback_to(principal, target, "ipc-rollback")
@@ -756,6 +748,24 @@ impl MutationExecutor for ProductionMutationExecutor {
             Ok(outcome) => activation_to_outcome(outcome),
             Err(e) => policy_error_outcome(&e),
         }
+    }
+
+    fn rollback_target(
+        &self,
+        principal: &str,
+        target_revision_id: Option<&str>,
+    ) -> Result<Option<RollbackTargetDto>, OperationError> {
+        let target = rollback_target_of(target_revision_id)?;
+        let record = self
+            .coordinator
+            .rollback_target_for(principal, &target)
+            .map_err(|e| policy_error(&e))?;
+        Ok(record.map(|record| RollbackTargetDto {
+            rule_count: rules_json::user_rule_count(&record.rules_json) as u64,
+            revision_id: record.revision_id,
+            activated_at: record.activated_at,
+            superseded_at: record.superseded_at,
+        }))
     }
 
     fn safe_disable(&self, reason: &str) -> MutationOutcome {
@@ -1349,6 +1359,7 @@ fn profile_for(
 fn dry_run_to_review_summary(
     summary: &DryRunSummary,
     scored: Option<ScoredCandidate>,
+    policy: ApplyFailurePolicy,
 ) -> ReviewSummaryResponse {
     let total_additions: u32 = summary
         .action_plans
@@ -1386,7 +1397,7 @@ fn dry_run_to_review_summary(
             Vec::new(),
         ),
     };
-    risk_signals.extend(pre_flight_signals(&summary.pre_flight_warnings));
+    risk_signals.extend(pre_flight_signals(&summary.pre_flight_warnings, policy));
     ReviewSummaryResponse {
         diff_summary: format!(
             "{} SID(s); +{total_additions} / -{total_removals} filters; {warning_count} pre-flight warning(s)",
@@ -1416,17 +1427,22 @@ fn dry_run_to_review_summary(
 }
 
 /// Pre-apply findings the user can act on, one signal per kind: the review
-/// otherwise showed only their count.
-fn pre_flight_signals(warnings: &[PreFlightWarning]) -> Vec<RiskSignalDto> {
+/// otherwise showed only their count. Whether a finding refuses the apply
+/// depends on the `policy` the apply will run under.
+fn pre_flight_signals(
+    warnings: &[PreFlightWarning],
+    policy: ApplyFailurePolicy,
+) -> Vec<RiskSignalDto> {
     let mut executables: Vec<String> = Vec::new();
-    let (mut adapter_missing, mut refused) = (false, false);
+    let (mut adapter_missing, mut refused, mut batched) = (false, false, false);
     for w in warnings {
+        refused |= w.category.refuses_activation(policy);
         match w.category {
-            category if category.blocks_activation() => refused = true,
             PreFlightCategory::AppRuleUnenforceable => {
                 executables.extend(w.subjects.iter().cloned());
             }
             PreFlightCategory::BindingUnresolved => adapter_missing = true,
+            PreFlightCategory::BatchOverflow => batched = true,
             _ => {}
         }
     }
@@ -1435,6 +1451,8 @@ fn pre_flight_signals(warnings: &[PreFlightWarning]) -> Vec<RiskSignalDto> {
     let mut signals = Vec::new();
     if refused {
         signals.push(RiskSignalDto::ApplyWillBeRefused);
+    } else if batched {
+        signals.push(RiskSignalDto::ApplyInSeveralBatches);
     }
     if adapter_missing {
         signals.push(RiskSignalDto::AdditionalAdapterUnresolved);
@@ -1575,7 +1593,24 @@ fn invalid_rule_value_summary(rules: &[RefusedRuleValue]) -> ReviewSummaryRespon
     summary
 }
 
+/// `None` is the last-known-good revision.
+fn rollback_target_of(target_revision_id: Option<&str>) -> Result<RollbackTarget, OperationError> {
+    let Some(raw) = target_revision_id else {
+        return Ok(RollbackTarget::Lkg);
+    };
+    RevisionId::from_prefixed_string(raw.to_string())
+        .map(RollbackTarget::Specific)
+        .map_err(|e| OperationError {
+            code: "malformed-revision-id".into(),
+            message: format!("invalid target revision id: {e}"),
+        })
+}
+
 fn policy_error_outcome(err: &PolicyError) -> MutationOutcome {
+    MutationOutcome::Failed(policy_error(err))
+}
+
+fn policy_error(err: &PolicyError) -> OperationError {
     let (code, message) = match err {
         PolicyError::ConfirmationTokenUnknown => (
             "token-not-found",
@@ -1627,19 +1662,19 @@ fn policy_error_outcome(err: &PolicyError) -> MutationOutcome {
             ),
         ),
         PolicyError::UnsupportedRuleShape { rule_id, reason } => {
-            return MutationOutcome::Failed(unsupported_rule_shape_error(rule_id, *reason));
+            return unsupported_rule_shape_error(rule_id, *reason);
         }
         PolicyError::ControlCharacterInRule { rule_id, field } => {
-            return MutationOutcome::Failed(control_character_error(rule_id, field));
+            return control_character_error(rule_id, field);
         }
         PolicyError::InvalidRuleValue { rules } => {
-            return MutationOutcome::Failed(invalid_rule_value_error(rules));
+            return invalid_rule_value_error(rules);
         }
     };
-    MutationOutcome::Failed(OperationError {
+    OperationError {
         code: code.into(),
         message,
-    })
+    }
 }
 
 // `Duration` import retained for future TTL plumbing.

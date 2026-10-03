@@ -95,6 +95,9 @@ nrr-platform-linux = { path = "../../platform/linux" }
 # Bootstrap tests use a temp directory to exercise the full
 # StorageProfile::TestTemp pipeline without touching %ProgramData%.
 tempfile = "3"
+# Captures what a call site writes to the operational log, through the real
+# NDJSON layer, so a test can check the line and the principal it carries.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 # Archive enrichment — the export-handler test reads the
 # produced zip to assert the diagnostics level ships the extra sections.
 zip = "2"

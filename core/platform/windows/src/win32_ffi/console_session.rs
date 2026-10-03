@@ -86,7 +86,7 @@ fn console_fallback_sid(own_process_sid: Option<String>) -> Option<String> {
 
 /// The SID of the user THIS process runs as (via its own primary token).
 /// `None` on any failure.
-fn current_process_user_sid() -> Option<String> {
+pub(crate) fn current_process_user_sid() -> Option<String> {
     let mut token = HANDLE::default();
     // SAFETY: `GetCurrentProcess` returns a pseudo-handle; `token` is a valid
     // out-param filled with a query token on success.

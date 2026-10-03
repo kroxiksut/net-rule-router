@@ -306,3 +306,53 @@ fn one_unreadable_principal_does_not_stop_the_sweep() {
         }
     );
 }
+
+/// The live recheck leaves verifying principals alone and recovers a tampered
+/// one exactly as the boot sweep would.
+#[test]
+fn the_live_recheck_recovers_only_the_tampered_principal() {
+    let fx = build_signed_fixture(ApplyFailurePolicy::AllOrNothing, KEY.to_vec());
+    let b1 = activate_for(&fx, BASELINE, "h-b1");
+    let x1 = activate_for(&fx, USER, "h-x1");
+    assert!(fx
+        .coordinator
+        .recheck_active_integrity("corr")
+        .expect("recheck")
+        .is_empty());
+
+    let x2 = activate_for(&fx, USER, "h-x2");
+    tamper_rules_json(&fx, x2.as_str());
+    let outcomes = fx
+        .coordinator
+        .recheck_active_integrity("corr")
+        .expect("recheck");
+
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    match outcome_of(&outcomes, USER) {
+        ActiveIntegrityOutcome::RolledBack {
+            rejected_revision_id,
+            trusted_source_revision_id,
+            ..
+        } => {
+            assert_eq!(rejected_revision_id, x2.as_str());
+            assert_eq!(trusted_source_revision_id, x1.as_str());
+        }
+        other => panic!("expected RolledBack, got {other:?}"),
+    }
+    assert_eq!(
+        status_active_of(&fx, BASELINE).as_deref(),
+        Some(b1.as_str())
+    );
+}
+
+#[test]
+fn the_live_recheck_does_nothing_without_a_signing_key() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let x1 = activate_for(&fx, USER, "h-x1");
+    tamper_rules_json(&fx, x1.as_str());
+    assert!(fx
+        .coordinator
+        .recheck_active_integrity("corr")
+        .expect("recheck")
+        .is_empty());
+}

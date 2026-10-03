@@ -101,6 +101,7 @@ fn trace_row() -> crate::conn_observation_consumer::ConnectionTraceRecord {
         nrr_drop_spec_id: None,
         nrr_block_reason: None,
         observed_unix_ms: Some(1_757_000_000_000),
+        remote_names: None,
     }
 }
 
@@ -167,6 +168,76 @@ fn conn_trace_reports_whether_the_observer_is_running() {
         watching.observer_active,
         "an empty ring under a running observer means 'nothing happened yet'"
     );
+}
+
+/// The name is resolved as the row enters the ring and served with it; a row
+/// recorded before any name was known still renders, address only.
+#[test]
+fn conn_trace_rows_carry_the_names_seen_for_their_remote() {
+    use crate::conn_trace_names::{AddressNameSource, ConnTraceNamer};
+    let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+        8,
+    ));
+    ring.push(trace_row());
+
+    let names = Arc::new(crate::observed_host_names::ObservedHostNames::new());
+    names.record("a.cdn.site.example", &["198.51.100.7".parse().expect("ip")]);
+    assert!(ring.attach_namer(Arc::new(ConnTraceNamer::new(vec![
+        names as Arc<dyn AddressNameSource>
+    ]))));
+    ring.push(trace_row());
+
+    let resp = conn_trace_list(&ConnTraceEntriesListHandler::new(Arc::clone(&ring)));
+    assert_eq!(resp.page.items.len(), 2);
+    let (newest, oldest) = (&resp.page.items[0], &resp.page.items[1]);
+    assert_eq!(newest.remote_hosts, vec!["a.cdn.site.example"]);
+    assert_eq!(newest.remote_host_count, 1);
+    assert_eq!(
+        newest.remote_host_floor, "site.example",
+        "the GUI may shorten to *.site.example, no further"
+    );
+    assert!(!newest.remote_fake_ip);
+    assert_eq!(newest.remote, "198.51.100.7:443", "the address stays");
+    assert!(oldest.remote_hosts.is_empty());
+    assert_eq!(oldest.remote_host_count, 0);
+    assert!(oldest.remote_host_floor.is_empty());
+}
+
+/// A virtual address is named by the pool and says so; once its binding is
+/// recycled the row still says it is virtual rather than going blank.
+#[test]
+fn conn_trace_rows_name_virtual_addresses_from_the_pool() {
+    use crate::conn_trace_names::ConnTraceNamer;
+    use crate::dns_resolver::FakeIpAnswerer;
+    use nrr_platform_api::fake_ip::{FakeIpPoolConfig, FakeIpScope};
+    let assembly = crate::fake_ip::FakeIpAssembly::new(
+        FakeIpScope::enabled(Vec::<String>::new()),
+        FakeIpPoolConfig::default(),
+    );
+    let fake = assembly
+        .answerer()
+        .fake_answer("app.example")
+        .expect("in scope")[0];
+    let recycled = std::net::Ipv4Addr::from(u32::from(fake) + 1);
+
+    let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+        8,
+    ));
+    assert!(ring.attach_namer(Arc::new(
+        ConnTraceNamer::new(Vec::new()).with_fake_ip_pool(assembly.binding_view())
+    )));
+    for ip in [recycled, fake] {
+        let mut row = trace_row();
+        row.remote = std::net::SocketAddr::new(ip.into(), 443);
+        ring.push(row);
+    }
+
+    let resp = conn_trace_list(&ConnTraceEntriesListHandler::new(Arc::clone(&ring)));
+    let (named, bare) = (&resp.page.items[0], &resp.page.items[1]);
+    assert_eq!(named.remote_hosts, vec!["app.example"]);
+    assert!(named.remote_fake_ip);
+    assert!(bare.remote_hosts.is_empty());
+    assert!(bare.remote_fake_ip, "recycled, yet still marked virtual");
 }
 
 #[test]

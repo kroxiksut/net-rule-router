@@ -460,6 +460,15 @@ pub fn runtime_dir() -> PathBuf {
     PathBuf::from("/run").join(RUNTIME_STATE_DIR)
 }
 
+/// Where the daemon is installed (`/usr/lib/netrulerouter/nrr-serviced`): the
+/// unit sets `ProtectHome=yes`, so a copy under `/home` can never be the one it
+/// runs. The install scripts stage the binary here.
+pub fn installed_daemon_path() -> PathBuf {
+    PathBuf::from("/usr/lib")
+        .join(RUNTIME_STATE_DIR)
+        .join(nrr_shared::product_identity::BinaryRole::Service.unix_file_name())
+}
+
 /// The operational-log directory systemd provisions via `LogsDirectory=`
 /// (`/var/log/netrulerouter`). Same reasoning as [`state_dir`].
 pub fn log_dir() -> PathBuf {

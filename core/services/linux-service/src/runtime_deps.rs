@@ -9,9 +9,9 @@
 //! ## What is wired and what is honestly absent
 //!
 //! Wired: health, IPC, adapter monitoring, operation-status GC, log and audit
-//! retention, and the enforcement cycle — logind names who is present, the
-//! per-principal store supplies their rules, nftables applies the lot in one
-//! pass.
+//! retention, revision signing with its live recheck, and the enforcement
+//! cycle — logind names who is present, the per-principal store supplies their
+//! rules, nftables applies the lot in one pass.
 //!
 //! The recompute hook is the enforcement cycle's own pass, so every neutral
 //! caller that knows a re-arm is due — the adapter monitor, the safety tick, the
@@ -142,7 +142,7 @@ pub(crate) fn build_runtime_deps(
     let recompute_hook: Option<RouteRecomputeHook> = enforcement.as_ref().map(|cycle| {
         let cycle = Arc::clone(cycle);
         Arc::new(move || {
-            cycle.tick_logged("recompute");
+            cycle.tick_if_changed_logged("recompute");
         }) as RouteRecomputeHook
     });
     // Stopping must restore the machine: policy left in the kernel by an exited
@@ -237,7 +237,10 @@ pub(crate) fn build_runtime_deps(
         // adapter port landed and was simply never called here, so the traffic
         // page had nothing to show on Linux.
         traffic_tick: traffic_tick(traffic_sampler, state_conn.as_ref()),
-        activation_coordinator: None,
+        activation_coordinator: ipc.activation_coordinator,
+        // The boot check covers what was there at start; this covers an edit
+        // made while the daemon runs.
+        revision_watch: ipc.revision_watch,
         // Domain rules are only as current as the addresses behind them: without
         // this the cache never refreshes, and a rule naming a domain enforces
         // whatever addresses happened to be known when they were first learnt.
@@ -357,6 +360,11 @@ pub(crate) struct IpcServerParts {
     pub mutation_tokens: Option<Arc<nrr_service_runtime::MutationTokenStore>>,
     /// Refreshed by every accept; the watchdog pokes the socket and reads it.
     pub accept_heartbeat: Arc<std::sync::atomic::AtomicU64>,
+    /// Held for the life of the daemon. `None` on the handshake-only fallback.
+    pub activation_coordinator:
+        Option<Arc<nrr_service_runtime::activation_coordinator::ActivationCoordinator>>,
+    /// The recheck after an outside write; `None` without a signing key.
+    pub revision_watch: Option<nrr_service_runtime::revision_watch::RevisionWatch>,
 }
 
 pub(crate) fn build_ipc_server(
@@ -365,8 +373,9 @@ pub(crate) fn build_ipc_server(
     event_bus: Arc<EventBus>,
     stack: Option<&PolicyStack>,
     instance: nrr_platform_linux::daemon_lock::DaemonLock,
+    verbosity: Option<nrr_service_runtime::TracingVerbosityHandle>,
 ) -> IpcServerParts {
-    let (registry, audit, mutation_tokens) = match stack {
+    let (registry, audit, mutation_tokens, activation_coordinator, revision_watch) = match stack {
         Some(stack) => {
             let surface = crate::ipc_deps::build_ipc_surface(
                 Arc::clone(&stack.state_conn),
@@ -387,13 +396,26 @@ pub(crate) fn build_ipc_server(
                 stack.traffic_sampler.clone(),
                 Arc::clone(&stack.cache_store),
                 stack.conn_trace.ring(),
+                stack.app_enforcement.clone(),
+                stack.conn_trace_log.apply_hook(),
+                verbosity,
+                // Beside the state database it signs, under the same `0700`.
+                Arc::new(nrr_platform_linux::key_store::FileKeyStore::in_state_dir(
+                    &artifacts.topology.data_dir,
+                )),
             );
             let mut registry = nrr_service_runtime::IpcHandlerRegistry::new();
             nrr_service_runtime::ipc_handlers::register_production_handlers(
                 &mut registry,
                 surface.deps,
             );
-            (registry, surface.audit, Some(surface.mutation_tokens))
+            (
+                registry,
+                surface.audit,
+                Some(surface.mutation_tokens),
+                Some(surface.coordinator),
+                surface.revision_watch,
+            )
         }
         None => {
             tracing::error!(
@@ -409,6 +431,8 @@ pub(crate) fn build_ipc_server(
                 crate::run::serving_registry_with(health, Arc::clone(&event_bus)),
                 Arc::new(nrr_service_runtime::NoopIpcAuditEmitter)
                     as Arc<dyn nrr_service_runtime::IpcAuditEmitter>,
+                None,
+                None,
                 None,
             )
         }
@@ -431,6 +455,8 @@ pub(crate) fn build_ipc_server(
         accept_heartbeat: server.accept_heartbeat(),
         server: Arc::new(server),
         mutation_tokens,
+        activation_coordinator,
+        revision_watch,
     }
 }
 
@@ -732,9 +758,14 @@ pub(crate) struct PolicyStack {
     /// get a look at it.
     pub dns_consumer_subject: Arc<std::sync::Mutex<Option<String>>>,
     pub cycle: Arc<PrincipalEnforcementCycle>,
+    /// Each principal's rule conflicts: the planner writes, the IPC surface
+    /// reads.
+    pub app_enforcement: nrr_service_runtime::app_enforcement_status::AppEnforcementStatus,
     /// The connection-trace panel: the app-destination tick writes it, the IPC
     /// surface reads it.
     pub conn_trace: Arc<nrr_service_runtime::conn_observation_consumer::ConnTraceTee>,
+    /// The tee's "write to the log" switch, for the settings writer to flip.
+    pub conn_trace_log: nrr_service_runtime::boot_settings::ConnTraceLogSwitch,
     /// The ledger both readers share: the housekeeping tick counts into it and
     /// the IPC surface reports from it. Two samplers would be two connections,
     /// one counting and the other answering. `None` leaves the counter off.
@@ -887,11 +918,15 @@ pub(crate) fn build_policy_stack(
     // One source object behind every reader — the filter path, the route path
     // and the exemption reader must see the same machine.
     let adapter_port: Arc<dyn nrr_platform_api::adapters::AdapterEventSource> = adapters;
+    let adapter_port_for_inputs = Arc::clone(&adapter_port);
 
     // One store, two readers: the tick that learns destinations and the planner
     // that turns them into flows. Two would mean the planner reading a memory
     // nobody fills — which is what "app rules do nothing" looked like.
     let app_observations = Arc::new(AppObservationStore::new());
+    // The planner writes each principal's rule conflicts, the snapshot handler
+    // reads them for the Overlaps screen.
+    let app_enforcement = nrr_service_runtime::app_enforcement_status::AppEnforcementStatus::new();
     let plans: Arc<dyn PrincipalPlanSource> = Arc::new(
         ProductionPrincipalPlanSource::new(
             rules,
@@ -906,7 +941,8 @@ pub(crate) fn build_policy_stack(
         .with_machine_facts(
             Arc::new(nrr_platform_linux::LinuxApi),
             Arc::clone(&adapter_port),
-        ),
+        )
+        .with_rule_conflicts(app_enforcement.clone()),
     );
     // The tracker turns a stream of probe results into a verdict with
     // hysteresis; the enforcer only ever asks it for the verdict. A tunnel that
@@ -945,7 +981,45 @@ pub(crate) fn build_policy_stack(
         }
     }
 
+    // Everything a pass reads, as change numbers: an idle pass then costs a few
+    // reads instead of a plan and an `nft` run.
+    let pass_inputs = {
+        use nrr_platform_api::route_table::RouteTablePort;
+        use nrr_service_runtime::pass_inputs::{hashed, sqlite_generation, PassInputs};
+        let cache = Arc::clone(&cache_store);
+        let observations = Arc::clone(&app_observations);
+        PassInputs::new()
+            .with_source("state", sqlite_generation(Arc::clone(&state_conn)))
+            .with_source(
+                "cache",
+                Arc::new(move || cache.lock().ok()?.change_generation()),
+            )
+            .with_source("apps", Arc::new(move || Some(observations.generation())))
+            .with_source(
+                "adapters",
+                hashed(move || adapter_port_for_inputs.enumerate_all()),
+            )
+            .with_source(
+                "routes",
+                hashed(|| nrr_platform_linux::LinuxApi.get_ip_forward_table()),
+            )
+    };
+
+    // Writing the trace to the log follows the saved switch live, the same
+    // switch the other platform's observer reads; the sentinel file in the
+    // data directory forces it on.
+    let conn_trace_log = nrr_service_runtime::boot_settings::ConnTraceLogSwitch::at_boot(
+        Some(&conn_for_stability),
+        nrr_service_runtime::boot_settings::conn_trace_forced(Some(&artifacts.topology.data_dir)),
+    );
+    let trace_ring =
+        Arc::new(nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(1000));
+    trace_ring.attach_namer(Arc::new(
+        nrr_service_runtime::conn_trace_names::ConnTraceNamer::production(Arc::clone(&cache_store)),
+    ));
+
     Some(PolicyStack {
+        app_enforcement,
         dns_capture,
         service_resolver,
         state_conn,
@@ -959,18 +1033,19 @@ pub(crate) fn build_policy_stack(
         dns_consumer_subject,
         conn_trace: Arc::new(
             nrr_service_runtime::conn_observation_consumer::ConnTraceTee::new(
-                Arc::new(
-                    nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(1000),
-                ),
+                trace_ring,
                 Arc::new(nrr_platform_linux::LinuxApi),
                 bindings_for_trace,
-            ),
+            )
+            .with_log_ndjson_flag(conn_trace_log.flag()),
         ),
+        conn_trace_log,
         cycle: Arc::new(
             PrincipalEnforcementCycle::new(Arc::new(LogindActivePrincipals), plans, enforcer)
                 .with_routes(routes)
                 .with_events(events)
-                .with_fail_closed_posture_status(fail_closed_posture),
+                .with_fail_closed_posture_status(fail_closed_posture)
+                .with_pass_inputs(pass_inputs),
         ),
         traffic_sampler: open_traffic_sampler(&artifacts.topology.traffic_db_path),
     })

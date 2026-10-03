@@ -10,7 +10,7 @@
 //! methods that need `&mut Connection` to create transactions.
 
 use crate::schema::AddressFamily;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::SystemTime;
 
@@ -23,8 +23,8 @@ use nrr_domain::decision_lookup::{
 use nrr_domain::revision::RevisionId;
 
 use crate::dto::{
-    CacheEntryRow, CacheLookupRequest, CacheLookupResult, CacheResetReason, CacheResetSummary,
-    CacheStats, CachedIpEntry, CleanupPolicy, CleanupSummary, ExpiredHostname,
+    AddressNames, CacheEntryRow, CacheLookupRequest, CacheLookupResult, CacheResetReason,
+    CacheResetSummary, CacheStats, CachedIpEntry, CleanupPolicy, CleanupSummary, ExpiredHostname,
     IntegrityCheckResult, NegativeCacheEntry, NegativeCacheReason, RecoveryAction, ResolutionEntry,
 };
 use crate::error::{StorageError, StorageResult};
@@ -45,9 +45,19 @@ use crate::schema::FreshnessStateDb;
 /// unbounded; anything refreshed within the window is retained.
 const HELD_RESOLUTION_BACKSTOP_SECS: i64 = 30 * 86_400;
 
+/// A restamp of an address last confirmed longer ago than this counts as news:
+/// it may have aged out of what enforcement reads, and bringing it back changes
+/// a plan. Shorter than any enforcement window, so the error is an extra pass,
+/// never a missed one.
+const RESTAMP_IS_NEWS_AFTER_MS: i64 = 60 * 60 * 1_000;
+
 pub struct SqliteCacheStore {
     conn: RefCell<Connection>,
     thresholds: FreshnessThresholds,
+    /// Counts this store's writes that change what a plan can read — a new
+    /// host/address pair, a removal, a census or fake-IP change — and not a
+    /// restamp of a pair already held, which every DNS answer produces.
+    news: Cell<u64>,
 }
 
 impl SqliteCacheStore {
@@ -59,7 +69,12 @@ impl SqliteCacheStore {
         Self {
             conn: RefCell::new(conn),
             thresholds,
+            news: Cell::new(0),
         }
+    }
+
+    fn note_news(&self) {
+        self.news.set(self.news.get().wrapping_add(1));
     }
 
     /// Consumes the store and returns the underlying connection.
@@ -69,6 +84,13 @@ impl SqliteCacheStore {
 }
 
 impl CacheRepository for SqliteCacheStore {
+    /// This store's own news plus any commit from another connection.
+    fn change_generation(&self) -> Option<u64> {
+        let conn = self.conn.borrow();
+        crate::change_generation::outside_writes(&conn)
+            .map(|outside| (outside << 32) ^ self.news.get())
+    }
+
     // ── Lookup ────────────────────────────────────────────────────────────────
 
     fn get_by_hostname(
@@ -296,6 +318,7 @@ impl CacheRepository for SqliteCacheStore {
 
         // 2. Upsert each resolved address. The family comes from the address,
         // never from the call site: one address must not be filed twice.
+        let mut news = false;
         for ip in &entry.resolved_ips {
             let family = AddressFamily::of(*ip).as_str();
             // `Display` for both families is the canonical text form (RFC 5952
@@ -328,6 +351,16 @@ impl CacheRepository for SqliteCacheStore {
                 )
                 .map_err(db_err)?;
 
+            let last_confirmed: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(resolved_at) FROM hostname_ip_resolutions
+                     WHERE hostname_id = ?1 AND ip_id = ?2",
+                    params![hostname_id, ip_id],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            news |= last_confirmed.is_none_or(|at| at < resolved_at_ms - RESTAMP_IS_NEWS_AFTER_MS);
+
             // 3. Upsert resolution row (one per hostname/ip/source triple).
             tx.execute(
                 "INSERT INTO hostname_ip_resolutions
@@ -353,7 +386,11 @@ impl CacheRepository for SqliteCacheStore {
             .map_err(db_err)?;
         }
 
-        tx.commit().map_err(db_err)
+        tx.commit().map_err(db_err)?;
+        if news {
+            self.note_news();
+        }
+        Ok(())
     }
 
     fn record_shared_ip_direct_host(
@@ -366,6 +403,15 @@ impl CacheRepository for SqliteCacheStore {
         let conn = self.conn.borrow();
         let packed = ipv4_packed(ip);
         let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+        let held: Option<i64> = conn
+            .query_row(
+                "SELECT primary_ruled FROM shared_ip_direct_hosts
+                 WHERE ipv4_packed = ?1 AND hostname = ?2",
+                params![packed, host],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
         conn.execute(
             "INSERT INTO shared_ip_direct_hosts (ipv4_packed, hostname, last_seen, primary_ruled)
              VALUES (?1, ?2, ?3, ?4)
@@ -375,6 +421,10 @@ impl CacheRepository for SqliteCacheStore {
             params![packed, host, now_ms, i64::from(primary_ruled)],
         )
         .map_err(db_err)?;
+        drop(conn);
+        if held != Some(i64::from(primary_ruled)) {
+            self.note_news();
+        }
         Ok(())
     }
 
@@ -390,6 +440,10 @@ impl CacheRepository for SqliteCacheStore {
                 params![host],
             )
             .map_err(db_err)?;
+        drop(conn);
+        if removed > 0 {
+            self.note_news();
+        }
         Ok(removed as u32)
     }
 
@@ -485,6 +539,43 @@ impl CacheRepository for SqliteCacheStore {
         Ok(n.max(0) as u32)
     }
 
+    fn names_for_address(
+        &self,
+        ip: IpAddr,
+        seen_since: SystemTime,
+        limit: usize,
+    ) -> StorageResult<AddressNames> {
+        let conn = self.conn.borrow();
+        let packed = match ip {
+            IpAddr::V4(v4) => Some(ipv4_packed(v4)),
+            IpAddr::V6(_) => None,
+        };
+        let mut stmt = conn.prepare_cached(NAMES_FOR_ADDRESS_SQL).map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    AddressFamily::of(ip).as_str(),
+                    ip.to_string(),
+                    system_time_to_ms(seen_since),
+                    packed,
+                    // At least one row, so the total arrives even when no name
+                    // is wanted.
+                    i64::try_from(limit.max(1)).unwrap_or(i64::MAX),
+                ],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(2)?)),
+            )
+            .map_err(db_err)?;
+        let mut out = AddressNames::default();
+        for row in rows {
+            let (host, total) = row.map_err(db_err)?;
+            out.total = u32::try_from(total.max(0)).unwrap_or(u32::MAX);
+            if out.names.len() < limit {
+                out.names.push(host);
+            }
+        }
+        Ok(out)
+    }
+
     fn shared_ip_census_ips(&self) -> StorageResult<Vec<Ipv4Addr>> {
         let conn = self.conn.borrow();
         let mut stmt = conn
@@ -546,6 +637,8 @@ impl CacheRepository for SqliteCacheStore {
             ],
         )
         .map_err(db_err)?;
+        drop(conn);
+        self.note_news();
         Ok(())
     }
 
@@ -877,6 +970,13 @@ impl CacheRepository for SqliteCacheStore {
             // `conn` (borrow_mut) is dropped here, before periodic_vacuum borrows immutably.
         };
 
+        if expired_resolutions_removed
+            + negative_cache_entries_removed
+            + shared_ip_direct_hosts_removed
+            > 0
+        {
+            self.note_news();
+        }
         let vacuumed = if policy.run_vacuum {
             self.periodic_vacuum().is_ok()
         } else {
@@ -926,6 +1026,8 @@ impl CacheRepository for SqliteCacheStore {
         .map_err(db_err)?;
 
         tx.commit().map_err(db_err)?;
+        drop(conn);
+        self.note_news();
 
         Ok(CacheResetSummary {
             reason,
@@ -958,6 +1060,8 @@ impl CacheRepository for SqliteCacheStore {
             )
             .map_err(db_err)?;
             tx.commit().map_err(db_err)?;
+            drop(conn);
+            self.note_news();
             return Ok(Vec::new());
         }
         let bindings = {
@@ -982,6 +1086,13 @@ impl CacheRepository for SqliteCacheStore {
         now_ms: i64,
     ) -> StorageResult<()> {
         let conn = self.conn.borrow();
+        let held: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fake_ip_bindings WHERE pool_index = ?1 AND domain = ?2)",
+                params![i64::from(pool_index), domain],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
         // OR REPLACE on purpose: it retires the row holding this index AND any
         // row holding this domain in one statement (both are unique).
         conn.execute(
@@ -990,6 +1101,10 @@ impl CacheRepository for SqliteCacheStore {
             params![i64::from(pool_index), domain, now_ms],
         )
         .map_err(db_err)?;
+        drop(conn);
+        if !held {
+            self.note_news();
+        }
         Ok(())
     }
 
@@ -1000,6 +1115,8 @@ impl CacheRepository for SqliteCacheStore {
             params![i64::from(pool_index)],
         )
         .map_err(db_err)?;
+        drop(conn);
+        self.note_news();
         Ok(())
     }
 
@@ -1040,6 +1157,10 @@ impl CacheRepository for SqliteCacheStore {
         .map_err(db_err)?;
 
         tx.commit().map_err(db_err)?;
+        drop(conn);
+        if resolutions_removed > 0 {
+            self.note_news();
+        }
         Ok(resolutions_removed)
     }
 
@@ -1168,6 +1289,25 @@ fn escape_like_literal(value: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_")
 }
+
+/// Names seen at one address: resolutions plus census tenants. Every branch is
+/// reached through a UNIQUE or primary-key index, so the cost follows the names
+/// on this one address, never the size of the cache.
+const NAMES_FOR_ADDRESS_SQL: &str = "WITH seen(host, at) AS (
+         SELECT h.canonical_host, r.resolved_at
+         FROM ip_addresses a
+         JOIN hostname_ip_resolutions r ON r.ip_id = a.id
+         JOIN hostnames h ON h.id = r.hostname_id
+         WHERE a.address_family = ?1 AND a.canonical_ip = ?2
+           AND r.resolved_at >= ?3
+         UNION ALL
+         SELECT hostname, last_seen FROM shared_ip_direct_hosts
+         WHERE ?4 IS NOT NULL AND ipv4_packed = ?4 AND last_seen >= ?3
+     )
+     SELECT host, MAX(at) AS latest, COUNT(*) OVER ()
+     FROM seen GROUP BY host
+     ORDER BY latest DESC, host ASC
+     LIMIT ?5";
 
 fn system_time_to_ms(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)

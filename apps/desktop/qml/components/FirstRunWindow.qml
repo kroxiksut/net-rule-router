@@ -138,19 +138,35 @@ Window {
         }, "first-run")
     }
 
-    /// What one connection reads as in the two pickers below. The Windows
-    /// connection name alone is not an answer to "which one is this": a laptop
-    /// shows "Wi-Fi", "Wi-Fi 2" and "Ethernet 3" with nothing to tell them
-    /// apart, while the adapter description names the hardware and the
-    /// availability says whether it is up right now.
-    function _adapterLabel(row) {
+    /// What one connection reads as in the picker for `role`. A system name
+    /// alone is not an answer to "which one is this" (`Wi-Fi 2`, `enp4s0f1`):
+    /// the kind says what the device is, the availability whether it is up,
+    /// and the hint which role the recommendation sees in it.
+    function _adapterLabel(row, role) {
         if (!row) return ""
         // One rule for how an adapter reads, shared with every dialog.
-        var out = Pure.adapterDisplayName(row)
-        var state = String(row.availability || "") === "available"
+        var parts = [Pure.adapterDisplayName(row)]
+        var tech = String(row.deviceTechnology || "")
+        if (tech !== "") parts.push(root.tr("interfaces.device-technology." + tech, tech))
+        var kind = String(row.kind || "")
+        if (kind !== "") parts.push(root.tr("interfaces.kind." + kind, kind))
+        parts.push(String(row.availability || "") === "available"
             ? root.tr("interfaces.connectivity.available", "Connected")
-            : root.tr("interfaces.connectivity.unavailable", "No connection")
-        return out + " · " + state
+            : root.tr("interfaces.connectivity.unavailable", "No connection"))
+        var taken = Pure.adapterHeldOtherRole(row, role)
+        var hint = Pure.adapterRoleHintSlug(row)
+        if (taken !== "")
+            parts.push(root.tr("interfaces.role.taken." + taken, taken))
+        else if (hint !== "")
+            parts.push(root.tr("interfaces.hint." + hint, hint))
+        return parts.join(" · ")
+    }
+
+    /// Whether the picker for `role` may act on its current choice: an adapter
+    /// already holding the other role is shown there but not offered.
+    function _offeredFor(index, role) {
+        return index >= 0 && index < root.interfacesModel.count
+            && Pure.adapterHeldOtherRole(root.interfacesModel.get(index), role) === ""
     }
 
     /// The connection that looks like a tunnel, by the snapshot's own
@@ -161,9 +177,15 @@ Window {
         if (!root.interfacesModel) return ""
         for (var i = 0; i < root.interfacesModel.count; i += 1) {
             var row = root.interfacesModel.get(i)
-            if (!row) continue
-            var kind = String((row.derivedAssessment || {}).classification || "").toLowerCase()
-            if (kind.indexOf("vpn") >= 0) return String(row.name || "")
+            if (!row || String(row.selectedRole || "") === "primary") continue
+            // A kind the OS decided outranks the name: a bridged tap reads as a
+            // tunnel by name and is a VM's port. "other" decides nothing.
+            var kind = String(row.kind || "")
+            var looksVpn = kind !== "" && kind !== "other"
+                ? kind === "tunnel"
+                : String((row.derivedAssessment || {}).classification || "")
+                    .toLowerCase().indexOf("vpn") >= 0
+            if (looksVpn) return String(row.name || "")
         }
         return ""
     }
@@ -498,11 +520,14 @@ Window {
                         textRole: "name"
                         currentIndex: -1
                         labelResolver: function(item) {
-                            return firstRunWindow._adapterLabel(item)
+                            return firstRunWindow._adapterLabel(item, "primary")
+                        }
+                        itemEnabledResolver: function(item) {
+                            return Pure.adapterHeldOtherRole(item, "primary") === ""
                         }
                         displayText: root.uiRevision >= 0 && currentIndex >= 0
                             ? firstRunWindow._adapterLabel(
-                                root.interfacesModel.get(currentIndex))
+                                root.interfacesModel.get(currentIndex), "primary")
                             : root.tr("dialog.first-run-wizard.primary-adapter-placeholder",
                                 "Choose a connection")
                         Accessible.role: Accessible.ComboBox
@@ -512,7 +537,8 @@ Window {
                     ThemedButton {
                         theme: root.uiTheme
                         text: root.tr("dialog.first-run-wizard.primary-adapter-assign", "Set as main")
-                        enabled: root.interfacesAreLive && firstRunPrimaryCombo.currentIndex >= 0
+                        enabled: root.interfacesAreLive && root.uiRevision >= 0
+                            && firstRunWindow._offeredFor(firstRunPrimaryCombo.currentIndex, "primary")
                         onClicked: {
                             if (root.interfacesRolesController
                                     && typeof root.interfacesRolesController.assignRole === "function") {
@@ -521,6 +547,17 @@ Window {
                             }
                         }
                     }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    visible: !firstRunWindow.primaryAssigned && root.uiRevision >= 0
+                        && firstRunPrimaryCombo.currentIndex >= 0
+                        && !firstRunWindow._offeredFor(firstRunPrimaryCombo.currentIndex, "primary")
+                    text: root.tr("interfaces.role.exclusive-note",
+                        "One adapter cannot carry both routes: to use it for the other one, unassign its current role first.")
                 }
                 Label {
                     Layout.fillWidth: true
@@ -573,11 +610,14 @@ Window {
                         textRole: "name"
                         currentIndex: -1
                         labelResolver: function(item) {
-                            return firstRunWindow._adapterLabel(item)
+                            return firstRunWindow._adapterLabel(item, "secondary")
+                        }
+                        itemEnabledResolver: function(item) {
+                            return Pure.adapterHeldOtherRole(item, "secondary") === ""
                         }
                         displayText: root.uiRevision >= 0 && currentIndex >= 0
                             ? firstRunWindow._adapterLabel(
-                                root.interfacesModel.get(currentIndex))
+                                root.interfacesModel.get(currentIndex), "secondary")
                             : root.tr("dialog.first-run-wizard.primary-adapter-placeholder",
                                 "Choose a connection")
                         Accessible.role: Accessible.ComboBox
@@ -588,7 +628,8 @@ Window {
                         theme: root.uiTheme
                         text: root.tr("dialog.first-run-wizard.secondary-adapter-assign",
                             "Set as additional")
-                        enabled: root.interfacesAreLive && firstRunSecondaryCombo.currentIndex >= 0
+                        enabled: root.interfacesAreLive && root.uiRevision >= 0
+                            && firstRunWindow._offeredFor(firstRunSecondaryCombo.currentIndex, "secondary")
                         onClicked: {
                             if (root.interfacesRolesController
                                     && typeof root.interfacesRolesController.assignRole === "function") {
@@ -605,6 +646,18 @@ Window {
                         Accessible.name: text
                         onClicked: firstRunWindow.secondaryDeferred = true
                     }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
+                        && root.uiRevision >= 0
+                        && firstRunSecondaryCombo.currentIndex >= 0
+                        && !firstRunWindow._offeredFor(firstRunSecondaryCombo.currentIndex, "secondary")
+                    text: root.tr("interfaces.role.exclusive-note",
+                        "One adapter cannot carry both routes: to use it for the other one, unassign its current role first.")
                 }
                 RowLayout {
                     Layout.fillWidth: true

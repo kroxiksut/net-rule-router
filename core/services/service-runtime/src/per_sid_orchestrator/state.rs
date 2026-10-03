@@ -113,13 +113,15 @@ pub struct PerSidApplyOrchestrator {
     /// actually ran on. The compare re-derives the whole plan and lowers it —
     /// measured at seconds inside a pass that fires every 30 s — to produce one
     /// log line. On unchanged input that line says exactly what it said last
-    /// time, so the work is skipped and only a real change is re-evidenced.
+    /// time, so the work is skipped and only a real change is re-evidenced —
+    /// and no more often than [`super::shadow_compare::SHADOW_COMPARE_EVERY`].
     ///
     /// Windows-only, like the comparison it serves: off-Windows there is no WFP
     /// filter set to compare against, and an ungated field is dead code that
     /// only the Linux build reports.
     #[cfg(windows)]
-    pub(super) shadow_compare_seen: Mutex<std::collections::HashMap<String, u64>>,
+    pub(super) shadow_compare_seen:
+        Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>,
     /// Last per-band breakdown logged for a SID, so the composition line is
     /// written when the SET CHANGES rather than on every recompute — the same
     /// dedup-on-content rule the other periodic lines follow.

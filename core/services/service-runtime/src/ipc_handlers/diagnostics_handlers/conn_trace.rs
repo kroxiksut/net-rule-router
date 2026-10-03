@@ -1,6 +1,4 @@
 //! Recent connections, as the Diagnostics panel shows them.
-//!
-//! Split out of `diagnostics_handlers`; the code is unchanged.
 
 use super::*;
 
@@ -205,6 +203,20 @@ impl IpcHandler for ConnTraceEntriesListHandler {
                 rule_host: owner_of(&r.remote).cloned().unwrap_or_default(),
                 expected_route: expected_route(&r.remote),
                 observed_at_ms: r.observed_unix_ms.map(|v| v as i64).unwrap_or(0),
+                remote_hosts: r
+                    .remote_names
+                    .as_ref()
+                    .map(|n| n.names.clone())
+                    .unwrap_or_default(),
+                remote_host_count: r.remote_names.as_ref().map_or(0, |n| n.total),
+                remote_host_floor: r
+                    .remote_names
+                    .as_ref()
+                    .and_then(|n| n.names.first())
+                    .and_then(|name| nrr_domain::companion_affinity::registrable_domain(name))
+                    .unwrap_or_default()
+                    .to_string(),
+                remote_fake_ip: r.remote_names.as_ref().is_some_and(|n| n.fake_ip),
             })
             .collect();
 

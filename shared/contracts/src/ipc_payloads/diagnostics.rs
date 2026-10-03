@@ -412,6 +412,24 @@ pub struct ConnTraceEntryDto {
     /// domain rule cannot match a bare address.
     #[serde(default)]
     pub rule_host: String,
+    /// Hostnames the service's DNS saw the remote address answered for, most
+    /// recent first, capped; the first is the one shown. Empty when none was
+    /// seen. Several names on one address is a shared front end, not an error.
+    #[serde(default)]
+    pub remote_hosts: Vec<String>,
+    /// Distinct names in all, which may exceed `remote_hosts.len()`.
+    #[serde(default)]
+    pub remote_host_count: u32,
+    /// Registrable domain of the shown name: the GUI may drop leading labels
+    /// to fit the column (`*.site.example`), never past this. Empty when the
+    /// name has none.
+    #[serde(default)]
+    pub remote_host_floor: String,
+    /// The remote is a virtual (fake-IP) address; its name, when present, is
+    /// the one the service dealt it for. Empty `remote_hosts` then means the
+    /// binding was recycled.
+    #[serde(default)]
+    pub remote_fake_ip: bool,
 }
 
 /// Wire response for `ConnTraceEntriesList`.

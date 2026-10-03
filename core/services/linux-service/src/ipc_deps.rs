@@ -15,16 +15,26 @@
 //! revision, so one pass reads it back and reconciles it. Doing it inline rather
 //! than waiting for the next tick is what lets the GUI report the truth instead
 //! of "submitted, probably".
+//!
+//! ## Signed revisions
+//!
+//! The coordinator signs every revision it writes with the key kept beside the
+//! state database, and the rows a previous run left are checked before the first
+//! enforcement pass reads them: the neutral `revision_signing` sequence, with the
+//! key store as the only part this platform supplies.
 
 #![cfg(target_os = "linux")]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use nrr_diagnostics::audit::alert::SecurityAlertsRepository;
+use nrr_platform_api::key_store::KeyStore;
 use nrr_service_runtime::activation_coordinator::{
     ActivationCoordinator, DispatchFailure, PreFlightWarning, RulesApplyDispatcher,
     SidActionPlanSummary,
 };
+use nrr_service_runtime::boot_integrity::AuditTrail;
 use nrr_service_runtime::ipc_handlers::event_bus::EventBus;
 use nrr_service_runtime::ipc_handlers::IpcHandlerDeps;
 use nrr_service_runtime::principal_enforcement::{CycleOutcome, PrincipalEnforcementCycle};
@@ -45,6 +55,8 @@ use nrr_service_runtime::production_settings::{
     ProductionRetentionSettings, ProductionRoutingPause, ProductionServiceStability,
     ProductionStorageUsage,
 };
+use nrr_service_runtime::revision_signing::RevisionSigning;
+use nrr_service_runtime::revision_watch::RevisionWatch;
 use nrr_service_runtime::routing_pause::{
     NoopRoutingPauseAudit, PauseDispatcher, RoutingPauseCoordinator,
 };
@@ -64,6 +76,12 @@ pub(crate) struct IpcSurface {
     /// refuses a privileged mutation whose record cannot be written; with a
     /// no-op emitter that safeguard can never fire.
     pub audit: Arc<dyn IpcAuditEmitter>,
+    /// The one coordinator every rule change goes through, signing what it
+    /// writes; the runtime holds it for the life of the daemon.
+    pub coordinator: Arc<ActivationCoordinator>,
+    /// The recheck after an outside write to the state database. `None`
+    /// without a signing key.
+    pub revision_watch: Option<RevisionWatch>,
 }
 
 /// Turns an approved revision into kernel state by running one enforcement pass.
@@ -125,7 +143,7 @@ impl CycleApplyDispatcher {
         // before: the fix may be one the plans do not show.
         self.cycle.request_retry();
         match self.cycle.tick_logged("apply") {
-            CycleOutcome::Applied { .. } => Ok(()),
+            CycleOutcome::Applied { .. } | CycleOutcome::Unchanged => Ok(()),
             // Every other outcome means the machine does NOT match the
             // revision that was just approved. Reporting success here would
             // leave the user believing rules are in force that are not.
@@ -204,6 +222,10 @@ pub(crate) fn build_ipc_surface(
     traffic_sampler: Option<crate::runtime_deps::TrafficSamplerHandle>,
     cache_store: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
     conn_trace_ring: Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>,
+    app_enforcement: nrr_service_runtime::app_enforcement_status::AppEnforcementStatus,
+    conn_trace_log_apply: Arc<dyn Fn(bool) + Send + Sync>,
+    verbosity: Option<nrr_service_runtime::TracingVerbosityHandle>,
+    key_store: Arc<dyn KeyStore>,
 ) -> IpcSurface {
     // Cloned before the facade takes ownership: storage usage counts the same
     // log directory the diagnostics reader serves from, and on Linux that lives
@@ -216,25 +238,42 @@ pub(crate) fn build_ipc_surface(
     // to the housekeeping tick — the same wiring the Windows surface has.
     let mutation_tokens: Arc<MutationTokenStore> = Arc::default();
     let audit = ipc_audit_emitter(audit_writer.as_ref());
-    let alerts_repo = Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(
+    let alerts_repo: Arc<dyn SecurityAlertsRepository> = Arc::new(
+        ProductionSecurityAlertsRepository::new(Arc::clone(&state_conn)),
+    );
+
+    // Before the coordinator exists and before the socket listens: the check
+    // has to see the rows exactly as the previous run signed them. The same
+    // sequence the Windows service runs; only the key store is ours.
+    let signing = RevisionSigning::bootstrap(
         &state_conn,
-    )));
+        key_store,
+        Arc::clone(&alerts_repo),
+        audit_writer
+            .as_ref()
+            .map(|w| Arc::clone(w) as Arc<AuditTrail>),
+        Arc::clone(&health),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+    );
 
     // Without an audit writer the coordinator still runs, but its trail is not
     // persisted. Bootstrap already reported why, so this stays silent about the
     // cause and only picks the emitter.
     let activation_audit: Arc<
         dyn nrr_service_runtime::activation_coordinator::ActivationAuditEmitter,
-    > = match audit_writer {
+    > = match audit_writer.as_ref() {
         Some(writer) => Arc::new(
-            ProductionActivationAuditEmitter::new(writer, Arc::clone(&ids))
+            ProductionActivationAuditEmitter::new(Arc::clone(writer), Arc::clone(&ids))
                 .with_event_bus(Arc::clone(&event_bus)),
         ),
         None => Arc::new(nrr_service_runtime::activation_coordinator::NoopActivationAudit),
     };
 
     let sid_registry = Arc::new(ActiveSidRegistry::new());
-    let coordinator = Arc::new(ActivationCoordinator::new(
+    let coordinator = ActivationCoordinator::new(
         Arc::clone(&state_conn),
         Arc::clone(&sid_registry),
         Arc::new(CycleApplyDispatcher {
@@ -245,7 +284,10 @@ pub(crate) fn build_ipc_surface(
         Arc::new(nrr_service_runtime::production_settings::SystemClock),
         ids,
         nrr_service_runtime::activation_coordinator::ApplyFailurePolicy::AllOrNothing,
-    ));
+    );
+    let coordinator = Arc::new(signing.sign(coordinator));
+    // Before the first enforcement pass reads the rules.
+    let revision_watch = signing.enforce_and_watch(Some(&coordinator));
 
     let pause_coordinator = Arc::new(RoutingPauseCoordinator::new(
         Arc::clone(&state_conn),
@@ -258,14 +300,19 @@ pub(crate) fn build_ipc_surface(
     // Every rule change the GUI makes — preset import, table edits, rollback —
     // lands here; without it a preview came back empty and read as "nothing to
     // apply". The coordinator's dispatcher is what makes an approval take effect.
-    let mutation_executor = ProductionMutationExecutor::new(Arc::clone(&coordinator))
-        .with_alerts_repo(Arc::clone(&alerts_repo) as _)
+    let mut mutation_executor = ProductionMutationExecutor::new(Arc::clone(&coordinator))
+        .with_alerts_repo(Arc::clone(&alerts_repo))
         .with_state_conn(Arc::clone(&state_conn))
         .with_event_bus(Arc::clone(&event_bus))
         .with_pause_coordinator(Arc::clone(&pause_coordinator))
         .with_stability_provider(Arc::new(ProductionServiceStability::new(Arc::clone(
             &state_conn,
         ))));
+    // An alert acknowledgement the trail cannot point at would be recorded
+    // as having happened nowhere; the chain restart needs the trail too.
+    if let Some(writer) = audit_writer.as_ref() {
+        mutation_executor = mutation_executor.with_audit_writer(Arc::clone(writer));
+    }
 
     // Wired but shadowed: the launcher answers `autostart.*` before the socket
     // hop because autostart is per-user and this daemon runs as root, where
@@ -300,10 +347,12 @@ pub(crate) fn build_ipc_surface(
                 logs_dir,
                 audit_dir,
                 cache_conn,
-                alerts_repo,
+                Arc::clone(&alerts_repo),
                 Some(Arc::clone(&state_conn)),
             )
-            .with_log_writer(log_writer),
+            .with_log_writer(log_writer)
+            // Restarts the service sealed are honoured; any other is an event.
+            .with_chain_restart_key(coordinator.audit_restart_key()),
         ),
         Arc::new(mutation_executor),
         Arc::clone(&mutation_tokens),
@@ -349,6 +398,14 @@ pub(crate) fn build_ipc_surface(
     // Archives go under the runtime directory: the state tree is `0700`, and a
     // user cannot open a file below a directory they cannot traverse.
     let deps = deps
+        // The tamper gate at the socket, and the elevation an acknowledgement
+        // needs once it would adopt another user's rows.
+        .with_alerts_repo(alerts_repo)
+        .with_other_principals_reader(
+            nrr_service_runtime::revision_signing::other_principals_hold_revisions(Arc::clone(
+                &stats_state_conn,
+            )),
+        )
         .with_cache_repository(cache_store)
         .with_archives_config(
             nrr_platform_linux::systemd::runtime_dir().join("archives"),
@@ -356,7 +413,25 @@ pub(crate) fn build_ipc_surface(
         )
         .with_system_info(nrr_platform_linux::system_info::collect())
         .with_file_handoff(Arc::new(nrr_platform_linux::file_handoff::ChownFileHandoff))
-        .with_conn_trace_ring(conn_trace_ring);
+        .with_conn_trace_ring(conn_trace_ring)
+        // The same status the planner publishes rule conflicts into.
+        .with_app_enforcement_status(app_enforcement);
+    // The stability fields this daemon applies live are the verbose window,
+    // resumed here from the stored deadline, and the connection trace's log
+    // switch; the rest of the row is stored and not read.
+    let stability = {
+        let writer = ProductionServiceStability::new(Arc::clone(&stats_state_conn))
+            .with_conn_trace_ndjson_apply(conn_trace_log_apply);
+        Arc::new(match verbosity {
+            Some(handle) => writer.with_verbosity_control(Arc::new(handle)
+                as Arc<dyn nrr_service_runtime::verbosity_control::VerbosityControl>),
+            None => writer,
+        })
+    };
+    let deps = deps.with_service_stability(
+        Arc::clone(&stability) as Arc<dyn nrr_service_runtime::ServiceStabilityConfigProvider>,
+        stability as Arc<dyn nrr_service_runtime::ServiceStabilityConfigWriter>,
+    );
     // The SAME engine the observation consumer feeds. Without it the
     // `autorules.candidates.*` operations stay registered as unimplemented and
     // the GUI's suggestions page has nothing to read.
@@ -393,6 +468,8 @@ pub(crate) fn build_ipc_surface(
         deps: Arc::new(deps),
         mutation_tokens,
         audit,
+        coordinator,
+        revision_watch,
     }
 }
 
@@ -405,6 +482,9 @@ fn default_autostart_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/etc/xdg"))
         .join("autostart")
 }
+
+#[cfg(test)]
+mod integrity_tests;
 
 #[cfg(test)]
 mod tests {

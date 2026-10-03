@@ -15,8 +15,8 @@
 //! Windows adapters live in `nrr-windows-service` and implement the trait.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::state::ServiceRuntimeState;
 
@@ -62,24 +62,60 @@ pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// SCM sends `Stop`.
 #[derive(Clone, Debug)]
 pub struct StopToken {
-    flag: Arc<AtomicBool>,
+    inner: Arc<StopSignal>,
+}
+
+#[derive(Debug, Default)]
+struct StopSignal {
+    flag: AtomicBool,
+    /// Wakes the sleepers in [`StopToken::wait_for`]. A sleeper that polled the
+    /// flag instead woke twenty times a second per thread, on every idle task.
+    lock: Mutex<()>,
+    wake: Condvar,
 }
 
 impl StopToken {
     pub fn new() -> Self {
         Self {
-            flag: Arc::new(AtomicBool::new(false)),
+            inner: Arc::new(StopSignal::default()),
         }
     }
 
-    /// Signal every clone of this token to stop. Idempotent.
+    /// Signal every clone of this token to stop, waking every sleeper.
+    /// Idempotent.
     pub fn request_stop(&self) {
-        self.flag.store(true, Ordering::SeqCst);
+        self.inner.flag.store(true, Ordering::SeqCst);
+        // Taken so a sleeper between its flag check and its wait cannot miss
+        // the notification.
+        let _guard = self.inner.lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.inner.wake.notify_all();
     }
 
     /// Whether `request_stop()` has been called on any clone.
     pub fn is_stop_requested(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.inner.flag.load(Ordering::SeqCst)
+    }
+
+    /// Sleep up to `total`, returning early — at once — when a stop is
+    /// requested. Returns whether it was.
+    pub fn wait_for(&self, total: Duration) -> bool {
+        let deadline = Instant::now() + total;
+        let mut guard = self.inner.lock.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if self.is_stop_requested() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            guard = self
+                .inner
+                .wake
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
     }
 }
 
@@ -139,6 +175,33 @@ pub trait ServiceController: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sleeper wakes on the stop itself, not on its next poll — and without
+    /// one, sleeps out its time instead of spinning.
+    #[test]
+    fn a_sleeper_wakes_at_once_on_stop_and_not_before() {
+        let token = StopToken::new();
+        let started = Instant::now();
+        assert!(!token.wait_for(Duration::from_millis(30)));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+
+        let sleeper = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                (token.wait_for(Duration::from_secs(30)), started.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        token.request_stop();
+        let (stopped, slept) = sleeper.join().expect("sleeper");
+        assert!(stopped);
+        assert!(slept < Duration::from_secs(5), "woke only at its deadline");
+        assert!(
+            token.wait_for(Duration::from_secs(30)),
+            "a stopped token sleeps"
+        );
+    }
 
     #[test]
     fn stop_token_is_observed_by_clones() {

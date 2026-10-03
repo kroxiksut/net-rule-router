@@ -26,7 +26,9 @@ use nrr_domain::rules_revision::{RevisionStatus, RulesRevisionSource};
 // from the api SSOT, not the Windows backend (absent off Windows).
 use nrr_platform_api::key_store::{InMemKeyStore, KeyStore};
 use nrr_service_runtime::bootstrap::sweep_signed_orphaned_candidates;
-use nrr_service_runtime::tamper_bootstrap::{mutations_blocked_by_alert, run_tamper_bootstrap};
+use nrr_service_runtime::tamper_bootstrap::{
+    mutations_blocked_by_alert, raise_tamper_alerts, run_tamper_bootstrap,
+};
 use nrr_service_runtime::ProductionSecurityAlertsRepository;
 use nrr_storage::migration::SqliteMigrationRunner;
 use nrr_storage::repository::MigrationRunner;
@@ -92,6 +94,8 @@ fn scenario_1_external_tamper_detected_and_gated() {
     let repo = alerts();
 
     let out = run_tamper_bootstrap(&conn, &ks, &repo, NOW).expect("bootstrap");
+    // No sweep here to wait for: the alert names the row as found.
+    raise_tamper_alerts(&repo, &out.pending_tamper_alerts, None, NOW);
 
     assert!(!out.key_was_reset);
     assert_eq!(out.tampered_revision_ids, vec!["rev-1".to_string()]);
@@ -170,7 +174,8 @@ fn scenario_4_ack_re_signs_and_restart_is_clean() {
     let repo = alerts();
 
     // First boot raises the alert and gates.
-    run_tamper_bootstrap(&conn, &ks, &repo, NOW).expect("boot1");
+    let out = run_tamper_bootstrap(&conn, &ks, &repo, NOW).expect("boot1");
+    raise_tamper_alerts(&repo, &out.pending_tamper_alerts, None, NOW);
     assert!(mutations_blocked_by_alert(repo.as_ref()));
     let alert_id = repo.list_by_state(SecurityAlertState::Active).unwrap()[0]
         .alert_id
@@ -253,8 +258,11 @@ fn tamper_alert_on_shared_connection_does_not_deadlock() {
     let worker_alerts = Arc::clone(&alerts_repo);
     std::thread::spawn(move || {
         let ks = InMemKeyStore::with_key(key());
-        let out = run_tamper_bootstrap(&worker_conn, &ks, &worker_alerts, NOW);
-        let _ = tx.send(out.map(|o| o.tampered_revision_ids));
+        let out = run_tamper_bootstrap(&worker_conn, &ks, &worker_alerts, NOW).map(|o| {
+            raise_tamper_alerts(&worker_alerts, &o.pending_tamper_alerts, None, NOW);
+            o.tampered_revision_ids
+        });
+        let _ = tx.send(out);
     });
     let tampered = rx
         .recv_timeout(std::time::Duration::from_secs(30))

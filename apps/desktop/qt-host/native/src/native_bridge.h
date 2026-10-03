@@ -662,6 +662,12 @@ public:
     Q_INVOKABLE QString createPresetSetDir(const QString &rootDir,
                                            const QString &setName);
 
+    /// Where rule sets go when the user has named no folder: the product
+    /// folder under Documents. Created only when `create` is set, so asking
+    /// where it would be leaves nothing on disk. Empty when there is no
+    /// Documents folder or it cannot be created.
+    Q_INVOKABLE QString defaultRuleSetsDir(bool create);
+
     /// Write a file to disk from base64-encoded bytes.
     /// Used by the GUI's `Qt.labs.platform.FileDialog` Save path to
     /// persist the `file-bytes-b64` returned by `rpcSettingsExportFull`.

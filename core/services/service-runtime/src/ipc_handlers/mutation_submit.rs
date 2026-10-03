@@ -1008,6 +1008,16 @@ mod tests {
         fn rollback(&self, principal: &str, target: Option<&str>) -> MutationOutcome {
             self.0.rollback(principal, target)
         }
+        fn rollback_target(
+            &self,
+            principal: &str,
+            target: Option<&str>,
+        ) -> Result<
+            Option<nrr_shared::ipc_payloads::RollbackTargetDto>,
+            crate::ipc_handlers::operation_status_store::OperationError,
+        > {
+            self.0.rollback_target(principal, target)
+        }
         fn safe_disable(&self, reason: &str) -> MutationOutcome {
             self.0.safe_disable(reason)
         }

@@ -80,19 +80,16 @@ pub fn pkexec_argv(helper: &Path, args: &[String]) -> Vec<String> {
 
 /// Classifies a finished `pkexec` process's exit status into an
 /// [`ElevationOutcome`], per pkexec(1):
-/// - `127` — not authorized / authentication could not be obtained → the user
-///   declined or lacks rights → [`ElevationOutcome::Declined`].
-/// - `126` — the helper could not be found or spawned → plumbing →
-///   [`ElevationOutcome::Failed`].
+/// - `126` — the user dismissed the authentication dialog →
+///   [`ElevationOutcome::Declined`].
+/// - `127` — not authorized, or authentication could not be obtained →
+///   [`ElevationOutcome::Declined`].
 /// - any other code (including the helper's own `0` / non-zero) — polkit
 ///   authorized and ran the helper → [`ElevationOutcome::Launched`].
 /// - `None` (terminated by a signal) → [`ElevationOutcome::Failed`].
 pub fn classify_pkexec_exit(code: Option<i32>) -> ElevationOutcome {
     match code {
-        Some(127) => ElevationOutcome::Declined,
-        Some(126) => {
-            ElevationOutcome::Failed("pkexec could not spawn the helper (126)".to_string())
-        }
+        Some(126 | 127) => ElevationOutcome::Declined,
         Some(_) => ElevationOutcome::Launched,
         None => ElevationOutcome::Failed("pkexec was terminated by a signal".to_string()),
     }
@@ -189,12 +186,10 @@ mod tests {
         assert_eq!(classify_pkexec_exit(Some(127)), ElevationOutcome::Declined);
     }
 
+    /// A closed dialog is the user's answer, not a broken install.
     #[test]
-    fn exit_126_is_failed_plumbing() {
-        assert!(matches!(
-            classify_pkexec_exit(Some(126)),
-            ElevationOutcome::Failed(_)
-        ));
+    fn exit_126_is_a_dismissed_dialog() {
+        assert_eq!(classify_pkexec_exit(Some(126)), ElevationOutcome::Declined);
     }
 
     #[test]

@@ -719,6 +719,9 @@ pub enum RiskSignalDto {
     AdditionalAdapterUnresolved,
     /// The service's own consistency check would refuse this apply.
     ApplyWillBeRefused,
+    /// Too many filters for one transaction: the apply goes through in several
+    /// steps, each all-or-nothing on its own.
+    ApplyInSeveralBatches,
     /// Values the per-row verdict refuses, so the revision is not accepted.
     /// The kind is also the code the refusal carries on execute.
     InvalidRuleValue {

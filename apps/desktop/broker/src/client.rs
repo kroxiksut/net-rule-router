@@ -11,6 +11,7 @@
 //! time: queueing in the launcher keeps each call's wait about its own work,
 //! not about whatever was ahead of it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ pub fn new_handle() -> BrokerHandle {
         last_used: Mutex::new(None),
         relay: Mutex::new(()),
         unanswered: Mutex::new(None),
+        awaiting_consent: AtomicBool::new(false),
     })
 }
 
@@ -63,6 +65,9 @@ pub struct Broker {
     /// Until it finishes the broker answers nothing else, so the next call
     /// asks whether it is free before handing it more work.
     unanswered: Mutex<Option<String>>,
+    /// A spawn is waiting on the UAC prompt, which stays up as long as the
+    /// user leaves it.
+    awaiting_consent: AtomicBool,
 }
 
 /// Outcome of a broker-relayed call.
@@ -116,6 +121,12 @@ impl Broker {
     /// GUI's "administrator rights are held" indicator, which polls.
     pub fn is_session_active(&self) -> bool {
         lock(&self.state).is_some()
+    }
+
+    /// Is a privileged call waiting for the user to answer the UAC prompt?
+    /// Callers stop counting its deadline meanwhile.
+    pub fn is_awaiting_consent(&self) -> bool {
+        self.awaiting_consent.load(Ordering::Acquire)
     }
 
     /// Mark the session as just-used (every relay that reached the broker).
@@ -288,15 +299,18 @@ impl Broker {
     }
 
     /// Returns the live session, spawning one (a single UAC prompt) if needed.
-    /// The state lock is held across the spawn so two callers cannot raise two
-    /// prompts.
+    /// Only a relay spawns, and relays are serialised, so there is one prompt
+    /// at a time. The state lock is not held across it: the status poll and
+    /// revoke read that lock, and the prompt can stay up for minutes.
     fn session_or_spawn<T: Transport>(&self, transport: &T) -> Result<Session, BrokerCallError> {
-        let mut guard = lock(&self.state);
-        if let Some(session) = guard.as_ref() {
-            return Ok(session.clone());
+        if let Some(session) = lock(&self.state).clone() {
+            return Ok(session);
         }
-        let session = transport.spawn()?;
-        *guard = Some(session.clone());
+        self.awaiting_consent.store(true, Ordering::Release);
+        let spawned = transport.spawn();
+        self.awaiting_consent.store(false, Ordering::Release);
+        let session = spawned?;
+        *lock(&self.state) = Some(session.clone());
         Ok(session)
     }
 
@@ -660,6 +674,87 @@ mod tests {
             &serde_json::json!({ "action": "reinstall" }),
             Duration::from_secs(60),
         )
+    }
+
+    /// A spawn that waits, the way the UAC prompt does, until released.
+    struct PromptedSpawn {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Transport for PromptedSpawn {
+        fn spawn(&self) -> Result<Session, BrokerCallError> {
+            let _ = self.entered.send(());
+            let _ = lock(&self.release).recv();
+            Ok(Session {
+                pipe_name: "broker-1".to_string(),
+                nonce: "nonce".to_string(),
+            })
+        }
+
+        fn exchange(
+            &self,
+            _session: &Session,
+            operation: &str,
+            _payload: &serde_json::Value,
+            _requested: Duration,
+            _answer_timeout: Duration,
+        ) -> Result<BrokerResponse, CallFailure> {
+            Ok(BrokerResponse::ok(serde_json::json!({ "op": operation })))
+        }
+
+        fn pipe_served(&self, _session: &Session) -> bool {
+            true
+        }
+    }
+
+    /// The status poll and revoke answer at once while the prompt is up, and
+    /// the poll can tell the user is being asked.
+    #[test]
+    fn the_status_poll_answers_while_the_uac_prompt_is_up() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let broker = new_handle();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let relaying = Arc::clone(&broker);
+        let relay = thread::spawn(move || {
+            let transport = PromptedSpawn {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            };
+            relaying
+                .relay(
+                    &transport,
+                    BROKER_PING,
+                    &serde_json::json!({}),
+                    Duration::ZERO,
+                )
+                .is_ok()
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the spawn started");
+
+        let (answer_tx, answer_rx) = mpsc::channel();
+        let polled = Arc::clone(&broker);
+        thread::spawn(move || {
+            let _ = answer_tx.send((
+                polled.is_awaiting_consent(),
+                polled.is_session_active(),
+                polled.shutdown_if_active(),
+            ));
+        });
+        let answer = answer_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).expect("release the prompt");
+        assert_eq!(
+            answer.expect("the poll waited for the prompt"),
+            (true, false, false)
+        );
+        assert!(relay.join().expect("relay thread"));
+        assert!(!broker.is_awaiting_consent());
+        assert!(broker.is_session_active());
     }
 
     #[test]

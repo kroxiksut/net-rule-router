@@ -20,7 +20,8 @@
 
 #![cfg(target_os = "linux")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use nrr_platform_api::adapters::AdapterEventSource;
 use nrr_platform_api::enforcement::{
@@ -30,6 +31,19 @@ use nrr_platform_api::enforcement::{
 
 use crate::lower_linux::{lower_scoped, EgressNames, ScopedPlan};
 use crate::nft_apply::{NftApplyError, NftCliEnforcement};
+use crate::nft_ir::NftRuleset;
+
+/// How long a ruleset identical to the one applied is trusted to still be in
+/// the kernel. Past it the same ruleset is applied again, which is what puts
+/// back a table somebody else flushed.
+const UNCHANGED_RECHECK: Duration = Duration::from_secs(5 * 60);
+
+/// The last ruleset the kernel took whole, and when.
+struct Applied {
+    ruleset: NftRuleset,
+    at: Instant,
+    rules: usize,
+}
 
 pub struct NftPolicyEnforcer {
     bindings: Arc<dyn EgressBindingSource>,
@@ -47,6 +61,9 @@ pub struct NftPolicyEnforcer {
     /// requirement and the evidence-freshness rules are policy and live in the
     /// neutral layer, which this crate must not depend on.
     liveness: Option<LivenessOracle>,
+    /// Lets a pass whose ruleset did not change skip the `nft` run — the most
+    /// expensive part of an idle pass.
+    applied: Mutex<Option<Applied>>,
 }
 
 /// `false` = this interface has been declared dead. Anything else — alive,
@@ -65,6 +82,7 @@ impl NftPolicyEnforcer {
             cli: NftCliEnforcement::new(),
             table: crate::lower_linux::NRR_TABLE.to_owned(),
             liveness: None,
+            applied: Mutex::new(None),
         }
     }
 
@@ -105,6 +123,23 @@ fn failure(e: NftApplyError) -> EnforcementFailure {
     }
 }
 
+/// Splits a slow apply into lowering and the `nft` run (render included), which
+/// the caller's pass timing sees only as one phase.
+fn report_apply_cost(lower: Duration, nft: Duration, rules: usize) {
+    const SLOW: Duration = Duration::from_millis(300);
+    if lower + nft < SLOW {
+        return;
+    }
+    tracing::info!(
+        target: "nrr::enforcement-cost",
+        msg_key = "nft-apply-cost",
+        lower_ms = lower.as_millis(),
+        nft_ms = nft.as_millis(),
+        rules,
+        "nft apply was slow — lowering vs the nft run",
+    );
+}
+
 impl NftPolicyEnforcer {
     /// Resolve one principal's bindings against the links present now.
     fn resolve(
@@ -141,8 +176,32 @@ impl PolicyEnforcer for NftPolicyEnforcer {
             .map(|(plan, egress)| ScopedPlan { plan, egress })
             .collect();
 
+        let started = Instant::now();
         let mut lowered = lower_scoped(&scoped);
         lowered.ruleset.table.clone_from(&self.table);
+        let lowered_at = Instant::now();
+        let notes_for_unsupported = || -> Vec<String> {
+            lowered
+                .unsupported
+                .iter()
+                .map(crate::nft_backend::note_for)
+                .collect()
+        };
+
+        let mut applied = self.applied.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(last) = applied.as_ref() {
+            if last.ruleset == lowered.ruleset && last.at.elapsed() < UNCHANGED_RECHECK {
+                return Ok(ApplyReport {
+                    applied: last.rules,
+                    skipped: lowered.unsupported.len(),
+                    failed: 0,
+                    notes: notes_for_unsupported(),
+                });
+            }
+        }
+        // Forgotten before the run: a failed or partial apply leaves the kernel
+        // holding something other than this ruleset.
+        *applied = None;
         // Best-effort for the same reason as the other enforcement entry: a
         // single rule the kernel refuses must not cost the user every other
         // rule they have.
@@ -150,12 +209,21 @@ impl PolicyEnforcer for NftPolicyEnforcer {
             .cli
             .apply_best_effort(&lowered.ruleset)
             .map_err(failure)?;
+        report_apply_cost(
+            lowered_at.duration_since(started),
+            lowered_at.elapsed(),
+            lowered.ruleset.rules.len(),
+        );
+        if outcome.skipped.is_empty() {
+            *applied = Some(Applied {
+                ruleset: lowered.ruleset.clone(),
+                at: Instant::now(),
+                rules: outcome.applied,
+            });
+        }
+        drop(applied);
 
-        let mut notes: Vec<String> = lowered
-            .unsupported
-            .iter()
-            .map(crate::nft_backend::note_for)
-            .collect();
+        let mut notes = notes_for_unsupported();
         notes.extend(
             outcome
                 .skipped
@@ -200,6 +268,7 @@ impl PolicyEnforcer for NftPolicyEnforcer {
     }
 
     fn teardown(&self) -> Result<(), EnforcementFailure> {
+        *self.applied.lock().unwrap_or_else(|p| p.into_inner()) = None;
         self.cli.teardown(&self.table).map_err(failure)
     }
 }
@@ -207,6 +276,71 @@ impl PolicyEnforcer for NftPolicyEnforcer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nrr_platform_api::adapters::MockAdapterEventSource;
+    use nrr_platform_api::enforcement::EgressBinding;
+
+    struct Unbound;
+    impl EgressBindingSource for Unbound {
+        fn bindings_for(&self, _: &UserPrincipal) -> EgressBinding {
+            EgressBinding::default()
+        }
+    }
+
+    /// An enforcer whose `nft` is a shell stand-in that records each run.
+    fn counting(log: &std::path::Path) -> NftPolicyEnforcer {
+        let script: &'static str =
+            Box::leak(format!("cat >/dev/null; echo run >> '{}'", log.display()).into_boxed_str());
+        let args: &'static [&'static str] = Box::leak(Box::new(["-c", script, "nft"]));
+        let mut enforcer =
+            NftPolicyEnforcer::new(Arc::new(Unbound), Arc::new(MockAdapterEventSource::new()));
+        enforcer.cli = NftCliEnforcement::with_program("/bin/sh", args, Duration::from_secs(10));
+        enforcer
+    }
+
+    fn runs(log: &std::path::Path) -> usize {
+        std::fs::read_to_string(log).map_or(0, |s| s.lines().count())
+    }
+
+    /// An idle pass hands the kernel nothing new, so it must not pay for an
+    /// `nft` run — but the same ruleset is still reapplied once the recheck
+    /// window has passed, and after a teardown, both of which may have left the
+    /// kernel without it.
+    #[test]
+    fn an_unchanged_ruleset_is_not_applied_again_until_the_recheck() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs");
+        let enforcer = counting(&log);
+
+        enforcer.enforce(&[]).expect("first apply");
+        enforcer.enforce(&[]).expect("unchanged apply");
+        assert_eq!(
+            runs(&log),
+            1,
+            "the unchanged ruleset was handed to nft again"
+        );
+
+        if let Some(applied) = enforcer
+            .applied
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            applied.at = Instant::now()
+                .checked_sub(UNCHANGED_RECHECK)
+                .expect("the clock is past one window");
+        }
+        enforcer.enforce(&[]).expect("recheck apply");
+        assert_eq!(runs(&log), 2, "the recheck did not reapply");
+
+        enforcer.teardown().expect("teardown");
+        let after_teardown = runs(&log);
+        enforcer.enforce(&[]).expect("apply after teardown");
+        assert_eq!(
+            runs(&log),
+            after_teardown + 1,
+            "a teardown must not be mistaken for the ruleset still being in force"
+        );
+    }
 
     #[test]
     fn only_a_hung_nft_is_worth_retrying_unchanged() {

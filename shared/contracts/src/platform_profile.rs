@@ -98,6 +98,10 @@ pub struct PlatformSupports {
     /// writing. Where the supervisor holds the defaults and never reads the
     /// stored row, the GUI must not offer settings nothing will apply.
     pub service_stability_config: bool,
+    /// Verbose service logging can be switched on for a window from the GUI.
+    /// Separate from `service_stability_config`: a service that applies none
+    /// of the other stability settings may still apply this one.
+    pub verbose_logging: bool,
     /// Local network segments can be exempted from leak protection by name.
     /// Needs the route coordinator that discovers and enforces them.
     pub local_network_exceptions: bool,
@@ -172,6 +176,7 @@ impl PlatformProfile {
                 background_service: true,
                 autostart: true,
                 service_stability_config: true,
+                verbose_logging: true,
                 local_network_exceptions: true,
                 block_notices: true,
                 audit_chain_restart: true,
@@ -209,12 +214,16 @@ impl PlatformProfile {
                 // connection observer, so all three answer `false` rather than
                 // let the GUI ask for handlers that are not registered.
                 service_stability_config: false,
+                // The daemon applies a verbose window live and resumes it on
+                // start, whatever happens to the rest of the stored row.
+                verbose_logging: true,
                 local_network_exceptions: false,
                 block_notices: false,
                 // The daemon wires no integrity key into the coordinator.
                 audit_chain_restart: false,
-                // The Linux observer tees into the panel's ring only.
-                conn_trace_log: false,
+                // The observer tee writes the operational log behind the same
+                // live switch as on Windows.
+                conn_trace_log: true,
                 // Inversions: Linux routes per-user (ip rule uidrange) and
                 // scopes per-user blocks to all protocols (meta skuid), which
                 // Windows cannot — but its per-app block is NOT leak-proof
@@ -245,6 +254,7 @@ impl PlatformProfile {
                 background_service: true,
                 autostart: true,
                 service_stability_config: false,
+                verbose_logging: false,
                 local_network_exceptions: false,
                 block_notices: false,
                 audit_chain_restart: false,
@@ -283,7 +293,15 @@ mod tests {
         assert!(s.kill_switch && s.app_routing && s.dns_observe && s.dns_resolver);
         assert!(s.hosts_pin && s.background_service && s.autostart);
         assert!(s.service_stability_config && s.local_network_exceptions && s.block_notices);
-        assert!(s.audit_chain_restart && s.conn_trace_log);
+        assert!(s.audit_chain_restart && s.conn_trace_log && s.verbose_logging);
+    }
+
+    /// The daemon applies a verbose window without the rest of the stability
+    /// row, so the GUI may offer that one switch on Linux.
+    #[test]
+    fn verbose_logging_is_offered_where_the_service_applies_it() {
+        assert!(PlatformProfile::linux().supports.verbose_logging);
+        assert!(!PlatformProfile::macos().supports.verbose_logging);
     }
 
     /// Service-backed features the Linux daemon does not carry out. A `true`
@@ -298,8 +316,15 @@ mod tests {
             assert!(!supports.local_network_exceptions);
             assert!(!supports.block_notices);
             assert!(!supports.audit_chain_restart);
-            assert!(!supports.conn_trace_log);
         }
+    }
+
+    /// Linux writes the connection trace to the service log; macOS has no
+    /// observer yet, so the GUI must not offer a switch that writes nothing.
+    #[test]
+    fn conn_trace_log_is_offered_where_the_service_writes_it() {
+        assert!(PlatformProfile::linux().supports.conn_trace_log);
+        assert!(!PlatformProfile::macos().supports.conn_trace_log);
     }
 
     #[test]

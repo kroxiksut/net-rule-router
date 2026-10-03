@@ -12,22 +12,33 @@ use super::*;
 /// not re-rank what a cold start showed. The role the user bound is shown
 /// separately (`selected_role`).
 pub fn assign_recommendations(rows: &mut [InterfaceRouteRow]) {
-    let scores = rows.iter().map(score_row).collect::<Vec<_>>();
+    let sole_uplink = sole_uplink_index(rows);
+    let scores = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| score_row(row, sole_uplink == Some(index)))
+        .collect::<Vec<_>>();
+    let eligible = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| role_eligibility(row, sole_uplink == Some(index)))
+        .collect::<Vec<_>>();
 
-    // A Bluetooth link is never preferred, so it must not take the maximum
-    // either: winning it and then being classed "not recommended" left no
-    // preferred primary at all and pointed every other row at it.
-    let contenders = || {
-        scores
-            .iter()
-            .enumerate()
-            .filter(|(index, score)| !score.blocked && !rows[*index].is_bluetooth_like)
-    };
-    let best_primary_index = contenders()
+    // A row barred from a role must not take that role's maximum either:
+    // winning it and then being classed "not recommended" left no preferred
+    // adapter at all and pointed every other row at it.
+    let best_primary_index = scores
+        .iter()
+        .enumerate()
+        .filter(|(index, score)| !score.blocked && eligible[*index].primary)
         .max_by_key(|(index, score)| (score.primary, primary_tie_break(&rows[*index])))
         .map(|(index, _)| index);
-    let best_secondary_index = contenders()
-        .filter(|(index, _)| Some(*index) != best_primary_index)
+    let best_secondary_index = scores
+        .iter()
+        .enumerate()
+        .filter(|(index, score)| {
+            !score.blocked && eligible[*index].secondary && Some(*index) != best_primary_index
+        })
         .max_by_key(|(index, score)| (score.secondary, secondary_tie_break(&rows[*index])))
         .map(|(index, _)| index);
 
@@ -39,8 +50,6 @@ pub fn assign_recommendations(rows: &mut [InterfaceRouteRow]) {
     for (index, score) in scores.into_iter().enumerate() {
         let class = if score.blocked {
             RecommendationClass::NotRecommended
-        } else if rows[index].is_bluetooth_like {
-            RecommendationClass::AllowedButNotRecommended
         } else if Some(index) == best_primary_index && score.primary >= 6 {
             RecommendationClass::PreferredPrimary
         } else if Some(index) == best_secondary_index && score.secondary >= 5 {
@@ -101,6 +110,54 @@ fn carries_traffic(row: &InterfaceRouteRow) -> bool {
     row.has_forwarding_path.unwrap_or(row.has_default_route)
 }
 
+/// The one row that is this machine's way out, judged by structure alone: the
+/// sole holder of a default route, else the sole row that forwards at all. It
+/// is the uplink whatever its kind says (a PPPoE link, a bridge carrying the
+/// host's address), so its kind neither bars nor penalises it.
+fn sole_uplink_index(rows: &[InterfaceRouteRow]) -> Option<usize> {
+    let only = |holds: fn(&InterfaceRouteRow) -> bool| {
+        let mut holders = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| holds(row))
+            .map(|(index, _)| index);
+        let first = holders.next()?;
+        holders.next().is_none().then_some(first)
+    };
+    if rows.iter().any(|row| row.has_default_route) {
+        only(|row| row.has_default_route)
+    } else {
+        only(carries_traffic)
+    }
+}
+
+fn is_bluetooth(row: &InterfaceRouteRow) -> bool {
+    row.is_bluetooth_like || row.kind == AdapterKind::Bluetooth
+}
+
+struct RoleEligibility {
+    primary: bool,
+    secondary: bool,
+}
+
+/// Which roles a row may be recommended for. A tunnel is a secondary and never
+/// the primary; a VM's or container's adapter is neither; a Bluetooth link is
+/// never preferred, whatever it holds.
+fn role_eligibility(row: &InterfaceRouteRow, sole_uplink: bool) -> RoleEligibility {
+    let (primary, secondary) = if is_bluetooth(row) {
+        (false, false)
+    } else if sole_uplink {
+        (true, true)
+    } else {
+        match row.kind {
+            AdapterKind::Tunnel => (false, true),
+            AdapterKind::Virtual => (false, false),
+            _ => (true, true),
+        }
+    };
+    RoleEligibility { primary, secondary }
+}
+
 struct RowScore {
     primary: i32,
     secondary: i32,
@@ -109,11 +166,22 @@ struct RowScore {
     key_signals: Vec<String>,
 }
 
-fn score_row(row: &InterfaceRouteRow) -> RowScore {
+fn score_row(row: &InterfaceRouteRow, sole_uplink: bool) -> RowScore {
     let mut primary = 0;
     let mut secondary = 0;
     let mut key_signals = Vec::new();
     let mut signal = |slug: &str| key_signals.push(slug.to_string());
+
+    let vpn_likelihood = row.derived_assessment.vpn_tunnel_likelihood;
+    let tunnel_kind = row.kind == AdapterKind::Tunnel && !sole_uplink;
+    let tunnel_shaped = tunnel_kind || vpn_likelihood == DerivedLikelihood::Likely;
+    if sole_uplink {
+        signal("sole-uplink-by-structure");
+    } else if tunnel_kind {
+        signal("adapter-kind-tunnel");
+    } else if row.kind == AdapterKind::Virtual {
+        signal("adapter-kind-virtual");
+    }
 
     let mut blocked = false;
     if row.availability_status == BasicAvailabilityStatus::Unavailable {
@@ -154,9 +222,7 @@ fn score_row(row: &InterfaceRouteRow) -> RowScore {
     } else if carries_traffic(row) {
         primary += 3;
         signal("forwarding-path-without-gateway");
-    } else if row.has_forwarding_path == Some(false)
-        && row.derived_assessment.vpn_tunnel_likelihood != DerivedLikelihood::Likely
-    {
+    } else if row.has_forwarding_path == Some(false) && !tunnel_shaped {
         // Evaluated, no way out, and not tunnel-shaped (host-only switch):
         // preferring it as the secondary would route rules into nothing. A
         // tunnel is exempt because it is normally still down while the user
@@ -185,27 +251,30 @@ fn score_row(row: &InterfaceRouteRow) -> RowScore {
         }
     }
 
-    match row.derived_assessment.vpn_tunnel_likelihood {
-        DerivedLikelihood::Likely => {
-            primary -= 4;
-            secondary += 4;
-            signal("vpn-tunnel-likely");
-        }
-        DerivedLikelihood::Possible => {
-            primary -= 1;
-            secondary += 2;
-            signal("vpn-tunnel-possible");
-        }
-        DerivedLikelihood::Unlikely => primary += 1,
-        DerivedLikelihood::Unknown => {}
+    match vpn_likelihood {
+        DerivedLikelihood::Likely => signal("vpn-tunnel-likely"),
+        DerivedLikelihood::Possible => signal("vpn-tunnel-possible"),
+        DerivedLikelihood::Unlikely | DerivedLikelihood::Unknown => {}
     }
+    // The name and the kind are two readings of one fact: counted once.
+    let (p, s) = if tunnel_shaped {
+        (-4, 4)
+    } else {
+        match vpn_likelihood {
+            DerivedLikelihood::Possible => (-1, 2),
+            DerivedLikelihood::Unlikely => (1, 0),
+            DerivedLikelihood::Likely | DerivedLikelihood::Unknown => (0, 0),
+        }
+    };
+    primary += p;
+    secondary += s;
 
     if row.derived_assessment.virtual_interface_likelihood == DerivedLikelihood::Likely {
         primary -= 3;
         secondary -= 2;
         signal("virtual-interface-likely");
     }
-    if row.is_bluetooth_like {
+    if is_bluetooth(row) {
         primary -= 4;
         secondary -= 2;
         signal("bluetooth-adapter-nondefault-routing-profile");
@@ -252,7 +321,9 @@ fn secondary_tie_break(row: &InterfaceRouteRow) -> i32 {
     if !row.persistent_id.trim().is_empty() {
         weight += 10;
     }
-    if row.derived_assessment.vpn_tunnel_likelihood == DerivedLikelihood::Likely {
+    if row.kind == AdapterKind::Tunnel
+        || row.derived_assessment.vpn_tunnel_likelihood == DerivedLikelihood::Likely
+    {
         weight += 8;
     }
     weight

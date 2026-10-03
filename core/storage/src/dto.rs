@@ -297,6 +297,18 @@ pub struct CacheStats {
     pub cache_generation: u64,
 }
 
+/// Names seen at one address, as [`CacheRepository::names_for_address`]
+/// returns them.
+///
+/// [`CacheRepository::names_for_address`]: crate::repository::CacheRepository::names_for_address
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddressNames {
+    /// Most recently seen first, capped by the caller's limit.
+    pub names: Vec<String>,
+    /// Distinct names in all, including the ones the limit left out.
+    pub total: u32,
+}
+
 // ── Cache entries viewer ──────────────────────────────────────────────────────
 
 /// One flat `(hostname, ip)` resolution row for the read-only cache-entries

@@ -136,6 +136,16 @@ pub(crate) struct SysfsFacts {
     pub(crate) is_wireless: bool,
     /// `tun_flags` is present — the device is a tun/tap.
     pub(crate) is_tun_device: bool,
+    /// `IFF_TAP` in `tun_flags`: an Ethernet-level tap, not a routed tun.
+    pub(crate) is_tap: bool,
+    /// A `master` link is present: the interface is enslaved to a bridge, a
+    /// bond or a switch, i.e. a port of something else.
+    pub(crate) has_master: bool,
+    /// `IFF_POINTOPOINT` out of `flags`.
+    pub(crate) point_to_point: bool,
+    /// A `device` link is present — a bus device (PCI, USB, SDIO) backs the
+    /// interface. Software devices have none.
+    pub(crate) has_device: Option<bool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -151,9 +161,10 @@ pub(crate) fn read_sysfs_facts(sysfs: &Path, name: &str) -> SysfsFacts {
             .map(|raw| raw.trim().to_ascii_lowercase())
             .ok()
     };
+    let flags = read_number("flags", 16);
     SysfsFacts {
         arphrd: read_number("type", 10),
-        admin_up: read_number("flags", 16).is_some_and(|f| f & IFF_UP != 0),
+        admin_up: flags.is_some_and(|f| f & IFF_UP != 0),
         operstate: read_text("operstate"),
         // Reading `carrier` on a down interface fails with EINVAL; absent is
         // the honest answer, not `false`.
@@ -163,6 +174,10 @@ pub(crate) fn read_sysfs_facts(sysfs: &Path, name: &str) -> SysfsFacts {
             .and_then(|text| devtype_from_uevent(&text)),
         is_wireless: dir.join("wireless").exists() || dir.join("phy80211").exists(),
         is_tun_device: dir.join("tun_flags").exists(),
+        is_tap: read_number("tun_flags", 16).is_some_and(|f| f & IFF_TAP != 0),
+        has_master: dir.join("master").exists(),
+        point_to_point: flags.is_some_and(|f| f & IFF_POINTOPOINT != 0),
+        has_device: Some(dir.join("device").exists()),
     }
 }
 
@@ -190,19 +205,22 @@ pub(crate) struct Classification {
 }
 
 /// ARPHRD classes worth naming. The rest fall through to `Other`.
-const ARPHRD_ETHER: u32 = 1;
-const ARPHRD_PPP: u32 = 512;
-const ARPHRD_TUNNEL: u32 = 768;
-const ARPHRD_TUNNEL6: u32 = 769;
-const ARPHRD_LOOPBACK: u32 = 772;
-const ARPHRD_SIT: u32 = 776;
-const ARPHRD_NONE: u32 = 65534;
+pub(crate) const ARPHRD_ETHER: u32 = 1;
+pub(crate) const ARPHRD_PPP: u32 = 512;
+pub(crate) const ARPHRD_TUNNEL: u32 = 768;
+pub(crate) const ARPHRD_TUNNEL6: u32 = 769;
+pub(crate) const ARPHRD_LOOPBACK: u32 = 772;
+pub(crate) const ARPHRD_SIT: u32 = 776;
+pub(crate) const ARPHRD_NONE: u32 = 65534;
 
 /// `IFF_UP` — administratively up. Sysfs `flags` exposes `dev->flags`, which
 /// does NOT carry `IFF_RUNNING`: on a live host `eth0` reads `0x1003` and `lo`
 /// reads `0x9`, neither with the running bit. Operational state therefore comes
 /// from `operstate` + `carrier`, and this flag is only the precondition.
 const IFF_UP: u32 = 0x1;
+const IFF_POINTOPOINT: u32 = 0x10;
+/// `tun_flags` bit for a tap (Ethernet-level) device.
+const IFF_TAP: u32 = 0x2;
 
 /// Kernel device types that mean "software construct", not a NIC. Distinct
 /// from the tunnel set: a bridge carries real traffic, it just is not hardware.

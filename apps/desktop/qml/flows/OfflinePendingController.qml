@@ -211,7 +211,9 @@ QtObject {
         var obj = root._readPendingOffline()
         if (Pure.pendingOfflineCount(obj) === 0) { finish([]); return }
         var rp = obj["route-policy"] || {}
-        var st = obj["stability"] || {}
+        // A parked key this OS's service never applies is no pending change;
+        // it is dropped with the rest once everything else matches.
+        var st = root.stabilityPatchForPlatform(obj["stability"] || {})
         var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
         if (!readCorr) { finish([]); return }
         root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
@@ -248,7 +250,7 @@ QtObject {
                 }
                 finish(rows)
             }
-            if (Object.keys(st).length === 0 || !root.serviceStabilitySupported
+            if (Object.keys(st).length === 0
                     || typeof nrrNativeBridge.rpcServiceStabilityConfigGet !== "function") {
                 finalizeWith({})
                 return
@@ -319,7 +321,7 @@ QtObject {
     function _applyOfflinePending(fallbackRows) {
         var obj = root._readPendingOffline()
         var rp = obj["route-policy"] || {}
-        var st = obj["stability"] || {}
+        var st = root.stabilityPatchForPlatform(obj["stability"] || {})
         var haveRp = Object.keys(rp).length > 0
         var haveSt = Object.keys(st).length > 0
         if (!haveRp && !haveSt) {

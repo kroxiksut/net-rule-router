@@ -459,6 +459,86 @@ pub enum CodegenDiagnostic {
     FailClosedDefaultEmitted,
 }
 
+impl CodegenDiagnostic {
+    /// The conflict this diagnostic reports to the user, if it is one.
+    #[must_use]
+    pub fn rule_conflict(&self) -> Option<crate::rule_conflicts::RuleConflict> {
+        use crate::rule_conflicts::RuleConflict;
+        match self {
+            Self::BlockLeaksSharedAddress {
+                rule_id,
+                ip,
+                host,
+                via_host,
+                count,
+            } => Some(RuleConflict::BlockLeaksSharedAddress {
+                rule_id: rule_id.clone(),
+                ip: *ip,
+                host: host.clone(),
+                via_host: via_host.clone(),
+                count: *count,
+            }),
+            Self::RouteOverriddenByLiteralBlock {
+                rule_id,
+                block_rule_id,
+                ip,
+                host,
+                count,
+            } => Some(RuleConflict::RouteOverriddenByLiteralBlock {
+                rule_id: rule_id.clone(),
+                block_rule_id: block_rule_id.clone(),
+                ip: *ip,
+                host: host.clone(),
+                count: *count,
+            }),
+            Self::UnsupportedRuleShape { rule_id, reason } => {
+                Some(RuleConflict::UnsupportedRuleShape {
+                    rule_id: rule_id.clone(),
+                    reason: *reason,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::rule_conflicts::RuleConflict> for CodegenDiagnostic {
+    fn from(conflict: crate::rule_conflicts::RuleConflict) -> Self {
+        use crate::rule_conflicts::RuleConflict;
+        match conflict {
+            RuleConflict::BlockLeaksSharedAddress {
+                rule_id,
+                ip,
+                host,
+                via_host,
+                count,
+            } => Self::BlockLeaksSharedAddress {
+                rule_id,
+                ip,
+                host,
+                via_host,
+                count,
+            },
+            RuleConflict::RouteOverriddenByLiteralBlock {
+                rule_id,
+                block_rule_id,
+                ip,
+                host,
+                count,
+            } => Self::RouteOverriddenByLiteralBlock {
+                rule_id,
+                block_rule_id,
+                ip,
+                host,
+                count,
+            },
+            RuleConflict::UnsupportedRuleShape { rule_id, reason } => {
+                Self::UnsupportedRuleShape { rule_id, reason }
+            }
+        }
+    }
+}
+
 // ── Public entry point ──────────────────────────────────────────────────────
 
 /// Generate filters + diagnostics for the given SID.
@@ -730,36 +810,21 @@ fn generate_for_rule(
     // only once the emitters below can scope the address to the application.
     if let Some(addr_match) = rule.address_match.as_ref() {
         // Conflicts the user must see, noted while the fan-out walks hosts.
-        let conflicts = std::cell::RefCell::new(RuleConflicts::default());
-        // A Block steers nothing, but it still loses an address a narrower
-        // rule names — the engine's order, not the weight band, decides.
-        let steerable = |host: Option<&str>, ip: IpAddr| match rule.action {
-            RuleAction::Block => {
-                if let Some(host) = host {
-                    if let Some(via) = ownership.block_leak(host, ip, addr_match) {
-                        conflicts.borrow_mut().note_leak(ip, host, via);
-                    }
-                }
-                !ownership.block_yields(ip, addr_match)
-            }
-            RuleAction::Route => {
-                let steers = ownership.address_rule_may_steer(ip, link);
-                if steers {
-                    if let Some(block) = ownership.literal_block_of(ip) {
-                        conflicts
-                            .borrow_mut()
-                            .note_vetoed(ip, host.unwrap_or_default(), block);
-                    }
-                }
-                steers
-            }
-        };
+        let walk = std::cell::RefCell::new(crate::rule_conflicts::AddressRuleWalk::new(
+            ownership,
+            rule.action,
+            addr_match,
+            link,
+        ));
+        let steerable = |host: Option<&str>, ip: IpAddr| walk.borrow_mut().keeps(host, ip);
         emit_for_address_match(
             sid, role_slug, ctx, pos, rule, addr_match, cache, &steerable, out,
         );
-        conflicts
-            .into_inner()
-            .emit(rule.id.as_str(), &mut out.diagnostics);
+        out.diagnostics.extend(
+            walk.into_inner()
+                .finish(rule.id.as_str())
+                .map(CodegenDiagnostic::from),
+        );
     } else if let Some(app) = rule.app_match.as_ref() {
         emit_for_app_match(
             sid,
@@ -891,51 +956,6 @@ fn emit_for_address_match(
         } else {
             CodegenDiagnostic::AddressClaimedByPrimary { rule_id, ip, count }
         });
-    }
-}
-
-/// The two conflicts one address rule can run into, each kept as one example
-/// plus a count of distinct addresses.
-#[derive(Default)]
-struct RuleConflicts {
-    leak: Option<(IpAddr, String, String)>,
-    leaked: std::collections::HashSet<IpAddr>,
-    vetoed: Option<(IpAddr, String, String)>,
-    vetoed_ips: std::collections::HashSet<IpAddr>,
-}
-
-impl RuleConflicts {
-    fn note_leak(&mut self, ip: IpAddr, host: &str, via_host: &str) {
-        if self.leaked.insert(ip) && self.leak.is_none() {
-            self.leak = Some((ip, host.to_string(), via_host.to_string()));
-        }
-    }
-
-    fn note_vetoed(&mut self, ip: IpAddr, host: &str, block_rule_id: &str) {
-        if self.vetoed_ips.insert(ip) && self.vetoed.is_none() {
-            self.vetoed = Some((ip, host.to_string(), block_rule_id.to_string()));
-        }
-    }
-
-    fn emit(self, rule_id: &str, out: &mut Vec<CodegenDiagnostic>) {
-        if let Some((ip, host, via_host)) = self.leak {
-            out.push(CodegenDiagnostic::BlockLeaksSharedAddress {
-                rule_id: rule_id.to_string(),
-                ip,
-                host,
-                via_host,
-                count: self.leaked.len(),
-            });
-        }
-        if let Some((ip, host, block_rule_id)) = self.vetoed {
-            out.push(CodegenDiagnostic::RouteOverriddenByLiteralBlock {
-                rule_id: rule_id.to_string(),
-                block_rule_id,
-                ip,
-                host,
-                count: self.vetoed_ips.len(),
-            });
-        }
     }
 }
 

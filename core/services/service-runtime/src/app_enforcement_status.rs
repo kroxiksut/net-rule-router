@@ -74,15 +74,21 @@ impl AppEnforcementStatus {
     }
 
     /// Replace `principal`'s rule conflicts; an empty list forgets them.
-    pub fn set_rule_conflicts(&self, principal: &str, mut conflicts: Vec<RuleConflictDto>) {
+    /// Returns whether the stored set changed, so a caller that re-plans on a
+    /// timer reports a change once rather than on every pass.
+    pub fn set_rule_conflicts(&self, principal: &str, mut conflicts: Vec<RuleConflictDto>) -> bool {
         conflicts.truncate(MAX_RULE_CONFLICTS);
-        if let Ok(mut guard) = self.0.lock() {
-            if conflicts.is_empty() {
-                guard.conflicts.remove(principal);
-            } else {
-                guard.conflicts.insert(principal.to_string(), conflicts);
-            }
+        let Ok(mut guard) = self.0.lock() else {
+            return false;
+        };
+        if conflicts.is_empty() {
+            return guard.conflicts.remove(principal).is_some();
         }
+        if guard.conflicts.get(principal) == Some(&conflicts) {
+            return false;
+        }
+        guard.conflicts.insert(principal.to_string(), conflicts);
+        true
     }
 
     /// `principal`'s rule conflicts from its last applying compute.
@@ -238,88 +244,11 @@ pub fn rule_conflicts_from(
     diagnostics: &[crate::wfp_codegen::CodegenDiagnostic],
     rule_book: &nrr_domain::canonical::CanonicalRuleBook,
 ) -> Vec<RuleConflictDto> {
-    use crate::wfp_codegen::CodegenDiagnostic;
-    use nrr_shared::ipc_payloads::RuleConflictKind;
-
-    let rule_of = |rule_id: &str| {
-        rule_book
-            .primary
-            .rules()
-            .iter()
-            .chain(rule_book.secondary.rules())
-            .find(|r| r.id.as_str() == rule_id)
-    };
-    let value_of = |rule_id: &str| -> String {
-        rule_of(rule_id)
-            .and_then(|r| r.address_match.as_ref())
-            .map(display_value)
-            .unwrap_or_default()
-    };
-    diagnostics
+    let conflicts: Vec<_> = diagnostics
         .iter()
-        .filter_map(|d| match d {
-            CodegenDiagnostic::RouteOverriddenByLiteralBlock {
-                rule_id,
-                block_rule_id,
-                ip,
-                host,
-                count,
-            } => Some(RuleConflictDto {
-                kind: RuleConflictKind::LiteralBlockOverridesRoute,
-                rule_id: rule_id.clone(),
-                rule_value: value_of(rule_id),
-                ip: ip.to_string(),
-                count: u32::try_from(*count).unwrap_or(u32::MAX),
-                other_rule_id: block_rule_id.clone(),
-                host: host.clone(),
-                via_host: String::new(),
-                app: String::new(),
-            }),
-            CodegenDiagnostic::BlockLeaksSharedAddress {
-                rule_id,
-                ip,
-                host,
-                via_host,
-                count,
-            } => Some(RuleConflictDto {
-                kind: RuleConflictKind::BlockLeaksSharedAddress,
-                rule_id: rule_id.clone(),
-                rule_value: value_of(rule_id),
-                ip: ip.to_string(),
-                count: u32::try_from(*count).unwrap_or(u32::MAX),
-                other_rule_id: String::new(),
-                host: host.clone(),
-                via_host: via_host.clone(),
-                app: String::new(),
-            }),
-            CodegenDiagnostic::UnsupportedRuleShape { rule_id, .. } => Some(RuleConflictDto {
-                kind: RuleConflictKind::UnsupportedRuleShape,
-                rule_id: rule_id.clone(),
-                rule_value: value_of(rule_id),
-                ip: String::new(),
-                count: 0,
-                other_rule_id: String::new(),
-                host: String::new(),
-                via_host: String::new(),
-                app: rule_of(rule_id)
-                    .and_then(|r| r.app_match.as_ref())
-                    .map(|a| a.pattern.as_str().to_string())
-                    .unwrap_or_default(),
-            }),
-            _ => None,
-        })
-        .collect()
-}
-
-/// A rule's address as the rules table spells it.
-fn display_value(m: &nrr_domain::canonical::CanonicalAddressMatch) -> String {
-    use nrr_domain::canonical::CanonicalAddressMatch;
-    match m {
-        CanonicalAddressMatch::ExactFqdn(host) => host.clone(),
-        CanonicalAddressMatch::SuffixDomain(suffix) => format!("*.{suffix}"),
-        CanonicalAddressMatch::Zone(zone) => zone.clone(),
-        CanonicalAddressMatch::ExactIp(ip) => ip.to_string(),
-    }
+        .filter_map(crate::wfp_codegen::CodegenDiagnostic::rule_conflict)
+        .collect();
+    crate::rule_conflicts::rule_conflict_dtos(&conflicts, rule_book)
 }
 
 #[cfg(test)]
@@ -341,14 +270,22 @@ mod tests {
             via_host: "a.example".into(),
             app: String::new(),
         };
-        status.set_rule_conflicts("S-1", vec![conflict.clone()]);
-        assert_eq!(status.rule_conflicts("S-1"), vec![conflict]);
+        assert!(status.set_rule_conflicts("S-1", vec![conflict.clone()]));
+        assert_eq!(status.rule_conflicts("S-1"), vec![conflict.clone()]);
         assert!(
             status.rule_conflicts("S-2").is_empty(),
             "another user sees none"
         );
-        status.set_rule_conflicts("S-1", Vec::new());
+        assert!(
+            !status.set_rule_conflicts("S-1", vec![conflict]),
+            "the same set again is not a change"
+        );
+        assert!(status.set_rule_conflicts("S-1", Vec::new()));
         assert!(status.rule_conflicts("S-1").is_empty());
+        assert!(
+            !status.set_rule_conflicts("S-1", Vec::new()),
+            "clearing an empty set is not a change"
+        );
     }
 
     #[test]

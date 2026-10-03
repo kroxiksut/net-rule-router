@@ -1,4 +1,5 @@
-//! Traffic-counter core — per-interface octet counters via `GetIfTable2`.
+//! Traffic-counter core — per-interface octet counters via `GetIfTable2` —
+//! and the adapter-kind facts read from the same rows.
 //!
 //! Backs `WindowsInterfaceCounterSource` (`crate::interface_traffic`). Unlike
 //! `GetAdaptersAddresses` (which carries no byte counters), `MIB_IF_ROW2`
@@ -29,7 +30,10 @@ use nrr_platform_api::adapters::{
     description_matches_virtual_software, text_indicates_vpn_tunnel, InterfaceType,
 };
 use nrr_platform_api::error::PlatformError;
+use nrr_platform_api::interface_rows::AdapterKindFacts;
 use nrr_platform_api::interface_traffic::InterfaceCounters;
+
+use crate::adapter_kind::{kind_facts, WindowsIfFacts};
 
 use super::wide::pwstr_lossy;
 
@@ -40,6 +44,40 @@ const IF_OPER_STATUS_UP: i32 = 1;
 
 /// Enumerate every interface's cumulative octet counters.
 pub fn read_interface_counters() -> Result<Vec<InterfaceCounters>, PlatformError> {
+    walk_if_table(decode_row)
+}
+
+/// What the OS says each interface is, keyed by lowercase `{GUID}` — the
+/// spelling `GetAdaptersAddresses` reports as `AdapterName`.
+pub fn read_interface_kind_facts(
+) -> Result<std::collections::HashMap<String, AdapterKindFacts>, PlatformError> {
+    walk_if_table(|row| {
+        // SAFETY: `Description` is a fixed `[u16; 257]` Win32 null-terminates.
+        let description = unsafe { pwstr_lossy(row.Description.as_ptr()) };
+        let facts = kind_facts(&WindowsIfFacts {
+            if_type: row.Type,
+            physical_medium: row.PhysicalMediumType.0,
+            hardware_interface: row.InterfaceAndOperStatusFlags._bitfield & HARDWARE_INTERFACE != 0,
+            description: &description,
+        });
+        (guid_key(&row.InterfaceGuid), facts)
+    })
+    .map(|rows| rows.into_iter().collect())
+}
+
+/// `HardwareInterface`, bit 0 of `InterfaceAndOperStatusFlags`.
+const HARDWARE_INTERFACE: u8 = 0x1;
+
+fn guid_key(guid: &windows::core::GUID) -> String {
+    let d = guid.data4;
+    format!(
+        "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
+        guid.data1, guid.data2, guid.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+    )
+}
+
+/// Decode every row of `GetIfTable2`, freeing the table before returning.
+fn walk_if_table<T>(decode: impl Fn(&MIB_IF_ROW2) -> T) -> Result<Vec<T>, PlatformError> {
     let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
 
     // SAFETY: `GetIfTable2` writes a freshly-allocated `MIB_IF_TABLE2*` into
@@ -58,7 +96,7 @@ pub fn read_interface_counters() -> Result<Vec<InterfaceCounters>, PlatformError
 
     // SAFETY: `table_ptr` was filled by Win32 and is non-null; `read_table`
     // only reads within the `NumEntries` rows Win32 allocated.
-    let result = unsafe { read_table(table_ptr) };
+    let result = unsafe { read_table(table_ptr, decode) };
 
     // SAFETY: `table_ptr` was allocated by the matching `GetIfTable2`; this is
     // the only correct way to release it.
@@ -73,7 +111,7 @@ pub fn read_interface_counters() -> Result<Vec<InterfaceCounters>, PlatformError
 ///
 /// `table` must be a valid, non-null pointer returned by `GetIfTable2` and not
 /// yet freed.
-unsafe fn read_table(table: *const MIB_IF_TABLE2) -> Vec<InterfaceCounters> {
+unsafe fn read_table<T>(table: *const MIB_IF_TABLE2, decode: impl Fn(&MIB_IF_ROW2) -> T) -> Vec<T> {
     // SAFETY: `table` is a valid Win32 allocation per caller invariant.
     let header = unsafe { &*table };
     let count = header.NumEntries as usize;
@@ -87,7 +125,7 @@ unsafe fn read_table(table: *const MIB_IF_TABLE2) -> Vec<InterfaceCounters> {
     for i in 0..count {
         // SAFETY: Win32 guarantees `count` consecutive valid rows after `first`.
         let row = unsafe { &*first.add(i) };
-        out.push(decode_row(row));
+        out.push(decode(row));
     }
     out
 }
@@ -127,6 +165,23 @@ fn decode_row(row: &MIB_IF_ROW2) -> InterfaceCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guid_key_matches_the_adapter_name_spelling() {
+        let guid = windows::core::GUID::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        assert_eq!(guid_key(&guid), "{01234567-89ab-cdef-0123-456789abcdef}");
+    }
+
+    #[test]
+    fn kind_facts_cover_the_loopback_interface() {
+        let facts = read_interface_kind_facts().expect("GetIfTable2 must succeed");
+        assert!(
+            facts
+                .values()
+                .any(|f| f.medium == nrr_platform_api::interface_rows::LinkMedium::Loopback),
+            "the kernel always carries a loopback interface"
+        );
+    }
 
     /// Smoke test: enumerate works on a real Windows host. The kernel always
     /// has at least the loopback interface, so we expect non-empty output.

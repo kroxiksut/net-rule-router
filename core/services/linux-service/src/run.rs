@@ -75,25 +75,24 @@ pub fn run() -> ExitCode {
     let artifacts = run_bootstrap(&BootstrapConfig::new(StorageProfile::ProductionService));
 
     // Install the NDJSON tracing subscriber so operational events are persisted
-    // (same subscriber the Windows service uses; OS-neutral). A stored verbose
-    // window is resumed and ended on time; the session's timer holds what it
-    // needs, so the handle is not kept here.
-    if let Some(writer) = artifacts.log_writer.as_ref() {
-        let state_db = &artifacts.topology.state_db_path;
-        let verbose = nrr_service_runtime::verbose_logging::verbose_at_boot(state_db);
-        let (_, handle) = install_ndjson_tracing_with_verbose(Arc::clone(writer), verbose);
-        if verbose {
-            let _window = nrr_service_runtime::verbose_logging::VerboseLogging::resume(
-                nrr_service_runtime::verbose_logging::persisted_until_at_boot(state_db),
-                nrr_service_runtime::verbose_logging::now_ms(),
-                Some(Arc::new(handle)),
+    // (same subscriber the Windows service uses; OS-neutral). The handle goes to
+    // the stability writer, which resumes a stored verbose window and ends it on
+    // time — one owner, or a window the user changes would still end on the old
+    // deadline.
+    let verbosity = match artifacts.log_writer.as_ref() {
+        Some(writer) => {
+            let verbose = nrr_service_runtime::verbose_logging::verbose_at_boot(
+                &artifacts.topology.state_db_path,
             );
+            Some(install_ndjson_tracing_with_verbose(Arc::clone(writer), verbose).1)
         }
-    } else {
-        eprintln!(
-            "warning: operational log writer unavailable; tracing events will not be persisted"
-        );
-    }
+        None => {
+            eprintln!(
+                "warning: operational log writer unavailable; tracing events will not be persisted"
+            );
+            None
+        }
+    };
 
     // The IPC server is NOT bound here: the supervised runtime binds it as part
     // of its accept-task bundle, so a bind failure lands in health rather than
@@ -166,6 +165,7 @@ pub fn run() -> ExitCode {
         Arc::clone(&event_bus),
         policy_stack.as_ref(),
         instance,
+        verbosity,
     );
     let accept_heartbeat = Arc::clone(&ipc.accept_heartbeat);
     // Observed resolutions: systemd-resolved tells us what it answered, so the

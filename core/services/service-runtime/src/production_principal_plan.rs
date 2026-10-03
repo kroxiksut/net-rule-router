@@ -83,6 +83,9 @@ pub struct ProductionPrincipalPlanSource {
     /// unplanned — honest on a host with no route mechanism, where the
     /// exemptions cannot be read.
     machine: Option<MachineFacts>,
+    /// Where each principal's rule conflicts are published for the Overlaps
+    /// screen. `None` leaves them unpublished.
+    conflicts: Option<crate::app_enforcement_status::AppEnforcementStatus>,
 }
 
 /// Where the exemption facts come from, and the pass's cached reading of them.
@@ -111,7 +114,19 @@ impl ProductionPrincipalPlanSource {
             app_resolver,
             app_observations,
             machine: None,
+            conflicts: None,
         }
+    }
+
+    /// Publish each planned principal's rule conflicts into `status` — the one
+    /// the `SnapshotInitial` handler reads.
+    #[must_use]
+    pub fn with_rule_conflicts(
+        mut self,
+        status: crate::app_enforcement_status::AppEnforcementStatus,
+    ) -> Self {
+        self.conflicts = Some(status);
+        self
     }
 
     /// Supply the route table and link list the blanket block's exemptions are
@@ -177,10 +192,20 @@ impl ProductionPrincipalPlanSource {
         availability: ChannelAvailability,
     ) -> Option<(EnforcementPlan, PlanCoverage)> {
         let stored = principal.as_stored();
+        let mut timings = crate::phase_timings::PhaseTimings::start();
         // No stored routing policy means the user never bound their adapters,
         // and a plan built without that would pin nothing.
-        let policy = self.policy.load_for_sid(stored)?;
-        let rules = self.rules.active_rules_for(stored)?;
+        // Without a policy or rules nothing is planned, so nothing conflicts.
+        let Some(policy) = self.policy.load_for_sid(stored) else {
+            self.publish_conflicts(stored, None);
+            return None;
+        };
+        timings.mark("policy");
+        let Some(rules) = self.rules.active_rules_for(stored) else {
+            self.publish_conflicts(stored, None);
+            return None;
+        };
+        timings.mark("rules");
 
         // The shared-IP policy decides which addresses the tunnel may claim,
         // and the plan has to be built behind the same decision the Windows
@@ -191,6 +216,7 @@ impl ProductionPrincipalPlanSource {
             self.fqdn_cache.as_ref(),
             policy.shared_ip_policy,
         );
+        timings.mark("denylist");
         // What policy may do about IPv6: naming the family and STEERING it are
         // separate answers, and only the machine reading knows either.
         let ipv6 = self.ipv6_guard(&policy);
@@ -202,12 +228,12 @@ impl ProductionPrincipalPlanSource {
             secondary_ip_denylist: &secondary_ip_denylist,
             ipv6,
         };
-        // The report says what did NOT plan (a rule waiting on DNS, an app that
-        // is not installed). This path has no channel to a GUI yet, so it is
-        // named and left — the wire exists, and the day a Linux front-end asks,
-        // the answer is already being produced.
-        let (mut flows, _plan_report) =
+        let (mut flows, plan_report) =
             plan_route_rules(&rules.rule_book, stored, rules.behavior_mode, &input);
+        // Before the early return below: a book whose every rule was skipped
+        // plans nothing, and those skips are exactly what the user must see.
+        self.publish_conflicts(stored, Some((&plan_report, &rules.rule_book)));
+        timings.mark("planner");
         // An empty rule set is not the same as "nothing to enforce". In the
         // tunnel-default modes the protection is the blanket block and the
         // leak-guard, and neither is rule-driven: returning early here left a
@@ -228,6 +254,7 @@ impl ProductionPrincipalPlanSource {
             ),
         );
         let rule_driven_flows = flows.len();
+        timings.mark("ownership");
 
         // The blanket block, when the settings ask for it AND the machine can
         // say what it must not cut. It supersedes the per-destination guard:
@@ -289,6 +316,7 @@ impl ProductionPrincipalPlanSource {
         if doh_lockdown_active(&policy) {
             flows.extend(plan_doh_dot_block(stored, &policy.doh_resolver_ips, true));
         }
+        timings.mark("guards");
 
         // Routes are planned even while the secondary is down: the applier
         // resolves the link at apply time and reports the ones it cannot steer,
@@ -310,6 +338,14 @@ impl ProductionPrincipalPlanSource {
             ),
             &self.tunnel_catch_alls(&policy),
         );
+        timings.mark("routes");
+        crate::phase_timings::report_if_slow(
+            &timings,
+            "principal-plan",
+            crate::phase_timings::slow_threshold_for(
+                crate::service_tasks::PRINCIPAL_ENFORCEMENT_INTERVAL,
+            ),
+        );
 
         let coverage = PlanCoverage {
             rule_driven_flows,
@@ -330,6 +366,45 @@ impl ProductionPrincipalPlanSource {
 }
 
 impl ProductionPrincipalPlanSource {
+    /// Store `principal`'s conflicts for the Overlaps screen; `None` clears
+    /// them. The pass re-plans on a timer, so only a change is logged.
+    fn publish_conflicts(
+        &self,
+        principal: &str,
+        planned: Option<(
+            &crate::enforcement_planner::PlanReport,
+            &nrr_domain::canonical::CanonicalRuleBook,
+        )>,
+    ) {
+        let Some(status) = self.conflicts.as_ref() else {
+            return;
+        };
+        let conflicts = planned
+            .map(|(report, book)| {
+                crate::rule_conflicts::rule_conflict_dtos(&report.conflicts, book)
+            })
+            .unwrap_or_default();
+        if !status.set_rule_conflicts(principal, conflicts) {
+            return;
+        }
+        let unsupported: Vec<String> = planned
+            .map(|(report, _)| report.unsupported_shapes())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(rule_id, reason)| format!("{rule_id} ({reason})"))
+            .collect();
+        if !unsupported.is_empty() {
+            tracing::warn!(
+                target: "nrr::enforcement",
+                msg_key = "persid-plan-rule-shape-unsupported",
+                sid = %principal,
+                count = unsupported.len(),
+                rules = %unsupported.join(", "),
+                "rules not enforced: they limit an address to one application, which enforcement cannot scope yet, so they were skipped rather than applied to every application",
+            );
+        }
+    }
+
     /// The blanket block-all, or nothing.
     ///
     /// Two postures share one shape. With the tunnel UP and an always-on mode,
@@ -1035,6 +1110,114 @@ mod tests {
         fn active_rules_for(&self, _sid: &str) -> Option<ActiveRulesSnapshot> {
             self.active_rules()
         }
+    }
+
+    /// What the Overlaps screen reads on this path: the principal's own
+    /// conflicts, re-planned every pass but reported once per change, and
+    /// cleared when the rules go.
+    #[test]
+    fn conflicts_are_published_per_principal_and_reported_once_per_change() {
+        use nrr_domain::canonical::{CanonicalAppMatch, CanonicalAppPattern};
+        use nrr_shared::ipc_payloads::RuleConflictKind;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Switchable(Mutex<Option<ActiveRulesSnapshot>>);
+        impl RulesProvider for Switchable {
+            fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            }
+        }
+        let shared = Ipv4Addr::new(192, 0, 2, 10);
+        let rule = |id: &str, action: RuleAction, m: CanonicalAddressMatch| CanonicalRule {
+            id: RuleId(id.into()),
+            enabled: true,
+            address_match: Some(m),
+            app_match: None,
+            comment: String::new(),
+            action,
+            origin: None,
+        };
+        let mut app_scoped = rule(
+            "b-app",
+            RuleAction::Block,
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))),
+        );
+        app_scoped.app_match = Some(CanonicalAppMatch {
+            pattern: CanonicalAppPattern::Exact("app".into()),
+            include_child_processes: false,
+        });
+        let rule_book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![
+                rule(
+                    "b-ip",
+                    RuleAction::Block,
+                    CanonicalAddressMatch::ExactIp(IpAddr::V4(shared)),
+                ),
+                app_scoped,
+            ]),
+            secondary: CanonicalRuleSet::from_rules(vec![rule(
+                "r-host",
+                RuleAction::Route,
+                CanonicalAddressMatch::ExactFqdn("a.example".into()),
+            )]),
+        };
+        let cache = crate::fqdn_cache_lookup::MockFqdnCacheLookup::default();
+        cache.set_ips("a.example", vec![shared]);
+        let rules = Arc::new(Switchable(Mutex::new(Some(ActiveRulesSnapshot {
+            rule_book,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+        }))));
+        let status = crate::app_enforcement_status::AppEnforcementStatus::new();
+        let source = source_with_cache(
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            Arc::new(Policy::armed()),
+            Arc::new(cache),
+        )
+        .with_rule_conflicts(status.clone());
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let writer = Arc::new(nrr_diagnostics::LogWriter::open(
+            nrr_diagnostics::LogWriterConfig::new(dir.path()),
+        ));
+        let subscriber = tracing_subscriber::registry().with(
+            nrr_diagnostics::NdjsonTracingLayer::new(Arc::clone(&writer)),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                let _ = source.plan_with_coverage(&user(), availability(true));
+            }
+        });
+
+        let kinds: Vec<RuleConflictKind> = status
+            .rule_conflicts(user().as_stored())
+            .iter()
+            .map(|c| c.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                RuleConflictKind::UnsupportedRuleShape,
+                RuleConflictKind::LiteralBlockOverridesRoute,
+            ]
+        );
+        assert!(status
+            .rule_conflicts(UserPrincipal::from_linux_uid(1001).as_stored())
+            .is_empty());
+        let mut reported = 0;
+        for entry in std::fs::read_dir(dir.path()).expect("logs dir") {
+            let text = std::fs::read_to_string(entry.expect("entry").path()).expect("read");
+            reported += text
+                .lines()
+                .filter(|l| l.contains("diag.event.persid-plan-rule-shape-unsupported"))
+                .count();
+        }
+        assert_eq!(reported, 1, "three passes over one book are one change");
+
+        *rules.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        assert!(source
+            .plan_with_coverage(&user(), availability(true))
+            .is_none());
+        assert!(status.rule_conflicts(user().as_stored()).is_empty());
     }
 
     #[test]

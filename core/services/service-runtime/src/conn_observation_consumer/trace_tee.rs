@@ -15,6 +15,9 @@ pub struct ConnTraceTee {
     ring: Arc<ConnectionTraceRing>,
     api: Arc<dyn RouteTablePort>,
     bindings: Arc<dyn EgressBindingSource>,
+    /// Whether each row is also written to the operational log. Shared with
+    /// the settings writer so a save applies without a restart.
+    log_ndjson: Arc<AtomicBool>,
 }
 
 impl ConnTraceTee {
@@ -29,7 +32,15 @@ impl ConnTraceTee {
             ring,
             api,
             bindings,
+            log_ndjson: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Follow the live "write the trace to the log" switch.
+    #[must_use]
+    pub fn with_log_ndjson_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.log_ndjson = flag;
+        self
     }
 
     pub fn ring(&self) -> Arc<ConnectionTraceRing> {
@@ -54,6 +65,7 @@ impl ConnTraceTee {
         // Each connection is labelled against its OWN user's bindings: two
         // people on one machine can bind different links.
         let mut roles: HashMap<&str, (Option<u32>, Option<u32>)> = HashMap::new();
+        let log_ndjson = self.log_ndjson.load(Ordering::Relaxed);
         for obs in attempts {
             let (primary, secondary) = match obs.user_sid.as_deref() {
                 Some(sid) => *roles
@@ -63,6 +75,9 @@ impl ConnTraceTee {
             };
             let mut rec = classify_connection(obs, &unicast, primary, secondary);
             rec.observed_unix_ms.get_or_insert(now_ms);
+            if log_ndjson {
+                log_observed_connection(&rec);
+            }
             self.ring.push(rec);
         }
     }
@@ -165,5 +180,55 @@ mod tests {
         assert_eq!(rows[0].egress.role, EgressRole::Primary);
         assert_eq!(rows[1].egress.role, EgressRole::Secondary);
         assert_eq!(rows[1].observed_unix_ms, Some(1234));
+    }
+
+    /// The log line is the one the full consumer writes, owned by the
+    /// connection's user so a log read scoped to them returns it — and it is
+    /// written only while the switch is on.
+    #[test]
+    fn a_logged_row_is_its_users_line_and_follows_the_switch() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let api = MockWindowsApi::new();
+        api.set_adapter_infos(vec![adapter(2, "eth0", Ipv4Addr::new(192, 168, 0, 5))]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let tee = ConnTraceTee::new(
+            Arc::new(ConnectionTraceRing::new(8)),
+            Arc::new(api),
+            Arc::new(Bound),
+        )
+        .with_log_ndjson_flag(Arc::clone(&flag));
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let writer = Arc::new(nrr_diagnostics::LogWriter::open(
+            nrr_diagnostics::LogWriterConfig::new(dir.path()),
+        ));
+        let subscriber = tracing_subscriber::registry().with(
+            nrr_diagnostics::NdjsonTracingLayer::new(Arc::clone(&writer)),
+        );
+        let attempt = [observation(
+            Ipv4Addr::new(192, 168, 0, 5),
+            ConnectionProgress::Attempt,
+        )];
+        tracing::subscriber::with_default(subscriber, || {
+            tee.record(&attempt, 1);
+            flag.store(true, Ordering::Relaxed);
+            tee.record(&attempt, 2);
+        });
+
+        let mut owners = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).expect("logs dir") {
+            let text = std::fs::read_to_string(entry.expect("entry").path()).expect("read");
+            for line in text.lines() {
+                let v: serde_json::Value = serde_json::from_str(line).expect("ndjson line");
+                if v["message_key"] == "diag.event.connobs-outbound-connection-observed" {
+                    owners.push(v["principal"].as_str().unwrap_or_default().to_string());
+                }
+            }
+        }
+        assert_eq!(
+            owners,
+            vec![UserPrincipal::from_linux_uid(1000).as_stored().to_string()],
+            "one line, written after the switch, owned by the connection's user"
+        );
     }
 }

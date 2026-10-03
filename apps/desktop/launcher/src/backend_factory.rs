@@ -44,7 +44,7 @@ use crate::ipc_backend_facade::IpcBackendFacade;
 /// a `Connecting` status and the 3s `backendStatusPoll` upgrades it to
 /// live data once the background client connects.
 pub const IPC_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
-/// Longer re-probe budget after auto-starting a DemandStart service. The
+/// Longer re-probe budget after starting the stopped service. The
 /// service was just launched, so the pipe is coming up; the reconnect
 /// worker's backoff (capped at 5 s) needs more headroom than the cold
 /// 800 ms probe.
@@ -142,6 +142,9 @@ pub struct BackendBundle {
     pub facade: Arc<dyn BackendFacade>,
     pub status: BackendConnectionStatus,
     pub choice: BackendChoice,
+    /// The service was stopped and this launch started it, which the user is
+    /// told: they may have stopped it on purpose.
+    pub service_started: bool,
 }
 
 /// Construct the backend per `choice`. For [`BackendChoice::Ipc`] this
@@ -159,11 +162,13 @@ pub fn create_backend(choice: BackendChoice) -> BackendBundle {
             facade: Arc::new(MockBackendFacade::default()) as Arc<dyn BackendFacade>,
             status: BackendConnectionStatus::Connected,
             choice,
+            service_started: false,
         },
         BackendChoice::PreviewLocal => BackendBundle {
             facade: Arc::new(PreviewLocalBackendFacade::default()) as Arc<dyn BackendFacade>,
             status: BackendConnectionStatus::Connected,
             choice,
+            service_started: false,
         },
         BackendChoice::Ipc => build_ipc_bundle(),
     }
@@ -178,6 +183,7 @@ fn build_ipc_bundle() -> BackendBundle {
                 facade: Arc::new(facade) as Arc<dyn BackendFacade>,
                 status: BackendConnectionStatus::Connected,
                 choice: BackendChoice::Ipc,
+                service_started: false,
             },
             Err(e) => {
                 eprintln!(
@@ -202,13 +208,13 @@ fn unreachable_bundle(status: ConnectionStatus) -> BackendBundle {
     fallback_with_status(status)
 }
 
-/// When the first IPC probe fails, the service may be configured
-/// DemandStart (start on app launch). If so, the interactive user holds a
-/// `SERVICE_START` grant, so start it now (no UAC) and re-probe. A
-/// non-DemandStart service (no grant) returns `NotStartable` → `None`, and
-/// the caller falls straight through to the mock backend. Returns
-/// `Some(bundle)` only when the service started AND the IPC re-probe
-/// connected.
+/// When the first IPC probe fails, the service may simply be stopped. It
+/// grants the interactive user `SERVICE_START` in either start mode, so start
+/// it now (no UAC) and re-probe: started with Windows, the wanted state is
+/// running; started with the app, this is that start. `NotStartable` (not
+/// installed, no grant, mid-transition) → `None`, and the caller falls
+/// through to the mock backend. Returns `Some(bundle)` only when the service
+/// started AND the IPC re-probe connected.
 #[cfg(target_os = "windows")]
 fn try_demand_start_on_this_os(client: &Arc<ServiceIpcClient>) -> Option<BackendBundle> {
     use nrr_broker::DemandStartOutcome;
@@ -219,7 +225,7 @@ fn try_demand_start_on_this_os(client: &Arc<ServiceIpcClient>) -> Option<Backend
     ) {
         return None;
     }
-    eprintln!("nrr-launcher: started DemandStart service ({outcome:?}); re-probing IPC");
+    eprintln!("nrr-launcher: started the stopped service ({outcome:?}); re-probing IPC");
     if !wait_for_connect(client, IPC_REPROBE_AFTER_START) {
         return None;
     }
@@ -228,6 +234,7 @@ fn try_demand_start_on_this_os(client: &Arc<ServiceIpcClient>) -> Option<Backend
             facade: Arc::new(facade) as Arc<dyn BackendFacade>,
             status: BackendConnectionStatus::Connected,
             choice: BackendChoice::Ipc,
+            service_started: outcome == DemandStartOutcome::Started,
         }),
         Err(e) => {
             eprintln!("nrr-launcher: IPC facade init failed after demand-start ({e}); using mock");
@@ -249,6 +256,7 @@ fn fallback_with_status(status: BackendConnectionStatus) -> BackendBundle {
         facade: Arc::new(MockBackendFacade::default()) as Arc<dyn BackendFacade>,
         status,
         choice: BackendChoice::Ipc,
+        service_started: false,
     }
 }
 

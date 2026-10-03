@@ -14,9 +14,9 @@ use std::net::IpAddr;
 use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
 use nrr_platform_api::interface_rows::{
     apply_external_ip_probes, build_derived_assessment, build_observed_facts,
-    derive_forwarding_next_hop, fallback_rows, is_bluetooth_like_interface,
-    preferred_display_address, unknown_recommendation, BasicAvailabilityStatus, InterfaceRouteRow,
-    InterfaceRowsPort, InterfacesDataSource,
+    classify_adapter_kind, derive_forwarding_next_hop, fallback_rows, is_bluetooth_like_interface,
+    preferred_display_address, unknown_recommendation, AdapterKind, BasicAvailabilityStatus,
+    DeviceTechnology, InterfaceRouteRow, InterfaceRowsPort, InterfacesDataSource,
 };
 use nrr_shared::RouteSelectionState;
 
@@ -54,7 +54,12 @@ impl InterfaceRowsPort for LinuxInterfaceRows {
             }
         };
 
-        let mut rows = build_rows(&adapters, &link_dns_servers(), forwarding_capable_indexes());
+        let mut rows = build_rows(
+            &adapters,
+            &link_dns_servers(),
+            forwarding_capable_indexes(),
+            &link_kinds(&adapters),
+        );
         rows.sort_by(|left, right| {
             left.adapter_name
                 .to_ascii_lowercase()
@@ -67,19 +72,43 @@ impl InterfaceRowsPort for LinuxInterfaceRows {
     }
 }
 
-/// The pure half: links plus the two lookups in, rows out. Free of the OS so
+/// The pure half: links plus the lookups in, rows out. Free of the OS so
 /// the mapping is tested on any host — the readers below are the only part that
 /// needs a Linux to run on.
 fn build_rows(
     adapters: &[AdapterInfo],
     dns_by_link: &HashMap<String, String>,
     forwarding: Option<HashSet<u32>>,
+    kinds: &HashMap<String, LinkKind>,
 ) -> Vec<InterfaceRouteRow> {
     adapters
         .iter()
         // No route can leave through it, so it is no candidate for either role.
         .filter(|adapter| adapter.interface_type != InterfaceType::Loopback)
-        .map(|adapter| row_for(adapter, dns_by_link, forwarding.as_ref()))
+        .map(|adapter| row_for(adapter, dns_by_link, forwarding.as_ref(), kinds))
+        .collect()
+}
+
+/// What sysfs says one link is.
+#[derive(Clone, Copy, Debug, Default)]
+struct LinkKind {
+    kind: AdapterKind,
+    device_technology: Option<DeviceTechnology>,
+}
+
+/// What each link is, by kernel name, from what sysfs says about the device.
+fn link_kinds(adapters: &[AdapterInfo]) -> HashMap<String, LinkKind> {
+    let sysfs = std::path::Path::new("/sys/class/net");
+    adapters
+        .iter()
+        .map(|adapter| {
+            let facts = crate::interface_traffic::read_sysfs_facts(sysfs, &adapter.adapter_name);
+            let link = LinkKind {
+                kind: classify_adapter_kind(crate::adapter_kind::kind_facts(&facts)),
+                device_technology: crate::adapter_kind::device_technology(&facts),
+            };
+            (adapter.adapter_name.clone(), link)
+        })
         .collect()
 }
 
@@ -87,11 +116,16 @@ fn row_for(
     adapter: &AdapterInfo,
     dns_by_link: &HashMap<String, String>,
     forwarding: Option<&HashSet<u32>>,
+    kinds: &HashMap<String, LinkKind>,
 ) -> InterfaceRouteRow {
     let name = match adapter.friendly_name.trim() {
         "" => adapter.adapter_name.trim(),
         named => named,
     };
+    let link = kinds
+        .get(&adapter.adapter_name)
+        .copied()
+        .unwrap_or_default();
     let availability = availability_of(adapter.oper_status);
     let addresses = adapter
         .ipv4_addresses
@@ -134,7 +168,11 @@ fn row_for(
         name: name.to_string(),
         interface_description: adapter.description.clone(),
         interface_type: interface_type.to_string(),
-        is_bluetooth_like: is_bluetooth_like_interface(name, &adapter.description, name),
+        kind: link.kind,
+        device_technology: link.device_technology,
+        // The medium the kernel reports catches a Bluetooth link with a neutral name.
+        is_bluetooth_like: link.kind == AdapterKind::Bluetooth
+            || is_bluetooth_like_interface(name, &adapter.description, name),
         local_ip,
         gateway,
         dns_servers,
@@ -305,12 +343,25 @@ mod tests {
     #[test]
     fn a_live_link_becomes_a_row_carrying_its_own_facts() {
         let dns = HashMap::from([("wlan0".to_string(), "192.0.2.1".to_string())]);
-        let rows = build_rows(&[adapter("wlan0", 3)], &dns, Some(HashSet::from([3])));
+        let kinds = HashMap::from([(
+            "wlan0".to_string(),
+            LinkKind {
+                kind: AdapterKind::Wifi,
+                device_technology: None,
+            },
+        )]);
+        let rows = build_rows(
+            &[adapter("wlan0", 3)],
+            &dns,
+            Some(HashSet::from([3])),
+            &kinds,
+        );
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.adapter_name, "wlan0");
         assert_eq!(row.persistent_id, "linux-link:wlan0");
         assert_eq!(row.interface_type, "wireless");
+        assert_eq!(row.kind, AdapterKind::Wifi);
         assert_eq!(row.local_ip, "192.0.2.10");
         assert_eq!(row.gateway, "192.0.2.1");
         assert_eq!(row.dns_servers, "192.0.2.1");
@@ -320,6 +371,27 @@ mod tests {
         assert_eq!(row.availability_status, BasicAvailabilityStatus::Available);
     }
 
+    #[test]
+    fn a_bluetooth_link_is_hidden_with_bluetooth_whatever_its_name() {
+        let kinds = HashMap::from([(
+            "link-example".to_string(),
+            LinkKind {
+                kind: AdapterKind::Bluetooth,
+                device_technology: None,
+            },
+        )]);
+        let rows = build_rows(&[adapter("link-example", 4)], &HashMap::new(), None, &kinds);
+        assert!(rows[0].is_bluetooth_like);
+
+        let rows = build_rows(
+            &[adapter("link-example", 4)],
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
+        assert!(!rows[0].is_bluetooth_like);
+    }
+
     /// The gateway-less tunnel: nothing to show in the gateway column, and the
     /// route table is what says traffic still leaves through it.
     #[test]
@@ -327,7 +399,12 @@ mod tests {
         let mut tunnel = adapter("wg0", 7);
         tunnel.interface_type = InterfaceType::Tunnel;
         tunnel.gateways.clear();
-        let rows = build_rows(&[tunnel], &HashMap::new(), Some(HashSet::from([7])));
+        let rows = build_rows(
+            &[tunnel],
+            &HashMap::new(),
+            Some(HashSet::from([7])),
+            &HashMap::new(),
+        );
         assert_eq!(rows[0].gateway, "-");
         assert!(!rows[0].has_default_route);
         assert_eq!(rows[0].has_forwarding_path, Some(true));
@@ -337,15 +414,42 @@ mod tests {
     /// An unreadable route table must not label a healthy link unusable.
     #[test]
     fn an_unreadable_route_table_leaves_forwarding_unevaluated() {
-        let rows = build_rows(&[adapter("eth0", 2)], &HashMap::new(), None);
+        let rows = build_rows(
+            &[adapter("eth0", 2)],
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
         assert_eq!(rows[0].has_forwarding_path, None);
+        // A link whose sysfs was not read claims no kind.
+        assert_eq!(rows[0].kind, AdapterKind::Other);
+        assert_eq!(rows[0].device_technology, None);
+    }
+
+    /// The driverless link's description is only its own name, so the
+    /// technology is what the details line has to say about it.
+    #[test]
+    fn a_tap_row_carries_its_technology_beside_its_kind() {
+        let mut tap = adapter("tap-example", 4);
+        tap.description = "tap-example".to_string();
+        let kinds = HashMap::from([(
+            "tap-example".to_string(),
+            LinkKind {
+                kind: AdapterKind::Tunnel,
+                device_technology: Some(DeviceTechnology::Tap),
+            },
+        )]);
+        let rows = build_rows(&[tap], &HashMap::new(), None, &kinds);
+        assert_eq!(rows[0].kind, AdapterKind::Tunnel);
+        assert_eq!(rows[0].device_technology, Some(DeviceTechnology::Tap));
+        assert_eq!(rows[0].interface_description, "tap-example");
     }
 
     #[test]
     fn loopback_is_no_candidate_for_a_route() {
         let mut lo = adapter("lo", 1);
         lo.interface_type = InterfaceType::Loopback;
-        assert!(build_rows(&[lo], &HashMap::new(), None).is_empty());
+        assert!(build_rows(&[lo], &HashMap::new(), None, &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -353,7 +457,7 @@ mod tests {
         let mut v6_only = adapter("eth0", 2);
         v6_only.ipv4_addresses.clear();
         v6_only.ipv6_addresses = vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)];
-        let rows = build_rows(&[v6_only], &HashMap::new(), None);
+        let rows = build_rows(&[v6_only], &HashMap::new(), None, &HashMap::new());
         assert_eq!(rows[0].local_ip, "2001:db8::1");
     }
 

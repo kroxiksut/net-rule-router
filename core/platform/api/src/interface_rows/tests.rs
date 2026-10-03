@@ -396,6 +396,7 @@ fn wire_dto_round_trip_preserves_display_and_scoring_fields() {
     assert_eq!(back.persistent_id, vpn.persistent_id);
     assert_eq!(back.name, "VPN");
     assert_eq!(back.interface_type, vpn.interface_type);
+    assert_eq!(back.kind, AdapterKind::Tunnel);
     assert_eq!(back.dns_servers, vpn.dns_servers);
     assert_eq!(back.is_bluetooth_like, vpn.is_bluetooth_like);
     // Scoring-input enums are faithfully parsed back.

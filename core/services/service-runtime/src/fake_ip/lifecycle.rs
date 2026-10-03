@@ -265,6 +265,17 @@ impl FakeIpBindingView {
         let guard = self.allocator.lock().unwrap_or_else(|p| p.into_inner());
         guard.binding_for_domain(hostname).map(|b| b.v4)
     }
+
+    /// The hostname a virtual address stands for: `None` when `addr` is not a
+    /// pool host, `Some(None)` when it is but its binding was recycled. One
+    /// lock, never touching the recycling order.
+    #[must_use]
+    pub fn domain_for_address(&self, addr: std::net::IpAddr) -> Option<Option<String>> {
+        let guard = self.allocator.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .holds_host(addr)
+            .then(|| guard.peek_domain_for_ip(addr).map(str::to_owned))
+    }
 }
 
 /// Builds the OS TUN adapter + [`FakeIpStack`] on demand. `None` means the stack

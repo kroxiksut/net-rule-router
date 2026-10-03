@@ -158,7 +158,8 @@ ScrollView {
             + section._connVerdictLabel(e && e.verdict) + "\t"
             + section._connProtoLabel(e && e.proto) + "\t"
             + String((e && e.local) || "") + "\t"
-            + Pure.formatTimestamp(e && e.observed_at_ms)
+            + Pure.formatTimestamp(e && e.observed_at_ms) + "\t"
+            + section._connRemoteHosts(e).join(" ")
     }
     function _copyConnSelected() {
         var model = section._connGroupedModel
@@ -244,10 +245,13 @@ ScrollView {
     property var _connGroupedBuild: {
         var lineH = section._listLineHeight
         if (!_connGroupByProcess) {
+            var flatHeight = 0
+            for (var f = 0; f < _connRendered.length; f++)
+                flatHeight += section._connRowHeight(_connRendered[f], lineH)
             return {
                 "rows": _connRendered,
                 "dropped": _connFiltered.length - _connRendered.length,
-                "height": _connRendered.length * 2 * lineH
+                "height": flatHeight
             }
         }
         var groups = ({})
@@ -275,7 +279,7 @@ ScrollView {
             // itself, with no header, no chevron and no count.
             if (rows.length === 1) {
                 out.push(rows[0])
-                height += 2 * lineH
+                height += section._connRowHeight(rows[0], lineH)
                 continue
             }
             out.push({ "_isGroupHeader": true, "process": k, "_count": rows.length })
@@ -284,7 +288,7 @@ ScrollView {
             var r = 0
             for (; r < rows.length && out.length < _renderCap; r++) {
                 out.push(rows[r])
-                height += 2 * lineH
+                height += section._connRowHeight(rows[r], lineH)
             }
             // Rows a collapsed group hides are one click away; rows the cap cut
             // off are not — only the latter count as truncation.
@@ -305,6 +309,73 @@ ScrollView {
     function _connProtoLabel(slug) {
         return root.tr("diag.conn-trace.proto." + String(slug || ""), String(slug || ""))
     }
+    // Names the service saw the remote address answered for, newest first.
+    function _connRemoteHosts(e) {
+        var hosts = e && e.remote_hosts
+        return Array.isArray(hosts) ? hosts : []
+    }
+    function _connRemoteHostCount(e) {
+        return Math.max(Number((e && e.remote_host_count) || 0),
+                        section._connRemoteHosts(e).length)
+    }
+    function _connRemoteIsFake(e) {
+        return !!(e && e.remote_fake_ip === true)
+    }
+    // "address · name (+N)". When it does not fit `width`, the name loses
+    // leading labels behind "*." until it does, but never past "*." + its
+    // registrable domain (sent by the service); beyond that the Label elides.
+    function _connRemoteCellText(e, fm, width) {
+        var addr = String((e && e.remote) || "—")
+        var hosts = section._connRemoteHosts(e)
+        if (hosts.length === 0)
+            return section._connRemoteIsFake(e)
+                ? addr + " · " + root.tr("diag.conn-trace.fake-ip", "fake-IP") : addr
+        var others = section._connRemoteHostCount(e) - 1
+        var compose = function(name) {
+            return addr + " · " + (others > 0
+                ? root.tr("diag.conn-trace.remote-host-others", "%1 (+%2)")
+                    .arg(name).arg(others)
+                : name)
+        }
+        var name = String(hosts[0])
+        var text = compose(name)
+        if (!fm || width <= 0 || fm.advanceWidth(text) <= width)
+            return text
+        var labels = name.split(".")
+        var floor = String((e && e.remote_host_floor) || "")
+        var tail = "." + floor.toLowerCase()
+        // A floor that is not this name's own tail is ignored, not trusted.
+        var floorLabels = (floor !== ""
+                && ("." + name.toLowerCase()).slice(-tail.length) === tail)
+            ? floor.split(".").length : labels.length
+        for (var k = 1; k <= labels.length - floorLabels; k++) {
+            text = compose("*." + labels.slice(k).join("."))
+            if (fm.advanceWidth(text) <= width)
+                break
+        }
+        return text
+    }
+    function _connRemoteTip(e) {
+        var hosts = section._connRemoteHosts(e)
+        var fake = section._connRemoteIsFake(e)
+        if (hosts.length === 0)
+            return fake ? root.tr("diag.conn-trace.fake-ip-recycled-tip",
+                "A virtual (fake-IP) address. The name it stood for is no longer in the pool.")
+                : ""
+        return (fake ? root.tr("diag.conn-trace.via-fake-ip",
+                "Via fake-IP: a virtual address the service gave this name.") + "\n" : "")
+            + root.tr("diag.conn-trace.remote-hosts-tip",
+                "Names this address was answered for (%1):")
+                .arg(section._connRemoteHostCount(e))
+            + "\n" + hosts.join("\n")
+    }
+    // Address and name share one line, so every data row is two lines.
+    function _connRowHeight(e, lineH) {
+        return 2 * lineH
+    }
+    // The Remote column grows with the window: it now carries the name too.
+    readonly property int _connRemoteColWidth:
+        Math.max(150, Math.min(400, Math.round(section.availableWidth * 0.36)))
 
     // Per-row lowercase search blob (see _cacheRowBlob).
     function _connRowBlob(e) {
@@ -314,6 +385,8 @@ ScrollView {
             section._connProtoLabel(e && e.proto),
             String((e && e.local) || ""),
             String((e && e.remote) || ""),
+            section._connRemoteHosts(e).join(" "),
+            section._connRemoteIsFake(e) ? root.tr("diag.conn-trace.fake-ip", "fake-IP") : "",
             section._connEgressLabel(e && e.egress_role),
             section._connVerdictLabel(e && e.verdict),
             Pure.formatTimestamp(e && e.observed_at_ms)
@@ -423,15 +496,15 @@ ScrollView {
     // Create a rule from the row the user is looking at. Reuses the shell's own
     // dialog — no new rule semantics, no second way to author a rule.
     // "Which rule decides this row": the rule diagnostics probe for this
-    // connection — by the rule host's name when the service knows it, since a
-    // domain rule cannot match a bare address.
-    function _explainConnRow(host, ip, process) {
-        if (host === "" && ip === "")
+    // connection, asked by name — the rule host, else the name the trace saw —
+    // since a domain rule cannot match a bare address. The address always
+    // travels along so the probe answers for this connection.
+    function _explainConnRow(ruleHost, name, ip, process) {
+        var subject = ruleHost !== "" ? ruleHost : (name !== "" ? name : ip)
+        if (subject === "")
             return
         root.notificationsController.explainInDiagnostics(
-            host !== "" ? host : ip,
-            host !== "" ? ip : "",
-            process === "?" ? "" : process)
+            subject, ip, process === "?" ? "" : process)
     }
     function _ruleFromConnRow(ruleType, value) {
         if (!root.ruleDialog || String(value || "") === "")
@@ -854,7 +927,7 @@ ScrollView {
                     }
                     Label {
                         id: connHdrRemote
-                        Layout.preferredWidth: 150
+                        Layout.preferredWidth: section._connRemoteColWidth
                         text: root.tr("diag.conn-trace.col-remote", "Remote")
                             + section._connSortArrow("remote")
                         color: root.mutedTextColor
@@ -1058,14 +1131,25 @@ ScrollView {
                             String((modelData && modelData.process_path) || "")
                         readonly property string _vRemote:
                             String((modelData && modelData.remote) || "")
-                        readonly property string _vRemoteIp: {
+                        // The address without its port, either family: the
+                        // service always appends ":port".
+                        readonly property string _vRemoteAddr: {
                             var raw = connRowItem._vRemote
                             var at = raw.lastIndexOf(":")
-                            var ip = at > 0 ? raw.substring(0, at) : raw
-                            return /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) ? ip : ""
+                            return at > 0 ? raw.substring(0, at) : raw
                         }
+                        readonly property string _vRemoteIp:
+                            /^\d{1,3}(\.\d{1,3}){3}$/.test(connRowItem._vRemoteAddr)
+                                ? connRowItem._vRemoteAddr : ""
                         readonly property string _vRuleHost:
                             String((modelData && modelData.rule_host) || "")
+                        readonly property var _vRemoteHosts:
+                            section._connRemoteHosts(modelData)
+                        readonly property string _vRemoteHostFirst:
+                            connRowItem._vRemoteHosts.length > 0
+                                ? String(connRowItem._vRemoteHosts[0]) : ""
+                        readonly property string _vRemoteTip:
+                            section._connRemoteTip(modelData)
                         readonly property string _vBlockReason: {
                             var reason = String((modelData && modelData.block_reason) || "")
                             return reason === "" ? ""
@@ -1103,11 +1187,12 @@ ScrollView {
                             }
                             MenuItem {
                                 visible: connRowItem._vRuleHost !== ""
-                                    || connRowItem._vRemoteIp !== ""
+                                    || connRowItem._vRemoteHostFirst !== ""
+                                    || connRowItem._vRemoteAddr !== ""
                                 text: root.tr("diag.conn-trace.why-this-route", "Why this route?")
                                 onTriggered: section._explainConnRow(
-                                    connRowItem._vRuleHost, connRowItem._vRemoteIp,
-                                    connRowItem._vProcess)
+                                    connRowItem._vRuleHost, connRowItem._vRemoteHostFirst,
+                                    connRowItem._vRemoteAddr, connRowItem._vProcess)
                             }
                             MenuSeparator { }
                             MenuItem {
@@ -1137,10 +1222,22 @@ ScrollView {
                                 text: root.copyValueLabel(connRowItem._vProcessPath)
                                 onTriggered: root.copyToClipboard(connRowItem._vProcessPath)
                             }
+                            // The cell may show a shortened name; these copy it whole.
                             MenuItem {
-                                visible: connRowItem._vRemote !== ""
-                                text: root.copyValueLabel(connRowItem._vRemote)
-                                onTriggered: root.copyToClipboard(connRowItem._vRemote)
+                                visible: connRowItem._vRemoteAddr !== ""
+                                text: root.tr("action.copy-address", "Copy address")
+                                onTriggered: root.copyToClipboard(connRowItem._vRemoteAddr)
+                            }
+                            MenuItem {
+                                visible: connRowItem._vRemoteHostFirst !== ""
+                                text: root.tr("action.copy-name", "Copy name")
+                                onTriggered: root.copyToClipboard(connRowItem._vRemoteHostFirst)
+                            }
+                            MenuItem {
+                                visible: connRowItem._vRemoteHosts.length > 1
+                                text: root.tr("action.copy-all-names", "Copy all names")
+                                onTriggered: root.copyToClipboard(
+                                    connRowItem._vRemoteHosts.join("\n"))
                             }
                             MenuItem {
                                 visible: connRowItem._vEgress !== ""
@@ -1190,11 +1287,27 @@ ScrollView {
                                     && connProcLabel.procPath !== ""
                                 ToolTip.text: connProcLabel.procPath
                             }
+                            // Elided in the middle, past the label floor, so the
+                            // address and the "(+N)" both stay in view.
                             Label {
-                                Layout.preferredWidth: 150
-                                text: String((modelData && modelData.remote) || "—")
+                                id: connRemoteCell
+                                Layout.preferredWidth: section._connRemoteColWidth
+                                Layout.maximumWidth: section._connRemoteColWidth
+                                text: connRemoteMetrics.height >= 0
+                                    ? section._connRemoteCellText(modelData, connRemoteMetrics,
+                                        connRemoteCell.width - connRemoteCell.leftPadding
+                                            - connRemoteCell.rightPadding)
+                                    : ""
                                 color: root.textColor
-                                elide: Text.ElideRight
+                                elide: Text.ElideMiddle
+                                FontMetrics { id: connRemoteMetrics; font: connRemoteCell.font }
+                                Accessible.name: connRowItem._vRemoteTip !== ""
+                                    ? connRowItem._vRemote + "\n" + connRowItem._vRemoteTip
+                                    : connRowItem._vRemote
+                                HoverHandler { id: connRemoteHover }
+                                ToolTip.visible: connRemoteHover.hovered
+                                    && connRowItem._vRemoteTip !== ""
+                                ToolTip.text: connRowItem._vRemoteTip
                             }
                             Label {
                                 id: connEgressCell

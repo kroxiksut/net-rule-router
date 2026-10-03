@@ -42,6 +42,7 @@ pub mod backup;
 pub mod block_notice_journal;
 pub mod block_notice_mutes;
 pub mod bootstrap;
+pub mod change_generation;
 pub mod doh_lockdown;
 pub mod dto;
 pub mod error;

@@ -85,6 +85,7 @@ fn fresh_deps() -> SupervisedRuntimeDeps {
         principal_enforcement: None,
         traffic_tick: None,
         activation_coordinator: None,
+        revision_watch: None,
         dns_refresh_orchestrator: None,
         route_recompute_hook: None,
         route_teardown_hook: None,

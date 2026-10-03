@@ -54,7 +54,7 @@ Dialog {
     }
 
     function _confirm() {
-        if (!nameIsUsable(nameField.text)) return
+        if (!nameIsUsable(nameField.text) || folder === "") return
         var n = String(nameField.text).trim()
         _accepted = true
         close()
@@ -122,6 +122,15 @@ Dialog {
                 }
             }
         }
+        Label {
+            Layout.fillWidth: true
+            visible: saveRuleSetDialog.folder === ""
+            wrapMode: Text.WordWrap
+            color: saveRuleSetDialog.root.uiTheme.colorDanger
+            font.pixelSize: saveRuleSetDialog.root.uiTheme.baseFontSizePx - 1
+            text: saveRuleSetDialog.root.tr("settings.presets.save-as-set.folder-missing",
+                "Choose a folder for the set.")
+        }
         RowLayout {
             Layout.fillWidth: true
             Layout.topMargin: saveRuleSetDialog.root.uiTheme.spacingSm
@@ -136,6 +145,7 @@ Dialog {
                 theme: saveRuleSetDialog.root.uiTheme
                 text: saveRuleSetDialog.root.tr("settings.presets.save-as-set.confirm", "Save set")
                 enabled: saveRuleSetDialog.nameIsUsable(nameField.text)
+                    && saveRuleSetDialog.folder !== ""
                 onClicked: saveRuleSetDialog._confirm()
             }
         }

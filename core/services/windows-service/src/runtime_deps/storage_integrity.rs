@@ -1,7 +1,7 @@
 //! Storage integrity: the row-MAC signing key and the coordinator that uses it.
 //!
 //! Carved out of [`super::build_supervised_runtime_deps`] because its
-//! interface is narrow — ten values in, two out — worth naming explicitly.
+//! interface is narrow — ten values in, three out — worth naming explicitly.
 //! Nothing here touches Windows: the DPAPI-backed key store is the
 //! OS-specific part, and it lives behind a port.
 
@@ -24,10 +24,11 @@ pub(super) struct StorageIntegrityInputs<'a> {
 
 /// What it hands back.
 ///
-/// Both `Option`: a boot with no settings DB or no audit writer still has to
+/// All `Option`: a boot with no settings DB or no audit writer still has to
 /// come up, it just cannot sign revisions or author auto-rules.
 pub(super) struct StorageIntegrity {
     pub activation_coordinator: Option<Arc<ActivationCoordinator>>,
+    pub revision_watch: Option<nrr_service_runtime::revision_watch::RevisionWatch>,
     pub block_notice_rule_author: Option<Arc<dyn nrr_service_runtime::auto_rules::AutoRuleAuthor>>,
 }
 
@@ -46,50 +47,26 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
         auto_rules_engine,
     } = inputs;
 
-    // ── DB-MAC tamper bootstrap ───────────────────────────────────────
-    // Load (or generate) the row-MAC signing key from the DPAPI key
-    // store, verify existing revisions, and raise tamper / key-reset
-    // alerts. The returned key is threaded into the
-    // ActivationCoordinator below so every revision write is signed.
-    // A failure degrades to unsigned operation and is raised as an alert,
-    // audited, and named in service health.
-    let key_store = production_key_store();
-    let alerts_repo: Option<Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>> =
-        settings_conn.as_ref().map(|conn| {
-            Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(conn)))
-                as Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>
-        });
+    // Row signing: key from the DPAPI store, boot verification, signed
+    // coordinator, live recheck — the one sequence every service runs.
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let boot_integrity =
-        alerts_repo.as_ref().map(
-            |alerts| nrr_service_runtime::boot_integrity::BootIntegrity {
-                alerts,
-                audit: artifacts
-                    .audit_writer
-                    .as_deref()
-                    .map(|w| w as &nrr_service_runtime::boot_integrity::AuditTrail),
-                health: health_agg.as_ref(),
-                now_ms,
-            },
-        );
-    let tamper_bootstrap = match (boot_integrity.as_ref(), settings_conn.as_ref()) {
-        (Some(integrity), Some(conn)) => integrity.bootstrap(conn, key_store.as_ref()),
-        _ => None,
-    };
-    let tamper_signing_key: Option<Vec<u8>> =
-        tamper_bootstrap.as_ref().map(|o| o.signing_key.clone());
-    // Keyed follow-up to the keyless boot sweep: signed candidate rows
-    // orphaned by a hard kill can only be rejected once the signing key
-    // exists (re-signing keeps their row_hmac consistent). Runs after
-    // verification so the scan saw the rows exactly as the previous run
-    // signed them. No key (bootstrap failed) → they stay pending until
-    // a healthy boot rather than being corrupted by a keyless flip.
-    if let (Some(conn), Some(key)) = (settings_conn.as_ref(), tamper_signing_key.as_ref()) {
-        nrr_service_runtime::bootstrap::sweep_signed_orphaned_candidates(conn, key);
-    }
+    let revision_signing = settings_conn.as_ref().map(|conn| {
+        nrr_service_runtime::revision_signing::RevisionSigning::bootstrap(
+            conn,
+            production_key_store(),
+            Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(conn)))
+                as Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>,
+            artifacts
+                .audit_writer
+                .clone()
+                .map(|w| w as Arc<nrr_service_runtime::boot_integrity::AuditTrail>),
+            Arc::clone(&health_agg),
+            now_ms,
+        )
+    });
 
     let activation_coordinator = match (settings_conn.as_ref(), artifacts.audit_writer.as_ref()) {
         (Some(conn), Some(audit_writer)) => {
@@ -146,12 +123,9 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
                     as Arc<dyn nrr_service_runtime::activation_coordinator::IdGenerator>,
                 startup_failure_policy,
             );
-            // Sign revision rows when the tamper bootstrap produced a key.
-            // Without it the coordinator runs unsigned (reported above).
-            if let Some(key) = tamper_signing_key.clone() {
-                coordinator = coordinator
-                    .with_signing_key(key)
-                    .with_key_store(Arc::clone(&key_store));
+            // Without a key the coordinator runs unsigned (already reported).
+            if let Some(signing) = revision_signing.as_ref() {
+                coordinator = signing.sign(coordinator);
             }
             // No-tray routing-user fallback: an
             // activation with a dead tray subscription must still dispatch to
@@ -166,19 +140,13 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
         _ => None,
     };
 
-    // Verify every principal's active revision (HMAC + Free rule cap)
-    // before any SID install can read it — none have started yet this
-    // early in bootstrap (the IPC server isn't listening). A row that
-    // reached `revisions` outside the app is rolled back to the last
-    // trusted revision here instead of being enforced as-is. No bootstrap
-    // outcome means no key, and an unsigned coordinator has nothing to verify.
-    if let (Some(coord), Some(integrity), Some(bootstrap)) = (
-        activation_coordinator.as_ref(),
-        boot_integrity.as_ref(),
-        tamper_bootstrap.as_ref(),
-    ) {
-        integrity.enforce_active(coord, bootstrap);
-    }
+    // Verified before any SID install can read the rules — none has started
+    // this early (the IPC server isn't listening); then rechecked after every
+    // outside write while the service runs. Without a coordinator the tamper
+    // alerts are still raised.
+    let revision_watch = revision_signing
+        .as_ref()
+        .and_then(|signing| signing.enforce_and_watch(activation_coordinator.as_ref()));
 
     // The rule author behind companion-domain acceptance and the "route this
     // blocked host" notice action. It submits through the ordinary mutation
@@ -239,6 +207,7 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
 
     StorageIntegrity {
         activation_coordinator,
+        revision_watch,
         block_notice_rule_author,
     }
 }

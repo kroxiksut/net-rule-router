@@ -18,23 +18,19 @@
 //! nothing"; the roots are injectable so the parsing is tested on temp dirs.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use nrr_platform_api::app_group_discovery::{
     classify_app, guest_network_bypasses_process, merge_discovered, AppDiscoverySource,
     AppGroupDiscoveryPort, AppGroupKind, DiscoveredApp,
 };
 
-/// `comm` is at most 16 bytes; anything longer is not a `comm` file.
-const MAX_COMM_BYTES: u64 = 256;
+use crate::app_scan::{
+    application_dirs, desktop_apps_in, read_capped, running_processes, DesktopApp, ProcessSeen,
+};
+
 /// A hypervisor's command line with every device spelled out; larger is not one.
 const MAX_CMDLINE_BYTES: u64 = 256 * 1024;
-/// Desktop entries are a few KiB; a larger file is not one worth parsing.
-const MAX_DESKTOP_ENTRY_BYTES: u64 = 64 * 1024;
-/// Guards against a pathological directory (or `/proc`) listing.
-const MAX_ENTRIES_PER_DIR: usize = 65_536;
 
 /// A kernel-NAT stack: its display label (the GUI wraps it with `tr()`), the
 /// bridges it creates, and the daemons that run it.
@@ -62,11 +58,6 @@ const KERNEL_NAT_STACKS: &[KernelNatStack] = &[
     },
 ];
 
-/// Launchers whose path in `Exec=` is not the application's own executable.
-/// Keeping them out of `exe_path` matters: the merge dedups by path, so every
-/// Flatpak app would otherwise collapse into one row.
-const EXEC_WRAPPERS: &[&str] = &["env", "flatpak", "sh", "bash", "snap"];
-
 /// Linux [`AppGroupDiscoveryPort`]: running processes + desktop entries +
 /// kernel-NAT stacks.
 #[derive(Debug, Clone)]
@@ -86,23 +77,10 @@ impl LinuxAppGroupDiscovery {
     /// The real system locations, plus this user's own data directories.
     #[must_use]
     pub fn new() -> Self {
-        let mut application_dirs: Vec<PathBuf> = [
-            "/usr/share/applications",
-            "/usr/local/share/applications",
-            "/var/lib/flatpak/exports/share/applications",
-            "/var/lib/snapd/desktop/applications",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-        if let Some(data_home) = user_data_home() {
-            application_dirs.push(data_home.join("applications"));
-            application_dirs.push(data_home.join("flatpak/exports/share/applications"));
-        }
         Self::with_roots(
             PathBuf::from("/proc"),
             PathBuf::from("/sys/class/net"),
-            application_dirs,
+            application_dirs(),
         )
     }
 
@@ -161,42 +139,15 @@ impl AppGroupDiscoveryPort for LinuxAppGroupDiscovery {
                 }),
         );
         for dir in &self.application_dirs {
-            out.extend(desktop_entries_in(dir));
+            out.extend(desktop_apps_in(dir).iter().filter_map(classify_desktop_app));
         }
         merge_discovered(out)
     }
 }
 
-/// `$XDG_DATA_HOME` when absolute (the spec ignores a relative one), else
-/// `~/.local/share`.
-fn user_data_home() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .map(|home| home.join(".local/share"))
-        })
-}
-
 // ── Source 1: running processes ───────────────────────────────────────────────
 
-struct ProcessSeen {
-    dir: PathBuf,
-    exe: Option<PathBuf>,
-    comm: Option<String>,
-}
-
 impl ProcessSeen {
-    fn exe_basename(&self) -> Option<&str> {
-        self.exe
-            .as_deref()
-            .and_then(Path::file_name)
-            .and_then(|n| n.to_str())
-    }
-
     fn classify(&self) -> Option<DiscoveredApp> {
         // `comm` is truncated to 15 bytes, so the full exe name wins when known.
         let (name, kind) = [self.exe_basename(), self.comm.as_deref()]
@@ -216,9 +167,7 @@ impl ProcessSeen {
             source: AppDiscoverySource::RunningProcess,
         })
     }
-}
 
-impl ProcessSeen {
     /// Read only for hypervisors: the arguments are NUL-separated.
     fn guest_on_a_bridge(&self) -> bool {
         read_capped(&self.dir.join("cmdline"), MAX_CMDLINE_BYTES)
@@ -226,216 +175,26 @@ impl ProcessSeen {
     }
 }
 
-fn running_processes(proc_root: &Path) -> Vec<ProcessSeen> {
-    let Ok(entries) = std::fs::read_dir(proc_root) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .take(MAX_ENTRIES_PER_DIR)
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .filter_map(|entry| {
-            let dir = entry.path();
-            let exe = std::fs::read_link(dir.join("exe")).ok().map(|target| {
-                // A replaced binary reads as `/path/app (deleted)`.
-                let text = target.to_string_lossy();
-                match text.strip_suffix(" (deleted)") {
-                    Some(live) => PathBuf::from(live),
-                    None => target,
-                }
-            });
-            let comm = read_capped(&dir.join("comm"), MAX_COMM_BYTES)
-                .map(|c| c.trim().to_string())
-                .filter(|c| !c.is_empty());
-            (exe.is_some() || comm.is_some()).then_some(ProcessSeen { dir, exe, comm })
-        })
-        .collect()
-}
-
 // ── Source 2: desktop entries ─────────────────────────────────────────────────
 
-/// The entries in `dir` and in its direct subdirectories: XDG allows vendor
-/// folders (`kde4/`, `wine/`). One level only, which also rules out a loop.
-fn desktop_entries_in(dir: &Path) -> Vec<DiscoveredApp> {
-    let mut out = Vec::new();
-    for subdir in desktop_entries_one_level(dir, &mut out) {
-        desktop_entries_one_level(&subdir, &mut out);
-    }
-    out
-}
-
-/// Classify the entries directly in `dir` into `out`; returns its subdirectories.
-fn desktop_entries_one_level(dir: &Path, out: &mut Vec<DiscoveredApp>) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut subdirs = Vec::new();
-    for entry in entries.flatten().take(MAX_ENTRIES_PER_DIR) {
-        let path = entry.path();
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            subdirs.push(path);
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if let Some(app) = read_capped(&path, MAX_DESKTOP_ENTRY_BYTES)
-            .and_then(|text| desktop_entry_app(stem, &text))
-        {
-            out.push(app);
-        }
-    }
-    subdirs
-}
-
-/// Classify one desktop entry. `stem` is its file name without `.desktop`.
-fn desktop_entry_app(stem: &str, text: &str) -> Option<DiscoveredApp> {
-    let entry = parse_desktop_entry(text)?;
-    if entry.hidden || entry.kind.as_deref().is_some_and(|k| k != "Application") {
-        return None;
-    }
-    let program = entry.exec.as_deref().and_then(exec_program);
-    let program_name = program
-        .as_deref()
-        .and_then(|p| Path::new(p).file_name())
-        .and_then(|n| n.to_str());
-    let kind = [entry.name.as_deref(), program_name, Some(stem)]
-        .into_iter()
-        .flatten()
-        .find_map(classify_app)?;
-    let display_name = entry
-        .name
-        .or_else(|| program_name.map(str::to_string))
-        .unwrap_or_else(|| stem.to_string());
-    // Only a path that names the app itself: a wrapper's path would merge
-    // unrelated apps, and a relative one is resolved through `$PATH` at launch.
-    // `Exec=` is a Unix path whatever the host, so no `Path::is_absolute`.
-    let exe_path = program.filter(|p| {
-        let path = Path::new(p);
-        p.starts_with('/')
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| !EXEC_WRAPPERS.contains(&n))
-    });
+fn classify_desktop_app(app: &DesktopApp) -> Option<DiscoveredApp> {
+    let kind = app.labels().find_map(classify_app)?;
     Some(DiscoveredApp {
         kind,
-        display_name,
-        exe_path,
+        display_name: app.display_name(),
+        exe_path: app.own_exe_path().map(str::to_string),
         running: false,
         source: AppDiscoverySource::InstalledProgram,
     })
 }
 
-#[derive(Default)]
-struct DesktopEntry {
-    name: Option<String>,
-    exec: Option<String>,
-    kind: Option<String>,
-    hidden: bool,
-}
-
-/// The unlocalized keys of the `[Desktop Entry]` group; other groups (actions)
-/// and localized `Name[xx]=` keys are ignored.
-fn parse_desktop_entry(text: &str) -> Option<DesktopEntry> {
-    let mut entry = DesktopEntry::default();
-    let mut in_main_group = false;
-    let mut seen_main_group = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') {
-            in_main_group = line == "[Desktop Entry]";
-            seen_main_group |= in_main_group;
-            continue;
-        }
-        if !in_main_group {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "Name" if !value.is_empty() => entry.name = Some(value.to_string()),
-            "Exec" if !value.is_empty() => entry.exec = Some(value.to_string()),
-            "Type" => entry.kind = Some(value.to_string()),
-            "Hidden" => entry.hidden = value == "true",
-            _ => {}
-        }
-    }
-    seen_main_group.then_some(entry)
-}
-
-/// The program an `Exec=` line runs: the first token after an optional
-/// `env VAR=value …` prefix, with the spec's double-quote escaping undone.
-fn exec_program(exec: &str) -> Option<String> {
-    let mut tokens = exec_tokens(exec).into_iter().peekable();
-    if tokens
-        .peek()
-        .is_some_and(|t| Path::new(t).file_name().and_then(|n| n.to_str()) == Some("env"))
-    {
-        tokens.next();
-        while tokens
-            .peek()
-            .is_some_and(|t| t.contains('=') || t.starts_with('-'))
-        {
-            tokens.next();
-        }
-    }
-    tokens.next().filter(|t| !t.is_empty())
-}
-
-fn exec_tokens(exec: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut chars = exec.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            '\\' if in_quotes => {
-                if let Some(escaped) = chars.next() {
-                    current.push(escaped);
-                }
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-/// The whole file as text, or `None` when unreadable or larger than `cap`.
-fn read_capped(path: &Path, cap: u64) -> Option<String> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .ok()?
-        .take(cap + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() as u64 <= cap).then(|| String::from_utf8_lossy(&bytes).into_owned())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::path::Path;
+
     use super::*;
+    use crate::app_scan::MAX_DESKTOP_ENTRY_BYTES;
 
     fn write(path: &Path, text: &str) {
         if let Some(dir) = path.parent() {
@@ -655,31 +414,6 @@ mod tests {
         let gone = fx.proc_root.join("nowhere");
         let discovery = LinuxAppGroupDiscovery::with_roots(gone.clone(), gone.clone(), vec![gone]);
         assert!(discovery.discover_app_groups().is_empty());
-    }
-
-    #[test]
-    fn exec_program_undoes_quoting_and_skips_env() {
-        assert_eq!(
-            exec_program(r#""/opt/My App/bin/app" --x"#).as_deref(),
-            Some("/opt/My App/bin/app")
-        );
-        assert_eq!(
-            exec_program("env LANG=C GDK_BACKEND=x11 qbittorrent %U").as_deref(),
-            Some("qbittorrent")
-        );
-        assert_eq!(
-            exec_program(r#""/opt/a\"b/app""#).as_deref(),
-            Some("/opt/a\"b/app")
-        );
-        assert_eq!(exec_program("   "), None);
-    }
-
-    #[test]
-    fn an_oversized_comm_is_not_read() {
-        let dir = tempfile::tempdir().expect("dir");
-        let path = dir.path().join("comm");
-        write(&path, &"x".repeat(MAX_COMM_BYTES as usize + 1));
-        assert!(read_capped(&path, MAX_COMM_BYTES).is_none());
     }
 
     #[test]

@@ -176,6 +176,10 @@ pub struct ConnectionTraceRecord {
     /// `None` for anything that is not our drop.
     pub nrr_block_reason: Option<&'static str>,
     pub observed_unix_ms: Option<u64>,
+    /// What the service's DNS saw the remote address answered for, or the name
+    /// a virtual address stands for, filled in as the row enters the ring.
+    /// Shared between rows to one address.
+    pub remote_names: Option<Arc<crate::conn_trace_names::RemoteNames>>,
 }
 
 /// Bounded in-memory ring of the most-recent resolved
@@ -191,6 +195,9 @@ pub struct ConnectionTraceRing {
     /// two different things to the user — "nothing has happened yet" and "we
     /// are not watching" — and only the composition root knows which.
     observer_active: AtomicBool,
+    /// Names each row's remote address on the way in; absent, rows carry the
+    /// address only.
+    namer: std::sync::OnceLock<Arc<crate::conn_trace_names::ConnTraceNamer>>,
 }
 
 impl ConnectionTraceRing {
@@ -200,7 +207,14 @@ impl ConnectionTraceRing {
             inner: Mutex::new(VecDeque::new()),
             cap: cap.max(1),
             observer_active: AtomicBool::new(false),
+            namer: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Name every row recorded from now on. The first namer stays; `false`
+    /// says one was already attached.
+    pub fn attach_namer(&self, namer: Arc<crate::conn_trace_names::ConnTraceNamer>) -> bool {
+        self.namer.set(namer).is_ok()
     }
 
     /// Record that the observation source is running and feeding this ring.
@@ -219,8 +233,14 @@ impl ConnectionTraceRing {
         self.observer_active.load(Ordering::Relaxed)
     }
 
-    /// Append the newest record, evicting the oldest when full.
-    pub fn push(&self, rec: ConnectionTraceRecord) {
+    /// Append the newest record, evicting the oldest when full. Named before
+    /// the ring is locked, so a reader never waits on a name lookup.
+    pub fn push(&self, mut rec: ConnectionTraceRecord) {
+        if rec.remote_names.is_none() {
+            if let Some(namer) = self.namer.get() {
+                rec.remote_names = namer.name(rec.remote.ip());
+            }
+        }
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         while g.len() >= self.cap {
             g.pop_front();
@@ -292,6 +312,7 @@ pub fn classify_connection(
         nrr_drop_spec_id: obs.nrr_drop_spec_id,
         nrr_block_reason: None,
         observed_unix_ms: obs.observed_unix_ms,
+        remote_names: None,
     }
 }
 
@@ -331,6 +352,25 @@ pub fn proto_str(p: TransportProtocol) -> &'static str {
         TransportProtocol::Udp => "udp",
         TransportProtocol::Other(_) => "other",
     }
+}
+
+/// One observed connection, written to the operational log. One line for every
+/// observer that feeds the trace, so the line a user reads — and the principal
+/// it is scoped to through `sid` — is the same on every platform.
+pub fn log_observed_connection(rec: &ConnectionTraceRecord) {
+    tracing::info!(
+        target: "nrr::conn-trace",
+        msg_key = "connobs-outbound-connection-observed",
+        process = rec.process_path.as_deref().unwrap_or("?"),
+        sid = rec.user_sid.as_deref().unwrap_or("?"),
+        proto = proto_str(rec.protocol),
+        remote = %rec.remote,
+        local = %rec.local,
+        egress_ifindex = rec.egress.ifindex,
+        egress = role_str(rec.egress.role),
+        verdict = verdict_str(rec.verdict),
+        "observed outbound connection",
+    );
 }
 
 /// Resolves the egress interface of each observed connection and logs the

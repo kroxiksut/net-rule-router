@@ -209,8 +209,10 @@ GroupBox {
     property bool _stabilityLoading: false
     property string _stabilityErrorCode: ""
 
+    // The accept policy is sent only where the service applies the whole row.
     readonly property bool _stabilityClientValid:
-        _stabilityDraftIsCritical
+        !root.serviceStabilitySupported
+        || _stabilityDraftIsCritical
         || (_stabilityDraftBackoffCapSec * 1000 >= _stabilityDraftBackoffBaseMs)
 
     /// Arm the draft state after a user edit.
@@ -235,6 +237,12 @@ GroupBox {
         if (!root._routingBackendConnected()) {
             _saveStabilityConfig()
         }
+    }
+
+    function _editConnTraceDraft(key, value) {
+        if (key === "conn-trace-ndjson") _stabilityDraftConnTraceNdjson = value
+        else _stabilityDraftConnTraceGui = value
+        _markStabilityDirty()
     }
 
     function _applyStabilityFromPayload(payload) {
@@ -357,7 +365,7 @@ GroupBox {
     }
 
     function _fetchStabilityConfig() {
-        if (!root.serviceStabilitySupported) return
+        if (!root.stabilityAnyKeySupported) return
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
         if (!root.bridgeAvailable
                 || bridge === null
@@ -410,6 +418,15 @@ GroupBox {
         _markStabilityDirty()
     }
 
+    function _stabilitySaveErrorText() {
+        if (_stabilityErrorCode === "") return ""
+        var lbl = (typeof root.ipcErrorLabel === "function")
+            ? root.ipcErrorLabel(_stabilityErrorCode)
+            : _stabilityErrorCode
+        return root.tr("settings.diagnostics.service-stability.save-failed",
+            "Save failed") + ": " + lbl
+    }
+
     /// Wire shape of the IPC accept policy built from the current drafts.
     /// Shared by the live Save and the offline park so both send the same thing.
     function _buildAcceptPolicy() {
@@ -431,16 +448,17 @@ GroupBox {
         // so the panel's settings can be armed BEFORE the service is started and
         // are offered for delivery on the connect edge. Previously the write
         // simply failed with "bridge unavailable" and the user's ticks were lost.
+        // Only the keys this OS's service applies, parked or sent alike.
+        var patch = root.stabilityPatchForPlatform({
+            "ipc-accept-policy": _buildAcceptPolicy(),
+            "conn-trace-ndjson": _stabilityDraftConnTraceNdjson,
+            "conn-trace-gui": _stabilityDraftConnTraceGui,
+            "cache-refresh-interval-secs": _stabilityDraftCacheRefreshSecs
+        })
         if (!root._routingBackendConnected()) {
             try {
-                root._recordOfflineRoutingIntent(
-                    "stability", "ipc-accept-policy", _buildAcceptPolicy())
-                root._recordOfflineRoutingIntent(
-                    "stability", "conn-trace-ndjson", _stabilityDraftConnTraceNdjson)
-                root._recordOfflineRoutingIntent(
-                    "stability", "conn-trace-gui", _stabilityDraftConnTraceGui)
-                root._recordOfflineRoutingIntent(
-                    "stability", "cache-refresh-interval-secs", _stabilityDraftCacheRefreshSecs)
+                for (var key in patch)
+                    root._recordOfflineRoutingIntent("stability", key, patch[key])
             } catch (e) {
                 // Reporting the failure keeps the drafts dirty and the guard
                 // honest; swallowing it would park nothing and claim a save.
@@ -458,20 +476,12 @@ GroupBox {
             if (typeof onComplete === "function") onComplete(true)
             return
         }
-        var policy = _buildAcceptPolicy()
         _stabilityLoading = true
         _stabilityErrorCode = ""
         // One clobber-safe writer. Send ONLY the Diagnostics-owned
-        // fields; the merge-on-Get preserves the Routing-owned fields
-        // (enforcement-mode, liveness-window, stop-policy, rule-scope), so the
-        // old carry-forward hacks (_stabilityLoaded*) are gone.
+        // fields; the merge-on-Get preserves the Routing-owned ones.
         try {
-            root.applyServiceStabilityPatch({
-                "ipc-accept-policy": policy,
-                "conn-trace-ndjson": _stabilityDraftConnTraceNdjson,
-                "conn-trace-gui": _stabilityDraftConnTraceGui,
-                "cache-refresh-interval-secs": _stabilityDraftCacheRefreshSecs
-            }, function(ok, code, payload) {
+            root.applyServiceStabilityPatch(patch, function(ok, code, payload) {
                 group._stabilityLoading = false
                 if (!ok) {
                     group._stabilityErrorCode = (code === "") ? "unknown" : code
@@ -1040,6 +1050,135 @@ GroupBox {
         // user can tell it apart from a screen that simply failed to load.
         Frame {
             Layout.fillWidth: true
+            visible: root.verboseLoggingSupported
+            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
+            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+            // Verbose service logging: a window that ends by itself, chosen
+            // here and nowhere else. Applied live (no restart) outside the
+            // draft/Save flow; the closed box shows what the service runs. Its
+            // own card: a service may apply it without the rest of stability.
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: root.uiTheme.spacingXxs
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    Label {
+                        text: root.tr("settings.diagnostics.service-stability.verbose.label",
+                            "Verbose service logging")
+                        color: root.textColor
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+                    VerboseLoggingDurationCombo {
+                        id: verboseLoggingCombo
+                        root: group.root
+                        theme: group.root.uiTheme
+                        Layout.fillWidth: true
+                        Layout.maximumWidth: 420
+                        currentIndex: {
+                            if (group._verboseParkedChange !== "")
+                                return Pure.VERBOSE_LOGGING_CHANGES.indexOf(group._verboseParkedChange)
+                            if (group.root.serviceVerboseLoggingMode === "until-restart") return 3
+                            return group.root.serviceVerboseLoggingMode === "off" ? 0 : -1
+                        }
+                        displayText: group.root.uiRevision >= 0 ? group._verboseStateText() : ""
+                        onActivated: function(index) {
+                            var change = options[index]
+                            if (!group.root._routingBackendConnected())
+                                group._verboseParkedChange = change
+                            group.root.applyVerboseLogging(change, "user:verbose-logging")
+                        }
+                        Accessible.name: group.root.tr(
+                            "settings.diagnostics.service-stability.verbose.label",
+                            "Verbose service logging") + ": " + displayText
+                        ToolTip.visible: hovered
+                        ToolTip.delay: 400
+                        ToolTip.text: group.root.tr(
+                            "settings.diagnostics.service-stability.verbose.tooltip",
+                            "Adds debug events to the service log. Switches itself off when the chosen time runs out or the service restarts. Applies immediately.")
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    text: root.tr(
+                        "settings.diagnostics.service-stability.verbose.help",
+                        "Useful for diagnosing rare problems. The log grows substantially while it is on, which is why it switches itself off.")
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                }
+                Timer {
+                    interval: 20000
+                    repeat: true
+                    running: group.visible && root.serviceVerboseLoggingMode === "timed"
+                    triggeredOnStart: true
+                    onTriggered: {
+                        group._verboseNowMs = Date.now()
+                        // The service ends the window at this same moment.
+                        if (group._verboseNowMs >= root.serviceVerboseLoggingUntilMs) {
+                            root.serviceVerboseLoggingMode = "off"
+                            root.serviceVerboseLoggingUntilMs = 0
+                        }
+                    }
+                }
+            }
+        }
+
+        // Where the service applies the trace switches without the rest of the
+        // stability row they get a card of their own, saved like the row.
+        Frame {
+            Layout.fillWidth: true
+            visible: !root.serviceStabilitySupported && root.supports("connTraceLog")
+            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
+            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: root.uiTheme.spacingSm
+                ServiceIntentDivergenceNote {
+                    root: group.root
+                    keys: ["conn-trace-ndjson", "conn-trace-gui"]
+                }
+                ConnTraceSwitches {
+                    root: group.root
+                    Layout.fillWidth: true
+                    ndjsonChecked: group._stabilityDraftConnTraceNdjson
+                    guiChecked: group._stabilityDraftConnTraceGui
+                    onNdjsonEdited: function(value) { group._editConnTraceDraft("conn-trace-ndjson", value) }
+                    onGuiEdited: function(value) { group._editConnTraceDraft("conn-trace-gui", value) }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    visible: group._stabilityErrorCode !== ""
+                    color: root.uiTheme.colorAccent
+                    wrapMode: Text.WordWrap
+                    text: group._stabilitySaveErrorText()
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    Item { Layout.fillWidth: true }
+                    Label {
+                        visible: group._stabilityDirty && !group._stabilityLoading
+                        color: root.mutedTextColor
+                        text: root.tr(
+                            "settings.autosave.pending", "Unsaved — saving shortly")
+                    }
+                    Label {
+                        visible: group._stabilityJustSaved
+                            && group._stabilityErrorCode === ""
+                            && !group._stabilityDirty
+                        color: root.uiTheme.colorAccent
+                        text: root.tr(
+                            "settings.diagnostics.service-stability.saved", "Saved")
+                    }
+                }
+            }
+        }
+
+        Frame {
+            Layout.fillWidth: true
             visible: !root.serviceStabilitySupported
             padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
             background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
@@ -1106,77 +1245,6 @@ GroupBox {
                     root: group.root
                     keys: ["ipc-accept-policy", "conn-trace-ndjson", "conn-trace-gui",
                         "cache-refresh-interval-secs"]
-                }
-
-                // Verbose service logging: a window that ends by itself, chosen
-                // here and nowhere else. Applied live (no restart) outside the
-                // draft/Save flow; the closed box shows what the service runs.
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    Layout.topMargin: root.uiTheme.spacingXs
-                    spacing: root.uiTheme.spacingXxs
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: root.uiTheme.spacingSm
-                        Label {
-                            text: root.tr("settings.diagnostics.service-stability.verbose.label",
-                                "Verbose service logging")
-                            color: root.textColor
-                            Layout.alignment: Qt.AlignVCenter
-                        }
-                        VerboseLoggingDurationCombo {
-                            id: verboseLoggingCombo
-                            root: group.root
-                            theme: group.root.uiTheme
-                            Layout.fillWidth: true
-                            Layout.maximumWidth: 420
-                            currentIndex: {
-                                if (group._verboseParkedChange !== "")
-                                    return Pure.VERBOSE_LOGGING_CHANGES.indexOf(group._verboseParkedChange)
-                                if (group.root.serviceVerboseLoggingMode === "until-restart") return 3
-                                return group.root.serviceVerboseLoggingMode === "off" ? 0 : -1
-                            }
-                            displayText: group.root.uiRevision >= 0 ? group._verboseStateText() : ""
-                            onActivated: function(index) {
-                                var change = options[index]
-                                if (!group.root._routingBackendConnected())
-                                    group._verboseParkedChange = change
-                                group.root.applyVerboseLogging(change, "user:verbose-logging")
-                            }
-                            Accessible.name: group.root.tr(
-                                "settings.diagnostics.service-stability.verbose.label",
-                                "Verbose service logging") + ": " + displayText
-                            ToolTip.visible: hovered
-                            ToolTip.delay: 400
-                            ToolTip.text: group.root.tr(
-                                "settings.diagnostics.service-stability.verbose.tooltip",
-                                "Adds debug events to the service log. Switches itself off when the chosen time runs out or the service restarts. Applies immediately.")
-                        }
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        Layout.preferredWidth: 0
-                        text: root.tr(
-                            "settings.diagnostics.service-stability.verbose.help",
-                            "Useful for diagnosing rare problems. The log grows substantially while it is on, which is why it switches itself off.")
-                        color: root.mutedTextColor
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                    }
-                    Timer {
-                        interval: 20000
-                        repeat: true
-                        running: group.visible && root.serviceVerboseLoggingMode === "timed"
-                        triggeredOnStart: true
-                        onTriggered: {
-                            group._verboseNowMs = Date.now()
-                            // The service ends the window at this same moment.
-                            if (group._verboseNowMs >= root.serviceVerboseLoggingUntilMs) {
-                                root.serviceVerboseLoggingMode = "off"
-                                root.serviceVerboseLoggingUntilMs = 0
-                            }
-                        }
-                    }
                 }
 
                 GridLayout {
@@ -1413,78 +1481,14 @@ GroupBox {
                     }
                 }
 
-                // Connection-egress trace.
-                // Two independent toggles: write the per-connection trace to
-                // the service NDJSON, and/or surface it in GUI diagnostics.
-                // Both apply on save. Off by default — privacy-sensitive.
-                ColumnLayout {
+                ConnTraceSwitches {
+                    root: group.root
                     Layout.fillWidth: true
-                    Layout.topMargin: root.uiTheme.spacingSm
-                    spacing: root.uiTheme.spacingXxs
-
-                    Label {
-                        Layout.fillWidth: true
-                        text: root.tr(
-                            "settings.diagnostics.conn-trace.heading",
-                            "Connection trace (diagnostic)")
-                        font.pixelSize: root.uiTheme.baseFontSizePx
-                        font.bold: true
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        text: root.tr(
-                            "settings.diagnostics.conn-trace.intro",
-                            "Records outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Observation itself is always on — these two switches decide where it is shown and whether it is written down.")
-                        color: root.mutedTextColor
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                    }
-                    CheckBox {
-                        // Hidden where the service has no disk sink for the trace.
-                        visible: root.supports("connTraceLog")
-                        text: root.tr(
-                            "settings.diagnostics.conn-trace.ndjson.label",
-                            "Write connection trace to service log (NDJSON)")
-                        checked: group._stabilityDraftConnTraceNdjson
-                        onToggled: {
-                            if (checked !== group._stabilityDraftConnTraceNdjson) {
-                                group._stabilityDraftConnTraceNdjson = checked
-                                group._markStabilityDirty()
-                            }
-                        }
-                        ToolTip.visible: hovered
-                        ToolTip.delay: 400
-                        ToolTip.text: root.tr(
-                            "settings.diagnostics.conn-trace.ndjson.tooltip",
-                            "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary or additional adapter). Takes effect immediately, no service restart.")
-                    }
-                    CheckBox {
-                        text: root.tr(
-                            "settings.diagnostics.conn-trace.gui.label",
-                            "Show connection trace in Diagnostics")
-                        checked: group._stabilityDraftConnTraceGui
-                        onToggled: {
-                            if (checked !== group._stabilityDraftConnTraceGui) {
-                                group._stabilityDraftConnTraceGui = checked
-                                group._markStabilityDirty()
-                            }
-                        }
-                        ToolTip.visible: hovered
-                        ToolTip.delay: 400
-                        ToolTip.text: root.tr(
-                            "settings.diagnostics.conn-trace.gui.tooltip",
-                            "Lets the connection-trace panel in Diagnostics show what was observed. Takes effect immediately, no service restart. Switching it off hides the panel's contents only — it does not stop observation, which app routing and rule suggestions rely on.")
-                    }
-                    Label {
-                        Layout.fillWidth: true
-                        Layout.leftMargin: root.uiTheme.spacingLg
-                        text: root.tr(
-                            "settings.diagnostics.conn-trace.help",
-                            "Privacy-sensitive: the trace carries per-connection process names and remote addresses. Writing it to disk is the part worth leaving off in normal operation.")
-                        color: root.mutedTextColor
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                    }
+                    Layout.topMargin: group.root.uiTheme.spacingSm
+                    ndjsonChecked: group._stabilityDraftConnTraceNdjson
+                    guiChecked: group._stabilityDraftConnTraceGui
+                    onNdjsonEdited: function(value) { group._editConnTraceDraft("conn-trace-ndjson", value) }
+                    onGuiEdited: function(value) { group._editConnTraceDraft("conn-trace-gui", value) }
                 }
 
                 // Save error gets its own line so the Save / Reset row
@@ -1494,15 +1498,7 @@ GroupBox {
                     visible: group._stabilityErrorCode !== ""
                     color: root.uiTheme.colorAccent
                     wrapMode: Text.WordWrap
-                    text: {
-                        if (group._stabilityErrorCode === "") return ""
-                        var lbl = (typeof root.ipcErrorLabel === "function")
-                            ? root.ipcErrorLabel(group._stabilityErrorCode)
-                            : group._stabilityErrorCode
-                        return root.tr(
-                            "settings.diagnostics.service-stability.save-failed",
-                            "Save failed") + ": " + lbl
-                    }
+                    text: group._stabilitySaveErrorText()
                 }
 
                 // Autosave cadence for this panel's drafts. The panel has no

@@ -435,6 +435,45 @@ function stabilityIntentAfterWrite(intent, partial, before, appElevated) {
 // The requests the verbose-logging control offers, in display order.
 var VERBOSE_LOGGING_CHANGES = ["off", "one-hour", "four-hours", "until-restart"]
 
+// Stability keys a service without the whole row still applies, each with the
+// capability that says so. Where `serviceStabilityConfig` holds, every key does.
+var STABILITY_KEY_CAPABILITY = {
+    "verbose-logging-change": "verboseLogging",
+    "conn-trace-ndjson": "connTraceLog",
+    "conn-trace-gui": "connTraceLog"
+}
+
+// `supports` is the platform profile's capability map; an absent map or flag
+// reads as supported, as the window's `supports()` does.
+function _profileSupports(supports, feature) {
+    return !supports || supports[feature] !== false
+}
+
+function stabilityKeyApplies(key, supports) {
+    if (_profileSupports(supports, "serviceStabilityConfig")) return true
+    var capability = STABILITY_KEY_CAPABILITY[key]
+    return capability !== undefined && _profileSupports(supports, capability)
+}
+
+// The part of a stability patch this platform's service applies. A key it
+// would only store must not be sent as if it took effect.
+function stabilityPatchForPlatform(partial, supports) {
+    var out = {}
+    for (var key in (partial || {})) {
+        if (stabilityKeyApplies(key, supports)) out[key] = partial[key]
+    }
+    return out
+}
+
+// Whether this platform's service applies any stability key at all.
+function stabilityAnyKeyApplies(supports) {
+    if (_profileSupports(supports, "serviceStabilityConfig")) return true
+    for (var key in STABILITY_KEY_CAPABILITY) {
+        if (_profileSupports(supports, STABILITY_KEY_CAPABILITY[key])) return true
+    }
+    return false
+}
+
 // Whole hours and minutes left until `untilMs`, rounded up to the minute so
 // the last minute never reads as zero.
 function remainingHoursMinutes(untilMs, nowMs) {
@@ -653,6 +692,8 @@ function mapWireInterfaceRow(w) {
         name: String(w["name"] || ""),
         description: String(w["interface-description"] || ""),
         type: String(w["interface-type"] || ""),
+        kind: String(w["kind"] || ""),
+        deviceTechnology: String(w["device-technology"] || ""),
         ip: String(w["local-ip"] || "-"),
         gateway: String(w["gateway"] || "-"),
         dns: String(w["dns-servers"] || "-"),
@@ -835,6 +876,29 @@ function adapterDisplayName(row) {
     return name + " \u2014 " + descr
 }
 
+// The hint beside an adapter's kind, read off the service's own role
+// recommendation: "looks-primary", "looks-vpn" or "". A tunnel's kind already
+// says VPN, so it gets no second word for it.
+function adapterRoleHintSlug(row) {
+    if (!row) return ""
+    var cls = String((row.recommendation || {})["class"] || "")
+    if (cls === "preferred-primary") return "looks-primary"
+    var kind = String(row.kind || "")
+    if (kind === "tunnel" || kind === "virtual") return ""
+    var vpn = String((row.derivedAssessment || {}).vpnTunnelLikelihood || "")
+    if (vpn === "likely" || (vpn === "possible" && cls === "preferred-secondary"))
+        return "looks-vpn"
+    return ""
+}
+
+// The role this adapter holds other than `role`, or "". One adapter cannot
+// carry both routes, so a picker for `role` does not offer it.
+function adapterHeldOtherRole(row, role) {
+    if (!row) return ""
+    var held = String(row.selectedRole || "")
+    return held !== "" && held !== String(role || "") ? held : ""
+}
+
 // Convenience predicate over `unroutableInterfaceReasonSlug`.
 function interfaceCannotCarryTrafficOut(row) {
     return unroutableInterfaceReasonSlug(row) !== ""
@@ -894,6 +958,33 @@ function operationOutcome(ok, status) {
     if (state === "completed") return ""
     if (state === "failed") return String((status.error && status.error.code) || "unknown")
     return null
+}
+
+// What a safe-rollback dry-run answered. `phase` is "ready" (a `target` and
+// the `token` that restores it), "none" (nothing to roll back to) or "error"
+// (`code` says why).
+function rollbackDryRunVerdict(ok, answer, code) {
+    var verdict = { phase: "error", token: "", target: null, code: "" }
+    if (!ok) {
+        verdict.code = String(code || "unknown")
+        return verdict
+    }
+    var a = answer || {}
+    if (a.error) {
+        verdict.code = String(a.error.code || "unknown")
+        return verdict
+    }
+    var token = String(a["confirmation-token"] || "")
+    if (token !== "" && a.target) {
+        verdict.phase = "ready"
+        verdict.token = token
+        verdict.target = a.target
+    } else if (token === "" && !a.target) {
+        verdict.phase = "none"
+    } else {
+        verdict.code = "bad-response"
+    }
+    return verdict
 }
 
 // Whether a `snapshot.diagnostics.get` status is the service saying it could

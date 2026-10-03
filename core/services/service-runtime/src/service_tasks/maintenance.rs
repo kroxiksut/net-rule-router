@@ -83,6 +83,26 @@ fn report_cleanup(what: &str, result: nrr_diagnostics::CleanupResult) {
 
 // ── Revisions retention prune ────────────────────────────────────────────────
 
+/// Rechecks the active revisions whenever the state database was written from
+/// outside the service, so a tampered row is rolled back now rather than at
+/// the next start.
+pub fn build_revision_watch_task(mut watch: crate::revision_watch::RevisionWatch) -> ServiceTask {
+    ServiceTask::periodic(
+        TASK_ID_REVISION_WATCH,
+        TaskClass::Optional,
+        REVISION_WATCH_INTERVAL,
+        0,
+        move |_stop| {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            watch.tick(now_ms);
+            TaskOutcome::Continue
+        },
+    )
+}
+
 /// Periodic revisions retention pass. Reads the active
 /// `RetentionSettings` from `nrr_service_state.db`, runs
 /// `RevisionsRepository::prune_by_retention`, then calls

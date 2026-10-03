@@ -1075,6 +1075,17 @@ impl MutationExecutor for NoopMutationExecutor {
         })
     }
 
+    fn rollback_target(
+        &self,
+        _principal: &str,
+        _target_revision_id: Option<&str>,
+    ) -> Result<Option<nrr_shared::ipc_payloads::RollbackTargetDto>, OperationError> {
+        Err(OperationError {
+            code: "not-implemented".into(),
+            message: "rollback is not available on this platform".into(),
+        })
+    }
+
     fn safe_disable(&self, _reason: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
             code: "not-implemented".into(),

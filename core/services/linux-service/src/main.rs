@@ -136,6 +136,11 @@ fn print_status() {
         println!("platform: linux (systemd); enforcement backend: nftables");
         // Asked, not asserted: this banner is the first thing an operator runs,
         // and "nftables" alone says nothing about whether this host can use it.
+        // Only root can ask; a refusal to an ordinary user is not the host's answer.
+        if !nrr_platform_linux::elevation::running_as_root() {
+            println!("nftables: not checked — the check needs root (sudo {DAEMON_NAME} status)");
+            return;
+        }
         match nrr_platform_linux::nft_backend::NftablesEnforcement::default().probe() {
             Ok(()) => println!("nftables: available"),
             Err(e) => println!("nftables: NOT available — {e}"),

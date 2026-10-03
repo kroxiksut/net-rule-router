@@ -363,7 +363,7 @@ impl NftCliEnforcement {
     }
 
     #[cfg(all(test, target_os = "linux"))]
-    const fn with_program(
+    pub(crate) const fn with_program(
         program: &'static str,
         leading_args: &'static [&'static str],
         timeout: Duration,

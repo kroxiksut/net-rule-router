@@ -39,6 +39,30 @@ QtObject {
     // Only without a launcher context, where no answer ever comes.
     readonly property int _contextlessDeadlineMs: 30000
 
+    // While the user answers an administrator prompt no deadline runs: the
+    // call that raised it waits on the person, not on the service. Resuming
+    // moves every pending deadline on by the time spent there. The poll that
+    // reports the prompt keeps its own deadline, or a lost poll would hold
+    // every other one forever.
+    property bool consentPending: false
+    readonly property string consentPollOperation: "local.broker-status"
+    property double _consentSince: 0
+    onConsentPendingChanged: {
+        var now = Date.now()
+        if (consentPending) {
+            _consentSince = now
+            return
+        }
+        if (_consentSince <= 0) return
+        var paused = now - _consentSince
+        _consentSince = 0
+        var table = pendingRpc
+        for (var id in table) {
+            if (table[id].operation !== consentPollOperation) table[id].deadline += paused
+        }
+        pendingRpc = table
+    }
+
     // correlation-id -> { cb, deadline, operation }. Reassigned wholesale on
     // every mutation so QML property-change tracking observes the update.
     property var pendingRpc: ({})
@@ -388,6 +412,7 @@ QtObject {
         var table = pendingRpc
         var stale = []
         for (var id in table) {
+            if (consentPending && table[id].operation !== consentPollOperation) continue
             if (table[id].deadline <= now) stale.push(id)
         }
         if (stale.length === 0) return

@@ -56,15 +56,14 @@ public slots:
                      const QString &servicePath,
                      const QString &command) {
 #ifndef Q_OS_WIN
-        // Elsewhere the service is the platform's own (systemd today), and
-        // registering or starting it is a Rust port's job, not this glue's.
-        // Saying so is the whole non-Windows behaviour: a GUI that silently
-        // did nothing would read as a service that refuses to start.
+        // Elsewhere the launcher carries the action out (`dispatch` routes it
+        // there); a host started without one has no way to, and says so
+        // rather than appear to do nothing.
         (void) servicePath;
         (void) command;
         emit result(operation, false,
-                    QStringLiteral("Service control from the app is Windows-only for now; "
-                                   "install and start the service from the command line."));
+                    QStringLiteral("Service control needs the app's launcher; "
+                                   "start the app normally, or use the command line."));
 #else
         SHELLEXECUTEINFOW sei{};
         sei.cbSize = sizeof(sei);
@@ -146,7 +145,7 @@ public:
         // root, where any authenticated user can create a directory. A cargo
         // build, whose host is not a sibling, gets the path from the launcher.
         const QString sibling =
-            QDir(applicationDir).filePath(QStringLiteral("nrr-service.exe"));
+            QDir(applicationDir).filePath(serviceBinaryName());
         if (QFileInfo::exists(sibling)) {
             servicePath_ = QDir::cleanPath(sibling);
         }
@@ -157,7 +156,7 @@ public:
         if (servicePath_.isEmpty() && !handedOverServiceExe.isEmpty()) {
             const QString handed = normalizeLocalPath(handedOverServiceExe);
             const bool named =
-                QFileInfo(handed).fileName().compare(QStringLiteral("nrr-service.exe"),
+                QFileInfo(handed).fileName().compare(serviceBinaryName(),
                                                      Qt::CaseInsensitive) == 0;
             if (named && QFileInfo::exists(handed)) {
                 servicePath_ = QDir::cleanPath(handed);
@@ -514,6 +513,16 @@ private:
 #endif
 
     void dispatch(const QString &operation, const QString &command) {
+#ifndef Q_OS_WIN
+        // The launcher runs the action against the installed service and
+        // locates it itself; no path from here is used.
+        if (bridge_ != nullptr) {
+            setBusy(true, operation);
+            emit operationStarted(operation);
+            dispatchViaBroker(operation, command);
+            return;
+        }
+#endif
         if (servicePath_.isEmpty()) {
             setBusy(false, QString());
             emit operationCompleted(operation, false,
@@ -591,20 +600,35 @@ private:
             return;
         }
         emit operationCompleted(operation, true, QString());
+#ifdef Q_OS_WIN
         // Reaching here means a service-control
         // action succeeded through the broker (non-elevated path), so the
         // broker session is live (UAC was granted). Tell the GUI so its
         // review banner + "revoke" control reflect the elevated session.
         emit brokerSessionEstablished();
+#endif
+#ifdef Q_OS_WIN
         // Auto-start after a successful install (mirrors onWorkerResult);
         // the broker is already up so this second action raises no UAC.
+        // Elsewhere the install already starts the unit, and a start of its
+        // own would ask for authorization a second time.
         if (operation == QStringLiteral("install")) {
             refreshStatus();
             dispatch(QStringLiteral("start"), QStringLiteral("start"));
             return;
         }
+#endif
         setBusy(false, QString());
         refreshStatus();
+    }
+
+    // The service binary's file name on this OS (the product-identity names).
+    static QString serviceBinaryName() {
+#ifdef Q_OS_WIN
+        return QStringLiteral("nrr-service.exe");
+#else
+        return QStringLiteral("nrr-serviced");
+#endif
     }
 
     void setBusy(bool busy, const QString &operation) {

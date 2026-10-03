@@ -101,8 +101,8 @@ pub struct ActivationCoordinator {
     /// negligible.
     failure_policy: Mutex<ApplyFailurePolicy>,
     /// Optional HMAC signing key for the `revisions.row_hmac` column.
-    /// `None` in tests and during early bring-up (the DPAPI keystore wires
-    /// it via [`Self::with_signing_key`] at bootstrap). When set, every
+    /// `None` in tests and during early bring-up (the platform key store
+    /// wires it via [`Self::with_signing_key`] at bootstrap). When set, every
     /// revision repository this coordinator builds signs on insert and
     /// re-signs after each status-changing UPDATE, so external tampering
     /// is detectable.
@@ -724,6 +724,20 @@ impl ActivationCoordinator {
             }
         }
         Ok(outcome)
+    }
+
+    /// The revision [`Self::rollback_to`] would restore, verified the same
+    /// way; `None` when there is no earlier revision. Writes nothing.
+    pub(crate) fn rollback_target_for(
+        &self,
+        principal: &str,
+        target: &RollbackTarget,
+    ) -> Result<Option<RevisionRecord>, PolicyError> {
+        match self.resolve_rollback_target(principal, target) {
+            Ok(record) => Ok(Some(record)),
+            Err(PolicyError::NoLastKnownGood) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     // ── reset_principal_to_baseline ──────────────────────────────────────────

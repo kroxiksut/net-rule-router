@@ -8,6 +8,8 @@ fn wired(name: &str) -> InterfaceRouteRow {
         name: name.to_string(),
         interface_description: format!("{name} adapter"),
         interface_type: "Ethernet".to_string(),
+        kind: AdapterKind::Ethernet,
+        device_technology: None,
         is_bluetooth_like: false,
         local_ip: "192.0.2.10".to_string(),
         gateway: "192.0.2.1".to_string(),
@@ -42,6 +44,7 @@ fn wired(name: &str) -> InterfaceRouteRow {
 fn tunnel(name: &str) -> InterfaceRouteRow {
     let mut row = wired(name);
     row.interface_type = "Tunnel".to_string();
+    row.kind = AdapterKind::Tunnel;
     row.local_ip = "198.51.100.7".to_string();
     row.gateway = "-".to_string();
     row.has_default_route = false;
@@ -123,7 +126,7 @@ fn an_unreadable_query_does_not_block_the_adapter() {
     row.gateway = "-".to_string();
     row.runtime_data_unavailable = true;
 
-    let unreadable = score_row(&row);
+    let unreadable = score_row(&row, false);
     assert!(!unreadable.blocked);
     assert!(unreadable
         .key_signals
@@ -131,7 +134,7 @@ fn an_unreadable_query_does_not_block_the_adapter() {
         .any(|s| s == "adapter-data-unreadable"));
 
     row.runtime_data_unavailable = false;
-    let genuine = score_row(&row);
+    let genuine = score_row(&row, false);
     assert!(
         genuine.blocked,
         "the same row with real data has no address"
@@ -163,6 +166,168 @@ fn an_adapter_with_no_way_out_is_not_recommended_unless_it_looks_like_a_tunnel()
         RecommendationClass::PreferredSecondary
     );
     assert!(!has_signal(find(&rows, "Tunnel"), "no-forwarding-path"));
+}
+
+fn class_of(rows: &[InterfaceRouteRow], name: &str) -> RecommendationClass {
+    find(rows, name).recommendation.class
+}
+
+/// A row the OS calls a tunnel and whose name says nothing about it, holding a
+/// gateway of its own: the case where only the kind tells it apart.
+fn plainly_named_tunnel(name: &str) -> InterfaceRouteRow {
+    let mut row = wired(name);
+    row.kind = AdapterKind::Tunnel;
+    row.observed_facts.external_ip_status = ExternalIpStatus::Resolved;
+    row
+}
+
+#[test]
+fn a_tunnel_is_a_secondary_and_never_the_preferred_primary() {
+    let mut wifi = wired("Wi-Fi");
+    wifi.kind = AdapterKind::Wifi;
+    let mut rows = vec![wifi, plainly_named_tunnel("Userspace")];
+
+    assign_recommendations(&mut rows);
+
+    assert_eq!(
+        class_of(&rows, "Wi-Fi"),
+        RecommendationClass::PreferredPrimary
+    );
+    let tunnel = find(&rows, "Userspace");
+    assert_eq!(
+        tunnel.recommendation.class,
+        RecommendationClass::PreferredSecondary
+    );
+    assert!(has_signal(tunnel, "adapter-kind-tunnel"));
+}
+
+#[test]
+fn a_virtual_adapter_is_recommended_for_neither_role() {
+    let mut vm_port = wired("VM port");
+    vm_port.kind = AdapterKind::Virtual;
+    vm_port.observed_facts.external_ip_status = ExternalIpStatus::Resolved;
+    let mut rows = vec![wired("Wired"), vm_port, tunnel("Tunnel")];
+
+    assign_recommendations(&mut rows);
+
+    assert_eq!(
+        class_of(&rows, "Wired"),
+        RecommendationClass::PreferredPrimary
+    );
+    assert_eq!(
+        class_of(&rows, "Tunnel"),
+        RecommendationClass::PreferredSecondary
+    );
+    let vm_port = find(&rows, "VM port");
+    assert_eq!(
+        vm_port.recommendation.class,
+        RecommendationClass::AllowedButNotRecommended
+    );
+    assert!(has_signal(vm_port, "adapter-kind-virtual"));
+    assert!(rows.iter().all(|row| !row
+        .recommendation
+        .excluded_alternatives
+        .iter()
+        .any(|alternative| alternative.ends_with("VM port"))));
+}
+
+/// With nothing else to choose from, a virtual adapter is still not offered as
+/// the additional route.
+#[test]
+fn a_virtual_adapter_beside_the_uplink_is_not_the_secondary() {
+    let mut host_only = wired("Host-only");
+    host_only.kind = AdapterKind::Virtual;
+    host_only.gateway = "-".to_string();
+    host_only.has_default_route = false;
+    host_only.has_forwarding_path = Some(true);
+    // What the assessment reads off an address without a gateway.
+    host_only.derived_assessment.vpn_tunnel_likelihood = DerivedLikelihood::Possible;
+    let mut rows = vec![wired("Wired"), host_only];
+
+    assign_recommendations(&mut rows);
+
+    assert_eq!(
+        class_of(&rows, "Host-only"),
+        RecommendationClass::AllowedButNotRecommended
+    );
+}
+
+/// Structure outranks the kind: a bridge carrying the host's address, or a
+/// link the OS calls a tunnel, is the uplink when nothing else holds a default
+/// route.
+#[test]
+fn the_sole_default_route_holder_stays_a_primary_whatever_its_kind() {
+    for kind in [AdapterKind::Virtual, AdapterKind::Tunnel] {
+        let mut uplink = wired("Uplink");
+        uplink.kind = kind;
+        let mut enslaved = wired("Enslaved");
+        enslaved.local_ip = "-".to_string();
+        enslaved.gateway = "-".to_string();
+        enslaved.has_default_route = false;
+        enslaved.has_forwarding_path = Some(false);
+        let mut rows = vec![uplink, enslaved, tunnel("Tunnel")];
+
+        assign_recommendations(&mut rows);
+
+        let uplink = find(&rows, "Uplink");
+        assert_eq!(
+            uplink.recommendation.class,
+            RecommendationClass::PreferredPrimary,
+            "{kind:?}"
+        );
+        assert!(has_signal(uplink, "sole-uplink-by-structure"), "{kind:?}");
+        assert!(!has_signal(uplink, "adapter-kind-tunnel"), "{kind:?}");
+    }
+}
+
+/// A gateway-less point-to-point uplink (PPPoE) is found by its forwarding
+/// path when no row holds a gateway.
+#[test]
+fn a_gateway_less_uplink_is_the_sole_way_out_when_nothing_holds_a_gateway() {
+    let mut pppoe = wired("Provider");
+    pppoe.kind = AdapterKind::Other;
+    pppoe.gateway = "-".to_string();
+    pppoe.has_default_route = false;
+    let mut idle = wired("Wired");
+    idle.gateway = "-".to_string();
+    idle.has_default_route = false;
+    idle.has_forwarding_path = Some(false);
+    let mut rows = vec![pppoe, idle];
+
+    assign_recommendations(&mut rows);
+
+    assert_eq!(
+        class_of(&rows, "Provider"),
+        RecommendationClass::PreferredPrimary
+    );
+    assert!(has_signal(
+        find(&rows, "Provider"),
+        "sole-uplink-by-structure"
+    ));
+}
+
+#[test]
+fn a_bluetooth_kind_is_never_preferred_whatever_its_name() {
+    let mut pan = wired("Personal link");
+    pan.kind = AdapterKind::Bluetooth;
+    pan.observed_facts.external_ip_status = ExternalIpStatus::Resolved;
+    let mut wifi = wired("Wi-Fi");
+    wifi.persistent_id.clear();
+    wifi.gateway = "-".to_string();
+    wifi.has_default_route = false;
+    wifi.observed_facts.connectivity_state = ConnectivityState::Degraded;
+    let mut rows = vec![wifi, pan];
+
+    assign_recommendations(&mut rows);
+
+    assert_eq!(
+        class_of(&rows, "Personal link"),
+        RecommendationClass::AllowedButNotRecommended
+    );
+    assert_eq!(
+        class_of(&rows, "Wi-Fi"),
+        RecommendationClass::PreferredPrimary
+    );
 }
 
 /// The cold start scores rows that crossed the wire, the refresh shows what

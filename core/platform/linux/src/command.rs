@@ -39,7 +39,7 @@ fn locate_under(root: &Path, name: &str) -> Option<PathBuf> {
         .find(|path| is_executable_file(path))
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };

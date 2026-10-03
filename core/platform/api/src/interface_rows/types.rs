@@ -67,6 +67,11 @@ pub struct InterfaceRouteRow {
     pub name: String,
     pub interface_description: String,
     pub interface_type: String,
+    /// What the OS says the device is, for the user choosing between them.
+    pub kind: AdapterKind,
+    /// Display only: the tun/tap device behind a link whose OS reports no
+    /// driver description to name it.
+    pub device_technology: Option<DeviceTechnology>,
     pub is_bluetooth_like: bool,
     pub local_ip: String,
     pub gateway: String,

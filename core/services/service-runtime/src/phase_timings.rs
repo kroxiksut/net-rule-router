@@ -70,6 +70,14 @@ impl PhaseTimings {
     }
 }
 
+/// The cost at which a periodic pass is worth a log line: a thirtieth of its
+/// period, so the line means "this pass alone holds a core over 3 %" at any
+/// cadence — 1 s for the 30 s recompute, a third of that for a 10 s tick.
+#[must_use]
+pub fn slow_threshold_for(period: Duration) -> Duration {
+    period / 30
+}
+
 /// Log a pass that ran long, naming what it spent the time on; stay silent
 /// otherwise.
 ///

@@ -27,9 +27,9 @@
 //! ## Testability
 //!
 //! [`FileKeyStore::at`] stores at an explicit path (a tempdir) without
-//! hardening the parent directory; [`FileKeyStore::default_system`] uses the
-//! canonical `/var/lib/netrulerouter/` location and additionally `chmod 0700`s
-//! the directory. The file itself is always written `0600`. The module is
+//! hardening the parent directory; [`FileKeyStore::default_system`] (the
+//! canonical `/var/lib/netrulerouter/`) and [`FileKeyStore::in_state_dir`]
+//! additionally `chmod 0700` the directory. The file itself is always written `0600`. The module is
 //! `#[cfg(unix)]` (it sets Unix mode bits), so its tests run on WSL2 / any Unix
 //! host; the consumer selects it under `#[cfg(target_os = "linux")]`.
 
@@ -82,10 +82,16 @@ impl FileKeyStore {
     /// The canonical production location, in the service's state root,
     /// hardening the directory to `0700` on save.
     pub fn default_system() -> Option<Self> {
-        nrr_platform_api::paths::production_data_root().map(|root| Self {
-            path: root.join(KEY_FILE_NAME),
+        nrr_platform_api::paths::production_data_root().map(|root| Self::in_state_dir(&root))
+    }
+
+    /// The key beside the state database it signs, in `state_dir`, which is
+    /// hardened to `0700` on save like [`Self::default_system`].
+    pub fn in_state_dir(state_dir: &Path) -> Self {
+        Self {
+            path: state_dir.join(KEY_FILE_NAME),
             harden_dir: true,
-        })
+        }
     }
 
     /// The resolved key-file path (exposed for diagnostics / tests).
@@ -326,6 +332,28 @@ mod tests {
             store.path(),
             Path::new("/var/lib/netrulerouter/db-mac-key.bin")
         );
+    }
+
+    #[test]
+    fn a_state_dir_store_hardens_the_directory_and_keeps_the_marker_beside_the_key() {
+        let dir = temp_dir();
+        let state_dir = dir.0.join("state");
+        std::fs::create_dir_all(&state_dir).expect("mkdir");
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen");
+        let store = FileKeyStore::in_state_dir(&state_dir);
+        store.save(&[3u8; SIGNING_KEY_BYTE_LEN]).expect("save");
+        store.save_resign_marker(&[4u8; 32]).expect("save marker");
+
+        let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(store.path(), state_dir.join(KEY_FILE_NAME));
+        assert_eq!(
+            store.resign_marker_path().parent(),
+            Some(state_dir.as_path())
+        );
+        assert_eq!(mode(&state_dir), DIR_MODE, "state dir must be rwx------");
+        assert_eq!(mode(store.path()), FILE_MODE);
+        assert_eq!(mode(&store.resign_marker_path()), FILE_MODE);
     }
 
     #[test]

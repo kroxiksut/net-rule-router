@@ -43,7 +43,7 @@ impl ProductionMutationExecutor {
         let summary =
             self.coordinator
                 .dry_run_rules(principal, &assembled.rules_json, "ipc-dry-run");
-        dry_run_to_review_summary(&summary, scored)
+        dry_run_to_review_summary(&summary, scored, self.coordinator.failure_policy())
     }
 
     /// Execute path for `MutationKind::PresetImport`. Same assembly as

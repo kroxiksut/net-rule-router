@@ -58,6 +58,7 @@ fn discover_from_processes() -> Vec<VpnCandidate> {
                 exe_path: Some(path.to_string_lossy().into_owned()),
                 running: true,
                 source: VpnCandidateSource::RunningProcess,
+                interface: None,
             });
         }
     }
@@ -80,6 +81,7 @@ fn discover_from_installed_programs() -> Vec<VpnCandidate> {
             exe_path: program.exe_path(),
             running: false,
             source: VpnCandidateSource::InstalledProgram,
+            interface: None,
         });
     }
     out

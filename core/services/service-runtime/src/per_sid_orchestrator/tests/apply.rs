@@ -259,10 +259,32 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
         "the same input yields the same verdict — recomputing it buys nothing"
     );
 
-    // Positive control: a changed filter set is changed input, and the evidence
-    // has to be taken again. Without this the test would pass on a compare that
-    // simply never runs twice.
+    // A changed filter set inside the sampling window waits for the window.
     let narrower = &live[..live.len().saturating_sub(1)];
+    assert!(
+        !orch.shadow_compare_neutral_plan(
+            sid,
+            mode,
+            &book.rule_book,
+            orch.fqdn_cache.as_ref(),
+            &std::collections::HashSet::new(),
+            narrower
+        ),
+        "a change inside the window is sampled later, not compared on the spot"
+    );
+
+    // Positive control: once the window has passed, changed input is compared
+    // again. Without this the test would pass on a compare that never reruns.
+    {
+        let mut seen = orch
+            .shadow_compare_seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let entry = seen.get_mut(sid).expect("the first compare was recorded");
+        entry.1 = std::time::Instant::now()
+            .checked_sub(super::super::shadow_compare::SHADOW_COMPARE_EVERY)
+            .expect("the clock is past one window");
+    }
     assert!(
         orch.shadow_compare_neutral_plan(
             sid,
@@ -272,7 +294,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &std::collections::HashSet::new(),
             narrower
         ),
-        "a different filter set is different input and must be compared again"
+        "a different filter set after the window must be compared again"
     );
 }
 

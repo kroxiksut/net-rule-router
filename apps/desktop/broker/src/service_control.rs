@@ -42,8 +42,8 @@ pub enum DemandStartOutcome {
     /// The service was already running / start-pending — nothing to do.
     AlreadyRunning,
     /// Could not act: service not installed, this user lacks `SERVICE_START`
-    /// (i.e. not a DemandStart-with-grant service), or it is mid-transition.
-    /// The caller falls back to the mock backend.
+    /// (granted to interactive sessions in either start mode), or it is
+    /// mid-transition. The caller falls back to the mock backend.
     NotStartable,
 }
 
@@ -75,8 +75,8 @@ pub fn try_start_demand_service() -> DemandStartOutcome {
     };
     let scm = ScHandle(scm);
     let name = to_wide(SERVICE_NAME);
-    // SAFETY: `scm` valid; `name` NUL-terminated. Access-denied here means no
-    // SERVICE_START grant (an AutoStart service) → NotStartable.
+    // SAFETY: `scm` valid; `name` NUL-terminated. Access-denied here means
+    // this session holds no SERVICE_START grant → NotStartable.
     let Ok(svc) = (unsafe {
         OpenServiceW(
             scm.0,

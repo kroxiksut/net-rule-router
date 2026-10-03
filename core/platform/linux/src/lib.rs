@@ -7,8 +7,8 @@
 //! the observation and host-integration ports (autostart, key store, service
 //! control, local time, interface counters, network change, reachability,
 //! app-path resolution, peer credentials, adapter enumeration, logind).
-//! Honest stubs remain, each saying so in its own module: fake-IP TUN, VPN and
-//! app-group discovery, the resolver-cache read.
+//! Honest stubs remain, each saying so in its own module: fake-IP TUN and the
+//! resolver-cache read.
 //!
 //! Much of the crate is pure Rust over the api traits — message encoding, plan
 //! lowering, parsers — so those parts compile and their tests run on the Windows
@@ -194,10 +194,12 @@ pub mod nft_apply;
 pub mod nft_backend;
 pub mod nft_policy_enforcer;
 
-/// Linux VPN-client discovery seam (design + stub).
-/// The neutral port lives in `nrr_platform_api::vpn_discovery`; this backend
-/// documents the /proc + `.desktop` + package-DB mechanism and returns an
-/// empty list until it can be verified on real Linux.
+/// The `/proc` and desktop-entry scans both discoveries below classify.
+mod app_scan;
+
+/// Linux VPN-client discovery: `/proc` processes, desktop entries, the native
+/// package DB, systemd tunnel units and NetworkManager VPN connections,
+/// matched by the neutral keyword policy in `nrr_platform_api::vpn_discovery`.
 pub mod vpn_discovery;
 
 /// Linux application-group discovery: `/proc` processes, XDG desktop entries
@@ -272,6 +274,10 @@ pub mod adapters;
 /// OS. Mirror of `nrr_platform_windows::interface_rows`: every judgement about
 /// a row is the neutral one, only the facts are read here.
 pub mod interface_rows;
+
+/// What kind of adapter a link is, translated from sysfs into the neutral
+/// facts the shared classifier decides from. Pure, tested on every host.
+mod adapter_kind;
 
 /// Runtime-directory socket mechanism behind
 /// `nrr_platform_api::single_instance::SingleInstancePort`.

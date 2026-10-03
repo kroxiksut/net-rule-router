@@ -47,7 +47,7 @@ use crate::error::PlatformError;
 
 /// Operational status of a network interface.
 /// Mirrors `IF_OPER_STATUS` in `IfMib.h`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IfOperStatus {
     Up,
     Down,
@@ -69,7 +69,7 @@ impl IfOperStatus {
 
 /// Interface type from `MIB_IF_ROW2::Type`.
 /// Only the values relevant to filtering are listed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InterfaceType {
     /// Regular Ethernet or Wi-Fi (IF_TYPE_ETHERNET_CSMACD = 6, 71 = IEEE80211).
     Ethernet,
@@ -108,7 +108,7 @@ impl InterfaceType {
 /// are carried: an observed connection is attributed to an interface by
 /// matching its LOCAL address against these lists, so a family missing here is
 /// a family whose traffic has no route and no verdict on screen.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AdapterInfo {
     /// Windows `IfIndex`.
     pub index: u32,

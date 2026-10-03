@@ -25,9 +25,9 @@ use nrr_service_runtime::ipc::canonical_operation_class;
 use nrr_service_runtime::ipc_handlers::payloads::{
     AdapterEntry, ContractNegotiateResponse, InterfacesRefreshResponse, MutationConfirmResponse,
     MutationDryRunResponse, OperationStatusResponse, ProductImpactDisableConfirmResponse,
-    ProductImpactDisableDryRunResponse, RollbackResponse, RulesListResponse, RulesRouteFilter,
-    ServiceHealthResponse, SnapshotInitialResponse, SnapshotInterfacesResponse, StatusUpdateEvent,
-    StatusUpdatesSubscribeResponse,
+    ProductImpactDisableDryRunResponse, RollbackResponse, RollbackTargetDto, RulesListResponse,
+    RulesRouteFilter, ServiceHealthResponse, SnapshotInitialResponse, SnapshotInterfacesResponse,
+    StatusUpdateEvent, StatusUpdatesSubscribeResponse,
 };
 use nrr_service_runtime::{
     register_production_handlers, ActiveRevisionState, AdaptersSnapshotProvider, EventBus,
@@ -122,6 +122,18 @@ impl MutationExecutor for FakeExecutor {
     fn rollback(&self, _principal: &str, target: Option<&str>) -> MutationOutcome {
         MutationOutcome::Completed(serde_json::json!({ "rolled-back-to": target }))
     }
+    fn rollback_target(
+        &self,
+        _principal: &str,
+        target: Option<&str>,
+    ) -> Result<Option<RollbackTargetDto>, OperationError> {
+        Ok(Some(RollbackTargetDto {
+            revision_id: target.unwrap_or("rev-lkg").to_string(),
+            activated_at: Some(1),
+            superseded_at: Some(2),
+            rule_count: 1,
+        }))
+    }
     fn safe_disable(&self, reason: &str) -> MutationOutcome {
         MutationOutcome::Completed(serde_json::json!({
             "safe-disabled": true,
@@ -157,6 +169,13 @@ impl MutationExecutor for RollbackRecorder {
     fn rollback(&self, principal: &str, target: Option<&str>) -> MutationOutcome {
         self.principals.lock().unwrap().push(principal.to_string());
         FakeExecutor.rollback(principal, target)
+    }
+    fn rollback_target(
+        &self,
+        principal: &str,
+        target: Option<&str>,
+    ) -> Result<Option<RollbackTargetDto>, OperationError> {
+        FakeExecutor.rollback_target(principal, target)
     }
     fn safe_disable(&self, reason: &str) -> MutationOutcome {
         FakeExecutor.safe_disable(reason)
@@ -198,6 +217,13 @@ impl MutationExecutor for FailingExecutor {
             code: "rollback.rejected.test".into(),
             message: "rollback test failure".into(),
         })
+    }
+    fn rollback_target(
+        &self,
+        principal: &str,
+        target: Option<&str>,
+    ) -> Result<Option<RollbackTargetDto>, OperationError> {
+        FakeExecutor.rollback_target(principal, target)
     }
     fn safe_disable(&self, _reason: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {

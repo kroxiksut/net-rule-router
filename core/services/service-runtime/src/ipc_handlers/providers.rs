@@ -149,6 +149,14 @@ pub trait MutationExecutor: Send + Sync {
     /// per-principal.
     fn rollback(&self, principal: &str, target_revision_id: Option<&str>) -> MutationOutcome;
 
+    /// What [`Self::rollback`] would restore, `Ok(None)` when there is no
+    /// earlier revision. Read-only, like [`Self::preview`].
+    fn rollback_target(
+        &self,
+        principal: &str,
+        target_revision_id: Option<&str>,
+    ) -> Result<Option<nrr_shared::ipc_payloads::RollbackTargetDto>, OperationError>;
+
     /// Execute the safe-disable flow: remove all routes/filters owned
     /// by the service and mark the runtime as `ApplyLayerDisabled`. The
     /// `reason` is a free-form string captured in audit. Production

@@ -339,6 +339,24 @@ pub fn dispatch_request(
     // runs without another prompt. Payload carries `action` +
     // `service-exe-path` (resolved C++-side). On UAC decline we surface
     // `uac-declined`; on broker-unavailable, a transport error.
+    #[cfg(target_os = "linux")]
+    if parsed.operation == SERVICE_CONTROL_OP {
+        let action = parsed
+            .payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let response = match crate::service_control_linux::run(action) {
+            Ok(value) => LauncherRpcResponse::ok(parsed.correlation_id.clone(), value),
+            Err(refusal) => LauncherRpcResponse::err(
+                parsed.correlation_id.clone(),
+                refusal.code,
+                refusal.message,
+            ),
+        };
+        write_response(stdin, &response);
+        return;
+    }
     if parsed.operation == SERVICE_CONTROL_OP {
         let response = match broker.call(
             nrr_broker::protocol::BROKER_SERVICE_CONTROL,
@@ -397,6 +415,7 @@ pub fn dispatch_request(
             parsed.correlation_id.clone(),
             serde_json::json!({
                 "elevated": broker.is_session_active(),
+                "awaiting-consent": broker.is_awaiting_consent(),
                 "auto-revoked": auto_revoked,
             }),
         );

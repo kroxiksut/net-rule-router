@@ -153,6 +153,19 @@ impl PreFlightCategory {
             Self::AppRuleUnenforceable | Self::BindingUnresolved => false,
         }
     }
+
+    /// Whether an activation under `policy` is refused over this finding:
+    /// pre-flight runs only under the strict policy, and otherwise only
+    /// content the apply cannot decode fails it — and best effort keeps even
+    /// that as drift.
+    #[must_use]
+    pub const fn refuses_activation(self, policy: ApplyFailurePolicy) -> bool {
+        match policy {
+            ApplyFailurePolicy::PreFlightThenAllOrNothing => self.blocks_activation(),
+            ApplyFailurePolicy::AllOrNothing => matches!(self, Self::InvalidRulesContent),
+            ApplyFailurePolicy::BestEffort => false,
+        }
+    }
 }
 
 /// Returned by [`ActivationCoordinator::dry_run_rules`].

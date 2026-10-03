@@ -7,7 +7,9 @@ use crate::ipc_handlers::mutation_token_store::StoredMutation;
 use crate::ipc_handlers::payloads::MutationKind;
 use crate::ipc_handlers::providers::{MutationExecutor, MutationOutcome};
 use crate::production_mutation_executor::ProductionMutationExecutor;
-use crate::tamper_bootstrap::{mutations_blocked_by_alert, run_tamper_bootstrap};
+use crate::tamper_bootstrap::{
+    mutations_blocked_by_alert, raise_tamper_alerts, run_tamper_bootstrap,
+};
 use nrr_diagnostics::audit::alert::{
     InMemorySecurityAlertsRepository, SecurityAlert, SecurityAlertState, SecurityAlertsRepository,
 };
@@ -57,9 +59,12 @@ fn edit(env: &Env, revision_id: &RevisionId, rules_json: &str) {
         .expect("edit outside the app");
 }
 
+/// A start with no sweep to wait for: the alerts name the rows as found.
 fn boot(env: &Env, now_ms: i64) -> crate::tamper_bootstrap::TamperBootstrapOutcome {
-    run_tamper_bootstrap(&env.fx.conn, env.key_store.as_ref(), &env.alerts, now_ms)
-        .expect("bootstrap")
+    let out = run_tamper_bootstrap(&env.fx.conn, env.key_store.as_ref(), &env.alerts, now_ms)
+        .expect("bootstrap");
+    raise_tamper_alerts(&env.alerts, &out.pending_tamper_alerts, None, now_ms);
+    out
 }
 
 /// The service a boot with `signing_key` builds.

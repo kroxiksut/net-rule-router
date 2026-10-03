@@ -885,6 +885,8 @@ fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
         name: "Ethernet".into(),
         interface_description: "Ethernet adapter".into(),
         interface_type: "ethernet".into(),
+        kind: "ethernet".into(),
+        device_technology: None,
         is_bluetooth_like: false,
         local_ip: "192.0.2.42".into(),
         gateway: "192.0.2.1".into(),

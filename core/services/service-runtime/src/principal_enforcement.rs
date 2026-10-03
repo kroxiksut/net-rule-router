@@ -101,6 +101,9 @@ pub enum CycleOutcome {
         /// Whether the set of plans differs from the previous pass. Drives the
         /// log level only — never whether to apply.
         changed: bool,
+        /// What differs from the previous pass, when it changed — the only way
+        /// to tell a real change from a plan that flaps between two states.
+        delta: Option<String>,
         /// Principals whose plan carries LESS protection than their settings
         /// ask for. Reported every pass, not once: an operator reading a single
         /// line about this run must not take it for full coverage.
@@ -110,6 +113,9 @@ pub enum CycleOutcome {
         /// What the route pass did, when a route mechanism is wired.
         routes: Option<crate::route_apply::RouteApplyReport>,
     },
+    /// Nothing the pass reads has changed since the policy in force was
+    /// applied, so neither planning nor the platform was asked.
+    Unchanged,
     /// The active set could not be read; the platform was left as it was.
     AuthorityUnavailable { reason: String },
     /// The platform refused the plans. Whatever was installed before is still
@@ -161,6 +167,9 @@ pub struct PrincipalEnforcementCycle {
     /// Epoch seconds the last pass finished, whatever its outcome; starts at
     /// construction so a first pass that never returns still goes stale.
     last_pass_at: AtomicU64,
+    /// What lets a pass asked for by a timer or an event be skipped when none of
+    /// its inputs moved. `None` = every pass plans and applies.
+    inputs: Option<crate::pass_inputs::PassInputs>,
 }
 
 /// Whether this plan asks for something the packet layer will apply to the
@@ -170,6 +179,57 @@ pub struct PrincipalEnforcementCycle {
 /// only on the ALE layers), so a block emitted there is machine-wide no matter
 /// whose plan produced it. `AllPackets` coverage on a Block is exactly that
 /// shape.
+/// One line naming what changed between two passes: counts per principal plus
+/// one example each way. Runs only on a change, so its quadratic diff never
+/// costs the steady state anything.
+fn describe_change(old: &[EnforcementPlan], new: &[EnforcementPlan]) -> String {
+    use nrr_platform_api::enforcement::plan_delta;
+    // Principals by position, not name: the name is redacted elsewhere on the
+    // same line, and free text would carry it past the redaction.
+    let mut parts = Vec::new();
+    for (n, plan) in new.iter().enumerate() {
+        let Some(before) = old.iter().find(|p| p.principal == plan.principal) else {
+            parts.push(format!("#{n}: new"));
+            continue;
+        };
+        let flows = plan_delta(before, plan);
+        let routes_added = plan
+            .routes
+            .iter()
+            .filter(|r| !before.routes.contains(r))
+            .count();
+        let routes_removed = before
+            .routes
+            .iter()
+            .filter(|r| !plan.routes.contains(r))
+            .count();
+        let sample = |f: &nrr_platform_api::enforcement::FlowRule| {
+            format!("{:?} {:?} {:?}", f.verdict, f.precedence.class, f.flow.dst)
+        };
+        let mut line = format!(
+            "#{n}: flows +{} -{}{}, routes +{routes_added} -{routes_removed}",
+            flows.added.len(),
+            flows.removed.len(),
+            if flows.reordered { " reordered" } else { "" },
+        );
+        if let Some(&i) = flows.added.first() {
+            line.push_str(&format!("; +[{}]", sample(&plan.flows[i])));
+        }
+        if let Some(&i) = flows.removed.first() {
+            line.push_str(&format!("; -[{}]", sample(&before.flows[i])));
+        }
+        parts.push(line);
+    }
+    let gone = old
+        .iter()
+        .filter(|plan| !new.iter().any(|p| p.principal == plan.principal))
+        .count();
+    if gone > 0 {
+        parts.push(format!("{gone} gone"));
+    }
+    parts.join(" | ")
+}
+
 fn plan_cuts_machine_wide(plan: &EnforcementPlan) -> bool {
     use nrr_platform_api::enforcement::{Coverage, Verdict};
     plan.flows
@@ -195,7 +255,16 @@ impl PrincipalEnforcementCycle {
             retry_requested: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             last_pass_at: AtomicU64::new(epoch_secs()),
+            inputs: None,
         }
+    }
+
+    /// Let passes asked for by a timer or an event skip when `inputs` say nothing
+    /// changed. An apply the user asked for never skips.
+    #[must_use]
+    pub fn with_pass_inputs(mut self, inputs: crate::pass_inputs::PassInputs) -> Self {
+        self.inputs = Some(inputs);
+        self
     }
 
     /// Attach the push bus so coverage notices reach the principals they
@@ -233,7 +302,11 @@ impl PrincipalEnforcementCycle {
 
     /// Run one pass. Passes are serialised: see `last_applied`.
     pub fn tick(&self) -> CycleOutcome {
-        let outcome = self.run_pass();
+        self.pass(false)
+    }
+
+    fn pass(&self, skip_if_unchanged: bool) -> CycleOutcome {
+        let outcome = self.run_pass(skip_if_unchanged);
         self.last_pass_at.store(epoch_secs(), Ordering::Relaxed);
         outcome
     }
@@ -251,7 +324,7 @@ impl PrincipalEnforcementCycle {
         self.last_pass_at.load(Ordering::Relaxed)
     }
 
-    fn run_pass(&self) -> CycleOutcome {
+    fn run_pass(&self, skip_if_unchanged: bool) -> CycleOutcome {
         let mut last = self.last_applied.lock().unwrap_or_else(|p| p.into_inner());
         // The cycle's own stop flag is set by `teardown`, which runs after the
         // tasks are drained; the process-wide latch flips the moment the stop
@@ -259,6 +332,7 @@ impl PrincipalEnforcementCycle {
         if self.stopped.load(Ordering::Acquire) || crate::teardown_in_progress() {
             return CycleOutcome::Stopped;
         }
+        let mut timings = crate::phase_timings::PhaseTimings::start();
         let active = match self.principals.active_principals() {
             Ok(active) => active,
             Err(e) => {
@@ -268,14 +342,29 @@ impl PrincipalEnforcementCycle {
             }
         };
 
+        let availability: Vec<ChannelAvailability> = active
+            .iter()
+            .map(|principal| self.enforcer.channel_availability(principal))
+            .collect();
+        let fingerprint = self
+            .inputs
+            .as_ref()
+            .and_then(|inputs| inputs.fingerprint(&(&active, &availability)));
+        timings.mark("authority");
+        if skip_if_unchanged && !self.retry_requested.load(Ordering::Acquire) {
+            if let (Some(inputs), Some(fp)) = (self.inputs.as_ref(), fingerprint) {
+                if inputs.is_settled(fp) {
+                    return CycleOutcome::Unchanged;
+                }
+            }
+        }
         self.plans.begin_pass();
         let mut plans: Vec<EnforcementPlan> = Vec::new();
         let mut unprotected: Vec<String> = Vec::new();
         let mut wants_machine_wide_cut: std::collections::BTreeMap<String, bool> =
             std::collections::BTreeMap::new();
         let mut guarded = 0usize;
-        for principal in &active {
-            let availability = self.enforcer.channel_availability(principal);
+        for (principal, availability) in active.iter().zip(availability.iter().copied()) {
             let Some(planned) = self.plans.plan_for(principal, availability) else {
                 continue;
             };
@@ -294,6 +383,10 @@ impl PrincipalEnforcementCycle {
         }
 
         let changed = last.as_deref() != Some(plans.as_slice());
+        let delta = changed
+            .then(|| last.as_deref().map(|old| describe_change(old, &plans)))
+            .flatten();
+        timings.mark("plan");
 
         // Planning above is not instant, and a stop can land inside it.
         if crate::teardown_in_progress() {
@@ -309,12 +402,13 @@ impl PrincipalEnforcementCycle {
             }
         }
         let result = self.enforcer.enforce(&plans);
+        timings.mark("filters");
         *refused = match &result {
             Err(e) if e.is_persistent() => Some((plans.clone(), e.to_string())),
             _ => None,
         };
         drop(refused);
-        match result {
+        let outcome = match result {
             Ok(report) => {
                 let principals = plans
                     .iter()
@@ -334,6 +428,7 @@ impl PrincipalEnforcementCycle {
                         }
                     })
                 });
+                timings.mark("routes");
 
                 if changed {
                     self.notify_coverage(&unprotected, &wants_machine_wide_cut);
@@ -342,10 +437,14 @@ impl PrincipalEnforcementCycle {
                     posture.set(guarded > 0);
                 }
                 *last = Some(plans);
+                if let (Some(inputs), Some(fp)) = (self.inputs.as_ref(), fingerprint) {
+                    inputs.settle(fp);
+                }
                 CycleOutcome::Applied {
                     principals,
                     report,
                     changed,
+                    delta,
                     unprotected,
                     guarded,
                     routes,
@@ -353,11 +452,24 @@ impl PrincipalEnforcementCycle {
             }
             // Deliberately NOT recorded as applied: the kernel does not hold
             // what it refused, whether or not the next tick tries again.
-            Err(e) => CycleOutcome::EnforcementFailed {
-                persistent: e.is_persistent(),
-                reason: e.reason,
-            },
-        }
+            Err(e) => {
+                if let Some(inputs) = self.inputs.as_ref() {
+                    inputs.unsettle();
+                }
+                CycleOutcome::EnforcementFailed {
+                    persistent: e.is_persistent(),
+                    reason: e.reason,
+                }
+            }
+        };
+        crate::phase_timings::report_if_slow(
+            &timings,
+            "principal-enforcement",
+            crate::phase_timings::slow_threshold_for(
+                crate::service_tasks::PRINCIPAL_ENFORCEMENT_INTERVAL,
+            ),
+        );
+        outcome
     }
 
     /// Run one pass and report it. `trigger` names what asked for the pass —
@@ -365,6 +477,14 @@ impl PrincipalEnforcementCycle {
     /// outcome means different things depending on what provoked it.
     pub fn tick_logged(&self, trigger: &'static str) -> CycleOutcome {
         let outcome = self.tick();
+        log_outcome(&outcome, trigger, self.authority());
+        outcome
+    }
+
+    /// [`Self::tick_logged`] for a timer or an event that may have changed
+    /// nothing: the pass is skipped when its inputs are the ones last applied.
+    pub fn tick_if_changed_logged(&self, trigger: &'static str) -> CycleOutcome {
+        let outcome = self.pass(true);
         log_outcome(&outcome, trigger, self.authority());
         outcome
     }
@@ -450,6 +570,7 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
             principals,
             report,
             changed,
+            delta,
             unprotected,
             guarded,
             routes,
@@ -523,6 +644,7 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
                     applied = report.applied,
                     skipped = report.skipped,
                     guarded,
+                    change = delta.as_deref().unwrap_or("first pass"),
                     "policy applied for the principals present",
                 );
             } else {
@@ -534,6 +656,11 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
                 );
             }
         }
+        CycleOutcome::Unchanged => tracing::trace!(
+            target: "nrr::enforcement",
+            trigger,
+            "policy inputs unchanged; pass skipped",
+        ),
         CycleOutcome::AuthorityUnavailable { reason } => tracing::warn!(
             target: "nrr::enforcement",
             msg_key = "principal-authority-unavailable",
@@ -868,6 +995,68 @@ mod tests {
             CycleOutcome::Applied { changed: false, .. }
         ));
         assert_eq!(enforcer.calls().len(), 2);
+    }
+
+    /// An idle pass costs nothing once its inputs say nothing moved — but only
+    /// a pass that may skip skips: the forced one (an apply the user asked for)
+    /// always reaches the platform, and a moved input brings the pass back.
+    #[test]
+    fn a_pass_whose_inputs_did_not_move_is_skipped_unless_forced() {
+        use std::sync::atomic::AtomicU64;
+        let generation = Arc::new(AtomicU64::new(0));
+        let source = Arc::clone(&generation);
+        let enforcer = Arc::new(RecordingEnforcer::new(false));
+        let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer)).with_pass_inputs(
+            crate::pass_inputs::PassInputs::new().with_source(
+                "test",
+                Arc::new(move || Some(source.load(Ordering::Relaxed))),
+            ),
+        );
+
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Unchanged
+        ));
+        assert_eq!(
+            enforcer.calls().len(),
+            1,
+            "a skipped pass reached the platform"
+        );
+
+        assert!(
+            matches!(c.tick(), CycleOutcome::Applied { .. }),
+            "a forced pass skipped"
+        );
+        assert_eq!(enforcer.calls().len(), 2);
+
+        generation.store(1, Ordering::Relaxed);
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Applied { .. }
+        ));
+        assert_eq!(enforcer.calls().len(), 3);
+    }
+
+    /// A refused pass leaves nothing settled: the next one must try again
+    /// rather than call the refused state applied.
+    #[test]
+    fn a_refused_pass_is_not_remembered_as_settled() {
+        let enforcer = Arc::new(RecordingEnforcer::new(true));
+        let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer)).with_pass_inputs(
+            crate::pass_inputs::PassInputs::new().with_source("test", Arc::new(|| Some(7))),
+        );
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::EnforcementFailed { .. }
+        ));
+        assert!(!matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Unchanged
+        ));
     }
 
     /// A transient failure must not be remembered as applied, or the next tick

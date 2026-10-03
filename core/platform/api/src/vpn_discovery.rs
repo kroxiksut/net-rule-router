@@ -23,13 +23,16 @@
 //! - **Windows** (`nrr_platform_windows::WindowsVpnDiscovery`, implemented):
 //!   `EnumProcesses` for running images; the `Uninstall` registry keys (HKLM +
 //!   `WOW6432Node` + HKCU) for installed programs.
-//! - **Linux** (`nrr_platform_linux::vpn_discovery`, designed/stub): `/proc`
+//! - **Linux** (`nrr_platform_linux::vpn_discovery`, implemented): `/proc`
 //!   for running images; XDG `.desktop` entries (incl. Flatpak/Snap export
 //!   dirs) as the distro-agnostic installed-apps source, refined by the native
 //!   package DB queried per family — deb → `dpkg-query`, rpm → `rpm -qa`, arch
 //!   → `pacman -Qq`, alpine → `apk info` (the low-level DB tools, not the
 //!   `apt`/`dnf`/`yum`/`zypper` front-ends, so the query is fast, offline, and
-//!   non-interactive).
+//!   non-interactive); plus the Linux-only signals of systemd tunnel units
+//!   (`wg-quick@`, `awg-quick@`, `openvpn*@`) and NetworkManager VPN
+//!   connections. Kernel WireGuard/AmneziaWG links come back as
+//!   [`VpnCandidateSource::KernelTunnel`] rows: a link to bind, not a program.
 //! - **macOS** (backend not created yet): `proc_listpids`/`libproc` for running
 //!   images; `.app` bundles under `/Applications`, `~/Applications` and
 //!   `/System/Applications` (read each bundle's `CFBundleName` /
@@ -53,6 +56,10 @@ pub enum VpnCandidateSource {
     /// An entry in the OS installed-programs registry whose display name
     /// matched (may or may not be running right now).
     InstalledProgram,
+    /// A tunnel the kernel itself runs. Its handshake leaves from no process,
+    /// so no program rule can carry it: the user binds its link as the
+    /// secondary route instead. Never selectable as a program.
+    KernelTunnel,
 }
 
 /// A likely VPN client surfaced to the user for confirmation. Never acted on
@@ -68,10 +75,29 @@ pub struct VpnCandidate {
     /// pick it and point at the exe manually.
     pub exe_path: Option<String>,
     /// True when a matching process is running right now (a strong signal
-    /// this really is an active VPN client).
+    /// this really is an active VPN client). For a kernel tunnel: its link
+    /// exists right now.
     pub running: bool,
     /// Provenance, for the GUI to explain why it is listed.
     pub source: VpnCandidateSource,
+    /// The link a [`VpnCandidateSource::KernelTunnel`] runs over, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+}
+
+impl VpnCandidate {
+    /// A kernel tunnel row. `interface` is `None` only for a configured tunnel
+    /// whose link name is not known until it comes up.
+    #[must_use]
+    pub fn kernel_tunnel(display_name: String, interface: Option<String>, link_up: bool) -> Self {
+        Self {
+            display_name,
+            exe_path: None,
+            running: link_up,
+            source: VpnCandidateSource::KernelTunnel,
+            interface,
+        }
+    }
 }
 
 /// Discover likely VPN clients on this machine. Never an error — a backend
@@ -218,13 +244,35 @@ pub fn vpn_client_class(text: &str) -> Option<VpnClientClass> {
     if lower.is_empty() {
         return None;
     }
-    if VPN_CORPORATE_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+    if VPN_CORPORATE_KEYWORDS
+        .iter()
+        .any(|kw| keyword_in(&lower, kw))
+    {
         return Some(VpnClientClass::Corporate);
     }
-    if VPN_CONSUMER_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+    if VPN_CONSUMER_KEYWORDS
+        .iter()
+        .any(|kw| keyword_in(&lower, kw))
+    {
         return Some(VpnClientClass::Consumer);
     }
     None
+}
+
+/// Keywords shorter than this match whole words only: as substrings they hit
+/// ordinary words (`cato` in "allocator", `ideco` in "dmidecode", `ivacy` in
+/// "privacy"). `vpn` is exempt — it names itself inside brands ("nordvpn").
+const WHOLE_WORD_BELOW: usize = 6;
+
+fn keyword_in(text: &str, keyword: &str) -> bool {
+    if keyword.chars().count() >= WHOLE_WORD_BELOW || keyword == "vpn" {
+        return text.contains(keyword);
+    }
+    text.match_indices(keyword).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + keyword.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
 }
 
 /// True when `text` looks like any VPN client, personal or corporate. See
@@ -236,7 +284,8 @@ pub fn looks_like_vpn(text: &str) -> bool {
 /// Merge candidates from several sources into a stable, deduplicated list.
 ///
 /// Dedup key: the exe path when present (case-insensitive), else the lower-
-/// cased display name. When two entries collapse, the merged one keeps
+/// cased display name; a kernel tunnel never collapses into a program row.
+/// When two entries collapse, the merged one keeps
 /// `running = true` if EITHER was running and prefers a known `exe_path` and
 /// the `RunningProcess` source (the stronger signal). Output is sorted:
 /// running candidates first, then by display name — so the GUI shows the most
@@ -245,6 +294,12 @@ pub fn merge_candidates(candidates: Vec<VpnCandidate>) -> Vec<VpnCandidate> {
     let mut merged: Vec<VpnCandidate> = Vec::new();
     for cand in candidates {
         let key_of = |c: &VpnCandidate| -> String {
+            if c.source == VpnCandidateSource::KernelTunnel {
+                return match &c.interface {
+                    Some(link) => format!("link:{link}"),
+                    None => format!("tunnel:{}", c.display_name.trim().to_ascii_lowercase()),
+                };
+            }
             match &c.exe_path {
                 Some(p) if !p.is_empty() => format!("path:{}", p.to_ascii_lowercase()),
                 _ => format!("name:{}", c.display_name.trim().to_ascii_lowercase()),
@@ -295,6 +350,25 @@ impl VpnDiscoveryPort for MockVpnDiscovery {
 
 #[cfg(test)]
 mod tests {
+
+    /// Short brand tokens inside ordinary words are not VPN clients; the
+    /// same tokens standing as words still are.
+    #[test]
+    fn a_short_keyword_matches_only_as_a_whole_word() {
+        for ordinary in [
+            "kworker/u17:1-rb_allocator",
+            "dmidecode",
+            "gnome-privacy-panel",
+            "shotwell-authenticator",
+        ] {
+            assert!(!looks_like_vpn(ordinary), "{ordinary}");
+        }
+        for client in ["Cato Client", "ideco-agent", "Ivacy VPN", "bigip_edge"] {
+            assert!(looks_like_vpn(client), "{client}");
+        }
+        assert!(looks_like_vpn("nordvpn"), "vpn inside a brand still counts");
+    }
+
     use super::*;
 
     fn cand(
@@ -308,7 +382,54 @@ mod tests {
             exe_path: path.map(|s| s.to_string()),
             running,
             source: src,
+            interface: None,
         }
+    }
+
+    #[test]
+    fn a_kernel_tunnel_never_merges_with_a_program_of_the_same_name() {
+        let out = merge_candidates(vec![
+            cand(
+                "wg-example",
+                None,
+                false,
+                VpnCandidateSource::InstalledProgram,
+            ),
+            VpnCandidate::kernel_tunnel("wg-example".into(), Some("wg-example".into()), true),
+            VpnCandidate::kernel_tunnel(
+                "wg-example (wg-quick)".into(),
+                Some("wg-example".into()),
+                false,
+            ),
+        ]);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].source, VpnCandidateSource::KernelTunnel);
+        assert!(out[0].running, "an up link wins the merge");
+        assert_eq!(out[0].interface.as_deref(), Some("wg-example"));
+        assert_eq!(out[1].source, VpnCandidateSource::InstalledProgram);
+    }
+
+    #[test]
+    fn the_wire_shape_names_the_tunnel_link_and_omits_it_for_programs() {
+        let tunnel = serde_json::to_value(VpnCandidate::kernel_tunnel(
+            "office-example".into(),
+            Some("wg-example".into()),
+            false,
+        ))
+        .expect("json");
+        assert_eq!(tunnel["source"], "kernel-tunnel");
+        assert_eq!(tunnel["interface"], "wg-example");
+        assert_eq!(tunnel["running"], false);
+        assert!(tunnel["exePath"].is_null());
+
+        let program = serde_json::to_value(cand(
+            "NordVPN",
+            None,
+            false,
+            VpnCandidateSource::InstalledProgram,
+        ))
+        .expect("json");
+        assert!(program.get("interface").is_none(), "{program}");
     }
 
     #[test]

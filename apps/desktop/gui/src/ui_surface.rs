@@ -174,6 +174,7 @@ pub fn write_qt_context_file_at(
     request: &crate::app_shell::LaunchRequest,
     backend: &dyn BackendFacade,
     backend_status: &BackendConnectionStatus,
+    service_started_on_launch: bool,
     answer_deadlines: &HostAnswerDeadlines,
 ) -> Result<(), String> {
     // One pass over the locale files, not three: each of the old calls loaded,
@@ -361,6 +362,8 @@ pub fn write_qt_context_file_at(
                 "name": row.name,
                 "description": row.interface_description,
                 "type": row.interface_type,
+                "kind": row.kind.slug(),
+                "deviceTechnology": row.device_technology.map_or("", |tech| tech.slug()),
                 "ip": row.local_ip,
                 "gateway": row.gateway,
                 "dns": row.dns_servers,
@@ -542,6 +545,8 @@ pub fn write_qt_context_file_at(
         // without a service behind it, and the GUI must park routing changes
         // in that case instead of pretending they were applied.
         "backendServiceBacked": backend_service_backed,
+        // The service was stopped and this launch started it again.
+        "serviceStartedOnLaunch": service_started_on_launch,
         "iconFileUrl": icon_file_url,
         "platformProfile": platform_profile,
         // How long `RpcTransport.qml` waits for each answer; the launcher owns the budgets.

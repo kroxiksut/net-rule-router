@@ -956,7 +956,7 @@ fn an_app_scoped_block_is_skipped_by_both_mechanisms_and_reported() {
         },
     );
     assert_eq!(
-        report.unsupported_shapes,
+        report.unsupported_shapes(),
         vec![(
             "b-app-ip".to_string(),
             UnsupportedShapeReason::AppScopedDestinationBlock
@@ -971,4 +971,120 @@ fn an_app_scoped_block_is_skipped_by_both_mechanisms_and_reported() {
     assert_eq!(c.rule_value, NARROW_IP.to_string());
     assert_eq!(c.app, APP);
     assert!(c.ip.is_empty() && c.count == 0);
+}
+
+/// The Overlaps screen lists the same conflicts whichever mechanism planned
+/// the rules: Windows reads them off the codegen, every other platform off the
+/// neutral planner.
+#[test]
+fn the_planner_reports_the_conflicts_the_codegen_reports() {
+    use nrr_service_runtime::app_enforcement_status::rule_conflicts_from;
+    use nrr_service_runtime::rule_conflicts::rule_conflict_dtos;
+    use nrr_shared::ipc_payloads::RuleConflictKind;
+
+    let shared_cache = || {
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips(NARROW_HOST, vec![NARROW_IP]);
+        cache.set_ips(ZONE_ONLY_HOST, vec![NARROW_IP, ZONE_ONLY_IP]);
+        cache
+    };
+    let literal_block = || {
+        block_rule(
+            "b-ip",
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(NARROW_IP)),
+        )
+    };
+    let zone_block = || block_rule("b-zone", CanonicalAddressMatch::Zone("example".into()));
+    let exact_route = || {
+        address_rule(
+            "r-exact",
+            CanonicalAddressMatch::ExactFqdn(NARROW_HOST.into()),
+        )
+    };
+    let mut app_scoped = block_rule(
+        "b-app-ip",
+        CanonicalAddressMatch::ExactIp(IpAddr::V4(ZONE_ONLY_IP)),
+    );
+    app_scoped.app_match = app_rule("unused", APP).app_match;
+    let several = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![zone_block(), app_scoped.clone()]),
+        secondary: CanonicalRuleSet::from_rules(vec![
+            literal_block(),
+            address_rule(
+                "r-suffix",
+                CanonicalAddressMatch::SuffixDomain(NARROW_HOST.into()),
+            ),
+        ]),
+    };
+
+    use RuleConflictKind::*;
+    let cases = [
+        (
+            "literal veto, block on main",
+            book_with(literal_block(), exact_route(), true),
+            zone_cache(),
+            vec![LiteralBlockOverridesRoute],
+        ),
+        (
+            "literal veto, block on additional",
+            book_with(literal_block(), exact_route(), false),
+            zone_cache(),
+            vec![LiteralBlockOverridesRoute],
+        ),
+        (
+            "leak through a shared address",
+            book_with(zone_block(), exact_route(), false),
+            shared_cache(),
+            vec![BlockLeaksSharedAddress],
+        ),
+        (
+            "unsupported shape",
+            book_with(app_scoped, exact_route(), false),
+            zone_cache(),
+            vec![UnsupportedRuleShape],
+        ),
+        (
+            "several, in rule order",
+            several,
+            shared_cache(),
+            vec![
+                BlockLeaksSharedAddress,
+                UnsupportedRuleShape,
+                LiteralBlockOverridesRoute,
+            ],
+        ),
+        (
+            "no conflict",
+            book_with(zone_block(), exact_route(), false),
+            zone_cache(),
+            vec![],
+        ),
+    ];
+    for (how, rule_book, cache, kinds) in cases {
+        let windows =
+            rule_conflicts_from(&codegen_output(&rule_book, &cache).diagnostics, &rule_book);
+        let (_, report) = plan_route_rules(
+            &rule_book,
+            "S-1-5-21-TEST",
+            RouteBehaviorMode::PreferPrimary,
+            &PlannerInput {
+                ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::Off,
+                fqdn_cache: &cache,
+                app_resolver: &MockAppPathResolver::new(),
+                app_observations: &MockAppObservationLookup::new(),
+                zone_priority_over_ip: false,
+                secondary_ip_denylist: &HashSet::new(),
+            },
+        );
+        assert_eq!(
+            windows.iter().map(|c| c.kind).collect::<Vec<_>>(),
+            kinds,
+            "{how}: {windows:?}"
+        );
+        assert_eq!(
+            rule_conflict_dtos(&report.conflicts, &rule_book),
+            windows,
+            "{how}"
+        );
+    }
 }

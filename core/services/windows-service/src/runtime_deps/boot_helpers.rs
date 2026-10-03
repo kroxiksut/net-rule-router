@@ -28,7 +28,15 @@ pub(super) fn resolve_tray_binary_path() -> PathBuf {
 /// the log in noise and teach everyone to filter the target out. A slow pass is
 /// the one worth a line, because it is the one that queues DNS answers and the
 /// GUI's own requests behind it.
-pub(super) fn report_recompute_cost(timings: &nrr_service_runtime::phase_timings::PhaseTimings) {
+/// `moved` names the inputs that made this pass run.
+pub(super) fn report_recompute_cost(
+    timings: &nrr_service_runtime::phase_timings::PhaseTimings,
+    moved: &str,
+) {
     const SLOW_PASS: std::time::Duration = std::time::Duration::from_secs(1);
-    nrr_service_runtime::phase_timings::report_if_slow(timings, "recompute", SLOW_PASS);
+    nrr_service_runtime::phase_timings::report_if_slow(
+        timings,
+        &format!("recompute[{moved}]"),
+        SLOW_PASS,
+    );
 }

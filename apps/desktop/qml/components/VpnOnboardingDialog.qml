@@ -30,7 +30,9 @@ Window {
     property var ownerRoot: null
 
     /// Scan state and results. `candidates` is a plain JS array of
-    /// `{ displayName, exePath, running, source }` objects returned by the RPC.
+    /// `{ displayName, exePath, running, source, interfaceName }` objects
+    /// returned by the RPC. A `kernel-tunnel` row is not a program: it is never
+    /// selectable and offers its link for the secondary role instead.
     property bool scanning: false
     property bool scanFailed: false
     property bool scanRan: false
@@ -59,6 +61,9 @@ Window {
     /// actual native file picker is wired later; for now the caller just notes
     /// the request.
     signal manualPickRequested()
+    /// Fired when the user wants a kernel tunnel's link bound as the
+    /// secondary route; the dialog has already closed.
+    signal kernelTunnelAdapterRequested(string interfaceName)
 
     function tr(key, fallback) {
         return ownerRoot && typeof ownerRoot.tr === "function"
@@ -103,6 +108,15 @@ Window {
         else delete next[key]
         root.selectedKeys = next
     }
+    function _isKernelTunnel(candidate) {
+        return String((candidate || {}).source || "") === "kernel-tunnel"
+    }
+    function _hasSelectable() {
+        for (var i = 0; i < root.candidates.length; i += 1) {
+            if (!root._isKernelTunnel(root.candidates[i])) return true
+        }
+        return false
+    }
     function _selectedCount() {
         var n = 0
         for (var k in root.selectedKeys) {
@@ -113,9 +127,10 @@ Window {
     /// True when every candidate is currently selected (and there is at least
     /// one). Drives the select-all control's toggle semantics and label.
     function _allSelected() {
-        if (!root.candidates || root.candidates.length === 0) return false
+        if (!root.candidates || !root._hasSelectable()) return false
         for (var i = 0; i < root.candidates.length; i += 1) {
             var c = root.candidates[i] || {}
+            if (root._isKernelTunnel(c)) continue
             var key = root._rowKeyOf(String(c.displayName || ""),
                 String(c.exePath || ""))
             if (root.selectedKeys[key] !== true) return false
@@ -134,6 +149,7 @@ Window {
         var next = {}
         for (var i = 0; i < root.candidates.length; i += 1) {
             var c = root.candidates[i] || {}
+            if (root._isKernelTunnel(c)) continue
             var key = root._rowKeyOf(String(c.displayName || ""),
                 String(c.exePath || ""))
             next[key] = true
@@ -180,7 +196,8 @@ Window {
                         || c["display-name"] || ""),
                     exePath: (exe === null || exe === undefined) ? "" : String(exe),
                     running: (c.running === true),
-                    source: String(c.source || "")
+                    source: String(c.source || ""),
+                    interfaceName: String(c["interface"] || "")
                 })
             }
             root.candidates = normalized
@@ -227,6 +244,18 @@ Window {
             return root.tr("vpn-onboarding.source-installed-program",
                 "found among installed programs")
         return ""
+    }
+
+    function _kernelTunnelTitle(c) {
+        var name = String(c.displayName || "")
+        if (c.running === true && String(c.interfaceName || "") !== "") {
+            return root.tr("vpn-onboarding.kernel-tunnel-assign",
+                "Kernel tunnel {name} — assign adapter {interface} as the additional link")
+                .replace("{name}", name)
+                .replace("{interface}", String(c.interfaceName))
+        }
+        return root.tr("vpn-onboarding.kernel-tunnel-down", "Tunnel {name} is not up")
+            .replace("{name}", name)
     }
 
     width: 640
@@ -331,7 +360,7 @@ Window {
         // the whole selection when all are already ticked (toggle semantics).
         RowLayout {
             Layout.fillWidth: true
-            visible: root.candidates.length > 0
+            visible: root._hasSelectable()
             spacing: root.ownerRoot ? root.ownerRoot.uiTheme.spacingSm : 8
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
@@ -373,6 +402,7 @@ Window {
                         property string rowKey: root._rowKeyOf(
                             String(modelData.displayName || ""),
                             String(modelData.exePath || ""))
+                        readonly property bool isTunnel: root._isKernelTunnel(modelData)
 
                         RowLayout {
                             id: rowLayout
@@ -385,6 +415,7 @@ Window {
                             // the app theme instead of the Windows Native style.
                             CheckBox {
                                 id: candidateCheck
+                                visible: !candidateCard.isTunnel
                                 Layout.alignment: Qt.AlignTop
                                 checked: root._isSelected(candidateCard.rowKey)
                                 onToggled: root._setSelected(candidateCard.rowKey, checked)
@@ -440,11 +471,13 @@ Window {
                                         wrapMode: Text.WordWrap
                                         font.bold: true
                                         color: root.ownerRoot ? root.ownerRoot.textColor : "white"
-                                        text: String(modelData.displayName || "")
+                                        text: candidateCard.isTunnel
+                                            ? root._kernelTunnelTitle(modelData)
+                                            : String(modelData.displayName || "")
                                     }
                                     // "running now" badge.
                                     Rectangle {
-                                        visible: modelData.running === true
+                                        visible: modelData.running === true && !candidateCard.isTunnel
                                         radius: 3
                                         color: root.ownerRoot ? root.ownerRoot.uiTheme.colorAccent : "#3d6fb4"
                                         Layout.preferredWidth: runningLabel.implicitWidth
@@ -465,6 +498,7 @@ Window {
                                 // "pick manually" hint when it is unknown.
                                 Label {
                                     Layout.fillWidth: true
+                                    visible: !candidateCard.isTunnel
                                     wrapMode: Text.WrapAnywhere
                                     font.pixelSize: (root.ownerRoot
                                         ? root.ownerRoot.uiTheme.baseFontSizePx : 13) - 1
@@ -483,6 +517,31 @@ Window {
                                         ? root.ownerRoot.uiTheme.baseFontSizePx : 13) - 2
                                     color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
                                     text: root._sourceHint(String(modelData.source || ""))
+                                }
+                                // Why a kernel tunnel has no program to tick.
+                                Label {
+                                    Layout.fillWidth: true
+                                    visible: candidateCard.isTunnel
+                                    wrapMode: Text.WordWrap
+                                    font.pixelSize: (root.ownerRoot
+                                        ? root.ownerRoot.uiTheme.baseFontSizePx : 13) - 1
+                                    color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
+                                    text: root.tr("vpn-onboarding.kernel-tunnel-why",
+                                        "The system itself runs this tunnel, so no program rule can carry it — it is routed by its adapter.")
+                                }
+                                ThemedButton {
+                                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                                    visible: candidateCard.isTunnel
+                                    enabled: modelData.running === true
+                                        && String(modelData.interfaceName || "") !== ""
+                                    text: root.tr("status.secondary-unresolved-button",
+                                        "Open Interfaces and routes")
+                                    Accessible.description: root._kernelTunnelTitle(modelData)
+                                    onClicked: {
+                                        var link = String(modelData.interfaceName || "")
+                                        root.close()
+                                        root.kernelTunnelAdapterRequested(link)
+                                    }
                                 }
                             }
                         }
@@ -541,6 +600,7 @@ Window {
                     var paths = []
                     for (var i = 0; i < root.candidates.length; i += 1) {
                         var c = root.candidates[i] || {}
+                        if (root._isKernelTunnel(c)) continue
                         var dn = String(c.displayName || "")
                         var ep = String(c.exePath || "")
                         if (root._isSelected(root._rowKeyOf(dn, ep))) {

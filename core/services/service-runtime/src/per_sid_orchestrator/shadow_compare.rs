@@ -23,6 +23,11 @@ pub(super) struct NeutralPlanVerdict {
     only_neutral: String,
 }
 
+/// The comparison runs at most this often per SID: it costs a full plan plus a
+/// lowering, on the path that also carries DNS answers.
+pub(super) const SHADOW_COMPARE_EVERY: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+
 /// At most this many differing filters are named per side. Enough to identify
 /// a category; past it the counts already say the sets diverge wholesale.
 const NEUTRAL_DIFF_SAMPLE: usize = 4;
@@ -97,10 +102,14 @@ impl PerSidApplyOrchestrator {
                 .shadow_compare_seen
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if seen.get(sid) == Some(&fingerprint) {
-                return false;
+            if let Some((last, at)) = seen.get(sid) {
+                // The filter set changes with every learned address; evidence
+                // sampled every few minutes says as much as evidence per change.
+                if *last == fingerprint || at.elapsed() < SHADOW_COMPARE_EVERY {
+                    return false;
+                }
             }
-            seen.insert(sid.to_string(), fingerprint);
+            seen.insert(sid.to_string(), (fingerprint, std::time::Instant::now()));
         }
         let Some(verdict) = self.neutral_plan_verdict(
             sid,

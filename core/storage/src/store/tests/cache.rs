@@ -390,3 +390,188 @@ fn clear_cache_empties_the_census() {
         .expect("census")
         .is_empty());
 }
+
+// ── names_for_address ─────────────────────────────────────────────────────
+
+fn resolution_at(hostname: &str, ip: IpAddr, at: SystemTime) -> ResolutionEntry {
+    ResolutionEntry {
+        canonical_hostname: hostname.to_string(),
+        raw_hostname_sample: None,
+        resolved_ips: vec![ip],
+        ttl_seconds: Some(300),
+        source: StorageResolutionSource::Dns,
+        resolved_at: at,
+        active_revision_id: None,
+    }
+}
+
+#[test]
+fn an_address_is_named_newest_first_with_census_tenants_and_a_total() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let ip = Ipv4Addr::new(192, 0, 2, 40);
+    let now = SystemTime::now();
+    let ago = |secs: u64| now - std::time::Duration::from_secs(secs);
+    for (host, at) in [
+        ("old.example", ago(300)),
+        ("new.example", ago(10)),
+        ("mid.example", ago(60)),
+    ] {
+        store
+            .upsert_resolution(resolution_at(host, IpAddr::V4(ip), at))
+            .expect("upsert");
+    }
+    let tenant_ms = system_time_to_ms(ago(30));
+    store
+        .record_shared_ip_direct_host(ip, "tenant.example", tenant_ms, false)
+        .expect("census");
+    // A neighbour address is somebody else's business.
+    store
+        .upsert_resolution(sample_resolution(
+            "neighbour.example",
+            Ipv4Addr::new(192, 0, 2, 41),
+        ))
+        .expect("upsert");
+
+    let named = store
+        .names_for_address(IpAddr::V4(ip), ago(3_600), 3)
+        .expect("names");
+    assert_eq!(
+        named.names,
+        vec!["new.example", "tenant.example", "mid.example"],
+        "most recently seen first, census tenants interleaved by recency"
+    );
+    assert_eq!(named.total, 4, "the limit trims the list, never the count");
+}
+
+#[test]
+fn a_name_not_seen_since_the_cutoff_does_not_name_the_address() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42));
+    let now = SystemTime::now();
+    store
+        .upsert_resolution(resolution_at(
+            "gone.example",
+            ip,
+            now - std::time::Duration::from_secs(7_200),
+        ))
+        .expect("upsert");
+    store
+        .upsert_resolution(resolution_at("here.example", ip, now))
+        .expect("upsert");
+
+    let named = store
+        .names_for_address(ip, now - std::time::Duration::from_secs(3_600), 8)
+        .expect("names");
+    assert_eq!(named.names, vec!["here.example"]);
+    assert_eq!(named.total, 1);
+}
+
+#[test]
+fn an_unknown_address_has_no_names_and_v6_is_looked_up_in_its_own_family() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let v6: IpAddr = "2001:db8::7".parse().expect("v6");
+    let now = SystemTime::now();
+    store
+        .upsert_resolution(resolution_at("dual.example", v6, now))
+        .expect("upsert");
+    let since = now - std::time::Duration::from_secs(60);
+
+    let named = store.names_for_address(v6, since, 8).expect("names");
+    assert_eq!(named.names, vec!["dual.example"]);
+    assert_eq!(named.total, 1);
+
+    let none = store
+        .names_for_address(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)), since, 8)
+        .expect("names");
+    assert!(none.names.is_empty());
+    assert_eq!(none.total, 0);
+
+    // A zero limit still reports how many there are.
+    let counted = store.names_for_address(v6, since, 0).expect("names");
+    assert!(counted.names.is_empty());
+    assert_eq!(counted.total, 1);
+}
+
+/// Asked once per newly seen connection address, so a full scan here would
+/// grow with the cache. The plan must reach every table through an index.
+#[test]
+fn naming_an_address_never_scans_a_table() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let conn = store.conn.borrow();
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {NAMES_FOR_ADDRESS_SQL}"))
+        .expect("plan");
+    let steps: Vec<String> = stmt
+        .query_map(
+            params!["v4", "192.0.2.1", 0_i64, 3_221_225_985_i64, 8_i64],
+            |r| r.get::<_, String>(3),
+        )
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect();
+    // Base tables appear under their alias; CTE and window co-routines are
+    // scans of a handful of in-memory rows and do not count.
+    for name in ["a", "r", "h", "shared_ip_direct_hosts"] {
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.starts_with(&format!("SEARCH {name} "))),
+            "{name} is not searched by index: {steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|s| s.starts_with(&format!("SCAN {name}"))),
+            "{name} is scanned: {steps:?}"
+        );
+    }
+}
+
+/// Every DNS answer restamps the pairs it repeats; only a pair that was not
+/// held moves the generation, or an idle pass would re-plan on each answer.
+#[test]
+fn only_news_moves_the_change_generation() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let ip = Ipv4Addr::new(203, 0, 113, 7);
+
+    let start = store.change_generation().expect("generation");
+    store
+        .upsert_resolution(sample_resolution("news.example", ip))
+        .expect("first");
+    let after_new = store.change_generation().expect("generation");
+    assert_ne!(after_new, start, "a new pair did not move it");
+
+    store
+        .upsert_resolution(sample_resolution("news.example", ip))
+        .expect("restamp");
+    assert_eq!(
+        store.change_generation(),
+        Some(after_new),
+        "a restamp of a held pair moved it"
+    );
+
+    store
+        .upsert_resolution(sample_resolution(
+            "news.example",
+            Ipv4Addr::new(203, 0, 113, 8),
+        ))
+        .expect("second address");
+    let after_second = store.change_generation().expect("generation");
+    assert_ne!(after_second, after_new, "a new address did not move it");
+
+    store
+        .record_shared_ip_direct_host(ip, "tenant.example", 1, false)
+        .expect("census");
+    let after_census = store.change_generation().expect("generation");
+    assert_ne!(
+        after_census, after_second,
+        "a new census tenant did not move it"
+    );
+    store
+        .record_shared_ip_direct_host(ip, "tenant.example", 2, false)
+        .expect("census restamp");
+    assert_eq!(store.change_generation(), Some(after_census));
+}
