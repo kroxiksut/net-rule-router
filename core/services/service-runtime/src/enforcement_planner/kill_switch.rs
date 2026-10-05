@@ -3,6 +3,9 @@
 
 use super::*;
 
+mod network_holds;
+pub use network_holds::*;
+
 /// Plan the **per-destination kill-switch** for `sid` — the
 /// leak-proof `OnlyVia(Secondary)` pins over each protected IP, across every
 /// selected protocol.
@@ -50,7 +53,7 @@ pub fn plan_kill_switch_destinations(
         if protocols.tcp || protocols.udp {
             flows.push(kill_switch_flow(
                 &principal,
-                ip,
+                host_match(ip),
                 None,
                 EgressConstraint::OnlyVia(EgressRef::Secondary),
                 Coverage::ConnectOnly,
@@ -73,7 +76,7 @@ pub fn plan_kill_switch_destinations(
         for (slot, proto) in selected_packet_protocols(protocols).into_iter().enumerate() {
             flows.push(kill_switch_flow(
                 &principal,
-                ip,
+                host_match(ip),
                 Some(proto),
                 EgressConstraint::OnlyVia(EgressRef::Secondary),
                 Coverage::AllPackets,
@@ -84,10 +87,10 @@ pub fn plan_kill_switch_destinations(
     flows
 }
 
-/// Build one [`PrecedenceClass::KillSwitchPermit`] `Permit` flow over `ip`.
+/// Build one [`PrecedenceClass::KillSwitchPermit`] `Permit` flow over `dst`.
 fn kill_switch_flow(
     principal: &PrincipalScope,
-    ip: IpAddr,
+    dst: DstMatch,
     protocol: Option<L4Proto>,
     egress: EgressConstraint,
     coverage: Coverage,
@@ -100,7 +103,7 @@ fn kill_switch_flow(
             ordinal,
         },
         flow: FlowMatch {
-            dst: host_match(ip),
+            dst,
             dst_port: None,
             protocol,
         },
@@ -109,6 +112,83 @@ fn kill_switch_flow(
         egress,
         coverage,
     }
+}
+
+/// Plan the kill-switch over the additional link's held networks: the same
+/// `OnlyVia(Secondary)` pin [`plan_kill_switch_destinations`] puts on an
+/// address, once per held network, plus the cut-outs left open inside them.
+/// Ordinals continue past the per-address pins, so the two never share a slot.
+pub fn plan_kill_switch_networks(
+    sid: &str,
+    holds: &NetworkHolds,
+    protocols: KillSwitchProtocols,
+) -> Vec<FlowRule> {
+    let principal = principal_scope(sid);
+    let mut flows = Vec::new();
+    for (i, net) in holds.held.iter().copied().enumerate() {
+        let ordinal = NETWORK_ORDINAL_BASE + i as u32;
+        if protocols.tcp || protocols.udp {
+            flows.push(kill_switch_flow(
+                &principal,
+                block_match(net),
+                None,
+                EgressConstraint::OnlyVia(EgressRef::Secondary),
+                Coverage::ConnectOnly,
+                ordinal,
+            ));
+        }
+        // IPv4 only, as for the per-address pin.
+        if !net.is_ipv4() {
+            continue;
+        }
+        let base = ordinal * PACKET_SLOTS_PER_DEST;
+        for (slot, proto) in selected_packet_protocols(protocols).into_iter().enumerate() {
+            flows.push(kill_switch_flow(
+                &principal,
+                block_match(net),
+                Some(proto),
+                EgressConstraint::OnlyVia(EgressRef::Secondary),
+                Coverage::AllPackets,
+                base + slot as u32,
+            ));
+        }
+    }
+    flows.extend(plan_network_cut_outs(&principal, holds, protocols));
+    flows
+}
+
+/// The cut-outs inside held networks, as exemptions: their band outranks every
+/// hold whatever the ordinals, so no lowering has to order holds against them.
+pub(super) fn plan_network_cut_outs(
+    principal: &PrincipalScope,
+    holds: &NetworkHolds,
+    protocols: KillSwitchProtocols,
+) -> Vec<FlowRule> {
+    let connect = protocols.tcp || protocols.udp;
+    let packet = !selected_packet_protocols(protocols).is_empty();
+    let mut flows = Vec::new();
+    for (j, cut) in holds.cut_outs.iter().copied().enumerate() {
+        let ordinal = NETWORK_ORDINAL_BASE + j as u32;
+        let mut push = |coverage| {
+            flows.push(catch_all_flow(
+                principal,
+                Verdict::Permit,
+                PrecedenceClass::CatchAllExempt,
+                block_match(cut),
+                EgressConstraint::Any,
+                None,
+                coverage,
+                ordinal,
+            ));
+        };
+        if connect {
+            push(Coverage::ConnectOnly);
+        }
+        if packet && cut.is_ipv4() {
+            push(Coverage::AllPackets);
+        }
+    }
+    flows
 }
 
 /// The named packet protocols (ICMP/IGMP/GRE/ESP) that ARE selected, in
@@ -410,3 +490,6 @@ pub(super) fn catch_all_flow(
         coverage,
     }
 }
+
+#[cfg(test)]
+mod network_tests;

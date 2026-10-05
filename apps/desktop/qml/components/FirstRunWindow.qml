@@ -70,9 +70,9 @@ Window {
     property bool wantDohLockdown: true
     property bool wantFakeIp: true
     property bool wantDiagnosticLogs: false
-    // Duration for the verbose-logging window `wantDiagnosticLogs` requests —
-    // one of `Pure.VERBOSE_LOGGING_CHANGES` minus "off" (the checkbox is the
-    // on/off control). Same default as Settings -> Diagnostics and logs.
+    // Duration of the log windows `wantDiagnosticLogs` opens (verbose logging
+    // and the connection trace on disk) — one of `Pure.LOG_WINDOW_CHANGES`
+    // minus "off" (the checkbox is the on/off control).
     property string diagnosticLogsDuration: "four-hours"
     property bool wantBlockNoticesMuted: false
 
@@ -128,7 +128,7 @@ Window {
         var patch = { "fake-ip-enabled": wantFakeIp }
         if (wantDiagnosticLogs) {
             patch["verbose-logging-change"] = diagnosticLogsDuration
-            patch["conn-trace-ndjson"] = true
+            patch["conn-trace-ndjson-change"] = diagnosticLogsDuration
             patch["conn-trace-gui"] = true
         }
         root.applyServiceStabilityPatch(patch, function(ok, code) {
@@ -683,6 +683,16 @@ Window {
                         Accessible.name: text
                         onClicked: root.openVpnOnboarding()
                     }
+                    // The hint says "connect it, then come back": a VPN brought
+                    // up while the wizard is open must not need a restart to show.
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("action.refresh-interfaces", "Refresh interfaces")
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                        enabled: !!root.interfacesRolesController
+                        onClicked: root.interfacesRolesController.refreshInterfacesFromService()
+                    }
                 }
                 Label {
                     Layout.fillWidth: true
@@ -781,10 +791,13 @@ Window {
                     Layout.leftMargin: firstRunDiagLogsCheck.indicator.width + firstRunDiagLogsCheck.spacing
                     visible: root.serviceStabilitySupported
                     spacing: root.uiTheme.spacingSm
-                    VerboseLoggingDurationCombo {
+                    LogWindowDurationCombo {
                         id: firstRunDiagLogsDurationCombo
                         root: firstRunWindow.root
                         theme: firstRunWindow.root.uiTheme
+                        labelFor: function(change) {
+                            return firstRunWindow.root.verboseLoggingChangeLabel(change)
+                        }
                         enabled: firstRunWindow.wantDiagnosticLogs
                         Layout.preferredWidth: 240
                         // No "off" here: the checkbox above is the on/off control.

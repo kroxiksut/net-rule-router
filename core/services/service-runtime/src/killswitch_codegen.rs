@@ -1089,6 +1089,8 @@ pub use v6::catch_all_v6_filters;
 
 mod fail_closed;
 pub use fail_closed::*;
+mod networks;
+pub use networks::*;
 mod filters;
 use filters::*;
 // ── Tests ───────────────────────────────────────────────────────────────────

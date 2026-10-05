@@ -44,9 +44,9 @@ ColumnLayout {
     function _describe(side) {
         var type = String(side["rule-type"])
         var value = String(side.value)
-        var typeLabel = type === "zone"
-            ? root.tr("rules.type.zone", "Zone")
-            : root.tr("rules.type.domain", "Domain")
+        // Both name kinds are a "Domain" rule in the rules list.
+        var typeLabel = root.ruleTypeLabel(
+            type === "exact-fqdn" || type === "suffix-domain" ? "domain" : type)
         return root.tr("rules.overlaps.rule", "{value} ({type})")
             .replace("{value}", type === "suffix-domain" ? "*." + value : value)
             .replace("{type}", typeLabel)
@@ -57,12 +57,25 @@ ColumnLayout {
     function _blockWinsTie(overlap) {
         return !!overlap && overlap["block-wins-tie"] === true
     }
+    function _mainStays(overlap) {
+        return !!overlap && overlap["main-stays-when-additional-down"] === true
+    }
+    function _mainStaysText() {
+        return root.tr("rules.overlaps.main-stays",
+            "Addresses of the main link inside this network stay on the main link even when the additional link is down. Leak protection does not block them.")
+    }
     function _reason(overlap) {
         if (section._blockWinsTie(overlap))
             return root.tr("rules.overlaps.reason.block-tie", "A block wins a tie")
-        return String(overlap.kind) === "duplicate"
+        var kind = String(overlap.kind)
+        return kind === "duplicate"
             ? root.tr("rules.overlaps.reason.duplicate", "Same rule on both routes")
+            : kind === "intersecting"
+            ? root.tr("rules.overlaps.reason.intersecting", "Narrower where they meet")
             : root.tr("rules.overlaps.reason.nested", "Narrower rule")
+    }
+    function _intersecting(overlap) {
+        return !!overlap && String(overlap.kind) === "intersecting"
     }
     /// The whole row as one sentence, for a screen reader.
     function _explain(overlap) {
@@ -72,13 +85,18 @@ ColumnLayout {
             : String(overlap.kind) === "duplicate"
             ? root.tr("rules.overlaps.duplicate",
                 "{winner} is set on both routes. It goes over {winner-route}: on a tie the main route wins.")
+            : section._intersecting(overlap)
+            ? root.tr("rules.overlaps.intersecting",
+                "{winner} and {loser} on {loser-route} share some addresses. Each shared address takes the narrower rule; most of them go over {winner-route}.")
             : root.tr("rules.overlaps.nested",
                 "{winner} goes over {winner-route}: it is narrower than {loser} on {loser-route}.")
-        return sentence
+        sentence = sentence
             .replace("{winner}", section._describe(overlap.winner))
             .replace("{loser}", section._describe(overlap.loser))
             .replace("{winner-route}", section._routeText(overlap.winner))
             .replace("{loser-route}", section._routeText(overlap.loser))
+        return section._mainStays(overlap)
+            ? sentence + " " + section._mainStaysText() : sentence
     }
 
     /// One service-reported conflict as a sentence.
@@ -131,7 +149,7 @@ ColumnLayout {
             color: root.textColor
             text: root.uiRevision >= 0
                 ? root.tr("rules.overlaps.intro",
-                    "When rules of the two routes cover the same sites, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one. Check that each site below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.")
+                    "When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.")
                 : ""
             Accessible.role: Accessible.StaticText
             Accessible.name: text
@@ -204,7 +222,7 @@ ColumnLayout {
         color: root.mutedTextColor
         text: root.uiRevision < 0 ? ""
             : section.controller.overlaps.length === 0
-            ? root.tr("rules.overlaps.empty", "No rules of the two routes cover the same sites.")
+            ? root.tr("rules.overlaps.empty", "No rules of the two routes cover the same sites or addresses.")
             : root.tr("rules.overlaps.all-resolved", "Every overlap is resolved.")
         Accessible.role: Accessible.StaticText
         Accessible.name: text
@@ -311,6 +329,12 @@ ColumnLayout {
                             text: root.tr("rules.overlaps.block-tie-warning",
                                 "The other rule names the same sites and never applies.")
                         }
+                        Cell {
+                            Layout.fillWidth: true
+                            visible: section._mainStays(row.overlap)
+                            color: root.mutedTextColor
+                            text: section._mainStaysText()
+                        }
                     }
                     ColumnLayout {
                         Layout.preferredWidth: section.colRuleWidth
@@ -375,6 +399,19 @@ ColumnLayout {
                                 Accessible.role: Accessible.Button
                                 Accessible.name: text
                                 onClicked: section.controller.sendOverLoserRoute(row.overlap)
+                            }
+                            // The winner only partly overlaps; moving it moves
+                            // all of its addresses.
+                            Label {
+                                visible: section._intersecting(row.overlap)
+                                    && section.controller.canReroute(row.overlap)
+                                width: actions.width
+                                wrapMode: Text.Wrap
+                                color: root.mutedTextColor
+                                text: root.tr("rules.overlaps.send-over-whole",
+                                    "This moves the whole rule, including addresses the other rule does not cover.")
+                                Accessible.role: Accessible.StaticText
+                                Accessible.name: text
                             }
                             Label {
                                 visible: !section.controller.canReroute(row.overlap)

@@ -148,16 +148,13 @@ impl StackWaker {
         self.cv.notify_all();
     }
 
-    /// Park until woken or `timeout` elapses, then clear the signal.
+    /// Park until woken or `timeout` elapses, then clear the signal. A spurious
+    /// wakeup keeps waiting: returning early only spins the poll loop.
     pub fn wait(&self, timeout: std::time::Duration) {
-        let mut signalled = guard(&self.signalled);
-        if !*signalled {
-            let (next, _) = self
-                .cv
-                .wait_timeout(signalled, timeout)
-                .unwrap_or_else(PoisonError::into_inner);
-            signalled = next;
-        }
+        let (mut signalled, _) = self
+            .cv
+            .wait_timeout_while(guard(&self.signalled), timeout, |signalled| !*signalled)
+            .unwrap_or_else(PoisonError::into_inner);
         *signalled = false;
     }
 }

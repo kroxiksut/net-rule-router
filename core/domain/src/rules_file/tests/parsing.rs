@@ -318,15 +318,15 @@ fn parse_preamble_lines_before_first_section_ignored() {
 
 #[test]
 fn parse_unknown_section_produces_warning() {
-    let input = "--- CIDR\n10.0.0.0/8\n";
+    let input = "--- Geo\n10.0.0.0/8\n";
     let outcome = parse_rules_file(input);
     assert_eq!(outcome.warnings.len(), 1);
     assert!(matches!(
         &outcome.warnings[0],
-        ParseWarning::UnknownSection { name, .. } if name == "CIDR"
+        ParseWarning::UnknownSection { name, .. } if name == "Geo"
     ));
     assert_eq!(outcome.unknown_sections.len(), 1);
-    assert_eq!(outcome.unknown_sections[0].name, "CIDR");
+    assert_eq!(outcome.unknown_sections[0].name, "Geo");
     assert_eq!(outcome.unknown_sections[0].entries.len(), 1);
 }
 
@@ -365,10 +365,10 @@ fn a_file_of_many_distinct_headers_parses_in_linear_time() {
 
 #[test]
 fn parse_multiple_unknown_sections_all_preserved() {
-    let input = "--- CIDR\n10.0.0.0/8\n--- Ports\n443\n";
+    let input = "--- Geo\n10.0.0.0/8\n--- Ports\n443\n";
     let outcome = parse_rules_file(input);
     assert_eq!(outcome.unknown_sections.len(), 2);
-    assert_eq!(outcome.unknown_sections[0].name, "CIDR");
+    assert_eq!(outcome.unknown_sections[0].name, "Geo");
     assert_eq!(outcome.unknown_sections[1].name, "Ports");
 }
 
@@ -376,7 +376,7 @@ fn parse_multiple_unknown_sections_all_preserved() {
 fn parse_unknown_sections_round_trip_free_edition() {
     // A file with known + unknown sections: known sections parsed,
     // unknown sections preserved with entries intact.
-    let input = "--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n";
+    let input = "--- Domains\nexample.com\n--- Geo\n10.0.0.0/8\n";
     let outcome = parse_rules_file(input);
     let domains = outcome.parsed.entries_for(RulesFileSection::Domains);
     assert_eq!(domains.len(), 1);
@@ -468,7 +468,7 @@ fn parse_preset_unknown_version_produces_warning() {
         &outcome.warnings[0],
         ParseWarning::UnknownFormatVersion {
             found: 99,
-            supported: 4
+            supported: CURRENT_RULES_FILE_FORMAT_VERSION
         }
     ));
 }
@@ -547,7 +547,7 @@ fn parse_unknown_version_produces_warning() {
         &outcome.warnings[0],
         ParseWarning::UnknownFormatVersion {
             found: 99,
-            supported: 4
+            supported: CURRENT_RULES_FILE_FORMAT_VERSION
         }
     ));
 }

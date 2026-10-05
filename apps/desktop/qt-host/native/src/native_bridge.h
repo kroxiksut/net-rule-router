@@ -496,6 +496,11 @@ public:
     /// `{status, message-key, args}` — the verdict the rules table shows.
     Q_INVOKABLE QString rpcRuleValueVerdict(const QString &ruleType, const QString &matchValue);
 
+    /// Async wrapper over the launcher-local `local.rule-values-classify` RPC:
+    /// a pasted address list sorted line by line. The callback gets `{rows,
+    /// truncated}`, each row `{value, rule-type, status, message-key, args}`.
+    Q_INVOKABLE QString rpcRuleValuesClassify(const QString &text);
+
     /// Async wrapper over the launcher-local
     /// `local.vpn.discover` RPC. Scans the machine (running processes +
     /// installed programs) for likely VPN clients; the callback lands on

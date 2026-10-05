@@ -327,4 +327,5 @@ fn full_resolution() -> KillSwitchResolution {
 mod catch_all;
 mod fail_closed;
 mod ipv6;
+mod networks;
 mod per_app;

@@ -110,10 +110,11 @@ impl SecondaryRouteCoordinator {
     /// One reading of the links and the route table, for a pass that asks
     /// several of the questions below and must get one machine's answers.
     pub fn read_machine(&self) -> MachineReading {
-        MachineReading {
-            routes: self.api.get_ip_forward_table(),
-            adapters: self.api.get_adapter_infos(),
-        }
+        MachineReading::new(
+            self.api.get_ip_forward_table(),
+            self.api.get_adapter_infos(),
+            |route| self.reconciler.owns(route),
+        )
     }
 
     /// Resolve `sid`'s routing inputs (mode + primary/secondary targets) from
@@ -150,7 +151,7 @@ impl SecondaryRouteCoordinator {
         let mode = route_behavior_mode(policy.mode);
         let live;
         let infos = match reading {
-            Some(reading) => reading.adapters.as_deref(),
+            Some(reading) => reading.adapters_or_error(),
             None => {
                 live = self.api.get_adapter_infos();
                 live.as_deref()

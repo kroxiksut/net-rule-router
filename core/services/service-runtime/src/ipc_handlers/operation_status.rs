@@ -51,6 +51,7 @@ impl IpcHandler for OperationStatusHandler {
             error: rec.error.map(|e| OperationErrorResponse {
                 code: e.code,
                 message: e.message,
+                args: e.args,
             }),
         };
         serde_json::to_value(resp).map_err(|e| IpcError {
@@ -119,6 +120,7 @@ mod tests {
         store.fail(
             &id,
             OperationError {
+                args: Default::default(),
                 code: "mutation.rejected.policy-degraded".into(),
                 message: "service is degraded".into(),
             },

@@ -143,6 +143,7 @@ impl RollbackHandler {
                 error: Some(OperationErrorResponse {
                     code: error.code,
                     message: error.message,
+                    args: error.args,
                 }),
                 ..RollbackDryRunResponse::default()
             },
@@ -394,6 +395,7 @@ mod tests {
     fn a_target_that_cannot_be_read_is_reported_by_its_code() {
         let exec = Arc::new(FakeMutationExecutor {
             rollback_target: Err(OperationError {
+                args: Default::default(),
                 code: "revision-integrity-rejected".into(),
                 message: "x".into(),
             }),

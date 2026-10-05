@@ -5,7 +5,7 @@
 //! nothing. A missing row, a failed read or a poisoned lock all resolve to the
 //! documented defaults — boot has no one to ask.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +14,7 @@ use nrr_diagnostics::{AuditRetentionPolicy, LogRetentionPolicy};
 use rusqlite::Connection;
 
 use crate::service_stability::{IpcAcceptFailurePolicy, ServiceStabilityConfig};
+use crate::timed_window::{now_ms, TimedSwitch, TimedWindow, WindowKind, WindowSink};
 
 /// The persisted operational-log and audit retention caps. `None` on lock or
 /// read failure.
@@ -143,35 +144,102 @@ pub fn read_boot_settings(conn: Option<&Arc<Mutex<Connection>>>) -> BootSettings
 /// trace into the operational log.
 pub const CONN_TRACE_SENTINEL: &str = "conn-trace.enabled";
 
-/// Whether the connection trace is forced into the operational log for the
-/// life of the process: the `NRR_CONN_TRACE` variable, or the sentinel file in
-/// `data_root`. The file is the service-friendly knob — a service manager
-/// caches its environment, a file needs only a restart.
-#[must_use]
-pub fn conn_trace_forced(data_root: Option<&Path>) -> bool {
-    std::env::var_os("NRR_CONN_TRACE").is_some()
-        || data_root.is_some_and(|root| root.join(CONN_TRACE_SENTINEL).exists())
+/// The variable that forces the connection trace into the operational log.
+pub const CONN_TRACE_ENV: &str = "NRR_CONN_TRACE";
+
+/// What holds the connection trace in the operational log for the life of the
+/// process. The file is the service-friendly knob: a service manager caches
+/// its environment, a file needs only a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnTraceForce {
+    Environment,
+    File(PathBuf),
 }
 
-/// The live switch for writing observed connections to the operational log.
+impl ConnTraceForce {
+    /// What the user removes to give control back: the variable's name or the
+    /// file's full path on this machine.
+    #[must_use]
+    pub fn source(&self) -> String {
+        match self {
+            Self::Environment => CONN_TRACE_ENV.to_owned(),
+            Self::File(path) => path.display().to_string(),
+        }
+    }
+}
+
+/// Whether, and by what, the connection trace is forced: the variable, or the
+/// sentinel file in `data_root`.
+#[must_use]
+pub fn conn_trace_forced(data_root: Option<&Path>) -> Option<ConnTraceForce> {
+    if std::env::var_os(CONN_TRACE_ENV).is_some() {
+        return Some(ConnTraceForce::Environment);
+    }
+    data_root
+        .map(|root| root.join(CONN_TRACE_SENTINEL))
+        .filter(|file| file.exists())
+        .map(ConnTraceForce::File)
+}
+
+/// Writing observed connections to the operational log: a window that closes
+/// by itself, like verbose logging, plus the process-wide force.
 ///
-/// Seeded from the saved row at boot; a later save reaches it through
-/// [`Self::apply_hook`] without a restart. A forced trace stays on whatever
-/// the save says. The disk sink is privacy-sensitive, so every failure to read
-/// the row leaves it off.
+/// The observer reads one flag per batch; the window drives it, so a deadline
+/// passing turns the sink off without a restart and costs nothing per
+/// connection. A forced trace stays on whatever the window says. The sink is
+/// privacy-sensitive, so every failure to read the stored deadline leaves it
+/// off.
 #[derive(Clone)]
 pub struct ConnTraceLogSwitch {
     flag: Arc<AtomicBool>,
-    forced: bool,
+    forced_by: Option<ConnTraceForce>,
+    window: TimedSwitch,
 }
 
 impl ConnTraceLogSwitch {
+    /// Resume the stored window, if it is still open.
     #[must_use]
-    pub fn at_boot(conn: Option<&Arc<Mutex<Connection>>>, forced: bool) -> Self {
-        let saved = conn.is_some_and(read_conn_trace_ndjson);
-        Self {
-            flag: Arc::new(AtomicBool::new(saved || forced)),
+    pub fn at_boot(
+        conn: Option<&Arc<Mutex<Connection>>>,
+        forced_by: Option<ConnTraceForce>,
+    ) -> Self {
+        Self::resume(conn.and_then(read_conn_trace_until), now_ms(), forced_by)
+    }
+
+    /// Resume `persisted_until_ms` as of `now_ms`: the sink starts open only
+    /// while that deadline is ahead, or when forced.
+    #[must_use]
+    pub fn resume(
+        persisted_until_ms: Option<i64>,
+        now_ms: i64,
+        forced_by: Option<ConnTraceForce>,
+    ) -> Self {
+        let forced = forced_by.is_some();
+        let resumed = TimedWindow::resumed(persisted_until_ms, now_ms);
+        let flag = Arc::new(AtomicBool::new(resumed.is_open(now_ms) || forced));
+        let sink: WindowSink = {
+            let flag = Arc::clone(&flag);
+            Arc::new(move |open: bool| flag.store(open || forced, Ordering::Relaxed))
+        };
+        let window = TimedSwitch::resume(
+            WindowKind::ConnTraceLog,
+            persisted_until_ms,
+            now_ms,
+            Some(sink),
+        );
+        let (mode, until_ms) = resumed.reported(now_ms);
+        tracing::info!(
+            target: "nrr::stability",
+            msg_key = "conn-trace-log-at-boot",
+            mode = mode.as_slug(),
+            until_ms,
             forced,
+            "connection trace log window resumed at boot",
+        );
+        Self {
+            flag,
+            forced_by,
+            window,
         }
     }
 
@@ -181,23 +249,32 @@ impl ConnTraceLogSwitch {
         Arc::clone(&self.flag)
     }
 
-    /// What the settings writer calls with the saved value.
+    /// Whether the sentinel file or the environment holds the sink on.
     #[must_use]
-    pub fn apply_hook(&self) -> Arc<dyn Fn(bool) + Send + Sync> {
-        let flag = Arc::clone(&self.flag);
-        let forced = self.forced;
-        Arc::new(move |on: bool| flag.store(on || forced, Ordering::Relaxed))
+    pub fn forced(&self) -> bool {
+        self.forced_by.is_some()
+    }
+
+    /// What holds the sink on, if anything.
+    #[must_use]
+    pub fn forced_by(&self) -> Option<&ConnTraceForce> {
+        self.forced_by.as_ref()
+    }
+
+    /// The window, for the settings writer to move and report.
+    #[must_use]
+    pub fn window(&self) -> &TimedSwitch {
+        &self.window
     }
 }
 
-fn read_conn_trace_ndjson(conn: &Arc<Mutex<Connection>>) -> bool {
+fn read_conn_trace_until(conn: &Arc<Mutex<Connection>>) -> Option<i64> {
     use nrr_storage::service_stability_config::ServiceStabilityConfigRepository;
-    let Ok(guard) = conn.lock() else {
-        return false;
-    };
+    let guard = conn.lock().ok()?;
     ServiceStabilityConfigRepository::new(&guard)
         .get_or_default()
-        .is_ok_and(|r| r.conn_trace_ndjson)
+        .ok()
+        .and_then(|r| r.conn_trace_ndjson_until_ms)
 }
 
 #[cfg(test)]
@@ -244,7 +321,7 @@ mod tests {
             repo.set(
                 &IpcAcceptPolicyWrite::Critical,
                 r.verbose_until_ms,
-                r.conn_trace_ndjson,
+                r.conn_trace_ndjson_until_ms,
                 r.conn_trace_gui,
                 r.rule_scope_service_driven,
                 r.routing_stop_policy,
@@ -275,14 +352,14 @@ mod tests {
         assert_ne!(settings, BootSettings::default());
     }
 
-    fn save_conn_trace_ndjson(conn: &Arc<Mutex<Connection>>, on: bool) {
+    fn save_conn_trace_until(conn: &Arc<Mutex<Connection>>, until_ms: Option<i64>) {
         let guard = conn.lock().expect("lock");
         let repo = ServiceStabilityConfigRepository::new(&guard);
         let r = repo.get_or_default().expect("read stability");
         repo.set(
             &IpcAcceptPolicyWrite::Critical,
             r.verbose_until_ms,
-            on,
+            until_ms,
             r.conn_trace_gui,
             r.rule_scope_service_driven,
             r.routing_stop_policy,
@@ -301,42 +378,104 @@ mod tests {
         .expect("save stability");
     }
 
-    /// The disk sink starts where the operator left it and follows a later
-    /// save without a restart.
-    #[test]
-    fn the_conn_trace_switch_starts_saved_and_follows_saves() {
-        let (_dir, conn) = state_db();
-        let off = ConnTraceLogSwitch::at_boot(Some(&conn), false);
-        assert!(
-            !off.flag().load(Ordering::Relaxed),
-            "opt-in: off by default"
-        );
-
-        save_conn_trace_ndjson(&conn, true);
-        let switch = ConnTraceLogSwitch::at_boot(Some(&conn), false);
-        let flag = switch.flag();
-        assert!(flag.load(Ordering::Relaxed));
-        (switch.apply_hook())(false);
-        assert!(!flag.load(Ordering::Relaxed), "a save reaches the observer");
-        (switch.apply_hook())(true);
-        assert!(flag.load(Ordering::Relaxed));
+    /// Polls instead of sleeping a fixed time: a loaded machine delays the
+    /// timer thread, never the verdict.
+    fn wait_until(done: impl Fn() -> bool) -> bool {
+        let started = std::time::Instant::now();
+        while !done() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
     }
 
     #[test]
-    fn a_forced_conn_trace_survives_a_save_that_turns_it_off() {
-        let switch = ConnTraceLogSwitch::at_boot(None, true);
-        (switch.apply_hook())(false);
-        assert!(switch.flag().load(Ordering::Relaxed));
+    fn the_conn_trace_log_is_off_by_default() {
+        let (_dir, conn) = state_db();
+        let switch = ConnTraceLogSwitch::at_boot(Some(&conn), None);
+        assert!(!switch.flag().load(Ordering::Relaxed), "opt-in");
+        assert_eq!(switch.window().window(), TimedWindow::Off);
+        let unreadable = ConnTraceLogSwitch::at_boot(None, None);
+        assert!(!unreadable.flag().load(Ordering::Relaxed));
+    }
+
+    /// A restart inside a timed window resumes it; one after it does not.
+    #[test]
+    fn a_restart_resumes_a_future_deadline_and_not_a_past_one() {
+        let (_dir, conn) = state_db();
+        let ahead = now_ms() + 3_600_000;
+        save_conn_trace_until(&conn, Some(ahead));
+        let resumed = ConnTraceLogSwitch::at_boot(Some(&conn), None);
+        assert!(resumed.flag().load(Ordering::Relaxed));
+        assert_eq!(
+            resumed.window().window(),
+            TimedWindow::Until { deadline_ms: ahead }
+        );
+
+        save_conn_trace_until(&conn, Some(1_000));
+        let expired = ConnTraceLogSwitch::at_boot(Some(&conn), None);
+        assert!(!expired.flag().load(Ordering::Relaxed));
+        assert_eq!(expired.window().window(), TimedWindow::Off);
+    }
+
+    #[test]
+    fn the_conn_trace_window_closes_the_sink_without_a_restart() {
+        let switch = ConnTraceLogSwitch::resume(None, now_ms(), None);
+        let flag = switch.flag();
+        switch.window().set(
+            TimedWindow::Until {
+                deadline_ms: now_ms() + 150,
+            },
+            now_ms(),
+        );
+        assert!(flag.load(Ordering::Relaxed), "the window opens the sink");
+        assert!(
+            wait_until(|| !flag.load(Ordering::Relaxed)),
+            "the deadline must close the sink"
+        );
+        assert_eq!(switch.window().window(), TimedWindow::Off);
+
+        // A resumed window ends the same way.
+        let resumed = ConnTraceLogSwitch::resume(Some(now_ms() + 150), now_ms(), None);
+        let flag = resumed.flag();
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(wait_until(|| !flag.load(Ordering::Relaxed)));
+    }
+
+    #[test]
+    fn a_forced_conn_trace_survives_a_closed_or_expired_window() {
+        let switch =
+            ConnTraceLogSwitch::resume(Some(1), now_ms(), Some(ConnTraceForce::Environment));
+        assert!(switch.forced());
+        assert!(switch.flag().load(Ordering::Relaxed), "an expired window");
+        switch.window().set(TimedWindow::UntilRestart, now_ms());
+        switch.window().set(TimedWindow::Off, now_ms());
+        assert!(switch.flag().load(Ordering::Relaxed), "a closed window");
+
+        switch.window().set(
+            TimedWindow::Until {
+                deadline_ms: now_ms() + 50,
+            },
+            now_ms(),
+        );
+        assert!(wait_until(|| switch.window().window() == TimedWindow::Off));
+        assert!(
+            switch.flag().load(Ordering::Relaxed),
+            "a window that ran out"
+        );
     }
 
     #[test]
     fn the_sentinel_file_forces_the_conn_trace() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         if std::env::var_os("NRR_CONN_TRACE").is_none() {
-            assert!(!conn_trace_forced(Some(dir.path())));
-            assert!(!conn_trace_forced(None));
+            assert!(conn_trace_forced(Some(dir.path())).is_none());
+            assert!(conn_trace_forced(None).is_none());
         }
         std::fs::write(dir.path().join(CONN_TRACE_SENTINEL), b"").expect("sentinel");
-        assert!(conn_trace_forced(Some(dir.path())));
+        assert_eq!(
+            conn_trace_forced(Some(dir.path())).map(|force| force.source()),
+            Some(dir.path().join(CONN_TRACE_SENTINEL).display().to_string()),
+            "the user is told the file's full path"
+        );
     }
 }

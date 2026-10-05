@@ -25,7 +25,11 @@ impl ProductionMutationExecutor {
             Err(e) => return MutationOutcome::Failed(e),
         };
         Self::canonicalize_rules_payload(&mut parsed, self.host_platform);
+        self.carry_unrecognized(&mut parsed, principal);
         if let Err(e) = self.enforce_free_rule_cap(&parsed.rules_json, principal) {
+            return MutationOutcome::Failed(e);
+        }
+        if let Some(e) = self.network_refusal(&parsed.rules_json, principal) {
             return MutationOutcome::Failed(e);
         }
         let correlation = parsed

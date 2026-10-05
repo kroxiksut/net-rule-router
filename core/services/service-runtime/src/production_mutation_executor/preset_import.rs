@@ -62,6 +62,9 @@ impl ProductionMutationExecutor {
         if let Err(e) = self.enforce_free_rule_cap(&assembled.rules_json, principal) {
             return MutationOutcome::Failed(e);
         }
+        if let Some(e) = self.network_refusal(&assembled.rules_json, principal) {
+            return MutationOutcome::Failed(e);
+        }
         let correlation = assembled
             .correlation_id
             .clone()
@@ -128,10 +131,12 @@ impl ProductionMutationExecutor {
     ) -> Result<AssembledPresetImport, OperationError> {
         let parsed: PresetImportPayload =
             serde_json::from_value(payload.clone()).map_err(|e| OperationError {
+                args: Default::default(),
                 code: "malformed-payload".into(),
                 message: format!("PresetImport payload invalid: {e}"),
             })?;
         let target = parsed.target().map_err(|e| OperationError {
+            args: Default::default(),
             code: "malformed-payload".into(),
             message: match e {
                 PresetImportPayloadError::NoBytesSupplied => {
@@ -195,12 +200,19 @@ impl ProductionMutationExecutor {
             }
         };
 
-        let content = RulesRevisionContent::new(book);
+        let mut content = RulesRevisionContent::new(book);
+        // The file replaces what the user can see; what this build cannot show
+        // them stays, as on every other rewrite.
+        if let Some(carried) = self.unrecognized_in_force(principal) {
+            carry_forward(&mut content, &carried);
+        }
         let dto = rules_json_codec::encode(&content);
         let rules_json = rules_json::to_canonical_string(&dto).map_err(|e| OperationError {
+            args: Default::default(),
             code: "internal".into(),
             message: format!("PresetImport canonical serialise failed: {e}"),
         })?;
+        report_unrecognized_rules(&rules_json, content.unrecognized.len(), principal);
         let mut hasher = Sha256::new();
         hasher.update(rules_json.as_bytes());
         let content_hash = format!("{:x}", hasher.finalize());

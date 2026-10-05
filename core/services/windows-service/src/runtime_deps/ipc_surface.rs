@@ -52,9 +52,10 @@ pub(super) struct IpcSurfaceInputs<'a> {
 
 /// What the assembly hands back.
 pub(super) struct IpcSurface {
-    /// The on-disk connection-trace NDJSON switch, shared by the settings
-    /// writer (flips it on save) and the observer (reads it per batch). The
-    /// ring below is always built; only the disk sink is opt-in.
+    /// The on-disk connection-trace NDJSON switch, driven by its window
+    /// (opened by the settings writer, closed by its deadline) and read by the
+    /// observer per batch. The ring below is always built; only the disk sink
+    /// is opt-in.
     pub conn_trace_ndjson: Arc<std::sync::atomic::AtomicBool>,
     pub conn_trace_ring:
         Option<Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>>,
@@ -109,9 +110,9 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
     // Connection-trace ring: written by the observer (built later in
     // `build_conn_trace_pair`), read by `conn-trace.entries.list`. Always
     // created — a bounded in-memory buffer, never persisted. The on-disk NDJSON
-    // sink is the privacy-sensitive output and stays opt-in; its switch is
-    // shared with the settings writer so a save applies without a restart.
-    // The dev sentinel forces it on for the life of the process.
+    // sink is the privacy-sensitive output: a window that closes by itself,
+    // shared with the settings writer so a request applies without a restart.
+    // The sentinel file forces it on for the life of the process.
     let conn_trace_log = nrr_service_runtime::boot_settings::ConnTraceLogSwitch::at_boot(
         settings_conn.as_ref(),
         nrr_service_runtime::boot_settings::conn_trace_forced(
@@ -380,7 +381,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 .with_instant_rst_flag(
                     nrr_service_runtime::fake_ip::global_instant_rst_enabled(),
                 )
-                .with_conn_trace_ndjson_apply(conn_trace_log.apply_hook());
+                .with_conn_trace_log(&conn_trace_log);
             // The live tracing filter: a verbose-logging request applies at
             // once and a window ends on time. `None` on a boot without a log
             // writer.
@@ -419,6 +420,20 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                         exec = exec.with_recovery_audit_sink(Arc::clone(sink));
                     }
                     exec = exec.with_alerts_repo(Arc::clone(&alerts_repo));
+                    // A network over the tunnel server, an attached network or
+                    // the fake-IP pool is refused where the submission lands.
+                    let facts_coordinator = route_coordinator.clone();
+                    exec = exec.with_network_screen(Arc::new(
+                        nrr_service_runtime::network_rule_screen::ProductionNetworkScreen::new(
+                            Arc::new(move |principal| {
+                                facts_coordinator
+                                    .as_ref()
+                                    .map(|c| c.network_route_facts(principal))
+                                    .unwrap_or_default()
+                            }),
+                            Some(*fake_ip_assembly.pool()),
+                        ),
+                    ));
                     if let Some(writer) = artifacts.audit_writer.as_ref() {
                         exec = exec.with_audit_writer(Arc::clone(writer));
                     }

@@ -92,6 +92,12 @@ QString NrrNativeBridge::rpcRuleValueVerdict(const QString &ruleType, const QStr
     return emitRpcRequest(QStringLiteral("local.rule-value-verdict"), obj);
 }
 
+QString NrrNativeBridge::rpcRuleValuesClassify(const QString &text) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("text"), text);
+    return emitRpcRequest(QStringLiteral("local.rule-values-classify"), obj);
+}
+
 QString NrrNativeBridge::rpcVpnDiscover() {
     return emitRpcRequest(QStringLiteral("local.vpn.discover"),
                           QJsonObject());

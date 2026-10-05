@@ -7,7 +7,7 @@
 //!   working rules files.
 //! - Metadata header comments (`name`, `description`, `author`,
 //!   `preset_version`) are optional and captured in `PresetMetadata`.
-//! - unsupported sections (`CIDR`, `Ports`, …) are parsed and preserved but
+//! - unsupported sections (`Geo`, `Ports`, …) are parsed and preserved but
 //!   **not** applied. They are reported via `ParseWarning::UnknownSection`.
 //! - Round-trip guarantee: parse and write-back lose nothing. Unsupported
 //!   entries survive unmodified in `unknown_sections`.
@@ -114,9 +114,9 @@ fn preset_file_without_any_metadata_keys_but_with_preset_header() {
 
 #[test]
 fn unsupported_sections_produce_unknown_section_warnings() {
-    // CIDR and Ports are unsupported sections. The Free parser must flag them
+    // Geo and Ports are unsupported sections. The Free parser must flag them
     // via `ParseWarning::UnknownSection` — they are not errors.
-    let input = "--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n--- Ports\n443\n";
+    let input = "--- Domains\nexample.com\n--- Geo\n10.0.0.0/8\n--- Ports\n443\n";
     let outcome = parse_rules_file(input);
 
     let unknown_names: Vec<&str> = outcome
@@ -125,8 +125,8 @@ fn unsupported_sections_produce_unknown_section_warnings() {
         .map(|s| s.name.as_str())
         .collect();
     assert!(
-        unknown_names.contains(&"CIDR"),
-        "CIDR must be in unknown_sections"
+        unknown_names.contains(&"Geo"),
+        "Geo must be in unknown_sections"
     );
     assert!(
         unknown_names.contains(&"Ports"),
@@ -144,7 +144,7 @@ fn unsupported_sections_produce_unknown_section_warnings() {
             }
         })
         .collect();
-    assert!(warning_names.contains(&"CIDR"));
+    assert!(warning_names.contains(&"Geo"));
     assert!(warning_names.contains(&"Ports"));
 }
 
@@ -152,7 +152,7 @@ fn unsupported_sections_produce_unknown_section_warnings() {
 fn unsupported_sections_not_in_parsed_active_sections() {
     // unsupported sections must NOT appear in `parsed.sections` — they are never
     // applied to routing policy in the Free edition.
-    let input = "--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n";
+    let input = "--- Domains\nexample.com\n--- Geo\n10.0.0.0/8\n";
     let outcome = parse_rules_file(input);
 
     let known_names: Vec<&str> = outcome
@@ -162,24 +162,24 @@ fn unsupported_sections_not_in_parsed_active_sections() {
         .map(|s| s.section.name())
         .collect();
     assert!(
-        !known_names.contains(&"CIDR"),
-        "CIDR must not appear in parsed.sections"
+        !known_names.contains(&"Geo"),
+        "Geo must not appear in parsed.sections"
     );
 }
 
 #[test]
 fn unsupported_section_entries_preserved_with_correct_count() {
-    let input = "--- CIDR\n10.0.0.0/8\n192.168.0.0/16\n--- Ports\n443\n";
+    let input = "--- Geo\n10.0.0.0/8\n192.168.0.0/16\n--- Ports\n443\n";
     let outcome = parse_rules_file(input);
 
-    let cidr = outcome
+    let geo = outcome
         .unknown_sections
         .iter()
-        .find(|s| s.name == "CIDR")
+        .find(|s| s.name == "Geo")
         .unwrap();
-    assert_eq!(cidr.entries.len(), 2);
-    assert_eq!(cidr.entries[0].match_value, "10.0.0.0/8");
-    assert_eq!(cidr.entries[1].match_value, "192.168.0.0/16");
+    assert_eq!(geo.entries.len(), 2);
+    assert_eq!(geo.entries[0].match_value, "10.0.0.0/8");
+    assert_eq!(geo.entries[1].match_value, "192.168.0.0/16");
 
     let ports = outcome
         .unknown_sections
@@ -194,7 +194,7 @@ fn unsupported_section_entries_preserved_with_correct_count() {
         outcome
             .warnings
             .iter()
-            .find(|w| matches!(w, ParseWarning::UnknownSection { name, .. } if name == "CIDR")),
+            .find(|w| matches!(w, ParseWarning::UnknownSection { name, .. } if name == "Geo")),
         Some(ParseWarning::UnknownSection { entry_count: 2, .. })
     ));
 }
@@ -210,7 +210,7 @@ fn round_trip_free_to_pro_no_data_loss() {
     let input = "\
 --- Zones\ncorp-internal\n\
 --- Domains\nexample.com\n\
---- CIDR\n10.0.0.0/8\n\
+--- Geo\n10.0.0.0/8\n\
 --- Ports\n443\n";
 
     let outcome = parse_rules_file(input);
@@ -224,47 +224,47 @@ fn round_trip_free_to_pro_no_data_loss() {
 
     // unsupported sections preserved.
     assert_eq!(outcome.unknown_sections.len(), 2);
-    let cidr = outcome
+    let geo = outcome
         .unknown_sections
         .iter()
-        .find(|s| s.name == "CIDR")
+        .find(|s| s.name == "Geo")
         .unwrap();
     let ports = outcome
         .unknown_sections
         .iter()
         .find(|s| s.name == "Ports")
         .unwrap();
-    assert_eq!(cidr.entries[0].match_value, "10.0.0.0/8");
+    assert_eq!(geo.entries[0].match_value, "10.0.0.0/8");
     assert_eq!(ports.entries[0].match_value, "443");
 }
 
 #[test]
 fn extended_sections_inline_comments_preserved_in_round_trip() {
-    let input = "--- CIDR\n10.0.0.0/8  # internal range\n";
+    let input = "--- Geo\n10.0.0.0/8  # internal range\n";
     let outcome = parse_rules_file(input);
-    let cidr = outcome
+    let geo = outcome
         .unknown_sections
         .iter()
-        .find(|s| s.name == "CIDR")
+        .find(|s| s.name == "Geo")
         .unwrap();
     assert_eq!(
-        cidr.entries[0].inline_comment.as_deref(),
+        geo.entries[0].inline_comment.as_deref(),
         Some("internal range")
     );
 }
 
 #[test]
 fn extended_sections_disabled_entries_preserved_in_round_trip() {
-    let input = "--- CIDR\n# 10.0.0.0/8\n";
+    let input = "--- Geo\n# 10.0.0.0/8\n";
     let outcome = parse_rules_file(input);
-    let cidr = outcome
+    let geo = outcome
         .unknown_sections
         .iter()
-        .find(|s| s.name == "CIDR")
+        .find(|s| s.name == "Geo")
         .unwrap();
-    assert_eq!(cidr.entries.len(), 1);
-    assert!(!cidr.entries[0].enabled);
-    assert_eq!(cidr.entries[0].match_value, "10.0.0.0/8");
+    assert_eq!(geo.entries.len(), 1);
+    assert!(!geo.entries[0].enabled);
+    assert_eq!(geo.entries[0].match_value, "10.0.0.0/8");
 }
 
 // ── a file with only supported sections ───────────────────────────────────────
@@ -322,7 +322,7 @@ fn fixture_preset_with_extended_sections_parses_correctly() {
 
     // unsupported sections preserved but not applied.
     assert!(!outcome.unknown_sections.is_empty());
-    assert!(outcome.unknown_sections.iter().any(|s| s.name == "CIDR"));
+    assert!(outcome.unknown_sections.iter().any(|s| s.name == "Geo"));
     assert!(outcome.unknown_sections.iter().any(|s| s.name == "Ports"));
 
     // Warnings for unsupported sections (no format-version warning — version is current).
@@ -347,7 +347,7 @@ fn fixture_preset_extended_sections_not_routed_on_windows() {
     // Only Free sections contribute to routing.
     let rule_set = rules_file_to_route_rule_set(&outcome.parsed, HostPlatform::Windows, false);
 
-    // CIDR/Ports entries must not appear in the rule set.
+    // Geo/Ports entries must not appear in the rule set.
     for rule in &rule_set.rules {
         let v = rule
             .address_match

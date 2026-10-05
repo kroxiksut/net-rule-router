@@ -899,3 +899,52 @@ fn a_name_sample_shows_a_few_names_and_counts_the_rest() {
     let many: BTreeSet<&str> = ["a", "b", "c", "d", "e", "f", "g"].into_iter().collect();
     assert_eq!(name_sample(&many), "a, b, c, d, e (+2 more)");
 }
+
+fn network_rule(id: &str, m: CanonicalAddressMatch) -> CanonicalRule {
+    CanonicalRule {
+        address_match: Some(m),
+        ..suffix_rule(id, "unused.example")
+    }
+}
+
+/// A host inside a network a rule names is what that rule asked for: it
+/// never reaches the co-tenant map the shared-address census is fed from.
+#[test]
+fn secondary_ip_owners_leaves_networks_out() {
+    let fqdn = MockFqdnCacheLookup::new();
+    let secondary = CanonicalRuleSet::from_rules(vec![network_rule(
+        "n1",
+        CanonicalAddressMatch::Subnet(
+            nrr_shared::ip_block::IpBlock::parse("198.51.100.0/24").expect("network"),
+        ),
+    )]);
+    assert!(build_secondary_ip_owners(&secondary, &fqdn).is_empty());
+}
+
+#[test]
+fn a_cached_address_inside_a_network_reports_the_subnet_kind() {
+    let range = nrr_shared::ip_block::IpRange::parse("203.0.113.10-203.0.113.20").expect("range");
+    let set = CanonicalRuleSet::from_rules(vec![
+        network_rule(
+            "n1",
+            CanonicalAddressMatch::Subnet(
+                nrr_shared::ip_block::IpBlock::parse("198.51.100.0/24").expect("network"),
+            ),
+        ),
+        network_rule("n2", CanonicalAddressMatch::ip_range(range)),
+    ]);
+    let kind = |ip: [u8; 4]| rule_set_match_kind("host.test", Some(Ipv4Addr::from(ip)), &set);
+    assert_eq!(kind([198, 51, 100, 7]), Some("subnet"));
+    assert_eq!(kind([203, 0, 113, 15]), Some("subnet"));
+    assert_eq!(kind([203, 0, 113, 21]), None);
+    assert_eq!(rule_set_match_kind("host.test", None, &set), None);
+
+    // A name rule still ranks above the network it resolves into.
+    let mut rules = set.rules().to_vec();
+    rules.push(exact_fqdn_rule("h1", "host.test"));
+    let set = CanonicalRuleSet::from_rules(rules);
+    assert_eq!(
+        rule_set_match_kind("host.test", Some(Ipv4Addr::new(198, 51, 100, 7)), &set),
+        Some("exact-fqdn")
+    );
+}

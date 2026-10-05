@@ -1,14 +1,16 @@
-// Confirm dialog for an additional (secondary) adapter that cannot carry
-// traffic out -- typically a host-only virtual NIC (VirtualBox, VMware,
-// Hyper-V internal) with no gateway and no default route.
+// Confirm dialog for an adapter that cannot carry traffic out -- typically a
+// host-only virtual NIC (VirtualBox, VMware, Hyper-V internal) with no gateway
+// and no default route.
 //
 // Picking such an adapter is allowed: the dialog states plainly what breaks and
 // then honours whatever the user answers. It never blocks the choice and never
 // weakens leak protection on the user's behalf.
 //
-// Two directions, selected by `contextSlug`:
+// Three directions, selected by `contextSlug`:
 //   "assign"      -- the user is about to bind this adapter as the additional
 //                    route.
+//   "assign-primary" -- ... as the main connection, which the service will not
+//                    route through.
 //   "kill-switch" -- the user is about to arm leak protection while such an
 //                    adapter is already bound.
 //
@@ -29,7 +31,7 @@ Dialog {
     /// Reason slug from `Pure.unroutableInterfaceReasonSlug`:
     /// "virtual-host-only" | "no-forwarding-path".
     property string reasonSlug: ""
-    /// "assign" | "kill-switch".
+    /// "assign" | "assign-primary" | "kill-switch".
     property string contextSlug: "assign"
     /// Whether leak protection is armed right now (only read in the "assign"
     /// direction, where it decides between "not routed" and "blocked").
@@ -54,11 +56,16 @@ Dialog {
         : tr("dialog.unroutable-secondary.reason-no-forwarding-path",
             "It has no gateway and no route out, so there is nowhere for it to send traffic.")
 
+    readonly property bool _primary: contextSlug === "assign-primary"
+
     readonly property string _situationText: contextSlug === "kill-switch"
         ? tr("dialog.unroutable-secondary.body-kill-switch",
             "It is currently assigned as your additional route.")
-        : tr("dialog.unroutable-secondary.body-assign",
-            "You are about to assign it as your additional route.")
+        : (_primary
+            ? tr("dialog.unroutable-secondary.body-assign-primary",
+                "You are about to make it your main connection.")
+            : tr("dialog.unroutable-secondary.body-assign",
+                "You are about to assign it as your additional route."))
 
     readonly property string _killSwitchText: contextSlug === "kill-switch"
         ? tr("dialog.unroutable-secondary.effect-kill-switch-arming",
@@ -115,8 +122,11 @@ Dialog {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
-            text: root.tr("dialog.unroutable-secondary.effect-routing",
-                "Rules that point at the additional route will not be routed through it.")
+            text: root._primary
+                ? root.tr("dialog.unroutable-secondary.effect-routing-primary",
+                    "The service will not route through it: traffic your rules do not route keeps going the way the system sends it. Choose the connection that reaches the internet as main.")
+                : root.tr("dialog.unroutable-secondary.effect-routing",
+                    "Rules that point at the additional route will not be routed through it.")
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }
@@ -126,6 +136,7 @@ Dialog {
             color: root.ownerRoot
                 ? root.ownerRoot.uiTheme.colorWarning
                 : palette.text
+            visible: !root._primary
             text: root._killSwitchText
             Accessible.role: Accessible.StaticText
             Accessible.name: text

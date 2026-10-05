@@ -289,7 +289,8 @@ impl SecondaryRouteCoordinator {
     /// Resolve one route binding (primary or secondary) to a
     /// [`SecondaryRouteTarget`] against live `infos`. `None` when the bound
     /// adapter is missing, unusable, or has no gateway and no derivable
-    /// next-hop. `role` ("primary"/"secondary") only labels the diagnostics.
+    /// next-hop. `role` is "primary" or "secondary"; a primary must also have a
+    /// way out of its own ([`has_own_way_out`]).
     /// Next hops are derived from `reading`'s route table, or the live one.
     pub(super) fn resolve_binding_target(
         &self,
@@ -498,6 +499,28 @@ impl SecondaryRouteCoordinator {
         // not-usable WARN latch so the next usable→not-usable transition logs
         // again instead of staying silently deduped forever.
         self.clear_not_usable(sid, role);
+        // A main link with no way out would take every unrouted connection
+        // into a dead end; the caller then falls back to the OS default route.
+        // Not asked of the additional link: a tunnel has no routes until its
+        // client installs them.
+        if role == "primary"
+            && self.routes_of(reading).is_some_and(|t| {
+                !has_own_way_out(info, &t, |r| r.is_ours || self.reconciler.owns(r))
+            })
+        {
+            if self.note_no_next_hop_once(sid, role) {
+                tracing::warn!(
+                    target: "nrr::route-coordinator",
+                    msg_key = "route-primary-no-way-out",
+                    sid = %sid,
+                    ifindex = info.index,
+                    adapter = %info.description,
+                    "the main connection has no gateway and no route out — not routing through it",
+                );
+            }
+            self.publish_enforcement_status(sid, "primary-no-way-out", role, Vec::new());
+            return None;
+        }
         self.publish_enforcement_status(sid, "ok", role, Vec::new());
         self.remember_mac_anchor(sid, role, binding, info);
         let gateway = match info.gateways.first().copied() {

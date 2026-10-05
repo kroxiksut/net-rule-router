@@ -1329,9 +1329,18 @@ ApplicationWindow {
         return tr("diag.conn-trace.egress." + String(slug || ""), String(slug || ""))
     }
 
-    function ipcErrorLabel(code) {
+    // `args` (optional) are the refusal's own values: a refusal that names
+    // what it refused reads as a sentence about it, else as the code's text.
+    function ipcErrorLabel(code, args) {
         var slug = String(code || "").toLowerCase().replace(/_/g, "-")
         if (slug === "") return tr("errors.unknown", "Unknown error")
+        var detail = Pure.refusalDetail(slug, args)
+        if (detail) {
+            var sentence = tr(detail.key, "")
+            if (sentence && sentence !== detail.key) {
+                return Pure.fillPlaceholders(sentence, detail.values)
+            }
+        }
         var key = "errors." + slug
         var fallback = tr("errors.unknown", "Unknown error")
         var localised = tr(key, "")
@@ -1350,7 +1359,7 @@ ApplicationWindow {
             return tr("risk.signal.invalid-rule-value",
                 "A rule contains an invalid value: {rules}").replace("{rules}", refusal.values)
         }
-        return ipcErrorLabel(refusal.code)
+        return ipcErrorLabel(refusal.code, refusal.args)
     }
 
     // Guarded section navigation. Every site that
@@ -2032,6 +2041,13 @@ ApplicationWindow {
     // "timed" (ends at `serviceVerboseLoggingUntilMs`) or "until-restart".
     property string serviceVerboseLoggingMode: "off"
     property real serviceVerboseLoggingUntilMs: 0
+    // The connection trace written to the service log, the same kind of
+    // window; `serviceConnTraceLogForced` when a file or variable on the
+    // service side holds it on regardless, and `...ForcedBy` names it.
+    property string serviceConnTraceLogMode: "off"
+    property real serviceConnTraceLogUntilMs: 0
+    property bool serviceConnTraceLogForced: false
+    property string serviceConnTraceLogForcedBy: ""
 
     // Preferences that live in the footer Apply/Cancel BUFFER: the user edits
     // them in Settings, and nothing happens until Apply. Only a patch touching
@@ -3635,6 +3651,11 @@ ApplicationWindow {
                 "Main connection is not set")
             body = tr("notifications.enforcement.no-primary.body",
                 "Without a main connection there is nowhere to send traffic your rules do not route, so the rules are not being applied.")
+        } else if (status === "primary-no-way-out") {
+            title = tr("notifications.enforcement.primary-no-way-out.title",
+                "The main connection has no way to the internet")
+            body = tr("notifications.enforcement.primary-no-way-out.body",
+                "The connection chosen as main has no gateway, so traffic your rules do not route is going out the way the system sends it instead. Choose the connection that actually reaches the internet as main.")
         } else if (status === "no-policy") {
             title = tr("notifications.enforcement.no-policy.title",
                 "Connections are not chosen yet")
@@ -3971,6 +3992,9 @@ ApplicationWindow {
             return uiIconSource("rule-type-zones")
         case "exact-ip":
         case "exact-ipv4":
+        case "exact-ipv6":
+        case "subnet":
+        case "ip-range":
             return uiIconSource("rule-type-ip")
         case "application":
             return uiIconSource("rule-type-windows")
@@ -4783,7 +4807,18 @@ ApplicationWindow {
             ? Number(p["verbose-logging-until-ms"] || 0) : 0
     }
 
-    // Verbose service logging: `change` is one of `Pure.VERBOSE_LOGGING_CHANGES`.
+    /// Adopt the connection-trace log window out of a service-stability payload.
+    function adoptConnTraceLog(payload) {
+        var p = payload || {}
+        var mode = Pure.stabilityEffective(p, "conn-trace-ndjson-mode")
+        window.serviceConnTraceLogMode = mode
+        window.serviceConnTraceLogUntilMs = (mode === "timed")
+            ? Number(p["conn-trace-ndjson-until-ms"] || 0) : 0
+        window.serviceConnTraceLogForced = Pure.stabilityEffective(p, "conn-trace-ndjson-forced")
+        window.serviceConnTraceLogForcedBy = String(Pure.stabilityEffective(p, "conn-trace-ndjson-forced-by") || "")
+    }
+
+    // Verbose service logging: `change` is one of `Pure.LOG_WINDOW_CHANGES`.
     // Applied live and admin-gated like every stability write; the service owns
     // the window and ends it itself, so what is shown is what it reports back.
     // A stopped service gets the request parked and delivered on connect.
@@ -4828,6 +4863,80 @@ ApplicationWindow {
         return window.tr("settings.diagnostics.service-stability.verbose.option-off", "Normal")
     }
 
+    // Writing the connection trace to the service log: the same kind of window
+    // as verbose logging, applied the same way.
+    function applyConnTraceLog(change, origin) {
+        if (!window._routingBackendConnected()) {
+            window._recordOfflineRoutingIntent("stability", "conn-trace-ndjson-change", change)
+            return
+        }
+        window.applyServiceStabilityPatch({ "conn-trace-ndjson-change": change },
+            function(ok, code, payload) {
+                if (!ok) {
+                    window.statusLine = window.tr("status.conn-trace-log-failed",
+                        "Could not update writing the connection trace to the log: ")
+                        + ((typeof window.ipcErrorLabel === "function")
+                            ? window.ipcErrorLabel(String(code || "unknown"))
+                            : String(code || "unknown"))
+                    return
+                }
+                window.adoptConnTraceLog(payload)
+                window.statusLine = (change !== "off")
+                    ? window.tr("status.conn-trace-log-enabled",
+                        "Connection trace is written to the log — applies immediately")
+                    : window.tr("status.conn-trace-log-disabled",
+                        "Connection trace is no longer written to the log — applies immediately")
+            }, String(origin || "user:conn-trace-log"))
+    }
+
+    function connTraceLogChangeLabel(change) {
+        switch (String(change)) {
+            case "one-hour":
+                return window.tr("settings.diagnostics.conn-trace.ndjson.option-one-hour",
+                    "Write for 1 hour")
+            case "four-hours":
+                return window.tr("settings.diagnostics.conn-trace.ndjson.option-four-hours",
+                    "Write for 4 hours")
+            case "until-restart":
+                return window.tr("settings.diagnostics.conn-trace.ndjson.option-until-restart",
+                    "Write until the service restarts")
+        }
+        return window.tr("settings.diagnostics.conn-trace.ndjson.option-off", "Off")
+    }
+
+    function _connTraceLogParkedChange() {
+        var parked = window._readPendingOffline()["stability"] || {}
+        return parked.hasOwnProperty("conn-trace-ndjson-change")
+            ? String(parked["conn-trace-ndjson-change"]) : ""
+    }
+
+    /// What the closed box reads: a forced trace first, then a request parked
+    /// while the service was offline, else the running window as of `nowMs`.
+    function connTraceLogStateText(nowMs) {
+        if (window.serviceConnTraceLogForced)
+            return window.tr("settings.diagnostics.conn-trace.ndjson.state-forced",
+                "Always on (forced)")
+        var parkedChange = window._connTraceLogParkedChange()
+        if (parkedChange !== "") return window.connTraceLogChangeLabel(parkedChange)
+        var mode = window.serviceConnTraceLogMode
+        if (mode === "until-restart") return window.connTraceLogChangeLabel("until-restart")
+        if (mode !== "timed") return window.connTraceLogChangeLabel("off")
+        return window.tr("settings.diagnostics.conn-trace.ndjson.state-timed",
+            "Writing: {time} left, until {clock}")
+            .replace("{time}", window.logWindowTimeLeftText(window.serviceConnTraceLogUntilMs, nowMs))
+            .replace("{clock}", Qt.formatTime(new Date(window.serviceConnTraceLogUntilMs), "HH:mm"))
+    }
+
+    /// Time left in a log window, shared by every window's state line.
+    function logWindowTimeLeftText(untilMs, nowMs) {
+        var left = Pure.remainingHoursMinutes(untilMs, nowMs)
+        return (left.hours > 0)
+            ? window.tr("label.time-left.hours-minutes", "{hours} h {minutes} min")
+                .replace("{hours}", left.hours).replace("{minutes}", left.minutes)
+            : window.tr("label.time-left.minutes", "{minutes} min")
+                .replace("{minutes}", left.minutes)
+    }
+
     /// A request parked while the service was offline, else "".
     function _verboseLoggingParkedChange() {
         var parked = window._readPendingOffline()["stability"] || {}
@@ -4853,16 +4962,9 @@ ApplicationWindow {
         var mode = window.serviceVerboseLoggingMode
         if (mode === "until-restart") return window.verboseLoggingChangeLabel("until-restart")
         if (mode !== "timed") return window.verboseLoggingChangeLabel("off")
-        var left = Pure.remainingHoursMinutes(window.serviceVerboseLoggingUntilMs, nowMs)
-        var time = (left.hours > 0)
-            ? window.tr("settings.diagnostics.service-stability.verbose.left-hours-minutes",
-                "{hours} h {minutes} min")
-                .replace("{hours}", left.hours).replace("{minutes}", left.minutes)
-            : window.tr("settings.diagnostics.service-stability.verbose.left-minutes",
-                "{minutes} min").replace("{minutes}", left.minutes)
         return window.tr("settings.diagnostics.service-stability.verbose.state-timed",
             "Verbose: {time} left, until {clock}")
-            .replace("{time}", time)
+            .replace("{time}", window.logWindowTimeLeftText(window.serviceVerboseLoggingUntilMs, nowMs))
             .replace("{clock}", Qt.formatTime(new Date(window.serviceVerboseLoggingUntilMs), "HH:mm"))
     }
 
@@ -5175,6 +5277,56 @@ ApplicationWindow {
         // the review flow.
         // Recompute against the baseline so an edit that nets back
         // to the saved content does NOT leave a false "unsaved" state.
+        _recomputeRulesDirty()
+    }
+
+    /// Add the accepted lines of a pasted address list, each with the type
+    /// Rust sorted it into; route, comment and the enable toggle come from the
+    /// dialog. A line already in the list is skipped, not reported as an error.
+    function saveRuleList(entries) {
+        var added = 0
+        var already = 0
+        var capped = false
+        var keys = {}
+        for (var k = 0; k < rulesModel.count; k += 1) keys[Rules.mergeKey(rulesModel.get(k))] = true
+        for (var i = 0; i < entries.length; i += 1) {
+            if (userRuleCount() >= freeRulesMaxCount) { capped = true; break }
+            var ruleType = String(entries[i]["rule-type"] || "")
+            var value = String(entries[i].value || "")
+            var item = {
+                id: nextFreeRuleId(),
+                enabled: ruleDialog.localEnabled,
+                ruleType: ruleType,
+                ruleTypeTitle: ruleTypeLabel(ruleType),
+                matchValue: value,
+                aceMatchValue: _aceLowerForSearch(value),
+                targetRoute: ruleDialog.localRoute,
+                comment: ruleDialog.localComment,
+                originReason: "",
+                originAnchor: "",
+                originAdded: ""
+            }
+            var key = Rules.mergeKey(item)
+            if (keys[key]) { already += 1; continue }
+            keys[key] = true
+            rulesModel.append(item)
+            // A new rule has no stored comment to clear.
+            if (item.comment !== "") _sidecarWriteCommentForRow(item)
+            added += 1
+        }
+        if (added > 0) rulesModelEdited()
+        var status = tr("status.rules-list-added", "Rules added: {count}.")
+            .replace("{count}", String(added))
+        if (already > 0) {
+            status += " " + tr("status.rules-list-already-present",
+                "Already in the list: {count}.").replace("{count}", String(already))
+        }
+        if (capped) {
+            status += " " + tr("status.rules-limit-reached",
+                "Up to {max} active rules are supported.")
+                .replace("{max}", String(freeRulesMaxCount))
+        }
+        statusLine = status
         _recomputeRulesDirty()
     }
 

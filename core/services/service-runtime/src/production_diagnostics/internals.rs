@@ -32,21 +32,10 @@ impl ProductionDiagnosticsFacade {
         )
     }
 
-    /// Minimal synthetic-probe explain.
-    ///
-    /// Reads the active rules revision, decodes it into a
-    /// `CanonicalRuleBook`, and walks `primary` then `secondary`
-    /// rule sets in priority order to find the first address match
-    /// against the input sample. Returns a minimal
-    /// [`ExplainResponse`] populated with the fields the compact-view
-    /// projection in the IPC handler reads
-    /// (`input`, `final_action_section`, `summary`). The lookup,
-    /// availability, and match sections stay `None` until a future
-    /// block adds a stored snapshot replay path.
-    ///
-    /// When no revision exists yet, falls back to an `Unavailable`
-    /// response keyed `service-unavailable` so the GUI shows the
-    /// "data unavailable" hint instead of empty fields.
+    /// Synthetic-probe explain: the caller's active rule book asked through the
+    /// engine's own matcher. The match and lookup sections are filled when an
+    /// address rule decided (a literal-IP Block, a network), so the GUI can
+    /// name it.
     pub(super) fn synthetic_explain(
         &self,
         sample: &nrr_diagnostics::explain::query::RuntimeInputSample,
@@ -146,19 +135,40 @@ impl ProductionDiagnosticsFacade {
         // the name resolves to, so a literal-IP Block on any cached one of
         // them is the answer, whatever the name rules say.
         let mut blocking_ip = literal_block_ip(&decision, observed_ipaddr);
+        // The cached address a network rule decided the name by, when it did.
+        let mut network_ip = None;
         if let (Some(name), None) = (host, observed_ipaddr) {
+            let cached = self.forward_resolve_host_ips(name);
             if let Some((ip, veto)) = literal_block_veto(
                 &rule_book,
                 name,
-                &self.forward_resolve_host_ips(name),
+                &cached,
                 sample.process_name.as_deref(),
                 zone_policy,
                 behavior_mode,
             ) {
                 decision = veto;
                 blocking_ip = Some(ip);
+            } else if let Some((ip, by_network)) = network_decision(
+                &rule_book,
+                name,
+                &cached,
+                sample.process_name.as_deref(),
+                zone_policy,
+                behavior_mode,
+            ) {
+                decision = by_network;
+                network_ip = Some(ip);
             }
         }
+        let matched_network = match &decision {
+            nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { candidate }
+                if candidate.match_class == nrr_domain::decision_matching::MatchClass::Subnet =>
+            {
+                network_rule_text(&rule_book, &candidate.rule_id)
+            }
+            _ => None,
+        };
         // The engine's answer stands, but a winner enforcement skips for its
         // shape must not read as enforced.
         let shape_not_enforced = match &decision {
@@ -179,6 +189,8 @@ impl ProductionDiagnosticsFacade {
             {
                 let reason = if blocking_ip.is_some() && host.is_some() {
                     "diag.explain.reason.blocked-by-ip-rule".to_string()
+                } else if network_ip.is_some() {
+                    "diag.explain.reason.blocked-by-network-rule".to_string()
                 } else {
                     format!(
                         "diag.explain.reason.rule-matched-{}",
@@ -260,7 +272,7 @@ impl ProductionDiagnosticsFacade {
         };
         let final_action_section = ExplainFinalActionSection {
             action_key,
-            route_role,
+            route_role: route_role.clone(),
             reason_key: reason_key.clone(),
         };
         let summary = ExplainSummarySection {
@@ -281,10 +293,36 @@ impl ProductionDiagnosticsFacade {
                     route_role: None,
                     conflict_resolved: false,
                     default_reason_key: None,
+                    matched_network: None,
                 }),
                 Some(ExplainLookupSection {
                     cache_state_key: "explain.lookup.cache_hit".to_string(),
                     cache_hit: observed_ipaddr.is_none(),
+                    has_errors: false,
+                    selected_ip: (!matches!(level, ExplainDetailLevel::CompactUi))
+                        .then(|| ip.to_string()),
+                    is_multi_ip: false,
+                    ttl_seconds: None,
+                }),
+            ),
+            // A network rule decided: name the network, and the cached address
+            // it was decided by when the probe gave none.
+            (
+                nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { candidate },
+                None,
+            ) if matched_network.is_some() => (
+                Some(ExplainMatchSection {
+                    outcome_key: "explain.match.rule_matched".to_string(),
+                    matched_rule_id: Some(candidate.rule_id.as_str().to_string()),
+                    match_class_label: Some("Subnet".to_string()),
+                    route_role: route_role.clone(),
+                    conflict_resolved: false,
+                    default_reason_key: None,
+                    matched_network: matched_network.clone(),
+                }),
+                network_ip.map(|ip| ExplainLookupSection {
+                    cache_state_key: "explain.lookup.cache_hit".to_string(),
+                    cache_hit: true,
                     has_errors: false,
                     selected_ip: (!matches!(level, ExplainDetailLevel::CompactUi))
                         .then(|| ip.to_string()),
@@ -343,18 +381,7 @@ impl ProductionDiagnosticsFacade {
             .ok()
     }
 
-    /// Reads the caller's per-SID `include_subdomains` flag
-    /// from `secondary_block_policy` so the synthetic routing-check expands
-    /// bare-domain rules to their subdomains exactly as
-    /// `ProductionRulesProvider::active_rules_for` does at enforcement time.
-    /// ON by default (the storage layer supplies the default
-    /// for a SID with no policy row). Degrades to `false` on an empty SID,
-    /// missing state DB, lock failure, or read error — the probe reports the
-    /// narrow rule book rather than guessing at an unreadable policy.
-    /// The caller's Zone-vs-ExactIp order. The engine has always taken this as
-    /// a parameter and both production callers passed the default, so the
-    /// setting the rule model documents ("Exact IP wins by default;
-    /// configurable") had no way to take effect.
+    /// The caller's Zone-vs-ExactIp order, as enforcement reads it.
     pub(super) fn zone_policy_for_sid(
         &self,
         sid: &str,
@@ -379,6 +406,9 @@ impl ProductionDiagnosticsFacade {
             .unwrap_or(false)
     }
 
+    /// The caller's `include_subdomains` flag, so the probe expands bare-domain
+    /// rules exactly as the rules provider does. `false` on any read failure:
+    /// the narrow book beats a guess at an unreadable policy.
     fn reads_include_subdomains(&self, sid: &str) -> bool {
         if sid.is_empty() {
             return false;
@@ -395,11 +425,6 @@ impl ProductionDiagnosticsFacade {
             .unwrap_or(false)
     }
 
-    /// Cached hostnames currently mapped to `ip` in the FQDN
-    /// cache, most-recently-resolved first (capped). Lets the routing-check
-    /// answer a bare-IP probe by the route its owning hostname takes, instead of
-    /// the misleading rule-less DEFAULT. Empty on a missing cache DB, lock/query
-    /// error, or when the IP is not cached.
     /// The addresses the FQDN cache holds for `host`, newest first. Empty
     /// without a cache or on any read error: the probe then answers from the
     /// name rules alone, as it did before it looked.
@@ -430,6 +455,9 @@ impl ProductionDiagnosticsFacade {
             .collect()
     }
 
+    /// Cached hostnames mapped to `ip`, newest first (capped), so a bare-IP
+    /// probe answers by the route its owning hostname takes. Empty on any
+    /// read failure.
     fn reverse_resolve_ip_hosts(&self, ip: &str) -> Vec<String> {
         let Some(conn_arc) = self.cache_conn.as_ref() else {
             return Vec::new();
@@ -644,6 +672,59 @@ fn literal_block_ip(
     }
 }
 
+/// The first of `cached_ips` a network rule decides `host` by, with the
+/// engine's answer for it. A name rule narrower than the network still wins
+/// inside `match_sample`, so only a host no name rule claims more closely is
+/// answered here — what enforcement does to a connection to that address.
+pub(super) fn network_decision(
+    rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+    host: &str,
+    cached_ips: &[std::net::IpAddr],
+    process_name: Option<&str>,
+    zone_policy: nrr_domain::decision_matching::ZonePriorityPolicy,
+    behavior_mode: nrr_domain::RouteBehaviorMode,
+) -> Option<(
+    std::net::IpAddr,
+    nrr_domain::decision_matching::RequestedRouteDecision,
+)> {
+    use nrr_domain::decision_matching::{MatchClass, RequestedRouteDecision};
+    cached_ips.iter().find_map(|ip| {
+        let decision = nrr_domain::decision_engine_input::match_sample(
+            rule_book,
+            Some(host),
+            Some(*ip),
+            process_name,
+            zone_policy,
+            behavior_mode,
+        );
+        matches!(
+            &decision,
+            RequestedRouteDecision::MatchedRoute { candidate }
+                if candidate.match_class == MatchClass::Subnet
+        )
+        .then_some((*ip, decision))
+    })
+}
+
+/// The network rule `rule_id` names, spelled as the rules list shows it.
+pub(super) fn network_rule_text(
+    rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+    rule_id: &nrr_domain::RuleId,
+) -> Option<String> {
+    let address = rule_book
+        .primary
+        .rules()
+        .iter()
+        .chain(rule_book.secondary.rules())
+        .find(|r| r.id == *rule_id)?
+        .address_match
+        .as_ref()?;
+    address
+        .ip_blocks()
+        .is_some()
+        .then(|| address.to_display_string())
+}
+
 /// Bytes on disk for a set of files. A file that cannot be stat'ed contributes
 /// nothing: the number is a storage indicator, and a hole in it is better than
 /// refusing to show any of it.
@@ -654,12 +735,6 @@ pub(super) fn total_bytes_of(files: &[std::path::PathBuf]) -> u64 {
         .sum()
 }
 
-/// First-match walk over a single canonical rule set. Returns the
-/// matched [`nrr_domain::canonical::CanonicalRule`] paired with a kebab-case
-/// match-class slug (`"exact-fqdn" | "suffix-domain" | "zone" |
-/// "exact-ip"`) used to build the reason key. Iteration order follows
-/// the storage order (already priority-sorted by
-/// `CanonicalRuleSet::from_rules`); the first matching rule wins.
 /// Maps a winning [`MatchClass`] to its `diag.explain.reason.rule-matched-*`
 /// locale slug. `Default` never reaches here (it is a `DefaultRoute`, handled
 /// separately), but the arm keeps the match exhaustive.
@@ -672,6 +747,7 @@ pub(super) fn match_class_reason_slug(
         MatchClass::SuffixDomain => "suffix-domain",
         MatchClass::Zone => "zone",
         MatchClass::ExactIp => "exact-ip",
+        MatchClass::Subnet => "subnet",
         MatchClass::Application => "application",
         MatchClass::Default => "none",
     }

@@ -53,6 +53,31 @@ fn the_hint_comes_from_the_recommendation_and_never_repeats_the_kind() {
     assert_eq!(output.trim(), "looks-primary,looks-vpn,,,", "{output}");
 }
 
+/// A host-only link chosen as the main one cut a machine off; the pickers say
+/// so beside its name. A tunnel waiting for its routes is not flagged.
+#[test]
+fn a_link_with_no_way_out_is_marked_before_any_recommendation() {
+    let harness = format!(
+        "{source}\n\
+         var hostOnly = {{ kind: 'ethernet', availability: 'available', gateway: '-',\n\
+                          hasForwardingPath: false,\n\
+                          recommendation: {{ 'class': 'preferred-primary' }} }};\n\
+         var tunnel = {{ kind: 'tunnel', availability: 'available', gateway: '-',\n\
+                        hasForwardingPath: false }};\n\
+         var uplink = {{ kind: 'ethernet', availability: 'available', gateway: '192.0.2.1',\n\
+                        hasForwardingPath: true,\n\
+                        recommendation: {{ 'class': 'preferred-primary' }} }};\n\
+         console.log([adapterRoleHintSlug(hostOnly), adapterRoleHintSlug(tunnel),\n\
+                      adapterRoleHintSlug(uplink)].join(','));\n",
+        source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
+    );
+    let Some(output) = run_node(&harness) else {
+        eprintln!("node not available — skipping the executable check");
+        return;
+    };
+    assert_eq!(output.trim(), "no-internet,,looks-primary", "{output}");
+}
+
 #[test]
 fn both_surfaces_consult_the_rule() {
     let wizard = repo_file("apps/desktop/qml/components/FirstRunWindow.qml");

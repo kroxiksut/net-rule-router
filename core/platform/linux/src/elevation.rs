@@ -160,12 +160,12 @@ mod tests {
 
     #[test]
     fn pkexec_argv_puts_helper_first_then_args() {
-        let helper = PathBuf::from("/usr/lib/netrulerouter/nrr-privileged-helper");
+        let helper = PathBuf::from("/usr/libexec/netrulerouter/nrr-privileged-helper");
         let args = vec!["--apply".to_string(), "rev-42".to_string()];
         assert_eq!(
             pkexec_argv(&helper, &args),
             vec![
-                "/usr/lib/netrulerouter/nrr-privileged-helper".to_string(),
+                "/usr/libexec/netrulerouter/nrr-privileged-helper".to_string(),
                 "--apply".to_string(),
                 "rev-42".to_string(),
             ]

@@ -123,9 +123,9 @@ QtObject {
             case "verbose-logging-change":
                 return root.tr("settings.diagnostics.service-stability.verbose.label",
                     "Verbose service logging")
-            case "conn-trace-ndjson":
+            case "conn-trace-ndjson-change":
                 return root.tr("settings.diagnostics.conn-trace.ndjson.label",
-                    "Write connection trace to service log (NDJSON)")
+                    "Write connection trace to service log")
             case "conn-trace-gui":
                 return root.tr("settings.diagnostics.conn-trace.gui.label",
                     "Show connection trace in diagnostics (GUI)")
@@ -179,6 +179,9 @@ QtObject {
                     + root.tr("settings.diagnostics.cache-refresh.unit", "min")
             case "verbose-logging-change":
                 return root.tr("settings.diagnostics.service-stability.verbose.option-" + String(value),
+                    String(value))
+            case "conn-trace-ndjson-change":
+                return root.tr("settings.diagnostics.conn-trace.ndjson.option-" + String(value),
                     String(value))
             case "ipc-accept-policy": {
                 var kind = String((value && (value["kind"] || value.kind)) || "recoverable")

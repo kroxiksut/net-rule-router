@@ -253,6 +253,15 @@ fn collect_flags(spec: &'static VerbSpec, rest: &[String]) -> Result<Vec<ParsedF
     Ok(parsed)
 }
 
+/// The console's word for a start mode, from the vocabulary its help offers:
+/// what it prints, `--start-mode=` accepts back. The wire slug is GUI history.
+pub(crate) fn start_mode_word(mode: ServiceStartMode) -> &'static str {
+    match mode {
+        ServiceStartMode::WithWindows => "auto",
+        ServiceStartMode::OnAppLaunch => "on-demand",
+    }
+}
+
 fn flag<'a>(flags: &'a [ParsedFlag], name: &str) -> Option<&'a ParsedFlag> {
     flags.iter().find(|f| f.name == name)
 }
@@ -332,6 +341,17 @@ mod tests {
     /// and not about how it was asked for.
     fn p(args: &[&str]) -> Result<Command, ParseError> {
         inv(args).map(|invocation| invocation.command)
+    }
+
+    #[test]
+    fn a_printed_start_mode_installs_back_as_the_same_mode() {
+        for mode in [ServiceStartMode::WithWindows, ServiceStartMode::OnAppLaunch] {
+            let flag = format!("--start-mode={}", start_mode_word(mode));
+            assert_eq!(
+                p(&["install", flag.as_str()]),
+                Ok(Command::Install { start_mode: mode })
+            );
+        }
     }
 
     fn inv(args: &[&str]) -> Result<Invocation, ParseError> {

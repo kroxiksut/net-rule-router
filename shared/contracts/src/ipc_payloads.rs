@@ -502,6 +502,10 @@ pub struct OperationStatusResponse {
 pub struct OperationErrorResponse {
     pub code: String,
     pub message: String,
+    /// Placeholder values for the localized text of `code`; absent when the
+    /// refusal needs none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub args: std::collections::BTreeMap<String, String>,
 }
 
 // ── ProductImpactDisableTemporary ────────────────────────────────────────────
@@ -775,9 +779,8 @@ pub enum StatusUpdateEvent {
     EnforcementStatusChanged {
         sid: String,
         /// `"ok"` | `"adapter-choice-needed"` | `"adapter-gone"` |
-        /// `"adapter-failed"` |
-        /// `"no-primary-route"` | `"no-policy"` | `"secondary-down"` |
-        /// `"adapters-unreadable"`. A client that does not recognise a value
+        /// `"adapter-failed"` | `"no-primary-route"` | `"primary-no-way-out"` |
+        /// `"no-policy"` | `"secondary-down"` | `"adapters-unreadable"`. A client that does not recognise a value
         /// shows the generic "your rules are not being applied" wording rather
         /// than nothing.
         status: String,

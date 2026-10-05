@@ -183,3 +183,82 @@ pub(super) fn derive_subnet_filter_id(
 ) -> WfpFilterId {
     derive_filter_id(sid, layer, action, Ipv4Addr::UNSPECIFIED, weight)
 }
+
+/// A network destination as WFP carries it: one subnet condition of its
+/// family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SubnetCondition {
+    V4(Ipv4Addr, u8),
+    V6(Ipv6Addr, u8),
+}
+
+impl SubnetCondition {
+    pub(super) fn of(dst: DstMatch) -> Option<Self> {
+        match dst {
+            DstMatch::SubnetV4 { net, prefix } => Some(Self::V4(net, prefix)),
+            DstMatch::SubnetV6 { net, prefix } => Some(Self::V6(net, prefix)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn ale_layer(self) -> WfpLayerKey {
+        match self {
+            Self::V4(..) => WfpLayerKey::AleAuthConnectV4,
+            Self::V6(..) => WfpLayerKey::AleAuthConnectV6,
+        }
+    }
+
+    pub(super) fn packet_layer(self) -> WfpLayerKey {
+        match self {
+            Self::V4(..) => WfpLayerKey::OutboundIpPacketV4,
+            Self::V6(..) => WfpLayerKey::OutboundIpPacketV6,
+        }
+    }
+}
+
+impl std::fmt::Display for SubnetCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V4(net, prefix) => write!(f, "{net}/{prefix}"),
+            Self::V6(net, prefix) => write!(f, "{net}/{prefix}"),
+        }
+    }
+}
+
+/// A rule filter whose destination is one network piece. The piece is part of
+/// the id: a rule's pieces differ by address, not only by weight.
+pub(super) fn make_subnet_filter(
+    layer: WfpLayerKey,
+    action: WfpAction,
+    subnet: SubnetCondition,
+    weight: u64,
+    user_sid: Option<String>,
+) -> WfpFilterSpec {
+    let id = derive_catch_all_id(
+        user_sid.as_deref(),
+        layer,
+        action,
+        weight,
+        &format!("net:{subnet}"),
+    );
+    let (remote_subnet, remote_subnet_v6) = match subnet {
+        SubnetCondition::V4(net, prefix) => (Some((net, prefix)), None),
+        SubnetCondition::V6(net, prefix) => (None, Some((net, prefix))),
+    };
+    WfpFilterSpec {
+        layer,
+        action,
+        remote_ip: None,
+        remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
+        remote_port: None,
+        weight,
+        id,
+        user_sid,
+        app_pattern: None,
+        local_interface_luid: None,
+        remote_subnet,
+        remote_subnet_v6,
+        ip_protocol: None,
+    }
+}

@@ -43,8 +43,8 @@ use crate::schema::{
     STATE_DB_V52_DDL, STATE_DB_V53_DDL, STATE_DB_V54_DDL, STATE_DB_V55_DDL, STATE_DB_V56_DDL,
     STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V59_DDL, STATE_DB_V5_DDL, STATE_DB_V60_DDL,
     STATE_DB_V61_DDL, STATE_DB_V62_DDL, STATE_DB_V63_DDL, STATE_DB_V64_DDL, STATE_DB_V65_DDL,
-    STATE_DB_V66_DDL, STATE_DB_V67_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL,
-    STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL, TRAFFIC_DB_V2_DDL,
+    STATE_DB_V66_DDL, STATE_DB_V67_DDL, STATE_DB_V68_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL,
+    STATE_DB_V8_DDL, STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL, TRAFFIC_DB_V2_DDL,
 };
 
 /// One versioned step; the catalogues below append, never edit.
@@ -613,6 +613,11 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         version: 67,
         name: "verbose_logging_deadline",
         stmts: STATE_DB_V67_DDL,
+    },
+    MigrationDef {
+        version: 68,
+        name: "conn_trace_log_deadline",
+        stmts: STATE_DB_V68_DDL,
     },
 ];
 

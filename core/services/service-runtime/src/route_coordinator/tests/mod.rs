@@ -265,5 +265,6 @@ mod binding_identity;
 mod first_contact_and_probe;
 mod foreign_tunnels;
 mod offers_and_paused;
+mod primary_way_out;
 mod recompute;
 mod sid_and_notices;

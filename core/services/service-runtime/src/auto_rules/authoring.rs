@@ -427,7 +427,9 @@ fn auto_rule_id(route: RouteRole, address_match: &CanonicalAddressMatch) -> Stri
         CanonicalAddressMatch::Zone(v) => ("zone", v.as_str()),
         // Never produced by a companion suggestion; folded in so the helper
         // stays total rather than growing a panic path.
-        CanonicalAddressMatch::ExactIp(_) => ("ip", ""),
+        CanonicalAddressMatch::ExactIp(_)
+        | CanonicalAddressMatch::Subnet(_)
+        | CanonicalAddressMatch::IpRange(_) => ("ip", ""),
     };
     hashed_rule_id(route, kind, value)
 }

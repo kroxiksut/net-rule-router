@@ -476,6 +476,7 @@ mod blocking_scope;
 mod cleanup;
 mod kill_switch;
 mod machine_reading;
+mod network_holds;
 mod preview;
 mod route_before_block;
 mod vpn_exempt;

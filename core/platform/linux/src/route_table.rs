@@ -16,11 +16,10 @@
 //!
 //! ## `is_ours`
 //!
-//! Always reported as `false`, exactly as the Windows FFI does: the marker is
-//! storage-anchored — the caller cross-references persisted
-//! `(destination, prefix, ifindex)` tuples. A route protocol number would be a
-//! tempting shortcut and a wrong one, since nothing stops another program from
-//! using the same value.
+//! Always reported as `false`, exactly as the Windows FFI does: the caller
+//! recognises its rows by the signature it writes (metric, shape, main table).
+//! A route protocol number would be a tempting shortcut and a wrong one, since
+//! nothing stops another program from using the same value.
 
 #![allow(unsafe_code)]
 // The socket half has no caller off Linux; the encoder/parser below still
@@ -376,7 +375,7 @@ fn parse_route_message(body: &[u8]) -> Option<RouteEntry> {
         next_hop,
         interface_index: interface_index?,
         metric,
-        // Storage-anchored, exactly as on Windows — see the module doc.
+        // Never on the wire — see the module doc.
         is_ours: false,
         table: if table == u32::from(RT_TABLE_MAIN) {
             RouteTableRef::Main
@@ -626,6 +625,43 @@ mod tests {
             !parsed.is_ours,
             "ownership is storage-anchored, never on the wire"
         );
+    }
+
+    /// The metric and the table are how a restarted service tells its own
+    /// network routes from anyone else's, so both survive the kernel's wire
+    /// format in either family.
+    #[test]
+    fn a_network_route_keeps_its_metric_and_table_on_the_wire() {
+        let v6: Ipv6Addr = "2001:db8:1::".parse().expect("v6 literal");
+        for (destination, prefix_length, next_hop) in [
+            (
+                IpAddr::V4(Ipv4Addr::new(10, 20, 0, 0)),
+                16,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ),
+            (IpAddr::V6(v6), 48, IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        ] {
+            let original = RouteEntry {
+                destination,
+                prefix_length,
+                next_hop,
+                interface_index: 7,
+                metric: 4,
+                is_ours: true,
+                table: RouteTableRef::Main,
+            };
+            let msg = encode_route_mutation(RTM_NEWROUTE, &original, 1).expect("encode");
+            let parsed = parse_route_message(&msg[NLMSG_HEADER_LEN..]).expect("parse");
+            assert_eq!(
+                (
+                    parsed.destination,
+                    parsed.prefix_length,
+                    parsed.metric,
+                    parsed.table
+                ),
+                (destination, prefix_length, 4, RouteTableRef::Main)
+            );
+        }
     }
 
     /// An on-link route has no gateway, and the attribute must be ABSENT — a

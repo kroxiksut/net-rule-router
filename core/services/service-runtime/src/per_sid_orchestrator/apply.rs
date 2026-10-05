@@ -347,9 +347,16 @@ impl PerSidApplyOrchestrator {
         // Destinations this set scopes to, deduplicated. Compared against the
         // previous install BEFORE the state is replaced.
         let (destinations, secondary_resolved) = Self::coverage_of(&filters);
-        self.tear_down_flows_to_new_destinations(sid, &destinations, secondary_resolved);
+        let networks = Self::rule_networks_of(sid, &filters);
+        self.tear_down_flows_to_new_destinations(sid, &destinations, &networks, secondary_resolved);
         Self::publish_enforced_addresses(sid, &filters);
-        self.upsert_state_with_destinations(sid, tracked_ids, destinations, secondary_resolved);
+        self.upsert_state_with_destinations(
+            sid,
+            tracked_ids,
+            destinations,
+            networks,
+            secondary_resolved,
+        );
         let kind = if was_known {
             PerSidApplyAuditKind::Updated
         } else {
@@ -591,7 +598,8 @@ impl PerSidApplyOrchestrator {
         // been up all along reads as one that "just came up" — a needless
         // sweep of every pinned destination.
         let (destinations, secondary_resolved) = Self::coverage_of(&desired);
-        self.tear_down_flows_to_new_destinations(sid, &destinations, secondary_resolved);
+        let networks = Self::rule_networks_of(sid, &desired);
+        self.tear_down_flows_to_new_destinations(sid, &destinations, &networks, secondary_resolved);
         Self::publish_enforced_addresses(sid, &desired);
         let live_total = {
             let removed_ids: std::collections::HashSet<u64> =
@@ -602,8 +610,10 @@ impl PerSidApplyOrchestrator {
                 installed: Vec::new(),
                 destinations: Vec::new(),
                 secondary_resolved: false,
+                networks: Vec::new(),
             });
             entry.destinations = destinations;
+            entry.networks = networks;
             entry.secondary_resolved = secondary_resolved;
             entry.installed.retain(|id| !removed_ids.contains(&id.raw));
             let mut have: std::collections::HashSet<u64> =
@@ -1037,7 +1047,7 @@ impl PerSidApplyOrchestrator {
 
     fn upsert_state(&self, sid: &str, installed: Vec<WfpFilterId>) {
         // No destinations, so nothing to sweep either way.
-        self.upsert_state_with_destinations(sid, installed, Vec::new(), false);
+        self.upsert_state_with_destinations(sid, installed, Vec::new(), Vec::new(), false);
     }
 
     /// Publish the addresses this filter set PERMITS, so the resolver can tell
@@ -1065,9 +1075,8 @@ impl PerSidApplyOrchestrator {
     /// it was built. Both are read off the filters, so the install and the
     /// reconcile path cannot derive them differently.
     ///
-    /// Only host-scoped filters contribute: every subnet-scoped filter we emit
-    /// is an exemption, with nothing to break loose. A CIDR rule would need
-    /// its range swept too.
+    /// Only host-scoped filters contribute here; a rule's network is read by
+    /// [`Self::rule_networks_of`], since a subnet filter is mostly an exemption.
     fn coverage_of(filters: &[WfpFilterSpec]) -> (Vec<std::net::Ipv4Addr>, bool) {
         let mut seen = std::collections::HashSet::new();
         let destinations = filters
@@ -1086,11 +1095,12 @@ impl PerSidApplyOrchestrator {
         (destinations, secondary_resolved)
     }
 
-    fn upsert_state_with_destinations(
+    pub(super) fn upsert_state_with_destinations(
         &self,
         sid: &str,
         installed: Vec<WfpFilterId>,
         destinations: Vec<std::net::Ipv4Addr>,
+        networks: Vec<nrr_shared::ip_block::IpBlock>,
         secondary_resolved: bool,
     ) {
         let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1101,8 +1111,34 @@ impl PerSidApplyOrchestrator {
                 installed,
                 destinations,
                 secondary_resolved,
+                networks,
             },
         );
+    }
+
+    /// The networks `sid`'s rules pin that this filter set carries. The set's
+    /// other subnet filters are exemptions (LAN, link-local), which no rule
+    /// changed, so only a network the rule book names counts. Empty — one map
+    /// miss — while the book holds none.
+    pub(super) fn rule_networks_of(
+        sid: &str,
+        filters: &[WfpFilterSpec],
+    ) -> Vec<nrr_shared::ip_block::IpBlock> {
+        let Some(index) = crate::fake_ip::global_rule_networks().for_principal(sid) else {
+            return Vec::new();
+        };
+        let named = index.networks();
+        let mut out: Vec<nrr_shared::ip_block::IpBlock> = filters
+            .iter()
+            .filter_map(|spec| {
+                let (net, prefix) = spec.remote_subnet?;
+                nrr_shared::ip_block::IpBlock::new(std::net::IpAddr::V4(net), prefix)
+            })
+            .filter(|block| named.contains(block))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Tear down live connections to destinations this install just started
@@ -1127,50 +1163,57 @@ impl PerSidApplyOrchestrator {
     /// These filters are `sid`'s alone, so only `sid`'s connections are torn
     /// down, and none to an address a direct host shares — the same cut
     /// [`crate::routed_host_flow_refresh::flows_to_reset`] makes.
-    fn tear_down_flows_to_new_destinations(
+    pub(super) fn tear_down_flows_to_new_destinations(
         &self,
         sid: &str,
         destinations: &[std::net::Ipv4Addr],
+        networks: &[nrr_shared::ip_block::IpBlock],
         secondary_resolved: bool,
     ) {
         let Some(reset) = self.stale_flow_reset.as_ref() else {
             return;
         };
-        let (previous, was_resolved) = {
+        let (previous, previous_networks, was_resolved) = {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
             match g.get(sid) {
                 Some(state) => (
-                    state.destinations.iter().copied().collect(),
+                    state
+                        .destinations
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::HashSet<_>>(),
+                    state.networks.clone(),
                     state.secondary_resolved,
                 ),
-                None => (std::collections::HashSet::new(), false),
+                None => (std::collections::HashSet::new(), Vec::new(), false),
             }
         };
         let tunnel_came_up = secondary_resolved && !was_resolved;
         // One table read for the whole set: "the tunnel came up" hands this
         // every pinned destination at once, on the edge that must not stall.
-        let victims: Vec<std::net::Ipv4Addr> = destinations
+        let hosts: Vec<std::net::Ipv4Addr> = destinations
             .iter()
             .copied()
             .filter(|ip| tunnel_came_up || !previous.contains(ip))
             .collect();
-        let fresh = victims.len();
-        if victims.is_empty() {
-            return;
-        }
-        let candidates = reset.established_flows_to(&victims);
-        if candidates.is_empty() {
-            return;
-        }
-        // Read only when something is connected: the census is a query.
-        let decision = crate::routed_host_flow_refresh::flows_to_reset(
-            candidates,
+        let nets: Vec<nrr_shared::ip_block::IpBlock> = networks
+            .iter()
+            .copied()
+            .filter(|net| tunnel_came_up || !previous_networks.contains(net))
+            .collect();
+        let fresh = hosts.len() + nets.len();
+        // Read only when something is connected: the census is a query. No
+        // anchor here: an apply routes addresses, it offers nothing.
+        let Some(outcome) = crate::routed_host_flow_refresh::reset_owner_flows(
+            reset.as_ref(),
+            self.fqdn_cache.as_ref(),
             sid,
-            &self.fqdn_cache.shared_direct_ips(),
-            // No anchor here: an apply routes addresses, it offers nothing.
-            &std::collections::HashSet::new(),
-        );
-        let torn_down = reset.reset_established(&decision.reset);
+            &nrr_platform_api::fake_ip::stale_flows::FlowTargets::new(hosts, nets),
+        ) else {
+            return;
+        };
+        let decision = &outcome.decision;
+        let torn_down = outcome.torn_down;
         if torn_down > 0 {
             let cause = if tunnel_came_up {
                 crate::flow_reset_log::ResetCause::TunnelCameUp

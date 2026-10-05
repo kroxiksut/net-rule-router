@@ -298,7 +298,10 @@ function pendingOfflineCount(obj) {
 var STABILITY_FIELD_DEFAULTS = {
     "verbose-logging-mode": "off",
     "verbose-logging-until-ms": 0,
-    "conn-trace-ndjson": false,
+    "conn-trace-ndjson-mode": "off",
+    "conn-trace-ndjson-until-ms": 0,
+    "conn-trace-ndjson-forced": false,
+    "conn-trace-ndjson-forced-by": "",
     "conn-trace-gui": true,
     "rule-scope-service-driven": true,
     "routing-stop-policy": "teardown",
@@ -336,6 +339,7 @@ var STABILITY_FIELD_CLAMPS = {
 // Legal values of the slug fields; anything else resolves to the default.
 var STABILITY_FIELD_CHOICES = {
     "verbose-logging-mode": ["off", "timed", "until-restart"],
+    "conn-trace-ndjson-mode": ["off", "timed", "until-restart"],
     "enforcement-mode": ["resolver", "reactive"],
     "routing-stop-policy": ["teardown", "persist"]
 }
@@ -347,8 +351,8 @@ function stabilityKeyIsKnown(key) {
 }
 
 // True when a recorded intent for `key` may be kept at all. A one-shot request
-// such as `verbose-logging-change` never is: replayed on the next connect it
-// would re-open a window that had ended. Neither is the rules lock, nor a key
+// such as `verbose-logging-change` or `conn-trace-ndjson-change` never is:
+// replayed on the next connect it would re-open a window that had ended. Neither is the rules lock, nor a key
 // this build no longer has.
 function stabilityIntentIsRecordable(key) {
     return stabilityKeyIsKnown(key) && STABILITY_INTENT_EXCLUDED_KEYS.indexOf(key) < 0
@@ -432,14 +436,15 @@ function stabilityIntentAfterWrite(intent, partial, before, appElevated) {
     return changed ? out : null
 }
 
-// The requests the verbose-logging control offers, in display order.
-var VERBOSE_LOGGING_CHANGES = ["off", "one-hour", "four-hours", "until-restart"]
+// The requests a log-window control (verbose logging, the connection trace on
+// disk) offers, in display order.
+var LOG_WINDOW_CHANGES = ["off", "one-hour", "four-hours", "until-restart"]
 
 // Stability keys a service without the whole row still applies, each with the
 // capability that says so. Where `serviceStabilityConfig` holds, every key does.
 var STABILITY_KEY_CAPABILITY = {
     "verbose-logging-change": "verboseLogging",
-    "conn-trace-ndjson": "connTraceLog",
+    "conn-trace-ndjson-change": "connTraceLog",
     "conn-trace-gui": "connTraceLog"
 }
 
@@ -876,14 +881,17 @@ function adapterDisplayName(row) {
     return name + " \u2014 " + descr
 }
 
-// The hint beside an adapter's kind, read off the service's own role
-// recommendation: "looks-primary", "looks-vpn" or "". A tunnel's kind already
-// says VPN, so it gets no second word for it.
+// The hint beside an adapter's kind: "no-internet" for a link with no way out,
+// else the service's own role recommendation — "looks-primary", "looks-vpn" or
+// "". A tunnel's kind already says VPN, so it gets no second word for it.
 function adapterRoleHintSlug(row) {
     if (!row) return ""
+    var kind = String(row.kind || "")
+    // A tunnel has no route out until its client installs one; that is not a
+    // fault worth a word beside its name.
+    if (kind !== "tunnel" && interfaceCannotCarryTrafficOut(row)) return "no-internet"
     var cls = String((row.recommendation || {})["class"] || "")
     if (cls === "preferred-primary") return "looks-primary"
-    var kind = String(row.kind || "")
     if (kind === "tunnel" || kind === "virtual") return ""
     var vpn = String((row.derivedAssessment || {}).vpnTunnelLikelihood || "")
     if (vpn === "likely" || (vpn === "possible" && cls === "preferred-secondary"))
@@ -935,10 +943,42 @@ function previewRefusal(summary) {
             return { code: "invalid-rule-value", values: refusedRuleValuesText(summary) }
         }
         if (signal.kind === "change-refused") {
-            return { code: String(signal.code || "unknown"), values: "" }
+            return { code: String(signal.code || "unknown"), values: "",
+                     args: signal.args || null }
         }
     }
     return null
+}
+
+// The locale key and placeholder values of a refusal that names what it
+// refused (a network over the tunnel server, a connected network or the
+// address pool), or null when the refusal has no such text: the caller then
+// shows the code's own text. `args` is the refusal's wire `args`.
+function refusalDetail(code, args) {
+    if (!args) return null
+    var network = String(args["network"] || "")
+    if (network === "") return null
+    var kind = String(args["covers-kind"] || "")
+    var covers = String(args["covers"] || "")
+    if (code === "network-covers-link" && covers !== ""
+            && (kind === "tunnel-server" || kind === "local-network")) {
+        return { key: "errors.network-covers-link-" + kind,
+                 values: { network: network, covers: covers } }
+    }
+    if (code === "network-covers-fake-ip-pool") {
+        return { key: "errors.network-covers-fake-ip-pool-named",
+                 values: { network: network } }
+    }
+    return null
+}
+
+// `text` with each `{name}` replaced by `values[name]`.
+function fillPlaceholders(text, values) {
+    var out = String(text)
+    for (var name in values) {
+        out = out.split("{" + name + "}").join(String(values[name]))
+    }
+    return out
 }
 
 // Whether the "new version" notice shows for `offer` ({latestVersion, url} or
@@ -958,6 +998,12 @@ function operationOutcome(ok, status) {
     if (state === "completed") return ""
     if (state === "failed") return String((status.error && status.error.code) || "unknown")
     return null
+}
+
+// The `args` of a failed operation's error: what the localized text of its
+// code substitutes. Empty when the answer carries none.
+function operationFailureArgs(status) {
+    return (status && status.error && status.error.args) || null
 }
 
 // What a safe-rollback dry-run answered. `phase` is "ready" (a `target` and

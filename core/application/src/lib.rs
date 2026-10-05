@@ -8,6 +8,10 @@ pub mod mock_backend;
 // rules in CLAUDE.md.
 pub use nrr_domain::rule_value_validation;
 
+// Same chain: the launcher sorts a pasted address list by the domain's own
+// reading of what each line is.
+pub use nrr_domain::ip_network_policy;
+
 // Same reason, same chain: the launcher answers `preset.parse`, and the
 // window must be able to say "the service will refuse this file" BEFORE the
 // user has chosen what to do with its contents.

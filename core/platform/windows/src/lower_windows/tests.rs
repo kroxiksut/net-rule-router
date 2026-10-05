@@ -166,3 +166,103 @@ fn fail_closed_ale_groups_per_protocol_get_distinct_ids() {
     assert_ne!(out[0].ip_protocol, out[1].ip_protocol);
     assert_ne!(out[0].id, out[1].id);
 }
+
+fn network_flow(class: PrecedenceClass, ordinal: u32, dst: DstMatch) -> FlowRule {
+    let block = class == PrecedenceClass::HardBlock;
+    FlowRule {
+        verdict: if block {
+            Verdict::Block
+        } else {
+            Verdict::Permit
+        },
+        precedence: Precedence { class, ordinal },
+        flow: FlowMatch {
+            dst,
+            dst_port: None,
+            protocol: None,
+        },
+        principal: PrincipalScope(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
+        app: AppScope::Any,
+        egress: EgressConstraint::Any,
+        coverage: if block {
+            Coverage::AllPackets
+        } else {
+            Coverage::ConnectOnly
+        },
+    }
+}
+
+#[test]
+fn a_subnet_route_flow_lowers_to_one_subnet_filter() {
+    let net = Ipv4Addr::new(10, 0, 0, 0);
+    let out = lower_route_rules(&plan(vec![network_flow(
+        PrecedenceClass::RouteRule(RouteRole::Secondary),
+        3,
+        DstMatch::SubnetV4 { net, prefix: 8 },
+    )]));
+    assert_eq!(out.len(), 1, "a subnet must not be dropped: {out:?}");
+    let f = &out[0];
+    assert_eq!(f.layer, WfpLayerKey::AleAuthConnectV4);
+    assert_eq!(f.action, WfpAction::Permit);
+    assert_eq!(f.remote_subnet, Some((net, 8)));
+    assert!(f.remote_ip.is_none() && f.remote_ip_set.is_empty());
+    assert_eq!(f.weight, BASE_SECONDARY + 3);
+    assert_eq!(f.user_sid.as_deref(), Some("S-1-5-21-A"));
+    assert!(f.validate_layer_conditions().is_ok());
+}
+
+#[test]
+fn a_subnet_block_flow_lowers_to_both_layers_in_either_family() {
+    let v6: Ipv6Addr = "2001:db8::".parse().expect("v6");
+    let out = lower_route_rules(&plan(vec![
+        network_flow(
+            PrecedenceClass::HardBlock,
+            0,
+            DstMatch::SubnetV4 {
+                net: Ipv4Addr::new(203, 0, 113, 0),
+                prefix: 24,
+            },
+        ),
+        network_flow(
+            PrecedenceClass::HardBlock,
+            1,
+            DstMatch::SubnetV6 {
+                net: v6,
+                prefix: 32,
+            },
+        ),
+    ]));
+    let layers: Vec<WfpLayerKey> = out.iter().map(|f| f.layer).collect();
+    assert_eq!(
+        layers,
+        vec![
+            WfpLayerKey::AleAuthConnectV4,
+            WfpLayerKey::OutboundIpPacketV4,
+            WfpLayerKey::AleAuthConnectV6,
+            WfpLayerKey::OutboundIpPacketV6,
+        ]
+    );
+    assert!(out.iter().all(|f| f.action == WfpAction::Block));
+    assert!(out.iter().all(|f| f.validate_layer_conditions().is_ok()));
+    assert_eq!(out[2].remote_subnet_v6, Some((v6, 32)));
+    assert!(out[1].user_sid.is_none() && out[3].user_sid.is_none());
+    let ids: std::collections::HashSet<u64> = out.iter().map(|f| f.id.raw).collect();
+    assert_eq!(ids.len(), out.len());
+}
+
+#[test]
+fn pieces_sharing_a_weight_still_get_distinct_ids() {
+    let piece = |third: u8| {
+        network_flow(
+            PrecedenceClass::RouteRule(RouteRole::Primary),
+            255,
+            DstMatch::SubnetV4 {
+                net: Ipv4Addr::new(10, 0, third, 0),
+                prefix: 24,
+            },
+        )
+    };
+    let out = lower_route_rules(&plan(vec![piece(1), piece(2)]));
+    assert_eq!(out.len(), 2);
+    assert_ne!(out[0].id, out[1].id);
+}

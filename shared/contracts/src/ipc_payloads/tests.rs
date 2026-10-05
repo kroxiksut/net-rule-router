@@ -878,10 +878,68 @@ fn the_refused_values_signal_is_named_after_its_error_code() {
 fn a_refused_change_names_its_error_code() {
     let json = serde_json::to_value(RiskSignalDto::ChangeRefused {
         code: "unsupported-rule-shape".into(),
+        args: Default::default(),
     })
     .expect("serialise");
     assert_eq!(json["kind"], "change-refused");
     assert_eq!(json["code"], "unsupported-rule-shape");
+    assert!(
+        json.get("args").is_none(),
+        "a refusal without values stays as it was"
+    );
+}
+
+/// A refused network names itself and what it covers, under kebab-case keys.
+#[test]
+fn a_refused_network_carries_its_values_and_reads_back() {
+    let args = std::collections::BTreeMap::from([
+        ("rule".to_owned(), "r1".to_owned()),
+        ("network".to_owned(), "10.0.0.0/8".to_owned()),
+        ("covers-kind".to_owned(), "tunnel-server".to_owned()),
+        ("covers".to_owned(), "10.1.2.3".to_owned()),
+    ]);
+    let signal = RiskSignalDto::ChangeRefused {
+        code: "network-covers-link".into(),
+        args,
+    };
+    let json = serde_json::to_value(&signal).expect("serialise");
+    assert_eq!(json["args"]["network"], "10.0.0.0/8");
+    assert_eq!(json["args"]["covers-kind"], "tunnel-server");
+    assert_eq!(json["args"]["covers"], "10.1.2.3");
+    let back: RiskSignalDto = serde_json::from_value(json).expect("round trip");
+    assert_eq!(back, signal);
+
+    // An older service's refusal has no args and still reads.
+    let old: RiskSignalDto = serde_json::from_value(
+        serde_json::json!({ "kind": "change-refused", "code": "network-covers-link" }),
+    )
+    .expect("older refusal");
+    assert_eq!(
+        old,
+        RiskSignalDto::ChangeRefused {
+            code: "network-covers-link".into(),
+            args: Default::default()
+        }
+    );
+}
+
+/// The failed operation's error carries the same values to the execute path.
+#[test]
+fn a_failed_operation_error_carries_args_only_when_it_has_them() {
+    let bare: OperationErrorResponse =
+        serde_json::from_value(serde_json::json!({ "code": "x", "message": "m" }))
+            .expect("older error");
+    assert!(bare.args.is_empty());
+    assert!(serde_json::to_value(&bare)
+        .expect("serialise")
+        .get("args")
+        .is_none());
+    let named = OperationErrorResponse {
+        args: std::collections::BTreeMap::from([("network".to_owned(), "10.0.0.0/8".to_owned())]),
+        ..bare
+    };
+    let json = serde_json::to_value(&named).expect("serialise");
+    assert_eq!(json["args"]["network"], "10.0.0.0/8");
 }
 
 /// A mask that blocks nothing (empty, or "Other" alone) is leak protection

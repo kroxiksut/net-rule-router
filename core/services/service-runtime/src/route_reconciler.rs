@@ -23,10 +23,9 @@
 //!
 //! The OS never reports `is_ours` (the FFI stamps `false`), so the
 //! reconciler is the source of truth for which routes it owns, tracked
-//! in-memory. Cleanup of routes orphaned by a crash (present in the OS
-//! table but not in memory) is handled at startup by the wiring layer,
-//! which knows the secondary gateway/metric signature — kept out of this
-//! pure diff/apply core.
+//! in-memory. Routes a crash orphaned are adopted by their signature
+//! ([`crate::route_codegen::is_owned_route`]) before the first reconcile, so
+//! that reconcile takes back the ones no longer wanted.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -353,6 +352,21 @@ impl SecondaryRouteReconciler {
         *owned = routes;
     }
 
+    /// Add to the owned set every row of the live table that carries our
+    /// signature, so the next reconcile keeps what is still wanted and takes
+    /// back the rest. Returns how many rows carried it.
+    pub fn adopt_signed_routes(&self) -> Result<usize, PlatformError> {
+        let found = signed_routes(self.api.as_ref())?;
+        let count = found.len();
+        let mut owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
+        for route in found {
+            if !owned.iter().any(|o| route_key(o) == route_key(&route)) {
+                owned.push(route);
+            }
+        }
+        Ok(count)
+    }
+
     /// Is this table row one of ours? Compared by destination, prefix and
     /// interface — the identity the OS table exposes; metric and flags are not
     /// part of it because the OS may report them differently from what we asked.
@@ -390,7 +404,7 @@ impl SecondaryRouteReconciler {
     /// held. Callers that derive `desired` FROM the owned set must hold the lock
     /// across both steps: releasing it in between lets a concurrent reconcile
     /// change what is owned, and the derived set then deletes routes it never
-    /// looked at (see [`Self::retain_secondary_hosts`]).
+    /// looked at (see [`Self::retain_rule_routes`]).
     fn reconcile_owned(
         &self,
         desired: &[RouteEntry],
@@ -517,23 +531,20 @@ impl SecondaryRouteReconciler {
         Ok(added)
     }
 
-    /// graceful-stop "keep secondary" teardown: delete NRR's
-    /// overlays (the mode-A `/2` counter-overlays and the mode-B `/1`
-    /// split-default) but KEEP the secondary `/32` host routes, so rule-matched
-    /// hosts keep egressing the secondary adapter after the service stops while general
-    /// traffic returns to whatever the OS/VPN provides — the primary default
-    /// for a gateway-less VPN, the VPN's own redirect for a full-tunnel one. No
-    /// fabricated default, so a split / corp VPN is respected (its non-org
-    /// traffic is not forced through the tunnel). Equivalent to
-    /// `reconcile(owned.filter(|r| r.prefix_length == 32))`.
-    pub fn retain_secondary_hosts(&self) -> Result<RouteReconcileDelta, PlatformError> {
+    /// Graceful-stop teardown: delete our overlays (the mode-A counter-overlays,
+    /// the mode-B split-default) and keep every rule route — hosts and network
+    /// pieces alike — so rule traffic keeps its link after the service stops
+    /// while the rest returns to whatever the OS or VPN provides. The overlay
+    /// signature decides, not the prefix: a network piece can be a `/32`, and
+    /// a network rule is wider than one.
+    pub fn retain_rule_routes(&self) -> Result<RouteReconcileDelta, PlatformError> {
         // One lock across derive AND apply: `keep` IS the owned set minus the
         // overlays, so a reconcile slipping in between would have its routes
         // deleted by a `desired` that predates them.
         let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
         let keep: Vec<RouteEntry> = owned
             .iter()
-            .filter(|r| r.prefix_length == 32)
+            .filter(|r| !crate::route_codegen::is_overlay_route(r))
             .cloned()
             .collect();
         self.reconcile_owned(&keep, owned)
@@ -558,20 +569,25 @@ impl std::fmt::Display for RouteSweepError {
     }
 }
 
-/// Remove every route in the table that carries our signature, with no service
-/// running to say which it installed. Returns how many went. Recognition is
-/// [`crate::route_codegen::is_owned_route`] alone, so this needs no stored state.
-pub fn sweep_owned_routes(api: Arc<dyn RouteTablePort>) -> Result<usize, RouteSweepError> {
-    let orphans: Vec<RouteEntry> = api
-        .get_ip_forward_table()
-        .map_err(RouteSweepError::Enumerate)?
+/// The rows of the live table carrying our signature
+/// ([`crate::route_codegen::is_owned_route`]), stamped as ours.
+fn signed_routes(api: &dyn RouteTablePort) -> Result<Vec<RouteEntry>, PlatformError> {
+    Ok(api
+        .get_ip_forward_table()?
         .into_iter()
         .filter(crate::route_codegen::is_owned_route)
         .map(|mut r| {
             r.is_ours = true;
             r
         })
-        .collect();
+        .collect())
+}
+
+/// Remove every route in the table that carries our signature, with no service
+/// running to say which it installed. Returns how many went. Recognition is
+/// [`crate::route_codegen::is_owned_route`] alone, so this needs no stored state.
+pub fn sweep_owned_routes(api: Arc<dyn RouteTablePort>) -> Result<usize, RouteSweepError> {
+    let orphans = signed_routes(api.as_ref()).map_err(RouteSweepError::Enumerate)?;
     if orphans.is_empty() {
         return Ok(0);
     }
@@ -1253,31 +1269,50 @@ mod tests {
     }
 
     #[test]
-    fn retain_secondary_hosts_keeps_slash32_drops_overlays() {
-        // graceful stop keeps the /32 rule-routes and
-        // drops NRR's /2 counter-overlay and /1 split-default, so rule-matched
-        // hosts keep egressing the secondary adapter while general traffic returns to the OS
-        // default.
+    fn retain_rule_routes_keeps_every_rule_route_and_drops_overlays() {
+        // Graceful stop: rule routes keep their link, the overlays go and
+        // general traffic returns to the OS default.
         let api = Arc::new(MockWindowsApi::new());
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let host_a = route([198, 51, 100, 8], [10, 0, 0, 1], 14);
         let host_b = route([198, 51, 100, 1], [10, 0, 0, 1], 14);
         let counter_overlay = raw_route([64, 0, 0, 0], 2, [192, 168, 0, 1], 16, true);
         let split_default = raw_route([0, 0, 0, 0], 1, [10, 0, 0, 1], 14, true);
-        rec.reconcile(&[host_a, host_b, counter_overlay, split_default])
-            .unwrap();
-        assert_eq!(rec.owned_count(), 4);
+        // A network rule's pieces sit at their own metric, wide and single.
+        let network_piece = RouteEntry {
+            metric: crate::route_codegen::NETWORK_ROUTE_METRIC,
+            ..raw_route([10, 20, 0, 0], 16, [10, 0, 0, 1], 14, true)
+        };
+        let single_piece = RouteEntry {
+            metric: crate::route_codegen::NETWORK_ROUTE_METRIC,
+            ..raw_route([10, 30, 0, 7], 32, [10, 0, 0, 1], 14, true)
+        };
+        rec.reconcile(&[
+            host_a,
+            host_b,
+            counter_overlay,
+            split_default,
+            network_piece,
+            single_piece,
+        ])
+        .unwrap();
+        assert_eq!(rec.owned_count(), 6);
 
-        let delta = rec.retain_secondary_hosts().unwrap();
+        let delta = rec.retain_rule_routes().unwrap();
         assert_eq!(
             delta.removed, 2,
             "both overlays removed (the /2 and the /1)"
         );
         assert_eq!(delta.added, 0);
-        assert_eq!(rec.owned_count(), 2, "only the two /32 host routes remain");
+        assert_eq!(rec.owned_count(), 4, "hosts and network pieces remain");
         let dests = table_dests(&api);
         assert!(dests.contains(&Ipv4Addr::new(198, 51, 100, 8)));
         assert!(dests.contains(&Ipv4Addr::new(198, 51, 100, 1)));
+        assert!(
+            dests.contains(&Ipv4Addr::new(10, 20, 0, 0)),
+            "a wide piece stays"
+        );
+        assert!(dests.contains(&Ipv4Addr::new(10, 30, 0, 7)));
         assert!(
             !dests.contains(&Ipv4Addr::new(64, 0, 0, 0)),
             "counter-overlay gone"

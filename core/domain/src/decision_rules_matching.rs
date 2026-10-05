@@ -5,7 +5,9 @@
 //! 1. ExactFqdn — exact hostname (always before SuffixDomain for the same hostname)
 //! 2. SuffixDomain — longest suffix domain (`*.label`); covers the apex `label`
 //!    itself and every subdomain of it — see [`match_suffix_domain`]
-//! 3. ExactIp / Zone (tiers 3a/3b) — order per [`ZonePriorityPolicy`] (default: ExactIp first)
+//! 3. ExactIp, Subnet / Zone (tiers 3a/3b) — order per [`ZonePriorityPolicy`]
+//!    (default: addresses first; an exact address before any network, then the
+//!    longest prefix)
 //! 4. Application — process name / glob (address-less rules only)
 //! 5. Default — behavior-mode fallback, no rule matched
 //!
@@ -113,6 +115,18 @@ pub fn match_rules(
                     let candidates: Vec<_> = effective_ips
                         .iter()
                         .flat_map(|ip| collect_exact_ip(rule_book, *ip, &input.app_identity))
+                        .collect();
+                    select_winner(candidates)
+                } else {
+                    None
+                }
+            }
+            // Same availability as an exact address: both read the address.
+            MatchClass::Subnet => {
+                if avail.exact_ip.is_none() {
+                    let candidates: Vec<_> = effective_ips
+                        .iter()
+                        .flat_map(|ip| collect_subnet(rule_book, *ip, &input.app_identity))
                         .collect();
                     select_winner(candidates)
                 } else {
@@ -264,6 +278,41 @@ fn collect_exact_ip(
                         rule.action,
                     ));
                 }
+            }
+        }
+    }
+    out
+}
+
+/// Networks holding `ip`, scored by the prefix of the block that holds it: a
+/// range is as narrow as its piece around the address, so `10.0.0.5-10.0.0.40`
+/// beats `10.0.0.0/24` for `10.0.0.9` on its own merits.
+///
+/// No Block veto here, unlike an exact address: a name inside a blocked network
+/// is the narrower rule and keeps its route.
+fn collect_subnet(
+    rule_book: &CanonicalRuleBook,
+    ip: IpAddr,
+    app_identity: &Option<NormalizedAppIdentity>,
+) -> Vec<RuleMatchCandidate> {
+    let mut out = Vec::new();
+    for role in [RouteRole::Primary, RouteRole::Secondary] {
+        for rule in rule_book.set_for(role).rules() {
+            if !rule.enabled {
+                continue;
+            }
+            let Some(blocks) = rule.address_match.as_ref().and_then(|m| m.ip_blocks()) else {
+                continue;
+            };
+            if let Some(block) = blocks.iter().find(|b| b.contains(ip)) {
+                out.push(make_candidate(
+                    &rule.id,
+                    role,
+                    MatchClass::Subnet,
+                    SpecificityScore(u32::from(block.prefix_len())),
+                    eval_app_filter(rule, app_identity),
+                    rule.action,
+                ));
             }
         }
     }

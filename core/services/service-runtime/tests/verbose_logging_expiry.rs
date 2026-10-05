@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use nrr_diagnostics::{
     LogWriter, LogWriterConfig, LoggingMode, DEFAULT_TRACING_FILTER, VERBOSE_TRACING_FILTER,
 };
-use nrr_service_runtime::verbose_logging::{VerboseLogging, VerboseWindow};
+use nrr_service_runtime::timed_window::TimedWindow;
+use nrr_service_runtime::verbose_logging;
 use nrr_service_runtime::{install_ndjson_tracing_with_verbose, VerbosityControl};
 
 fn now_ms() -> i64 {
@@ -31,20 +32,20 @@ fn an_expired_window_closes_the_filter_and_the_writer_gate() {
     );
     assert_eq!(writer.filter().mode(), LoggingMode::Diagnostic);
 
-    let session = VerboseLogging::resume(
+    let session = verbose_logging::resume(
         Some(deadline),
         now_ms(),
         Some(Arc::new(handle.clone()) as Arc<dyn VerbosityControl>),
     );
-    assert!(matches!(session.window(), VerboseWindow::Until { .. }));
+    assert!(matches!(session.window(), TimedWindow::Until { .. }));
 
     let started = Instant::now();
-    while session.window() != VerboseWindow::Off && started.elapsed() < Duration::from_secs(10) {
+    while session.window() != TimedWindow::Off && started.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
         session.window(),
-        VerboseWindow::Off,
+        TimedWindow::Off,
         "the window must end on its own"
     );
     assert_eq!(

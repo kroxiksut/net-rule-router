@@ -15,6 +15,7 @@
 //! | [`ExactFqdn(name)`] | N | one per cached resolved IPv4. Cold cache → 0 + diagnostic. |
 //! | [`SuffixDomain(suffix)`] | Σ | for the apex and each cached subdomain × its cached IPv4 set. Cold cache → 0 + diagnostic. |
 //! | [`Zone(zone)`] | Σ | same fan-out as `SuffixDomain` minus the apex — the bare zone label is not a member of its zone. |
+//! | [`Subnet`] / [`IpRange`] | P | one `remote_subnet` filter per piece: the rule's blocks minus the narrower rules inside them (see `enforcement_planner::NetworkCarving`). Never per address. |
 //! | App match (no address) | N | one per resolved exe path — the name/glob is resolved to concrete on-disk paths (`app_pattern` = absolute Win32 path). Unresolved name/glob → 0 + `AppUnresolved` diagnostic. |
 //! | App match + address | 0 | not enforceable as written: skipped with an `UnsupportedRuleShape` diagnostic, never widened to every application. |
 //! | Default (`StrictSecondaryFailClosed`) | 1 | catch-all `Block` filter at the lowest weight. |
@@ -24,6 +25,8 @@
 //! [`ExactFqdn(name)`]: nrr_domain::canonical::CanonicalAddressMatch::ExactFqdn
 //! [`SuffixDomain(suffix)`]: nrr_domain::canonical::CanonicalAddressMatch::SuffixDomain
 //! [`Zone(zone)`]: nrr_domain::canonical::CanonicalAddressMatch::Zone
+//! [`Subnet`]: nrr_domain::canonical::CanonicalAddressMatch::Subnet
+//! [`IpRange`]: nrr_domain::canonical::CanonicalAddressMatch::IpRange
 //!
 //! ## Weight assignment
 //!
@@ -77,6 +80,7 @@ use nrr_domain::rule_shape::{
 };
 use nrr_platform_api::enforcement::EnforcementCapabilities;
 use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey};
+use nrr_shared::ip_block::IpBlock;
 use nrr_shared::{RouteBehaviorMode, RouteRole};
 
 use crate::address_ownership::AppDestinationRefusal;
@@ -149,6 +153,8 @@ pub const PER_HOSTNAME_IP_CAP: usize = 64;
 // never make an unimplemented shape pass the submission gate.
 const EMITS_APP_SCOPED_DESTINATION_BLOCK: bool = false;
 const EMITS_APP_SCOPED_DESTINATION_ROUTE: bool = false;
+// Filters, routes, the kill-switch and Fail-Closed all carry networks.
+const EMITS_NETWORK_DESTINATION: bool = true;
 
 /// The rule shapes enforcement carries out, given `caps`: what the emitters
 /// implement AND what the platform can hold.
@@ -159,6 +165,7 @@ pub fn rule_shape_support(caps: &EnforcementCapabilities) -> RuleShapeSupport {
             && caps.per_app_block_leakproof,
         app_scoped_destination_route: EMITS_APP_SCOPED_DESTINATION_ROUTE
             && caps.per_app_routing_true,
+        network_destination: EMITS_NETWORK_DESTINATION,
     }
 }
 
@@ -309,6 +316,12 @@ pub struct CodegenOutput {
     /// contributes nothing here, so its destinations keep their pins — no
     /// per-app pair protects them.
     pub app_observed_secondary_ips: Vec<Ipv4Addr>,
+    /// The network pieces the secondary route rules' filters carry, in emission
+    /// order: each is address space that rule set owns, narrower rules already
+    /// carved out — the network twin of [`Self::secondary_dest_ips`].
+    pub secondary_dest_networks: Vec<IpBlock>,
+    /// The network pieces the primary route rules' filters carry.
+    pub primary_dest_networks: Vec<IpBlock>,
 }
 
 impl CodegenOutput {
@@ -451,6 +464,14 @@ pub enum CodegenDiagnostic {
         rule_id: String,
         reason: UnsupportedShapeReason,
     },
+    /// Carving the narrower rules out of a network rule needed more than
+    /// `cap` pieces, so its filters cover its own blocks uncarved and the
+    /// narrower rules inside lose to it. `pieces` is where carving stopped.
+    NetworkCarvingOverCap {
+        rule_id: String,
+        pieces: usize,
+        cap: usize,
+    },
     /// Fail-closed catch-all `Block` filter was emitted. Exactly
     /// one of these appears per codegen output when
     /// `behavior_mode == StrictSecondaryFailClosed`. Useful for
@@ -547,6 +568,16 @@ impl From<crate::rule_conflicts::RuleConflict> for CodegenDiagnostic {
 /// vectors. Same inputs → identical filter ids and identical
 /// diagnostic vector.
 pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
+    generate_filters_with_shapes(input, current_rule_shape_support())
+}
+
+/// [`generate_filters`] under an explicit shape support, so a shape the service
+/// does not enforce yet can be emitted and tested ahead of the switch.
+#[doc(hidden)]
+pub fn generate_filters_with_shapes(
+    input: CodegenInput<'_>,
+    shapes: RuleShapeSupport,
+) -> CodegenOutput {
     let mut out = CodegenOutput::default();
 
     // a cache view that hides policy-declined shared IPs.
@@ -561,17 +592,25 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
     // filter from this offset on is secondary-driven — that slice gives
     // us the kill-switch's protected destination set.
     let mut secondary_filter_start = 0usize;
-    let shapes = current_rule_shape_support();
     // Who owns which address, decided once by the arbiter every mechanism reads.
     // Resolved from the UNFILTERED cache: the denylist view exists to trim what
     // goes to the tunnel, and reading it here would understate what the main
     // link claims.
+    let order = crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+        input.zone_priority_over_ip,
+    );
     let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
         input.rule_book,
         input.fqdn_cache,
-        crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
-            input.zone_priority_over_ip,
-        ),
+        order,
+    );
+    let carving = crate::enforcement_planner::NetworkCarving::index(
+        input.rule_book,
+        input.fqdn_cache,
+        &ownership,
+        order,
+        shapes,
+        input.secondary_ip_denylist,
     );
     for (role_idx, role) in [RouteRole::Primary, RouteRole::Secondary]
         .into_iter()
@@ -610,6 +649,7 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
                 cache_for_role,
                 &gate,
                 &ownership,
+                &carving,
                 input.app_resolver,
                 input.families,
                 shapes,
@@ -639,6 +679,9 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
     // emission order) for the per-app kill-switch. Only Permit (route) app rules
     // contribute — a Block app rule is being dropped, not routed via the secondary adapter, so
     // it must not be "protected". Mirrors the secondary_dest_ips collection.
+    out.secondary_dest_networks = destination_networks(&out.filters[secondary_filter_start..]);
+    out.primary_dest_networks = destination_networks(&out.filters[..secondary_filter_start]);
+
     out.secondary_app_patterns = {
         let mut seen = std::collections::HashSet::new();
         out.filters[secondary_filter_start..]
@@ -753,6 +796,7 @@ fn generate_for_rule(
     cache: &dyn FqdnCacheLookup,
     gate: &crate::address_ownership::AppDestinationGate<'_>,
     ownership: &crate::address_ownership::AddressOwnership,
+    carving: &crate::enforcement_planner::NetworkCarving,
     app_resolver: &dyn nrr_platform_api::AppPathResolver,
     families: crate::enforcement_planner::FamilyScope,
     shapes: RuleShapeSupport,
@@ -808,7 +852,18 @@ fn generate_for_rule(
     };
     // A rule naming both matches as AND; the shape gate above let one through
     // only once the emitters below can scope the address to the application.
-    if let Some(addr_match) = rule.address_match.as_ref() {
+    if let Some(blocks) = rule.address_match.as_ref().and_then(|m| m.ip_blocks()) {
+        let carved = carving.pieces(blocks, link, rule.action, families);
+        if let Some(pieces) = carved.over_cap {
+            out.diagnostics
+                .push(CodegenDiagnostic::NetworkCarvingOverCap {
+                    rule_id: rule.id.as_str().to_string(),
+                    pieces,
+                    cap: crate::enforcement_planner::NETWORK_PIECE_CAP,
+                });
+        }
+        emit_network_filters(sid, role_slug, ctx, pos, rule, &carved.pieces, out);
+    } else if let Some(addr_match) = rule.address_match.as_ref() {
         // Conflicts the user must see, noted while the fan-out walks hosts.
         let walk = std::cell::RefCell::new(crate::rule_conflicts::AddressRuleWalk::new(
             ownership,
@@ -859,6 +914,8 @@ fn emit_for_address_match(
     match addr_match {
         // The pass names no IPv6 while no link carries the family.
         CanonicalAddressMatch::ExactIp(addr) if !ctx.families.admits(*addr) => {}
+        // Networks are emitted by `emit_network_filters`, never as hosts.
+        CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_) => {}
         CanonicalAddressMatch::ExactIp(addr) => {
             let addr = *addr;
             if steerable(None, addr) {
@@ -1223,6 +1280,90 @@ fn destination_ips(spec: &WfpFilterSpec) -> impl Iterator<Item = IpAddr> + '_ {
         .chain(spec.remote_ip_set_v6.iter().copied().map(IpAddr::V6))
 }
 
+/// Every network piece the route filters carry, deduplicated in emission
+/// order. Packet mirrors exist only for Blocks, so the ALE filters suffice.
+fn destination_networks(filters: &[WfpFilterSpec]) -> Vec<IpBlock> {
+    let mut seen = std::collections::HashSet::new();
+    filters
+        .iter()
+        .filter(|f| f.action == WfpAction::Permit)
+        .filter_map(|f| {
+            f.remote_subnet
+                .and_then(|(net, len)| IpBlock::new(IpAddr::V4(net), len))
+                .or_else(|| {
+                    f.remote_subnet_v6
+                        .and_then(|(net, len)| IpBlock::new(IpAddr::V6(net), len))
+                })
+        })
+        .filter(|b| seen.insert(*b))
+        .collect()
+}
+
+/// One filter per network piece, at the rule's own slots. A Block piece gets
+/// its packet-layer mirror, as a host Block does.
+fn emit_network_filters(
+    sid: &str,
+    role_slug: &str,
+    ctx: EmitContext,
+    pos: u64,
+    rule: &CanonicalRule,
+    pieces: &[IpBlock],
+    out: &mut CodegenOutput,
+) {
+    let kind = format!("{}network", ctx.kind_prefix);
+    let pkt_kind = format!("{kind}-pkt");
+    for (idx, piece) in pieces.iter().enumerate() {
+        let weight = rule_weight(ctx.base_weight, pos, idx as u64);
+        let target = piece.to_string();
+        let id = filter_id_for(sid, role_slug, rule.id.as_str(), &kind, &target);
+        let mut spec = network_spec(*piece, false, ctx.action, weight, id);
+        spec.user_sid = Some(sid.to_string());
+        out.filters.push(spec);
+        if ctx.is_block() {
+            let id = filter_id_for(sid, role_slug, rule.id.as_str(), &pkt_kind, &target);
+            out.filters
+                .push(network_spec(*piece, true, WfpAction::Block, weight, id));
+        }
+    }
+}
+
+/// A filter whose only destination condition is `piece`, unscoped to a user.
+fn network_spec(
+    piece: IpBlock,
+    packet_layer: bool,
+    action: WfpAction,
+    weight: u64,
+    id: WfpFilterId,
+) -> WfpFilterSpec {
+    let prefix = piece.prefix_len();
+    let (layer, remote_subnet, remote_subnet_v6) = match piece.network() {
+        IpAddr::V4(net) if packet_layer => {
+            (WfpLayerKey::OutboundIpPacketV4, Some((net, prefix)), None)
+        }
+        IpAddr::V4(net) => (WfpLayerKey::AleAuthConnectV4, Some((net, prefix)), None),
+        IpAddr::V6(net) if packet_layer => {
+            (WfpLayerKey::OutboundIpPacketV6, None, Some((net, prefix)))
+        }
+        IpAddr::V6(net) => (WfpLayerKey::AleAuthConnectV6, None, Some((net, prefix))),
+    };
+    WfpFilterSpec {
+        layer,
+        action,
+        remote_ip: None,
+        remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
+        remote_port: None,
+        weight,
+        id,
+        user_sid: None,
+        app_pattern: None,
+        local_interface_luid: None,
+        remote_subnet,
+        remote_subnet_v6,
+        ip_protocol: None,
+    }
+}
+
 /// Emit one rule's address set as PACKED chunks instead of one filter per
 /// address.
 ///
@@ -1404,5 +1545,7 @@ pub fn filter_id_for(
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+mod network_tests;
 #[cfg(test)]
 mod tests;

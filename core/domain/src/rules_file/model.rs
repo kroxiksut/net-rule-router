@@ -8,8 +8,8 @@ use super::*;
 /// appear exactly as listed in files. The GUI may display localized descriptions
 /// *about* each section, but the name itself is invariant.
 ///
-/// The enum is `#[non_exhaustive]`: further sections (`CIDR`, `Ports`, …) may
-/// become variants later.
+/// The enum is `#[non_exhaustive]`: further sections (`Ports`, …) may become
+/// variants later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum RulesFileSection {
@@ -21,9 +21,16 @@ pub enum RulesFileSection {
     /// Suffix and exact FQDN domain rules.
     /// Active in the Free edition on all platforms.
     Domains,
-    /// Exact IP address rules. No CIDR; CIDR matching is not supported.
+    /// Exact IP address rules, one address per line. A network or a range is
+    /// a line error here, never re-filed.
     /// Active in the Free edition on all platforms.
     Ip,
+    /// Network rules, `10.0.0.0/8` or `2001:db8::/32`.
+    /// Active in the Free edition on all platforms.
+    Cidr,
+    /// Address range rules, `10.0.0.5-10.0.0.40`.
+    /// Active in the Free edition on all platforms.
+    Ranges,
     /// Windows application rules matched by `.exe` filename (case-insensitive).
     /// Present in files on all platforms; applied **only on Windows**.
     Windows,
@@ -51,10 +58,12 @@ impl RulesFileSection {
     ///
     /// `Auto` sorts last so a file reads as "what you wrote, then what the
     /// application added for you".
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Zones,
         Self::Domains,
         Self::Ip,
+        Self::Cidr,
+        Self::Ranges,
         Self::Windows,
         Self::Linux,
         Self::MacOS,
@@ -69,6 +78,8 @@ impl RulesFileSection {
             Self::Zones => "Zones",
             Self::Domains => "Domains",
             Self::Ip => "IP",
+            Self::Cidr => "CIDR",
+            Self::Ranges => "Ranges",
             Self::Windows => "Windows",
             Self::Linux => "Linux",
             Self::MacOS => "MacOS",
@@ -82,7 +93,7 @@ impl RulesFileSection {
     /// preserved in the file — they are never silently stripped on export.
     pub const fn is_active_on(self, platform: HostPlatform) -> bool {
         match self {
-            Self::Zones | Self::Domains | Self::Ip | Self::Auto => true,
+            Self::Zones | Self::Domains | Self::Ip | Self::Cidr | Self::Ranges | Self::Auto => true,
             Self::Windows => matches!(platform, HostPlatform::Windows),
             Self::Linux => matches!(platform, HostPlatform::Linux),
             Self::MacOS => matches!(platform, HostPlatform::MacOS),
@@ -105,7 +116,7 @@ impl RulesFileSection {
             Self::Windows => Some(HostPlatform::Windows),
             Self::Linux => Some(HostPlatform::Linux),
             Self::MacOS => Some(HostPlatform::MacOS),
-            Self::Zones | Self::Domains | Self::Ip | Self::Auto => None,
+            Self::Zones | Self::Domains | Self::Ip | Self::Cidr | Self::Ranges | Self::Auto => None,
         }
     }
 
@@ -132,6 +143,8 @@ impl RulesFileSection {
             "zones" => Some(Self::Zones),
             "domains" => Some(Self::Domains),
             "ip" => Some(Self::Ip),
+            "cidr" => Some(Self::Cidr),
+            "ranges" => Some(Self::Ranges),
             "windows" => Some(Self::Windows),
             "linux" => Some(Self::Linux),
             "macos" => Some(Self::MacOS),

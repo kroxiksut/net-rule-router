@@ -37,6 +37,7 @@ impl ProductionMutationExecutor {
     ) -> Result<SecurityAlertMutationPayload, OperationError> {
         serde_json::from_value::<SecurityAlertMutationPayload>(payload.clone()).map_err(|e| {
             OperationError {
+                args: Default::default(),
                 code: "malformed-payload".into(),
                 message: format!("SecurityAlert payload invalid: {e}"),
             }
@@ -58,6 +59,7 @@ impl ProductionMutationExecutor {
         };
         let Some(repo) = self.alerts_repo.as_ref() else {
             return MutationOutcome::Failed(OperationError {
+                args: Default::default(),
                 code: "alerts-store-unavailable".into(),
                 message: "security alerts repository not wired".into(),
             });
@@ -66,12 +68,14 @@ impl ProductionMutationExecutor {
             Ok(Some(a)) => a,
             Ok(None) => {
                 return MutationOutcome::Failed(OperationError {
+                    args: Default::default(),
                     code: "alert-not-found".into(),
                     message: format!("alert {} not found", parsed.alert_id),
                 });
             }
             Err(e) => {
                 return MutationOutcome::Failed(OperationError {
+                    args: Default::default(),
                     code: "alerts-storage-failure".into(),
                     message: format!("alerts repo find_by_id failed: {e}"),
                 });
@@ -93,6 +97,7 @@ impl ProductionMutationExecutor {
         );
         if !allowed {
             return MutationOutcome::Failed(OperationError {
+                args: Default::default(),
                 code: "illegal-state-transition".into(),
                 message: format!(
                     "cannot transition alert {} from {} to {}",
@@ -118,6 +123,7 @@ impl ProductionMutationExecutor {
             now_ms,
         ) {
             return MutationOutcome::Failed(OperationError {
+                args: Default::default(),
                 code: "alerts-storage-failure".into(),
                 message: format!("alerts update_state failed: {e}"),
             });
@@ -198,6 +204,7 @@ impl ProductionMutationExecutor {
                 ),
             })
             .map_err(|e| OperationError {
+                args: Default::default(),
                 code: "audit-write-failed".into(),
                 message: format!("could not record the alert change: {e}"),
             })

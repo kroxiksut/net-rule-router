@@ -139,3 +139,103 @@ fn every_reported_winner_is_the_engines_winner() {
         assert_eq!(candidate.route_role, expected, "{host}: {overlap:?}");
     }
 }
+
+fn ip(id: &str, address: &str) -> RuleDto {
+    rule(
+        id,
+        AddressMatchDto::ExactIpv4 {
+            address: address.into(),
+        },
+    )
+}
+
+fn subnet(id: &str, network: &str) -> RuleDto {
+    rule(
+        id,
+        AddressMatchDto::Subnet {
+            network: network.into(),
+        },
+    )
+}
+
+fn range(id: &str, first: &str, last: &str) -> RuleDto {
+    rule(
+        id,
+        AddressMatchDto::IpRange {
+            first: first.into(),
+            last: last.into(),
+        },
+    )
+}
+
+/// Nested and duplicate address pairs: the winner's first address lies in both
+/// rules, and the engine must route it the way the screen says.
+#[test]
+fn every_reported_address_winner_is_the_engines_winner() {
+    let dto = CanonicalRulesJsonV1 {
+        schema_version: RULES_JSON_SCHEMA_VERSION,
+        primary: vec![
+            subnet("P1", "10.0.0.0/8"),
+            ip("P2", "192.168.7.7"),
+            subnet("P3", "172.16.5.0/24"),
+            blocking(subnet("P4", "10.99.0.0/16")),
+        ],
+        secondary: vec![
+            subnet("S1", "10.20.0.0/16"),
+            subnet("S2", "192.168.0.0/16"),
+            range("S3", "172.16.5.0", "172.16.5.255"),
+            range("S4", "10.99.0.5", "10.99.0.40"),
+        ],
+    };
+    let found = find_route_overlaps(&dto, false);
+    assert!(found.len() >= 5, "{found:?}");
+    for overlap in &found {
+        let pick = |id: &str| {
+            dto.primary
+                .iter()
+                .chain(&dto.secondary)
+                .find(|r| r.id == id)
+                .cloned()
+                .expect("reported rule is in the book")
+        };
+        let mut pair = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: Vec::new(),
+            secondary: Vec::new(),
+        };
+        for side in [&overlap.winner, &overlap.loser] {
+            let target = if side.route == "primary" {
+                &mut pair.primary
+            } else {
+                &mut pair.secondary
+            };
+            target.push(pick(&side.rule_id));
+        }
+        let book = decode(pair, HostPlatform::Windows)
+            .expect("pair decodes")
+            .rule_book;
+        let address: std::net::IpAddr = overlap
+            .winner
+            .value
+            .split(['/', '-'])
+            .next()
+            .and_then(|a| a.parse().ok())
+            .expect("an address starts the winner's value");
+        let decision = match_sample(
+            &book,
+            None,
+            Some(address),
+            None,
+            ZonePriorityPolicy::default(),
+            RouteBehaviorMode::PreferPrimary,
+        );
+        let RequestedRouteDecision::MatchedRoute { candidate } = decision else {
+            panic!("{address} matched nothing");
+        };
+        assert_eq!(
+            candidate.rule_id.as_str(),
+            overlap.winner.rule_id,
+            "{address}: {overlap:?}"
+        );
+    }
+}

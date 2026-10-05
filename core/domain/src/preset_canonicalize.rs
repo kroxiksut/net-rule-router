@@ -61,7 +61,7 @@
 //!   [`CanonicalAddressMatch::SuffixDomain`]; display layer restores it.
 //! - **Platform-inactive sections** — on Windows, `--- Linux` and `--- MacOS`
 //!   entries are excluded from the canonical rule set (never applied to routing).
-//! - **unsupported section entries** — entries in unknown sections (e.g. `--- CIDR`,
+//! - **unsupported section entries** — entries in unknown sections (e.g. `--- Geo`,
 //!   `--- Ports`) are not converted; they live in `ParseOutcome::unknown_sections`
 //!   and are round-tripped through the file, but they are outside the canonical
 //!   policy boundary for the Free edition.
@@ -343,6 +343,8 @@ mod tests {
                 Some(CanonicalAddressMatch::Zone(_)) => 2,
                 Some(CanonicalAddressMatch::ExactIp(_)) => 3,
                 None => 4,
+                Some(CanonicalAddressMatch::Subnet(_)) => 5,
+                Some(CanonicalAddressMatch::IpRange(_)) => 6,
             })
             .collect();
         assert!(
@@ -534,8 +536,8 @@ mod tests {
 
     #[test]
     fn unsupported_sections_not_in_canonical_rule_set() {
-        // CIDR entries live in unknown_sections and must not enter the canonical set.
-        let set = rule_set("--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n");
+        // Geo entries live in unknown_sections and must not enter the canonical set.
+        let set = rule_set("--- Domains\nexample.com\n--- Geo\n10.0.0.0/8\n");
         assert_eq!(set.len(), 1);
         let value = match &set.rules()[0].address_match {
             Some(CanonicalAddressMatch::ExactFqdn(v)) => v.as_str(),
@@ -610,7 +612,7 @@ mod tests {
                     errors.iter().all(|e| matches!(
                         e,
                         ValidationError::InvalidIpAddress { .. }
-                            | ValidationError::CidrNotSupported { .. }
+                            | ValidationError::WrongAddressSection { .. }
                     )),
                     "{value}: {errors:?}"
                 ),

@@ -339,7 +339,7 @@ QtObject {
         root.statusLine = root.tr("status.rules-activate-failed",
             "Failed to activate rules: ") +
             ((typeof root.ipcErrorLabel === "function")
-                ? root.ipcErrorLabel(String(code || "unknown"))
+                ? root.ipcErrorLabel(String(code || "unknown"), root.rpc.lastFailureArgs)
                 : String(code || "unknown"))
     }
 

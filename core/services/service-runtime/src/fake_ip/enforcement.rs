@@ -24,6 +24,7 @@ use std::net::Ipv4Addr;
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleSet};
 use nrr_platform_api::fake_ip::{FakeIpPoolConfig, FakeIpScope};
 use nrr_platform_api::types::WfpFilterSpec;
+use nrr_shared::ip_block::IpBlock;
 
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::wfp_codegen::{PER_HOSTNAME_IP_CAP, SUFFIX_FANOUT_BACKSTOP};
@@ -103,6 +104,10 @@ pub fn plan_fake_ip_enforcement(
             CanonicalAddressMatch::Zone(zone) => {
                 cache.hostnames_under_suffix(zone, SUFFIX_FANOUT_BACKSTOP)
             }
+            // A network names addresses, not hosts a virtual address could stand
+            // in for, and suppresses nothing. Nor does it lift a suppression:
+            // its allow carves the declined set out (`DeclinedAddresses`).
+            CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_) => continue,
             // Literal IPs (and app rules, carried on a separate field) have no
             // name to hand a fake address, so fake-IP does not apply.
             CanonicalAddressMatch::ExactIp(_) => Vec::new(),
@@ -130,6 +135,15 @@ pub fn plan_fake_ip_enforcement(
         .collect();
 
     FakeIpEnforcementPlan { suppress_ips }
+}
+
+/// Whether a rule network shares any address with the fake-IP pool, an
+/// IPv4-mapped network read as its IPv4 one. Such a rule is refused whether or
+/// not fake-IP is on: the toggle flips later without the rules being checked
+/// again, and a network over the pool steers virtual addresses off the TUN.
+#[must_use]
+pub fn network_overlaps_fake_ip_pool(network: IpBlock, pool: &FakeIpPoolConfig) -> bool {
+    pool.overlaps_block(nrr_domain::ip_network_policy::canonical_block(network))
 }
 
 /// What the per-SID orchestrator needs to fold fake-IP into a filter plan: the
@@ -416,6 +430,73 @@ mod tests {
                 .all(|f| f.ip_protocol.is_none()),
             "the pool permit(s) must stay protocol-agnostic when the UDP relay is enabled"
         );
+    }
+
+    fn subnet_rule(net: &str) -> CanonicalRule {
+        CanonicalRule {
+            id: RuleId(format!("r-{net}")),
+            enabled: true,
+            address_match: Some(CanonicalAddressMatch::Subnet(
+                IpBlock::parse(net).expect("test network literal"),
+            )),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_domain::RuleAction::Route,
+            origin: None,
+        }
+    }
+
+    /// A network alone hands out no virtual address and suppresses nothing,
+    /// whatever the census says about the addresses inside it.
+    #[test]
+    fn a_network_rule_alone_never_contributes() {
+        let cache = MockFqdnCacheLookup::new();
+        let plan = plan_fake_ip_enforcement(
+            &FakeIpScope::enabled(Vec::<String>::new()),
+            &CanonicalRuleSet::from_rules(vec![subnet_rule("203.0.113.0/24")]),
+            &cache,
+            &SharedSet(vec![ip(203, 0, 113, 140)]),
+        );
+        assert!(plan.suppress_ips.is_empty());
+    }
+
+    /// A wide allow must not re-admit what the census suppressed: the scope
+    /// host's shared address stays suppressed with a network around it, and
+    /// the final denylist hands it to that network's carve-out.
+    #[test]
+    fn a_network_around_a_suppressed_address_does_not_readmit_it() {
+        let cache = MockFqdnCacheLookup::new();
+        let shared = ip(203, 0, 113, 140);
+        let own = ip(203, 0, 113, 141);
+        cache.set_ips("assistant.example", vec![shared, own]);
+        let secondary = CanonicalRuleSet::from_rules(vec![
+            subnet_rule("203.0.113.0/24"),
+            fqdn_rule("assistant.example"),
+        ]);
+        let base: HashSet<Ipv4Addr> = [shared].into_iter().collect();
+        let aug =
+            augment_codegen_for_fake_ip("S-1-5-21-3", &ctx(true), &secondary, &cache, &base, false);
+        assert_eq!(aug.denylist_additions, vec![shared]);
+
+        let mut denylist = base;
+        denylist.extend(aug.denylist_additions);
+        let declined = crate::secondary_ip_policy::DeclinedAddresses::new(&denylist);
+        let network = IpBlock::parse("203.0.113.0/24").expect("block");
+        assert_eq!(declined.inside(network), &[shared]);
+    }
+
+    #[test]
+    fn a_network_over_the_pool_is_refused() {
+        let pool = FakeIpPoolConfig::default();
+        let net = |text: &str| IpBlock::parse(text).expect("test network literal");
+        assert!(network_overlaps_fake_ip_pool(net("198.18.0.0/16"), &pool));
+        assert!(network_overlaps_fake_ip_pool(net("198.0.0.0/8"), &pool));
+        assert!(network_overlaps_fake_ip_pool(
+            net("::ffff:198.19.0.0/112"),
+            &pool
+        ));
+        assert!(!network_overlaps_fake_ip_pool(net("10.0.0.0/8"), &pool));
+        assert!(!network_overlaps_fake_ip_pool(net("198.20.0.0/14"), &pool));
     }
 
     #[test]

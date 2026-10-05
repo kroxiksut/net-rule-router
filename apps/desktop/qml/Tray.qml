@@ -1901,6 +1901,11 @@ SystemTrayIcon {
                 "Main connection is not set")
             body = tr("notifications.enforcement.no-primary.body",
                 "Without a main connection there is nowhere to send traffic your rules do not route, so the rules are not being applied.")
+        } else if (status === "primary-no-way-out") {
+            title = tr("notifications.enforcement.primary-no-way-out.title",
+                "The main connection has no way to the internet")
+            body = tr("notifications.enforcement.primary-no-way-out.body",
+                "The connection chosen as main has no gateway, so traffic your rules do not route is going out the way the system sends it instead. Choose the connection that actually reaches the internet as main.")
         } else if (status === "no-policy") {
             title = tr("notifications.enforcement.no-policy.title",
                 "Connections are not chosen yet")

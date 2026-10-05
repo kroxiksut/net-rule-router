@@ -210,6 +210,10 @@ pub(super) struct DiagnosticTally {
     pub(super) app_rule_dest_used_by_other_process: usize,
     pub(super) address_claimed_by_main_link: usize,
     pub(super) primary_exceptions_unavailable: usize,
+    pub(super) network_yields_to_local_network: usize,
+    pub(super) network_routed_around_tunnel_server: usize,
+    pub(super) network_claimed_by_main_link: usize,
+    pub(super) network_routes_capped: usize,
 }
 
 pub(super) fn diagnostic_tally(
@@ -232,6 +236,10 @@ pub(super) fn diagnostic_tally(
             }
             D::AddressClaimedByMainLink { count, .. } => t.address_claimed_by_main_link += count,
             D::PrimaryExceptionsUnavailable => t.primary_exceptions_unavailable += 1,
+            D::NetworkYieldsToLocalNetwork { .. } => t.network_yields_to_local_network += 1,
+            D::NetworkRoutedAroundTunnelServer { .. } => t.network_routed_around_tunnel_server += 1,
+            D::NetworkClaimedByMainLink { .. } => t.network_claimed_by_main_link += 1,
+            D::NetworkRoutesCapped { .. } => t.network_routes_capped += 1,
         }
     }
     t
@@ -361,6 +369,22 @@ pub(super) fn derive_secondary_next_hop_v6(
     ifindex: u32,
 ) -> Option<std::net::Ipv6Addr> {
     nrr_platform_api::interface_rows::derive_forwarding_next_hop_v6(routes, ifindex)
+}
+
+/// Whether `info` can carry traffic out on its own: a gateway, or a forwarding
+/// path in routes we did not install. Our overlay through an adapter proves
+/// nothing about it — counted, a host-only link once used as the main one
+/// would keep vouching for itself.
+pub(super) fn has_own_way_out(
+    info: &AdapterInfo,
+    routes: &[RouteEntry],
+    owns: impl Fn(&RouteEntry) -> bool,
+) -> bool {
+    if !info.gateways.is_empty() {
+        return true;
+    }
+    let foreign: Vec<RouteEntry> = routes.iter().filter(|r| !owns(r)).cloned().collect();
+    nrr_platform_api::interface_rows::derive_forwarding_next_hop(&foreign, info.index).is_some()
 }
 
 /// Derive the **primary** routing target (gateway + interface) from the OS

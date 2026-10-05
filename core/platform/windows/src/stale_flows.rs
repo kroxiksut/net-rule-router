@@ -19,7 +19,7 @@
 #![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use windows::Win32::NetworkManagement::IpHelper::{
@@ -27,7 +27,9 @@ use windows::Win32::NetworkManagement::IpHelper::{
     MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB,
 };
 
-use nrr_platform_api::fake_ip::stale_flows::{EstablishedFlow, StaleFlowReset, StaleFlowSweep};
+use nrr_platform_api::fake_ip::stale_flows::{
+    EstablishedFlow, FlowTargets, StaleFlowReset, StaleFlowSweep,
+};
 
 use crate::flow_owner::{read_tcp_owner_pid_table, row_endpoint};
 use crate::win32_ffi::console_session::process_user_sid;
@@ -119,11 +121,11 @@ impl StaleFlowReset for WindowsStaleFlowReset {
         sweep
     }
 
-    fn established_flows_to(&self, targets: &[Ipv4Addr]) -> Vec<EstablishedFlow> {
+    fn established_flows_matching(&self, targets: &FlowTargets) -> Vec<EstablishedFlow> {
         if targets.is_empty() {
             return Vec::new();
         }
-        let wanted: HashSet<u32> = targets.iter().copied().map(u32::from).collect();
+        let wanted = targets.matcher();
         let Some(buffer) = read_tcp_owner_pid_table() else {
             return Vec::new();
         };
@@ -137,7 +139,7 @@ impl StaleFlowReset for WindowsStaleFlowReset {
             for i in 0..count {
                 let row = &*rows.add(i);
                 if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32
-                    && wanted.contains(&u32::from_be(row.dwRemoteAddr))
+                    && wanted.matches(Ipv4Addr::from(u32::from_be(row.dwRemoteAddr)))
                 {
                     let (local, remote) = row_endpoints(row);
                     matched.push((local, remote, row.dwOwningPid));
@@ -369,6 +371,10 @@ mod tests {
             .established_flows_to(&[nobody])
             .is_empty());
         assert!(WindowsStaleFlowReset.established_flows_to(&[]).is_empty());
+        let unused = nrr_shared::ip_block::IpBlock::parse("192.0.2.240/28").expect("test network");
+        assert!(WindowsStaleFlowReset
+            .established_flows_matching(&FlowTargets::new(Vec::new(), vec![unused]))
+            .is_empty());
     }
 
     #[test]

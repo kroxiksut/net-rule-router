@@ -216,5 +216,7 @@ fn display_value(m: &CanonicalAddressMatch) -> String {
         CanonicalAddressMatch::SuffixDomain(suffix) => format!("*.{suffix}"),
         CanonicalAddressMatch::Zone(zone) => zone.clone(),
         CanonicalAddressMatch::ExactIp(ip) => ip.to_string(),
+        CanonicalAddressMatch::Subnet(block) => block.to_string(),
+        CanonicalAddressMatch::IpRange(range) => range.to_string(),
     }
 }

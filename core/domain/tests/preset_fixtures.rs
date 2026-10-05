@@ -194,7 +194,7 @@ fn duplicate_domains_accepted_with_warnings_and_second_copy_dropped() {
 
 static EXTENDED_SECTIONS: &[u8] = include_bytes!("fixtures/preset_with_extended_sections.txt");
 
-/// unsupported sections (CIDR, Ports) are not included in the canonical rule set
+/// unsupported sections (Geo, Ports) are not included in the canonical rule set
 /// but their entries are preserved in `ParseOutcome::unknown_sections`.
 #[test]
 fn extended_sections_not_in_canonical_rule_set() {
@@ -216,7 +216,7 @@ fn extended_sections_not_in_canonical_rule_set() {
         warnings
             .iter()
             .any(|w| matches!(w, PresetImportWarning::UnknownSection { .. })),
-        "expected UnknownSection warning for CIDR/Ports sections"
+        "expected UnknownSection warning for Geo/Ports sections"
     );
 
     // The canonical rule set contains only Free-edition rules.
@@ -243,15 +243,15 @@ fn extended_sections_not_in_canonical_rule_set() {
         !parse_outcome.unknown_sections.is_empty(),
         "unsupported sections must be preserved in unknown_sections"
     );
-    let cidr = parse_outcome
+    let geo = parse_outcome
         .unknown_sections
         .iter()
-        .find(|s| s.name == "CIDR");
-    assert!(cidr.is_some(), "CIDR section must be preserved");
+        .find(|s| s.name == "Geo");
+    assert!(geo.is_some(), "Geo section must be preserved");
     assert_eq!(
-        cidr.expect("checked above").entries.len(),
+        geo.expect("checked above").entries.len(),
         2,
-        "CIDR must have 2 entries"
+        "Geo must have 2 entries"
     );
 
     let ports = parse_outcome

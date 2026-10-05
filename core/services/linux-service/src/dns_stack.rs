@@ -21,7 +21,9 @@ use nrr_platform_linux::dns_redirect::{
     clear_every_redirect, detect_capture_method, DnsCaptureMethod, DnsCaptureParts,
     DnsCaptureSelector, DnsFiles, SystemDnsCommands,
 };
-use nrr_service_runtime::dns_resolver_service::{DnsResolverController, DnsResolverFactory};
+use nrr_service_runtime::dns_resolver_service::{
+    ArmRefusal, DnsResolverController, DnsResolverFactory,
+};
 use nrr_service_runtime::dns_stack::{DnsStackInputs, DnsStackPlatform};
 use nrr_service_runtime::dns_upstream::{UdpUpstreamProbe, UpstreamDnsPool};
 
@@ -277,7 +279,7 @@ pub(crate) fn resolver_controller(
                 error = %e,
                 "the DNS listener's address could not be prepared; the local resolver stays off",
             );
-            return None;
+            return Err(ArmRefusal::Unavailable);
         }
         (armed.build)()
     });

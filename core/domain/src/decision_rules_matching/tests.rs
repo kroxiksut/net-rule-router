@@ -1456,3 +1456,137 @@ fn a_narrower_route_still_beats_a_wider_block() {
     );
     assert_eq!(matched_rule_id(&d), Some("r-exact"));
 }
+
+// ── Subnets and ranges ────────────────────────────────────────────────────
+
+fn subnet(text: &str) -> CanonicalAddressMatch {
+    CanonicalAddressMatch::Subnet(nrr_shared::ip_block::IpBlock::parse(text).expect("subnet"))
+}
+
+fn ip_range(text: &str) -> CanonicalAddressMatch {
+    CanonicalAddressMatch::ip_range(nrr_shared::ip_block::IpRange::parse(text).expect("range"))
+}
+
+fn blocked(mut r: CanonicalRule) -> CanonicalRule {
+    r.action = crate::canonical::RuleAction::Block;
+    r
+}
+
+fn decide(input: &NormalizedDecisionInput, rules: &CanonicalRuleBook) -> RequestedRouteDecision {
+    match_rules(
+        input,
+        &empty_lookup(),
+        rules,
+        default_zone_policy(),
+        prefer_primary(),
+    )
+}
+
+#[test]
+fn an_address_inside_a_subnet_follows_the_subnet() {
+    let rules = book(vec![], vec![rule("s", Some(subnet("10.20.0.0/16")), None)]);
+    let d = decide(&input_ip(Ipv4Addr::new(10, 20, 3, 4)), &rules);
+    assert_eq!(matched_class(&d), Some(MatchClass::Subnet));
+    assert_eq!(matched_role(&d), Some(RouteRole::Secondary));
+    assert_eq!(matched_specificity(&d), Some(SpecificityScore(16)));
+    let outside = decide(&input_ip(Ipv4Addr::new(10, 21, 0, 1)), &rules);
+    assert_eq!(matched_class(&outside), None);
+}
+
+#[test]
+fn an_exact_address_beats_the_subnet_it_sits_in() {
+    let rules = book(
+        vec![rule("ip", Some(exact_ip(10, 20, 3, 4)), None)],
+        vec![rule("s", Some(subnet("10.20.0.0/16")), None)],
+    );
+    let d = decide(&input_ip(Ipv4Addr::new(10, 20, 3, 4)), &rules);
+    assert_eq!(matched_rule_id(&d), Some("ip"));
+    assert_eq!(matched_role(&d), Some(RouteRole::Primary));
+}
+
+#[test]
+fn the_longer_prefix_wins() {
+    let rules = book(
+        vec![rule("wide", Some(subnet("10.0.0.0/8")), None)],
+        vec![rule("narrow", Some(subnet("10.20.0.0/24")), None)],
+    );
+    let d = decide(&input_ip(Ipv4Addr::new(10, 20, 0, 9)), &rules);
+    assert_eq!(matched_rule_id(&d), Some("narrow"));
+    let d = decide(&input_ip(Ipv4Addr::new(10, 30, 0, 9)), &rules);
+    assert_eq!(matched_rule_id(&d), Some("wide"));
+}
+
+#[test]
+fn a_range_is_as_narrow_as_its_piece_around_the_address() {
+    let rules = book(
+        vec![rule("net", Some(subnet("10.0.0.0/24")), None)],
+        vec![rule("range", Some(ip_range("10.0.0.5-10.0.0.40")), None)],
+    );
+    let inside = decide(&input_ip(Ipv4Addr::new(10, 0, 0, 9)), &rules);
+    assert_eq!(
+        matched_rule_id(&inside),
+        Some("range"),
+        "10.0.0.8/29 beats /24"
+    );
+    let outside = decide(&input_ip(Ipv4Addr::new(10, 0, 0, 41)), &rules);
+    assert_eq!(matched_rule_id(&outside), Some("net"));
+}
+
+#[test]
+fn a_name_beats_the_subnet_its_address_sits_in() {
+    let rules = book(
+        vec![rule("name", Some(exact_fqdn("app.corp.example")), None)],
+        vec![rule("s", Some(subnet("10.20.0.0/16")), None)],
+    );
+    let d = decide(
+        &input_full("app.corp.example", Ipv4Addr::new(10, 20, 3, 4), "x.exe"),
+        &rules,
+    );
+    assert_eq!(matched_rule_id(&d), Some("name"));
+}
+
+#[test]
+fn a_subnet_beats_a_zone() {
+    let rules = book(
+        vec![rule("zone", Some(zone("example")), None)],
+        vec![rule("s", Some(subnet("10.20.0.0/16")), None)],
+    );
+    let d = decide(
+        &input_full("app.corp.example", Ipv4Addr::new(10, 20, 3, 4), "x.exe"),
+        &rules,
+    );
+    assert_eq!(matched_rule_id(&d), Some("s"));
+}
+
+#[test]
+fn a_blocked_subnet_does_not_veto_a_name_inside_it() {
+    let rules = book(
+        vec![rule("name", Some(exact_fqdn("app.corp.example")), None)],
+        vec![blocked(rule("s", Some(subnet("10.20.0.0/16")), None))],
+    );
+    let d = decide(
+        &input_full("app.corp.example", Ipv4Addr::new(10, 20, 3, 4), "x.exe"),
+        &rules,
+    );
+    assert_eq!(matched_rule_id(&d), Some("name"), "the narrower rule wins");
+    let bare = decide(&input_ip(Ipv4Addr::new(10, 20, 3, 4)), &rules);
+    assert_eq!(matched_rule_id(&bare), Some("s"));
+}
+
+#[test]
+fn ipv6_subnets_match_their_own_family_only() {
+    let rules = book(
+        vec![],
+        vec![rule("s6", Some(subnet("2001:db8::/32")), None)],
+    );
+    let v6 = normalize_runtime_input(&runtime_input_for(
+        "",
+        Some("2001:db8::7".parse().expect("v6")),
+        None,
+    ));
+    assert_eq!(matched_rule_id(&decide(&v6, &rules)), Some("s6"));
+    assert_eq!(
+        matched_class(&decide(&input_ip(Ipv4Addr::new(32, 1, 13, 184)), &rules)),
+        None
+    );
+}

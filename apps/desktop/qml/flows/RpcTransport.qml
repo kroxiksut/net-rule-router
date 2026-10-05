@@ -115,6 +115,9 @@ QtObject {
     // Correlation ids of calls the caller declared LONG. Reassigned wholesale
     // for the same property-tracking reason as `pendingRpc`.
     property var pendingLongRpc: ({})
+    // The error values of the mutation outcome read last, for the localized
+    // text of its failure code.
+    property var lastFailureArgs: null
 
     // True while a call that may legitimately hold the client's single
     // in-flight slot for tens of seconds is outstanding — the rules preview and
@@ -174,6 +177,7 @@ QtObject {
         }
         registerRpcCallback(corr, function(ok, status) {
             var failure = Pure.operationOutcome(ok, status)
+            transport.lastFailureArgs = Pure.operationFailureArgs(status)
             if (failure === transport.securityAlertGateCode) transport.securityAlertGateHit()
             if (failure === null) settleByState(done)
             else done(failure)

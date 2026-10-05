@@ -157,22 +157,49 @@ pub fn plan_route_rules(
     behavior_mode: RouteBehaviorMode,
     input: &PlannerInput,
 ) -> (Vec<FlowRule>, PlanReport) {
+    plan_route_rules_with_shapes(
+        rule_book,
+        sid,
+        behavior_mode,
+        input,
+        crate::wfp_codegen::current_rule_shape_support(),
+    )
+}
+
+/// [`plan_route_rules`] under an explicit shape support, so a shape the service
+/// does not enforce yet can be planned and tested ahead of the switch.
+#[doc(hidden)]
+pub fn plan_route_rules_with_shapes(
+    rule_book: &CanonicalRuleBook,
+    sid: &str,
+    behavior_mode: RouteBehaviorMode,
+    input: &PlannerInput,
+    shapes: nrr_domain::rule_shape::RuleShapeSupport,
+) -> (Vec<FlowRule>, PlanReport) {
     let principal = principal_scope(sid);
     let families = input.ipv6.families();
     let mut flows = Vec::new();
     let mut report = PlanReport::default();
-    let shapes = crate::wfp_codegen::current_rule_shape_support();
     // The same arbiter the Windows codegens read. Without it this path pins an
     // app rule's observed destinations over an address rule the user wrote for
     // that very host, and the kill-switch then blocks the address for every
     // process — the incident the arbiter exists for, reproduced on the Linux
     // enforcement path.
+    let order = crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+        input.zone_priority_over_ip,
+    );
     let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
         rule_book,
         input.fqdn_cache,
-        crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
-            input.zone_priority_over_ip,
-        ),
+        order,
+    );
+    let carving = NetworkCarving::index(
+        rule_book,
+        input.fqdn_cache,
+        &ownership,
+        order,
+        shapes,
+        input.secondary_ip_denylist,
     );
     // Secondary rules read the denylist-filtered view, primary rules the raw
     // cache — the same split `wfp_codegen::generate_filters` makes. Without it
@@ -247,7 +274,20 @@ pub fn plan_route_rules(
                 coverage,
             };
 
-            if let Some(addr_match) = rule.address_match.as_ref() {
+            if let Some(blocks) = rule.address_match.as_ref().and_then(|m| m.ip_blocks()) {
+                // A network is planned as the subnets it wins, never as hosts.
+                let carved = carving.pieces(blocks, link, rule.action, families);
+                for (idx, piece) in carved.pieces.into_iter().enumerate() {
+                    flows.push(FlowRule {
+                        flow: FlowMatch {
+                            dst: subnet_match(piece),
+                            dst_port: None,
+                            protocol: None,
+                        },
+                        ..host_flow((idx as u32).min(SLOTS_PER_RULE - 1), piece.network())
+                    });
+                }
+            } else if let Some(addr_match) = rule.address_match.as_ref() {
                 // The same walk the codegen asks: a Block yields an address a
                 // narrower rule names, and a route may not take an address the
                 // main link's rules name — the flow acts on the ADDRESS, which
@@ -390,6 +430,8 @@ fn for_each_target(
         // address rules over that family.
         CanonicalAddressMatch::ExactIp(ip) if families.admits(*ip) => visit(0, None, *ip),
         CanonicalAddressMatch::ExactIp(_) => {}
+        // Networks are planned as subnets by the caller, never as hosts.
+        CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_) => {}
         CanonicalAddressMatch::ExactFqdn(host) => {
             for (i, ip) in capped_for_host(cache, host, families).enumerate() {
                 visit(i as u32, Some(host), ip);
@@ -417,6 +459,20 @@ fn host_match(ip: IpAddr) -> DstMatch {
     match ip {
         IpAddr::V4(v4) => DstMatch::HostV4(v4),
         IpAddr::V6(v6) => DstMatch::HostV6(v6),
+    }
+}
+
+/// A network destination match, by family.
+fn subnet_match(block: nrr_shared::ip_block::IpBlock) -> DstMatch {
+    match block.network() {
+        IpAddr::V4(net) => DstMatch::SubnetV4 {
+            net,
+            prefix: block.prefix_len(),
+        },
+        IpAddr::V6(net) => DstMatch::SubnetV6 {
+            net,
+            prefix: block.prefix_len(),
+        },
     }
 }
 
@@ -572,6 +628,8 @@ fn visit_suffix_targets(
 
 mod kill_switch;
 pub use kill_switch::*;
+mod networks;
+pub use networks::{NetworkCarving, NetworkPieces, NETWORK_PIECE_CAP};
 mod fail_closed;
 pub use fail_closed::*;
 mod routes;
@@ -602,6 +660,28 @@ pub fn route_destinations(flows: &[FlowRule], role: RouteRole) -> Vec<IpAddr> {
             _ => None,
         })
         .filter(|ip| seen.insert(*ip))
+        .collect()
+}
+
+/// The networks a role's rules route, in planning order (deduplicated) — the
+/// pieces left after carving, so each is an address set the role owns.
+pub fn route_networks(flows: &[FlowRule], role: RouteRole) -> Vec<nrr_shared::ip_block::IpBlock> {
+    let mut seen = std::collections::HashSet::new();
+    flows
+        .iter()
+        .filter(|f| {
+            f.verdict == Verdict::Permit && f.precedence.class == PrecedenceClass::RouteRule(role)
+        })
+        .filter_map(|f| match f.flow.dst {
+            DstMatch::SubnetV4 { net, prefix } => {
+                nrr_shared::ip_block::IpBlock::new(IpAddr::V4(net), prefix)
+            }
+            DstMatch::SubnetV6 { net, prefix } => {
+                nrr_shared::ip_block::IpBlock::new(IpAddr::V6(net), prefix)
+            }
+            _ => None,
+        })
+        .filter(|b| seen.insert(*b))
         .collect()
 }
 
@@ -676,5 +756,7 @@ pub fn route_app_paths(flows: &[FlowRule], role: RouteRole) -> Vec<String> {
 #[cfg(test)]
 static NO_DENYLIST: std::sync::OnceLock<HashSet<Ipv4Addr>> = std::sync::OnceLock::new();
 
+#[cfg(test)]
+mod network_tests;
 #[cfg(test)]
 mod tests;

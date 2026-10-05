@@ -675,3 +675,55 @@ fn an_unwired_flow_reset_changes_nothing_about_the_install() {
     assert_eq!(count, 2 + EXEMPT);
     assert_eq!(api.wfp_filters.lock().unwrap().len(), 2 + EXEMPT);
 }
+
+/// A network a rule just started pinning is swept for its owner alone, and
+/// only once: re-listing it would cut the connections the first sweep let
+/// reconnect.
+#[test]
+fn a_new_rule_network_tears_down_only_the_owners_connections_inside_it() {
+    use nrr_platform_api::fake_ip::stale_flows::{
+        EstablishedFlow, MockStaleFlowReset, StaleFlowReset,
+    };
+    use nrr_shared::ip_block::IpBlock;
+    use std::net::SocketAddrV4;
+    const OWNER: &str = "S-1-5-21-A";
+    let net = IpBlock::parse("198.51.100.0/24").unwrap();
+    let flow = |remote: Ipv4Addr, port: u16, owner: &str| EstablishedFlow {
+        local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 7), port),
+        remote: SocketAddrV4::new(remote, 443),
+        owner: Some(owner.to_owned()),
+        pid: None,
+        image: None,
+    };
+    let inside = Ipv4Addr::new(198, 51, 100, 77);
+    let owners = flow(inside, 50_001, OWNER);
+    let reset = Arc::new(MockStaleFlowReset::new());
+    reset.set_flows(vec![
+        owners.clone(),
+        flow(inside, 50_002, "S-1-5-21-B"),
+        flow(Ipv4Addr::new(203, 0, 113, 5), 50_003, OWNER),
+    ]);
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(SharedCensus(Default::default()));
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::new(ScriptedSource::default()) as Arc<dyn RoutePolicySource>,
+        Arc::new(ScriptedRules::default()) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_stale_flow_reset(Arc::clone(&reset) as Arc<dyn StaleFlowReset>);
+
+    orch.tear_down_flows_to_new_destinations(OWNER, &[], &[net], false);
+    assert_eq!(reset.queried_networks(), vec![net]);
+    assert_eq!(reset.reset_flows(), vec![owners]);
+
+    orch.upsert_state_with_destinations(OWNER, Vec::new(), Vec::new(), vec![net], false);
+    orch.tear_down_flows_to_new_destinations(OWNER, &[], &[net], false);
+    assert_eq!(
+        reset.queried_networks(),
+        vec![net],
+        "a network already enforced is not swept again"
+    );
+}

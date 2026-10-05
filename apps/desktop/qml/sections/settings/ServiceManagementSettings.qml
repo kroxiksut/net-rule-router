@@ -508,7 +508,7 @@ GroupBox {
                         || startModeBlock.startMode === ""
                 }
                 text: root.tr("settings.service.start-mode.with-windows.label",
-                    "Start with Windows (recommended)")
+                    "Start with the system (recommended)")
                 onClicked: {
                     if (startModeBlock.startMode !== "with-windows"
                         && group._serviceAvailable()) {
@@ -542,7 +542,7 @@ GroupBox {
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.service.start-mode.help",
-                    "“Start with Windows” keeps your rules enforced from boot, before anyone logs in (best for always-on or managed setups). “Start when the app opens” runs the service only while you use NetRuleRouter and lets the app start it without an administrator prompt every time. Changing this needs administrator approval.")
+                    "“Start with the system” keeps your rules enforced from boot, before anyone logs in (best for always-on or managed setups). “Start when the app opens” runs the service only while you use NetRuleRouter and lets the app start it without an administrator prompt every time. Changing this needs administrator approval.")
             }
         }
 

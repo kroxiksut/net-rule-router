@@ -322,6 +322,7 @@ impl FakeMutationExecutor {
     pub fn always_fail(code: &str, message: &str) -> Self {
         Self {
             fail_with: Some(OperationError {
+                args: Default::default(),
                 code: code.into(),
                 message: message.into(),
             }),

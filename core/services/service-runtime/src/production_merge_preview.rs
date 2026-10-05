@@ -296,6 +296,8 @@ fn type_and_value(rule: &CanonicalRule) -> (String, String) {
             CanonicalAddressMatch::SuffixDomain(v) => ("domain".to_string(), format!("*.{v}")),
             CanonicalAddressMatch::Zone(v) => ("zone".to_string(), v.clone()),
             CanonicalAddressMatch::ExactIp(a) => ("exact-ip".to_string(), a.to_string()),
+            CanonicalAddressMatch::Subnet(b) => ("subnet".to_string(), b.to_string()),
+            CanonicalAddressMatch::IpRange(r) => ("ip-range".to_string(), r.to_string()),
         }
     } else if let Some(app) = &rule.app_match {
         ("application".to_string(), app.pattern.as_str().to_string())

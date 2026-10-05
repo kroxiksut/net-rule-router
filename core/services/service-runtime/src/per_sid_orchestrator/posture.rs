@@ -207,6 +207,7 @@ impl PerSidApplyOrchestrator {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(sid);
+        self.network_hold_log.forget(sid);
     }
 
     /// Whether this trim differs from the last one logged for `sid`; `None`
@@ -364,14 +365,16 @@ impl PerSidApplyOrchestrator {
     }
 
     /// Build the fail-closed filter set for the failure posture. Mode A
-    /// (selective) blocks only the protected secondary destinations; modes B
-    /// (everything-via-secondary) block all egress except the safe
-    /// exemptions. Pure projection over the codegen primitives.
+    /// (selective) blocks only the protected secondary destinations and the
+    /// held networks; modes B (everything-via-secondary) block all egress
+    /// except the safe exemptions. Pure projection over the codegen primitives.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn fail_closed_filters(
         &self,
         sid: &str,
         mode: RouteBehaviorMode,
         protected_secondary_ips: &[std::net::IpAddr],
+        holds: &crate::enforcement_planner::NetworkHolds,
         exemptions: &FailClosedExemptions,
         protocols: crate::killswitch_codegen::KillSwitchProtocols,
         posture: FailClosedPosture,
@@ -402,9 +405,13 @@ impl PerSidApplyOrchestrator {
                     // whole v6 family.
                     let protected: Vec<std::net::IpAddr> =
                         exempt_tunnel_servers(protected_secondary_ips, exemptions);
-                    crate::killswitch_codegen::fail_closed_block_destinations(
+                    let mut out = crate::killswitch_codegen::fail_closed_block_destinations(
                         sid, &protected, protocols,
-                    )
+                    );
+                    out.extend(crate::killswitch_codegen::fail_closed_network_filters(
+                        sid, holds, protocols,
+                    ));
+                    out
                 }
             }
             RouteBehaviorMode::PreferSecondaryWhenAvailable
@@ -422,9 +429,13 @@ impl PerSidApplyOrchestrator {
                 } else {
                     let protected: Vec<std::net::IpAddr> =
                         exempt_tunnel_servers(protected_secondary_ips, exemptions);
-                    crate::killswitch_codegen::fail_closed_block_destinations(
+                    let mut out = crate::killswitch_codegen::fail_closed_block_destinations(
                         sid, &protected, protocols,
-                    )
+                    );
+                    out.extend(crate::killswitch_codegen::fail_closed_network_filters(
+                        sid, holds, protocols,
+                    ));
+                    out
                 }
             }
         }

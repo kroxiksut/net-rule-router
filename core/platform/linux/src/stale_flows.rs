@@ -19,12 +19,14 @@
 // is still tested there.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::Mutex;
 
 use nrr_platform_api::enforcement::UserPrincipal;
-use nrr_platform_api::fake_ip::stale_flows::{EstablishedFlow, StaleFlowReset, StaleFlowSweep};
+use nrr_platform_api::fake_ip::stale_flows::{
+    EstablishedFlow, FlowTargets, StaleFlowReset, StaleFlowSweep,
+};
 
 /// Production [`StaleFlowReset`] over `sock_diag`.
 #[derive(Debug, Default)]
@@ -81,11 +83,11 @@ impl StaleFlowReset for LinuxStaleFlowReset {
         }
     }
 
-    fn established_flows_to(&self, targets: &[Ipv4Addr]) -> Vec<EstablishedFlow> {
+    fn established_flows_matching(&self, targets: &FlowTargets) -> Vec<EstablishedFlow> {
         if targets.is_empty() {
             return Vec::new();
         }
-        let wanted: HashSet<Ipv4Addr> = targets.iter().copied().collect();
+        let wanted = targets.matcher();
         let Some(sockets) = self.established() else {
             return Vec::new();
         };
@@ -93,7 +95,7 @@ impl StaleFlowReset for LinuxStaleFlowReset {
             .iter()
             .filter_map(|s| {
                 let (local, remote) = s.v4_endpoints()?;
-                wanted.contains(remote.ip()).then_some((local, remote, s))
+                wanted.matches(*remote.ip()).then_some((local, remote, s))
             })
             .collect();
         {
@@ -1044,6 +1046,29 @@ mod tests {
         let reset = LinuxStaleFlowReset::new();
         assert!(reset.established_flows_to(&[v4(192, 0, 2, 254)]).is_empty());
         assert!(reset.established_flows_to(&[]).is_empty());
+    }
+
+    /// A network target lists what a host target would, from the same dump.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn our_own_connection_is_listed_through_the_network_holding_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (_accepted, _) = listener.accept().expect("accept");
+        let local = client.local_addr().expect("local");
+        let loopback = nrr_shared::ip_block::IpBlock::parse("127.0.0.0/8").expect("network");
+        let outside = nrr_shared::ip_block::IpBlock::parse("192.0.2.0/24").expect("network");
+
+        let reset = LinuxStaleFlowReset::new();
+        let inside =
+            reset.established_flows_matching(&FlowTargets::new(Vec::new(), vec![loopback]));
+        assert!(inside
+            .iter()
+            .any(|f| std::net::SocketAddr::V4(f.local) == local));
+        assert!(reset
+            .established_flows_matching(&FlowTargets::new(Vec::new(), vec![outside]))
+            .is_empty());
     }
 
     /// The assertion the port exists for: a listed connection is closed and

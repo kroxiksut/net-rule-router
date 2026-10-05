@@ -1063,6 +1063,7 @@ impl MutationExecutor for NoopMutationExecutor {
 
     fn execute(&self, _payload: StoredMutation, _principal: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
+            args: Default::default(),
             code: "not-implemented".into(),
             message: "revision mutations are not available on this platform".into(),
         })
@@ -1070,6 +1071,7 @@ impl MutationExecutor for NoopMutationExecutor {
 
     fn rollback(&self, _principal: &str, _target_revision_id: Option<&str>) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
+            args: Default::default(),
             code: "not-implemented".into(),
             message: "rollback is not available on this platform".into(),
         })
@@ -1081,6 +1083,7 @@ impl MutationExecutor for NoopMutationExecutor {
         _target_revision_id: Option<&str>,
     ) -> Result<Option<nrr_shared::ipc_payloads::RollbackTargetDto>, OperationError> {
         Err(OperationError {
+            args: Default::default(),
             code: "not-implemented".into(),
             message: "rollback is not available on this platform".into(),
         })
@@ -1088,6 +1091,7 @@ impl MutationExecutor for NoopMutationExecutor {
 
     fn safe_disable(&self, _reason: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
+            args: Default::default(),
             code: "not-implemented".into(),
             message: "safe disable is not available on this platform".into(),
         })

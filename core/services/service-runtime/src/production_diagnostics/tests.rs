@@ -1406,3 +1406,229 @@ fn the_status_revision_summary_follows_the_audience() {
         (Some("rev-bob".into()), 3)
     );
 }
+
+fn network_book(
+    secondary: Vec<nrr_domain::canonical::CanonicalRule>,
+) -> nrr_domain::canonical::CanonicalRuleBook {
+    nrr_domain::canonical::CanonicalRuleBook {
+        primary: nrr_domain::canonical::CanonicalRuleSet::from_rules(vec![]),
+        secondary: nrr_domain::canonical::CanonicalRuleSet::from_rules(secondary),
+    }
+}
+
+fn address_rule(
+    id: &str,
+    m: nrr_domain::canonical::CanonicalAddressMatch,
+    action: nrr_domain::RuleAction,
+) -> nrr_domain::canonical::CanonicalRule {
+    nrr_domain::canonical::CanonicalRule {
+        id: nrr_domain::RuleId(id.into()),
+        enabled: true,
+        address_match: Some(m),
+        app_match: None,
+        comment: String::new(),
+        action,
+        origin: None,
+    }
+}
+
+/// A name no rule names is decided by the network its cached address falls
+/// into — what enforcement does to that connection — while a narrower name
+/// rule keeps the name.
+#[test]
+fn a_network_decides_a_name_probe_through_its_cached_address() {
+    use nrr_domain::canonical::CanonicalAddressMatch;
+    use nrr_domain::decision_matching::{MatchClass, RequestedRouteDecision, ZonePriorityPolicy};
+    use nrr_domain::{RouteBehaviorMode, RuleAction};
+    use nrr_shared::ip_block::IpBlock;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let inside = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+    let outside = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+    let net = IpBlock::parse("198.51.100.0/24").expect("network");
+    let mut book = network_book(vec![address_rule(
+        "n-1",
+        CanonicalAddressMatch::Subnet(net),
+        RuleAction::Block,
+    )]);
+    let probe = |book: &nrr_domain::canonical::CanonicalRuleBook, ips: &[IpAddr]| {
+        network_decision(
+            book,
+            "a.example",
+            ips,
+            None,
+            ZonePriorityPolicy::default(),
+            RouteBehaviorMode::PreferPrimary,
+        )
+    };
+
+    let (ip, decision) = probe(&book, &[outside, inside]).expect("the network decides");
+    assert_eq!(ip, inside);
+    let RequestedRouteDecision::MatchedRoute { candidate } = decision else {
+        panic!("a network match is a matched rule");
+    };
+    assert_eq!(candidate.match_class, MatchClass::Subnet);
+    assert_eq!(
+        network_rule_text(&book, &candidate.rule_id).as_deref(),
+        Some("198.51.100.0/24")
+    );
+    assert!(probe(&book, &[outside]).is_none(), "no address inside");
+
+    // A rule naming the host is narrower than the network and wins.
+    book.primary = nrr_domain::canonical::CanonicalRuleSet::from_rules(vec![address_rule(
+        "h-1",
+        CanonicalAddressMatch::ExactFqdn("a.example".into()),
+        RuleAction::Route,
+    )]);
+    assert!(probe(&book, &[inside]).is_none());
+}
+
+#[test]
+fn a_range_is_named_as_the_user_wrote_it() {
+    use nrr_domain::canonical::CanonicalAddressMatch;
+    use nrr_shared::ip_block::IpRange;
+
+    let range = IpRange::parse("198.51.100.5-198.51.100.40").expect("range");
+    let book = network_book(vec![address_rule(
+        "r-1",
+        CanonicalAddressMatch::ip_range(range),
+        nrr_domain::RuleAction::Route,
+    )]);
+    assert_eq!(
+        network_rule_text(&book, &nrr_domain::RuleId("r-1".into())).as_deref(),
+        Some("198.51.100.5-198.51.100.40")
+    );
+    assert!(network_rule_text(&book, &nrr_domain::RuleId("missing".into())).is_none());
+}
+
+/// The probe answer names the network that decided an address, so the user
+/// sees which of their subnet rules is in force.
+#[test]
+fn the_explain_answer_names_the_network_that_matched() {
+    use nrr_shared::rules_json::{
+        to_canonical_string, AddressMatchDto, CanonicalRulesJsonV1, RuleDto,
+        RULES_JSON_SCHEMA_VERSION,
+    };
+    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+    use nrr_storage::repository::MigrationRunner;
+
+    let dir = TempDir::new().expect("tmp");
+    let conn = open_connection(&dir.path().join("state.db")).expect("open");
+    let runner = SqliteMigrationRunner::for_state_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+    let rules_json = to_canonical_string(&CanonicalRulesJsonV1 {
+        schema_version: RULES_JSON_SCHEMA_VERSION,
+        primary: vec![],
+        secondary: vec![RuleDto {
+            id: "N-0001".into(),
+            enabled: true,
+            address_match: Some(AddressMatchDto::Subnet {
+                network: "198.51.100.0/24".into(),
+            }),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        }],
+    })
+    .expect("serialise");
+    conn.lock()
+        .expect("lock")
+        .execute(
+            "INSERT INTO revisions (
+                principal, revision_id, content_hash, rules_json, status, source,
+                correlation_id, created_at, activated_at
+             ) VALUES (?1, 'rev-1', 'h', ?2, 'active', 'gui-rules-edit', 'c', 1, 1)",
+            rusqlite::params![nrr_storage::BASELINE_PRINCIPAL, rules_json],
+        )
+        .expect("seed active revision");
+    let alerts: Arc<dyn SecurityAlertsRepository> =
+        Arc::new(InMemorySecurityAlertsRepository::new());
+    let facade = ProductionDiagnosticsFacade::new(dir.path(), dir.path(), None, alerts, Some(conn));
+    let explain = |ip: &str| {
+        let q = ExplainQuery::Synthetic {
+            input_sample: nrr_diagnostics::explain::RuntimeInputSample::new().with_ip(ip),
+        };
+        facade
+            .get_explain(&q, ExplainDetailLevel::Diagnostics, "")
+            .expect("explain")
+    };
+
+    let inside = explain("198.51.100.77");
+    let matched = inside.match_section.expect("a network decided");
+    assert_eq!(matched.matched_rule_id.as_deref(), Some("N-0001"));
+    assert_eq!(matched.match_class_label.as_deref(), Some("Subnet"));
+    assert_eq!(matched.matched_network.as_deref(), Some("198.51.100.0/24"));
+    assert_eq!(matched.route_role.as_deref(), Some("secondary"));
+    assert!(
+        inside.lookup_section.is_none(),
+        "the probe gave the address"
+    );
+
+    // Positive control: an address outside the network names nothing.
+    assert!(explain("198.51.101.77").match_section.is_none());
+}
+
+/// Every reason the explain probe can name is translated: a missing key shows
+/// the user a raw `diag.explain.reason.*` id. Keys built with `format!` are
+/// invisible to the workspace-wide `tr()` scan, so they are listed here.
+#[test]
+fn every_explain_reason_is_translated() {
+    use nrr_domain::decision_matching::MatchClass;
+    // Exhaustive on purpose: a new class must decide its reason key here.
+    let matched = |class: MatchClass| match class {
+        MatchClass::ExactFqdn
+        | MatchClass::SuffixDomain
+        | MatchClass::ExactIp
+        | MatchClass::Subnet
+        | MatchClass::Zone
+        | MatchClass::Application => Some(format!(
+            "diag.explain.reason.rule-matched-{}",
+            super::internals::match_class_reason_slug(class)
+        )),
+        // A matched route never carries the default class.
+        MatchClass::Default => None,
+    };
+    let mut keys: Vec<String> = [
+        MatchClass::ExactFqdn,
+        MatchClass::SuffixDomain,
+        MatchClass::ExactIp,
+        MatchClass::Subnet,
+        MatchClass::Zone,
+        MatchClass::Application,
+        MatchClass::Default,
+    ]
+    .into_iter()
+    .filter_map(matched)
+    .collect();
+    let source = include_str!("internals.rs");
+    let mut rest = source;
+    while let Some(at) = rest.find("\"diag.explain.reason.") {
+        rest = &rest[at + 1..];
+        let end = rest.find('"').expect("closed literal");
+        if !rest[..end].contains('{') {
+            keys.push(rest[..end].to_string());
+        }
+        rest = &rest[end..];
+    }
+    assert!(keys.len() >= 8, "the scan sees too few reasons: {keys:?}");
+
+    for locale in ["en", "ru"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../locales")
+            .join(format!("{locale}.json"));
+        let text = std::fs::read_to_string(&path).expect("locale file");
+        let tree: serde_json::Value = serde_json::from_str(&text).expect("locale json");
+        let missing: Vec<&String> = keys
+            .iter()
+            .filter(|key| {
+                key.split('.')
+                    .try_fold(&tree, |node, part| node.get(part))
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+            })
+            .collect();
+        assert!(missing.is_empty(), "locale '{locale}' lacks {missing:?}");
+    }
+}

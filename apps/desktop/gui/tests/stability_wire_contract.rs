@@ -289,24 +289,31 @@ fn merge_never_downgrades_a_recorded_intent_to_the_wire_default() {
     );
 }
 
-/// A verbose-logging request is one-shot: the service never echoes it, and a
-/// recorded intent for it would re-open an ended window on every reconnect.
+/// A log-window request (verbose logging, the connection trace on disk) is
+/// one-shot: the service never echoes it, and a recorded intent for it would
+/// re-open an ended window on every reconnect.
 #[test]
-fn a_verbose_logging_request_is_never_echoed_or_replayed() {
+fn a_log_window_request_is_never_echoed_or_replayed() {
+    use nrr_shared::ipc_payloads::LogWindowChange;
     let mut dto: ServiceStabilityConfigDto =
         serde_json::from_value(json!({ "ipc-accept-policy": accept_policy_at_defaults() }))
             .unwrap_or_else(|e| panic!("minimal config: {e}"));
-    dto.verbose_logging_change = Some(nrr_shared::ipc_payloads::VerboseLoggingChange::OneHour);
+    dto.verbose_logging_change = Some(LogWindowChange::OneHour);
+    dto.conn_trace_ndjson_change = Some(LogWindowChange::UntilRestart);
     let wire = serde_json::to_value(&dto).unwrap_or_else(|e| panic!("serialise: {e}"));
     assert_eq!(wire["verbose-logging-change"], json!("one-hour"));
-    assert!(
-        !config_at_wire_defaults().contains_key("verbose-logging-change"),
-        "an answer without a request must not carry the key"
-    );
+    assert_eq!(wire["conn-trace-ndjson-change"], json!("until-restart"));
+    for key in ["verbose-logging-change", "conn-trace-ndjson-change"] {
+        assert!(
+            !config_at_wire_defaults().contains_key(key),
+            "an answer without a request must not carry {key}"
+        );
+    }
 
     let harness = format!(
         "{source}
          console.log(JSON.stringify([stabilityIntentIsRecordable(\"verbose-logging-change\"), \
+           stabilityIntentIsRecordable(\"conn-trace-ndjson-change\"), \
            stabilityIntentIsRecordable(\"dns-via-secondary\"), \
            stabilityIntentIsRecordable(\"allow-user-rule-edits\")]));
 ",
@@ -318,7 +325,7 @@ fn a_verbose_logging_request_is_never_echoed_or_replayed() {
     };
     assert_eq!(
         output.trim(),
-        "[false,true,false]",
+        "[false,false,true,false]",
         "only declared config keys may be recorded as intent, and the administrator's rules \
          lock never is"
     );
@@ -556,7 +563,14 @@ fn every_replayable_key_has_a_divergence_line_in_a_panel() {
         }
     }
     // Reported by the service, never written by it: nothing to diverge.
-    let reported_only = ["verbose-logging-mode", "verbose-logging-until-ms"];
+    let reported_only = [
+        "verbose-logging-mode",
+        "verbose-logging-until-ms",
+        "conn-trace-ndjson-mode",
+        "conn-trace-ndjson-until-ms",
+        "conn-trace-ndjson-forced",
+        "conn-trace-ndjson-forced-by",
+    ];
     let mut replayable: BTreeSet<String> = qml_object("STABILITY_FIELD_DEFAULTS")
         .keys()
         .filter(|key| !reported_only.contains(&key.as_str()))

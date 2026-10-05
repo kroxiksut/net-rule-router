@@ -167,7 +167,8 @@ impl Mute {
 /// One blocked connection attempt, as enforcement saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockAttempt {
-    /// Destination name when known; the address is the fallback identity.
+    /// What the destination is called when known — its host name, or the
+    /// blocked network it falls into; the address is the fallback identity.
     pub host: Option<String>,
     /// Destination address, always known.
     pub dest: String,
@@ -181,6 +182,16 @@ impl BlockAttempt {
     #[must_use]
     pub fn destination_label(&self) -> &str {
         self.host.as_deref().unwrap_or(&self.dest)
+    }
+
+    /// The same attempt, named by the blocked network rule it fell into
+    /// (`198.51.100.0/24`). The rule the user can edit is the network, not
+    /// the address, and every address inside it folds into one episode
+    /// instead of one notice each.
+    #[must_use]
+    pub fn within_network(mut self, network: String) -> Self {
+        self.host = Some(network);
+        self
     }
 
     fn key(&self) -> EpisodeKey {
@@ -377,6 +388,29 @@ mod tests {
             app: Some(app.to_owned()),
             reason: BlockReason::NotCoveredByRules,
         }
+    }
+
+    #[test]
+    fn addresses_inside_one_blocked_network_are_one_episode_named_by_it() {
+        let mut ledger = BlockNoticeLedger::default();
+        let to = |dest: &str| {
+            BlockAttempt {
+                host: None,
+                dest: dest.to_owned(),
+                app: Some("scanner.exe".to_owned()),
+                reason: BlockReason::BlockedByRule,
+            }
+            .within_network("198.51.100.0/24".to_owned())
+        };
+
+        let notice = ledger
+            .record(0, &to("198.51.100.1"))
+            .expect("first is news");
+        assert_eq!(notice.destination, "198.51.100.0/24");
+        assert!(ledger.record(1, &to("198.51.100.2")).is_none());
+        assert!(ledger.record(2, &to("198.51.100.3")).is_none());
+        assert_eq!(ledger.attempts_so_far(&to("198.51.100.4")), 3);
+        assert_eq!(ledger.resolve_destination("198.51.100.0/24"), 1);
     }
 
     #[test]

@@ -12,11 +12,17 @@ fn err_for(value: &str) -> ValidationError {
 fn an_address_shaped_value_is_refused_and_named() {
     assert!(matches!(
         err_for("192.168.1.0/24"),
-        ValidationError::CidrNotSupported { .. }
+        ValidationError::WrongAddressSection {
+            belongs_in: IpValueKind::Subnet,
+            ..
+        }
     ));
     assert!(matches!(
         err_for("10.0.0.1-10.0.0.9"),
-        ValidationError::IpRangeNotSupported { .. }
+        ValidationError::WrongAddressSection {
+            belongs_in: IpValueKind::Range,
+            ..
+        }
     ));
     assert!(matches!(
         err_for("2001:db8::1"),

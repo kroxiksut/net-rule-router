@@ -167,7 +167,7 @@ fn run_state_migrations_empty_db() {
     // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
     // + v49 (block_notice_mutes table — durable "do not show" choices)
     // + v50 (isp_block_candidates_enabled on service_stability_config)
-    assert_eq!(s.to_version, 67);
+    assert_eq!(s.to_version, 68);
     assert_eq!(
         s.migrations_applied,
         [
@@ -238,6 +238,7 @@ fn run_state_migrations_empty_db() {
             "add_block_notice_launched_by",
             "drop_integrity_log_and_apply_snapshots",
             "verbose_logging_deadline",
+            "conn_trace_log_deadline",
         ]
     );
 }
@@ -249,8 +250,8 @@ fn state_migration_idempotent() {
 
     runner.run_pending_migrations().expect("first run");
     let s = runner.run_pending_migrations().expect("second run");
-    assert_eq!(s.from_version, 67);
-    assert_eq!(s.to_version, 67);
+    assert_eq!(s.from_version, 68);
+    assert_eq!(s.to_version, 68);
     assert!(s.migrations_applied.is_empty());
 }
 
@@ -343,8 +344,8 @@ fn verify_state_schema_after_migration() {
 
     let v = runner.verify_schema().expect("verify");
     assert!(v.is_ok(), "state schema verification failed: {v:?}");
-    // through v67 (verbose_logging_deadline)
-    assert_eq!(v.version, 67);
+    // through v68 (conn_trace_log_deadline)
+    assert_eq!(v.version, 68);
 }
 
 #[test]
@@ -519,6 +520,7 @@ fn shipped_state_checksums_are_unchanged() {
             (65, "05750f96e61bd967"),
             (66, "9ad42c4782705cc2"),
             (67, "64cae489eb8a64b4"),
+            (68, "bcd0ffef9e5dccf4"),
         ],
     );
 }
@@ -908,7 +910,7 @@ fn upgrade_state_db_from_v1_to_v2() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
     assert_eq!(summary.from_version, 1);
-    assert_eq!(summary.to_version, 67);
+    assert_eq!(summary.to_version, 68);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -978,6 +980,7 @@ fn upgrade_state_db_from_v1_to_v2() {
             "add_block_notice_launched_by",
             "drop_integrity_log_and_apply_snapshots",
             "verbose_logging_deadline",
+            "conn_trace_log_deadline",
         ]
     );
 
@@ -1015,7 +1018,7 @@ fn upgrade_state_db_from_v2_to_v3() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
     assert_eq!(summary.from_version, 2);
-    assert_eq!(summary.to_version, 67);
+    assert_eq!(summary.to_version, 68);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -1084,6 +1087,7 @@ fn upgrade_state_db_from_v2_to_v3() {
             "add_block_notice_launched_by",
             "drop_integrity_log_and_apply_snapshots",
             "verbose_logging_deadline",
+            "conn_trace_log_deadline",
         ]
     );
 

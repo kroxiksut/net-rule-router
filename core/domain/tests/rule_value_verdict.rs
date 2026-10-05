@@ -108,7 +108,7 @@ fn stored_value(address: Option<&CanonicalAddressMatch>, app: Option<&str>) -> S
             | CanonicalAddressMatch::ExactFqdn(v)
             | CanonicalAddressMatch::SuffixDomain(v),
         ) => v.clone(),
-        Some(CanonicalAddressMatch::ExactIp(ip)) => ip.to_string(),
+        Some(other) => other.to_display_string(),
         None => app.expect("an application rule").to_string(),
     }
 }

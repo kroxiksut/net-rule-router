@@ -10,8 +10,9 @@
 //! Rules within a [`CanonicalRuleSet`] are stored in a fixed canonical order:
 //! `ExactFqdn` first (sorted lexicographically), then `SuffixDomain` (sorted
 //! lexicographically), then `Zone` (sorted lexicographically), then `ExactIp`
-//! (sorted numerically by 32-bit value), then `Application` (sorted
-//! lexicographically by process name). Rules sharing a match value are then
+//! (sorted numerically), then `Application` (sorted lexicographically by
+//! process name), then `Subnet` and `IpRange` (sorted numerically; they sort
+//! after the older kinds so no stored ordering moves). Rules sharing a match value are then
 //! ordered by every remaining field, so the order is total: two equal books
 //! produce the same byte sequence when serialized, and therefore the same
 //! SHA-256 content hash, whatever order they arrived in.
@@ -27,6 +28,7 @@
 use core::fmt;
 use std::net::IpAddr;
 
+use nrr_shared::ip_block::{IpBlock, IpRange};
 use nrr_shared::RouteRole;
 
 use crate::{RouteBehaviorMode, RouteBinding};
@@ -99,7 +101,6 @@ pub struct CanonicalAppMatch {
 ///
 /// All domain labels are lowercase, have no trailing dot, and are ASCII
 /// (punycode-encoded per IDNA2008 for internationalized names).
-/// IPv6 addresses are never present — the Free edition accepts only IPv4.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CanonicalAddressMatch {
     /// Matches the exact FQDN only (runtime priority tier 1 — highest).
@@ -130,9 +131,20 @@ pub enum CanonicalAddressMatch {
     /// Matches exactly one address of either family (runtime priority tier 3 by default;
     /// configurable vs [`CanonicalAddressMatch::Zone`]).
     ExactIp(IpAddr),
+    /// Matches every address of one network. Within the address tier a longer
+    /// prefix beats a shorter one, and an exact address beats any network.
+    Subnet(IpBlock),
+    /// Matches an inclusive address range. Kept as written for display and the
+    /// rules file; every consumer reads its [`IpRange::blocks`]. Boxed: ranges
+    /// are rare, and inline they would grow every rule in memory.
+    IpRange(Box<IpRange>),
 }
 
 impl CanonicalAddressMatch {
+    pub fn ip_range(range: IpRange) -> Self {
+        Self::IpRange(Box::new(range))
+    }
+
     /// Returns the address as a user-facing string.
     ///
     /// `SuffixDomain` is rendered with `*.` prefix restored.
@@ -142,6 +154,18 @@ impl CanonicalAddressMatch {
             Self::SuffixDomain(label) => format!("*.{label}"),
             Self::Zone(name) => name.clone(),
             Self::ExactIp(addr) => addr.to_string(),
+            Self::Subnet(block) => block.to_string(),
+            Self::IpRange(range) => range.to_string(),
+        }
+    }
+
+    /// The networks the rule names, when it names addresses by network: one
+    /// for a subnet, the decomposition for a range.
+    pub fn ip_blocks(&self) -> Option<&[IpBlock]> {
+        match self {
+            Self::Subnet(block) => Some(std::slice::from_ref(block)),
+            Self::IpRange(range) => Some(range.blocks()),
+            _ => None,
         }
     }
 
@@ -155,7 +179,24 @@ impl CanonicalAddressMatch {
             // move; a v6 key sorts after every v4 one.
             Self::ExactIp(IpAddr::V4(addr)) => format!("{:010}", u32::from(*addr)),
             Self::ExactIp(IpAddr::V6(addr)) => format!("v6:{:032x}", u128::from(*addr)),
+            Self::Subnet(block) => {
+                format!("{}/{:03}", ip_sort_key(block.network()), block.prefix_len())
+            }
+            Self::IpRange(range) => {
+                format!(
+                    "{}-{}",
+                    ip_sort_key(range.first()),
+                    ip_sort_key(range.last())
+                )
+            }
         }
+    }
+}
+
+fn ip_sort_key(addr: IpAddr) -> String {
+    match addr {
+        IpAddr::V4(v4) => format!("{:010}", u32::from(v4)),
+        IpAddr::V6(v6) => format!("v6:{:032x}", u128::from(v6)),
     }
 }
 
@@ -198,7 +239,8 @@ impl CanonicalRule {
     /// This is the **canonical storage order** used for deterministic hashing — it
     /// does **not** reflect runtime evaluation priority, which is configurable for
     /// Zone vs ExactIp (see `ZonePriorityPolicy`):
-    /// `ExactFqdn(0) < SuffixDomain(1) < Zone(2) < ExactIp(3) < Application(4)`.
+    /// `ExactFqdn(0) < SuffixDomain(1) < Zone(2) < ExactIp(3) < Application(4)
+    /// < Subnet(5) < IpRange(6)`.
     /// Within each group, the match value string is used for lexicographic
     /// ordering. Not total on its own — [`CanonicalRuleSet::from_rules`] adds
     /// the tie-breaker.
@@ -210,6 +252,8 @@ impl CanonicalRule {
                     CanonicalAddressMatch::SuffixDomain(_) => 1u8,
                     CanonicalAddressMatch::Zone(_) => 2u8,
                     CanonicalAddressMatch::ExactIp(_) => 3u8,
+                    CanonicalAddressMatch::Subnet(_) => 5u8,
+                    CanonicalAddressMatch::IpRange(_) => 6u8,
                 };
                 (group, m.sort_key_str())
             }
@@ -267,7 +311,8 @@ impl CanonicalRule {
 /// Canonically ordered collection of routing rules for one route role.
 ///
 /// Rules are stored in the fixed canonical order described in the module
-/// documentation: ExactFqdn → SuffixDomain → Zone → ExactIp → Application,
+/// documentation: ExactFqdn → SuffixDomain → Zone → ExactIp → Application →
+/// Subnet → IpRange,
 /// then lexicographically by value within each group, then by the remaining
 /// fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

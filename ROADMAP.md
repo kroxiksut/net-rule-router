@@ -21,11 +21,6 @@ on real IPv6 networks before calling it finished.
 
 ## Right after the first alpha
 
-**CIDR subnets and IP ranges.** Route a whole network, such as the internal
-ranges a corporate VPN serves, with one rule instead of one rule per address.
-Very wide ranges are refused, so one rule cannot swallow a large share of the
-internet. Rules files written for the first alpha keep working.
-
 **Traffic history per connection.** See how much went through the additional
 connection and how much went directly, over a period you choose.
 

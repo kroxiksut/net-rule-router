@@ -202,16 +202,30 @@ fn seeds_the_suffix_apex_but_ignores_zone_and_ip_rules() {
         action: nrr_domain::RuleAction::Route,
         origin: None,
     };
+    let subnet = CanonicalRule {
+        id: RuleId("r-net".into()),
+        address_match: Some(CanonicalAddressMatch::Subnet(
+            nrr_shared::ip_block::IpBlock::parse("198.51.100.0/24").expect("network"),
+        )),
+        ..ip.clone()
+    };
+    let range = CanonicalRule {
+        id: RuleId("r-range".into()),
+        address_match: Some(CanonicalAddressMatch::ip_range(
+            nrr_shared::ip_block::IpRange::parse("203.0.113.5-203.0.113.9").expect("range"),
+        )),
+        ..ip.clone()
+    };
     let rules = Arc::new(FakeRules::new(
         empty(),
-        CanonicalRuleSet::from_rules(vec![zone, ip]),
+        CanonicalRuleSet::from_rules(vec![zone, ip, subnet, range]),
     ));
     let s = seeder(Arc::clone(&resolver), cache, lookup, rules);
     let sum = s.seed_for_principal("S-A", SystemTime::now());
     assert_eq!(
         sum,
         SeedSummary::default(),
-        "a zone label is not a host and an IP needs no DNS → nothing seeded"
+        "a zone label is not a host and an address or network needs no DNS → nothing seeded"
     );
     assert!(resolver.observed_queries().is_empty());
 }

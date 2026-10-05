@@ -852,6 +852,8 @@ fn canonical_profile_rules_are_in_canonical_order() {
                 "domain"
             }
             Some(CanonicalAddressMatch::ExactIp(_)) => "ip",
+            Some(CanonicalAddressMatch::Subnet(_)) => "subnet",
+            Some(CanonicalAddressMatch::IpRange(_)) => "ip-range",
             None => "app",
         })
         .collect();

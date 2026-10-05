@@ -526,15 +526,16 @@ QtObject {
         var selected = root.interfacesModel.get(index)
         var selectedId = String(selected.persistentId || "")
         var selectedName = String(selected.name || "")
-        // An adapter with no way out to the network is a legal secondary, but
-        // rules aimed at it stop being routed -- and are blocked outright once
-        // leak protection is armed. Say so before committing the selection; the
-        // answer is honoured either way.
-        if (role === "secondary" && unroutableConfirmed !== true) {
+        // An adapter with no way out to the network is a legal choice, but as
+        // the additional route its rules stop being routed (blocked once leak
+        // protection is armed), and as the main one the service passes it over.
+        // Say so before committing the selection; the answer is honoured.
+        if (unroutableConfirmed !== true) {
             var candidate = _liveRowByIdOrName(selectedId, selectedName)
             if (candidate && Pure.interfaceCannotCarryTrafficOut(candidate)
                     && typeof root.confirmUnroutableSecondary === "function") {
-                root.confirmUnroutableSecondary(candidate, "assign", function() {
+                root.confirmUnroutableSecondary(candidate,
+                        role === "primary" ? "assign-primary" : "assign", function() {
                     interfacesRolesController.assignRole(index, role, true)
                 })
                 return

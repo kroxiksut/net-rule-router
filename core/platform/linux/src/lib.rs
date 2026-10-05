@@ -202,6 +202,9 @@ mod app_scan;
 /// matched by the neutral keyword policy in `nrr_platform_api::vpn_discovery`.
 pub mod vpn_discovery;
 
+/// The peers of the kernel's WireGuard/AmneziaWG links, which no route names.
+pub mod tunnel_endpoints;
+
 /// Linux application-group discovery: `/proc` processes, XDG desktop entries
 /// and the libvirt / Docker / Podman bridges, classified by the neutral
 /// dictionary in `nrr_platform_api::app_group_discovery`.

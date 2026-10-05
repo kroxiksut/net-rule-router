@@ -2,11 +2,13 @@ use nrr_shared::{
     FreeRuleType, RouteRole, RuleScenario, RulesEnabledFilter, RulesTypeFilter, RulesViewSort,
 };
 
-const SUPPORTED_FREE_RULE_TYPES: [FreeRuleType; 4] = [
+const SUPPORTED_FREE_RULE_TYPES: [FreeRuleType; 6] = [
     FreeRuleType::Application,
     FreeRuleType::Domain,
     FreeRuleType::Zone,
     FreeRuleType::ExactIp,
+    FreeRuleType::IpRange,
+    FreeRuleType::Subnet,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +216,8 @@ fn build_rows(
             Some(RulesTypeFilter::Domain) => row.rule_type == FreeRuleType::Domain,
             Some(RulesTypeFilter::Zones) => row.rule_type == FreeRuleType::Zone,
             Some(RulesTypeFilter::ExactIp) => row.rule_type == FreeRuleType::ExactIp,
+            Some(RulesTypeFilter::Subnet) => row.rule_type == FreeRuleType::Subnet,
+            Some(RulesTypeFilter::IpRange) => row.rule_type == FreeRuleType::IpRange,
             // Host-relative, as the contract says: `Application` is whichever
             // per-OS section this build calls its own.
             Some(RulesTypeFilter::Application) => row.app_section == Some(native_app_section()),
@@ -260,12 +264,18 @@ fn row_matches_query(row: &RuleRowPreview, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{rules_screen_preview_snapshot, RulesScreenRequest};
-    use nrr_shared::{RuleScenario, RulesTypeFilter};
+    use nrr_shared::{FreeRuleType, RuleScenario, RulesTypeFilter};
 
     #[test]
     fn rules_snapshot_exposes_the_free_rule_types() {
         let snapshot = rules_screen_preview_snapshot(RulesScreenRequest::default());
-        assert_eq!(snapshot.supported_rule_types.len(), 4);
+        assert_eq!(snapshot.supported_rule_types.len(), 6);
+        for network_type in [FreeRuleType::Subnet, FreeRuleType::IpRange] {
+            assert!(
+                snapshot.supported_rule_types.contains(&network_type),
+                "the Add dialog must offer {network_type}"
+            );
+        }
         assert_eq!(snapshot.rows.len(), super::RULE_ROWS.len());
     }
 

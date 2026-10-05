@@ -19,7 +19,7 @@ NRR_SERVICE_ALIAS_NAME="nrr-service"
 # The unit sets ProtectHome=yes, so a daemon under /home can never exec — the
 # scripts stage the build-tree binary here and register it from this copy.
 # The Windows scripts register the build output in place; nothing hides it there.
-NRR_SERVICE_INSTALL_DIR="/usr/lib/$NRR_PRODUCT_NAME_UNIX"
+NRR_SERVICE_INSTALL_DIR="/usr/libexec/$NRR_PRODUCT_NAME_UNIX"
 NRR_STAGED_SERVICE_BINARY="$NRR_SERVICE_INSTALL_DIR/$NRR_SERVICE_EXE_NAME"
 
 # The rest of the machine-wide footprint. Mirrors, in order, the install plan in

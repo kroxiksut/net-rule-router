@@ -217,6 +217,15 @@ while IFS= read -r user_path; do
   [ -n "$user_path" ] || continue
   purge_path "$user_path" user
 done <<<"$user_paths"
+# Qt nests the per-app folder in a vendor one (`…/NetRuleRouter/NetRuleRouter`);
+# the vendor folder goes too, once nothing else is left in it.
+if [ "$apply" -eq 1 ]; then
+  while IFS= read -r user_path; do
+    parent="$(dirname -- "$user_path")"
+    [ "$(basename -- "$parent")" = "$NRR_PRODUCT_NAME" ] || continue
+    if rmdir -- "$parent" 2>/dev/null; then mark_removed "$parent"; fi
+  done <<<"$user_paths"
+fi
 
 if [ "$apply" -eq 1 ]; then
   nrr_run_privileged systemctl daemon-reload || true

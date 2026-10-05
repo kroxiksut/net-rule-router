@@ -15,20 +15,29 @@
 //! two separate pieces of news.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nrr_domain::block_notice::{BlockAttempt, BlockNoticeLedger, Mute};
+use nrr_domain::block_notice::{BlockAttempt, BlockNoticeLedger, BlockReason, Mute};
+use nrr_domain::canonical::CanonicalRuleBook;
+use nrr_domain::decision_matching::{MatchClass, RequestedRouteDecision, ZonePriorityPolicy};
+use nrr_domain::{RouteBehaviorMode, RuleAction};
 use nrr_platform_api::process_lineage::ProcessLineagePort;
 use nrr_shared::ipc_payloads::StatusUpdateEvent;
 
 use crate::block_notice_journal_store::BlockNoticeJournalStore;
 use crate::ipc_handlers::event_bus::EventBus;
+use crate::per_sid_orchestrator::RulesProvider;
 
 /// Loads the persisted mutes of one principal. Consulted when a principal's
 /// ledger is first created and again on [`BlockNoticeCenter::reload_mutes`],
 /// so a mute the user just set takes effect without a restart.
 pub type MuteLoaderFn = Arc<dyn Fn(&str) -> Vec<Mute> + Send + Sync>;
+
+/// Names the blocked network an attempt fell into, when a network Block rule is
+/// what dropped it; `None` leaves the attempt named as it came.
+pub type BlockedNetworkFn = Arc<dyn Fn(&str, &BlockAttempt) -> Option<String> + Send + Sync>;
 
 /// Principals tracked at once. A machine has a handful of interactive users;
 /// the cap only bounds memory if something upstream starts inventing SIDs.
@@ -45,6 +54,7 @@ pub struct BlockNoticeCenter {
     /// Attached once the process recorder is up, which is after this center
     /// is built; empty until then and on platforms without one.
     lineage: Mutex<Option<Arc<dyn ProcessLineagePort>>>,
+    blocked_network: Option<BlockedNetworkFn>,
 }
 
 impl Default for BlockNoticeCenter {
@@ -62,7 +72,16 @@ impl BlockNoticeCenter {
             events: None,
             journal: None,
             lineage: Mutex::new(None),
+            blocked_network: None,
         }
+    }
+
+    /// Name an attempt dropped by a network Block rule after that network, so
+    /// a scan across it is one notice the user can act on.
+    #[must_use]
+    pub fn with_blocked_network(mut self, namer: BlockedNetworkFn) -> Self {
+        self.blocked_network = Some(namer);
+        self
     }
 
     /// Attach the persisted mute set. Without it every ledger starts unmuted,
@@ -114,6 +133,14 @@ impl BlockNoticeCenter {
     /// principal: it still deserves a notice, and lumping it in with a real
     /// user would let that user's mutes silence it.
     pub fn record_observed(&self, sid: &str, attempt: &BlockAttempt, observed_ms: Option<u64>) {
+        let named;
+        let attempt = match self.blocked_network.as_ref().and_then(|f| f(sid, attempt)) {
+            Some(network) => {
+                named = attempt.clone().within_network(network);
+                &named
+            }
+            None => attempt,
+        };
         let now_ms = now_ms();
         let notice = {
             let mut guard = self.ledgers.lock().unwrap_or_else(|p| p.into_inner());
@@ -212,6 +239,115 @@ impl BlockNoticeCenter {
         if let Some(ledger) = guard.get_mut(sid) {
             ledger.set_mutes(mutes);
         }
+    }
+}
+
+/// How long one principal's rule book serves the network lookup before a
+/// re-read: a rule edit shows within seconds, a scan costs one read.
+const BLOCKED_BOOK_TTL: Duration = Duration::from_secs(5);
+
+/// One principal's book as the network lookup needs it.
+struct BlockedBook {
+    book: CanonicalRuleBook,
+    behavior_mode: RouteBehaviorMode,
+    /// Every block an enabled network Block rule names: the cheap first test,
+    /// so a drop outside them never reaches the matcher.
+    blocks: Vec<nrr_shared::ip_block::IpBlock>,
+}
+
+/// The production [`BlockedNetworkFn`]: asks the engine which rule dropped the
+/// address and names it when it is a network Block.
+pub struct BlockedNetworks {
+    rules: Arc<dyn RulesProvider>,
+    memo: Mutex<HashMap<String, (Instant, Arc<BlockedBook>)>>,
+}
+
+impl BlockedNetworks {
+    #[must_use]
+    pub fn new(rules: Arc<dyn RulesProvider>) -> Self {
+        Self {
+            rules,
+            memo: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn into_fn(self) -> BlockedNetworkFn {
+        let this = Arc::new(self);
+        Arc::new(move |sid: &str, attempt: &BlockAttempt| this.network_for(sid, attempt))
+    }
+
+    /// The network rule that dropped `attempt`, as the user wrote it. Only a
+    /// rule block can be one; the matcher decides, so a narrower rule naming
+    /// the host keeps the attempt named by its host.
+    pub fn network_for(&self, sid: &str, attempt: &BlockAttempt) -> Option<String> {
+        self.network_at(sid, attempt, Instant::now())
+    }
+
+    fn network_at(&self, sid: &str, attempt: &BlockAttempt, now: Instant) -> Option<String> {
+        if attempt.reason != BlockReason::BlockedByRule || sid.is_empty() {
+            return None;
+        }
+        let ip: IpAddr = attempt.dest.parse().ok()?;
+        let book = self.book_for(sid, now)?;
+        if !book.blocks.iter().any(|block| block.contains(ip)) {
+            return None;
+        }
+        let decision = nrr_domain::decision_engine_input::match_sample(
+            &book.book,
+            attempt.host.as_deref(),
+            Some(ip),
+            attempt.app.as_deref(),
+            ZonePriorityPolicy::default(),
+            book.behavior_mode,
+        );
+        let RequestedRouteDecision::MatchedRoute { candidate } = decision else {
+            return None;
+        };
+        if candidate.action != RuleAction::Block || candidate.match_class != MatchClass::Subnet {
+            return None;
+        }
+        let address = book
+            .book
+            .primary
+            .rules()
+            .iter()
+            .chain(book.book.secondary.rules())
+            .find(|rule| rule.id == candidate.rule_id)?
+            .address_match
+            .as_ref()?;
+        Some(address.to_display_string())
+    }
+
+    fn book_for(&self, sid: &str, now: Instant) -> Option<Arc<BlockedBook>> {
+        let mut memo = self.memo.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, book)) = memo.get(sid) {
+            if now.saturating_duration_since(*at) < BLOCKED_BOOK_TTL {
+                return Some(Arc::clone(book));
+            }
+        }
+        let snapshot = self.rules.active_rules_for(sid)?;
+        let blocks = snapshot
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .chain(snapshot.rule_book.secondary.rules())
+            .filter(|rule| rule.enabled && rule.action == RuleAction::Block)
+            .filter_map(|rule| rule.address_match.as_ref()?.ip_blocks())
+            .flatten()
+            .copied()
+            .collect();
+        let book = Arc::new(BlockedBook {
+            book: snapshot.rule_book,
+            behavior_mode: snapshot.behavior_mode,
+            blocks,
+        });
+        if memo.len() >= MAX_TRACKED_PRINCIPALS && !memo.contains_key(sid) {
+            memo.clear();
+        }
+        memo.insert(sid.to_owned(), (now, Arc::clone(&book)));
+        Some(book)
     }
 }
 
@@ -504,5 +640,154 @@ mod tests {
         center.record(ALICE, &attempt());
 
         assert!(bus.peek_pending_for(&sub.subscription_id, 10).is_empty());
+    }
+
+    // ── a blocked network names the notice ───────────────────────────────
+
+    struct FixedRules(nrr_domain::canonical::CanonicalRuleBook);
+
+    impl RulesProvider for FixedRules {
+        fn active_rules(&self) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+            self.active_rules_for(ALICE)
+        }
+        fn active_rules_for(
+            &self,
+            _principal: &str,
+        ) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+            Some(crate::per_sid_orchestrator::ActiveRulesSnapshot {
+                rule_book: self.0.clone(),
+                behavior_mode: RouteBehaviorMode::PreferPrimary,
+            })
+        }
+    }
+
+    fn rule(
+        id: &str,
+        m: nrr_domain::canonical::CanonicalAddressMatch,
+        action: RuleAction,
+    ) -> nrr_domain::canonical::CanonicalRule {
+        nrr_domain::canonical::CanonicalRule {
+            id: nrr_domain::RuleId(id.into()),
+            enabled: true,
+            address_match: Some(m),
+            app_match: None,
+            comment: String::new(),
+            action,
+            origin: None,
+        }
+    }
+
+    fn networks(rules: Vec<nrr_domain::canonical::CanonicalRule>) -> BlockedNetworks {
+        BlockedNetworks::new(Arc::new(FixedRules(CanonicalRuleBook {
+            primary: nrr_domain::canonical::CanonicalRuleSet::from_rules(rules),
+            secondary: nrr_domain::canonical::CanonicalRuleSet::from_rules(vec![]),
+        })))
+    }
+
+    fn blocked_to(dest: &str, host: Option<&str>) -> BlockAttempt {
+        BlockAttempt {
+            host: host.map(str::to_owned),
+            dest: dest.to_owned(),
+            app: Some("scanner.exe".to_owned()),
+            reason: BlockReason::BlockedByRule,
+        }
+    }
+
+    fn subnet(text: &str) -> nrr_domain::canonical::CanonicalAddressMatch {
+        nrr_domain::canonical::CanonicalAddressMatch::Subnet(
+            nrr_shared::ip_block::IpBlock::parse(text).expect("network"),
+        )
+    }
+
+    #[test]
+    fn an_address_inside_a_blocked_network_is_named_by_that_network() {
+        let namer = networks(vec![rule(
+            "n-1",
+            subnet("198.51.100.0/24"),
+            RuleAction::Block,
+        )]);
+        assert_eq!(
+            namer
+                .network_for(ALICE, &blocked_to("198.51.100.9", None))
+                .as_deref(),
+            Some("198.51.100.0/24")
+        );
+        assert!(namer
+            .network_for(ALICE, &blocked_to("198.51.101.9", None))
+            .is_none());
+    }
+
+    #[test]
+    fn a_range_is_named_as_written_and_a_routed_network_names_nothing() {
+        let range =
+            nrr_shared::ip_block::IpRange::parse("198.51.100.5-198.51.100.40").expect("range");
+        let namer = networks(vec![
+            rule(
+                "r-1",
+                nrr_domain::canonical::CanonicalAddressMatch::ip_range(range),
+                RuleAction::Block,
+            ),
+            rule("n-2", subnet("203.0.113.0/24"), RuleAction::Route),
+        ]);
+        assert_eq!(
+            namer
+                .network_for(ALICE, &blocked_to("198.51.100.20", None))
+                .as_deref(),
+            Some("198.51.100.5-198.51.100.40")
+        );
+        assert!(namer
+            .network_for(ALICE, &blocked_to("203.0.113.9", None))
+            .is_none());
+    }
+
+    /// The narrower rule decides: a literal-IP Block inside the network is
+    /// its own notice, and only a rule drop is ever attributed to a network.
+    #[test]
+    fn a_narrower_rule_or_another_cause_keeps_the_attempt_as_it_came() {
+        let inside: std::net::IpAddr = "198.51.100.9".parse().expect("ip");
+        let namer = networks(vec![
+            rule("n-1", subnet("198.51.100.0/24"), RuleAction::Block),
+            rule(
+                "i-1",
+                nrr_domain::canonical::CanonicalAddressMatch::ExactIp(inside),
+                RuleAction::Block,
+            ),
+        ]);
+        assert!(namer
+            .network_for(ALICE, &blocked_to("198.51.100.9", None))
+            .is_none());
+        let mut outage = blocked_to("198.51.100.10", None);
+        outage.reason = BlockReason::RouteUnavailable;
+        assert!(namer.network_for(ALICE, &outage).is_none());
+        assert!(namer
+            .network_for("", &blocked_to("198.51.100.10", None))
+            .is_none());
+    }
+
+    #[test]
+    fn a_scan_across_a_blocked_network_is_one_notice() {
+        let namer = networks(vec![rule(
+            "n-1",
+            subnet("198.51.100.0/24"),
+            RuleAction::Block,
+        )]);
+        let bus = Arc::new(EventBus::new());
+        let sub = bus.subscribe_as("test-client".to_string(), Some(ALICE.to_string()), None);
+        let center = BlockNoticeCenter::new()
+            .with_event_bus(Arc::clone(&bus))
+            .with_blocked_network(namer.into_fn());
+
+        for last in 1..=20 {
+            center.record(ALICE, &blocked_to(&format!("198.51.100.{last}"), None));
+        }
+
+        let pending = bus.peek_pending_for(&sub.subscription_id, 10);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        match &pending[0].event {
+            StatusUpdateEvent::BlockNoticeRaised { destination, .. } => {
+                assert_eq!(destination, "198.51.100.0/24");
+            }
+            other => panic!("expected BlockNoticeRaised, got {other:?}"),
+        }
     }
 }

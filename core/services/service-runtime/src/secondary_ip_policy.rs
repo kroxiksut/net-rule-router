@@ -11,8 +11,9 @@
 //! consistently (a route without a matching WFP entry, or vice-versa, would be
 //! an incoherent partial commit).
 //!
-//! Only NAME-derived IPs are considered: `ExactIp` rules name an address
-//! outright, so they are always honoured (never denied) regardless of sharing.
+//! Only NAME-derived IPs are considered: `ExactIp` and network rules name
+//! addresses outright and weigh nothing here. A network does not shield a
+//! declined address inside it either — see [`DeclinedAddresses`].
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -20,6 +21,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleSet};
 use nrr_domain::shared_ip::{commit_shared_ip, SharedIpPolicy};
 use nrr_domain::RuleAction;
+use nrr_shared::ip_block::IpBlock;
 
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 // Cap on suffix/zone fan-out when expanding rules to their cached hostnames,
@@ -58,9 +60,15 @@ pub fn secondary_ip_denylist(
             continue;
         }
         match &rule.address_match {
-            // Explicit IPs are the user's direct choice — always honoured, never
-            // subject to the shared-IP heuristic.
-            Some(CanonicalAddressMatch::ExactIp(_)) | None => {}
+            // Explicit IPs and networks are the user's direct choice and name no
+            // host to weigh. The census only ever declines, so it cannot pin an
+            // address the arbiter gave another link's network either.
+            Some(
+                CanonicalAddressMatch::ExactIp(_)
+                | CanonicalAddressMatch::Subnet(_)
+                | CanonicalAddressMatch::IpRange(_),
+            )
+            | None => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 rule_hosts.insert(host.clone());
                 // The shared-IP census is an IPv4 ledger.
@@ -100,6 +108,39 @@ pub fn secondary_ip_denylist(
         }
     }
     denied
+}
+
+/// The declined set in address order, asked by network.
+///
+/// A network allow on the additional link — one route or one permit for the
+/// whole block — would re-admit every declined address inside it, dragging
+/// each one's direct co-tenant into the tunnel the census kept it out of. The
+/// emitter carves these out instead, and asks without walking the network.
+/// Build it from the FINAL denylist (fake-IP suppressions included).
+#[derive(Clone, Debug, Default)]
+pub struct DeclinedAddresses {
+    sorted: Vec<Ipv4Addr>,
+}
+
+impl DeclinedAddresses {
+    #[must_use]
+    pub fn new(denied: &HashSet<Ipv4Addr>) -> Self {
+        let mut sorted: Vec<Ipv4Addr> = denied.iter().copied().collect();
+        sorted.sort_unstable();
+        Self { sorted }
+    }
+
+    /// The declined addresses inside `network`, ascending. Empty for an IPv6
+    /// network: the census is an IPv4 ledger.
+    #[must_use]
+    pub fn inside(&self, network: IpBlock) -> &[Ipv4Addr] {
+        let (IpAddr::V4(first), IpAddr::V4(last)) = (network.network(), network.last()) else {
+            return &[];
+        };
+        let start = self.sorted.partition_point(|ip| *ip < first);
+        let end = self.sorted.partition_point(|ip| *ip <= last);
+        &self.sorted[start..end]
+    }
 }
 
 /// Record a suffix/zone rule's expanded host list into the census maps.
@@ -218,6 +259,68 @@ mod tests {
         let secondary = CanonicalRuleSet::from_rules(vec![fqdn_rule("r1", "assistant.example")]);
         let denied = secondary_ip_denylist(&secondary, &cache, SharedIpPolicy::MajorityOfIp);
         assert!(denied.contains(&shared));
+    }
+
+    /// A network names no host for the census, and a name host's shared
+    /// address inside one is declined all the same — the carve-out the
+    /// network's emitter then asks for.
+    #[test]
+    fn a_network_neither_counts_nor_shields_a_shared_address() {
+        let inner = MockFqdnCacheLookup::new();
+        let shared = Ipv4Addr::new(192, 0, 2, 7);
+        inner.set_ips("assistant.example", vec![shared]);
+        let mut direct = HashMap::new();
+        direct.insert(shared, 3);
+        let cache = CensusMock { inner, direct };
+        let network = CanonicalRule {
+            address_match: Some(CanonicalAddressMatch::Subnet(
+                IpBlock::parse("192.0.2.0/24").expect("block"),
+            )),
+            ..fqdn_rule("r-net", "unused")
+        };
+        let only_network = CanonicalRuleSet::from_rules(vec![network.clone()]);
+        assert!(
+            secondary_ip_denylist(&only_network, &cache, SharedIpPolicy::MajorityOfIp).is_empty()
+        );
+
+        let both =
+            CanonicalRuleSet::from_rules(vec![network, fqdn_rule("r1", "assistant.example")]);
+        let denied = secondary_ip_denylist(&both, &cache, SharedIpPolicy::MajorityOfIp);
+        assert!(denied.contains(&shared));
+        let declined = DeclinedAddresses::new(&denied);
+        assert_eq!(
+            declined.inside(IpBlock::parse("192.0.2.0/24").expect("block")),
+            &[shared]
+        );
+        assert!(declined
+            .inside(IpBlock::parse("192.0.3.0/24").expect("block"))
+            .is_empty());
+        assert!(declined
+            .inside(IpBlock::parse("2001:db8::/32").expect("block"))
+            .is_empty());
+    }
+
+    #[test]
+    fn declined_addresses_answer_by_network_bounds() {
+        let denied: HashSet<Ipv4Addr> = [
+            Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(10, 0, 0, 255),
+            Ipv4Addr::new(10, 0, 1, 0),
+            Ipv4Addr::new(9, 255, 255, 255),
+        ]
+        .into_iter()
+        .collect();
+        let declined = DeclinedAddresses::new(&denied);
+        assert_eq!(
+            declined.inside(IpBlock::parse("10.0.0.0/24").expect("block")),
+            &[Ipv4Addr::new(10, 0, 0, 0), Ipv4Addr::new(10, 0, 0, 255)]
+        );
+        assert_eq!(
+            declined
+                .inside(IpBlock::parse("10.0.0.0/8").expect("block"))
+                .len(),
+            3
+        );
     }
 
     #[test]

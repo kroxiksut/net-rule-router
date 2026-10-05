@@ -42,7 +42,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use nrr_platform_api::fake_ip::stale_flows::{EstablishedFlow, StaleFlowReset, StaleFlowSweep};
+use nrr_platform_api::fake_ip::stale_flows::{
+    EstablishedFlow, FlowTargets, StaleFlowReset, StaleFlowSweep,
+};
 
 use crate::flow_reset_log::{log_reset_flows, ResetCause};
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
@@ -121,6 +123,47 @@ pub fn flows_to_reset(
         }
     }
     decision
+}
+
+/// What [`reset_owner_flows`] decided and how much of it the OS carried out.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OwnerFlowReset {
+    pub decision: FlowRefreshDecision,
+    pub torn_down: usize,
+}
+
+/// Tear down `owner`'s established connections to `targets` — hosts, or any
+/// address inside a network a rule names — under [`flows_to_reset`]'s rules,
+/// with no anchor. `None` when nothing was connected: the census is a query,
+/// read only when there is a connection to spare.
+pub fn reset_owner_flows(
+    reset: &dyn StaleFlowReset,
+    cache: &dyn FqdnCacheLookup,
+    owner: &str,
+    targets: &FlowTargets,
+) -> Option<OwnerFlowReset> {
+    if targets.is_empty() {
+        return None;
+    }
+    let candidates = reset.established_flows_matching(targets);
+    if candidates.is_empty() {
+        return None;
+    }
+    let decision = flows_to_reset(
+        candidates,
+        owner,
+        &cache.shared_direct_ips(),
+        &HashSet::new(),
+    );
+    let torn_down = if decision.reset.is_empty() {
+        0
+    } else {
+        reset.reset_established(&decision.reset)
+    };
+    Some(OwnerFlowReset {
+        decision,
+        torn_down,
+    })
 }
 
 /// The addresses one pass looks at, and which of them are the anchors'.
@@ -591,6 +634,67 @@ mod tests {
         );
         assert_eq!(listed.len(), MAX_ADDRESSES_PER_PASS);
         assert!(listed.contains(&ip("203.0.113.200")));
+    }
+
+    // ── a network target ──────────────────────────────────────────────────
+
+    fn network(text: &str) -> nrr_shared::ip_block::IpBlock {
+        nrr_shared::ip_block::IpBlock::parse(text).expect("test network")
+    }
+
+    #[test]
+    fn a_network_tears_down_only_the_owners_flows_inside_it() {
+        let reset = MockStaleFlowReset::new();
+        let mine_inside = flow("198.51.100.20", 50_000, Some(OWNER));
+        reset.set_flows(vec![
+            mine_inside.clone(),
+            flow("198.51.100.21", 50_001, Some(OTHER_USER)),
+            flow("198.51.100.22", 50_002, None),
+            flow("198.51.101.1", 50_003, Some(OWNER)),
+        ]);
+        let targets = FlowTargets::new(Vec::new(), vec![network("198.51.100.0/24")]);
+
+        let outcome = reset_owner_flows(&reset, &FakeCache::default(), OWNER, &targets)
+            .expect("something was connected");
+
+        assert_eq!(reset.reset_flows(), vec![mine_inside]);
+        assert_eq!(outcome.torn_down, 1);
+        assert_eq!(outcome.decision.kept_other_owner, 1);
+        assert_eq!(outcome.decision.kept_unknown_owner, 1);
+    }
+
+    #[test]
+    fn an_address_the_census_saw_serving_a_direct_host_is_spared_inside_a_network() {
+        let reset = MockStaleFlowReset::new();
+        let routed = flow("198.51.100.20", 50_000, Some(OWNER));
+        reset.set_flows(vec![
+            routed.clone(),
+            flow("198.51.100.30", 50_001, Some(OWNER)),
+        ]);
+        let mut cache = FakeCache::default();
+        cache.shared_direct.insert(ip("198.51.100.30"));
+        let targets = FlowTargets::new(Vec::new(), vec![network("198.51.100.0/24")]);
+
+        let outcome = reset_owner_flows(&reset, &cache, OWNER, &targets).expect("connected");
+
+        assert_eq!(reset.reset_flows(), vec![routed]);
+        assert_eq!(outcome.decision.kept_shared, 1);
+    }
+
+    #[test]
+    fn nothing_connected_or_nothing_asked_reads_nothing() {
+        let reset = MockStaleFlowReset::new();
+        assert!(reset_owner_flows(
+            &reset,
+            &FakeCache::default(),
+            OWNER,
+            &FlowTargets::default()
+        )
+        .is_none());
+        assert!(reset.queried_networks().is_empty());
+        let targets = FlowTargets::new(Vec::new(), vec![network("198.51.100.0/24")]);
+        assert!(reset_owner_flows(&reset, &FakeCache::default(), OWNER, &targets).is_none());
+        assert!(reset.reset_flows().is_empty());
     }
 
     // ── the address set ───────────────────────────────────────────────────

@@ -36,10 +36,14 @@ use crate::{
         CanonicalAddressMatch, CanonicalAppMatch, CanonicalAppPattern, CanonicalProfile,
         CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
     },
+    ip_network_policy::{self, IpValueKind},
     rules_file::HostPlatform,
     ActiveConfiguration, AddressMatch, AppMatch, AppMatchPattern, Rule, RuleId,
 };
 use nrr_shared::app_identity::ExecutableNaming;
+use nrr_shared::ip_block::{IpBlock, IpRange};
+
+use crate::address_class::canonical_ip;
 
 // ── Public error types ────────────────────────────────────────────────────────
 
@@ -68,13 +72,36 @@ pub enum ValidationError {
     /// internationalized domain name per UTS#46/IDNA2008.
     DomainInvalidIdn { rule_id: RuleId, value: String },
 
-    /// An `ExactIp` rule contains a CIDR notation address (`192.168.1.0/24`).
-    /// CIDR subnet matching is not supported.
-    CidrNotSupported { rule_id: RuleId, value: String },
+    /// An address value written under the heading of another kind: a subnet
+    /// in `--- IP`, an address in `--- CIDR`. Section is type, so the value is
+    /// never re-filed; `belongs_in` names the right one.
+    WrongAddressSection {
+        rule_id: RuleId,
+        value: String,
+        belongs_in: IpValueKind,
+    },
 
-    /// An `ExactIp` rule contains an IP range (`10.0.0.1-10.0.0.100`).
-    /// Range matching is not supported.
-    IpRangeNotSupported { rule_id: RuleId, value: String },
+    /// A `Subnet` rule value that is not a network (`a.b.c.d/len`).
+    InvalidSubnet { rule_id: RuleId, value: String },
+
+    /// An `IpRange` rule value that is not a range of one family in order.
+    InvalidIpRange { rule_id: RuleId, value: String },
+
+    /// A network or range wider than
+    /// [`crate::ip_network_policy::widest_rule_prefix`].
+    NetworkTooWide {
+        rule_id: RuleId,
+        value: String,
+        widest_prefix: u8,
+    },
+
+    /// A network or range touching loopback, multicast, broadcast or "this
+    /// host": routing it would break the machine, not reach a site.
+    NetworkCoversReserved {
+        rule_id: RuleId,
+        value: String,
+        class: AddressClass,
+    },
 
     /// An `ExactIp` rule contains a string that cannot be parsed as any IP
     /// address. The rule cannot be applied and must be corrected.
@@ -173,8 +200,11 @@ impl ValidationError {
             Self::RuleEmptyMatch { rule_id }
             | Self::DomainEmptyValue { rule_id }
             | Self::DomainInvalidIdn { rule_id, .. }
-            | Self::CidrNotSupported { rule_id, .. }
-            | Self::IpRangeNotSupported { rule_id, .. }
+            | Self::WrongAddressSection { rule_id, .. }
+            | Self::InvalidSubnet { rule_id, .. }
+            | Self::InvalidIpRange { rule_id, .. }
+            | Self::NetworkTooWide { rule_id, .. }
+            | Self::NetworkCoversReserved { rule_id, .. }
             | Self::InvalidIpAddress { rule_id, .. }
             | Self::IpAddressNotADestination { rule_id, .. }
             | Self::DomainInvalidValue { rule_id, .. }
@@ -215,14 +245,43 @@ impl fmt::Display for ValidationError {
             Self::DomainInvalidValue { rule_id, value } => {
                 write!(f, "rule {rule_id}: '{value}' is not a host name")
             }
-            Self::CidrNotSupported { rule_id, value } => {
+            Self::WrongAddressSection {
+                rule_id,
+                value,
+                belongs_in,
+            } => {
+                let section = match belongs_in {
+                    IpValueKind::Address => "IP",
+                    IpValueKind::Subnet => "CIDR",
+                    IpValueKind::Range => "Ranges",
+                };
                 write!(
                     f,
-                    "rule {rule_id}: CIDR notation '{value}' is not supported"
+                    "rule {rule_id}: '{value}' belongs in the --- {section} section"
                 )
             }
-            Self::IpRangeNotSupported { rule_id, value } => {
-                write!(f, "rule {rule_id}: IP range '{value}' is not supported")
+            Self::InvalidSubnet { rule_id, value } => {
+                write!(f, "rule {rule_id}: '{value}' is not a network")
+            }
+            Self::InvalidIpRange { rule_id, value } => {
+                write!(f, "rule {rule_id}: '{value}' is not an address range")
+            }
+            Self::NetworkTooWide {
+                rule_id,
+                value,
+                widest_prefix,
+            } => {
+                write!(
+                    f,
+                    "rule {rule_id}: '{value}' is wider than a /{widest_prefix} network"
+                )
+            }
+            Self::NetworkCoversReserved {
+                rule_id,
+                value,
+                class,
+            } => {
+                write!(f, "rule {rule_id}: '{value}' covers {class:?} addresses")
             }
             Self::InvalidIpAddress { rule_id, value } => {
                 write!(f, "rule {rule_id}: '{value}' is not a valid IP address")
@@ -342,6 +401,26 @@ pub enum ValidationWarning {
         class: AddressClass,
     },
 
+    /// A subnet written with host bits set (`10.0.2.7/24`) names its network
+    /// (`10.0.2.0/24`); the rule keeps the network.
+    SubnetHostBitsCleared {
+        rule_id: RuleId,
+        original: String,
+        normalized: String,
+    },
+
+    /// A network or range wider than Fail-Closed holds
+    /// ([`crate::ip_network_policy::fail_closed_widest_prefix`], carried as
+    /// `widest_prefix`): it is routed, but not blocked while the tunnel is down.
+    /// `public` when part of it lies outside private address space — a wide
+    /// public network is rarely meant.
+    WideNetwork {
+        rule_id: RuleId,
+        value: String,
+        public: bool,
+        widest_prefix: u8,
+    },
+
     /// A stored rule on an address that is never a destination
     /// ([`ValidationError::IpAddressNotADestination`]) was dropped on read;
     /// the rest of the rules load.
@@ -447,6 +526,28 @@ impl fmt::Display for ValidationWarning {
                 class,
             } => {
                 write!(f, "rule {rule_id}: {address} is a {class:?} address")
+            }
+            Self::SubnetHostBitsCleared {
+                rule_id,
+                original,
+                normalized,
+            } => {
+                write!(
+                    f,
+                    "rule {rule_id}: subnet '{original}' names the network '{normalized}'"
+                )
+            }
+            Self::WideNetwork {
+                rule_id,
+                value,
+                public,
+                ..
+            } => {
+                let scope = if *public { "public " } else { "" };
+                write!(
+                    f,
+                    "rule {rule_id}: {scope}network '{value}' is wider than Fail-Closed holds"
+                )
             }
             Self::RuleOnNoDestinationDropped { rule_id, value } => {
                 write!(
@@ -757,6 +858,28 @@ fn normalize_rule(
                 }
             }
         }
+        Some(AddressMatch::Subnet(text)) => match canonical_subnet(text, &rule.id, warnings) {
+            Ok(block) => Some(CanonicalAddressMatch::Subnet(block)),
+            Err(ValidationError::NetworkCoversReserved { rule_id, value, .. }) => {
+                warnings.push(ValidationWarning::RuleOnNoDestinationDropped { rule_id, value });
+                return None;
+            }
+            Err(e) => {
+                errors.push(e);
+                return None;
+            }
+        },
+        Some(AddressMatch::IpRange(text)) => match canonical_ip_range(text, &rule.id, warnings) {
+            Ok(range) => Some(CanonicalAddressMatch::ip_range(range)),
+            Err(ValidationError::NetworkCoversReserved { rule_id, value, .. }) => {
+                warnings.push(ValidationWarning::RuleOnNoDestinationDropped { rule_id, value });
+                return None;
+            }
+            Err(e) => {
+                errors.push(e);
+                return None;
+            }
+        },
         Some(AddressMatch::ExactIp(text)) => match canonical_ip_address(text, &rule.id, warnings) {
             Ok(addr) => Some(CanonicalAddressMatch::ExactIp(addr)),
             // A rules file is stored data: such a rule is dropped, the rest
@@ -998,28 +1121,151 @@ pub(crate) fn canonical_ip_address(
 
 /// Names what an unparseable address value is, when its shape says so.
 fn address_refusal(value: &str, rule_id: &RuleId) -> ValidationError {
-    let rule_id = rule_id.clone();
-    let value_owned = value.to_string();
-    if let Some((head, _)) = value.split_once('/') {
-        if head.parse::<IpAddr>().is_ok() {
-            return ValidationError::CidrNotSupported {
-                rule_id,
-                value: value_owned,
-            };
+    wrong_section(value, rule_id, IpValueKind::Address).unwrap_or_else(|| {
+        ValidationError::InvalidIpAddress {
+            rule_id: rule_id.clone(),
+            value: value.to_string(),
         }
+    })
+}
+
+/// The section a value of another kind belongs in, when it is written under
+/// `section`'s heading.
+fn wrong_section(value: &str, rule_id: &RuleId, section: IpValueKind) -> Option<ValidationError> {
+    IpValueKind::of(value)
+        .filter(|kind| *kind != section)
+        .map(|belongs_in| ValidationError::WrongAddressSection {
+            rule_id: rule_id.clone(),
+            value: value.to_string(),
+            belongs_in,
+        })
+}
+
+/// The canonical network of a `--- CIDR` value, or the error the rule
+/// pipeline refuses it with.
+pub(crate) fn canonical_subnet(
+    value: &str,
+    rule_id: &RuleId,
+    warnings: &mut Vec<ValidationWarning>,
+) -> Result<IpBlock, ValidationError> {
+    let value = value.trim();
+    let Some(written) = IpBlock::parse(value) else {
+        return Err(
+            wrong_section(value, rule_id, IpValueKind::Subnet).unwrap_or_else(|| {
+                ValidationError::InvalidSubnet {
+                    rule_id: rule_id.clone(),
+                    value: value.to_string(),
+                }
+            }),
+        );
+    };
+    let block = ip_network_policy::canonical_block(written);
+    if block.network() != written.network() {
+        warnings.push(ValidationWarning::Ipv4MappedIpv6Normalized {
+            rule_id: rule_id.clone(),
+            original: value.to_string(),
+            normalized: block.to_string(),
+        });
+    } else if value
+        .split_once('/')
+        .and_then(|(a, _)| a.trim().parse::<IpAddr>().ok())
+        != Some(block.network())
+    {
+        warnings.push(ValidationWarning::SubnetHostBitsCleared {
+            rule_id: rule_id.clone(),
+            original: value.to_string(),
+            normalized: block.to_string(),
+        });
     }
-    if let Some((from, to)) = value.split_once('-') {
-        if from.parse::<IpAddr>().is_ok() && to.parse::<IpAddr>().is_ok() {
-            return ValidationError::IpRangeNotSupported {
-                rule_id,
-                value: value_owned,
-            };
-        }
+    check_networks(value, std::slice::from_ref(&block), rule_id, warnings)?;
+    Ok(block)
+}
+
+/// The canonical range of a `--- Ranges` value, or the error the rule
+/// pipeline refuses it with.
+pub(crate) fn canonical_ip_range(
+    value: &str,
+    rule_id: &RuleId,
+    warnings: &mut Vec<ValidationWarning>,
+) -> Result<IpRange, ValidationError> {
+    let value = value.trim();
+    let parsed = value.split_once('-').and_then(|(first, last)| {
+        let first = canonical_ip(first.trim().parse().ok()?);
+        let last = canonical_ip(last.trim().parse().ok()?);
+        IpRange::new(first, last)
+    });
+    let Some(range) = parsed else {
+        return Err(
+            wrong_section(value, rule_id, IpValueKind::Range).unwrap_or_else(|| {
+                ValidationError::InvalidIpRange {
+                    rule_id: rule_id.clone(),
+                    value: value.to_string(),
+                }
+            }),
+        );
+    };
+    let widest = ip_network_policy::prefix_of_width(range.is_ipv4(), range.width_bits());
+    let allowed = ip_network_policy::widest_rule_prefix(range.is_ipv4());
+    if widest < u32::from(allowed) {
+        return Err(ValidationError::NetworkTooWide {
+            rule_id: rule_id.clone(),
+            value: value.to_string(),
+            widest_prefix: allowed,
+        });
     }
-    ValidationError::InvalidIpAddress {
-        rule_id,
-        value: value_owned,
+    check_networks(value, range.blocks(), rule_id, warnings)?;
+    Ok(range)
+}
+
+/// The width and class limits every rule network shares.
+fn check_networks(
+    value: &str,
+    blocks: &[IpBlock],
+    rule_id: &RuleId,
+    warnings: &mut Vec<ValidationWarning>,
+) -> Result<(), ValidationError> {
+    if let Some(wide) = blocks
+        .iter()
+        .find(|b| ip_network_policy::wider_than_rule_allows(**b))
+    {
+        return Err(ValidationError::NetworkTooWide {
+            rule_id: rule_id.clone(),
+            value: value.to_string(),
+            widest_prefix: ip_network_policy::widest_rule_prefix(wide.network().is_ipv4()),
+        });
     }
+    if let Some(class) = blocks
+        .iter()
+        .find_map(|b| ip_network_policy::reserved_overlap(*b))
+    {
+        return Err(ValidationError::NetworkCoversReserved {
+            rule_id: rule_id.clone(),
+            value: value.to_string(),
+            class,
+        });
+    }
+    if let Some(link_local) = blocks
+        .iter()
+        .find(|b| ip_network_policy::touches_link_local(**b))
+    {
+        warnings.push(ValidationWarning::UnusualIpDestination {
+            rule_id: rule_id.clone(),
+            address: link_local.network(),
+            class: AddressClass::LinkLocal,
+        });
+    }
+    if let Some(wide) = blocks
+        .iter()
+        .find(|b| ip_network_policy::wider_than_fail_closed(**b))
+    {
+        warnings.push(ValidationWarning::WideNetwork {
+            rule_id: rule_id.clone(),
+            value: value.to_string(),
+            public: !blocks.iter().all(|b| ip_network_policy::is_private(*b)),
+            widest_prefix: ip_network_policy::fail_closed_widest_prefix(wide.network().is_ipv4()),
+        });
+    }
+    Ok(())
 }
 
 /// Normalizes an [`AppMatch`]:

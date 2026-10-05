@@ -97,10 +97,11 @@ fn build() -> (
 fn canonical_rules(tag: &str) -> String {
     use nrr_shared::rules_json::{
         to_canonical_string, AddressMatchDto, CanonicalRulesJsonV1, RuleDto,
-        RULES_JSON_SCHEMA_VERSION,
     };
+    // Schema 1: a book of the older kinds is stored at 1, so the payload is
+    // already canonical and keeps the hash the test names.
     to_canonical_string(&CanonicalRulesJsonV1 {
-        schema_version: RULES_JSON_SCHEMA_VERSION,
+        schema_version: 1,
         primary: vec![RuleDto {
             id: format!("r-{tag}"),
             enabled: true,

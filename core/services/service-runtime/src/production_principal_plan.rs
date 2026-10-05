@@ -41,18 +41,22 @@ use nrr_shared::RouteRole;
 
 use crate::catch_all_exemptions::{collect_exemptions, CatchAllExemptions};
 use crate::enforcement_planner::{
-    plan_catch_all_kill_switch, plan_doh_dot_block, plan_fail_closed_block_all,
-    plan_fail_closed_destinations,
+    never_blocked_networks, plan_catch_all_kill_switch, plan_doh_dot_block,
+    plan_fail_closed_block_all, plan_fail_closed_destinations, plan_fail_closed_networks,
+    NetworkHoldLog, NetworkHolds,
 };
 use crate::killswitch_codegen::KillSwitchProtocols;
 use crate::machine_reading::MachineReading;
 use crate::per_sid_orchestrator::PerSidPolicySnapshot;
 
 use crate::app_observation_lookup::AppObservationLookup;
-use crate::enforcement_planner::{plan_route_rules, plan_routes, PlannerInput};
+use crate::enforcement_planner::{plan_route_rules, plan_routes_with, PlannerInput};
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::per_sid_orchestrator::{RoutePolicySource, RulesProvider};
 use crate::principal_enforcement::{PlannedPolicy, PrincipalPlanSource};
+use crate::route_codegen::network_routes::{names_networks, NetworkRouteFacts};
+use crate::tunnel_server_memory::TunnelServerMemory;
+use nrr_platform_api::tunnel_endpoints::TunnelEndpointSource;
 
 /// What a plan covers, so the caller reports it instead of implying the whole
 /// policy is in force.
@@ -86,6 +90,32 @@ pub struct ProductionPrincipalPlanSource {
     /// Where each principal's rule conflicts are published for the Overlaps
     /// screen. `None` leaves them unpublished.
     conflicts: Option<crate::app_enforcement_status::AppEnforcementStatus>,
+    network_hold_log: NetworkHoldLog,
+    /// Tunnel servers no live route names. `None` plans around the live host
+    /// routes alone.
+    tunnel_servers: Option<TunnelServerSources>,
+}
+
+/// The tunnel servers known beyond the bound links' host routes: the kernel
+/// tunnels' peers and the servers remembered from earlier passes and runs.
+struct TunnelServerSources {
+    memory: Arc<TunnelServerMemory>,
+    endpoints: Option<Arc<dyn TunnelEndpointSource>>,
+    /// The peers read this pass; one read serves every principal.
+    pass_peers: Mutex<Option<Arc<[std::net::IpAddr]>>>,
+}
+
+impl TunnelServerSources {
+    fn pass_peers(&self) -> Arc<[std::net::IpAddr]> {
+        let mut cached = self.pass_peers.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(cached.get_or_insert_with(|| {
+            self.endpoints
+                .as_ref()
+                .map(|source| source.tunnel_endpoints())
+                .unwrap_or_default()
+                .into()
+        }))
+    }
 }
 
 /// Where the exemption facts come from, and the pass's cached reading of them.
@@ -115,7 +145,27 @@ impl ProductionPrincipalPlanSource {
             app_observations,
             machine: None,
             conflicts: None,
+            network_hold_log: NetworkHoldLog::default(),
+            tunnel_servers: None,
         }
+    }
+
+    /// Remember the tunnel servers each pass sees and plan around them while
+    /// nothing live names them; `endpoints` adds the kernel tunnels' peers.
+    /// For a platform without a route coordinator, which keeps this memory
+    /// itself.
+    #[must_use]
+    pub fn with_tunnel_servers(
+        mut self,
+        memory: Arc<TunnelServerMemory>,
+        endpoints: Option<Arc<dyn TunnelEndpointSource>>,
+    ) -> Self {
+        self.tunnel_servers = Some(TunnelServerSources {
+            memory,
+            endpoints,
+            pass_peers: Mutex::new(None),
+        });
+        self
     }
 
     /// Publish each planned principal's rule conflicts into `status` — the one
@@ -177,10 +227,12 @@ impl ProductionPrincipalPlanSource {
                 );
             })
             .ok()?;
-        let reading = Arc::new(MachineReading {
-            routes: Ok(routes),
-            adapters: Ok(adapters),
-        });
+        // This path keeps no record of what it installed; our signature is it.
+        let reading = Arc::new(MachineReading::new(
+            Ok(routes),
+            Ok(adapters),
+            crate::route_codegen::is_owned_route,
+        ));
         *cached = Some(Arc::clone(&reading));
         Some(reading)
     }
@@ -220,6 +272,9 @@ impl ProductionPrincipalPlanSource {
         // What policy may do about IPv6: naming the family and STEERING it are
         // separate answers, and only the machine reading knows either.
         let ipv6 = self.ipv6_guard(&policy);
+        // Every pass, whatever the book needs: the screen of a rule submitted
+        // while the tunnel is down reads what was noted here.
+        self.remember_tunnel_servers(&policy);
         let input = PlannerInput {
             fqdn_cache: self.fqdn_cache.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
@@ -304,11 +359,15 @@ impl ProductionPrincipalPlanSource {
         // pair — permit over that link, block the same destination anywhere
         // else — so the guard would be adding rules that change nothing.
         let fail_closed = if availability.secondary || block_all_armed {
+            self.network_hold_log.forget(stored);
             Vec::new()
         } else {
             self.fail_closed_flows(stored, &policy, &flows, &ownership)
         };
-        let fail_closed_blocks = fail_closed.len();
+        let fail_closed_blocks = fail_closed
+            .iter()
+            .filter(|flow| flow.verdict == Verdict::Block)
+            .count();
         flows.extend(fail_closed);
 
         // Browser DoH hides the names wildcard rules learn from, so blocking it
@@ -322,21 +381,17 @@ impl ProductionPrincipalPlanSource {
         // resolves the link at apply time and reports the ones it cannot steer,
         // which keeps "no route installed" a stated fact rather than a silent
         // omission in the plan.
-        let routes = plan_routes(
+        let routes = self.routes_for(
+            &policy,
             rules.behavior_mode,
             &rules.rule_book,
             availability.primary,
-            self.fqdn_cache.as_ref(),
-            self.app_observations.as_ref(),
             // The same addresses the filters were planned without: a route to
             // the tunnel for an address the policy declined would carry a
             // direct host's traffic there, as the route codegen elsewhere avoids.
             &secondary_ip_denylist,
             ipv6.route_families(),
-            crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
-                policy.zone_priority_over_ip,
-            ),
-            &self.tunnel_catch_alls(&policy),
+            crate::wfp_codegen::current_rule_shape_support(),
         );
         timings.mark("routes");
         crate::phase_timings::report_if_slow(
@@ -430,7 +485,9 @@ impl ProductionPrincipalPlanSource {
             return Vec::new();
         }
         let exemptions = self.exemptions_for(policy);
-        if !exemptions.can_arm() {
+        // A remembered server alone is no licence: with the links unresolved
+        // the attached subnets are unknown, and the block would cut the LAN.
+        if !exemptions.can_arm() || !self.links_resolve(policy) {
             tracing::warn!(
                 target: "nrr::enforcement",
                 msg_key = "persid-plan-blanket-block-refused",
@@ -502,33 +559,174 @@ impl ProductionPrincipalPlanSource {
         ) else {
             return Vec::new();
         };
-        // No reconciler here to say which rows we installed; our signature does.
-        // Without it the mode-B overlay left in the table would pass for the
-        // tunnel's own.
-        let routes: Vec<nrr_platform_api::RouteEntry> = reading
-            .routes()
-            .unwrap_or_default()
+        crate::route_codegen::tunnel_catch_all_prefixes(
+            reading.routes().unwrap_or_default(),
+            tunnel.index,
+        )
+    }
+
+    /// The route intents for `book`, network routes planned around this
+    /// machine's links.
+    #[allow(clippy::too_many_arguments)]
+    fn routes_for(
+        &self,
+        policy: &PerSidPolicySnapshot,
+        mode: RouteBehaviorMode,
+        book: &nrr_domain::canonical::CanonicalRuleBook,
+        has_primary: bool,
+        denied: &std::collections::HashSet<std::net::Ipv4Addr>,
+        families: crate::enforcement_planner::FamilyScope,
+        support: nrr_domain::rule_shape::RuleShapeSupport,
+    ) -> Vec<nrr_platform_api::enforcement::RouteIntent> {
+        let catch_alls = self.tunnel_catch_alls(policy);
+        let networks = self.network_route_facts(policy, book, support, &catch_alls);
+        plan_routes_with(
+            mode,
+            book,
+            has_primary,
+            self.fqdn_cache.as_ref(),
+            self.app_observations.as_ref(),
+            denied,
+            families,
+            crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+                policy.zone_priority_over_ip,
+            ),
+            &catch_alls,
+            &networks,
+            support,
+        )
+    }
+
+    /// What a network rule's routes must respect, from the pass's reading: the
+    /// tunnel's routes, the attached networks and the tunnel's servers. Only
+    /// the catch-alls when no network rule would use the rest, which keeps a
+    /// host-only book's plan exactly what it was.
+    fn network_route_facts(
+        &self,
+        policy: &PerSidPolicySnapshot,
+        book: &nrr_domain::canonical::CanonicalRuleBook,
+        support: nrr_domain::rule_shape::RuleShapeSupport,
+        catch_alls: &[(std::net::Ipv4Addr, u8)],
+    ) -> NetworkRouteFacts {
+        let fallback = || NetworkRouteFacts::from_catch_alls(catch_alls);
+        if !names_networks(book, support) {
+            return fallback();
+        }
+        let Some(reading) = self.machine_reading() else {
+            return fallback();
+        };
+        let adapters = reading.adapters().unwrap_or_default();
+        let secondary = policy.secondary.as_ref().map(|b| b.display_name.as_str());
+        let tunnel =
+            crate::catch_all_exemptions::bound_adapter(adapters, secondary).map(|a| a.index);
+        let exemptions = collect_exemptions(
+            reading.routes().unwrap_or_default(),
+            adapters,
+            policy.primary.as_ref().map(|b| b.display_name.as_str()),
+            secondary,
+        );
+        let servers = exemptions
+            .server_ips
             .iter()
-            .map(|r| nrr_platform_api::RouteEntry {
-                is_ours: r.is_ours || crate::route_codegen::is_owned_route(r),
-                ..r.clone()
-            })
+            .map(|ip| std::net::IpAddr::V4(*ip))
+            .chain(
+                exemptions
+                    .server_ips_v6
+                    .iter()
+                    .map(|ip| std::net::IpAddr::V6(*ip)),
+            )
+            .chain(self.known_tunnel_servers())
             .collect();
-        crate::route_codegen::tunnel_catch_all_prefixes(&routes, tunnel.index)
+        NetworkRouteFacts::read(
+            reading.routes().unwrap_or_default(),
+            adapters,
+            tunnel,
+            servers,
+        )
     }
 
     /// What this principal's blanket block must not cut, from the pass's reading
     /// of the machine.
+    ///
+    /// The known servers join even while the links are unresolved: every use
+    /// of a server here opens, and a stale one only permits a little more.
     fn exemptions_for(&self, policy: &PerSidPolicySnapshot) -> CatchAllExemptions {
         let Some(reading) = self.machine_reading() else {
             return CatchAllExemptions::default();
         };
-        collect_exemptions(
+        let mut exemptions = collect_exemptions(
+            reading.routes().unwrap_or_default(),
+            reading.adapters().unwrap_or_default(),
+            policy.primary.as_ref().map(|b| b.display_name.as_str()),
+            policy.secondary.as_ref().map(|b| b.display_name.as_str()),
+        );
+        for ip in self.known_tunnel_servers() {
+            match ip {
+                std::net::IpAddr::V4(v4) if !exemptions.server_ips.contains(&v4) => {
+                    exemptions.server_ips.push(v4);
+                }
+                std::net::IpAddr::V6(v6) if !exemptions.server_ips_v6.contains(&v6) => {
+                    exemptions.server_ips_v6.push(v6);
+                }
+                _ => {}
+            }
+        }
+        exemptions
+    }
+
+    /// Whether both bound links are present with a way out — what the
+    /// exemptions need to name the attached subnets at all.
+    fn links_resolve(&self, policy: &PerSidPolicySnapshot) -> bool {
+        self.machine_reading().is_some_and(|reading| {
+            crate::catch_all_exemptions::links_resolve(
+                reading.adapters().unwrap_or_default(),
+                policy.primary.as_ref().map(|b| b.display_name.as_str()),
+                policy.secondary.as_ref().map(|b| b.display_name.as_str()),
+            )
+        })
+    }
+
+    /// Note the tunnel servers this principal's links show live: the bound
+    /// tunnel's host routes and the kernel tunnels' peers.
+    fn remember_tunnel_servers(&self, policy: &PerSidPolicySnapshot) {
+        let Some(sources) = self.tunnel_servers.as_ref() else {
+            return;
+        };
+        let Some(reading) = self.machine_reading() else {
+            return;
+        };
+        let mut live = collect_exemptions(
             reading.routes().unwrap_or_default(),
             reading.adapters().unwrap_or_default(),
             policy.primary.as_ref().map(|b| b.display_name.as_str()),
             policy.secondary.as_ref().map(|b| b.display_name.as_str()),
         )
+        .server_ips;
+        live.extend(sources.pass_peers().iter().filter_map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => Some(*v4),
+            std::net::IpAddr::V6(_) => None,
+        }));
+        sources.memory.observe(&live);
+    }
+
+    /// The servers known beyond the live host routes: the kernel tunnels'
+    /// peers and the remembered ones. Empty without a memory.
+    fn known_tunnel_servers(&self) -> Vec<std::net::IpAddr> {
+        let Some(sources) = self.tunnel_servers.as_ref() else {
+            return Vec::new();
+        };
+        sources
+            .pass_peers()
+            .iter()
+            .copied()
+            .chain(
+                sources
+                    .memory
+                    .remembered()
+                    .into_iter()
+                    .map(std::net::IpAddr::V4),
+            )
+            .collect()
     }
 
     /// Blocks over the secondary rules' IPv6 destinations when the tunnel
@@ -567,7 +765,8 @@ impl ProductionPrincipalPlanSource {
         )
     }
 
-    /// The per-destination blocks that arm while the secondary is unreachable.
+    /// The per-destination and per-network blocks that arm while the secondary
+    /// is unreachable.
     ///
     /// Empty unless the user actually armed the leak-guard: it is opt-in, and
     /// blocking traffic nobody asked to have blocked is the one failure mode a
@@ -584,6 +783,7 @@ impl ProductionPrincipalPlanSource {
             || !policy.block_secondary_when_unavailable
             || !policy.kill_switch_fail_closed
         {
+            self.network_hold_log.forget(stored);
             return Vec::new();
         }
         // An address the user's own main-link rules name is never blocked: the
@@ -593,15 +793,38 @@ impl ProductionPrincipalPlanSource {
             .into_iter()
             .filter(|ip| ownership.may_block(*ip))
             .collect();
-        if protected.is_empty() {
-            return Vec::new();
-        }
-        plan_fail_closed_destinations(
-            stored,
-            &protected,
-            KillSwitchProtocols::from_bits(policy.kill_switch_protocols),
-        )
+        let holds = NetworkHolds::for_pass(ownership, &protected, || {
+            never_blocked(&self.exemptions_for(policy))
+        });
+        self.network_hold_log.note(stored, &holds);
+        let protocols = KillSwitchProtocols::from_bits(policy.kill_switch_protocols);
+        let mut flows = plan_fail_closed_destinations(stored, &protected, protocols);
+        flows.extend(plan_fail_closed_networks(stored, &holds, protocols));
+        flows
     }
+}
+
+/// What a held network must leave open, from the same reading the blanket
+/// block's exemptions come from.
+fn never_blocked(exemptions: &CatchAllExemptions) -> Vec<nrr_shared::ip_block::IpBlock> {
+    use std::net::IpAddr;
+    never_blocked_networks(
+        exemptions
+            .server_ips
+            .iter()
+            .map(|ip| IpAddr::V4(*ip))
+            .chain(exemptions.server_ips_v6.iter().map(|ip| IpAddr::V6(*ip))),
+        exemptions
+            .local_subnets
+            .iter()
+            .map(|(net, len)| (IpAddr::V4(*net), *len))
+            .chain(
+                exemptions
+                    .local_subnets_v6
+                    .iter()
+                    .map(|(net, len)| (IpAddr::V6(*net), *len)),
+            ),
+    )
 }
 
 /// The addresses the PRIMARY rules route. Under a blanket block they keep their
@@ -669,6 +892,9 @@ impl PrincipalPlanSource for ProductionPrincipalPlanSource {
     fn begin_pass(&self) {
         if let Some(machine) = self.machine.as_ref() {
             *machine.reading.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+        if let Some(sources) = self.tunnel_servers.as_ref() {
+            *sources.pass_peers.lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
     }
 
@@ -1513,6 +1739,113 @@ mod tests {
         assert!(!coverage.kill_switch_complete);
     }
 
+    /// A memory that already holds `servers` and writes nowhere.
+    fn remembering(servers: Vec<Ipv4Addr>) -> Arc<TunnelServerMemory> {
+        Arc::new(TunnelServerMemory::new(
+            Arc::new(|_: &[Ipv4Addr]| {}),
+            Arc::new(move || servers.clone()),
+        ))
+    }
+
+    /// The server route is gone while the tunnel reconnects, but the server
+    /// was seen before: the block arms with its hole, as on the platform
+    /// whose coordinator keeps the same memory.
+    #[test]
+    fn a_remembered_server_lets_the_blanket_block_arm_without_its_route() {
+        let (api, links) = machine(false);
+        let (plan, coverage) = source(
+            Arc::new(OneSecondaryRule(
+                RouteBehaviorMode::StrictSecondaryFailClosed,
+            )),
+            Arc::new(Policy::armed()),
+        )
+        .with_machine_facts(
+            api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+            links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+        )
+        .with_tunnel_servers(remembering(vec![SERVER]), None)
+        .plan_with_coverage(&user(), availability(true))
+        .expect("the rule must plan");
+
+        assert!(blanket_blocks(&plan) > 0);
+        assert!(exempts(&plan, DstMatch::HostV4(SERVER)));
+        assert!(coverage.kill_switch_complete);
+    }
+
+    /// Our own host route via the main gateway has a server's shape. Read as
+    /// one, it would arm the block with a hole to nowhere and no hole for the
+    /// real server; the same route without our signature is a server.
+    #[test]
+    fn our_own_host_route_is_never_taken_for_the_tunnel_server() {
+        use nrr_platform_api::route_table::RouteTablePort;
+        let ours = Ipv4Addr::new(198, 51, 100, 77);
+        let plan_with = |metric: u32| {
+            let (api, links) = machine(false);
+            let mut table = api.get_ip_forward_table().expect("mock table");
+            table.push(nrr_platform_api::types::RouteEntry {
+                destination: IpAddr::V4(ours),
+                prefix_length: 32,
+                next_hop: IpAddr::V4(GATEWAY),
+                interface_index: 2,
+                metric,
+                is_ours: false,
+                table: nrr_platform_api::RouteTableRef::Main,
+            });
+            api.set_route_table(table);
+            source(
+                Arc::new(OneSecondaryRule(
+                    RouteBehaviorMode::StrictSecondaryFailClosed,
+                )),
+                Arc::new(Policy::armed()),
+            )
+            .with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            )
+            .plan_with_coverage(&user(), availability(true))
+            .expect("the rule must plan")
+        };
+
+        let (plan, coverage) = plan_with(crate::route_codegen::SECONDARY_ROUTE_METRIC);
+        assert_eq!(blanket_blocks(&plan), 0, "armed on our own route");
+        assert!(!exempts(&plan, DstMatch::HostV4(ours)));
+        assert!(!coverage.kill_switch_complete);
+
+        // Positive control: the same row without our signature is a server.
+        let (plan, coverage) = plan_with(0);
+        assert!(blanket_blocks(&plan) > 0);
+        assert!(exempts(&plan, DstMatch::HostV4(ours)));
+        assert!(coverage.kill_switch_complete);
+    }
+
+    /// Without the bound tunnel's link the attached subnets cannot be read,
+    /// and a remembered server must not arm a block that would cut the LAN.
+    #[test]
+    fn a_remembered_server_alone_does_not_arm_over_unresolved_links() {
+        let (api, links) = machine(false);
+        links
+            .adapters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|a| a.friendly_name != "tun0");
+        let (plan, coverage) = source(
+            Arc::new(OneSecondaryRule(
+                RouteBehaviorMode::StrictSecondaryFailClosed,
+            )),
+            Arc::new(Policy::armed()),
+        )
+        .with_machine_facts(
+            api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+            links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+        )
+        .with_tunnel_servers(remembering(vec![SERVER]), None)
+        .plan_with_coverage(&user(), availability(false))
+        .expect("the rule must plan");
+
+        assert_eq!(blanket_blocks(&plan), 0);
+        assert!(!coverage.kill_switch_complete);
+    }
+
     /// Tunnel gone, block-all asked for: the traffic is held rather than let out
     /// the way the user asked it not to go — and the per-destination guard is
     /// NOT added on top, because one policy stated twice is two things to keep
@@ -1698,5 +2031,665 @@ mod tests {
             overlay,
             crate::route_codegen::counter_overlay_for(&redirect_set)
         );
+    }
+
+    /// Held networks on this path, judged by the precedence order every
+    /// lowering realises.
+    mod network_holds {
+        use super::*;
+        use crate::address_ownership::{AddressOwnership, ZoneVsIpOrder};
+        use nrr_domain::rule_shape::RuleShapeSupport;
+        use nrr_platform_api::enforcement::{AppScope, Coverage};
+        use nrr_shared::ip_block::IpBlock;
+
+        const MAIN_HOST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 77);
+
+        fn route(id: &str, m: CanonicalAddressMatch) -> CanonicalRule {
+            CanonicalRule {
+                id: RuleId(id.into()),
+                enabled: true,
+                address_match: Some(m),
+                app_match: None,
+                comment: String::new(),
+                action: RuleAction::Route,
+                origin: None,
+            }
+        }
+
+        fn subnet(text: &str) -> CanonicalAddressMatch {
+            CanonicalAddressMatch::Subnet(IpBlock::parse(text).expect("subnet"))
+        }
+
+        fn address_book() -> CanonicalRuleBook {
+            CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![route(
+                    "p-host",
+                    CanonicalAddressMatch::ExactIp(IpAddr::V4(MAIN_HOST)),
+                )]),
+                secondary: CanonicalRuleSet::from_rules(vec![route(
+                    "s-host",
+                    CanonicalAddressMatch::ExactIp(IpAddr::V4(SECONDARY_HOST)),
+                )]),
+            }
+        }
+
+        /// [`address_book`] plus a secondary `/24` around `MAIN_HOST` and a
+        /// secondary `/12`.
+        fn network_book() -> CanonicalRuleBook {
+            let mut rules = address_book().secondary.rules().to_vec();
+            rules.push(route("s-24", subnet("198.51.100.0/24")));
+            rules.push(route("s-12", subnet("172.16.0.0/12")));
+            CanonicalRuleBook {
+                primary: address_book().primary,
+                secondary: CanonicalRuleSet::from_rules(rules),
+            }
+        }
+
+        struct Book(CanonicalRuleBook);
+        impl RulesProvider for Book {
+            fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+                Some(ActiveRulesSnapshot {
+                    rule_book: self.0.clone(),
+                    behavior_mode: RouteBehaviorMode::PreferPrimary,
+                })
+            }
+        }
+
+        fn ownership_with_networks(book: &CanonicalRuleBook) -> AddressOwnership {
+            AddressOwnership::resolve_with_support(
+                book,
+                &crate::fqdn_cache_lookup::MockFqdnCacheLookup::default(),
+                ZoneVsIpOrder::default(),
+                RuleShapeSupport {
+                    network_destination: true,
+                    ..crate::wfp_codegen::current_rule_shape_support()
+                },
+            )
+        }
+
+        fn on_machine() -> ProductionPrincipalPlanSource {
+            let (api, links) = machine(true);
+            source(Arc::new(NoRules), Arc::new(Policy::armed())).with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            )
+        }
+
+        fn armed() -> PerSidPolicySnapshot {
+            Policy::armed().load_for_sid("").expect("policy")
+        }
+
+        /// The tunnel-gone flows for `network_book` under the arbiter above.
+        fn fail_closed(source: &ProductionPrincipalPlanSource) -> Vec<FlowRule> {
+            source.fail_closed_flows(
+                user().as_stored(),
+                &armed(),
+                &[],
+                &ownership_with_networks(&network_book()),
+            )
+        }
+
+        fn dst_block(dst: DstMatch) -> Option<IpBlock> {
+            match dst {
+                DstMatch::Any => None,
+                DstMatch::HostV4(ip) => IpBlock::new(IpAddr::V4(ip), 32),
+                DstMatch::HostV6(ip) => IpBlock::new(IpAddr::V6(ip), 128),
+                DstMatch::SubnetV4 { net, prefix } => IpBlock::new(IpAddr::V4(net), prefix),
+                DstMatch::SubnetV6 { net, prefix } => IpBlock::new(IpAddr::V6(net), prefix),
+            }
+        }
+
+        /// The verdict of the highest-precedence connect flow over `ip`.
+        fn verdict(flows: &[FlowRule], ip: Ipv4Addr) -> Option<Verdict> {
+            let mut best: Option<&FlowRule> = None;
+            for flow in flows.iter().filter(|f| {
+                f.coverage == Coverage::ConnectOnly
+                    && matches!(f.app, AppScope::Any)
+                    && dst_block(f.flow.dst).is_some_and(|b| b.contains(IpAddr::V4(ip)))
+            }) {
+                if best.is_none_or(|b| flow.precedence.is_higher_priority_than(b.precedence)) {
+                    best = Some(flow);
+                }
+            }
+            best.map(|flow| flow.verdict)
+        }
+
+        #[test]
+        fn an_unresolved_tunnel_blocks_a_secondary_slash_24() {
+            let flows = fail_closed(&on_machine());
+            assert!(flows.iter().any(|f| f.verdict == Verdict::Block
+                && f.flow.dst
+                    == DstMatch::SubnetV4 {
+                        net: Ipv4Addr::new(198, 51, 100, 0),
+                        prefix: 24,
+                    }));
+            assert_eq!(
+                verdict(&flows, Ipv4Addr::new(198, 51, 100, 9)),
+                Some(Verdict::Block)
+            );
+        }
+
+        #[test]
+        fn a_primary_address_inside_the_held_slash_24_stays_open() {
+            let flows = fail_closed(&on_machine());
+            assert_eq!(verdict(&flows, MAIN_HOST), Some(Verdict::Permit));
+            assert!(!flows
+                .iter()
+                .any(|f| f.verdict == Verdict::Block && f.flow.dst == DstMatch::HostV4(MAIN_HOST)));
+        }
+
+        #[test]
+        fn a_slash_12_is_too_wide_to_hold_and_is_reported_once_per_change() {
+            use tracing_subscriber::layer::SubscriberExt;
+
+            let source = on_machine();
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let writer = Arc::new(nrr_diagnostics::LogWriter::open(
+                nrr_diagnostics::LogWriterConfig::new(dir.path()),
+            ));
+            let subscriber = tracing_subscriber::registry().with(
+                nrr_diagnostics::NdjsonTracingLayer::new(Arc::clone(&writer)),
+            );
+            let flows = tracing::subscriber::with_default(subscriber, || {
+                let flows = fail_closed(&source);
+                for _ in 0..2 {
+                    assert_eq!(fail_closed(&source), flows);
+                }
+                flows
+            });
+
+            assert!(!flows
+                .iter()
+                .any(|f| dst_block(f.flow.dst).is_some_and(|b| b.prefix_len() == 12)));
+            assert_eq!(verdict(&flows, Ipv4Addr::new(172, 16, 4, 4)), None);
+            let mut reported = 0;
+            for entry in std::fs::read_dir(dir.path()).expect("logs dir") {
+                let text = std::fs::read_to_string(entry.expect("entry").path()).expect("read");
+                reported += text
+                    .lines()
+                    .filter(|l| l.contains("diag.event.persid-plan-network-too-wide"))
+                    .count();
+            }
+            assert_eq!(reported, 1, "three passes over one book are one change");
+        }
+
+        /// The Windows live path arms the same holds and cut-outs from the same
+        /// machine reading: one answer, two mechanisms.
+        #[test]
+        fn both_mechanisms_hold_and_open_the_same_networks() {
+            let source = on_machine();
+            let read = source.exemptions_for(&armed());
+            assert!(!read.server_ips.is_empty(), "fixture guard");
+            let exemptions = crate::killswitch_codegen::FailClosedExemptions {
+                bootstrap_server_ips: read.server_ips.clone(),
+                bootstrap_server_ips_v6: read.server_ips_v6.clone(),
+                local_subnets: read.local_subnets.clone(),
+                local_subnets_v6: read.local_subnets_v6.clone(),
+                ..crate::killswitch_codegen::FailClosedExemptions::default()
+            };
+            let holds =
+                NetworkHolds::for_pass(&ownership_with_networks(&network_book()), &[], || {
+                    exemptions.never_blocked_networks()
+                });
+            let windows: std::collections::BTreeSet<(String, bool)> =
+                crate::killswitch_codegen::fail_closed_network_filters(
+                    user().as_stored(),
+                    &holds,
+                    KillSwitchProtocols::from_bits(armed().kill_switch_protocols),
+                )
+                .into_iter()
+                .filter(|f| {
+                    matches!(
+                        f.layer,
+                        nrr_platform_api::types::WfpLayerKey::AleAuthConnectV4
+                            | nrr_platform_api::types::WfpLayerKey::AleAuthConnectV6
+                    )
+                })
+                .filter_map(|f| {
+                    let block = match (f.remote_ip, f.remote_subnet, f.remote_subnet_v6) {
+                        (Some(ip), _, _) => IpBlock::new(IpAddr::V4(ip), 32),
+                        (None, Some((net, len)), _) => IpBlock::new(IpAddr::V4(net), len),
+                        (None, None, Some((net, len))) => IpBlock::new(IpAddr::V6(net), len),
+                        (None, None, None) => None,
+                    }?;
+                    Some((
+                        block.to_string(),
+                        f.action == nrr_platform_api::types::WfpAction::Block,
+                    ))
+                })
+                .collect();
+            let neutral: std::collections::BTreeSet<(String, bool)> = fail_closed(&source)
+                .into_iter()
+                .filter(|f| f.coverage == Coverage::ConnectOnly)
+                .filter_map(|f| {
+                    Some((
+                        dst_block(f.flow.dst)?.to_string(),
+                        f.verdict == Verdict::Block,
+                    ))
+                })
+                .collect();
+            assert!(windows.contains(&("198.51.100.0/24".to_string(), true)));
+            assert_eq!(windows, neutral);
+        }
+
+        /// End to end through a plan: network rules keep every flow of the
+        /// address book and add the held `/24`'s Fail-Closed block, never the
+        /// too-wide `/12`'s.
+        #[test]
+        fn network_rules_plan_on_top_of_the_address_book() {
+            let (without, without_coverage) = plan(Book(address_book()), Policy::armed(), false);
+            assert!(without_coverage.fail_closed_blocks > 0, "fixture guard");
+            let (with, with_coverage) = plan(Book(network_book()), Policy::armed(), false);
+            assert!(
+                without.flows.iter().all(|f| with.flows.contains(f)),
+                "a network rule must not take anything of the address book away"
+            );
+            let blocks = |net: Ipv4Addr, prefix: u8| {
+                with.flows.iter().any(|f| {
+                    f.verdict == Verdict::Block && f.flow.dst == DstMatch::SubnetV4 { net, prefix }
+                })
+            };
+            assert!(blocks(Ipv4Addr::new(198, 51, 100, 0), 24));
+            assert!(!blocks(Ipv4Addr::new(172, 16, 0, 0), 12));
+            assert!(with_coverage.fail_closed_blocks > without_coverage.fail_closed_blocks);
+        }
+    }
+
+    /// Network routes on this path, planned around the machine's own links.
+    mod network_routes {
+        use super::*;
+        use crate::enforcement_planner::FamilyScope;
+        use crate::route_codegen::NETWORK_ROUTE_METRIC;
+        use nrr_domain::rule_shape::RuleShapeSupport;
+        use nrr_platform_api::enforcement::{EgressRef, RouteIntent};
+        use nrr_shared::ip_block::IpBlock;
+        use std::collections::HashSet;
+
+        const LAN_GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 20, 1, 1);
+        const TUNNEL_SERVER: Ipv4Addr = Ipv4Addr::new(10, 20, 200, 7);
+
+        fn networks() -> RuleShapeSupport {
+            RuleShapeSupport {
+                network_destination: true,
+                ..crate::wfp_codegen::current_rule_shape_support()
+            }
+        }
+
+        fn net(text: &str) -> IpBlock {
+            IpBlock::parse(text).expect("network literal")
+        }
+
+        fn rule(id: &str, m: CanonicalAddressMatch) -> CanonicalRule {
+            CanonicalRule {
+                id: RuleId(id.into()),
+                enabled: true,
+                address_match: Some(m),
+                app_match: None,
+                comment: String::new(),
+                action: RuleAction::Route,
+                origin: None,
+            }
+        }
+
+        fn subnet(id: &str, text: &str) -> CanonicalRule {
+            rule(id, CanonicalAddressMatch::Subnet(net(text)))
+        }
+
+        fn exact(id: &str, ip: Ipv4Addr) -> CanonicalRule {
+            rule(id, CanonicalAddressMatch::ExactIp(IpAddr::V4(ip)))
+        }
+
+        /// A LAN `10.20.1.0/24` on eth0, the tunnel on tun0, and the tunnel's
+        /// server in the same `/16`, reached via the LAN gateway.
+        fn on_machine() -> ProductionPrincipalPlanSource {
+            let (api, links) = machine_parts(true);
+            source(Arc::new(NoRules), Arc::new(Policy::armed())).with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            )
+        }
+
+        /// The machine of [`on_machine`]; without `server_route` the tunnel
+        /// is down and no route names its server.
+        fn machine_parts(
+            server_route: bool,
+        ) -> (
+            Arc<nrr_platform_api::MockWindowsApi>,
+            Arc<nrr_platform_api::adapters::MockAdapterEventSource>,
+        ) {
+            use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+
+            let link =
+                |index: u32, name: &str, address: Ipv4Addr, gateways: Vec<Ipv4Addr>| AdapterInfo {
+                    index,
+                    adapter_name: name.to_owned(),
+                    description: String::new(),
+                    friendly_name: name.to_owned(),
+                    mac: None,
+                    interface_type: InterfaceType::Ethernet,
+                    oper_status: IfOperStatus::Up,
+                    ipv4_addresses: vec![address],
+                    ipv6_addresses: Vec::new(),
+                    gateways,
+                };
+            let adapters = vec![
+                link(2, "eth0", Ipv4Addr::new(10, 20, 1, 10), vec![LAN_GATEWAY]),
+                link(5, "tun0", Ipv4Addr::new(10, 8, 0, 6), Vec::new()),
+            ];
+            let links = Arc::new(nrr_platform_api::adapters::MockAdapterEventSource::new());
+            *links.adapters.lock().unwrap_or_else(|p| p.into_inner()) = adapters.clone();
+            let row = |dst: Ipv4Addr, prefix: u8, next_hop: Ipv4Addr, index: u32| {
+                nrr_platform_api::types::RouteEntry {
+                    destination: IpAddr::V4(dst),
+                    prefix_length: prefix,
+                    next_hop: IpAddr::V4(next_hop),
+                    interface_index: index,
+                    metric: 0,
+                    is_ours: false,
+                    table: nrr_platform_api::RouteTableRef::Main,
+                }
+            };
+            let api = Arc::new(nrr_platform_api::MockWindowsApi::new());
+            let mut table = vec![
+                row(Ipv4Addr::UNSPECIFIED, 0, LAN_GATEWAY, 2),
+                row(Ipv4Addr::new(10, 20, 1, 0), 24, Ipv4Addr::UNSPECIFIED, 2),
+                row(Ipv4Addr::new(10, 8, 0, 0), 24, Ipv4Addr::UNSPECIFIED, 5),
+            ];
+            if server_route {
+                table.push(row(TUNNEL_SERVER, 32, LAN_GATEWAY, 2));
+            }
+            api.set_route_table(table);
+            api.set_adapter_infos(adapters);
+            (api, links)
+        }
+
+        fn policy() -> PerSidPolicySnapshot {
+            Policy::armed().load_for_sid("").expect("policy")
+        }
+
+        fn routes(
+            source: &ProductionPrincipalPlanSource,
+            mode: RouteBehaviorMode,
+            book: &CanonicalRuleBook,
+            support: RuleShapeSupport,
+        ) -> Vec<RouteIntent> {
+            source.routes_for(
+                &policy(),
+                mode,
+                book,
+                true,
+                &HashSet::new(),
+                FamilyScope::V4Only,
+                support,
+            )
+        }
+
+        /// The tunnel's network pieces, in plan order.
+        fn tunnel_networks(routes: &[RouteIntent]) -> Vec<IpBlock> {
+            routes
+                .iter()
+                .filter(|r| r.egress == EgressRef::Secondary && r.metric == NETWORK_ROUTE_METRIC)
+                .filter_map(|r| match r.dst {
+                    DstMatch::SubnetV4 { net, prefix } => IpBlock::new(IpAddr::V4(net), prefix),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn the_facts_come_from_the_pass_reading() {
+            let source = on_machine();
+            let book = CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(Vec::new()),
+                secondary: CanonicalRuleSet::from_rules(vec![subnet("s", "10.20.0.0/16")]),
+            };
+            let facts = source.network_route_facts(&policy(), &book, networks(), &[]);
+            assert_eq!(
+                facts.local_networks,
+                vec![net("10.8.0.0/24"), net("10.20.1.0/24")]
+            );
+            assert_eq!(facts.tunnel_servers, vec![IpAddr::V4(TUNNEL_SERVER)]);
+            // Nothing to route: the reading is not even consulted.
+            assert_eq!(
+                source.network_route_facts(&policy(), &book, RuleShapeSupport::NONE, &[]),
+                NetworkRouteFacts::default()
+            );
+        }
+
+        /// A tunnel `/16` holding the LAN and the tunnel's server: the LAN
+        /// keeps its own addresses, the server keeps its own route, and the
+        /// rest of the network rides the tunnel.
+        #[test]
+        fn a_tunnel_network_skips_the_lan_and_the_tunnel_server() {
+            let book = CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(Vec::new()),
+                secondary: CanonicalRuleSet::from_rules(vec![
+                    subnet("s-16", "10.20.0.0/16"),
+                    subnet("s-in-lan", "10.20.1.128/25"),
+                ]),
+            };
+            let pieces = tunnel_networks(&routes(
+                &on_machine(),
+                RouteBehaviorMode::PreferPrimary,
+                &book,
+                networks(),
+            ));
+            let lan = net("10.20.1.0/24");
+            assert_eq!(
+                pieces.len(),
+                16,
+                "one sibling per bit down to the server: {pieces:?}"
+            );
+            assert!(pieces
+                .iter()
+                .all(|p| !p.contains(IpAddr::V4(TUNNEL_SERVER))));
+            assert!(
+                pieces.iter().all(|p| !lan.covers(*p)),
+                "a piece inside the LAN would take it off eth0: {pieces:?}"
+            );
+
+            // Longest prefix over what the table then holds.
+            let mut table: Vec<(IpBlock, &str)> = vec![
+                (net("0.0.0.0/0"), "eth0"),
+                (lan, "eth0"),
+                (net("10.20.200.7/32"), "eth0"),
+            ];
+            table.extend(pieces.iter().map(|p| (*p, "tun0")));
+            let pick = |ip: &str| {
+                let ip: IpAddr = ip.parse().expect("address literal");
+                table
+                    .iter()
+                    .filter(|(b, _)| b.contains(ip))
+                    .max_by_key(|(b, _)| b.prefix_len())
+                    .map(|(_, link)| *link)
+            };
+            for (ip, want) in [
+                ("10.20.1.50", "eth0"),
+                ("10.20.1.200", "eth0"),
+                ("10.20.200.7", "eth0"),
+                ("10.20.0.1", "tun0"),
+                ("10.20.200.6", "tun0"),
+                ("10.20.255.254", "tun0"),
+                ("10.21.0.1", "eth0"),
+            ] {
+                assert_eq!(pick(ip), Some(want), "{ip}");
+            }
+        }
+
+        /// The machine reading changes nothing for a book that names no
+        /// network, nor under a shape support without networks.
+        #[test]
+        fn without_networks_the_route_plan_is_what_it_always_was() {
+            let source = on_machine();
+            let hosts = CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![exact(
+                    "p",
+                    Ipv4Addr::new(192, 0, 2, 9),
+                )]),
+                secondary: CanonicalRuleSet::from_rules(vec![exact(
+                    "s",
+                    Ipv4Addr::new(198, 51, 100, 4),
+                )]),
+            };
+            let with_networks = CanonicalRuleBook {
+                primary: hosts.primary.clone(),
+                secondary: CanonicalRuleSet::from_rules(vec![
+                    exact("s", Ipv4Addr::new(198, 51, 100, 4)),
+                    subnet("s-16", "10.20.0.0/16"),
+                ]),
+            };
+            let shipped = crate::wfp_codegen::current_rule_shape_support();
+            let mut cases = vec![(&hosts, networks())];
+            if !shipped.network_destination {
+                cases.push((&with_networks, shipped));
+            }
+            let cache = crate::fqdn_cache_lookup::MockFqdnCacheLookup::default();
+            let apps = crate::app_observation_lookup::MockAppObservationLookup::default();
+            for mode in [
+                RouteBehaviorMode::PreferPrimary,
+                RouteBehaviorMode::PreferSecondaryWhenAvailable,
+                RouteBehaviorMode::StrictSecondaryFailClosed,
+            ] {
+                for &(book, support) in &cases {
+                    let before = crate::enforcement_planner::plan_routes(
+                        mode,
+                        book,
+                        true,
+                        &cache,
+                        &apps,
+                        &HashSet::new(),
+                        FamilyScope::V4Only,
+                        crate::address_ownership::ZoneVsIpOrder::default(),
+                        &[],
+                    );
+                    assert_eq!(
+                        routes(&source, mode, book, support),
+                        before,
+                        "{mode:?}, {support:?}"
+                    );
+                }
+            }
+        }
+
+        fn sixteen() -> CanonicalRuleBook {
+            CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(Vec::new()),
+                secondary: CanonicalRuleSet::from_rules(vec![subnet("s-16", "10.20.0.0/16")]),
+            }
+        }
+
+        fn down_machine() -> ProductionPrincipalPlanSource {
+            let (api, links) = machine_parts(false);
+            source(Arc::new(NoRules), Arc::new(Policy::armed())).with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            )
+        }
+
+        fn routes_over_server(source: &ProductionPrincipalPlanSource) -> Vec<IpBlock> {
+            tunnel_networks(&routes(
+                source,
+                RouteBehaviorMode::PreferPrimary,
+                &sixteen(),
+                networks(),
+            ))
+            .into_iter()
+            .filter(|p| p.contains(IpAddr::V4(TUNNEL_SERVER)))
+            .collect()
+        }
+
+        /// Tunnel down, no route names its server: only the memory keeps a
+        /// tunnel `/16` from swallowing the server it reconnects to.
+        #[test]
+        fn a_remembered_server_is_spared_while_the_tunnel_is_down() {
+            assert!(
+                !routes_over_server(&down_machine()).is_empty(),
+                "fixture guard: nothing live names the server"
+            );
+            let source = down_machine().with_tunnel_servers(remembering(vec![TUNNEL_SERVER]), None);
+            assert_eq!(routes_over_server(&source), Vec::<IpBlock>::new());
+        }
+
+        struct Peers(Vec<IpAddr>);
+        impl TunnelEndpointSource for Peers {
+            fn tunnel_endpoints(&self) -> Vec<IpAddr> {
+                self.0.clone()
+            }
+        }
+
+        /// A kernel tunnel's peer names its server where no route does, and
+        /// it is remembered for when the tunnel is gone.
+        #[test]
+        fn a_kernel_tunnel_peer_is_spared_and_remembered() {
+            let memory = remembering(Vec::new());
+            let peer = Ipv4Addr::new(10, 20, 77, 1);
+            let source = down_machine().with_tunnel_servers(
+                Arc::clone(&memory),
+                Some(Arc::new(Peers(vec![IpAddr::V4(peer)]))),
+            );
+            source.remember_tunnel_servers(&policy());
+            assert_eq!(memory.remembered(), vec![peer]);
+            let facts = source.network_route_facts(&policy(), &sixteen(), networks(), &[]);
+            assert_eq!(facts.tunnel_servers, vec![IpAddr::V4(peer)]);
+        }
+
+        /// The whole path through the one store: a pass sees the server live,
+        /// the tunnel drops, and the submission screen still refuses a subnet
+        /// over it while the route plan still spares it.
+        #[test]
+        fn a_server_seen_live_is_refused_and_spared_after_the_tunnel_drops() {
+            use crate::network_rule_screen::{facts_with_remembered_servers, screen_network};
+            use crate::production_mutation_executor::NetworkRuleConflict;
+            use crate::tunnel_server_memory::persisted_servers;
+            use nrr_storage::{
+                open_connection, repository::MigrationRunner, SqliteMigrationRunner,
+            };
+
+            let dir = tempfile::tempdir().expect("temp dir");
+            let runner = SqliteMigrationRunner::for_state_db(
+                open_connection(&dir.path().join("nrr_service_state.db")).expect("open"),
+            );
+            runner.run_pending_migrations().expect("migrate");
+            let state = Arc::new(Mutex::new(runner.into_connection()));
+            let memory = Arc::new(TunnelServerMemory::over_state_db(Arc::clone(&state)));
+
+            on_machine()
+                .with_tunnel_servers(Arc::clone(&memory), None)
+                .remember_tunnel_servers(&policy());
+
+            let (down_api, _) = machine_parts(false);
+            let screen = facts_with_remembered_servers(
+                down_api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                persisted_servers(Arc::clone(&state)),
+            );
+            let facts = screen("principal");
+            assert!(matches!(
+                screen_network(net("10.20.200.0/24"), &facts, None),
+                Some(NetworkRuleConflict::CoversLink(_))
+            ));
+            assert_eq!(screen_network(net("10.20.100.0/24"), &facts, None), None);
+
+            let after_restart = down_machine()
+                .with_tunnel_servers(Arc::new(TunnelServerMemory::over_state_db(state)), None);
+            assert_eq!(routes_over_server(&after_restart), Vec::<IpBlock>::new());
+        }
+
+        /// Without the memory the screen knows no server, as before.
+        #[test]
+        fn without_a_remembered_server_the_screen_lets_the_subnet_through() {
+            let (down_api, _) = machine_parts(false);
+            let screen = crate::network_rule_screen::facts_with_remembered_servers(
+                down_api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                Arc::new(Vec::<Ipv4Addr>::new),
+            );
+            assert_eq!(
+                crate::network_rule_screen::screen_network(
+                    net("10.20.200.0/24"),
+                    &screen("principal"),
+                    None
+                ),
+                None
+            );
+        }
     }
 }

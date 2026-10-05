@@ -41,6 +41,7 @@ pub mod decision_rules_matching;
 pub mod enforcement_mode;
 pub mod extension_channel;
 pub mod import;
+pub mod ip_network_policy;
 pub mod ipv4_network;
 pub mod linked_source;
 pub mod merge;
@@ -194,6 +195,10 @@ impl fmt::Display for RuleId {
 /// `ExactIp(text)` matches one exact IPv4 or IPv6 address. It holds the value
 /// as written in the `--- IP` section; validation parses it, and a value that
 /// is not an address (a subnet, a range, a name) is refused there.
+///
+/// `Subnet(text)` (`--- CIDR`) and `IpRange(text)` (`--- Ranges`) hold their
+/// values the same way. Section is type: a subnet written under `--- IP` is a
+/// line error, never silently re-filed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AddressMatch {
     /// Matches the exact FQDN only (runtime priority tier 1 — highest).
@@ -208,6 +213,10 @@ pub enum AddressMatch {
     Zone(String),
     /// Matches one exact address (runtime priority tier 3 by default; configurable vs Zone).
     ExactIp(String),
+    /// Matches every address of a network, written `a.b.c.d/len`.
+    Subnet(String),
+    /// Matches an inclusive address range, written `first-last`.
+    IpRange(String),
 }
 
 impl AddressMatch {
@@ -219,7 +228,7 @@ impl AddressMatch {
             Self::ExactFqdn(label) => label.clone(),
             Self::SuffixDomain(label) => format!("*.{label}"),
             Self::Zone(name) => name.clone(),
-            Self::ExactIp(text) => text.clone(),
+            Self::ExactIp(text) | Self::Subnet(text) | Self::IpRange(text) => text.clone(),
         }
     }
 }

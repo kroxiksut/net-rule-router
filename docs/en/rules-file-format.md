@@ -35,16 +35,24 @@ and must appear exactly as shown.
 | `--- Zones` | Zone-level group routing | All |
 | `--- Domains` | Suffix and exact FQDN rules | All |
 | `--- IP` | Exact IP address rules | All |
+| `--- CIDR` | Subnet rules (`10.0.0.0/8`) | All |
+| `--- Ranges` | IP range rules (`192.0.2.10-192.0.2.40`) | All |
 | `--- Windows` | Windows application rules (`.exe` filename) | Windows only |
 | `--- Linux` | Linux application rules (process name or path) | Linux only |
 | `--- MacOS` | macOS application rules (bundle ID or process name) | macOS only |
 | `--- Auto` | Rules the application added on your behalf (§1.13) | All |
 
-Future revisions may introduce additional sections (`CIDR`, `Ports`, and
-others) as the rule model expands.
+Future revisions may introduce additional sections (such as `Ports`) as the
+rule model expands.
 
-`--- Auto` is written last, so a file reads as "the rules you wrote, then the
-rules the application added for you".
+Sections are written in the order of the table above, empty ones included
+(see "Empty sections" below). `--- Auto` is written last, so a file reads as
+"the rules you wrote, then the rules the application added for you".
+
+**A section is a type, strictly.** A subnet or a range under `--- IP`, an exact
+address under `--- CIDR`, a subnet under `--- Ranges` and so on are line
+errors, and the message names the section the value belongs in. The program
+never moves lines between sections on its own.
 
 #### Platform filtering
 
@@ -131,7 +139,7 @@ Empty lines and lines containing only whitespace are ignored.
 ### 1.4 Complete example
 
 ```
-# NetRuleRouter rules file — version 4
+# NetRuleRouter rules file — version 5
 # Route: Primary (main network)
 
 --- Zones
@@ -145,6 +153,13 @@ updates.example.org    # exact FQDN: vendor update endpoint
 
 --- IP
 203.0.113.7
+
+--- CIDR
+10.0.0.0/8             # corporate network
+2001:db8::/48
+
+--- Ranges
+192.0.2.10-192.0.2.40  # a block of addresses
 
 --- Windows
 browser.exe      # browser traffic
@@ -173,15 +188,19 @@ The following priority order is fixed (highest to lowest):
    itself and any subdomain of it at any depth. Longest base domain wins
    among competing suffix rules. To route the apex differently from its
    subdomains, add an exact rule for the apex — it is a higher tier and wins.
-4. **IP** — exact IP address. CIDR subnets and IP ranges arrive in the next
-   alpha.
-5. **Application** (`Windows` / `Linux` / `MacOS`) — matched by process
+4. **CIDR and Ranges** — a subnet or an IP range. It beats the zone it sits
+   inside. Between networks the longer prefix wins, so `10.1.0.0/16` beats
+   `10.0.0.0/8`. A name beats a subnet that contains its address. The same
+   network on both routes is an error.
+5. **IP** — exact IP address. It beats any network that contains it.
+6. **Application** (`Windows` / `Linux` / `MacOS`) — matched by process
    filename (exact or glob). Exact names take precedence over glob patterns;
    among glob matches, the first rule in the file wins. Only the
    platform-appropriate section is evaluated. The destinations an application
    rule teaches the router (§1.10) are evaluated at this tier too — below the
-   Domains and IP tiers, so a top-level address rule for the same address wins.
-6. **Default route** — determined by `ActiveConfiguration.behavior_mode`.
+   Domains, CIDR, Ranges and IP tiers, so a top-level address rule for the same
+   address wins.
+7. **Default route** — determined by `ActiveConfiguration.behavior_mode`.
 
 Both the primary and additional rule files are evaluated independently. The
 first match across both files determines the route.
@@ -266,22 +285,62 @@ subdomains one way and the bare domain the other.
 
 #### IP (`--- IP`)
 
-Exact IPv4 or IPv6 address. CIDR subnets and IP ranges arrive in the next
-alpha.
+Exact IPv4 or IPv6 address, one per line.
 
 ```
 203.0.113.7
 2001:db8::7
 ```
 
-> Whole subnets are not written here — the rules file matches single
-> addresses only. A whole subnet belongs to the **Local networks** list in
-> Settings, a separate mechanism that is the only place accepting CIDR
-> notation. That list has a different job: it names local network segments —
-> for example a hypervisor's virtual-machine network, or the subnet of your
-> main connection — that must stay reachable while routed traffic is
-> blocked. It does not send traffic anywhere; it only keeps local segments
-> reachable.
+A subnet or a range is not written here: it is a line error that names the
+section it belongs in (`--- CIDR` or `--- Ranges`).
+
+> Do not confuse these sections with the **Local networks** list in Settings.
+> That list has a different job: it names local network segments — for example
+> a hypervisor's virtual-machine network, or the subnet of your main
+> connection — that must stay reachable while routed traffic is blocked. It
+> does not send traffic anywhere; it only keeps local segments reachable.
+
+#### CIDR (`--- CIDR`)
+
+A subnet in CIDR notation, IPv4 or IPv6, one per line. Route a whole network
+with one rule, on Windows and Linux.
+
+```
+10.0.0.0/8             # corporate network
+2001:db8::/48
+```
+
+#### Ranges (`--- Ranges`)
+
+An inclusive range of addresses, `first-last`, IPv4 or IPv6. Spaces around the
+dash are accepted when reading; the file is written without them.
+
+```
+192.0.2.10-192.0.2.40
+192.0.2.100 - 192.0.2.120
+```
+
+#### What the app checks in a network or a range
+
+- A subnet wider than /8 (IPv4) or /16 (IPv6) is refused, so one rule cannot
+  swallow a large share of the internet.
+- A subnet or a range that touches loopback, multicast, broadcast or the
+  "this network" block is refused.
+- Link-local addresses are accepted with a warning.
+- Host bits set in a subnet (`10.0.2.7/24`) are cleared with a warning, and the
+  file is written back as `10.0.2.0/24`.
+- The same network on both routes is a line error.
+- When you save, a network is refused if it covers the address of the tunnel's
+  server, a network the computer is connected to, or the address pool the app
+  uses for name-based routing. The message names what it covers.
+- A network wider than /16 (IPv4) or /48 (IPv6) is routed, but while the
+  additional connection is down Fail-Closed does not block it, and the app
+  warns you about this when you save the rule.
+
+The Overlaps tab on the Rules screen shows when an address named for the main
+connection lies inside a network named for the additional one: that address
+stays on the main connection even when the additional one is down.
 
 #### Windows / Linux / MacOS (application sections)
 
@@ -310,7 +369,8 @@ same process name, the first rule defined in the file wins.
 
 ### 1.7 Section names are not localized
 
-Section names (`Zones`, `Domains`, `IP`, `Windows`, `Linux`, `MacOS`, `Auto`)
+Section names (`Zones`, `Domains`, `IP`, `CIDR`, `Ranges`, `Windows`, `Linux`,
+`MacOS`, `Auto`)
 are technical keywords in the file format. They are not passed through the
 locale layer and are not translated. The same applies to the reason slugs used
 inside the `--- Auto` section (§1.13): the slug in the file is a fixed keyword,
@@ -326,7 +386,7 @@ language the user chooses — they are never modified or translated.
 ### 1.9 Forward compatibility — extended sections
 
 When a rules file contains sections this version does not recognise (for
-example `--- CIDR` or `--- Ports` produced by a newer or extended format
+example `--- Ports` produced by a newer or extended format
 revision), those sections are **parsed and preserved** in the file but are
 **not applied** to the routing policy. This mirrors the existing behaviour
 for platform-specific sections on a non-matching host (see section 1.3).
@@ -372,11 +432,17 @@ The header line `# NetRuleRouter rules file — version N` (and the preset heade
 | 2 | Reserved, never used. |
 | 3 | Per-rule `+block` flag (§1.12). |
 | 4 | App-authored rules section (§1.13, `--- Auto`). |
+| 5 | Subnet and range sections (§1.8, `--- CIDR`, `--- Ranges`). |
 
 Version 2 was reserved for a nested `- destination` syntax under application
 rules. It was never implemented and no build reads or writes it; the number is
 left in place rather than reused, so a file from any build means the same thing
 in every build. Do not declare version 2 in a file.
+
+A file that contains a `--- CIDR` or `--- Ranges` section declares **version
+5**. An older build treats those sections as extended ones (§1.9): it keeps
+the rules in the file, warns about them and does not apply them, so opening
+such a file in an older build breaks nothing.
 
 A file that contains an `--- Auto` section declares **version 4**. A
 pre-version-4 reader does not recognise the section name and therefore treats
@@ -627,14 +693,14 @@ Preset metadata is stored as header comments at the top of each file, before
 any section headers. All keys are optional.
 
 ```
-# NetRuleRouter preset — version 4
+# NetRuleRouter preset — version 5
 # name: Corporate VPN Rules
 # description: Routes corporate traffic via the additional (VPN) interface
 # author: Jane Doe
 # preset_version: 1
 ```
 
-The first line `# NetRuleRouter preset — version 4` identifies the file as a
+The first line `# NetRuleRouter preset — version 5` identifies the file as a
 preset and carries the format version. A file without this header is still
 valid as a rules file; the metadata lines are treated as free comments.
 

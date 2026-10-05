@@ -83,6 +83,8 @@ pub enum ParsedRuleType {
     Zone,
     Domain,
     ExactIp,
+    Subnet,
+    IpRange,
     Application,
 }
 
@@ -94,6 +96,8 @@ impl ParsedRuleType {
             ParsedRuleType::Zone => "zone",
             ParsedRuleType::Domain => "domain",
             ParsedRuleType::ExactIp => "exact-ip",
+            ParsedRuleType::Subnet => "subnet",
+            ParsedRuleType::IpRange => "ip-range",
             ParsedRuleType::Application => "application",
         }
     }
@@ -104,7 +108,7 @@ impl ParsedRuleType {
 #[serde(rename_all = "kebab-case")]
 pub struct PassthroughBlock {
     /// Original case-sensitive section name (e.g. `"Linux"`,
-    /// `"MacOS"`, `"Cidr"`).
+    /// `"MacOS"`, `"Geo"`).
     pub section_name: String,
     /// Verbatim content of the section, between its header and the
     /// next section header (or end of file). Newlines preserved.

@@ -491,7 +491,7 @@ ColumnLayout {
             // disable the rule, so they're not counted here.
             if (String(item.validationStatus || "valid") !== "error") return false
         }
-        if (filterType !== "all" && String(item.ruleType || "") !== filterType) return false
+        if (filterType !== "all" && Rules.canonicalRuleTypeSlug(item.ruleType) !== filterType) return false
         if (filterRoute !== "all" && String(item.targetRoute || "") !== filterRoute) return false
         if (filterAutoAddedOnly && String(item.originReason || "") === "") return false
         if (searchText !== "") {
@@ -513,7 +513,10 @@ ColumnLayout {
             var hay = (String(item.matchValue || "") + " "
                 + String(item.aceMatchValue || "") + " "
                 + String(item.comment || "")).toLowerCase()
-            if (hay.indexOf(needle) < 0) return false
+            // The text as typed too: a subnet's `/` and an IPv6 address's
+            // `:` read as URL punctuation to the host normalizer above.
+            if (hay.indexOf(needle) < 0
+                    && hay.indexOf(String(searchText).trim().toLowerCase()) < 0) return false
         }
         return true
     }
@@ -1606,15 +1609,8 @@ ColumnLayout {
     //
     // The wire payload is `CanonicalRulesJsonV1`-shaped:
     // `{ "schema-version": 1, "primary": [RuleDto...], "secondary": [...] }`.
-    // Each `RuleDto` carries either `address-match` (4 kinds) or
-    // `app-match` (2 pattern kinds). Mapping from local `rulesModel`
-    // rows:
-    //   ruleType="exact-fqdn"    → address-match {kind:"exact-fqdn", value}
-    //   ruleType="suffix-domain" → address-match {kind:"suffix-domain", suffix}
-    //   ruleType="zone"          → address-match {kind:"zone", name}
-    //   ruleType="exact-ip"      → address-match {kind:"exact-ipv4", address}
-    //   ruleType="application"   → app-match {pattern:{kind:"exact",value},
-    //                                          include-child-processes:false}
+    // Each `RuleDto` carries either `address-match` or `app-match`; the row
+    // mapping is `Rules.ruleRowToWireDto`.
     //
     // Application rule details (include-child-processes flag, exact
     // vs glob) aren't in `rulesModel` today — defaults to `exact`
@@ -1978,7 +1974,7 @@ ColumnLayout {
             id: typeFilterCombo
             theme: root.uiTheme
             implicitWidth: 200
-            model: [ "all", "zone", "domain", "exact-ip", "application" ]
+            model: [ "all", "zone", "domain", "exact-ip", "ip-range", "subnet", "application" ]
             function typeLabel(id) {
                 if (id === "all") return root.tr("rules.filter.type.all", "All types")
                 return root.tr("rules.filter.type." + id, root.tr("rules.type." + id, id))

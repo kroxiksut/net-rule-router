@@ -24,6 +24,7 @@ use rusqlite::Connection;
 
 use crate::ipc_handlers::event_bus::EventBus;
 
+use crate::boot_settings::ConnTraceLogSwitch;
 use crate::ipc_handlers::payloads::{
     ApplyFailurePolicyDto, AutostartDto, LogRetentionConfigDto, LogRetentionConfigSetRequest,
     RetentionSettingsDto, RetentionSettingsSetRequest, RoutingPauseDto, StorageUsageDto,
@@ -35,6 +36,7 @@ use crate::ipc_handlers::providers::{
     StorageUsageProvider,
 };
 use crate::routing_pause::RoutingPauseCoordinator;
+use crate::timed_window::{now_ms, TimedSwitch, TimedWindow, WindowKind};
 
 fn now_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -716,7 +718,7 @@ pub struct ProductionServiceStability {
     /// The running verbose-logging window. Only the instance given the live
     /// filter (`with_verbosity_control`) drives and times it; any other
     /// instance reports timed windows from the stored deadline.
-    verbose: crate::verbose_logging::VerboseLogging,
+    verbose: TimedSwitch,
     /// The fake-IP live-apply seam. When `Some`, a `set()`
     /// reconciles the fake-IP stack to `fake_ip_enabled && mode == Resolver`
     /// WITHOUT a service restart. The hook must be async/best-effort (driver
@@ -759,10 +761,13 @@ pub struct ProductionServiceStability {
     /// `dns_fast_answers_flag`. `None` in tests / unwired boots (the toggle
     /// still persists; takes effect next restart).
     instant_rst_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Receives the stored connection-trace NDJSON switch after every write,
-    /// so the observer starts or stops writing without a restart. `None` in
-    /// tests and unwired boots.
-    conn_trace_ndjson_apply: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+    /// The window that writes the connection trace to the log, shared with
+    /// the observer's flag (`with_conn_trace_log`). Unwired, it is reported
+    /// from the stored deadline like `verbose`.
+    conn_trace_log: TimedSwitch,
+    /// The sentinel file or the environment holds the trace on for the life
+    /// of the process; reported so the GUI can say why it cannot be shut.
+    conn_trace_forced_by: Option<String>,
 }
 
 /// Argument to the fake-IP live-apply hook (`with_fake_ip_apply`).
@@ -788,19 +793,22 @@ impl ProductionServiceStability {
             conn,
             liveness_tracker: None,
             resolver_controller: None,
-            verbose: crate::verbose_logging::VerboseLogging::resume(None, 0, None),
+            verbose: crate::verbose_logging::resume(None, 0, None),
             fake_ip_apply: None,
             dns_via_secondary_flag: None,
             dns_fast_answers_flag: None,
             udp_relay_apply: None,
             instant_rst_flag: None,
-            conn_trace_ndjson_apply: None,
+            conn_trace_log: TimedSwitch::resume(WindowKind::ConnTraceLog, None, 0, None),
+            conn_trace_forced_by: None,
         }
     }
 
-    /// Attaches the connection-trace NDJSON live-apply hook. Chain after `new`.
-    pub fn with_conn_trace_ndjson_apply(mut self, apply: Arc<dyn Fn(bool) + Send + Sync>) -> Self {
-        self.conn_trace_ndjson_apply = Some(apply);
+    /// Attaches the running connection-trace log window, so a request moves
+    /// the observer's sink without a restart. Chain after `new`.
+    pub fn with_conn_trace_log(mut self, switch: &ConnTraceLogSwitch) -> Self {
+        self.conn_trace_log = switch.window().clone();
+        self.conn_trace_forced_by = switch.forced_by().map(|force| force.source());
         self
     }
 
@@ -877,26 +885,8 @@ impl ProductionServiceStability {
             .lock()
             .ok()
             .and_then(|conn| nrr_storage::service_stability_config::probe_verbose_until(&conn));
-        self.verbose = crate::verbose_logging::VerboseLogging::resume(
-            persisted,
-            crate::verbose_logging::now_ms(),
-            Some(control),
-        );
+        self.verbose = crate::verbose_logging::resume(persisted, now_ms(), Some(control));
         self
-    }
-
-    /// "Until restart" lives only in the process; a timed window is whatever
-    /// the stored deadline says, which keeps every instance on one answer.
-    fn verbose_window(
-        &self,
-        persisted_until_ms: Option<i64>,
-        now_ms: i64,
-    ) -> crate::verbose_logging::VerboseWindow {
-        use crate::verbose_logging::VerboseWindow;
-        match self.verbose.window() {
-            VerboseWindow::UntilRestart => VerboseWindow::UntilRestart,
-            _ => VerboseWindow::resumed(persisted_until_ms, now_ms),
-        }
     }
 
     fn record_to_dto(rec: &IpcAcceptPolicyRecord) -> IpcAcceptFailurePolicyDto {
@@ -939,6 +929,25 @@ impl ProductionServiceStability {
     }
 }
 
+/// The window before a write, the one after it, and the deadline to store.
+/// No request leaves the running window and its stored deadline exactly as
+/// they are, so saving an unrelated setting can neither extend nor end it.
+fn requested_window(
+    running: &TimedSwitch,
+    prior_until_ms: Option<i64>,
+    change: Option<nrr_shared::ipc_payloads::LogWindowChange>,
+    now_ms: i64,
+) -> (TimedWindow, TimedWindow, Option<i64>) {
+    let prior = running.effective(prior_until_ms, now_ms);
+    match change {
+        Some(change) => {
+            let next = TimedWindow::requested(change, now_ms);
+            (prior, next, next.persisted_until_ms())
+        }
+        None => (prior, prior, prior_until_ms),
+    }
+}
+
 impl ServiceStabilityConfigProvider for ProductionServiceStability {
     fn get(&self) -> ServiceStabilityConfigDto {
         let default = ServiceStabilityConfigDto::default();
@@ -949,16 +958,28 @@ impl ServiceStabilityConfigProvider for ProductionServiceStability {
         let repo = ServiceStabilityConfigRepository::new(&conn);
         match repo.get_or_default() {
             Ok(rec) => {
-                let now_ms = crate::verbose_logging::now_ms();
+                let now_ms = now_ms();
                 let (verbose_logging_mode, verbose_logging_until_ms) = self
-                    .verbose_window(rec.verbose_until_ms, now_ms)
+                    .verbose
+                    .effective(rec.verbose_until_ms, now_ms)
+                    .reported(now_ms);
+                let (conn_trace_ndjson_mode, conn_trace_ndjson_until_ms) = self
+                    .conn_trace_log
+                    .effective(rec.conn_trace_ndjson_until_ms, now_ms)
                     .reported(now_ms);
                 ServiceStabilityConfigDto {
                     ipc_accept_policy: Self::record_to_dto(&rec.ipc_accept_policy),
                     verbose_logging_mode,
                     verbose_logging_until_ms,
                     verbose_logging_change: None,
-                    conn_trace_ndjson: rec.conn_trace_ndjson,
+                    conn_trace_ndjson_mode,
+                    conn_trace_ndjson_until_ms,
+                    conn_trace_ndjson_forced: self.conn_trace_forced_by.is_some(),
+                    conn_trace_ndjson_forced_by: self
+                        .conn_trace_forced_by
+                        .clone()
+                        .unwrap_or_default(),
+                    conn_trace_ndjson_change: None,
                     conn_trace_gui: rec.conn_trace_gui,
                     rule_scope_service_driven: rec.rule_scope_service_driven,
                     routing_stop_policy: rec.routing_stop_policy.as_slug().to_string(),
@@ -1011,17 +1032,23 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
             .as_ref()
             .map(|r| r.enforcement_mode)
             .unwrap_or_default();
-        let now_ms = crate::verbose_logging::now_ms();
+        let now_ms = now_ms();
         let prior_until = prior_record.as_ref().and_then(|r| r.verbose_until_ms);
-        let prior_verbose = self.verbose_window(prior_until, now_ms);
-        let verbose = dto.verbose_logging_change.map_or(prior_verbose, |change| {
-            crate::verbose_logging::VerboseWindow::requested(change, now_ms)
-        });
-        // No request leaves the stored deadline exactly as it is.
-        let verbose_until_ms = match dto.verbose_logging_change {
-            Some(_) => verbose.persisted_until_ms(),
-            None => prior_until,
-        };
+        let (prior_verbose, verbose, verbose_until_ms) = requested_window(
+            &self.verbose,
+            prior_until,
+            dto.verbose_logging_change,
+            now_ms,
+        );
+        let prior_trace_until = prior_record
+            .as_ref()
+            .and_then(|r| r.conn_trace_ndjson_until_ms);
+        let (prior_trace, trace, trace_until_ms) = requested_window(
+            &self.conn_trace_log,
+            prior_trace_until,
+            dto.conn_trace_ndjson_change,
+            now_ms,
+        );
         // Same rationale for the two routing-critical toggles: log
         // prior→written for both, always, so the NDJSON can confirm whether
         // a toggle write ever arrived even when the running stack does not
@@ -1061,7 +1088,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
         repo.set(
             &write,
             verbose_until_ms,
-            dto.conn_trace_ndjson,
+            trace_until_ms,
             dto.conn_trace_gui,
             dto.rule_scope_service_driven,
             routing_stop_policy,
@@ -1121,6 +1148,19 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
             changed = prior_verbose != verbose,
             live_reload = self.verbose.is_live(),
             "service-stability config written (verbose logging)",
+        );
+        if dto.conn_trace_ndjson_change.is_some() {
+            self.conn_trace_log.set(trace, now_ms);
+        }
+        tracing::info!(
+            target: "nrr::stability",
+            msg_key = "prod-settings-conn-trace-log-written",
+            prior = prior_trace.reported(now_ms).0.as_slug(),
+            written = trace.reported(now_ms).0.as_slug(),
+            changed = prior_trace != trace,
+            forced = self.conn_trace_forced_by.is_some(),
+            live_reload = self.conn_trace_log.is_live(),
+            "service-stability config written (connection trace log)",
         );
         // start/stop the local DNS resolver to
         // match the persisted enforcement mode WITHOUT a service restart. The
@@ -1268,18 +1308,24 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
-        if let Some(apply) = &self.conn_trace_ndjson_apply {
-            apply(written.conn_trace_ndjson);
-        }
         let (verbose_logging_mode, verbose_logging_until_ms) = self
-            .verbose_window(written.verbose_until_ms, now_ms)
+            .verbose
+            .effective(written.verbose_until_ms, now_ms)
+            .reported(now_ms);
+        let (conn_trace_ndjson_mode, conn_trace_ndjson_until_ms) = self
+            .conn_trace_log
+            .effective(written.conn_trace_ndjson_until_ms, now_ms)
             .reported(now_ms);
         Ok(ServiceStabilityConfigDto {
             ipc_accept_policy: Self::record_to_dto(&written.ipc_accept_policy),
             verbose_logging_mode,
             verbose_logging_until_ms,
             verbose_logging_change: None,
-            conn_trace_ndjson: written.conn_trace_ndjson,
+            conn_trace_ndjson_mode,
+            conn_trace_ndjson_until_ms,
+            conn_trace_ndjson_forced: self.conn_trace_forced_by.is_some(),
+            conn_trace_ndjson_forced_by: self.conn_trace_forced_by.clone().unwrap_or_default(),
+            conn_trace_ndjson_change: None,
             conn_trace_gui: written.conn_trace_gui,
             rule_scope_service_driven: written.rule_scope_service_driven,
             routing_stop_policy: written.routing_stop_policy.as_slug().to_string(),

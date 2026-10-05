@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::Ipv4Addr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
 use nrr_platform_api::dns_observe::{DnsObservation, DnsObservationSource};
@@ -62,7 +62,7 @@ impl ResolvedDnsObserver {
     pub fn start() -> Option<Self> {
         let mut child = crate::command::system_tool("resolvectl")
             .and_then(|exe| {
-                Command::new(exe)
+                crate::command::tool_command(exe)
                     .args(["monitor", "--json=short"])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())

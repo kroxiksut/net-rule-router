@@ -37,6 +37,7 @@ pub mod health;
 pub mod lifecycle;
 pub mod production_ports;
 pub mod relay;
+pub mod rule_networks;
 pub mod self_heal;
 pub mod stack;
 pub mod vpn_client_bypass;
@@ -50,8 +51,9 @@ pub use direct::{
     ArmedDirectFakeIpAnswerer, DirectAwareUpstreamResolver, DirectRealIpMap, DIRECT_MAP_CAPACITY,
 };
 pub use enforcement::{
-    augment_codegen_for_fake_ip, plan_fake_ip_enforcement, FakeIpAugmentation,
-    FakeIpEnforcementContext, FakeIpEnforcementPlan, NoSharedIps, SharedIpCensus,
+    augment_codegen_for_fake_ip, network_overlaps_fake_ip_pool, plan_fake_ip_enforcement,
+    FakeIpAugmentation, FakeIpEnforcementContext, FakeIpEnforcementPlan, NoSharedIps,
+    SharedIpCensus,
 };
 pub use flow::{parse_packet, FlowKey, FlowProtocol, ParsedPacket};
 pub use health::FakeIpHealth;
@@ -65,6 +67,10 @@ pub use production_ports::{
 pub use relay::{
     FixedRouteSelector, RelayCore, RelayDecision, RouteSelector, StaticUpstreamResolver,
     UpstreamAddressResolver, DEFAULT_SESSION_IDLE_MS,
+};
+pub use rule_networks::{
+    global_rule_networks, ActivePrincipalNetworks, AdditionalNetworkOwner, RuleNetworkCell,
+    RuleNetworkIndex,
 };
 pub use self_heal::{
     probe_and_heal, HealPersistFn, HealVerdict, RuntimeHostExclusions, VpnSelfHealObserver,

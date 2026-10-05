@@ -148,7 +148,11 @@
     "disabled": "disabled",
     "language-ru": "Russian",
     "language-en": "English",
-    "plural-rule": "one-other"
+    "plural-rule": "one-other",
+    "time-left": {
+      "hours-minutes": "{hours} h {minutes} min",
+      "minutes": "{minutes} min"
+    }
   },
   "settings": {
     "service-intent": {
@@ -195,12 +199,12 @@
       "start-mode": {
         "heading": "When the service starts",
         "with-windows": {
-          "label": "Start with Windows (recommended)"
+          "label": "Start with the system (recommended)"
         },
         "on-app-launch": {
           "label": "Start when the app opens"
         },
-        "help": "“Start with Windows” keeps your rules enforced from boot, before anyone logs in (best for always-on or managed setups). “Start when the app opens” runs the service only while you use NetRuleRouter and lets the app start it without an administrator prompt every time. Changing this needs administrator approval."
+        "help": "“Start with the system” keeps your rules enforced from boot, before anyone logs in (best for always-on or managed setups). “Start when the app opens” runs the service only while you use NetRuleRouter and lets the app start it without an administrator prompt every time. Changing this needs administrator approval."
       },
       "launch-tray": {
         "label": "Also start the tray at sign-in",
@@ -838,24 +842,29 @@
           "option-one-hour": "Verbose for 1 hour",
           "option-four-hours": "Verbose for 4 hours",
           "option-until-restart": "Verbose until the service restarts",
-          "state-timed": "Verbose: {time} left, until {clock}",
-          "left-hours-minutes": "{hours} h {minutes} min",
-          "left-minutes": "{minutes} min"
+          "state-timed": "Verbose: {time} left, until {clock}"
         }
       },
       "conn-trace": {
         "heading": "Connection trace (diagnostic)",
-        "intro": "Records outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Observation itself is always on — these two switches decide where it is shown and whether it is written down.",
+        "intro": "Records outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Observation itself is always on — these two controls decide where it is shown and whether it is written down.",
         "intro-no-log": "Shows outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Observation itself is always on — this switch decides whether it is shown. On this platform the trace is never written to disk.",
         "ndjson": {
-          "label": "Write connection trace to service log (NDJSON)",
-          "tooltip": "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary or additional adapter). Takes effect immediately, no service restart."
+          "label": "Write connection trace to service log",
+          "tooltip": "Each observed connection is written to the service log: process, remote IP:port and egress interface (primary or additional adapter). Switches itself off when the chosen time runs out or the service restarts. Applies immediately.",
+          "option-off": "Off",
+          "option-one-hour": "Write for 1 hour",
+          "option-four-hours": "Write for 4 hours",
+          "option-until-restart": "Write until the service restarts",
+          "state-timed": "Writing: {time} left, until {clock}",
+          "state-forced": "Always on (forced)",
+          "forced-help": "Forced on by the service through {source}. Remove it, then restart the service to control this here again."
         },
         "gui": {
           "label": "Show connection trace in Diagnostics",
           "tooltip": "Lets the connection-trace panel in Diagnostics show what was observed. Takes effect immediately, no service restart. Switching it off hides the panel's contents only — it does not stop observation, which app routing and rule suggestions rely on."
         },
-        "help": "Privacy-sensitive: the trace carries per-connection process names and remote addresses. Writing it to disk is the part worth leaving off in normal operation.",
+        "help": "Privacy-sensitive: the trace carries per-connection process names and remote addresses. Writing it to disk is why it switches itself off; leave it off in normal operation.",
         "help-no-log": "Privacy-sensitive: the trace carries per-connection process names and remote addresses. It is kept in memory only and is gone when the service restarts."
       },
       "rule-scope": {
@@ -1233,10 +1242,12 @@
       "title": "This adapter cannot carry traffic out",
       "adapter-line": "Adapter: {name}",
       "body-assign": "You are about to assign it as your additional route.",
+      "body-assign-primary": "You are about to make it your main connection.",
       "body-kill-switch": "It is currently assigned as your additional route.",
       "reason-virtual-host-only": "It looks like a host-only virtual adapter (VirtualBox, VMware or Hyper-V internal) and it has no gateway, so it has no way out to the network.",
       "reason-no-forwarding-path": "It has no gateway and no route out, so there is nowhere for it to send traffic.",
       "effect-routing": "Rules that point at the additional route will not be routed through it.",
+      "effect-routing-primary": "The service will not route through it: traffic your rules do not route keeps going the way the system sends it. Choose the connection that reaches the internet as main.",
       "effect-kill-switch-on": "Leak protection is on, so those destinations are BLOCKED instead: the sites behind those rules stop loading.",
       "effect-kill-switch-off": "Leak protection is off right now, so nothing is blocked. If you turn it on later, those destinations will be blocked.",
       "effect-kill-switch-arming": "Once leak protection is on, those destinations are BLOCKED instead: the sites behind those rules stop loading.",
@@ -1572,7 +1583,9 @@
       "classify-ip": "IP addresses",
       "classify-windows": "Windows applications",
       "classify-skip": "Skip (discard)",
-      "apply": "Apply"
+      "apply": "Apply",
+      "classify-cidr": "Subnets (CIDR)",
+      "classify-ranges": "IP ranges"
     },
     "save-before-close": {
       "title": "Save rule changes?",
@@ -1932,6 +1945,9 @@
     "verbose-logging-enabled": "Verbose service logging enabled — applies immediately",
     "verbose-logging-disabled": "Verbose service logging disabled — applies immediately",
     "verbose-logging-failed": "Could not update verbose service logging: ",
+    "conn-trace-log-enabled": "Connection trace is written to the log — applies immediately",
+    "conn-trace-log-disabled": "Connection trace is no longer written to the log — applies immediately",
+    "conn-trace-log-failed": "Could not update writing the connection trace to the log: ",
     "rules-drift-apply-has-local-edits": "Your app has rule changes that are not saved yet, so the files were not loaded over them. Save or discard them here first.",
     "rules-drift-apply-requested": "Loading the rules from your files, then applying them to the service.",
     "rules-drift-compare-requested": "Comparing the rules in your files with the ones being applied…",
@@ -1966,7 +1982,9 @@
     "route-binding-keep-mine": "Apply what is shown here",
     "route-binding-keep-mine-description": "Send the connections shown here to the background service, replacing the ones it is applying.",
     "primary-probe-limits-reset": "Check limits are back to their defaults.",
-    "traffic-history-merge-failed": "Could not save the answer: "
+    "traffic-history-merge-failed": "Could not save the answer: ",
+    "rules-list-added": "Rules added: {count}.",
+    "rules-list-already-present": "Already in the list: {count}."
   },
   "interfaces": {
     "type": {
@@ -2102,6 +2120,7 @@
       "tap": "TAP device"
     },
     "hint": {
+      "no-internet": "no internet access",
       "looks-primary": "looks like the main connection",
       "looks-vpn": "looks like a VPN"
     }
@@ -2227,7 +2246,9 @@
       "zone": "Zone",
       "application": "Application",
       "domain": "Domain",
-      "exact-ip": "Exact IP"
+      "exact-ip": "Exact IP",
+      "subnet": "Subnet (CIDR)",
+      "ip-range": "IP range"
     },
     "application-not-leakproof": "On this system an application rule is not airtight: connections the app makes before it is recognised can still get through.",
     "application-routing-note": "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.",
@@ -2244,7 +2265,10 @@
       "exact-ip": "192.0.2.1",
       "application-windows": "browser.exe",
       "application-linux": "browser",
-      "application-macos": "Browser.app"
+      "application-macos": "Browser.app",
+      "subnet": "10.0.0.0/8",
+      "ip-range": "192.0.2.10-192.0.2.40",
+      "address-list": "192.0.2.10, 198.51.100.0/24, 203.0.113.5-203.0.113.40"
     },
     "hint": {
       "zone": "A zone — letters, digits, hyphens, parts separated by dots; an optional leading dot is allowed. Matches all hosts in the zone. Examples: .ru, ru, com, intra, corp.internal.",
@@ -2252,7 +2276,9 @@
       "exact-ip": "Exact IPv4 or IPv6 address. For IPv4 each octet is 0–255 and the first is ≥ 1. Examples: 192.0.2.1, 203.0.113.7, 2001:db8::7.",
       "application-windows": "Process filename — .exe, .ps1, .bat or any executable script. Exact (browser.exe) or glob (*vpn*.exe).",
       "application-linux": "Process filename, case-sensitive on Linux.",
-      "application-macos": "Process filename or app bundle id."
+      "application-macos": "Process filename or app bundle id.",
+      "subnet": "A network in CIDR form: an address, a slash and the prefix length. Matches every address in the network; an address with host bits set is saved as its network. Examples: 10.0.0.0/8, 198.51.100.0/24, 2001:db8::/32.",
+      "ip-range": "Two addresses of the same family joined by a dash, the first not greater than the last. Matches every address from the first to the last inclusive. Examples: 192.0.2.10-192.0.2.40, 2001:db8::1-2001:db8::ff."
     },
     "comment": {
       "max-length": "Up to {max} characters",
@@ -2339,12 +2365,22 @@
         "exact-ip-octet-out-of-range": "Octet {octet} (position {position}) is out of range. Each octet must be 0–255.",
         "exact-ip-this-host": "0.0.0.0/8 and :: mean “this host”, not a destination — a rule cannot name them.",
         "exact-ip-broadcast": "255.255.255.255 is the local broadcast used by DHCP and device discovery, not a destination — a rule cannot name it.",
-        "application": "Enter a process filename or glob (e.g. browser.exe, *vpn*.exe, script.ps1)."
+        "application": "Enter a process filename or glob (e.g. browser.exe, *vpn*.exe, script.ps1).",
+        "subnet": "Enter a network such as 10.0.0.0/8 or 2001:db8::/32.",
+        "ip-range": "Enter a range such as 10.0.0.5-10.0.0.40 (both ends of the same family, first ≤ last).",
+        "is-exact-ip": "This is a single address — choose the type “Exact IP”.",
+        "is-subnet": "This is a subnet — choose the type “Subnet (CIDR)”.",
+        "is-ip-range": "This is an IP range — choose the type “IP range”.",
+        "network-too-wide": "A network wider than /{prefix} cannot be a rule.",
+        "network-reserved": "This network covers loopback, multicast or “this host” addresses, which a rule cannot route."
       },
       "match-value-warning": {
         "exact-ip-loopback": "Loopback addresses (127.0.0.0/8) are unusual routing targets.",
         "exact-ip-multicast": "Multicast addresses (224.0.0.0/4) are unusual routing targets.",
-        "exact-ip-link-local": "Link-local addresses (169.254.0.0/16, fe80::/10) never leave the local network and are unusual routing targets."
+        "exact-ip-link-local": "Link-local addresses (169.254.0.0/16, fe80::/10) never leave the local network and are unusual routing targets.",
+        "network-wide": "Routed, but not blocked when the additional connection drops: leak protection holds networks up to /{prefix}.",
+        "network-wide-public": "Routed, but not blocked when the additional connection drops: leak protection holds networks up to /{prefix}. This is a large public network — make sure you meant it.",
+        "subnet-host-bits": "Saved as the network {network}."
       }
     },
     "file-sync": {
@@ -2354,16 +2390,6 @@
         "auto-apply": "Apply automatically"
       },
       "update-button": "Update rules from file"
-    },
-    "file-format": {
-      "section-hint": {
-        "zones": "Zone-level group routing. Matches all traffic for a named zone (e.g. .ru, corp-internal). Highest priority tier.",
-        "domains": "Domain name rules. Exact FQDN (example.com) or subdomain wildcard (*.example.com). Exact match takes priority over wildcard.",
-        "ip": "Exact IP address rules, IPv4 or IPv6. One address per entry. CIDR is not supported yet.",
-        "windows": "Windows application rules matched by process filename — exact or glob (e.g. *vpn*.exe). Applied on Windows only.",
-        "linux": "Linux application rules matched by process name. Stored in the file on all platforms, but applied only on Linux.",
-        "macos": "macOS application rules matched by bundle ID or process name. Stored in the file on all platforms, but applied only on macOS."
-      }
     },
     "extended-section": {
       "badge-label": "Not applied",
@@ -2522,18 +2548,19 @@
     "overlaps": {
       "nav-label": "Overlaps",
       "pending-badge": "{n} overlap(s) not confirmed",
-      "intro": "When rules of the two routes cover the same sites, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one. Check that each site below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.",
+      "intro": "When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.",
       "rule": "{value} ({type})",
       "nested": "{winner} goes over {winner-route}: it is narrower than {loser} on {loser-route}.",
       "duplicate": "{winner} is set on both routes. It goes over {winner-route}: on a tie the main route wins.",
       "block-tie": "{winner} names the same sites as {loser} on {loser-route}. They are blocked: on a tie a block wins over a route.",
       "block-tie-warning": "The other rule names the same sites and never applies.",
+      "main-stays": "Addresses of the main link inside this network stay on the main link even when the additional link is down. Leak protection does not block them.",
       "block-note": "A block rule is part of this pair; change it in the rules list.",
       "confirm": "Correct",
       "confirm-all": "Confirm all",
       "confirmed": "Confirmed",
       "unconfirm": "Ask again",
-      "empty": "No rules of the two routes cover the same sites.",
+      "empty": "No rules of the two routes cover the same sites or addresses.",
       "column": {
         "winner": "Rule that wins",
         "loser": "Overlaps with",
@@ -2543,7 +2570,8 @@
       "reason": {
         "block-tie": "A block wins a tie",
         "nested": "Narrower rule",
-        "duplicate": "Same rule on both routes"
+        "duplicate": "Same rule on both routes",
+        "intersecting": "Narrower where they meet"
       },
       "via": "via {route}",
       "send-over": "Send over {route} instead",
@@ -2556,7 +2584,16 @@
         "leak": "{rule} does not block {host}: it shares {ip} with {via}, which a narrower rule routes, so the address stays open.",
         "more": "Addresses affected besides this one: {count}.",
         "unsupported-shape": "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application."
-      }
+      },
+      "intersecting": "{winner} and {loser} on {loser-route} share some addresses. Each shared address takes the narrower rule; most of them go over {winner-route}.",
+      "send-over-whole": "This moves the whole rule, including addresses the other rule does not cover."
+    },
+    "paste": {
+      "toggle": "Add a list of addresses, subnets and ranges",
+      "label": "One entry per line. Addresses, subnets and ranges can be mixed: each is added as its own type.",
+      "summary": "To add: {accepted}. Not added: {rejected}.",
+      "truncated": "Only the first {count} lines were read.",
+      "line-unrecognized": "Not an address, a subnet or a range."
     }
   },
   "connection": {
@@ -3078,9 +3115,11 @@
         "rule-matched-suffix-domain": "Matched domain-suffix rule",
         "rule-matched-exact-fqdn": "Matched exact-name rule",
         "rule-matched-exact-ip": "Matched exact-IP rule",
+        "rule-matched-subnet": "Matched subnet or IP-range rule",
         "rule-matched-application": "Matched application rule",
         "rule-shape-not-enforced": "Matched a rule that limits an address to one application. Such rules cannot be carried out yet: the result shown is what the rule asks for, but it is not enforced",
         "blocked-by-ip-rule": "Blocked by an address rule: this name resolves to a blocked address",
+        "blocked-by-network-rule": "Blocked by a subnet or range rule: this address lies inside a blocked network",
         "no-rule-match": "No rule matched — default route applies"
       },
       "final-action": {
@@ -3248,6 +3287,7 @@
       "svctask-cache-sweep-failed": "The cache sweep failed; it will retry on the next pass ({error}).",
       "svctask-retention-settings-read-failed": "Could not read retention settings; skipping this cleanup pass ({error}).",
       "svctask-revisions-pruned": "Revision retention removed {superseded} superseded, {rejected} rejected, and {rolled_back} rolled-back revision(s).",
+      "rules-unrecognized-kept": "{unrecognized} rule(s) of a kind this version does not know are kept in the rule set but not applied.",
       "svctask-revisions-prune-failed": "Revision retention pass failed ({error}).",
       "svctask-revisions-touch-failed": "Could not update the last-cleanup timestamp for revision retention ({error}).",
       "svctask-dns-observe-cached": "DNS observation cached new hosts under active rules: {matched} matched, {refreshed} refreshed, {ignored} ignored, {collateral} collateral.",
@@ -3282,7 +3322,7 @@
       "diagarchive-prune-failed": "Could not remove old diagnostics archive {path} ({error}).",
       "svcstability-rules-lock-refused": "Refused a non-elevated request to change the administrative rules lock to {requested}.",
       "svcstability-machine-change-refused": "Refused a non-elevated change of settings shared by every user of this computer: {fields}.",
-      "svcstability-set-requested": "Service-stability settings change requested from {origin}: enforcement mode {requested_enforcement_mode}, verbose logging {requested_verbose}.",
+      "svcstability-set-requested": "Service-stability settings change requested from {origin}: enforcement mode {requested_enforcement_mode}, verbose logging {requested_verbose}, connection trace log {requested_conn_trace_log}.",
       "svcstability-set-completed": "Service-stability settings change from {origin} completed in {elapsed_ms} ms (success: {ok}).",
       "ifacerefresh-requested": "External-address refresh requested — re-enumerating adapters and probing.",
       "ifacerefresh-finished": "External-address refresh finished: {rows} adapter(s), {attempted} probed, {resolved} resolved, in {elapsed_ms} ms.",
@@ -3573,6 +3613,9 @@
       "persid-plan-zone-widening-unimplemented": "The \"zone widening\" coverage strategy is selected but not yet supported; falling back to per-IP pinning.",
       "persid-plan-pin-set-trimmed": "Leak protection address set trimmed: {kept} address(es) kept, {dropped} dropped (already routed elsewhere or covered by {app_covered} app-observed destination(s)).",
       "persid-plan-shared-ip-excluded": "Smart leak protection excluded {excluded} shared address(es) from blocking (each is also used by a directly-visited host); {pinned} address(es) remain pinned.",
+      "persid-plan-network-too-wide": "{count} network(s) routed through the additional adapter are wider than /{widest_prefix}, so leak protection does not block them while that adapter is down: their traffic may leave through the main adapter (for example: {sample}).",
+      "persid-plan-network-over-cap": "{count} network(s) routed through the additional adapter are past the leak protection limit and are not blocked while that adapter is down (for example: {sample}).",
+      "persid-plan-network-spared": "Leak protection never blocks {count} network(s) routed through the additional adapter: they cover the local network, a reserved range or the tunnel server, or the main adapter's rules name them too (for example: {sample}).",
       "persid-plan-pair-empty-fail-closed": "Leak protection could not arm the leak-proof pair in mode {mode}; blocking traffic instead ({fail_closed_filters} filter(s)).",
       "persid-plan-pair-empty-fail-open": "Leak protection was requested but could not arm this cycle in mode {mode}; traffic is allowed through (fail-open).",
       "persid-plan-kill-switch-active": "Leak protection active in mode {mode}: {kill_switch_filters} filter(s) pinning {pinned_addresses} address(es).",
@@ -3605,7 +3648,7 @@
       "persid-posture-dns-flush-failed": "Could not clear the DNS cache after leak protection's block-all posture changed (now armed: {block_all_armed}): {error}; already-cached names stay unobserved until they expire.",
       "persid-posture-app-rules-learning": "New application rule(s) delivered for the first time ({apps}); their destinations are still being learned.",
       "persid-posture-cross-set-duplicates": "{count} active rule(s) name the same traffic on both routes (example: {sample}).",
-      "persid-shadow-plan-differs": "Internal consistency check found a difference between the experimental and live filter plans ({live} live vs {neutral} experimental); live enforcement is unaffected.",
+      "persid-shadow-plan-differs": "Internal consistency check found a difference between the experimental and live filter plans ({live} live vs {neutral} experimental); live enforcement is unaffected. Only live: {differs_live}. Only experimental: {differs_neutral}.",
       "persid-plan-route-table-unreadable": "Could not read the system route table; the full block-all protection cannot be armed this round: {error}.",
       "persid-plan-links-unreadable": "Could not read the list of network adapters; the full block-all protection cannot be armed this round: {error}.",
       "persid-plan-blanket-block-refused": "Full block-all was requested, but the tunnel server's address could not be determined; arming it would prevent the tunnel from reconnecting, so it was not enabled.",
@@ -3648,6 +3691,7 @@
       "route-adapter-enum-failed": "Could not list network adapters ({error}) — routing targets cannot be resolved right now.",
       "route-no-secondary-bound": "No additional-route adapter is assigned — assign both connections in \"Interfaces & routes\" and apply (elevation required); otherwise nothing is routed over the additional connection.",
       "route-primary-derived": "No main-route adapter is assigned — it was inferred from the system's default route (interface {ifindex}, gateway {gateway}), so unmatched traffic uses the real connection instead of the additional route.",
+      "route-primary-no-way-out": "The main connection (interface {ifindex}) has no gateway and no route out — traffic the rules do not route follows the system's default route instead.",
       "route-no-primary-derivable": "No main-route adapter is assigned and none could be inferred from the system's default route (additional-route interface {secondary_ifindex}) — in \"direct\" mode, unmatched traffic stays on the additional route. Assign a main-route adapter in \"Interfaces & routes\".",
       "route-mac-anchor-remembered": "Remembered the hardware address of the {role} adapter \"{adapter}\" so it is still recognized after it changes identifiers.",
       "route-local-networks-unreadable-additional": "Could not read the system route table ({error}) — reporting no local networks for the additional route.",
@@ -3674,6 +3718,7 @@
       "route-policy-recompute-failed": "Recomputing routes after a policy change failed ({error}).",
       "prod-settings-enforcement-mode-written": "DNS enforcement mode set to {written} (previous: {prior}, changed: {changed}, live resolver available: {resolver_live}).",
       "prod-settings-verbose-logging-written": "Verbose service logging set to {written} (previous: {prior}, changed: {changed}, live reload: {live_reload}).",
+      "prod-settings-conn-trace-log-written": "Connection trace log set to {written} (previous: {prior}, changed: {changed}, forced: {forced}, live reload: {live_reload}).",
       "prod-settings-fake-ip-written": "Fake-IP setting saved as {written} (previous: {prior}, changed: {changed}).",
       "prod-settings-dns-via-secondary-written": "“DNS through the tunnel” setting saved as {written} (previous: {prior}, changed: {changed}).",
       "prod-settings-fast-dns-answers-written": "Fast DNS answers setting saved as {written} (previous: {prior}, changed: {changed}).",
@@ -3763,6 +3808,9 @@
       "autorules-tick-companion-domain-summary": "Companion-domain check found addresses a routed site needs: parked {parked}, authored {authored}, pending {pending}, published {published}.",
       "verbose-logging-window-ended": "Verbose service logging window ended; back to normal logging.",
       "verbose-logging-expiry-unarmed": "Verbose logging timer could not start ({error}); the window ends at the next service restart.",
+      "conn-trace-log-window-ended": "Connection trace log window ended; connections are no longer written to the log.",
+      "conn-trace-log-expiry-unarmed": "Connection trace log timer could not start ({error}); the window ends at the next service restart.",
+      "conn-trace-log-at-boot": "Connection trace log at service start: {mode} (until {until_ms}, forced: {forced}).",
       "storage-kill-switch-protocols-reset": "A stored leak protection protocol selection blocked nothing; every protocol is blocked instead."
     }
   },
@@ -3860,6 +3908,11 @@
     "rpc-timed-out": "Response timeout",
     "safe-disable-rpc-pending": "Safe disable RPC bridge is not wired yet",
     "rules-locked": "Your administrator manages the routing rules on this computer, so they cannot be changed here.",
+    "network-covers-link": "The network covers the VPN server or a network this computer is connected to, so routing it would cut the connection its own traffic uses. Choose a network that does not include them.",
+    "network-covers-fake-ip-pool": "The network overlaps the address range the program reserves for name-based routing. Choose a different network.",
+    "network-covers-link-tunnel-server": "The network {network} includes the VPN server {covers}, so routing it would cut the connection its own traffic uses. Choose a network that does not include it.",
+    "network-covers-link-local-network": "The network {network} overlaps {covers}, a network this computer is connected to, so routing it would cut the connection its own traffic uses. Choose a network that does not overlap it.",
+    "network-covers-fake-ip-pool-named": "The network {network} overlaps the address range the program reserves for name-based routing. Choose a different network.",
     "security-alert-unacknowledged": "Rules cannot be changed until the security alert in Diagnostics is reviewed and acknowledged.",
     "revision-status-mismatch": "These changes were already applied — nothing was sent again.",
     "token-already-consumed": "These changes were already applied — nothing was sent again.",
@@ -4007,6 +4060,10 @@
       "no-primary": {
         "title": "Main connection is not set",
         "body": "Without a main connection there is nowhere to send traffic your rules do not route, so the rules are not being applied."
+      },
+      "primary-no-way-out": {
+        "title": "The main connection has no way to the internet",
+        "body": "The connection chosen as main has no gateway, so traffic your rules do not route is going out the way the system sends it instead. Choose the connection that actually reaches the internet as main."
       },
       "action": "Open interfaces",
       "no-policy": {

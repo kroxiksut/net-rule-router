@@ -1,6 +1,6 @@
 //! A stability patch carries only the keys the platform's service applies. A
 //! service without the whole row (Linux) still applies the verbose window and
-//! the connection-trace switches, so the GUI offers and sends exactly those —
+//! the connection-trace controls, so the GUI offers and sends exactly those —
 //! and nothing it would merely store. Runs the real `pure.js` through `node`
 //! against the real platform profiles; the executable checks are skipped when
 //! node is absent.
@@ -33,7 +33,7 @@ fn diagnostics_patch() -> Value {
     json!({
         "ipc-accept-policy": { "kind": "critical" },
         "verbose-logging-change": "one-hour",
-        "conn-trace-ndjson": true,
+        "conn-trace-ndjson-change": "four-hours",
         "conn-trace-gui": false,
         "cache-refresh-interval-secs": 600,
         "fake-ip-enabled": true
@@ -59,7 +59,7 @@ fn a_platform_without_the_row_sends_only_the_verbose_and_trace_keys() {
         linux,
         json!({
             "verbose-logging-change": "one-hour",
-            "conn-trace-ndjson": true,
+            "conn-trace-ndjson-change": "four-hours",
             "conn-trace-gui": false
         })
     );
@@ -101,10 +101,11 @@ fn the_capability_table_names_real_flags_and_real_keys() {
         return;
     };
     let supports = supports_of(PlatformProfile::windows());
-    // The one request-only key is echoed only when present, so the fixture names it.
+    // The request-only keys are echoed only when present, so the fixture names them.
     let dto: ServiceStabilityConfigDto = serde_json::from_value(json!({
         "ipc-accept-policy": { "kind": "critical" },
-        "verbose-logging-change": "one-hour"
+        "verbose-logging-change": "one-hour",
+        "conn-trace-ndjson-change": "one-hour"
     }))
     .expect("a minimal config deserialises");
     let dto = serde_json::to_value(dto).expect("serialise the DTO");

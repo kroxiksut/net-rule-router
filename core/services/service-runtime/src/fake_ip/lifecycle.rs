@@ -51,6 +51,9 @@ pub struct FakeIpAssembly {
     /// The additional route's own subnets, read live — the answerer must never
     /// hand a virtual address for the tunnel's interior.
     secondary_subnets: Option<crate::dns_resolver::SecondarySubnetsFn>,
+    /// Addresses the user's networks give the additional link: the direct-host
+    /// answerers leave those hosts on their real answer.
+    network_owner: Option<Arc<dyn super::rule_networks::AdditionalNetworkOwner>>,
     /// Confirmed-VPN-client bypass handed to every stack this assembly builds —
     /// a relayed flow owned by the client that establishes the secondary link
     /// leaves over the primary instead. Inert until the boot wiring supplies an
@@ -74,6 +77,7 @@ impl FakeIpAssembly {
             runtime_exclusions: Arc::new(super::self_heal::RuntimeHostExclusions::new()),
             health: Arc::new(super::health::FakeIpHealth::new()),
             secondary_subnets: None,
+            network_owner: None,
             vpn_bypass: Arc::new(super::vpn_client_bypass::NoVpnClientBypass),
             stale_flow_reset: Arc::new(NoopStaleFlowReset),
         }
@@ -158,6 +162,17 @@ impl FakeIpAssembly {
         self
     }
 
+    /// Teach the direct-host answerers which real addresses a network rule
+    /// routes over the additional link. Optional — unwired, none is consulted.
+    #[must_use]
+    pub fn with_network_owner(
+        mut self,
+        owner: Arc<dyn super::rule_networks::AdditionalNetworkOwner>,
+    ) -> Self {
+        self.network_owner = Some(owner);
+        self
+    }
+
     /// The DIRECT-host answerer for the armed block-all,
     /// sharing this assembly's allocator, scope and direct-host map. `armed`
     /// is the same latch the [`crate::dns_resolver_ports::ReconcilingDirectAnswerGate`]
@@ -167,14 +182,18 @@ impl FakeIpAssembly {
         &self,
         armed: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> super::direct::ArmedDirectFakeIpAnswerer {
-        super::direct::ArmedDirectFakeIpAnswerer::new(
+        let answerer = super::direct::ArmedDirectFakeIpAnswerer::new(
             self.scope.clone(),
             Arc::clone(&self.allocator),
             Arc::clone(&self.direct_map),
             armed,
         )
         .with_runtime_exclusions(Arc::clone(&self.runtime_exclusions))
-        .with_health(Arc::clone(&self.health))
+        .with_health(Arc::clone(&self.health));
+        match self.network_owner.as_ref() {
+            Some(owner) => answerer.with_network_owner(Arc::clone(owner)),
+            None => answerer,
+        }
     }
 
     /// Wrap `inner` (the FQDN-cache resolver) so the relay resolves

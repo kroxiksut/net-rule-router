@@ -70,6 +70,8 @@ pub fn classify_section(name: &str) -> Option<ParsedRuleType> {
         "Zones" => Some(ParsedRuleType::Zone),
         "Domains" => Some(ParsedRuleType::Domain),
         "IP" => Some(ParsedRuleType::ExactIp),
+        "CIDR" => Some(ParsedRuleType::Subnet),
+        "Ranges" => Some(ParsedRuleType::IpRange),
         "Windows" => Some(ParsedRuleType::Application),
         // App-authored rules share the domain value grammar; authorship is
         // carried by `ParsedRule::origin`, not by the rule type. Classifying
@@ -93,6 +95,8 @@ pub fn classify_section_lenient(name: &str) -> Option<ParsedRuleType> {
         "zones" => Some(ParsedRuleType::Zone),
         "domains" => Some(ParsedRuleType::Domain),
         "ip" => Some(ParsedRuleType::ExactIp),
+        "cidr" => Some(ParsedRuleType::Subnet),
+        "ranges" => Some(ParsedRuleType::IpRange),
         "auto" => Some(ParsedRuleType::Domain),
         // The application section of the OS we are RUNNING ON is a rule
         // section; the others are passthrough. `nrr_domain::rules_file` already

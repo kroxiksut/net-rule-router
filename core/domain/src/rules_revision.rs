@@ -47,6 +47,26 @@ pub struct RulesRevisionContent {
     pub rule_book: CanonicalRuleBook,
     /// Format version. New revisions use [`RULES_REVISION_FORMAT_VERSION`].
     pub format_version: u16,
+    /// Rules of a kind this build does not know, kept as they came: stored and
+    /// written back on every rewrite, never applied.
+    pub unrecognized: UnrecognizedRules,
+}
+
+/// Rules a newer build wrote that this one cannot read, per route.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnrecognizedRules {
+    pub primary: Vec<nrr_shared::rules_json::RuleDto>,
+    pub secondary: Vec<nrr_shared::rules_json::RuleDto>,
+}
+
+impl UnrecognizedRules {
+    pub fn len(&self) -> usize {
+        self.primary.len() + self.secondary.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl RulesRevisionContent {
@@ -55,6 +75,7 @@ impl RulesRevisionContent {
         Self {
             rule_book,
             format_version: RULES_REVISION_FORMAT_VERSION,
+            unrecognized: UnrecognizedRules::default(),
         }
     }
 }

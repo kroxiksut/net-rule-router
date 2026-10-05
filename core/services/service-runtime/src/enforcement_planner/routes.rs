@@ -2,6 +2,10 @@
 //! and the fake-IP pool.
 
 use super::*;
+use crate::route_codegen::network_routes::{
+    plan_network_routes, NetworkRouteFacts, NetworkRoutePlan,
+};
+use crate::route_codegen::NETWORK_ROUTE_METRIC;
 
 // ── System route table (route_codegen) ──────────────────────────────────────────
 
@@ -43,12 +47,46 @@ pub fn plan_routes(
     // The tunnel's own catch-all prefixes; empty when they are not known.
     tunnel_catch_alls: &[(Ipv4Addr, u8)],
 ) -> Vec<RouteIntent> {
+    plan_routes_with(
+        mode,
+        rule_book,
+        has_primary,
+        cache,
+        app_observations,
+        denied,
+        families,
+        order,
+        tunnel_catch_alls,
+        &NetworkRouteFacts::from_catch_alls(tunnel_catch_alls),
+        crate::wfp_codegen::current_rule_shape_support(),
+    )
+}
+
+/// [`plan_routes`] with what the machine says about its links, which network
+/// rules are routed around, and the shape support to plan under — the neutral
+/// twin of `route_codegen::generate_routes_with`, lowering the same
+/// [`plan_network_routes`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_routes_with(
+    mode: RouteBehaviorMode,
+    rule_book: &CanonicalRuleBook,
+    has_primary: bool,
+    cache: &dyn FqdnCacheLookup,
+    app_observations: &dyn AppObservationLookup,
+    denied: &HashSet<Ipv4Addr>,
+    families: FamilyScope,
+    order: crate::address_ownership::ZoneVsIpOrder,
+    tunnel_catch_alls: &[(Ipv4Addr, u8)],
+    networks: &NetworkRouteFacts,
+    support: nrr_domain::rule_shape::RuleShapeSupport,
+) -> Vec<RouteIntent> {
     let mut routes = Vec::new();
     // Ownership from the UNFILTERED cache: the denylist view exists to trim
     // what goes to the tunnel, and reading it here would understate what the
     // main link claims.
-    let ownership =
-        crate::address_ownership::AddressOwnership::resolve_with_order(rule_book, cache, order);
+    let ownership = crate::address_ownership::AddressOwnership::resolve_with_support(
+        rule_book, cache, order, support,
+    );
     match mode {
         RouteBehaviorMode::PreferPrimary => {
             // Secondary rules → /32 via the secondary, minus any declined shared IP.
@@ -108,7 +146,64 @@ pub fn plan_routes(
             }
         }
     }
+    let plan = plan_network_routes(
+        mode,
+        rule_book,
+        has_primary,
+        &ownership,
+        networks,
+        tunnel_catch_alls,
+        support,
+    );
+    push_network_intents(plan, families, &mut routes);
     routes
+}
+
+/// Lower a network plan into intents, after the host routes — the order and
+/// the dedup `route_codegen::push_network_plan` uses.
+fn push_network_intents(plan: NetworkRoutePlan, families: FamilyScope, out: &mut Vec<RouteIntent>) {
+    let egress_of = |link| match link {
+        crate::address_ownership::Link::Main => EgressRef::Primary,
+        crate::address_ownership::Link::Additional => EgressRef::Secondary,
+    };
+    let mut hosts: HashSet<(IpAddr, bool)> = out
+        .iter()
+        .filter_map(|r| match r.dst {
+            DstMatch::HostV4(ip) => Some((IpAddr::V4(ip), r.egress == EgressRef::Primary)),
+            DstMatch::HostV6(ip) => Some((IpAddr::V6(ip), r.egress == EgressRef::Primary)),
+            _ => None,
+        })
+        .collect();
+    for (link, ip) in plan.hosts {
+        let egress = egress_of(link);
+        if !families.admits(ip)
+            || crate::net_filter::is_non_routable(&ip)
+            || !hosts.insert((ip, egress == EgressRef::Primary))
+        {
+            continue;
+        }
+        out.push(RouteIntent {
+            dst: host_match(ip),
+            egress,
+            metric: SECONDARY_ROUTE_METRIC,
+            table: RouteTableRef::Main,
+        });
+    }
+    for (link, block) in plan.networks {
+        let egress = egress_of(link);
+        if !families.admits(block.network())
+            || (block.is_single_address()
+                && hosts.contains(&(block.network(), egress == EgressRef::Primary)))
+        {
+            continue;
+        }
+        out.push(RouteIntent {
+            dst: subnet_match(block),
+            egress,
+            metric: NETWORK_ROUTE_METRIC,
+            table: RouteTableRef::Main,
+        });
+    }
 }
 
 /// Plan the `/32` host routes for one ruleset (neutral equivalent of
@@ -166,6 +261,8 @@ fn plan_host_routes(
                     push_host_route(*ip, &egress, seen, out, &mut per_rule);
                 }
             }
+            // Routed by `plan_network_routes`, which needs both links' networks.
+            Some(CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_)) => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 for ip in capped_for_host(cache, host, families) {
                     if !steerable(ip) {
@@ -412,7 +509,9 @@ pub(super) fn note_address_resolution(
     cache: &dyn FqdnCacheLookup,
 ) {
     let name = match addr_match {
-        CanonicalAddressMatch::ExactIp(_) => return,
+        CanonicalAddressMatch::ExactIp(_)
+        | CanonicalAddressMatch::Subnet(_)
+        | CanonicalAddressMatch::IpRange(_) => return,
         CanonicalAddressMatch::ExactFqdn(host) => host,
         CanonicalAddressMatch::SuffixDomain(suffix) => suffix,
         CanonicalAddressMatch::Zone(zone) => zone,

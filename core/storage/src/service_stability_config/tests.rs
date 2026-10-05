@@ -52,7 +52,7 @@ fn verbose_deadline_roundtrips_through_set_and_get() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         Some(i64::MAX),
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -93,7 +93,7 @@ fn probe_verbose_until_reflects_persisted_value() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         Some(i64::MAX),
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -127,7 +127,7 @@ fn fake_ip_enabled_defaults_false_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -147,7 +147,7 @@ fn fake_ip_enabled_defaults_false_and_roundtrips() {
     let r = repo.get_or_default().expect("get");
     assert!(r.fake_ip_enabled, "fake_ip_enabled=true must persist");
     // Unrelated flags untouched.
-    assert!(r.verbose_until_ms.is_none() && !r.conn_trace_ndjson);
+    assert!(r.verbose_until_ms.is_none() && r.conn_trace_ndjson_until_ms.is_none());
 }
 
 #[test]
@@ -165,7 +165,7 @@ fn fake_ip_udp_relay_defaults_false_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -206,7 +206,7 @@ fn fake_ip_instant_rst_defaults_true_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -240,7 +240,7 @@ fn set_rules_lock(repo: &ServiceStabilityConfigRepository<'_>, allow: bool, now_
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -339,14 +339,17 @@ fn conn_trace_flags_default_and_roundtrip_independently() {
 
     // Implicit default: the on-disk sink is off, the GUI view is on.
     let d = repo.get_or_default().expect("get");
-    assert!(!d.conn_trace_ndjson, "the disk sink stays opt-in");
+    assert_eq!(
+        d.conn_trace_ndjson_until_ms, None,
+        "the disk sink stays opt-in"
+    );
     assert!(d.conn_trace_gui, "an unwritten DB still shows the panel");
 
-    // GUI on, NDJSON off — independent toggles.
+    // GUI on, log window shut — independent of each other.
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         true,
         true,
         RoutingStopPolicy::Teardown,
@@ -364,7 +367,10 @@ fn conn_trace_flags_default_and_roundtrip_independently() {
     )
     .expect("set");
     let r = repo.get_or_default().expect("get");
-    assert!(!r.conn_trace_ndjson, "ndjson must stay off");
+    assert_eq!(
+        r.conn_trace_ndjson_until_ms, None,
+        "the log window must stay shut"
+    );
     assert!(r.conn_trace_gui, "gui must persist on");
     // Unrelated flags untouched.
     assert!(r.verbose_until_ms.is_none());
@@ -387,7 +393,7 @@ fn rule_scope_defaults_to_service_driven_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         false,
         RoutingStopPolicy::Teardown,
@@ -406,7 +412,9 @@ fn rule_scope_defaults_to_service_driven_and_roundtrips() {
     .expect("set");
     let r = repo.get_or_default().expect("get");
     assert!(!r.rule_scope_service_driven, "app-driven must persist");
-    assert!(r.verbose_until_ms.is_none() && !r.conn_trace_ndjson && !r.conn_trace_gui);
+    assert!(
+        r.verbose_until_ms.is_none() && r.conn_trace_ndjson_until_ms.is_none() && !r.conn_trace_gui
+    );
 }
 
 #[test]
@@ -424,7 +432,7 @@ fn routing_stop_policy_defaults_to_persist_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Persist,
@@ -449,7 +457,7 @@ fn routing_stop_policy_defaults_to_persist_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -492,7 +500,7 @@ fn cache_refresh_interval_defaults_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Persist,
@@ -539,7 +547,7 @@ fn enforcement_mode_defaults_to_resolver_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Persist,
@@ -570,7 +578,7 @@ fn enforcement_mode_defaults_to_resolver_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Persist,
@@ -612,7 +620,7 @@ fn secondary_liveness_window_defaults_disabled_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Persist,
@@ -637,7 +645,7 @@ fn secondary_liveness_window_defaults_disabled_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Persist,
@@ -666,7 +674,7 @@ fn secondary_liveness_window_defaults_disabled_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Persist,
@@ -695,7 +703,7 @@ fn secondary_liveness_window_defaults_disabled_and_roundtrips() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Persist,
@@ -795,7 +803,7 @@ fn set_recoverable_then_get_roundtrips() {
     repo.set(
         &policy,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -826,7 +834,7 @@ fn set_critical_then_get_returns_critical_with_null_params() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -855,7 +863,7 @@ fn set_overwrites_previous_row() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -879,7 +887,7 @@ fn set_overwrites_previous_row() {
             backoff_cap_ms: 1_500,
         },
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -963,7 +971,7 @@ fn schema_rejects_second_row() {
     repo.set(
         &IpcAcceptPolicyWrite::Critical,
         None,
-        false,
+        None,
         false,
         true,
         RoutingStopPolicy::Teardown,
@@ -1019,6 +1027,81 @@ fn schema_rejects_a_non_positive_verbose_deadline() {
     let res = conn.execute(
         "INSERT INTO service_stability_config
             (id, ipc_accept_kind, ipc_max_restarts, ipc_backoff_base_ms, ipc_backoff_cap_ms, set_by_sid, updated_at, verbose_until_ms)
+         VALUES (1, 'critical', NULL, NULL, NULL, NULL, 1, 0)",
+        [],
+    );
+    assert!(res.is_err(), "a deadline of 0 must be rejected");
+}
+
+#[test]
+fn conn_trace_deadline_roundtrips_independently_of_verbose() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let repo = ServiceStabilityConfigRepository::new(&conn);
+    repo.set(
+        &IpcAcceptPolicyWrite::Critical,
+        None,
+        Some(1_234_567),
+        true,
+        true,
+        RoutingStopPolicy::Teardown,
+        300,
+        EnforcementMode::Resolver,
+        0,
+        false,
+        false,
+        true,
+        false,
+        true,
+        true,
+        Some("S-CT"),
+        3,
+    )
+    .expect("set");
+    let r = repo.get_or_default().expect("get");
+    assert_eq!(
+        r.conn_trace_ndjson_until_ms,
+        Some(1_234_567),
+        "the trace deadline must persist"
+    );
+    assert_eq!(r.verbose_until_ms, None, "the verbose window is separate");
+
+    // Shutting the window clears the deadline.
+    repo.set(
+        &IpcAcceptPolicyWrite::Critical,
+        None,
+        None,
+        true,
+        true,
+        RoutingStopPolicy::Teardown,
+        300,
+        EnforcementMode::Resolver,
+        0,
+        false,
+        false,
+        true,
+        false,
+        true,
+        true,
+        Some("S-CT"),
+        4,
+    )
+    .expect("set");
+    assert_eq!(
+        repo.get_or_default()
+            .expect("get")
+            .conn_trace_ndjson_until_ms,
+        None
+    );
+}
+
+#[test]
+fn schema_rejects_a_non_positive_conn_trace_deadline() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = open_state_db(&dir);
+    let res = conn.execute(
+        "INSERT INTO service_stability_config
+            (id, ipc_accept_kind, ipc_max_restarts, ipc_backoff_base_ms, ipc_backoff_cap_ms, set_by_sid, updated_at, conn_trace_ndjson_until_ms)
          VALUES (1, 'critical', NULL, NULL, NULL, NULL, 1, 0)",
         [],
     );

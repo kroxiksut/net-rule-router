@@ -594,14 +594,22 @@ impl DnsResolverService {
     }
 }
 
-/// Builds a fresh [`DnsResolverService`] on demand. Each call re-captures the
-/// current upstream DNS + rebuilds the listener, so a runtime start after a
-/// network change is correct. Returns `None` when the resolver cannot be safely
-/// armed (no upstream captured, missing deps) — the controller then stays
-/// reactive (fail-open, general DNS untouched). Injected from the platform boot
-/// wiring so the concrete OS construction (NRPT redirect, upstream capture) stays
-/// in the windows-service crate, not in this generic control logic.
-pub type DnsResolverFactory = Arc<dyn Fn() -> Option<DnsResolverService> + Send + Sync>;
+/// Why a factory declined to build a resolver. Either way the controller stays
+/// reactive and the OS DNS is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmRefusal {
+    /// Nobody is signed in. The sign-in event arms it; retrying earlier only
+    /// repeats the refusal.
+    AwaitingSignIn,
+    /// Something the arm needs is missing: no upstream answered, or the
+    /// listener could not be prepared. Worth retrying with backoff.
+    Unavailable,
+}
+
+/// Builds a fresh [`DnsResolverService`] on each start, re-capturing the
+/// upstream so a start after a network change is correct. The OS construction
+/// is injected by the platform service crate.
+pub type DnsResolverFactory = Arc<dyn Fn() -> Result<DnsResolverService, ArmRefusal> + Send + Sync>;
 
 /// Runtime start/stop controller for the Mode-B resolver, so switching
 /// [`EnforcementMode`] takes effect WITHOUT a service restart. Owns the
@@ -643,6 +651,9 @@ struct ControllerInner {
     /// Only the false→true edge clears the backoff — see
     /// [`DnsResolverController::note_upstream_present`].
     upstream_present: bool,
+    /// The last arm was refused because nobody is signed in: the watchdog
+    /// leaves it to the sign-in event, which comes through `start`.
+    awaiting_sign_in: bool,
 }
 
 impl DnsResolverController {
@@ -736,6 +747,7 @@ impl DnsResolverController {
         let mut inner = self.lock();
         inner.desired = true;
         inner.restart_cooldown = 0;
+        inner.awaiting_sign_in = false;
         Self::start_locked(&mut inner);
     }
 
@@ -765,7 +777,7 @@ impl DnsResolverController {
     /// or while backing off after a failed re-arm. Idempotent and cheap.
     pub fn tick(&self) {
         let mut inner = self.lock();
-        if inner.disarmed || !inner.desired {
+        if inner.disarmed || !inner.desired || inner.awaiting_sign_in {
             return;
         }
         Self::reap_finished(&mut inner);
@@ -806,13 +818,20 @@ impl DnsResolverController {
         };
         // Re-captures the current upstream DNS (the network may have changed
         // since boot). A failure to arm is fail-open — general DNS keeps working.
-        let Some(service) = factory() else {
-            tracing::warn!(
-                target: "nrr::dns-resolver",
-                msg_key = "dns-resolver-arm-failed",
-                "Mode B: resolver could not be armed (no upstream / deps); staying reactive",
-            );
-            return;
+        let service = match factory() {
+            Ok(service) => service,
+            Err(ArmRefusal::AwaitingSignIn) => {
+                inner.awaiting_sign_in = true;
+                return;
+            }
+            Err(ArmRefusal::Unavailable) => {
+                tracing::warn!(
+                    target: "nrr::dns-resolver",
+                    msg_key = "dns-resolver-arm-failed",
+                    "Mode B: resolver could not be armed (no upstream / deps); staying reactive",
+                );
+                return;
+            }
         };
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -1842,7 +1861,7 @@ mod tests {
     fn controller_start_is_fail_open_when_factory_returns_none() {
         // A factory that refuses to arm (no upstream) leaves the resolver off.
         let controller = DnsResolverController::new();
-        controller.set_factory(Arc::new(|| None));
+        controller.set_factory(Arc::new(|| Err(ArmRefusal::Unavailable)));
         controller.apply(EnforcementMode::Resolver);
         assert!(!controller.is_running());
     }
@@ -1854,7 +1873,7 @@ mod tests {
         let controller = DnsResolverController::new();
         // Ephemeral loopback port — no privilege, no clash with a real :53.
         controller.set_factory(Arc::new(move || {
-            Some(DnsResolverService::new(
+            Ok(DnsResolverService::new(
                 listener(),
                 Arc::clone(&redirect_for_factory) as Arc<dyn SystemDnsRedirectPort>,
                 "127.0.0.1:0".parse().unwrap(),
@@ -1911,7 +1930,7 @@ mod tests {
         let redirect_for_factory = Arc::clone(&redirect);
         let controller = DnsResolverController::new();
         controller.set_factory(Arc::new(move || {
-            Some(DnsResolverService::new(
+            Ok(DnsResolverService::new(
                 listener(),
                 Arc::clone(&redirect_for_factory) as Arc<dyn SystemDnsRedirectPort>,
                 "127.0.0.1:0".parse().unwrap(),
@@ -1944,13 +1963,13 @@ mod tests {
 
         // Desire Resolver mode while arming is impossible (factory yields None):
         // `desired == true`, but nothing is running.
-        controller.set_factory(Arc::new(|| None));
+        controller.set_factory(Arc::new(|| Err(ArmRefusal::Unavailable)));
         controller.apply(EnforcementMode::Resolver);
         assert!(!controller.is_running(), "a None factory cannot arm");
 
         // A real factory is now available; the watchdog tick must re-arm.
         controller.set_factory(Arc::new(move || {
-            Some(DnsResolverService::new(
+            Ok(DnsResolverService::new(
                 listener(),
                 Arc::clone(&redirect_for_factory) as Arc<dyn SystemDnsRedirectPort>,
                 "127.0.0.1:0".parse().unwrap(),
@@ -1970,5 +1989,30 @@ mod tests {
             !controller.is_running(),
             "watchdog must respect the shutdown latch"
         );
+    }
+
+    #[test]
+    fn watchdog_leaves_an_unsigned_machine_to_the_sign_in_event() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let controller = DnsResolverController::new();
+        controller.set_factory(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(ArmRefusal::AwaitingSignIn)
+        }));
+        controller.apply(EnforcementMode::Resolver);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        for _ in 0..(RESOLVER_RESTART_BACKOFF_TICKS * 3 + 3) {
+            controller.tick();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "before sign-in the watchdog must not retry"
+        );
+
+        controller.start();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "sign-in arms again");
     }
 }

@@ -1788,6 +1788,12 @@ fn an_app_and_address_rule_is_skipped_whole_for_either_action() {
 #[test]
 fn no_capability_set_unlocks_an_unimplemented_shape() {
     use nrr_platform_api::enforcement::AppMatchMechanism;
+    // Networks are emitted on every platform; the application-scoped shapes
+    // are not, whatever a platform could hold.
+    let implemented = RuleShapeSupport {
+        network_destination: true,
+        ..RuleShapeSupport::NONE
+    };
     let everything = EnforcementCapabilities {
         per_user_routing: true,
         per_app_routing_true: true,
@@ -1801,7 +1807,7 @@ fn no_capability_set_unlocks_an_unimplemented_shape() {
         EnforcementCapabilities::linux_mvp(),
         EnforcementCapabilities::macos_mvp(),
     ] {
-        assert_eq!(rule_shape_support(&caps), RuleShapeSupport::NONE);
+        assert_eq!(rule_shape_support(&caps), implemented);
     }
-    assert_eq!(current_rule_shape_support(), RuleShapeSupport::NONE);
+    assert_eq!(current_rule_shape_support(), implemented);
 }

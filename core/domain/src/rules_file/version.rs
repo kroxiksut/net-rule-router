@@ -11,14 +11,11 @@ use super::*;
 /// sections/fields are ignored and [`ParseWarning::UnknownFormatVersion`] is
 /// emitted.
 ///
-/// 4, not 1: versions are cumulative and this build implements 1 (`sections,
-/// comments, disabled rules`), 3 (`+block`) and 4 (`--- Auto`). Version 2 was
-/// reserved for a nested `- destination` syntax that was specified and never
-/// implemented — the number stays retired rather than reused, so a file means
-/// the same thing in every build. While the constant said 1, every valid file
-/// of the format we actually write was greeted with "some rules may be
-/// ignored".
-pub const CURRENT_RULES_FILE_FORMAT_VERSION: u32 = 4;
+/// Versions are cumulative: 1 (sections, comments, disabled rules), 3
+/// (`+block`), 4 (`--- Auto`), 5 (`--- CIDR`, `--- Ranges`). Version 2 was a
+/// nested `- destination` syntax never implemented; the number stays retired
+/// so a file means the same thing in every build.
+pub const CURRENT_RULES_FILE_FORMAT_VERSION: u32 = 5;
 
 /// Optional metadata declared in a preset file's preamble comments.
 ///

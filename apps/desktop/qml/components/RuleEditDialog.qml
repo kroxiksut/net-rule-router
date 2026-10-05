@@ -74,8 +74,10 @@ Dialog {
                 text: root.tr("action.ok", "OK")
                 // App rules ARE saveable now — they route the app's observed
                 // destinations via the secondary (app-routing via observation).
-                enabled: ruleDialog.isMatchValueValid(ruleDialog.localRuleType,
-                    ruleDialog.localValue)
+                enabled: ruleDialog.listMode
+                    ? ruleDialog.acceptedListRows.length > 0
+                    : ruleDialog.isMatchValueValid(ruleDialog.localRuleType,
+                        ruleDialog.localValue)
                 onClicked: ruleDialog.accept()
             }
             ThemedButton {
@@ -163,6 +165,10 @@ Dialog {
             localEnabled = true
             allowBlockRoute = false
         }
+        listMode = false
+        listText = ""
+        if (listInput) listInput.text = ""
+        if (listModeCheck) listModeCheck.checked = false
         // Sync visible widgets to fresh local state. Bindings on `text` /
         // `currentIndex` / `checked` are broken by user input, so do this
         // directly.
@@ -239,13 +245,16 @@ Dialog {
     // value can be saved is `isMatchValueValid()`.
     //
     // - `exact-ip` accepts hex digits, dots and colons up to 45 chars, the
-    //   longest IPv6 text form.
+    //   longest IPv6 text form; `subnet` adds `/` and a prefix, `ip-range` a
+    //   `-` and a second address, spaces around it allowed.
     // - the rest cap the length only: `\p{L}` / `\u…` ranges silently block
     //   Cyrillic input on some Qt builds.
     function matchValueRegex(ruleType) {
         if (ruleType === "exact-ip") {
             return new RegExp("^[0-9A-Fa-f.:]{0,45}$")
         }
+        if (ruleType === "subnet") return new RegExp("^[0-9A-Fa-f.:/ ]{0,51}$")
+        if (ruleType === "ip-range") return new RegExp("^[0-9A-Fa-f.: -]{0,93}$")
         if (ruleType === "zone" || ruleType === "domain") return new RegExp("^.{0,253}$")
         if (ruleType === "application") return new RegExp("^.{0,260}$")
         return new RegExp("^.*$")
@@ -253,8 +262,14 @@ Dialog {
     function matchValueMaxLength(ruleType) {
         if (ruleType === "zone" || ruleType === "domain") return 253
         if (ruleType === "exact-ip")    return 45
+        if (ruleType === "subnet")      return 51
+        if (ruleType === "ip-range")    return 93
         if (ruleType === "application") return 260
         return 260
+    }
+    /// The address types a pasted list is sorted into.
+    function isAddressRuleType(ruleType) {
+        return ruleType === "exact-ip" || ruleType === "subnet" || ruleType === "ip-range"
     }
     // The verdict on the value on screen, asked of the launcher: the one the
     // rules table shows, which for a zone or domain is the service's own
@@ -301,16 +316,95 @@ Dialog {
         var verdict = _verdictFor(ruleType, raw)
         return verdict !== null && verdict.status === "error"
     }
-    // The refusal in the rules table's words, `{name}` args filled in.
+    function isMatchValueWarned(ruleType, raw) {
+        var verdict = _verdictFor(ruleType, raw)
+        return verdict !== null && verdict.status === "warning"
+    }
+    /// A verdict's message in the rules table's words, `{name}` args filled in.
+    function verdictMessage(messageKey, args, fallback) {
+        if (String(messageKey || "") === "") return fallback
+        var msg = root.tr(messageKey, fallback)
+        for (var k in (args || {})) {
+            msg = msg.split("{" + k + "}").join(String(args[k]))
+        }
+        return msg
+    }
     function refusalText() {
         var fallback = root.tr("rules.validation.error", "Error — rule is inactive")
         var verdict = _verdictFor(localRuleType, localValue)
-        if (verdict === null || verdict.messageKey === "") return fallback
-        var msg = root.tr(verdict.messageKey, fallback)
-        for (var k in verdict.args) {
-            msg = msg.split("{" + k + "}").join(String(verdict.args[k]))
+        return verdict === null ? fallback
+            : verdictMessage(verdict.messageKey, verdict.args, fallback)
+    }
+    function warningText() {
+        var verdict = _verdictFor(localRuleType, localValue)
+        return verdict === null ? ""
+            : verdictMessage(verdict.messageKey, verdict.args,
+                root.tr("rules.validation.warning", "Warning"))
+    }
+
+    // ── A pasted list of addresses, subnets and ranges ──
+    // Rust sorts each line into its type and judges it as that type
+    // (`local.rule-values-classify`); the dialog only shows the answer.
+    property bool listMode: false
+    property string listText: ""
+    property var _listAnswer: ({ text: "", rows: [], truncated: false })
+    readonly property bool listAvailable: !!root && !!root.rpc && root.rpc.bridgeAvailable
+        && typeof root.rpc.bridge.rpcRuleValuesClassify === "function"
+    readonly property var listRows: _listAnswer.text === listText.trim() ? _listAnswer.rows : []
+    readonly property var acceptedListRows: {
+        var out = []
+        for (var i = 0; i < listRows.length; i += 1) {
+            if (String(listRows[i].status) !== "error") out.push(listRows[i])
         }
-        return msg
+        return out
+    }
+    function _requestListClassification() {
+        var text = listText.trim()
+        if (text === "" || !listAvailable) {
+            _listAnswer = { text: text, rows: [], truncated: false }
+            return
+        }
+        var corr = root.rpc.bridge.rpcRuleValuesClassify(text)
+        root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            if (!ok) {
+                console.log("local.rule-values-classify failed:", code, msg)
+                return
+            }
+            ruleDialog._listAnswer = {
+                text: text,
+                rows: (payload && payload.rows) || [],
+                truncated: !!(payload && payload.truncated)
+            }
+        })
+    }
+    // Typing a long list must not ask once per keystroke.
+    Timer {
+        id: listClassifyTimer
+        interval: 200
+        repeat: false
+        onTriggered: ruleDialog._requestListClassification()
+    }
+    onListTextChanged: listClassifyTimer.restart()
+    function listRowText(row) {
+        var status = String(row.status || "")
+        if (status === "valid") return root.ruleTypeLabel(String(row["rule-type"]))
+        var fallback = status === "error"
+            ? root.tr("rules.validation.error", "Error — rule is inactive")
+            : root.tr("rules.validation.warning", "Warning")
+        var message = verdictMessage(row["message-key"], row.args, fallback)
+        if (status === "error") return message
+        return root.ruleTypeLabel(String(row["rule-type"])) + " — " + message
+    }
+    function listSummaryText() {
+        var text = root.tr("rules.paste.summary", "To add: {accepted}. Not added: {rejected}.")
+            .replace("{accepted}", String(acceptedListRows.length))
+            .replace("{rejected}", String(listRows.length - acceptedListRows.length))
+        if (_listAnswer.truncated && listRows.length > 0) {
+            text += " " + root.tr("rules.paste.truncated",
+                "Only the first {count} lines were read.")
+                .replace("{count}", String(listRows.length))
+        }
+        return text
     }
     // Paste convenience: when the user pastes a full URL copied from a
     // browser, reduce it to the bare host so the value passes validation.
@@ -338,6 +432,14 @@ Dialog {
     }
 
     onAccepted: {
+        if (listMode) {
+            if (acceptedListRows.length === 0) {
+                open()
+                return
+            }
+            root.saveRuleList(acceptedListRows)
+            return
+        }
         if (!isMatchValueValid(localRuleType, localValue)) {
             // Enter-key submission of a value that cannot be saved (yet):
             // stay on the form, where OK is disabled.
@@ -362,6 +464,8 @@ Dialog {
             displayText: root.uiRevision >= 0 && currentIndex >= 0 && currentIndex < root.ruleTypesModel.count
                 ? root.ruleTypeLabel(root.ruleTypesModel.get(currentIndex).id) : ""
             popup.width: root.comboPopupWidth(ruleTypeCombo, root.ruleTypesModel, "id", function(item) { return root.ruleTypeLabel(item.id) })
+            // A pasted list takes each line's type from the line itself.
+            enabled: !ruleDialog.listMode
             onActivated: ruleDialog.localRuleType = root.ruleTypesModel.get(currentIndex).id
             // All rule types are selectable. `application` routes the app's
             // OBSERVED destinations via the secondary (app-routing via
@@ -387,10 +491,126 @@ Dialog {
                 }
             }
         }
-        Label { text: root.tr("label.match-value", "Match value"); color: root.textColor }
+        CheckBox {
+            id: listModeCheck
+            visible: root.editingRule < 0 && ruleDialog.listAvailable
+                && ruleDialog.isAddressRuleType(ruleDialog.localRuleType)
+            checked: ruleDialog.listMode
+            text: root.uiRevision >= 0
+                ? root.tr("rules.paste.toggle", "Add a list of addresses, subnets and ranges")
+                : ""
+            onToggled: {
+                ruleDialog.listMode = checked
+                if (checked) listInput.forceActiveFocus()
+            }
+            Accessible.role: Accessible.CheckBox
+            Accessible.name: text
+        }
+        Label {
+            visible: ruleDialog.listMode
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            wrapMode: Text.WordWrap
+            color: root.textColor
+            text: root.uiRevision >= 0
+                ? root.tr("rules.paste.label",
+                    "One entry per line. Addresses, subnets and ranges can be mixed: each is added as its own type.")
+                : ""
+        }
+        ScrollView {
+            id: listInputScroll
+            visible: ruleDialog.listMode
+            Layout.fillWidth: true
+            Layout.preferredHeight: 120
+            clip: true
+            ThemedTextArea {
+                id: listInput
+                theme: root.uiTheme
+                wrapMode: TextArea.NoWrap
+                placeholderText: root.uiRevision >= 0
+                    ? root.tr("rules.placeholder.address-list",
+                        "192.0.2.10, 198.51.100.0/24, 203.0.113.5-203.0.113.40")
+                    : ""
+                onTextChanged: ruleDialog.listText = text
+                // Tab leaves the field, as in every other control of the form.
+                Keys.onTabPressed: function(event) {
+                    var next = listInput.nextItemInFocusChain(true)
+                    if (next) next.forceActiveFocus(Qt.TabFocusReason)
+                    event.accepted = true
+                }
+                Keys.onBacktabPressed: function(event) {
+                    var prev = listInput.nextItemInFocusChain(false)
+                    if (prev) prev.forceActiveFocus(Qt.BacktabFocusReason)
+                    event.accepted = true
+                }
+                Accessible.role: Accessible.EditableText
+                Accessible.name: listModeCheck.text
+                Accessible.description: root.uiRevision >= 0
+                    ? root.tr("rules.paste.label",
+                        "One entry per line. Addresses, subnets and ranges can be mixed: each is added as its own type.")
+                    : ""
+            }
+        }
+        Label {
+            id: listSummary
+            visible: ruleDialog.listMode && ruleDialog.listRows.length > 0
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            wrapMode: Text.WordWrap
+            color: root.textColor
+            text: root.uiRevision >= 0 ? ruleDialog.listSummaryText() : ""
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+        ScrollView {
+            id: listPreview
+            visible: listSummary.visible
+            Layout.fillWidth: true
+            Layout.preferredHeight: Math.min(160, listPreviewColumn.implicitHeight)
+            clip: true
+            contentWidth: availableWidth
+            ColumnLayout {
+                id: listPreviewColumn
+                width: listPreview.availableWidth
+                spacing: 2
+                Repeater {
+                    model: ruleDialog.listRows
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: root.uiTheme.spacingSm
+                        Label {
+                            Layout.preferredWidth: 200
+                            Layout.alignment: Qt.AlignTop
+                            elide: Text.ElideMiddle
+                            color: root.textColor
+                            text: String(modelData.value)
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 0
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                            color: String(modelData.status) === "error" ? root.uiTheme.colorDanger
+                                : String(modelData.status) === "warning" ? root.uiTheme.colorWarning
+                                : root.mutedTextColor
+                            text: root.uiRevision >= 0 ? ruleDialog.listRowText(modelData) : ""
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: String(modelData.value) + ": " + text
+                        }
+                    }
+                }
+            }
+        }
+        Label {
+            visible: !ruleDialog.listMode
+            text: root.tr("label.match-value", "Match value")
+            color: root.textColor
+        }
         ThemedTextField {
             id: matchValueField
             theme: root.uiTheme
+            visible: !ruleDialog.listMode
             Layout.fillWidth: true
             text: ruleDialog.localValue
             onTextChanged: {
@@ -409,8 +629,6 @@ Dialog {
             placeholderText: root.uiRevision >= 0
                 ? ruleDialog.matchValuePlaceholder(ruleDialog.localRuleType)
                 : ""
-            // Length cap per rule type — `zone`/`domain` 253, `exact-ip` 45,
-            // `application` 260.
             maximumLength: ruleDialog.matchValueMaxLength(ruleDialog.localRuleType)
             // Validator uses partial-match-friendly regex so each
             // keystroke is accepted (Qt rejects Invalid intermediate
@@ -464,6 +682,7 @@ Dialog {
         }
         Label {
             Layout.fillWidth: true
+            visible: !ruleDialog.listMode
             wrapMode: Text.WordWrap
             color: root.mutedTextColor
             font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
@@ -539,9 +758,22 @@ Dialog {
             wrapMode: Text.WordWrap
             color: root.uiTheme.colorDanger
             font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            visible: ruleDialog.localValue !== ""
+            visible: !ruleDialog.listMode && ruleDialog.localValue !== ""
                 && ruleDialog.isMatchValueRefused(ruleDialog.localRuleType, ruleDialog.localValue)
             text: root.uiRevision >= 0 ? ruleDialog.refusalText() : ""
+        }
+        // Saveable, but not quite what was typed or not fully protected — a
+        // wide network, host bits cleared, an unusual address.
+        Label {
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            color: root.uiTheme.colorWarning
+            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+            visible: !ruleDialog.listMode && ruleDialog.localValue !== ""
+                && ruleDialog.isMatchValueWarned(ruleDialog.localRuleType, ruleDialog.localValue)
+            text: root.uiRevision >= 0 ? ruleDialog.warningText() : ""
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
         }
         Label { text: root.tr("label.target-route", "Target route"); color: root.textColor }
         ThemedComboBox {

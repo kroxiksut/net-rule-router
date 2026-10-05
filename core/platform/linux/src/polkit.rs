@@ -29,7 +29,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::process::Command;
 use std::time::Duration;
 
 use nrr_platform_api::authorization::{
@@ -163,7 +162,7 @@ fn run_with_timeout(args: &[String], timeout: Duration) -> Option<i32> {
 
     let mut child = crate::command::system_tool(PKCHECK_PROGRAM)
         .and_then(|exe| {
-            Command::new(exe)
+            crate::command::tool_command(exe)
                 .args(args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

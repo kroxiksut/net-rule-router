@@ -161,7 +161,7 @@ pub enum PresetImportRejectedReason {
 
     /// A match value string exceeds [`MAX_MATCH_VALUE_LEN`] bytes.
     ///
-    /// `section` is the raw section name (e.g. `"Domains"`, `"CIDR"`).
+    /// `section` is the raw section name (e.g. `"Domains"`, `"Geo"`).
     /// `value` is truncated to 64 bytes for display safety.
     MatchValueTooLong {
         section: String,
@@ -173,7 +173,7 @@ pub enum PresetImportRejectedReason {
     /// An inline comment on a rule line exceeds [`MAX_INLINE_COMMENT_CHARS`]
     /// characters (Unicode scalar values, not bytes).
     ///
-    /// `section` is the raw section name (e.g. `"Domains"`, `"CIDR"`).
+    /// `section` is the raw section name (e.g. `"Domains"`, `"Geo"`).
     /// `comment_preview` is truncated to 64 bytes for display safety.
     /// `chars` is the actual character count of the (whitespace-trimmed)
     /// comment, which exceeds `limit`.
@@ -255,7 +255,7 @@ impl fmt::Display for PresetImportRejectedReason {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresetImportWarning {
-    /// A section with an unrecognised name was found (e.g. `--- CIDR`,
+    /// A section with an unrecognised name was found (e.g. `--- Geo`,
     /// `--- Ports`). Its entries are preserved but will not be applied to
     /// routing policy. The GUI displays them with a "not applied" badge.
     UnknownSection { name: String, entry_count: usize },
@@ -581,11 +581,7 @@ mod tests {
                 "",
                 "metadata",
             ),
-            (
-                b"--- CIDR\n10.0.0.0/8  # x\x0by\n",
-                "CIDR",
-                "inline-comment",
-            ),
+            (b"--- Geo\n10.0.0.0/8  # x\x0by\n", "Geo", "inline-comment"),
             (b"--- CI\x07DR\n10.0.0.0/8\n", "CI DR", "section-name"),
         ];
         for (input, section, field) in cases {
@@ -607,7 +603,7 @@ mod tests {
 
     #[test]
     fn unsupported_section_produces_accepted_with_warning() {
-        let input = b"--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n";
+        let input = b"--- Domains\nexample.com\n--- Geo\n10.0.0.0/8\n";
         let outcome = validate_preset_bytes(input);
         assert!(outcome.is_accepted());
         assert!(outcome.has_warnings());
@@ -615,13 +611,13 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(matches!(
             &warnings[0],
-            PresetImportWarning::UnknownSection { name, entry_count: 1 } if name == "CIDR"
+            PresetImportWarning::UnknownSection { name, entry_count: 1 } if name == "Geo"
         ));
     }
 
     #[test]
     fn multiple_extended_sections_produce_one_warning_each() {
-        let input = b"--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n--- Ports\n443\n";
+        let input = b"--- Domains\nexample.com\n--- Geo\n10.0.0.0/8\n--- Ports\n443\n";
         let outcome = validate_preset_bytes(input);
         assert!(outcome.has_warnings());
         assert_eq!(outcome.warnings().len(), 2);
@@ -643,7 +639,7 @@ mod tests {
     #[test]
     fn extended_section_and_version_mismatch_both_reported() {
         let input = b"# NetRuleRouter preset \xe2\x80\x94 version 99\n\
-                      --- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n";
+                      --- Domains\nexample.com\n--- Geo\n10.0.0.0/8\n";
         let outcome = validate_preset_bytes(input);
         assert!(outcome.has_warnings());
         assert_eq!(outcome.warnings().len(), 2);
@@ -651,7 +647,7 @@ mod tests {
 
     #[test]
     fn parse_outcome_available_when_accepted_with_warnings() {
-        let input = b"--- CIDR\n10.0.0.0/8\n";
+        let input = b"--- Geo\n10.0.0.0/8\n";
         let outcome = validate_preset_bytes(input);
         assert!(outcome.has_warnings());
         assert!(outcome.parse_outcome().is_some());
@@ -766,7 +762,7 @@ mod tests {
     #[test]
     fn rule_count_includes_unknown_extended_section_entries() {
         // Entries in unknown sections count toward the total rule limit.
-        let mut content = String::from("--- CIDR\n");
+        let mut content = String::from("--- Geo\n");
         for i in 0..=FREE_MAX_RULES {
             content.push_str(&format!("10.0.{}.0/24\n", i % 256));
         }
@@ -850,13 +846,13 @@ mod tests {
     #[test]
     fn match_value_too_long_in_unknown_section_is_rejected() {
         let value = "x".repeat(MAX_MATCH_VALUE_LEN + 1);
-        let input = format!("--- CIDR\n{value}\n");
+        let input = format!("--- Geo\n{value}\n");
         let outcome = validate_preset_bytes(input.as_bytes());
         assert!(matches!(
             outcome,
             PresetFileValidationOutcome::Rejected(PresetImportRejectedReason::MatchValueTooLong {
                 ref section, ..
-            }) if section == "CIDR"
+            }) if section == "Geo"
         ));
     }
 
@@ -952,14 +948,14 @@ mod tests {
     #[test]
     fn inline_comment_too_long_in_unknown_section_is_rejected() {
         let comment = "a".repeat(MAX_INLINE_COMMENT_CHARS + 1);
-        let input = format!("--- CIDR\n10.0.0.0/8  # {comment}\n");
+        let input = format!("--- Geo\n10.0.0.0/8  # {comment}\n");
         let outcome = validate_preset_bytes(input.as_bytes());
         assert!(
             matches!(
                 outcome,
                 PresetFileValidationOutcome::Rejected(
                     PresetImportRejectedReason::InlineCommentTooLong { ref section, .. }
-                ) if section == "CIDR"
+                ) if section == "Geo"
             ),
             "got {outcome:?}"
         );
@@ -1022,7 +1018,7 @@ mod tests {
     fn warning_display_is_nonempty() {
         let warnings = [
             PresetImportWarning::UnknownSection {
-                name: "CIDR".to_string(),
+                name: "Geo".to_string(),
                 entry_count: 3,
             },
             PresetImportWarning::FormatVersionMismatch {

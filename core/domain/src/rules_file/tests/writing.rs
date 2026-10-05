@@ -14,7 +14,7 @@ example.com
     )
     .parsed;
     let carried = [PassthroughSection {
-        name: "CIDR".to_string(),
+        name: "Geo".to_string(),
         body: "10.0.0.0/8
 "
         .to_string(),
@@ -29,7 +29,7 @@ example.com
         .collect();
     assert_eq!(
         names,
-        vec!["CIDR"],
+        vec!["Geo"],
         "written text:
 {text}"
     );
@@ -195,7 +195,7 @@ fn write_preserves_unknown_sections_in_supplied_order() {
     let parsed = RulesFileParsed::default();
     let unknown = vec![
         UnknownSection {
-            name: "CIDR".to_string(),
+            name: "Geo".to_string(),
             entries: vec![RulesFileEntry::enabled("10.0.0.0/8")],
         },
         UnknownSection {
@@ -207,12 +207,12 @@ fn write_preserves_unknown_sections_in_supplied_order() {
         },
     ];
     let text = write_rules_file(&parsed, &unknown, None);
-    assert!(text.contains("--- CIDR\n10.0.0.0/8\n"), "got:\n{text}");
+    assert!(text.contains("--- Geo\n10.0.0.0/8\n"), "got:\n{text}");
     assert!(text.contains("--- Ports\n443\n# 8080\n"), "got:\n{text}");
-    // CIDR must appear before Ports.
-    let cidr_at = text.find("--- CIDR").unwrap();
+    // Geo must appear before Ports.
+    let geo_at = text.find("--- Geo").unwrap();
     let ports_at = text.find("--- Ports").unwrap();
-    assert!(cidr_at < ports_at, "supplied order not preserved");
+    assert!(geo_at < ports_at, "supplied order not preserved");
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn write_round_trips_unknown_sections() {
 --- Domains
 example.com
 
---- CIDR
+--- Geo
 10.0.0.0/8
 192.168.1.0/24  # office subnet
 
@@ -246,7 +246,9 @@ fn write_includes_preset_metadata_when_supplied() {
     };
     let text = write_rules_file(&parsed, &[], Some(&meta));
     assert!(
-        text.starts_with("# NetRuleRouter preset \u{2014} version 4\n"),
+        text.starts_with(&format!(
+            "# NetRuleRouter preset \u{2014} version {CURRENT_RULES_FILE_FORMAT_VERSION}\n"
+        )),
         "got:\n{text}"
     );
     assert!(text.contains("# name: Corporate VPN\n"));
@@ -365,7 +367,7 @@ fn a_line_break_in_any_field_never_becomes_a_rule_or_section() {
         }],
     };
     let unknown = [UnknownSection {
-        name: "CIDR\n--- IP\n192.0.2.11".to_string(),
+        name: "Geo\n--- IP\n192.0.2.11".to_string(),
         entries: vec![],
     }];
     let meta = PresetMetadata {

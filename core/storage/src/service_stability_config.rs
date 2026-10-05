@@ -125,13 +125,13 @@ pub struct ServiceStabilityConfigRecord {
     /// restarts" must not survive one, and a deadline already passed reads as
     /// normal logging (schema v67).
     pub verbose_until_ms: Option<i64>,
-    /// When `true` the opt-in connection-egress trace writes each observed
-    /// connection to the operational NDJSON. Persisted as INTEGER 0/1;
-    /// default `false`.
-    pub conn_trace_ndjson: bool,
+    /// UTC milliseconds until which each observed connection is written to
+    /// the operational log; `None` writes nothing. Stored like
+    /// `verbose_until_ms`: only a timed window, and a deadline already passed
+    /// reads as off (schema v68).
+    pub conn_trace_ndjson_until_ms: Option<i64>,
     /// When `true` the connection-egress trace streams to the GUI
-    /// «Диагностика» panel. Independent of
-    /// `conn_trace_ndjson` (either, both, or neither). Default `false`.
+    /// «Диагностика» panel. Independent of the log window. Default `false`.
     pub conn_trace_gui: bool,
     /// Routing scope. When `true` (the default) the
     /// service enforces the active console user's routing policy continuously
@@ -258,10 +258,10 @@ impl ServiceStabilityConfigRecord {
             set_by_sid: None,
             updated_at: 0,
             verbose_until_ms: None,
-            conn_trace_ndjson: false,
+            conn_trace_ndjson_until_ms: None,
             // Showing the trace in the GUI costs nothing on disk and is what
             // makes the Diagnostics panel useful out of the box; the
-            // privacy-sensitive half is the NDJSON sink above, which stays off.
+            // privacy-sensitive half is the log window above, which stays shut.
             // This is the answer for a state DB that was never written — an
             // existing row keeps whatever it holds.
             conn_trace_gui: true,
@@ -322,7 +322,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                         set_by_sid,
                         updated_at,
                         verbose_until_ms,
-                        conn_trace_ndjson,
+                        conn_trace_ndjson_until_ms,
                         conn_trace_gui,
                         rule_scope_service_driven,
                         routing_stop_policy,
@@ -346,7 +346,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                     let set_by_sid: Option<String> = row.get(4)?;
                     let updated_at: i64 = row.get(5)?;
                     let verbose_until_ms: Option<i64> = row.get(6)?;
-                    let conn_trace_ndjson: i64 = row.get(7)?;
+                    let conn_trace_ndjson_until_ms: Option<i64> = row.get(7)?;
                     let conn_trace_gui: i64 = row.get(8)?;
                     let rule_scope_service_driven: i64 = row.get(9)?;
                     let routing_stop_policy: String = row.get(10)?;
@@ -367,7 +367,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                         set_by_sid,
                         updated_at,
                         verbose_until_ms,
-                        conn_trace_ndjson,
+                        conn_trace_ndjson_until_ms,
                         conn_trace_gui,
                         rule_scope_service_driven,
                         routing_stop_policy,
@@ -396,7 +396,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                 sid,
                 updated,
                 verbose_until_ms,
-                ct_ndjson,
+                conn_trace_ndjson_until_ms,
                 ct_gui,
                 rule_scope,
                 stop_policy_slug,
@@ -422,7 +422,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                     set_by_sid: sid,
                     updated_at: updated,
                     verbose_until_ms,
-                    conn_trace_ndjson: ct_ndjson != 0,
+                    conn_trace_ndjson_until_ms,
                     conn_trace_gui: ct_gui != 0,
                     rule_scope_service_driven: rule_scope != 0,
                     routing_stop_policy,
@@ -464,7 +464,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
         &self,
         policy: &IpcAcceptPolicyWrite,
         verbose_until_ms: Option<i64>,
-        conn_trace_ndjson: bool,
+        conn_trace_ndjson_until_ms: Option<i64>,
         conn_trace_gui: bool,
         rule_scope_service_driven: bool,
         routing_stop_policy: RoutingStopPolicy,
@@ -493,7 +493,6 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
             ),
             IpcAcceptPolicyWrite::Critical => (KIND_CRITICAL, None, None, None),
         };
-        let ct_ndjson_int: i64 = if conn_trace_ndjson { 1 } else { 0 };
         let ct_gui_int: i64 = if conn_trace_gui { 1 } else { 0 };
         let rule_scope_int: i64 = if rule_scope_service_driven { 1 } else { 0 };
         let stop_policy_slug = routing_stop_policy.as_slug();
@@ -521,7 +520,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                     (id, ipc_accept_kind,
                      ipc_max_restarts, ipc_backoff_base_ms, ipc_backoff_cap_ms,
                      set_by_sid, updated_at, verbose_until_ms,
-                     conn_trace_ndjson, conn_trace_gui, rule_scope_service_driven,
+                     conn_trace_ndjson_until_ms, conn_trace_gui, rule_scope_service_driven,
                      routing_stop_policy, cache_refresh_interval_secs, enforcement_mode,
                      secondary_liveness_window_secs, fake_ip_enabled, dns_via_secondary,
                      dns_fast_answers, fake_ip_udp_relay, fake_ip_instant_rst,
@@ -536,7 +535,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                      set_by_sid          = excluded.set_by_sid,
                      updated_at          = excluded.updated_at,
                      verbose_until_ms    = excluded.verbose_until_ms,
-                     conn_trace_ndjson   = excluded.conn_trace_ndjson,
+                     conn_trace_ndjson_until_ms = excluded.conn_trace_ndjson_until_ms,
                      conn_trace_gui      = excluded.conn_trace_gui,
                      rule_scope_service_driven = excluded.rule_scope_service_driven,
                      routing_stop_policy = excluded.routing_stop_policy,
@@ -557,7 +556,7 @@ impl<'c> ServiceStabilityConfigRepository<'c> {
                     set_by_sid,
                     now_ms,
                     verbose_until_ms,
-                    ct_ndjson_int,
+                    conn_trace_ndjson_until_ms,
                     ct_gui_int,
                     rule_scope_int,
                     stop_policy_slug,

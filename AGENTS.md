@@ -126,9 +126,10 @@ Contract tests live in `shared/contracts/tests/` split by domain.
 1. Exact FQDN
 2. Subdomain / suffix
 3. Zone — TLD or internal domain suffix (e.g. `.ru`, `.com`, `.intra`); hostname must end with `.{zone_name}`
-4. Exact IP — beats the zone it sits inside (the narrower of the two)
-5. Application
-6. Default route
+4. Subnet / IP range — beats the zone it sits inside; between networks the longer prefix wins; an identical network on both routes is an error
+5. Exact IP — beats any network (and zone) containing it
+6. Application
+7. Default route
 
 The same invariant settles application rules against address rules, and it is the address-ownership arbiter that enforces it: an address a rule names belongs to that rule, and an application keeps only the addresses nobody named.
 

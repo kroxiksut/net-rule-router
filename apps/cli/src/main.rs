@@ -22,7 +22,7 @@ mod verbs;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use nrr_platform_api::service_control::{
     ServiceControlError, ServiceControlPort, ServiceInstallSpec, ServiceStartMode,
@@ -131,7 +131,10 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
             match port.install(&spec) {
                 Ok(report) => {
                     println!("Installed the {PRODUCT_NAME} service.");
-                    println!("  start mode:        {}", start_mode.slug());
+                    println!(
+                        "  start mode:        {}",
+                        parse::start_mode_word(start_mode)
+                    );
                     println!("  binary:            {}", spec.binary_path.display());
                     println!(
                         "  crash recovery:    {}",
@@ -260,7 +263,10 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
             }
             println!("Re-registered the {PRODUCT_NAME} service.");
             println!("  binary:            {}", spec.binary_path.display());
-            println!("  start mode:        {}", spec.start_mode.slug());
+            println!(
+                "  start mode:        {}",
+                parse::start_mode_word(spec.start_mode)
+            );
             // The removal took the grant with the old registration, so an
             // on-demand service comes back unstartable by the launcher unless
             // it is re-issued here.
@@ -368,7 +374,7 @@ fn print_status(report: &ServiceStatusReport) {
         println!("  running build:     older than the installed binary — restart to run it");
     }
     match report.start_mode {
-        Some(mode) => println!("  starts:            {}", mode.slug()),
+        Some(mode) => println!("  starts:            {}", parse::start_mode_word(mode)),
         None => println!("  starts:            unknown"),
     }
     match report.binary_path.as_ref() {
@@ -411,7 +417,14 @@ fn running_predates_binary(report: &ServiceStatusReport) -> bool {
     };
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
-        .is_ok_and(|modified| modified > started)
+        .is_ok_and(|modified| replaced_after_start(modified, started, SystemTime::now()))
+}
+
+/// A modification time in the future is clock or time-zone skew, not a
+/// replacement: zip stores local time without a zone, so a package unpacked
+/// west of where it was built carries file times hours ahead.
+fn replaced_after_start(modified: SystemTime, started: SystemTime, now: SystemTime) -> bool {
+    modified > started && modified <= now
 }
 
 /// Print an actionable failure and pick its exit code. Access denied gets the
@@ -604,6 +617,21 @@ mod tests {
             Some(nrr_platform_linux::systemd::DAEMON_CLEANUP_VERB)
         );
         assert_eq!(BinaryRole::Service.host_file_name(), "nrr-serviced");
+    }
+
+    #[test]
+    fn only_a_past_rewrite_counts_as_a_replaced_binary() {
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let now = started + Duration::from_secs(60);
+        let hour = Duration::from_secs(3600);
+        assert!(replaced_after_start(
+            started + Duration::from_secs(30),
+            started,
+            now
+        ));
+        assert!(!replaced_after_start(started - hour, started, now));
+        // A package unpacked west of where it was built: file times ahead of now.
+        assert!(!replaced_after_start(started + 5 * hour, started, now));
     }
 
     #[test]

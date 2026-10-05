@@ -144,6 +144,9 @@ pub struct ProductionMutationExecutor {
     /// The audit trail an administrator's chain restart is written to. `None`
     /// refuses the restart as `audit-unavailable`.
     audit_writer: Option<Arc<nrr_diagnostics::AuditWriter>>,
+    /// Screens new network rules against this machine's links and pool.
+    /// `None` accepts them on their values alone.
+    network_screen: Option<Arc<dyn NetworkRuleScreen>>,
 }
 
 impl ProductionMutationExecutor {
@@ -159,7 +162,14 @@ impl ProductionMutationExecutor {
             pause_coordinator: None,
             stability: None,
             audit_writer: None,
+            network_screen: None,
         }
+    }
+
+    /// Attach the runtime screen for new network rules.
+    pub fn with_network_screen(mut self, screen: Arc<dyn NetworkRuleScreen>) -> Self {
+        self.network_screen = Some(screen);
+        self
     }
 
     /// Attach the audit trail so an administrator can restart its chain.
@@ -252,6 +262,7 @@ impl ProductionMutationExecutor {
         payload: &serde_json::Value,
     ) -> Result<RulesUpdatePayload, OperationError> {
         serde_json::from_value::<RulesUpdatePayload>(payload.clone()).map_err(|e| OperationError {
+            args: Default::default(),
             code: "malformed-payload".into(),
             message: format!("RulesUpdate payload invalid: {e}"),
         })
@@ -265,6 +276,11 @@ impl ProductionMutationExecutor {
         rules_json: &str,
         principal: &str,
     ) -> Option<ReviewSummaryResponse> {
+        // First, as on the execute path: a network that would cut a link is
+        // refused whatever else the book holds.
+        if let Some(error) = self.network_refusal(rules_json, principal) {
+            return Some(refused_summary(&error));
+        }
         let carried = self.coordinator.rules_json_in_force_for(principal);
         if let Some((rule_id, reason)) =
             crate::activation_coordinator::unsupported_rule_shape(rules_json, carried.as_deref())
@@ -331,6 +347,7 @@ impl ProductionMutationExecutor {
             None => Ok(()),
             Some(nrr_domain::validation::RuleCapExcess::User { count, limit }) => {
                 Err(OperationError {
+                    args: Default::default(),
                     code: "rule-cap-exceeded".into(),
                     message: format!(
                         "Up to {limit} active rules are allowed; this revision has {count}."
@@ -339,6 +356,7 @@ impl ProductionMutationExecutor {
             }
             Some(nrr_domain::validation::RuleCapExcess::Auto { count, limit }) => {
                 Err(OperationError {
+                    args: Default::default(),
                     code: "auto-rule-cap-exceeded".into(),
                     message: format!(
                         "Up to {limit} app-added rules are allowed; this revision has {count}."
@@ -418,6 +436,7 @@ impl ProductionMutationExecutor {
         // Same spelling the execute path will store, so the preview scores and
         // dedupes against exactly what would be applied.
         Self::canonicalize_rules_payload(&mut parsed, self.host_platform);
+        self.carry_unrecognized(&mut parsed, principal);
         if let Err(e) = self.enforce_free_rule_cap(&parsed.rules_json, principal) {
             return refused_summary(&e);
         }
@@ -510,6 +529,7 @@ impl ProductionMutationExecutor {
                 "mutation refused — rule changes are locked by the administrator",
             );
             return Some(OperationError {
+                args: Default::default(),
                 code: RULES_LOCKED_ERROR_CODE.into(),
                 message: RULES_LOCKED_MESSAGE.into(),
             });
@@ -526,6 +546,7 @@ impl ProductionMutationExecutor {
             "mutation refused — a security alert must be acknowledged first",
         );
         Some(OperationError {
+            args: Default::default(),
             code: SECURITY_ALERT_GATE_CODE.into(),
             message: SECURITY_ALERT_GATE_MESSAGE.into(),
         })
@@ -673,6 +694,7 @@ impl MutationExecutor for ProductionMutationExecutor {
         let outcome = match stored.kind {
             MutationKind::RulesUpdate => self.execute_rules_update(&stored.payload, principal),
             MutationKind::RouteBindingsUpdate => MutationOutcome::Failed(OperationError {
+                args: Default::default(),
                 code: "wrong-channel".into(),
                 message: "RouteBindingsUpdate uses RoutePolicyUpdate IPC op".into(),
             }),
@@ -683,6 +705,7 @@ impl MutationExecutor for ProductionMutationExecutor {
             ),
             MutationKind::PresetExport | MutationKind::SettingsExport => {
                 MutationOutcome::Failed(OperationError {
+                    args: Default::default(),
                     code: "wrong-channel".into(),
                     message: format!(
                         "{:?} is deprecated; use PresetExportGet / SettingsExportFull \
@@ -777,6 +800,7 @@ impl MutationExecutor for ProductionMutationExecutor {
         // is `AuditWriteFailed`, not silent corruption).
         let Some(sink) = self.recovery_audit_sink.as_ref() else {
             return MutationOutcome::Failed(OperationError {
+                args: Default::default(),
                 code: "audit-unavailable".into(),
                 message: "recovery audit sink not wired; safe-disable refused".into(),
             });
@@ -812,6 +836,7 @@ impl MutationExecutor for ProductionMutationExecutor {
                 let Some(coordinator) = self.pause_coordinator.as_ref() else {
                     // Unreachable given the `apply_available` gate above.
                     return MutationOutcome::Failed(OperationError {
+                        args: Default::default(),
                         code: "apply-layer-unavailable".into(),
                         message: "pause coordinator not wired; cannot suspend enforcement".into(),
                     });
@@ -824,6 +849,7 @@ impl MutationExecutor for ProductionMutationExecutor {
                         "suspended-sids": paused.len(),
                     })),
                     Err(e) => MutationOutcome::Failed(OperationError {
+                        args: Default::default(),
                         code: "safe-disable-teardown-failed".into(),
                         message: format!("enforcement teardown failed after audit: {e}"),
                     }),
@@ -834,17 +860,20 @@ impl MutationExecutor for ProductionMutationExecutor {
             })),
             SafeDisableOutcome::AuditWriteFailed { detail } => {
                 MutationOutcome::Failed(OperationError {
+                    args: Default::default(),
                     code: "audit-write-failed".into(),
                     message: format!("audit write failed before safe-disable: {detail}"),
                 })
             }
             SafeDisableOutcome::ApplyLayerUnavailable => MutationOutcome::Failed(OperationError {
+                args: Default::default(),
                 code: "apply-layer-unavailable".into(),
                 message: "apply layer unreachable; cannot restore default routing".into(),
             }),
             SafeDisableOutcome::ConfirmationRequired => {
                 // Defensive: tokens are constructed identical above.
                 MutationOutcome::Failed(OperationError {
+                    args: Default::default(),
                     code: "confirmation-required".into(),
                     message: "internal: confirmation token mismatch".into(),
                 })
@@ -925,6 +954,7 @@ fn refused_summary(err: &OperationError) -> ReviewSummaryResponse {
     let mut summary = malformed_summary(&err.message);
     summary.risk_signals.push(RiskSignalDto::ChangeRefused {
         code: err.code.clone(),
+        args: err.args.clone(),
     });
     summary
 }
@@ -1004,6 +1034,7 @@ fn canonicalize_route_bytes(
     let bytes = BASE64_STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| OperationError {
+            args: Default::default(),
             code: "malformed-payload".into(),
             message: format!("PresetImport: base64 decode failed for {route:?}: {e}"),
         })?;
@@ -1019,6 +1050,7 @@ fn canonicalize_route_bytes(
         // so the executor never panics on unknown shapes.
         _ => {
             return Err(OperationError {
+                args: Default::default(),
                 code: "preset-validation-failed".into(),
                 message: format!("PresetImport: unknown validation outcome for {route:?}"),
             });
@@ -1092,6 +1124,7 @@ fn canonicalize_route_bytes(
             Ok(finalize(rule_set))
         }
         PresetRulesCanonicalizeOutcome::Rejected { errors } => Err(OperationError {
+            args: Default::default(),
             code: "canonicalize-rejected".into(),
             message: format!(
                 "PresetImport: canonicalization rejected {route:?} ({} errors): {errors:?}",
@@ -1102,6 +1135,7 @@ fn canonicalize_route_bytes(
         // `#[non_exhaustive]`. If domain adds a new variant, default to
         // a generic rejection so the executor never panics.
         _ => Err(OperationError {
+            args: Default::default(),
             code: "canonicalize-rejected".into(),
             message: format!("PresetImport: unknown canonicalize outcome for {route:?}"),
         }),
@@ -1156,6 +1190,7 @@ fn rejection_to_operation_error(
         ),
     };
     OperationError {
+        args: Default::default(),
         code: code.into(),
         message: format!("PresetImport: {route:?} {detail}"),
     }
@@ -1507,6 +1542,7 @@ fn activation_to_outcome(outcome: ActivationOutcome) -> MutationOutcome {
             reverted_sids,
             reason,
         } => MutationOutcome::Failed(OperationError {
+            args: Default::default(),
             code: "rolled-back-on-failure".into(),
             message: format!(
                 "revision {} rejected; reverted {} SID(s); reason: {reason}",
@@ -1518,6 +1554,7 @@ fn activation_to_outcome(outcome: ActivationOutcome) -> MutationOutcome {
             rejected_revision,
             sid_failures,
         } => MutationOutcome::Failed(OperationError {
+            args: Default::default(),
             code: "pre-flight-failed".into(),
             message: format!(
                 "revision {} rejected by pre-flight; {} SID failure(s)",
@@ -1535,6 +1572,7 @@ fn unsupported_rule_shape_error(
     reason: nrr_domain::rule_shape::UnsupportedShapeReason,
 ) -> OperationError {
     OperationError {
+        args: Default::default(),
         code: "unsupported-rule-shape".into(),
         message: format!(
             "rule {rule_id} names both an application and an address ({reason}); enforcement cannot limit that address to the application, so the change was refused"
@@ -1548,6 +1586,7 @@ const CONTROL_CHARACTER_CODE: &str = "control-character";
 
 fn control_character_error(rule_id: &str, field: &str) -> OperationError {
     OperationError {
+        args: Default::default(),
         code: CONTROL_CHARACTER_CODE.into(),
         message: format!(
             "rule {rule_id:?}: {field} contains a line break or other control character"
@@ -1561,6 +1600,7 @@ fn control_character_error(rule_id: &str, field: &str) -> OperationError {
 fn invalid_rule_value_error(rules: &[RefusedRuleValue]) -> OperationError {
     let ids: Vec<&str> = rules.iter().map(|r| r.rule_id.as_str()).collect();
     OperationError {
+        args: Default::default(),
         code: INVALID_RULE_VALUE_CODE.into(),
         message: format!(
             "rules {}: the value is not valid for the rule type, so the change was refused",
@@ -1601,6 +1641,7 @@ fn rollback_target_of(target_revision_id: Option<&str>) -> Result<RollbackTarget
     RevisionId::from_prefixed_string(raw.to_string())
         .map(RollbackTarget::Specific)
         .map_err(|e| OperationError {
+            args: Default::default(),
             code: "malformed-revision-id".into(),
             message: format!("invalid target revision id: {e}"),
         })
@@ -1672,6 +1713,7 @@ fn policy_error(err: &PolicyError) -> OperationError {
         }
     };
     OperationError {
+        args: Default::default(),
         code: code.into(),
         message,
     }
@@ -1693,3 +1735,13 @@ mod audit_chain;
 mod preset_import;
 #[cfg(test)]
 mod tests;
+mod unrecognized;
+
+use unrecognized::carry_forward;
+#[cfg(test)]
+pub(crate) use unrecognized::first_report_of_book;
+pub(crate) use unrecognized::report_unrecognized_rules;
+pub use unrecognized::{
+    NetworkRuleConflict, NetworkRuleScreen, NETWORK_COVERS_FAKE_IP_POOL_CODE,
+    NETWORK_COVERS_LINK_CODE,
+};

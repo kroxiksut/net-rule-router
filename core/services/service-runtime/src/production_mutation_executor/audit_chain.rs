@@ -63,6 +63,7 @@ impl ProductionMutationExecutor {
     ) -> MutationOutcome {
         let failed = |code: &str, message: String| {
             MutationOutcome::Failed(OperationError {
+                args: Default::default(),
                 code: code.into(),
                 message,
             })

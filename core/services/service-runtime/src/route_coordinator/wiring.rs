@@ -46,6 +46,7 @@ impl SecondaryRouteCoordinator {
             app_observations: Arc::new(AppObservationStore::new()),
             dns_via_secondary: None,
             learned_vpn_endpoints: None,
+            network_support: crate::wfp_codegen::current_rule_shape_support(),
         }
     }
 

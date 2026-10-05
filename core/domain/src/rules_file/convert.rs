@@ -66,6 +66,12 @@ pub fn rules_file_to_route_rule_set(
                 RulesFileSection::Ip => {
                     (Some(AddressMatch::ExactIp(entry.match_value.clone())), None)
                 }
+                RulesFileSection::Cidr => {
+                    (Some(AddressMatch::Subnet(entry.match_value.clone())), None)
+                }
+                RulesFileSection::Ranges => {
+                    (Some(AddressMatch::IpRange(entry.match_value.clone())), None)
+                }
                 // Platform-specific app sections.
                 RulesFileSection::Windows | RulesFileSection::Linux | RulesFileSection::MacOS => {
                     let pattern = if entry.match_value.contains('*') {
@@ -118,6 +124,8 @@ pub fn rules_file_to_route_rule_set(
 /// | `SuffixDomain(label)`      | `Domains`    | `*.label`             |
 /// | `Zone(name)`               | `Zones`      | `name`                |
 /// | `ExactIp(addr)`            | `IP`         | `addr.to_string()`    |
+/// | `Subnet(block)`            | `CIDR`       | `net/len`             |
+/// | `IpRange(range)`           | `Ranges`     | `first-last`          |
 /// | (app match, no address)    | `host_app_section` | `pattern.as_str()` |
 ///
 /// A rule carrying an [`nrr_shared::auto_rule::RuleOrigin`] overrides the
@@ -153,6 +161,8 @@ pub fn canonical_rule_set_to_rules_file_parsed(
     let mut zones: Vec<RulesFileEntry> = Vec::new();
     let mut domains: Vec<RulesFileEntry> = Vec::new();
     let mut ips: Vec<RulesFileEntry> = Vec::new();
+    let mut subnets: Vec<RulesFileEntry> = Vec::new();
+    let mut ranges: Vec<RulesFileEntry> = Vec::new();
     let mut apps: Vec<RulesFileEntry> = Vec::new();
     let mut auto: Vec<RulesFileEntry> = Vec::new();
 
@@ -194,6 +204,8 @@ pub fn canonical_rule_set_to_rules_file_parsed(
                 ),
                 CanonicalAddressMatch::Zone(name) => (&mut zones, name.clone()),
                 CanonicalAddressMatch::ExactIp(addr) => (&mut ips, addr.to_string()),
+                CanonicalAddressMatch::Subnet(block) => (&mut subnets, block.to_string()),
+                CanonicalAddressMatch::IpRange(range) => (&mut ranges, range.to_string()),
             };
             bucket.push(RulesFileEntry {
                 match_value: value,
@@ -224,37 +236,19 @@ pub fn canonical_rule_set_to_rules_file_parsed(
         // silently skip such a rule if encountered (defensive).
     }
 
-    let mut sections = Vec::new();
-    if !zones.is_empty() {
-        sections.push(SectionContent {
-            section: RulesFileSection::Zones,
-            entries: zones,
-        });
-    }
-    if !domains.is_empty() {
-        sections.push(SectionContent {
-            section: RulesFileSection::Domains,
-            entries: domains,
-        });
-    }
-    if !ips.is_empty() {
-        sections.push(SectionContent {
-            section: RulesFileSection::Ip,
-            entries: ips,
-        });
-    }
-    if !apps.is_empty() {
-        sections.push(SectionContent {
-            section: host_app_section,
-            entries: apps,
-        });
-    }
-    if !auto.is_empty() {
-        sections.push(SectionContent {
-            section: RulesFileSection::Auto,
-            entries: auto,
-        });
-    }
+    let sections = [
+        (RulesFileSection::Zones, zones),
+        (RulesFileSection::Domains, domains),
+        (RulesFileSection::Ip, ips),
+        (RulesFileSection::Cidr, subnets),
+        (RulesFileSection::Ranges, ranges),
+        (host_app_section, apps),
+        (RulesFileSection::Auto, auto),
+    ]
+    .into_iter()
+    .filter(|(_, entries)| !entries.is_empty())
+    .map(|(section, entries)| SectionContent { section, entries })
+    .collect();
 
     RulesFileParsed { sections }
 }

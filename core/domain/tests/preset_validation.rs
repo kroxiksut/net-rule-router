@@ -3,7 +3,7 @@
 //! Test matrix:
 //!   - malformed file (binary noise, truncated UTF-8)
 //!   - oversized file
-//!   - unknown unsupported sections (CIDR, Ports)
+//!   - unknown unsupported sections (Geo, Ports)
 //!   - invalid match values (semantic errors deferred, length errors here)
 //!   - duplicate rules (parse-level: accepted, semantic layer deduplicates)
 //!   - empty file
@@ -107,12 +107,12 @@ fn size_check_happens_before_encoding_check() {
 // ── Unknown unsupported sections ──────────────────────────────────────────────────────
 
 #[test]
-fn cidr_section_is_accepted_with_warning_not_rejected() {
-    let input = b"--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n";
+fn geo_section_is_accepted_with_warning_not_rejected() {
+    let input = b"--- Domains\nexample.com\n--- Geo\n10.0.0.0/8\n";
     let outcome = validate_preset_bytes(input);
     assert!(
         outcome.is_accepted(),
-        "CIDR section must not reject the file"
+        "Geo section must not reject the file"
     );
     assert!(outcome.has_warnings());
 }
@@ -131,7 +131,7 @@ fn ports_section_is_accepted_with_warning() {
 
 #[test]
 fn unknown_section_entries_included_in_parse_outcome() {
-    let input = b"--- CIDR\n10.0.0.0/8\n192.168.0.0/16\n";
+    let input = b"--- Geo\n10.0.0.0/8\n192.168.0.0/16\n";
     let outcome = validate_preset_bytes(input);
     let po = outcome.parse_outcome().unwrap();
     assert_eq!(po.unknown_sections.len(), 1);
@@ -140,7 +140,7 @@ fn unknown_section_entries_included_in_parse_outcome() {
 
 #[test]
 fn file_with_only_extended_sections_is_accepted_with_warning() {
-    let input = b"--- CIDR\n10.0.0.0/8\n";
+    let input = b"--- Geo\n10.0.0.0/8\n";
     let outcome = validate_preset_bytes(input);
     assert!(outcome.is_accepted());
     assert!(outcome.has_warnings());
@@ -173,13 +173,13 @@ fn match_value_one_byte_over_limit_is_rejected() {
 #[test]
 fn too_long_value_in_extended_section_is_rejected() {
     let v = "x".repeat(MAX_MATCH_VALUE_LEN + 1);
-    let input = format!("--- CIDR\n{v}\n");
+    let input = format!("--- Geo\n{v}\n");
     let outcome = validate_preset_bytes(input.as_bytes());
     assert!(matches!(
         outcome,
         PresetFileValidationOutcome::Rejected(PresetImportRejectedReason::MatchValueTooLong {
             ref section, ..
-        }) if section == "CIDR"
+        }) if section == "Geo"
     ));
 }
 
@@ -245,7 +245,7 @@ fn rule_count_spans_both_free_and_extended_sections() {
     for i in 0..half {
         content.push_str(&format!("h{i}.example.com\n"));
     }
-    content.push_str("--- CIDR\n");
+    content.push_str("--- Geo\n");
     for i in 0..=(half + 1) {
         content.push_str(&format!("10.{}.0.0/24\n", i % 256));
     }

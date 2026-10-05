@@ -228,7 +228,7 @@ fn start_mode_from_unit_file_state(unit_file_state: &str) -> Option<ServiceStart
 /// Extract the binary from an `ExecStart` property value.
 ///
 /// systemd renders it as a structured record —
-/// `{ path=/usr/lib/netrulerouter/nrr-serviced ; argv[]=… ; ignore_errors=no … }` —
+/// `{ path=/usr/libexec/netrulerouter/nrr-serviced ; argv[]=… ; ignore_errors=no … }` —
 /// so the executable is the `path=` field, not the whole string.
 fn exec_start_binary(exec_start: &str) -> Option<PathBuf> {
     let after = exec_start.split("path=").nth(1)?;
@@ -365,9 +365,30 @@ impl LinuxServiceControl {
                 .map_err(|e| classify_io_failure(&e, "creating the alias symlink"))?;
         }
         for cmd in &plan.post_write_commands {
-            self.run_checked(cmd)?;
+            if *cmd == crate::systemd::reset_start_limit() {
+                self.clear_start_limit()?;
+            } else {
+                self.run_checked(cmd)?;
+            }
         }
         Ok(())
+    }
+
+    /// Clear the start-limit counter before an operator's start. The counter
+    /// lives in the loaded unit; one systemd has not loaded — a fresh install,
+    /// or a unit collected since it last ran — has none, and `reset-failed`
+    /// refuses it as "not loaded". That refusal is the success it means.
+    fn clear_start_limit(&self) -> Result<(), ServiceControlError> {
+        let argv = crate::systemd::reset_start_limit();
+        let outcome = self
+            .ops
+            .run(&argv)
+            .map_err(|e| classify_spawn_failure(&e, &argv))?;
+        if outcome.succeeded() || outcome.stderr.contains("not loaded") {
+            Ok(())
+        } else {
+            Err(classify_command_failure(&outcome, &argv))
+        }
     }
 
     fn execute_uninstall_plan(
@@ -553,7 +574,7 @@ impl ServiceControlPort for LinuxServiceControl {
         if self.query()?.is_none() {
             return Err(ServiceControlError::NotInstalled);
         }
-        self.run_checked(&crate::systemd::reset_start_limit())?;
+        self.clear_start_limit()?;
         // `--no-block` returns as soon as the job is queued, so the wait below
         // is ours to bound rather than systemd's.
         self.run_checked(&systemctl(&["start", "--no-block", SYSTEMD_UNIT_NAME]))?;
@@ -678,7 +699,7 @@ mod tests {
     use nrr_platform_api::service_control::RecoveryPolicy;
     use std::cell::RefCell;
 
-    const DAEMON: &str = "/usr/lib/netrulerouter/nrr-serviced";
+    const DAEMON: &str = "/usr/libexec/netrulerouter/nrr-serviced";
 
     /// The recorded side effects, shared between the port (which owns its ops)
     /// and the test (which reads them).
@@ -890,13 +911,51 @@ mod tests {
                 "write /etc/systemd/system/netrulerouter.service 644".to_string(),
                 "write /etc/logrotate.d/netrulerouter 644".to_string(),
                 "write /usr/share/polkit-1/actions/netrulerouter.policy 644".to_string(),
-                "link /usr/lib/netrulerouter/nrr-service -> /usr/lib/netrulerouter/nrr-serviced"
+                "link /usr/libexec/netrulerouter/nrr-service -> /usr/libexec/netrulerouter/nrr-serviced"
                     .to_string(),
                 "run systemctl daemon-reload".to_string(),
                 "run systemctl reset-failed netrulerouter.service".to_string(),
                 "run systemctl enable --now netrulerouter.service".to_string(),
             ]
         );
+    }
+
+    /// systemd 253 refuses `reset-failed` for a unit it has not loaded, as on
+    /// any first install. There is no counter to clear, so the install goes on;
+    /// any other refusal still stops it.
+    #[test]
+    fn a_first_install_goes_on_past_a_unit_systemd_has_not_loaded() {
+        let not_loaded = failed(
+            1,
+            "Failed to reset failed state of unit netrulerouter.service:              Unit netrulerouter.service not loaded.",
+        );
+        let (port, journal) = port_over(vec![("reset-failed", not_loaded)]);
+        port.install(&install_spec(ServiceStartMode::WithWindows))
+            .expect("a unit with no counter is nothing to clear");
+        assert!(recorded(&journal)
+            .iter()
+            .any(|o| o == "run systemctl enable --now netrulerouter.service"));
+
+        let (port, _) = port_over(vec![("reset-failed", failed(1, "Access denied"))]);
+        assert!(port
+            .install(&install_spec(ServiceStartMode::WithWindows))
+            .is_err());
+    }
+
+    #[test]
+    fn a_start_goes_on_past_a_unit_systemd_has_not_loaded() {
+        let (port, journal) = port_over(vec![
+            ("show", ok(&show_running())),
+            ("is-active", ok("")),
+            (
+                "reset-failed",
+                failed(1, "Unit netrulerouter.service not loaded."),
+            ),
+        ]);
+        port.start(Duration::from_secs(5)).expect("start");
+        assert!(recorded(&journal)
+            .iter()
+            .any(|o| o == "run systemctl start --no-block netrulerouter.service"));
     }
 
     #[test]
@@ -970,7 +1029,7 @@ mod tests {
                 "remove /etc/systemd/system/netrulerouter.service".to_string(),
                 "remove /etc/logrotate.d/netrulerouter".to_string(),
                 "remove /usr/share/polkit-1/actions/netrulerouter.policy".to_string(),
-                "remove /usr/lib/netrulerouter/nrr-service".to_string(),
+                "remove /usr/libexec/netrulerouter/nrr-service".to_string(),
                 "run systemctl daemon-reload".to_string(),
             ]
         );

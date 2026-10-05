@@ -21,8 +21,11 @@
 //! the worst case is the old behaviour, an application waiting on a dead
 //! socket, so callers log the outcome and carry on.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::sync::Mutex;
+
+use nrr_shared::ip_block::IpBlock;
 
 /// What one teardown pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +59,68 @@ pub struct EstablishedFlow {
     pub image: Option<String>,
 }
 
+/// The remote addresses one listing asks about: single hosts and whole
+/// networks, read from one pass over the connection table.
+///
+/// A network rule names every address inside it, so a flow to any of them sits
+/// behind the rule. Only IPv4 networks can hold a listed flow; an IPv6 block
+/// matches nothing here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlowTargets {
+    hosts: Vec<Ipv4Addr>,
+    networks: Vec<IpBlock>,
+}
+
+impl FlowTargets {
+    #[must_use]
+    pub fn new(hosts: Vec<Ipv4Addr>, networks: Vec<IpBlock>) -> Self {
+        Self { hosts, networks }
+    }
+
+    #[must_use]
+    pub fn hosts(&self) -> &[Ipv4Addr] {
+        &self.hosts
+    }
+
+    #[must_use]
+    pub fn networks(&self) -> &[IpBlock] {
+        &self.networks
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty() && self.networks.is_empty()
+    }
+
+    /// The membership test a platform runs per table row, built once.
+    #[must_use]
+    pub fn matcher(&self) -> FlowTargetMatcher<'_> {
+        FlowTargetMatcher {
+            hosts: self.hosts.iter().copied().collect(),
+            networks: &self.networks,
+        }
+    }
+}
+
+/// [`FlowTargets`] prepared for a per-row membership test.
+#[derive(Debug)]
+pub struct FlowTargetMatcher<'a> {
+    hosts: HashSet<Ipv4Addr>,
+    networks: &'a [IpBlock],
+}
+
+impl FlowTargetMatcher<'_> {
+    /// Is `remote` one of the hosts, or inside one of the networks?
+    #[must_use]
+    pub fn matches(&self, remote: Ipv4Addr) -> bool {
+        self.hosts.contains(&remote)
+            || self
+                .networks
+                .iter()
+                .any(|net| net.contains(IpAddr::V4(remote)))
+    }
+}
+
 /// Tear down established TCP connections aimed at a range of addresses.
 pub trait StaleFlowReset: Send + Sync {
     /// Tear down every established TCP connection whose REMOTE address falls
@@ -69,16 +134,22 @@ pub trait StaleFlowReset: Send + Sync {
     /// policy starts being enforced.
     fn reset_flows_to(&self, base: Ipv4Addr, prefix_len: u8) -> StaleFlowSweep;
 
-    /// Established TCP connections to any of `targets`, each with its owner,
-    /// from one read of the connection table. Lets a caller decide per
-    /// connection instead of per address, when one address serves several
-    /// users. The default lists nothing, so a platform without the mechanism
-    /// tears nothing down.
-    fn established_flows_to(&self, _targets: &[Ipv4Addr]) -> Vec<EstablishedFlow> {
+    /// Established TCP connections to any of `targets`, each with its owner.
+    /// [`Self::established_flows_matching`] over hosts only.
+    fn established_flows_to(&self, targets: &[Ipv4Addr]) -> Vec<EstablishedFlow> {
+        self.established_flows_matching(&FlowTargets::new(targets.to_vec(), Vec::new()))
+    }
+
+    /// Established TCP connections to any host or into any network of
+    /// `targets`, each with its owner, from one read of the connection table.
+    /// Lets a caller decide per connection instead of per address, when one
+    /// address serves several users. The default lists nothing, so a platform
+    /// without the mechanism tears nothing down.
+    fn established_flows_matching(&self, _targets: &FlowTargets) -> Vec<EstablishedFlow> {
         Vec::new()
     }
 
-    /// Tear down exactly `flows`, as listed by [`Self::established_flows_to`].
+    /// Tear down exactly `flows`, as listed by [`Self::established_flows_matching`].
     /// Returns how many the OS agreed to close.
     fn reset_established(&self, _flows: &[EstablishedFlow]) -> usize {
         0
@@ -108,6 +179,7 @@ pub struct MockStaleFlowReset {
 struct MockInner {
     calls: Vec<(Ipv4Addr, u8)>,
     queried: Vec<Ipv4Addr>,
+    queried_networks: Vec<IpBlock>,
     answer: StaleFlowSweep,
     flows: Vec<EstablishedFlow>,
     reset: Vec<EstablishedFlow>,
@@ -145,6 +217,16 @@ impl MockStaleFlowReset {
             .clone()
     }
 
+    /// Every network a listing was asked about, in call order.
+    #[must_use]
+    pub fn queried_networks(&self) -> Vec<IpBlock> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .queried_networks
+            .clone()
+    }
+
     /// The connection table [`StaleFlowReset::established_flows_to`] reads.
     pub fn set_flows(&self, flows: Vec<EstablishedFlow>) {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).flows = flows;
@@ -168,13 +250,15 @@ impl StaleFlowReset for MockStaleFlowReset {
         inner.answer
     }
 
-    fn established_flows_to(&self, targets: &[Ipv4Addr]) -> Vec<EstablishedFlow> {
+    fn established_flows_matching(&self, targets: &FlowTargets) -> Vec<EstablishedFlow> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        inner.queried.extend_from_slice(targets);
+        inner.queried.extend_from_slice(targets.hosts());
+        inner.queried_networks.extend_from_slice(targets.networks());
+        let matcher = targets.matcher();
         inner
             .flows
             .iter()
-            .filter(|flow| targets.contains(flow.remote.ip()))
+            .filter(|flow| matcher.matches(*flow.remote.ip()))
             .cloned()
             .collect()
     }
@@ -247,5 +331,52 @@ mod tests {
         assert_eq!(mock.queried(), vec![wanted]);
         assert_eq!(mock.reset_established(&listed), 1);
         assert_eq!(mock.reset_flows(), listed);
+    }
+
+    #[test]
+    fn a_network_target_matches_every_address_inside_it_and_nothing_outside() {
+        let net = IpBlock::parse("203.0.113.0/28").expect("test network");
+        let targets = FlowTargets::new(vec![Ipv4Addr::new(198, 51, 100, 7)], vec![net]);
+        let matcher = targets.matcher();
+        assert!(matcher.matches(Ipv4Addr::new(203, 0, 113, 0)));
+        assert!(matcher.matches(Ipv4Addr::new(203, 0, 113, 15)));
+        assert!(!matcher.matches(Ipv4Addr::new(203, 0, 113, 16)));
+        assert!(matcher.matches(Ipv4Addr::new(198, 51, 100, 7)));
+        assert!(!matcher.matches(Ipv4Addr::new(198, 51, 100, 8)));
+    }
+
+    #[test]
+    fn an_ipv6_network_matches_no_listed_flow() {
+        let v6 = IpBlock::parse("::/0").expect("test network");
+        let targets = FlowTargets::new(Vec::new(), vec![v6]);
+        assert!(!targets.matcher().matches(Ipv4Addr::new(203, 0, 113, 1)));
+    }
+
+    #[test]
+    fn mock_lists_flows_into_an_asked_network() {
+        let mock = MockStaleFlowReset::new();
+        let to = |ip: Ipv4Addr| EstablishedFlow {
+            local: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 50_000),
+            remote: SocketAddrV4::new(ip, 443),
+            owner: None,
+            pid: None,
+            image: None,
+        };
+        let inside = Ipv4Addr::new(203, 0, 113, 9);
+        mock.set_flows(vec![to(inside), to(Ipv4Addr::new(198, 51, 100, 1))]);
+        let net = IpBlock::parse("203.0.113.0/24").expect("test network");
+
+        let listed = mock.established_flows_matching(&FlowTargets::new(Vec::new(), vec![net]));
+
+        assert_eq!(listed, vec![to(inside)]);
+        assert_eq!(mock.queried_networks(), vec![net]);
+    }
+
+    #[test]
+    fn the_noop_lists_nothing_for_a_network_either() {
+        let net = IpBlock::parse("203.0.113.0/24").expect("test network");
+        assert!(NoopStaleFlowReset
+            .established_flows_matching(&FlowTargets::new(Vec::new(), vec![net]))
+            .is_empty());
     }
 }

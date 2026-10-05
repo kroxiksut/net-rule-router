@@ -42,7 +42,7 @@
 use std::net::IpAddr;
 
 use nrr_shared::rules_json::{
-    AddressMatchDto, AppMatchDto, AppPatternDto, CanonicalRulesJsonV1,
+    required_schema_version, AddressMatchDto, AppMatchDto, AppPatternDto, CanonicalRulesJsonV1,
     RuleAction as WireRuleAction, RuleDto, RULES_JSON_SCHEMA_VERSION,
 };
 
@@ -51,9 +51,12 @@ use crate::canonical::{
     CanonicalRuleBook, CanonicalRuleSet,
 };
 use crate::rules_file::HostPlatform;
-use crate::rules_revision::{RulesRevisionContent, RULES_REVISION_FORMAT_VERSION};
+use crate::rules_revision::{
+    RulesRevisionContent, UnrecognizedRules, RULES_REVISION_FORMAT_VERSION,
+};
 use crate::validation::{
-    canonical_app_pattern, canonical_host_name, canonical_ip_address, HostNameKind, ValidationError,
+    canonical_app_pattern, canonical_host_name, canonical_ip_address, canonical_ip_range,
+    canonical_subnet, HostNameKind, ValidationError,
 };
 use crate::RuleId;
 use nrr_shared::app_identity::ExecutableNaming;
@@ -101,6 +104,10 @@ pub enum RulesJsonCodecError {
     /// An application value the rule pipeline refuses (too long, a control
     /// character).
     AppNameInvalid { rule_id: String, raw: String },
+    /// A subnet or range the rule pipeline refuses.
+    InvalidNetwork { rule_id: String, raw: String },
+    /// An address match of a known kind with the wrong fields.
+    MalformedAddressMatch { rule_id: String },
 }
 
 impl core::fmt::Display for RulesJsonCodecError {
@@ -127,6 +134,12 @@ impl core::fmt::Display for RulesJsonCodecError {
             Self::AppNameInvalid { rule_id, raw } => {
                 write!(f, "rule {rule_id:?}: invalid application name {raw:?}")
             }
+            Self::InvalidNetwork { rule_id, raw } => {
+                write!(f, "rule {rule_id:?}: invalid network or range {raw:?}")
+            }
+            Self::MalformedAddressMatch { rule_id } => {
+                write!(f, "rule {rule_id:?}: malformed address match")
+            }
         }
     }
 }
@@ -141,23 +154,25 @@ impl std::error::Error for RulesJsonCodecError {}
 /// [`CanonicalRuleSet`] — `primary` and `secondary` rules are emitted
 /// in the same sequence the domain layer iterates them.
 pub fn encode(content: &RulesRevisionContent) -> CanonicalRulesJsonV1 {
-    CanonicalRulesJsonV1 {
+    let route = |set: &CanonicalRuleSet, kept: &[RuleDto]| -> Vec<RuleDto> {
+        set.rules()
+            .iter()
+            .map(encode_rule)
+            .chain(kept.iter().cloned())
+            .collect()
+    };
+    let mut dto = CanonicalRulesJsonV1 {
         schema_version: RULES_JSON_SCHEMA_VERSION,
-        primary: content
-            .rule_book
-            .primary
-            .rules()
-            .iter()
-            .map(encode_rule)
-            .collect(),
-        secondary: content
-            .rule_book
-            .secondary
-            .rules()
-            .iter()
-            .map(encode_rule)
-            .collect(),
-    }
+        primary: route(&content.rule_book.primary, &content.unrecognized.primary),
+        secondary: route(
+            &content.rule_book.secondary,
+            &content.unrecognized.secondary,
+        ),
+    };
+    // A book of the older kinds keeps schema 1 and its exact bytes, so no
+    // stored revision changes hash and an older build still reads it.
+    dto.schema_version = required_schema_version(&dto);
+    dto
 }
 
 fn encode_rule(rule: &CanonicalRule) -> RuleDto {
@@ -205,6 +220,13 @@ fn encode_address_match(m: &CanonicalAddressMatch) -> AddressMatchDto {
         CanonicalAddressMatch::ExactIp(IpAddr::V6(addr)) => AddressMatchDto::ExactIpv6 {
             address: addr.to_string(),
         },
+        CanonicalAddressMatch::Subnet(block) => AddressMatchDto::Subnet {
+            network: block.to_string(),
+        },
+        CanonicalAddressMatch::IpRange(range) => AddressMatchDto::IpRange {
+            first: range.first().to_string(),
+            last: range.last().to_string(),
+        },
     }
 }
 
@@ -233,23 +255,18 @@ pub fn decode(
     platform: HostPlatform,
 ) -> Result<RulesRevisionContent, RulesJsonCodecError> {
     let naming = platform.executable_naming();
-    if dto.schema_version != RULES_JSON_SCHEMA_VERSION {
+    // A newer schema is read, not refused: its unknown kinds are kept aside,
+    // so a revision written by a newer build survives a downgrade.
+    if dto.schema_version == 0 {
         return Err(RulesJsonCodecError::UnsupportedSchemaVersion {
             got: dto.schema_version,
             expected: RULES_JSON_SCHEMA_VERSION,
         });
     }
 
-    let primary = dto
-        .primary
-        .into_iter()
-        .map(|rule| decode_rule(rule, naming))
-        .collect::<Result<Vec<_>, _>>()?;
-    let secondary = dto
-        .secondary
-        .into_iter()
-        .map(|rule| decode_rule(rule, naming))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut unrecognized = UnrecognizedRules::default();
+    let primary = decode_route(dto.primary, naming, &mut unrecognized.primary)?;
+    let secondary = decode_route(dto.secondary, naming, &mut unrecognized.secondary)?;
 
     Ok(RulesRevisionContent {
         rule_book: CanonicalRuleBook {
@@ -257,7 +274,31 @@ pub fn decode(
             secondary: CanonicalRuleSet::from_rules(secondary),
         },
         format_version: RULES_REVISION_FORMAT_VERSION,
+        unrecognized,
     })
+}
+
+/// The route's rules this build reads; the rest go to `kept`, sorted by id so
+/// the re-encoded bytes do not depend on arrival order.
+fn decode_route(
+    rules: Vec<RuleDto>,
+    naming: ExecutableNaming,
+    kept: &mut Vec<RuleDto>,
+) -> Result<Vec<CanonicalRule>, RulesJsonCodecError> {
+    let mut out = Vec::with_capacity(rules.len());
+    for rule in rules {
+        match &rule.address_match {
+            Some(m @ AddressMatchDto::Unrecognized(_)) => {
+                if m.is_malformed() {
+                    return Err(RulesJsonCodecError::MalformedAddressMatch { rule_id: rule.id });
+                }
+                kept.push(rule);
+            }
+            _ => out.push(decode_rule(rule, naming)?),
+        }
+    }
+    kept.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
 }
 
 fn decode_rule(
@@ -305,6 +346,28 @@ fn decode_address_match(
         }
         AddressMatchDto::ExactIpv6 { address } => {
             CanonicalAddressMatch::ExactIp(exact_ip(rule_id, address, true)?)
+        }
+        AddressMatchDto::Subnet { network } => {
+            canonical_subnet(&network, &RuleId(rule_id.to_string()), &mut Vec::new())
+                .map(CanonicalAddressMatch::Subnet)
+                .map_err(|_| RulesJsonCodecError::InvalidNetwork {
+                    rule_id: rule_id.to_string(),
+                    raw: network,
+                })?
+        }
+        AddressMatchDto::IpRange { first, last } => {
+            let raw = format!("{first}-{last}");
+            canonical_ip_range(&raw, &RuleId(rule_id.to_string()), &mut Vec::new())
+                .map(CanonicalAddressMatch::ip_range)
+                .map_err(|_| RulesJsonCodecError::InvalidNetwork {
+                    rule_id: rule_id.to_string(),
+                    raw,
+                })?
+        }
+        AddressMatchDto::Unrecognized(_) => {
+            return Err(RulesJsonCodecError::MalformedAddressMatch {
+                rule_id: rule_id.to_string(),
+            })
         }
     })
 }
@@ -812,16 +875,69 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_schema_is_read_and_its_unknown_kinds_are_kept() {
+        let wire = r#"{"schema-version":999,"primary":[{"id":"r-x","enabled":true,"address-match":{"kind":"port-range","from":80,"to":90}},{"id":"r-1","enabled":true,"address-match":{"kind":"exact-fqdn","value":"x.test"}}],"secondary":[]}"#;
+        let dto = nrr_shared::rules_json::from_canonical_string(wire).expect("wire");
+        let content = decode(dto, HostPlatform::Windows).expect("a newer book is read");
+        assert_eq!(
+            content.rule_book.primary.rules().len(),
+            1,
+            "known kind applies"
+        );
+        assert_eq!(
+            content.unrecognized.primary.len(),
+            1,
+            "unknown kind is kept"
+        );
+        let again = encode(&content);
+        assert_eq!(again.primary.len(), 2, "a rewrite keeps the unknown rule");
+        assert_eq!(again.schema_version, RULES_JSON_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_known_kind_with_wrong_fields_is_refused_not_kept() {
+        let wire = r#"{"schema-version":2,"primary":[{"id":"r-x","enabled":true,"address-match":{"kind":"subnet","net":"10.0.0.0/8"}}],"secondary":[]}"#;
+        let dto = nrr_shared::rules_json::from_canonical_string(wire).expect("wire");
+        assert!(matches!(
+            decode(dto, HostPlatform::Windows),
+            Err(RulesJsonCodecError::MalformedAddressMatch { .. })
+        ));
+    }
+
+    #[test]
+    fn subnets_and_ranges_round_trip_canonically() {
+        let wire = r#"{"schema-version":2,"primary":[{"id":"r-s","enabled":true,"address-match":{"kind":"subnet","network":"10.0.2.7/24"}},{"id":"r-r","enabled":true,"address-match":{"kind":"ip-range","first":"10.0.0.5","last":"10.0.0.40"}}],"secondary":[]}"#;
+        let dto = nrr_shared::rules_json::from_canonical_string(wire).expect("wire");
+        let content = decode(dto, HostPlatform::Windows).expect("decode");
+        let again = encode(&content);
+        assert_eq!(again.schema_version, 2);
+        assert_eq!(
+            again.primary[0].address_match,
+            Some(AddressMatchDto::Subnet {
+                network: "10.0.2.0/24".into()
+            }),
+            "host bits are cleared"
+        );
+        assert_eq!(
+            again.primary[1].address_match,
+            Some(AddressMatchDto::IpRange {
+                first: "10.0.0.5".into(),
+                last: "10.0.0.40".into()
+            })
+        );
+    }
+
+    #[test]
     fn decode_rejects_unsupported_schema_version() {
         let dto = CanonicalRulesJsonV1 {
-            schema_version: 999,
+            schema_version: 0,
             primary: vec![],
             secondary: vec![],
         };
         let err = decode(dto, HostPlatform::Windows).expect_err("must reject");
         match err {
             RulesJsonCodecError::UnsupportedSchemaVersion { got, expected } => {
-                assert_eq!(got, 999);
+                assert_eq!(got, 0);
                 assert_eq!(expected, RULES_JSON_SCHEMA_VERSION);
             }
             other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
@@ -993,7 +1109,7 @@ mod tests {
                     CanonicalAddressMatch::Zone(v)
                     | CanonicalAddressMatch::ExactFqdn(v)
                     | CanonicalAddressMatch::SuffixDomain(v) => v.clone(),
-                    CanonicalAddressMatch::ExactIp(ip) => ip.to_string(),
+                    other => other.to_display_string(),
                 };
                 (r.id.as_str(), value)
             })
@@ -1030,10 +1146,10 @@ mod tests {
     }
 
     #[test]
-    fn encode_uses_wire_schema_version_constant() {
+    fn a_book_of_the_older_kinds_keeps_schema_one() {
         let content = RulesRevisionContent::new(book(vec![exact_fqdn("r-1", "x.test")], vec![]));
         let dto = encode(&content);
-        assert_eq!(dto.schema_version, RULES_JSON_SCHEMA_VERSION);
+        assert_eq!(dto.schema_version, 1, "its bytes and hash must not move");
     }
 
     #[test]

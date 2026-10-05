@@ -13,9 +13,9 @@ fn fresh_conn() -> (TempDir, Arc<Mutex<Connection>>) {
     (dir, Arc::new(Mutex::new(runner.into_connection())))
 }
 
-use crate::verbose_logging::VerboseWindow;
 use crate::verbosity_control::VerbosityControl;
-use nrr_shared::ipc_payloads::{VerboseLoggingChange, VerboseLoggingMode};
+use nrr_shared::ipc_payloads::{LogWindowChange, LogWindowMode};
+use std::sync::atomic::Ordering;
 
 #[derive(Default)]
 struct RecordingVerbosity {
@@ -39,7 +39,7 @@ impl RecordingVerbosity {
 
 fn request(
     stab: &ProductionServiceStability,
-    change: VerboseLoggingChange,
+    change: LogWindowChange,
 ) -> ServiceStabilityConfigDto {
     let mut dto = ServiceStabilityConfigProvider::get(stab);
     dto.verbose_logging_change = Some(change);
@@ -59,16 +59,14 @@ fn a_timed_window_is_persisted_as_a_deadline_and_reported() {
     let (_dir, conn) = fresh_conn();
     let stab = ProductionServiceStability::new(Arc::clone(&conn));
     let base = ServiceStabilityConfigProvider::get(&stab);
-    assert_eq!(base.verbose_logging_mode, VerboseLoggingMode::Off);
+    assert_eq!(base.verbose_logging_mode, LogWindowMode::Off);
     assert_eq!(base.verbose_logging_until_ms, 0);
 
-    let before = crate::verbose_logging::now_ms();
-    let written = request(&stab, VerboseLoggingChange::OneHour);
-    assert_eq!(written.verbose_logging_mode, VerboseLoggingMode::Timed);
+    let before = now_ms();
+    let written = request(&stab, LogWindowChange::OneHour);
+    assert_eq!(written.verbose_logging_mode, LogWindowMode::Timed);
     let deadline = stored_until(&conn).expect("a timed window stores its deadline");
-    assert!(
-        deadline >= before + 3_600_000 && deadline <= crate::verbose_logging::now_ms() + 3_600_000
-    );
+    assert!(deadline >= before + 3_600_000 && deadline <= now_ms() + 3_600_000);
     assert_eq!(written.verbose_logging_until_ms, deadline);
     assert!(
         written.verbose_logging_change.is_none(),
@@ -79,7 +77,7 @@ fn a_timed_window_is_persisted_as_a_deadline_and_reported() {
     // resumes the same window from the stored deadline.
     let reopened = ProductionServiceStability::new(Arc::clone(&conn));
     let read = ServiceStabilityConfigProvider::get(&reopened);
-    assert_eq!(read.verbose_logging_mode, VerboseLoggingMode::Timed);
+    assert_eq!(read.verbose_logging_mode, LogWindowMode::Timed);
     assert_eq!(read.verbose_logging_until_ms, deadline);
 }
 
@@ -87,14 +85,11 @@ fn a_timed_window_is_persisted_as_a_deadline_and_reported() {
 fn until_restart_is_not_persisted_so_a_restart_clears_it() {
     let (_dir, conn) = fresh_conn();
     let stab = ProductionServiceStability::new(Arc::clone(&conn));
-    let written = request(&stab, VerboseLoggingChange::UntilRestart);
-    assert_eq!(
-        written.verbose_logging_mode,
-        VerboseLoggingMode::UntilRestart
-    );
+    let written = request(&stab, LogWindowChange::UntilRestart);
+    assert_eq!(written.verbose_logging_mode, LogWindowMode::UntilRestart);
     assert_eq!(
         ServiceStabilityConfigProvider::get(&stab).verbose_logging_mode,
-        VerboseLoggingMode::UntilRestart
+        LogWindowMode::UntilRestart
     );
     assert_eq!(stored_until(&conn), None, "nothing may outlive the process");
 
@@ -102,7 +97,7 @@ fn until_restart_is_not_persisted_so_a_restart_clears_it() {
         .with_verbosity_control(Arc::new(RecordingVerbosity::default()));
     assert_eq!(
         ServiceStabilityConfigProvider::get(&restarted).verbose_logging_mode,
-        VerboseLoggingMode::Off
+        LogWindowMode::Off
     );
 }
 
@@ -116,7 +111,7 @@ fn a_deadline_in_the_past_boots_to_normal_logging() {
         repo.set(
             &IpcAcceptPolicyWrite::Critical,
             Some(1_000),
-            r.conn_trace_ndjson,
+            r.conn_trace_ndjson_until_ms,
             r.conn_trace_gui,
             r.rule_scope_service_driven,
             r.routing_stop_policy,
@@ -139,7 +134,7 @@ fn a_deadline_in_the_past_boots_to_normal_logging() {
         .with_verbosity_control(Arc::clone(&control) as Arc<dyn VerbosityControl>);
     assert_eq!(
         ServiceStabilityConfigProvider::get(&stab).verbose_logging_mode,
-        VerboseLoggingMode::Off
+        LogWindowMode::Off
     );
     assert_eq!(
         control.calls(),
@@ -159,7 +154,7 @@ fn a_request_drives_the_live_filter_and_a_plain_save_does_not() {
         "nothing stored: the boot filter stands"
     );
 
-    request(&stab, VerboseLoggingChange::FourHours);
+    request(&stab, LogWindowChange::FourHours);
     assert_eq!(control.calls(), vec![true]);
 
     // An unrelated save echoes the reported state and carries no request.
@@ -171,21 +166,21 @@ fn a_request_drives_the_live_filter_and_a_plain_save_does_not() {
         vec![true],
         "a plain save leaves the window alone"
     );
-    assert_eq!(written.verbose_logging_mode, VerboseLoggingMode::Timed);
+    assert_eq!(written.verbose_logging_mode, LogWindowMode::Timed);
     assert!(stored_until(&conn).is_some());
 
-    request(&stab, VerboseLoggingChange::Off);
+    request(&stab, LogWindowChange::Off);
     assert_eq!(control.calls(), vec![true, false]);
     assert_eq!(stored_until(&conn), None);
-    assert_eq!(stab.verbose.window(), VerboseWindow::Off);
+    assert_eq!(stab.verbose.window(), TimedWindow::Off);
 }
 
 #[test]
 fn a_request_succeeds_without_a_live_filter() {
     let (_dir, conn) = fresh_conn();
     let stab = ProductionServiceStability::new(Arc::clone(&conn));
-    let written = request(&stab, VerboseLoggingChange::OneHour);
-    assert_eq!(written.verbose_logging_mode, VerboseLoggingMode::Timed);
+    let written = request(&stab, LogWindowChange::OneHour);
+    assert_eq!(written.verbose_logging_mode, LogWindowMode::Timed);
 }
 
 /// Proves the get-merge-set contract the QML patch queue relies on: as
@@ -197,29 +192,29 @@ fn sequential_get_merge_set_round_trips_do_not_clobber_each_other() {
     let (_dir, conn) = fresh_conn();
     let stab = ProductionServiceStability::new(Arc::clone(&conn));
 
-    // "Diagnostics" panel: Get → flip conn_trace_ndjson only → Set.
+    // "Diagnostics" panel: Get → flip conn_trace_gui only → Set.
     let mut after_diag = ServiceStabilityConfigProvider::get(&stab);
-    after_diag.conn_trace_ndjson = true;
+    after_diag.conn_trace_gui = false;
     let written_diag = ServiceStabilityConfigWriter::set(&stab, &after_diag, Some("S-DIAG"))
         .expect("diagnostics set");
-    assert!(written_diag.conn_trace_ndjson);
+    assert!(!written_diag.conn_trace_gui);
     assert_eq!(written_diag.enforcement_mode, "resolver");
 
     // "Routing" panel: Get (must observe the diagnostics write) → flip
     // enforcement_mode only → Set. Away from the default: writing the value
     // the row already holds would pass even if the write were dropped.
     let mut after_routing = ServiceStabilityConfigProvider::get(&stab);
-    assert!(after_routing.conn_trace_ndjson);
+    assert!(!after_routing.conn_trace_gui);
     after_routing.enforcement_mode = "reactive".to_string();
     let written_routing = ServiceStabilityConfigWriter::set(&stab, &after_routing, Some("S-ROUTE"))
         .expect("routing set");
     assert!(
-        written_routing.conn_trace_ndjson,
+        !written_routing.conn_trace_gui,
         "routing panel's Set must not clobber the diagnostics panel's field"
     );
 
     let final_state = ServiceStabilityConfigProvider::get(&stab);
-    assert!(final_state.conn_trace_ndjson);
+    assert!(!final_state.conn_trace_gui);
     assert_eq!(final_state.enforcement_mode, "reactive");
 }
 
@@ -310,13 +305,10 @@ fn a_set_that_omits_the_rules_lock_preserves_it() {
     // A different panel saves an unrelated toggle with no opinion on the
     // lock (the shape an older client sends).
     dto.allow_user_rule_edits = None;
-    dto.conn_trace_ndjson = true;
+    dto.conn_trace_gui = false;
     let written =
         ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-OTHER")).expect("unrelated set");
-    assert!(
-        written.conn_trace_ndjson,
-        "the unrelated field must be saved"
-    );
+    assert!(!written.conn_trace_gui, "the unrelated field must be saved");
     assert_eq!(
         written.allow_user_rule_edits,
         Some(false),
@@ -379,25 +371,170 @@ fn instant_rst_set_drives_live_flag_with_persisted_value() {
     assert!(readback.fake_ip_instant_rst, "on must be durably persisted");
 }
 
-/// The trace-to-log switch reaches the running observer on save, in both
-/// directions, carrying the stored value rather than the requested one.
+fn request_trace(
+    stab: &ProductionServiceStability,
+    change: LogWindowChange,
+) -> ServiceStabilityConfigDto {
+    let mut dto = ServiceStabilityConfigProvider::get(stab);
+    dto.conn_trace_ndjson_change = Some(change);
+    ServiceStabilityConfigWriter::set(stab, &dto, Some("S-TEST")).expect("set must succeed")
+}
+
+fn stored_trace_until(conn: &Arc<Mutex<Connection>>) -> Option<i64> {
+    let guard = conn.lock().expect("lock");
+    ServiceStabilityConfigRepository::new(&guard)
+        .get_or_default()
+        .expect("read")
+        .conn_trace_ndjson_until_ms
+}
+
+fn traced(
+    conn: &Arc<Mutex<Connection>>,
+    forced: bool,
+) -> (ConnTraceLogSwitch, ProductionServiceStability) {
+    let switch = ConnTraceLogSwitch::at_boot(
+        Some(conn),
+        forced.then_some(crate::boot_settings::ConnTraceForce::Environment),
+    );
+    let stab = ProductionServiceStability::new(Arc::clone(conn)).with_conn_trace_log(&switch);
+    (switch, stab)
+}
+
+/// A request opens and shuts the observer's sink; a plain save neither
+/// extends nor ends the running window.
 #[test]
-fn conn_trace_ndjson_set_reaches_the_running_observer() {
+fn a_trace_request_drives_the_sink_and_a_plain_save_does_not() {
     let (_dir, conn) = fresh_conn();
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let stab = ProductionServiceStability::new(Arc::clone(&conn)).with_conn_trace_ndjson_apply({
-        let seen = Arc::clone(&seen);
-        Arc::new(move |on: bool| seen.lock().expect("lock").push(on))
-    });
+    let (switch, stab) = traced(&conn, false);
+    let flag = switch.flag();
+    let base = ServiceStabilityConfigProvider::get(&stab);
+    assert_eq!(base.conn_trace_ndjson_mode, LogWindowMode::Off);
+    assert!(!base.conn_trace_ndjson_forced);
+    assert!(!flag.load(Ordering::Relaxed), "the disk sink stays opt-in");
 
-    let mut dto = ServiceStabilityConfigProvider::get(&stab);
-    assert!(!dto.conn_trace_ndjson, "the disk sink stays opt-in");
-    dto.conn_trace_ndjson = true;
-    ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set on");
-    dto.conn_trace_ndjson = false;
-    ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set off");
+    let before = now_ms();
+    let written = request_trace(&stab, LogWindowChange::OneHour);
+    assert_eq!(written.conn_trace_ndjson_mode, LogWindowMode::Timed);
+    let deadline = stored_trace_until(&conn).expect("a timed window stores its deadline");
+    assert!(deadline >= before + 3_600_000 && deadline <= now_ms() + 3_600_000);
+    assert_eq!(written.conn_trace_ndjson_until_ms, deadline);
+    assert!(
+        written.conn_trace_ndjson_change.is_none(),
+        "the request is never echoed"
+    );
+    assert!(flag.load(Ordering::Relaxed), "the observer starts writing");
+    assert_eq!(
+        stored_until(&conn),
+        None,
+        "the verbose window is not touched"
+    );
 
-    assert_eq!(*seen.lock().expect("lock"), vec![true, false]);
+    let mut echo = ServiceStabilityConfigProvider::get(&stab);
+    echo.fake_ip_enabled = true;
+    let written = ServiceStabilityConfigWriter::set(&stab, &echo, Some("S-TEST")).expect("set");
+    assert_eq!(written.conn_trace_ndjson_mode, LogWindowMode::Timed);
+    assert_eq!(stored_trace_until(&conn), Some(deadline));
+    assert!(
+        flag.load(Ordering::Relaxed),
+        "a plain save leaves the window alone"
+    );
+
+    let written = request_trace(&stab, LogWindowChange::Off);
+    assert_eq!(written.conn_trace_ndjson_mode, LogWindowMode::Off);
+    assert_eq!(stored_trace_until(&conn), None);
+    assert!(
+        !flag.load(Ordering::Relaxed),
+        "turning it off early stops the writes"
+    );
+}
+
+/// A restart inside a timed window resumes it, from the stored deadline.
+#[test]
+fn a_restart_resumes_the_trace_window_still_ahead() {
+    let (_dir, conn) = fresh_conn();
+    let (_switch, stab) = traced(&conn, false);
+    let deadline = request_trace(&stab, LogWindowChange::FourHours).conn_trace_ndjson_until_ms;
+
+    let (restarted, stab) = traced(&conn, false);
+    assert!(restarted.flag().load(Ordering::Relaxed));
+    let read = ServiceStabilityConfigProvider::get(&stab);
+    assert_eq!(read.conn_trace_ndjson_mode, LogWindowMode::Timed);
+    assert_eq!(read.conn_trace_ndjson_until_ms, deadline);
+}
+
+#[test]
+fn an_until_restart_trace_is_not_persisted() {
+    let (_dir, conn) = fresh_conn();
+    let (switch, stab) = traced(&conn, false);
+    let written = request_trace(&stab, LogWindowChange::UntilRestart);
+    assert_eq!(written.conn_trace_ndjson_mode, LogWindowMode::UntilRestart);
+    assert!(switch.flag().load(Ordering::Relaxed));
+    assert_eq!(
+        stored_trace_until(&conn),
+        None,
+        "nothing may outlive the process"
+    );
+
+    let (restarted, stab) = traced(&conn, false);
+    assert!(!restarted.flag().load(Ordering::Relaxed));
+    assert_eq!(
+        ServiceStabilityConfigProvider::get(&stab).conn_trace_ndjson_mode,
+        LogWindowMode::Off
+    );
+}
+
+/// The file or the environment keeps the sink on through any request, and
+/// the service says so.
+#[test]
+fn a_forced_trace_is_reported_and_outlasts_a_request_to_stop() {
+    let (_dir, conn) = fresh_conn();
+    let (switch, stab) = traced(&conn, true);
+    assert!(switch.flag().load(Ordering::Relaxed));
+    assert!(ServiceStabilityConfigProvider::get(&stab).conn_trace_ndjson_forced);
+
+    request_trace(&stab, LogWindowChange::OneHour);
+    let written = request_trace(&stab, LogWindowChange::Off);
+    assert_eq!(written.conn_trace_ndjson_mode, LogWindowMode::Off);
+    assert!(written.conn_trace_ndjson_forced);
+    assert!(switch.flag().load(Ordering::Relaxed), "forced stays on");
+}
+
+/// Unwired (tests, a reader-only instance), a request still persists and is
+/// reported from the stored deadline.
+#[test]
+fn a_trace_request_succeeds_without_a_running_sink() {
+    let (_dir, conn) = fresh_conn();
+    let stab = ProductionServiceStability::new(Arc::clone(&conn));
+    let written = request_trace(&stab, LogWindowChange::OneHour);
+    assert_eq!(written.conn_trace_ndjson_mode, LogWindowMode::Timed);
+    let reader = ProductionServiceStability::new(Arc::clone(&conn));
+    assert_eq!(
+        ServiceStabilityConfigProvider::get(&reader).conn_trace_ndjson_mode,
+        LogWindowMode::Timed
+    );
+}
+
+/// The wire shape a client sends and reads back: the request travels, the
+/// answer carries the reported state and never the request.
+#[test]
+fn the_trace_window_round_trips_through_the_wire_shape() {
+    let (_dir, conn) = fresh_conn();
+    let (_switch, stab) = traced(&conn, false);
+    let mut request = serde_json::to_value(ServiceStabilityConfigProvider::get(&stab))
+        .expect("serialise the config");
+    request["conn-trace-ndjson-change"] = serde_json::json!("one-hour");
+    let dto: ServiceStabilityConfigDto =
+        serde_json::from_value(request).expect("the request deserialises");
+    assert_eq!(dto.conn_trace_ndjson_change, Some(LogWindowChange::OneHour));
+
+    let answer = serde_json::to_value(
+        ServiceStabilityConfigWriter::set(&stab, &dto, Some("S-TEST")).expect("set"),
+    )
+    .expect("serialise the answer");
+    assert_eq!(answer["conn-trace-ndjson-mode"], serde_json::json!("timed"));
+    assert!(answer["conn-trace-ndjson-until-ms"].as_i64().unwrap_or(0) > 0);
+    assert_eq!(answer["conn-trace-ndjson-forced"], serde_json::json!(false));
+    assert!(answer.get("conn-trace-ndjson-change").is_none());
 }
 
 /// Without a wired live-flag seam (tests / degraded boot), `set()` must

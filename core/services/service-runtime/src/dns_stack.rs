@@ -18,7 +18,8 @@ use nrr_platform_api::network_change::{NetworkChangeObserver, NetworkChangeSubsc
 use rusqlite::Connection;
 
 use crate::dns_resolver_service::{
-    DnsResolverFactory, DnsResolverService, NamespaceRecheck, CLAIMS_SAFETY_RECHECK_INTERVAL,
+    ArmRefusal, DnsResolverFactory, DnsResolverService, NamespaceRecheck,
+    CLAIMS_SAFETY_RECHECK_INTERVAL,
 };
 use crate::dns_upstream::UpstreamDnsPool;
 use crate::production_rules_provider::ProductionRulesProvider;
@@ -174,7 +175,7 @@ fn build_dns_resolver_instance(
     inputs: &DnsStackInputs,
     platform: &DnsStackPlatform,
     fed: bool,
-) -> Option<DnsResolverService> {
+) -> Result<DnsResolverService, ArmRefusal> {
     use crate::dns_listener::DnsInterceptListener;
     use crate::dns_resolver_ports::{
         ActiveRuleHostOracle, CacheFactSink, DirectUdpUpstreamResolver, HookSyncReconciler,
@@ -192,7 +193,7 @@ fn build_dns_resolver_instance(
                 msg_key = "dns-stack-modeb-no-signed-in-user",
                 "Mode B: no signed-in user yet — staying reactive until sign-in",
             );
-            return None;
+            return Err(ArmRefusal::AwaitingSignIn);
         }
     }
 
@@ -206,7 +207,7 @@ fn build_dns_resolver_instance(
             msg_key = "dns-stack-modeb-no-upstream-answered",
             "Mode B requested but no upstream IPv4 DNS answered a probe; staying reactive",
         );
-        return None;
+        return Err(ArmRefusal::Unavailable);
     };
 
     let rules = || {
@@ -389,7 +390,7 @@ fn build_dns_resolver_instance(
     .with_short_name_suffixes(Arc::new(move || user_suffix().into_iter().collect()));
     // A VPN connecting mid-session claims its namespace the moment its link
     // appears, and a quiet machine costs the guard no read at all.
-    Some(if fed {
+    Ok(if fed {
         service.with_change_feed(
             Arc::clone(namespace_recheck()),
             CLAIMS_SAFETY_RECHECK_INTERVAL,

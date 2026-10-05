@@ -19,6 +19,7 @@
 //! | `Zone(z)` | same fan-out minus the apex — the bare zone label is not a member of its zone. |
 //! | app-only rule (no address) | one route per destination the app has been observed connecting to (none observed yet → 0 + diagnostic). |
 //! | app + address rule | **0** — the two conditions match as AND and a route cannot be scoped to a process, so routing the address would over-route. |
+//! | `Subnet` / `IpRange` | one route per block over the rule's own link, in every mode, split to out-specific the tunnel's routes ([`network_routes`]). |
 //!
 //! Scope: IPv4 IP/FQDN/domain-suffix/zone routing. IP-subnet/CIDR zones do not
 //! exist in the canonical model — `Zone` is always a *domain* suffix.
@@ -59,7 +60,9 @@ pub const HOST_PREFIX: u8 = 32;
 /// The same shape in IPv6.
 pub const HOST_PREFIX_V6: u8 = 128;
 
-/// Whether `prefix_length` is a shape THIS codegen emits.
+/// Whether `prefix_length` is a shape THIS codegen emits at
+/// [`SECONDARY_ROUTE_METRIC`]; network routes carry their own signature
+/// ([`is_network_shape`] at [`NETWORK_ROUTE_METRIC`]).
 ///
 /// Startup orphan adoption and the uninstall sweep identify our leftovers by
 /// metric plus shape. Besides host routes, IPv4 carries the overlay: its
@@ -91,15 +94,47 @@ const OVERLAY_PREFIXES: std::ops::RangeInclusive<u8> = 1..=TUNNEL_CATCH_ALL_MAX_
 /// destination — documented in `strategy.rs`'s risk matrix.
 pub const SECONDARY_ROUTE_METRIC: u32 = 5;
 
+/// Metric for a network rule's routes. Its own value, because a rule network
+/// can have an overlay half's length (`/8`..`/13`): by shape alone the two are
+/// one thing, and pausing or a crash would treat the rule as an overlay.
+pub const NETWORK_ROUTE_METRIC: u32 = 4;
+
 /// Whether a row read back from the system table carries our signature. The OS
 /// never marks a route as ours, so crash recovery adopts by this and nothing
-/// else — metric, a shape we emit, and the main table (a Linux dump also
-/// returns other tables, which we never write).
+/// else — metric, a shape we emit at that metric, and the main table (a Linux
+/// dump also returns other tables, which we never write).
 #[must_use]
 pub fn is_owned_route(route: &RouteEntry) -> bool {
+    route.table == nrr_platform_api::RouteTableRef::Main
+        && match route.metric {
+            SECONDARY_ROUTE_METRIC => is_owned_shape(route.destination, route.prefix_length),
+            NETWORK_ROUTE_METRIC => is_network_shape(route.destination, route.prefix_length),
+            _ => false,
+        }
+}
+
+/// A length a network rule's route can have: no wider than a rule may be,
+/// down to a single address (a piece split around a tunnel server).
+#[must_use]
+pub fn is_network_shape(destination: IpAddr, prefix_length: u8) -> bool {
+    let max = if destination.is_ipv4() {
+        HOST_PREFIX
+    } else {
+        HOST_PREFIX_V6
+    };
+    (nrr_domain::ip_network_policy::widest_rule_prefix(destination.is_ipv4())..=max)
+        .contains(&prefix_length)
+}
+
+/// One of our overlay halves — the routes that carry what no rule names.
+/// Never a rule's route, whatever its length: those sit at
+/// [`NETWORK_ROUTE_METRIC`] or are host routes.
+#[must_use]
+pub fn is_overlay_route(route: &RouteEntry) -> bool {
     route.metric == SECONDARY_ROUTE_METRIC
         && route.table == nrr_platform_api::RouteTableRef::Main
-        && is_owned_shape(route.destination, route.prefix_length)
+        && route.destination.is_ipv4()
+        && OVERLAY_PREFIXES.contains(&route.prefix_length)
 }
 
 /// the two split-default halves. Together they cover all of
@@ -283,6 +318,29 @@ pub enum RouteCodegenDiagnostic {
     /// counter-overlay can't be installed, so non-rule traffic stays on whatever
     /// the VPN's own redirect does. Bind a primary adapter to enable it.
     PrimaryExceptionsUnavailable,
+    /// Part of a network rule lies inside a network this machine is attached
+    /// to, and was left to that interface: routing it elsewhere would take the
+    /// segment away from itself.
+    NetworkYieldsToLocalNetwork {
+        rule_id: String,
+        network: nrr_shared::ip_block::IpBlock,
+        local: nrr_shared::ip_block::IpBlock,
+    },
+    /// A network routed into the tunnel holds the tunnel's own server, which
+    /// was cut out so the tunnel can still reach it.
+    NetworkRoutedAroundTunnelServer {
+        rule_id: String,
+        network: nrr_shared::ip_block::IpBlock,
+        server: IpAddr,
+    },
+    /// The main link's rules name the same network, and keep it.
+    NetworkClaimedByMainLink {
+        rule_id: String,
+        network: nrr_shared::ip_block::IpBlock,
+    },
+    /// Out-specifying the tunnel's routes asked for more routes than one rule
+    /// may install; the widest were kept.
+    NetworkRoutesCapped { rule_id: String, cap: usize },
 }
 
 #[derive(Debug, Default)]
@@ -433,6 +491,8 @@ pub fn generate_secondary_routes(
                     note_held(&mut held, ip);
                 }
             }
+            // Routed by `network_routes`, which needs both links' networks at once.
+            Some(CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_)) => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 if cache.ips_for_hostname(host).is_empty() {
                     out.diagnostics
@@ -547,6 +607,9 @@ fn note_held(held: &mut Option<(IpAddr, usize)>, ip: IpAddr) {
 /// the primary NIC (the mode-A counter-overlay and the mode-B exceptions);
 /// `None` records [`RouteCodegenDiagnostic::PrimaryExceptionsUnavailable`] and
 /// skips that part. Pure: no I/O beyond the injected FQDN cache reader.
+///
+/// Network rules see only the tunnel's catch-alls here and follow the shape
+/// support this build ships; [`generate_routes_with`] takes the full reading.
 // Eight positional arguments, one over the lint's taste. Grouping them into a
 // struct would be a second shape of the same call for the ten call sites to
 // keep in step, and the last one is what this function is FOR: the arbitration
@@ -571,18 +634,49 @@ pub fn generate_routes(
     // mode A's counter-overlay is shaped to out-specific exactly these.
     tunnel_catch_alls: &[(Ipv4Addr, u8)],
 ) -> RouteCodegenOutput {
-    match mode {
+    generate_routes_with(
+        mode,
+        rule_book,
+        primary_target,
+        secondary_target,
+        cache,
+        app_observations,
+        denied,
+        order,
+        tunnel_catch_alls,
+        &network_routes::NetworkRouteFacts::from_catch_alls(tunnel_catch_alls),
+        crate::wfp_codegen::current_rule_shape_support(),
+    )
+}
+
+/// [`generate_routes`] with what the machine says about its links, which
+/// network rules are routed around, and the shape support to plan under.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_routes_with(
+    mode: RouteBehaviorMode,
+    rule_book: &CanonicalRuleBook,
+    primary_target: Option<&SecondaryRouteTarget>,
+    secondary_target: &SecondaryRouteTarget,
+    cache: &dyn FqdnCacheLookup,
+    app_observations: &dyn AppObservationLookup,
+    denied: &HashSet<Ipv4Addr>,
+    order: crate::address_ownership::ZoneVsIpOrder,
+    tunnel_catch_alls: &[(Ipv4Addr, u8)],
+    networks: &network_routes::NetworkRouteFacts,
+    support: nrr_domain::rule_shape::RuleShapeSupport,
+) -> RouteCodegenOutput {
+    // Read from the UNFILTERED cache: the denylist view exists to trim what
+    // goes to the tunnel, and using it here would understate what the main
+    // link claims.
+    let ownership = crate::address_ownership::AddressOwnership::resolve_with_support(
+        rule_book, cache, order, support,
+    );
+    let mut out = match mode {
         RouteBehaviorMode::PreferPrimary => {
             // Secondary-bound rules → /32 via the secondary (VPN), minus any
             // shared IP the policy declined (fed via a filtered cache view).
             let secondary_cache =
                 crate::secondary_ip_policy::DenylistFilteredCache::new(cache, denied);
-            // Read from the UNFILTERED cache: the denylist view exists to
-            // trim what goes to the tunnel, and using it here would understate
-            // what the main link claims.
-            let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
-                rule_book, cache, order,
-            );
             let mut out = generate_secondary_routes(
                 &rule_book.secondary,
                 secondary_target,
@@ -630,9 +724,6 @@ pub fn generate_routes(
                     // the ADDITIONAL link's rules name, or a host the user
                     // deliberately tunnels would follow a program out onto the
                     // open link.
-                    let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
-                        rule_book, cache, order,
-                    );
                     let exceptions = generate_secondary_routes(
                         &rule_book.primary,
                         pt,
@@ -651,7 +742,78 @@ pub fn generate_routes(
             }
             out
         }
+    };
+    let plan = network_routes::plan_network_routes(
+        mode,
+        rule_book,
+        primary_target.is_some(),
+        &ownership,
+        networks,
+        tunnel_catch_alls,
+        support,
+    );
+    push_network_plan(plan, primary_target, secondary_target, &mut out);
+    out
+}
+
+/// Lower a network plan onto the two targets, after the host routes.
+fn push_network_plan(
+    plan: network_routes::NetworkRoutePlan,
+    primary_target: Option<&SecondaryRouteTarget>,
+    secondary_target: &SecondaryRouteTarget,
+    out: &mut RouteCodegenOutput,
+) {
+    let target_of = |link| match link {
+        crate::address_ownership::Link::Main => primary_target,
+        crate::address_ownership::Link::Additional => Some(secondary_target),
+    };
+    let mut hosts: HashSet<(IpAddr, u32)> = out
+        .routes
+        .iter()
+        .filter(|r| r.prefix_length == host_prefix_for(r.destination))
+        .map(|r| (r.destination, r.interface_index))
+        .collect();
+    for (link, ip) in plan.hosts {
+        let Some(target) = target_of(link) else {
+            continue;
+        };
+        if is_non_routable(ip) || !hosts.insert((ip, target.interface_index)) {
+            continue;
+        }
+        if let Some(next_hop) = next_hop_for(ip, target) {
+            out.routes.push(RouteEntry {
+                destination: ip,
+                prefix_length: host_prefix_for(ip),
+                next_hop,
+                interface_index: target.interface_index,
+                metric: SECONDARY_ROUTE_METRIC,
+                is_ours: true,
+                table: nrr_platform_api::RouteTableRef::Main,
+            });
+        }
     }
+    for (link, block) in plan.networks {
+        let Some(target) = target_of(link) else {
+            continue;
+        };
+        // A single-address piece already routed as a host is that route.
+        if block.is_single_address() && hosts.contains(&(block.network(), target.interface_index)) {
+            continue;
+        }
+        // No next hop for the family is no way out: a black hole, not a route.
+        if let Some(next_hop) = next_hop_for(block.network(), target) {
+            out.routes.push(RouteEntry {
+                destination: block.network(),
+                prefix_length: block.prefix_len(),
+                next_hop,
+                interface_index: target.interface_index,
+                metric: NETWORK_ROUTE_METRIC,
+                is_ours: true,
+                table: nrr_platform_api::RouteTableRef::Main,
+            });
+        }
+    }
+    out.diagnostics.extend(plan.diagnostics);
 }
 
 /// `/32` routes that send the service's own DNS queries out the secondary link
@@ -831,6 +993,8 @@ fn fanout_suffix(
     }
     had_subhosts
 }
+
+pub mod network_routes;
 
 #[cfg(test)]
 mod tests;

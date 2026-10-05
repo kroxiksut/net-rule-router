@@ -208,12 +208,14 @@ impl MutationExecutor for FailingExecutor {
     }
     fn execute(&self, _payload: StoredMutation, _principal: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
+            args: Default::default(),
             code: "mutation.rejected.test".into(),
             message: "test failure".into(),
         })
     }
     fn rollback(&self, _principal: &str, _target: Option<&str>) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
+            args: Default::default(),
             code: "rollback.rejected.test".into(),
             message: "rollback test failure".into(),
         })
@@ -227,6 +229,7 @@ impl MutationExecutor for FailingExecutor {
     }
     fn safe_disable(&self, _reason: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
+            args: Default::default(),
             code: "safe-disable.rejected.test".into(),
             message: "safe-disable test failure".into(),
         })

@@ -130,6 +130,9 @@ pub struct ArmedDirectFakeIpAnswerer {
     armed: Arc<dyn Fn() -> bool + Send + Sync>,
     runtime_exclusions: Arc<super::self_heal::RuntimeHostExclusions>,
     health: Arc<super::health::FakeIpHealth>,
+    /// Real addresses the user's networks give the additional link; such a
+    /// host keeps its real answer. See [`super::rule_networks`].
+    network_owner: Option<Arc<dyn super::rule_networks::AdditionalNetworkOwner>>,
 }
 
 impl ArmedDirectFakeIpAnswerer {
@@ -147,6 +150,7 @@ impl ArmedDirectFakeIpAnswerer {
             armed,
             runtime_exclusions: Arc::new(super::self_heal::RuntimeHostExclusions::new()),
             health: Arc::new(super::health::FakeIpHealth::new()),
+            network_owner: None,
         }
     }
 
@@ -168,6 +172,17 @@ impl ArmedDirectFakeIpAnswerer {
         self.health = health;
         self
     }
+
+    /// Decline hosts whose real address a network rule routes over the
+    /// additional link. Builder-style; unwired, no network is consulted.
+    #[must_use]
+    pub fn with_network_owner(
+        mut self,
+        owner: Arc<dyn super::rule_networks::AdditionalNetworkOwner>,
+    ) -> Self {
+        self.network_owner = Some(owner);
+        self
+    }
 }
 
 impl DirectFakeIpAnswerer for ArmedDirectFakeIpAnswerer {
@@ -184,6 +199,13 @@ impl DirectFakeIpAnswerer for ArmedDirectFakeIpAnswerer {
         // cannot fire on a DNS query — no process attribution — matching the
         // rule-host answerer's documented posture.)
         if !self.scope.decide(hostname, None).is_fake_ip() {
+            return None;
+        }
+        if self
+            .network_owner
+            .as_ref()
+            .is_some_and(|owner| owner.owns_any(real))
+        {
             return None;
         }
         self.map.record(hostname, real);
@@ -316,6 +338,34 @@ mod tests {
         );
         // An empty answer set is never claimed.
         assert_eq!(armed.fake_direct_answer("blog.example", &[]), None);
+    }
+
+    /// The relay would carry a direct host out of the main link; inside a
+    /// network the user routes over the additional one, that breaks the rule.
+    #[test]
+    fn a_host_inside_an_additional_network_keeps_its_real_answer() {
+        struct Additional(Vec<Ipv4Addr>);
+        impl super::super::rule_networks::AdditionalNetworkOwner for Additional {
+            fn owns_any(&self, real: &[Ipv4Addr]) -> bool {
+                real.iter().any(|ip| self.0.contains(ip))
+            }
+        }
+        let (answerer, map) = answerer(Arc::new(AtomicBool::new(true)));
+        let answerer = answerer.with_network_owner(Arc::new(Additional(vec![ip(10, 20, 0, 5)])));
+        assert_eq!(
+            answerer.fake_direct_answer(
+                "files.corp.example",
+                &[ip(203, 0, 113, 9), ip(10, 20, 0, 5)]
+            ),
+            None
+        );
+        assert!(
+            map.ips_for("files.corp.example").is_empty(),
+            "nothing recorded"
+        );
+        assert!(answerer
+            .fake_direct_answer("blog.example", &[ip(203, 0, 113, 68)])
+            .is_some());
     }
 
     #[test]

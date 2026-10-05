@@ -34,8 +34,8 @@ fn section_from_name_roundtrip() {
 
 #[test]
 fn section_from_name_rejects_unknown() {
-    assert_eq!(RulesFileSection::from_name("CIDR"), None);
-    assert_eq!(RulesFileSection::from_name("cidr"), None);
+    assert_eq!(RulesFileSection::from_name("Geo"), None);
+    assert_eq!(RulesFileSection::from_name("geo"), None);
     assert_eq!(RulesFileSection::from_name(""), None);
     // Case-insensitive, matching nrr_shared::preset_parser.
     assert_eq!(
@@ -70,7 +70,7 @@ fn section_parse_header_rejects_non_headers() {
     assert_eq!(RulesFileSection::parse_header("Zones"), None);
     assert_eq!(RulesFileSection::parse_header("-- Zones"), None);
     assert_eq!(RulesFileSection::parse_header("# --- Zones"), None);
-    assert_eq!(RulesFileSection::parse_header("--- CIDR"), None);
+    assert_eq!(RulesFileSection::parse_header("--- Geo"), None);
 }
 
 #[test]
@@ -123,8 +123,30 @@ fn platform_specific_flag_correct() {
 
 #[test]
 fn all_free_sections_are_listed_with_auto_last() {
-    assert_eq!(RulesFileSection::ALL.len(), 7);
-    assert_eq!(RulesFileSection::ALL[6], RulesFileSection::Auto);
+    assert_eq!(RulesFileSection::ALL.len(), 9);
+    assert_eq!(RulesFileSection::ALL[8], RulesFileSection::Auto);
+}
+
+#[test]
+fn network_sections_are_named_and_cross_platform() {
+    assert_eq!(
+        RulesFileSection::from_name("CIDR"),
+        Some(RulesFileSection::Cidr)
+    );
+    assert_eq!(
+        RulesFileSection::from_name("ranges"),
+        Some(RulesFileSection::Ranges)
+    );
+    assert_eq!(RulesFileSection::Cidr.name(), "CIDR");
+    assert_eq!(RulesFileSection::Ranges.name(), "Ranges");
+    for platform in [
+        HostPlatform::Windows,
+        HostPlatform::Linux,
+        HostPlatform::MacOS,
+    ] {
+        assert!(RulesFileSection::Cidr.is_active_on(platform));
+        assert!(RulesFileSection::Ranges.is_active_on(platform));
+    }
 }
 
 #[test]

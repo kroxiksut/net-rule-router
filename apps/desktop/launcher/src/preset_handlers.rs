@@ -343,9 +343,10 @@ ru
         // rules from 1, so the subnet line is the second rule.
         assert_eq!(flagged[0]["id-hint"], json!(2));
         assert_eq!(flagged[0]["status"], json!("error"));
+        // Section is type: the verdict names the type the subnet belongs to.
         assert_eq!(
             flagged[0]["message-key"],
-            json!("rules.validation.match-value-invalid.exact-ip")
+            json!("rules.validation.match-value-invalid.is-subnet")
         );
     }
 

@@ -100,9 +100,10 @@ Typical metadata header in rules files:
 
 ## Extended sections
 
-Packs may include sections this version does not recognise (`--- CIDR`,
-`--- Ports`, and others). Such files import safely: unrecognised rules are
-preserved but not applied to routing policy.
+Packs may include sections this version does not recognise (`--- Ports` and
+others). Such files import safely: unrecognised rules are preserved but not
+applied to routing policy. Subnets and IP ranges have their own sections,
+`--- CIDR` and `--- Ranges`.
 
 ## Validation limits
 

@@ -24,6 +24,8 @@
 //! |                                 | the cold start used.                                              |
 //! | `local.rule-value-verdict`      | The Add/Edit rule dialog's gate — the verdict the rules table     |
 //! |                                 | shows for one value, via `rule_value_validation`.                 |
+//! | `local.rule-values-classify`    | A pasted address list, each line sorted into exact IP / subnet /  |
+//! |                                 | range with that type's verdict.                                   |
 //!
 //! Slug shape mirrors the IpcOperationName convention
 //! (`<domain>.<resource>.<verb>`) — though `local.*` has no verb tier
@@ -100,6 +102,7 @@ pub fn handle_local_request(
         "local.canonical-rules-hash" => handle_canonical_rules_hash(payload),
         "local.rules-overlaps" => handle_rules_overlaps(payload),
         "local.rule-value-verdict" => handle_rule_value_verdict(payload),
+        "local.rule-values-classify" => handle_rule_values_classify(payload),
         "local.service-info" => handle_service_info(client),
         "local.vpn.discover" => handle_vpn_discover(),
         "local.app-groups.discover" => handle_app_groups_discover(),
@@ -542,6 +545,53 @@ fn handle_rule_value_verdict(payload: &Value) -> LocalHandlerResult {
     }))
 }
 
+/// Locale key of a pasted line that is no address, network or range.
+const UNRECOGNIZED_LINE_KEY: &str = "rules.paste.line-unrecognized";
+
+/// A pasted list, one entry per line (commas and semicolons also separate),
+/// each sorted into the address type it is and judged as that type. Blank
+/// entries and `#` comment lines are skipped; past the Free rule cap the list
+/// is cut, since nothing beyond it could be added.
+fn handle_rule_values_classify(payload: &Value) -> LocalHandlerResult {
+    let text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or(LocalHandlerError::MissingField("text"))?;
+    let mut entries = text
+        .split(['\n', '\r', ',', ';'])
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty() && !entry.starts_with('#'));
+    let rows: Vec<Value> = entries
+        .by_ref()
+        .take(nrr_shared::rules_json::FREE_MAX_RULES)
+        .map(classify_rule_value)
+        .collect();
+    let truncated = entries.next().is_some();
+    Ok(json!({ "rows": rows, "truncated": truncated }))
+}
+
+fn classify_rule_value(value: &str) -> Value {
+    use nrr_application::ip_network_policy::IpValueKind;
+    let Some(kind) = IpValueKind::of(value) else {
+        return json!({
+            "value": value,
+            "rule-type": "",
+            "status": "error",
+            "message-key": UNRECOGNIZED_LINE_KEY,
+            "args": {},
+        });
+    };
+    let rule_type = kind.rule_type_slug();
+    let verdict = nrr_application::rule_value_validation::validate_rule_value(rule_type, value);
+    json!({
+        "value": value,
+        "rule-type": rule_type,
+        "status": verdict.status_slug(),
+        "message-key": verdict.message_key(),
+        "args": verdict.args(),
+    })
+}
+
 /// Every exact rule already covered by a wildcard rule, so the rules screen
 /// can offer the redundant ones for removal, and every pair of rules on the
 /// two routes that claim the same hosts. Local because it is a pure function
@@ -635,6 +685,78 @@ mod tests {
                 &empty_client(),
             ),
             Err(LocalHandlerError::MissingField("match-value"))
+        ));
+    }
+
+    fn classify(text: &str) -> Value {
+        handle_local_request(
+            "local.rule-values-classify",
+            &json!({ "text": text }),
+            &empty_client(),
+        )
+        .expect("classification")
+    }
+
+    /// A mixed paste comes back sorted by type, each line with that type's
+    /// verdict, and a line that is no address says so.
+    #[test]
+    fn a_pasted_list_is_sorted_into_addresses_subnets_and_ranges() {
+        let answer = classify(concat!(
+            "203.0.113.7\r\n198.51.100.0/24\n\n# office\n",
+            "192.0.2.10 - 192.0.2.20, 2001:db8::/48; example.com\n",
+            "198.0.0.0/7\n198.51.100.9/24",
+        ));
+        assert_eq!(answer["truncated"], json!(false));
+        let rows = answer["rows"].as_array().expect("rows");
+        let summary: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["value"].as_str().expect("value"),
+                    r["rule-type"].as_str().expect("rule-type"),
+                    r["status"].as_str().expect("status"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("203.0.113.7", "exact-ip", "valid"),
+                ("198.51.100.0/24", "subnet", "valid"),
+                ("192.0.2.10 - 192.0.2.20", "ip-range", "valid"),
+                ("2001:db8::/48", "subnet", "valid"),
+                ("example.com", "", "error"),
+                ("198.0.0.0/7", "subnet", "error"),
+                ("198.51.100.9/24", "subnet", "warning"),
+            ]
+        );
+        assert_eq!(rows[4]["message-key"], UNRECOGNIZED_LINE_KEY);
+        assert_eq!(
+            rows[5]["message-key"],
+            "rules.validation.match-value-invalid.network-too-wide"
+        );
+        assert_eq!(
+            rows[6]["message-key"],
+            "rules.validation.match-value-warning.subnet-host-bits"
+        );
+        assert_eq!(rows[6]["args"]["network"], "198.51.100.0/24");
+    }
+
+    /// Nothing past the Free cap could be added, so the answer stops there
+    /// and says it did.
+    #[test]
+    fn a_paste_longer_than_the_rule_cap_is_cut_and_flagged() {
+        let cap = nrr_shared::rules_json::FREE_MAX_RULES;
+        let text = (0..=cap)
+            .map(|i| format!("10.{}.{}.1", i / 256, i % 256))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let answer = classify(&text);
+        assert_eq!(answer["rows"].as_array().expect("rows").len(), cap);
+        assert_eq!(answer["truncated"], json!(true));
+        assert!(matches!(
+            handle_local_request("local.rule-values-classify", &json!({}), &empty_client()),
+            Err(LocalHandlerError::MissingField("text"))
         ));
     }
 

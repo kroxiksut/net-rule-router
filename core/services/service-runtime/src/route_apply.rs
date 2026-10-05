@@ -12,6 +12,7 @@
 //! optional gateway on every platform this product targets.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use nrr_platform_api::adapters::{AdapterEventSource, AdapterInfo, IfOperStatus};
@@ -42,6 +43,8 @@ pub struct PlannedRouteApplier {
     reconciler: SecondaryRouteReconciler,
     adapters: Arc<dyn AdapterEventSource>,
     bindings: Arc<dyn EgressBindingSource>,
+    /// Whether a previous run's routes have been taken over yet.
+    leftovers_adopted: AtomicBool,
 }
 
 impl PlannedRouteApplier {
@@ -54,6 +57,36 @@ impl PlannedRouteApplier {
             reconciler: SecondaryRouteReconciler::new(api),
             adapters,
             bindings,
+            leftovers_adopted: AtomicBool::new(false),
+        }
+    }
+
+    /// Take over the routes a previous run left in the table, once, before
+    /// the first reconcile. Without it a crash strands them: a wanted route's
+    /// add conflicts and is never claimed, an unwanted one is never deleted.
+    /// An unreadable table is retried on the next pass.
+    fn adopt_leftovers(&self) {
+        if self.leftovers_adopted.load(Ordering::Acquire) {
+            return;
+        }
+        match self.reconciler.adopt_signed_routes() {
+            Ok(count) => {
+                self.leftovers_adopted.store(true, Ordering::Release);
+                if count > 0 {
+                    tracing::info!(
+                        target: "nrr::routes",
+                        msg_key = "route-orphans-adopted",
+                        count,
+                        "adopted routes a previous run left in the table",
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "nrr::routes",
+                msg_key = "route-orphan-enum-failed",
+                error = %e,
+                "route table unreadable: a previous run's routes are adopted on a later pass",
+            ),
         }
     }
 
@@ -68,6 +101,7 @@ impl PlannedRouteApplier {
             .enumerate_all()
             .map_err(|e| format!("adapters could not be read: {e}"))?;
 
+        self.adopt_leftovers();
         let mut desired = Vec::new();
         let mut unresolved = Vec::new();
         for plan in plans {
@@ -109,6 +143,7 @@ impl PlannedRouteApplier {
     /// Drop every route this product owns — used when policy stops applying, so
     /// stopping the service restores the machine's own routing.
     pub fn clear(&self) -> Result<RouteApplyReport, String> {
+        self.adopt_leftovers();
         let delta = self
             .reconciler
             .clear()
@@ -198,5 +233,96 @@ mod tests {
     fn an_unspecified_index_is_refused() {
         let adapters = vec![adapter("tun0", 0, true, None)];
         assert!(target_for(&adapters, "tun0").is_none());
+    }
+
+    struct Bound;
+    impl EgressBindingSource for Bound {
+        fn bindings_for(
+            &self,
+            _: &nrr_platform_api::enforcement::UserPrincipal,
+        ) -> nrr_platform_api::enforcement::EgressBinding {
+            nrr_platform_api::enforcement::EgressBinding {
+                primary: Some("eth0".into()),
+                secondary: Some("tun0".into()),
+            }
+        }
+    }
+
+    fn row(
+        dst: [u8; 4],
+        prefix: u8,
+        metric: u32,
+        table: nrr_platform_api::RouteTableRef,
+    ) -> nrr_platform_api::RouteEntry {
+        nrr_platform_api::RouteEntry {
+            destination: std::net::IpAddr::V4(Ipv4Addr::from(dst)),
+            prefix_length: prefix,
+            next_hop: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            interface_index: 7,
+            metric,
+            is_ours: false,
+            table,
+        }
+    }
+
+    /// After a crash the table still holds our routes and no process owns
+    /// them. The first pass takes back what is no longer wanted and keeps the
+    /// rest — recognised by metric, shape and table, never by shape alone.
+    #[test]
+    fn the_first_pass_takes_over_what_a_previous_run_left() {
+        use nrr_platform_api::enforcement::{DstMatch, EgressRef, RouteIntent};
+        use nrr_platform_api::RouteTableRef;
+
+        let main = || RouteTableRef::Main;
+        let network = crate::route_codegen::NETWORK_ROUTE_METRIC;
+        let host = crate::route_codegen::SECONDARY_ROUTE_METRIC;
+        let wanted = row([198, 51, 100, 0], 24, network, main());
+        let foreign = vec![
+            row([10, 30, 0, 0], 16, 100, main()),
+            // A wide shape at the network metric is not a rule's route.
+            row([128, 0, 0, 0], 1, network, main()),
+            row([10, 40, 0, 0], 16, network, RouteTableRef::Tagged(51820)),
+        ];
+        let api = Arc::new(nrr_platform_api::MockWindowsApi::new());
+        let mut table = vec![
+            wanted.clone(),
+            row([10, 20, 0, 0], 16, network, main()),
+            row([0, 0, 0, 0], 1, host, main()),
+        ];
+        table.extend(foreign.iter().cloned());
+        api.set_route_table(table);
+        let adapters = Arc::new(nrr_platform_api::adapters::MockAdapterEventSource::new());
+        *adapters.adapters.lock().unwrap_or_else(|p| p.into_inner()) = vec![
+            adapter("eth0", 2, true, Some(Ipv4Addr::new(192, 168, 1, 1))),
+            adapter("tun0", 7, true, None),
+        ];
+        let applier = PlannedRouteApplier::new(
+            Arc::clone(&api) as Arc<dyn RouteTablePort>,
+            adapters as Arc<dyn AdapterEventSource>,
+            Arc::new(Bound),
+        );
+        let plan = EnforcementPlan {
+            principal: nrr_platform_api::enforcement::UserPrincipal::from_linux_uid(1000),
+            flows: Vec::new(),
+            routes: vec![RouteIntent {
+                dst: DstMatch::SubnetV4 {
+                    net: Ipv4Addr::new(198, 51, 100, 0),
+                    prefix: 24,
+                },
+                egress: EgressRef::Secondary,
+                metric: network,
+                table: RouteTableRef::Main,
+            }],
+            policy_rules: Vec::new(),
+        };
+
+        let report = applier.apply(&[plan]).expect("apply");
+
+        assert_eq!((report.added, report.removed), (0, 2));
+        let mut want = vec![wanted];
+        want.extend(foreign);
+        let left = api.get_ip_forward_table().expect("table");
+        assert_eq!(left.len(), want.len(), "{left:?}");
+        assert!(want.iter().all(|w| left.contains(w)), "{left:?}");
     }
 }

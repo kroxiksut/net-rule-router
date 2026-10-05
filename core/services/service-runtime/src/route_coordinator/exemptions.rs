@@ -70,8 +70,8 @@ impl SecondaryRouteCoordinator {
         // reading gives a kill-switch with no LAN, no DHCP and no printers
         // exempted — and nothing in the log to say why. Same posture as the
         // LUID failure above: stay off and let the next tick try again.
-        let routes = match &reading.routes {
-            Ok(routes) => routes.clone(),
+        let routes = match reading.routes_or_error() {
+            Ok(routes) => routes.to_vec(),
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",
@@ -83,7 +83,6 @@ impl SecondaryRouteCoordinator {
                 return None;
             }
         };
-        let routes = self.stamped_with_ownership(routes);
         let primary_gateway = resolution.primary.map(|p| p.gateway);
         let mut server_ips =
             bootstrap_server_ips(&routes, secondary.interface_index, primary_gateway);
@@ -218,8 +217,8 @@ impl SecondaryRouteCoordinator {
         // subnets this link was seen with — the same reasoning as the VPN-server
         // cache below. A stale LAN exemption permits a little more; an empty one
         // cuts the user's own network with nothing in the log.
-        let (routes, table_read) = match &reading.routes {
-            Ok(routes) => (routes.clone(), true),
+        let (routes, table_read) = match reading.routes_or_error() {
+            Ok(routes) => (routes.to_vec(), true),
             Err(e) => {
                 tracing::warn!(
                     target: "nrr::route-coordinator",

@@ -180,6 +180,7 @@ impl PerSidApplyOrchestrator {
         if intent.publishes() {
             crate::vpn_client_registry::global_confirmed_vpn_clients()
                 .publish(sid, &policy.link_provider_exe_paths);
+            crate::fake_ip::global_rule_networks().publish(sid, &rules.rule_book);
         }
         timings.mark("fake-ip");
         // One reading of the machine for the whole pass, and each resolver asked
@@ -822,6 +823,11 @@ impl PerSidApplyOrchestrator {
                 };
             match kill_switch().clone() {
                 Some(resolution) => {
+                    let holds = crate::enforcement_planner::NetworkHolds::for_pass(
+                        &ownership,
+                        &ks_dest_ips,
+                        || resolution.never_blocked_networks(),
+                    );
                     // Mode A (PreferPrimary) protects only the selected secondary
                     // destinations; mode B arms the catch-all (all off-tunnel).
                     let ks = match behavior_mode {
@@ -832,6 +838,12 @@ impl PerSidApplyOrchestrator {
                                 resolution.secondary_luid,
                                 protocols,
                             );
+                            ks.extend(crate::killswitch_codegen::kill_switch_network_filters(
+                                sid,
+                                &holds,
+                                resolution.secondary_luid,
+                                protocols,
+                            ));
                             //  — also pin secondary-routed apps to the
                             // secondary adapter egress (ALE layer only — no per-app ICMP).
                             // Main-named addresses need no rescue permits: the
@@ -868,6 +880,15 @@ impl PerSidApplyOrchestrator {
                             ks
                         }
                     };
+                    // A blanket block covers every network, so only a
+                    // per-destination posture leaves any of them open.
+                    let per_destination = behavior_mode == RouteBehaviorMode::PreferPrimary
+                        || (ks.is_empty() && fail_closed);
+                    if intent.publishes() {
+                        let blanket = crate::enforcement_planner::NetworkHolds::default();
+                        let in_force = if per_destination { &holds } else { &blanket };
+                        self.network_hold_log.note(sid, in_force);
+                    }
                     if ks.is_empty() {
                         // Leak-proof pair could not arm — honour the failure
                         // posture instead of silently allowing.
@@ -915,6 +936,7 @@ impl PerSidApplyOrchestrator {
                                 sid,
                                 behavior_mode,
                                 &ks_dest_ips,
+                                &holds,
                                 &exemptions,
                                 protocols,
                                 FailClosedPosture { block_all: false },
@@ -1076,6 +1098,19 @@ impl PerSidApplyOrchestrator {
                         let effective_block_all = effective_block_all
                             || behavior_mode != RouteBehaviorMode::PreferPrimary;
                         block_all_armed = effective_block_all;
+                        // The block-all covers every network itself.
+                        let holds = if effective_block_all {
+                            crate::enforcement_planner::NetworkHolds::default()
+                        } else {
+                            crate::enforcement_planner::NetworkHolds::for_pass(
+                                &ownership,
+                                &ks_dest_ips,
+                                || exemptions.never_blocked_networks(),
+                            )
+                        };
+                        if intent.publishes() {
+                            self.network_hold_log.note(sid, &holds);
+                        }
                         // Armed for BOTH shapes: with the default per-IP posture
                         // the block set covers only the addresses already known,
                         // which is exactly the state a DNS answer or a seeder
@@ -1085,6 +1120,7 @@ impl PerSidApplyOrchestrator {
                             sid,
                             behavior_mode,
                             &ks_dest_ips,
+                            &holds,
                             &exemptions,
                             protocols,
                             FailClosedPosture {

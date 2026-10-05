@@ -238,7 +238,7 @@ pub(crate) fn build_ipc_surface(
     cache_store: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
     conn_trace_ring: Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>,
     app_enforcement: nrr_service_runtime::app_enforcement_status::AppEnforcementStatus,
-    conn_trace_log_apply: Arc<dyn Fn(bool) + Send + Sync>,
+    conn_trace_log: nrr_service_runtime::boot_settings::ConnTraceLogSwitch,
     verbosity: Option<nrr_service_runtime::TracingVerbosityHandle>,
     key_store: Arc<dyn KeyStore>,
     // The daemon's own resolver: under the DNS redirect `/etc/resolv.conf`
@@ -318,8 +318,23 @@ pub(crate) fn build_ipc_surface(
     // Every rule change the GUI makes — preset import, table edits, rollback —
     // lands here; without it a preview came back empty and read as "nothing to
     // apply". The coordinator's dispatcher is what makes an approval take effect.
+    let screen_route_table = Arc::clone(&route_table);
     let mut mutation_executor = ProductionMutationExecutor::new(Arc::clone(&coordinator))
         .with_alerts_repo(Arc::clone(&alerts_repo))
+        // No fake-IP pool on this platform: only the links are screened.
+        .with_network_screen(Arc::new(
+            nrr_service_runtime::network_rule_screen::ProductionNetworkScreen::new(
+                // The tunnel servers the planner remembered: a subnet over one
+                // is refused while its tunnel is down.
+                nrr_service_runtime::network_rule_screen::facts_with_remembered_servers(
+                    screen_route_table,
+                    nrr_service_runtime::tunnel_server_memory::persisted_servers(Arc::clone(
+                        &state_conn,
+                    )),
+                ),
+                None,
+            ),
+        ))
         .with_state_conn(Arc::clone(&state_conn))
         .with_event_bus(Arc::clone(&event_bus))
         .with_pause_coordinator(Arc::clone(&pause_coordinator))
@@ -482,10 +497,10 @@ pub(crate) fn build_ipc_surface(
             >);
     // The stability fields this daemon applies live are the verbose window,
     // resumed here from the stored deadline, and the connection trace's log
-    // switch; the rest of the row is stored and not read.
+    // window; the rest of the row is stored and not read.
     let stability = {
         let writer = ProductionServiceStability::new(Arc::clone(&stats_state_conn))
-            .with_conn_trace_ndjson_apply(conn_trace_log_apply);
+            .with_conn_trace_log(&conn_trace_log);
         Arc::new(match verbosity {
             Some(handle) => writer.with_verbosity_control(Arc::new(handle)
                 as Arc<dyn nrr_service_runtime::verbosity_control::VerbosityControl>),

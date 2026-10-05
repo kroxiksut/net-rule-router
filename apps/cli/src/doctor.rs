@@ -167,6 +167,9 @@ pub struct Facts {
     /// What the service itself said when asked. `None` when the probe was not
     /// attempted at all (no service manager on this platform).
     pub service_answer: Option<ServiceAnswer>,
+    /// The registered binary is a byte-for-byte copy of the one shipped here:
+    /// an install that stages a copy into a system directory runs this build.
+    pub registered_is_shipped_copy: bool,
 }
 
 /// The outcome of asking the running service who it is.
@@ -296,6 +299,12 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
             Registration::Installed { run_state, .. } if *run_state == "running"
         );
         match (answer, claims_running) {
+            (ServiceAnswer::Answered { service_version }, _) if service_version == UNREPORTED => {
+                findings.push(Finding::pass(
+                    "service answered",
+                    "connected; it did not report its version".to_string(),
+                ));
+            }
             (ServiceAnswer::Answered { service_version }, _) => {
                 let detail = if service_version == facts.console_version {
                     format!("{service_version} (same as this console)")
@@ -405,6 +414,11 @@ fn registered_binary_finding(facts: &Facts, registered: Option<&Path>) -> Findin
     };
     if same_path(registered, shipped, facts.paths_are_case_insensitive) {
         Finding::pass("registered binary", registered.display().to_string())
+    } else if facts.registered_is_shipped_copy {
+        Finding::pass(
+            "registered binary",
+            format!("{} (a copy of the one shipped here)", registered.display()),
+        )
     } else {
         Finding::warn(
             "registered binary",
@@ -519,7 +533,18 @@ pub fn collect(port: Option<&dyn ServiceControlPort>) -> Facts {
 
     let profile = PlatformProfile::current();
     let registration = read_registration(port);
+    let registered_is_shipped_copy = match (&registration, sibling(BinaryRole::Service)) {
+        (
+            Registration::Installed {
+                binary_path: Some(registered),
+                ..
+            },
+            Some(shipped),
+        ) => same_contents(registered, &shipped),
+        _ => false,
+    };
     Facts {
+        registered_is_shipped_copy,
         console_version: env!("CARGO_PKG_VERSION"),
         console_path: console_path.clone(),
         service_binary: sibling(BinaryRole::Service),
@@ -555,6 +580,19 @@ fn probe_service(registration: &Registration) -> Option<ServiceAnswer> {
     }))
 }
 
+/// What stands for a version the handshake did not carry.
+const UNREPORTED: &str = "unreported";
+
+/// Whether two files hold the same bytes. Unreadable is "not the same": the
+/// finding then says what it would have said without the comparison.
+fn same_contents(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {}
+        _ => return false,
+    }
+    matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+}
+
 /// Turn the link outcome into the fact [`assess`] judges. The version is asked
 /// for only once connected.
 fn service_answer(link: Link, version: impl FnOnce() -> Option<String>) -> ServiceAnswer {
@@ -564,7 +602,7 @@ fn service_answer(link: Link, version: impl FnOnce() -> Option<String>) -> Servi
             // connection, not a version we do not have.
             service_version: version()
                 .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "unreported".to_string()),
+                .unwrap_or_else(|| UNREPORTED.to_string()),
         },
         Link::NotRunning | Link::NotAnswering => ServiceAnswer::Silent,
         Link::Refused(reason) => ServiceAnswer::Refused { reason },
@@ -613,7 +651,7 @@ fn read_registration(port: Option<&dyn ServiceControlPort>) -> Registration {
     match port.query() {
         Ok(Some(report)) => Registration::Installed {
             run_state: report.run_state.slug(),
-            start_mode: report.start_mode.map(|m| m.slug()),
+            start_mode: report.start_mode.map(crate::parse::start_mode_word),
             binary_path: report.binary_path,
         },
         Ok(None) => Registration::NotInstalled,
@@ -660,6 +698,7 @@ mod tests {
 
     fn facts(registration: Registration) -> Facts {
         Facts {
+            registered_is_shipped_copy: false,
             console_version: "0.0.0-test",
             console_path: Some(installed_binary(BinaryRole::Console)),
             service_binary: Some(installed_binary(BinaryRole::Service)),
@@ -686,7 +725,7 @@ mod tests {
     fn installed(binary: Option<PathBuf>, run_state: &'static str) -> Registration {
         Registration::Installed {
             run_state,
-            start_mode: Some("with-windows"),
+            start_mode: Some("auto"),
             binary_path: binary,
         }
     }
@@ -792,6 +831,27 @@ mod tests {
         assert!(finding
             .detail
             .contains(&installed_binary(BinaryRole::Service).display().to_string()));
+    }
+
+    /// An install that stages a copy into a system directory runs this very
+    /// build; only a different file is worth a warning.
+    #[test]
+    fn a_staged_copy_of_the_shipped_binary_is_not_a_stray() {
+        let stray = stray_binary(BinaryRole::Service);
+        let mut facts = facts(installed(Some(stray.clone()), "running"));
+        facts.registered_is_shipped_copy = true;
+        let findings = assess(&facts);
+        let finding = find(&findings, "registered binary");
+        assert_eq!(finding.level, Level::Pass);
+        assert!(finding.detail.contains(&stray.display().to_string()));
+    }
+
+    /// A version the handshake did not carry is unknown, not different.
+    #[test]
+    fn an_unreported_version_is_not_called_a_different_build() {
+        let mut facts = facts(installed(None, "running"));
+        facts.service_answer = Some(service_answer(Link::Connected, || None));
+        assert_eq!(find(&assess(&facts), "service answered").level, Level::Pass);
     }
 
     #[test]

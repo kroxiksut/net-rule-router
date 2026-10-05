@@ -30,6 +30,9 @@ pub struct PerSidFilterSet {
     /// Read off the LUID-conditional permits the leak-guard emits only once it
     /// has an adapter; the false → true edge is "the tunnel just came up".
     pub secondary_resolved: bool,
+    /// Rule networks the installed set scopes to, compared like
+    /// [`Self::destinations`] to name what just came under enforcement.
+    pub networks: Vec<nrr_shared::ip_block::IpBlock>,
 }
 
 /// What applying a candidate rule set to one SID would do — derived without

@@ -24,11 +24,12 @@ use std::collections::{BTreeMap, HashSet};
 use nrr_shared::rules_json::{AddressMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleDto};
 
 use crate::address_class::AddressClass;
+use crate::ip_network_policy::IpValueKind;
 use crate::rules_file::HostPlatform;
 use crate::rules_json_codec::wire_app_pattern;
 use crate::validation::{
-    canonical_app_pattern, canonical_host_name, canonical_ip_address, HostNameKind,
-    ValidationError, ValidationWarning,
+    canonical_app_pattern, canonical_host_name, canonical_ip_address, canonical_ip_range,
+    canonical_subnet, HostNameKind, ValidationError, ValidationWarning,
 };
 use crate::RuleId;
 
@@ -106,8 +107,8 @@ impl RuleValueValidation {
 
 /// Validate a rule's match value for the given rule-type slug.
 ///
-/// `rule_type_slug` is one of `"zone" | "domain" | "exact-ip" |
-/// "application"`. Unknown slugs return [`RuleValueValidation::Error`]
+/// `rule_type_slug` is one of `"zone" | "domain" | "exact-ip" | "subnet" |
+/// "ip-range" | "application"`. Unknown slugs return [`RuleValueValidation::Error`]
 /// with key `rules.validation.unknown-rule-type` so callers don't silently
 /// drop misconfigured snapshots.
 pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValueValidation {
@@ -119,6 +120,12 @@ pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValue
         "zone" => validate_host_name(HostNameKind::Zone, trimmed),
         "domain" => validate_host_name(HostNameKind::Domain, trimmed),
         "exact-ip" => validate_exact_ip(trimmed),
+        "subnet" => validate_network(trimmed, |value, warnings| {
+            canonical_subnet(value, &RuleId(String::new()), warnings).map(drop)
+        }),
+        "ip-range" => validate_network(trimmed, |value, warnings| {
+            canonical_ip_range(value, &RuleId(String::new()), warnings).map(drop)
+        }),
         "application" => validate_application(trimmed),
         _ => {
             let mut args = BTreeMap::new();
@@ -146,6 +153,9 @@ fn validate_exact_ip(value: &str) -> RuleValueValidation {
                 }
                 _ => "rules.validation.match-value-invalid.exact-ip-this-host",
             });
+        }
+        Err(ValidationError::WrongAddressSection { belongs_in, .. }) => {
+            return wrong_kind(belongs_in)
         }
         Err(_) => return exact_ip_refusal(value),
     }
@@ -192,6 +202,91 @@ fn exact_ip_refusal(value: &str) -> RuleValueValidation {
         }
     }
     RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip")
+}
+
+/// The value is another kind of address: name the type it belongs to.
+fn wrong_kind(belongs_in: IpValueKind) -> RuleValueValidation {
+    RuleValueValidation::error(match belongs_in {
+        IpValueKind::Address => "rules.validation.match-value-invalid.is-exact-ip",
+        IpValueKind::Subnet => "rules.validation.match-value-invalid.is-subnet",
+        IpValueKind::Range => "rules.validation.match-value-invalid.is-ip-range",
+    })
+}
+
+// ── subnet / ip-range ─────────────────────────────────────────────────────────
+
+/// The pipeline's verdict on a network or a range, warnings included.
+fn validate_network(
+    value: &str,
+    canonical: impl FnOnce(&str, &mut Vec<ValidationWarning>) -> Result<(), ValidationError>,
+) -> RuleValueValidation {
+    let mut warnings = Vec::new();
+    match canonical(value, &mut warnings) {
+        Ok(()) => {}
+        Err(ValidationError::WrongAddressSection { belongs_in, .. }) => {
+            return wrong_kind(belongs_in)
+        }
+        Err(ValidationError::InvalidSubnet { .. }) => {
+            return RuleValueValidation::error("rules.validation.match-value-invalid.subnet")
+        }
+        Err(ValidationError::NetworkTooWide { widest_prefix, .. }) => {
+            return RuleValueValidation::Error {
+                message_key: "rules.validation.match-value-invalid.network-too-wide".to_string(),
+                args: prefix_arg(widest_prefix),
+            }
+        }
+        Err(ValidationError::NetworkCoversReserved { .. }) => {
+            return RuleValueValidation::error(
+                "rules.validation.match-value-invalid.network-reserved",
+            )
+        }
+        Err(_) => {
+            return RuleValueValidation::error("rules.validation.match-value-invalid.ip-range")
+        }
+    }
+    let wide = warnings.iter().find_map(|w| match w {
+        ValidationWarning::WideNetwork {
+            public,
+            widest_prefix,
+            ..
+        } => Some((*public, *widest_prefix)),
+        _ => None,
+    });
+    if let Some((public, widest_prefix)) = wide {
+        return RuleValueValidation::Warning {
+            message_key: if public {
+                "rules.validation.match-value-warning.network-wide-public"
+            } else {
+                "rules.validation.match-value-warning.network-wide"
+            }
+            .to_string(),
+            args: prefix_arg(widest_prefix),
+        };
+    }
+    for warning in &warnings {
+        match warning {
+            ValidationWarning::SubnetHostBitsCleared { normalized, .. } => {
+                let mut args = BTreeMap::new();
+                args.insert("network".to_string(), normalized.clone());
+                return RuleValueValidation::Warning {
+                    message_key: "rules.validation.match-value-warning.subnet-host-bits"
+                        .to_string(),
+                    args,
+                };
+            }
+            ValidationWarning::UnusualIpDestination { .. } => {
+                return RuleValueValidation::warning(
+                    "rules.validation.match-value-warning.exact-ip-link-local",
+                )
+            }
+            _ => {}
+        }
+    }
+    RuleValueValidation::Valid
+}
+
+fn prefix_arg(prefix: u8) -> BTreeMap<String, String> {
+    BTreeMap::from([("prefix".to_string(), prefix.to_string())])
 }
 
 // ── zone / domain ─────────────────────────────────────────────────────────────
@@ -294,7 +389,12 @@ pub fn wire_rule_values(rule: &RuleDto) -> impl Iterator<Item = (&'static str, S
         AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
             ("exact-ip", address.clone())
         }
+        AddressMatchDto::Subnet { network } => ("subnet", network.clone()),
+        AddressMatchDto::IpRange { first, last } => ("ip-range", format!("{first}-{last}")),
+        // Kept for a newer build, never judged by this one.
+        AddressMatchDto::Unrecognized(_) => ("", String::new()),
     });
+    let address = address.filter(|(kind, _)| !kind.is_empty());
     let app = rule.app_match.as_ref().map(|m| match &m.pattern {
         AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => {
             ("application", value.clone())
@@ -367,15 +467,33 @@ pub fn drop_rules_refused_outright(book: &mut CanonicalRulesJsonV1) -> Vec<Refus
 /// The value that puts `rule` beyond any book, as the rules table shows it.
 fn refused_outright(rule: &RuleDto) -> Option<String> {
     let no_rule = RuleId(String::new());
-    if let Some(AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address }) =
-        &rule.address_match
-    {
-        if matches!(
-            canonical_ip_address(address, &no_rule, &mut Vec::new()),
-            Err(ValidationError::IpAddressNotADestination { .. })
-        ) {
-            return Some(address.clone());
+    match &rule.address_match {
+        Some(AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address }) => {
+            if matches!(
+                canonical_ip_address(address, &no_rule, &mut Vec::new()),
+                Err(ValidationError::IpAddressNotADestination { .. })
+            ) {
+                return Some(address.clone());
+            }
         }
+        Some(AddressMatchDto::Subnet { network }) => {
+            if matches!(
+                canonical_subnet(network, &no_rule, &mut Vec::new()),
+                Err(ValidationError::NetworkCoversReserved { .. })
+            ) {
+                return Some(network.clone());
+            }
+        }
+        Some(AddressMatchDto::IpRange { first, last }) => {
+            let value = format!("{first}-{last}");
+            if matches!(
+                canonical_ip_range(&value, &no_rule, &mut Vec::new()),
+                Err(ValidationError::NetworkCoversReserved { .. })
+            ) {
+                return Some(value);
+            }
+        }
+        _ => {}
     }
     let app = rule.app_match.as_ref()?;
     // The refusal does not depend on the platform's spelling of names.
@@ -541,14 +659,54 @@ mod tests {
 
     #[test]
     fn a_subnet_a_range_or_a_name_is_not_an_address() {
-        for value in [
+        err(
+            "exact-ip",
             "192.168.1.0/24",
+            "match-value-invalid.is-subnet",
+        );
+        err(
+            "exact-ip",
             "10.0.0.1-10.0.0.9",
-            "abc.def",
-            "fe80::1%3",
-        ] {
+            "match-value-invalid.is-ip-range",
+        );
+        for value in ["abc.def", "fe80::1%3"] {
             err("exact-ip", value, "match-value-invalid.exact-ip");
         }
+    }
+
+    #[test]
+    fn a_subnet_is_judged_by_its_width_and_class() {
+        ok("subnet", "10.0.0.0/16");
+        ok("subnet", "2001:db8::/48");
+        err("subnet", "10.0.0.0/7", "network-too-wide");
+        err("subnet", "127.0.0.0/16", "network-reserved");
+        err("subnet", "224.0.0.0/8", "network-reserved");
+        err("subnet", "10.0.0.0/33", "match-value-invalid.subnet");
+        err("subnet", "192.0.2.1", "match-value-invalid.is-exact-ip");
+        err(
+            "subnet",
+            "10.0.0.1-10.0.0.9",
+            "match-value-invalid.is-ip-range",
+        );
+        warn("subnet", "10.0.0.0/8", "network-wide");
+        warn("subnet", "8.0.0.0/12", "network-wide-public");
+        warn("subnet", "10.0.2.7/24", "subnet-host-bits");
+        warn("subnet", "169.254.1.0/24", "link-local");
+    }
+
+    #[test]
+    fn a_range_is_judged_by_its_blocks() {
+        ok("ip-range", "10.0.0.5-10.0.0.40");
+        ok("ip-range", "2001:db8::1 - 2001:db8::ff");
+        err(
+            "ip-range",
+            "10.0.0.9-10.0.0.1",
+            "match-value-invalid.ip-range",
+        );
+        err("ip-range", "10.0.0.0-11.0.0.0", "network-too-wide");
+        err("ip-range", "126.255.255.0-127.0.0.1", "network-reserved");
+        err("ip-range", "10.0.0.0/24", "match-value-invalid.is-subnet");
+        warn("ip-range", "10.0.0.0-10.3.255.255", "network-wide");
     }
 
     #[test]

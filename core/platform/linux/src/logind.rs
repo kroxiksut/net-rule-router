@@ -55,8 +55,10 @@ struct LoginctlUser {
     user: String,
     #[serde(default)]
     linger: bool,
+    /// Absent before systemd 254: that `list-users` names a user without a
+    /// state, which [`user_state`] then asks for one by one.
     #[serde(default)]
-    state: String,
+    state: Option<String>,
 }
 
 /// How the user list is asked for, newest spelling first.
@@ -107,7 +109,23 @@ fn live_users_via(args: &[&str]) -> Result<Vec<LiveUser>, LogindError> {
             stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         });
     }
-    parse_live_users(&String::from_utf8_lossy(&out.stdout))
+    parse_live_users(&String::from_utf8_lossy(&out.stdout), user_state)
+}
+
+/// One user's state, for a `list-users` that did not print it. `None` when the
+/// lookup fails: the list has just answered, so a failure here is a user who
+/// left between the two calls, not a logind that cannot be asked.
+fn user_state(uid: u32) -> Option<String> {
+    let uid = uid.to_string();
+    let out = crate::command::output_with_timeout(
+        "loginctl",
+        &["show-user", &uid, "--property=State", "--value"],
+        crate::command::DEFAULT_COMMAND_TIMEOUT,
+    )
+    .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Everything that can go wrong asking the question.
@@ -146,15 +164,28 @@ impl std::fmt::Display for LogindError {
 
 impl std::error::Error for LogindError {}
 
-/// Rows in, live users out. Pure over the bytes, so it is tested on every OS.
-fn parse_live_users(stdout: &str) -> Result<Vec<LiveUser>, LogindError> {
+/// Rows in, live users out. Pure over the bytes and `state_of`, so it is
+/// tested on every OS.
+fn parse_live_users(
+    stdout: &str,
+    state_of: impl Fn(u32) -> Option<String>,
+) -> Result<Vec<LiveUser>, LogindError> {
     let text = stdout.trim();
     if text.is_empty() {
         return Ok(Vec::new());
     }
     let rows: Vec<LoginctlUser> =
         serde_json::from_str(text).map_err(|e| LogindError::Unreadable(e.to_string()))?;
-    Ok(rows.into_iter().filter_map(to_live_user).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|mut row| {
+            let state = match row.state.take() {
+                Some(state) => state,
+                None => state_of(row.uid)?,
+            };
+            to_live_user(row, &state)
+        })
+        .collect())
 }
 
 /// Which states mean "enforce for this user".
@@ -163,8 +194,8 @@ fn parse_live_users(stdout: &str) -> Result<Vec<LiveUser>, LogindError> {
 /// - `lingering` — no session, but linger keeps their services running.
 /// - anything else, `closing` included — not counted. A state this version does
 ///   not know is not evidence of presence.
-fn to_live_user(row: LoginctlUser) -> Option<LiveUser> {
-    let state = row.state.to_ascii_lowercase();
+fn to_live_user(row: LoginctlUser, state: &str) -> Option<LiveUser> {
+    let state = state.to_ascii_lowercase();
     let live = matches!(state.as_str(), "active" | "online" | "lingering");
     live.then(|| LiveUser {
         uid: row.uid,
@@ -205,11 +236,31 @@ impl nrr_platform_api::active_principals::ActivePrincipalSource for LogindActive
 mod tests {
     use super::*;
 
+    /// A current systemd: every row carries its state, nothing is looked up.
+    fn listed(stdout: &str) -> Result<Vec<LiveUser>, LogindError> {
+        parse_live_users(stdout, |uid| unreachable!("uid {uid} came with its state"))
+    }
+
+    #[test]
+    fn a_list_without_states_asks_for_each_one() {
+        // systemd 253 (RHEL 9 family) prints no `state` in `list-users`.
+        let text = r#"[{"uid":1000,"user":"a","linger":false},
+                       {"uid":1001,"user":"b","linger":false},
+                       {"uid":1002,"user":"c","linger":false}]"#;
+        let users = parse_live_users(text, |uid| match uid {
+            1000 => Some("active".to_string()),
+            1001 => Some("closing".to_string()),
+            _ => None,
+        })
+        .expect("parses");
+        assert_eq!(users.len(), 1, "closing and vanished users are not live");
+        assert_eq!(users[0].uid, 1000);
+    }
+
     #[test]
     fn an_attached_session_counts() {
-        let users =
-            parse_live_users(r#"[{"uid":1000,"user":"alice","linger":false,"state":"active"}]"#)
-                .expect("parses");
+        let users = listed(r#"[{"uid":1000,"user":"alice","linger":false,"state":"active"}]"#)
+            .expect("parses");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].uid, 1000);
         assert_eq!(users[0].name, "alice");
@@ -221,17 +272,15 @@ mod tests {
         // The case this module exists for: the terminal is gone, the work is
         // not. `online` means sessions exist without one being in the
         // foreground.
-        let users =
-            parse_live_users(r#"[{"uid":1000,"user":"alice","linger":false,"state":"online"}]"#)
-                .expect("parses");
+        let users = listed(r#"[{"uid":1000,"user":"alice","linger":false,"state":"online"}]"#)
+            .expect("parses");
         assert_eq!(users.len(), 1);
     }
 
     #[test]
     fn linger_without_a_session_counts_and_is_flagged() {
-        let users =
-            parse_live_users(r#"[{"uid":900,"user":"svc","linger":true,"state":"lingering"}]"#)
-                .expect("parses");
+        let users = listed(r#"[{"uid":900,"user":"svc","linger":true,"state":"lingering"}]"#)
+            .expect("parses");
         assert!(
             users[0].lingering,
             "the caller logs this differently: nobody is logged in, yet we enforce"
@@ -241,29 +290,27 @@ mod tests {
     #[test]
     fn a_user_on_the_way_out_does_not_count() {
         // Enforcing for someone who just logged out would outlive them.
-        let users =
-            parse_live_users(r#"[{"uid":1000,"user":"alice","linger":false,"state":"closing"}]"#)
-                .expect("parses");
+        let users = listed(r#"[{"uid":1000,"user":"alice","linger":false,"state":"closing"}]"#)
+            .expect("parses");
         assert!(users.is_empty());
     }
 
     #[test]
     fn an_unknown_state_does_not_count() {
-        let users =
-            parse_live_users(r#"[{"uid":1000,"user":"alice","linger":false,"state":"whatever"}]"#)
-                .expect("parses");
+        let users = listed(r#"[{"uid":1000,"user":"alice","linger":false,"state":"whatever"}]"#)
+            .expect("parses");
         assert!(users.is_empty());
     }
 
     #[test]
     fn nobody_logged_in_is_an_answer_not_an_error() {
-        assert!(parse_live_users("[]").expect("parses").is_empty());
-        assert!(parse_live_users("").expect("empty output").is_empty());
+        assert!(listed("[]").expect("parses").is_empty());
+        assert!(listed("").expect("empty output").is_empty());
     }
 
     #[test]
     fn several_users_are_all_reported() {
-        let users = parse_live_users(
+        let users = listed(
             r#"[{"uid":1000,"user":"a","linger":false,"state":"active"},
                 {"uid":1001,"user":"b","linger":false,"state":"online"},
                 {"uid":1002,"user":"c","linger":false,"state":"closing"}]"#,
@@ -291,7 +338,7 @@ mod tests {
         // What an older systemd prints. Its footer ("2 users listed.") reads as
         // uid 2 to a first-field parser — a fabricated user is worse than a
         // refusal, so this must be an error.
-        let err = parse_live_users(
+        let err = listed(
             "1000 alice no active
 2 users listed.
 ",

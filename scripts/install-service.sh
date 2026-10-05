@@ -4,7 +4,7 @@
 # ServiceControlPort implementation (LinuxServiceControl), different driver.
 #
 # Two differences from install-service.ps1:
-#   * the build output is staged into /usr/lib/netrulerouter first — the unit
+#   * the build output is staged into /usr/libexec/netrulerouter first — the unit
 #     sets ProtectHome=yes and `install` refuses a daemon under /home, which
 #     could only ever fail at exec with 203;
 #   * `nrr-serviced install` enables AND starts the unit in one step

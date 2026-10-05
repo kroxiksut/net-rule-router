@@ -56,7 +56,7 @@ impl SecondaryRouteCoordinator {
                         sid = %sid,
                         "routing paused for this user (persist policy) — keeping /32 rule-routes, dropping overlays only",
                     );
-                    return self.teardown_keep_secondary_hosts();
+                    return self.teardown_keep_rule_routes();
                 }
             }
         }
@@ -124,13 +124,10 @@ impl SecondaryRouteCoordinator {
         self.reconciler.clear()
     }
 
-    /// graceful-stop teardown that KEEPS the secondary
-    /// `/32` rule-routes and removes only NRR's overlays, so rule-matched hosts
-    /// keep egressing the secondary adapter after the service stops. VPN-type-aware
-    /// without probing: removing the overlays lets the OS route the rest to the
-    /// primary (gateway-less VPN) or the VPN's own default (full-tunnel VPN). See
-    /// [`SecondaryRouteReconciler::retain_secondary_hosts`].
-    pub fn teardown_keep_secondary_hosts(&self) -> Result<RouteReconcileDelta, PlatformError> {
-        self.reconciler.retain_secondary_hosts()
+    /// Graceful-stop teardown: rule routes stay, our overlays go, and the OS
+    /// routes the rest to the primary or the VPN's own default. See
+    /// [`SecondaryRouteReconciler::retain_rule_routes`].
+    pub fn teardown_keep_rule_routes(&self) -> Result<RouteReconcileDelta, PlatformError> {
+        self.reconciler.retain_rule_routes()
     }
 }

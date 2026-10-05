@@ -412,7 +412,7 @@ pub(crate) fn build_ipc_server(
                     Arc::clone(&stack.cache_store),
                     stack.conn_trace.ring(),
                     stack.app_enforcement.clone(),
-                    stack.conn_trace_log.apply_hook(),
+                    stack.conn_trace_log.clone(),
                     verbosity,
                     // Beside the state database it signs, under the same `0700`.
                     Arc::new(nrr_platform_linux::key_store::FileKeyStore::in_state_dir(
@@ -783,7 +783,7 @@ pub(crate) struct PolicyStack {
     /// The connection-trace panel: the app-destination tick writes it, the IPC
     /// surface reads it.
     pub conn_trace: Arc<nrr_service_runtime::conn_observation_consumer::ConnTraceTee>,
-    /// The tee's "write to the log" switch, for the settings writer to flip.
+    /// The tee's "write to the log" window, for the settings writer to move.
     pub conn_trace_log: nrr_service_runtime::boot_settings::ConnTraceLogSwitch,
     /// The ledger both readers share: the housekeeping tick counts into it and
     /// the IPC surface reports from it. Two samplers would be two connections,
@@ -974,6 +974,19 @@ pub(crate) fn build_policy_stack(
             Arc::new(nrr_platform_linux::LinuxApi),
             Arc::clone(&adapter_port),
         )
+        // A WireGuard server shows in no route, and any server vanishes with
+        // its tunnel; the memory keeps planning around both. The same table
+        // the network screen reads.
+        .with_tunnel_servers(
+            Arc::new(
+                nrr_service_runtime::tunnel_server_memory::TunnelServerMemory::over_state_db(
+                    Arc::clone(&state_conn),
+                ),
+            ),
+            Some(Arc::new(
+                nrr_platform_linux::tunnel_endpoints::LinuxTunnelEndpoints::new(),
+            )),
+        )
         .with_rule_conflicts(app_enforcement.clone()),
     );
     // The tracker turns a stream of probe results into a verdict with
@@ -1045,8 +1058,8 @@ pub(crate) fn build_policy_stack(
             )
     };
 
-    // Writing the trace to the log follows the saved switch live, the same
-    // switch the other platform's observer reads; the sentinel file in the
+    // Writing the trace to the log is a window that closes by itself, the
+    // same one the other platform's observer reads; the sentinel file in the
     // data directory forces it on.
     let conn_trace_log = nrr_service_runtime::boot_settings::ConnTraceLogSwitch::at_boot(
         Some(&conn_for_stability),

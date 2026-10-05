@@ -16,30 +16,46 @@ use crate::canonical::{CanonicalRule, CanonicalRuleBook, RuleAction};
 
 /// What a rule's conditions constrain.
 ///
-/// Exhaustive on purpose: a destination qualifier (ports, protocols, a CIDR)
-/// arrives as a new variant, and [`shape_verdict`] then refuses to compile
-/// until its support is decided.
+/// Exhaustive on purpose: a destination qualifier (ports, protocols) arrives
+/// as a new variant, and [`shape_verdict`] then refuses to compile until its
+/// support is decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RuleShape {
     /// A destination only: every application's traffic to it.
     Destination,
+    /// A network destination only — a subnet or a range.
+    NetworkDestination,
     /// An application only: every connection it opens.
     Source,
     /// One application's traffic to one destination.
     SourceAndDestination,
+    /// One application's traffic to a network.
+    SourceAndNetwork,
 }
 
 impl RuleShape {
     /// Every shape, for exhaustive tables and tests.
-    pub const ALL: [Self; 3] = [Self::Destination, Self::Source, Self::SourceAndDestination];
+    pub const ALL: [Self; 5] = [
+        Self::Destination,
+        Self::NetworkDestination,
+        Self::Source,
+        Self::SourceAndDestination,
+        Self::SourceAndNetwork,
+    ];
 
     /// The shape of `rule`; `None` for a rule with no condition, which
     /// validation refuses on its own.
     #[must_use]
     pub fn of(rule: &CanonicalRule) -> Option<Self> {
+        let network = rule
+            .address_match
+            .as_ref()
+            .is_some_and(|m| m.ip_blocks().is_some());
         match (rule.address_match.is_some(), rule.app_match.is_some()) {
+            (true, false) if network => Some(Self::NetworkDestination),
             (true, false) => Some(Self::Destination),
             (false, true) => Some(Self::Source),
+            (true, true) if network => Some(Self::SourceAndNetwork),
             (true, true) => Some(Self::SourceAndDestination),
             (false, false) => None,
         }
@@ -58,13 +74,17 @@ pub struct RuleShapeSupport {
     /// Route one application's traffic to a destination over a link, leaving
     /// other applications' traffic to it on its own route.
     pub app_scoped_destination_route: bool,
+    /// Route and block a whole network: filters, routes and Fail-Closed carry
+    /// a subnet, not only a host.
+    pub network_destination: bool,
 }
 
 impl RuleShapeSupport {
-    /// No app-scoped destination shapes.
+    /// No app-scoped destination shapes, no networks.
     pub const NONE: Self = Self {
         app_scoped_destination_block: false,
         app_scoped_destination_route: false,
+        network_destination: false,
     };
 }
 
@@ -76,6 +96,8 @@ pub enum UnsupportedShapeReason {
     AppScopedDestinationBlock,
     /// An application + destination route.
     AppScopedDestinationRoute,
+    /// A subnet or a range, on a platform that enforces hosts only.
+    NetworkDestination,
 }
 
 impl UnsupportedShapeReason {
@@ -84,6 +106,7 @@ impl UnsupportedShapeReason {
         match self {
             Self::AppScopedDestinationBlock => "app-scoped-destination-block",
             Self::AppScopedDestinationRoute => "app-scoped-destination-route",
+            Self::NetworkDestination => "network-destination",
         }
     }
 }
@@ -115,9 +138,20 @@ pub const fn shape_verdict(
     action: RuleAction,
     support: RuleShapeSupport,
 ) -> ShapeVerdict {
+    let network = matches!(
+        shape,
+        RuleShape::NetworkDestination | RuleShape::SourceAndNetwork
+    );
+    if network && !support.network_destination {
+        return ShapeVerdict::Unsupported {
+            reason: UnsupportedShapeReason::NetworkDestination,
+        };
+    }
     match (shape, action) {
-        (RuleShape::Destination | RuleShape::Source, _) => ShapeVerdict::Supported,
-        (RuleShape::SourceAndDestination, RuleAction::Block) => {
+        (RuleShape::Destination | RuleShape::NetworkDestination | RuleShape::Source, _) => {
+            ShapeVerdict::Supported
+        }
+        (RuleShape::SourceAndDestination | RuleShape::SourceAndNetwork, RuleAction::Block) => {
             if support.app_scoped_destination_block {
                 ShapeVerdict::Supported
             } else {
@@ -126,7 +160,7 @@ pub const fn shape_verdict(
                 }
             }
         }
-        (RuleShape::SourceAndDestination, RuleAction::Route) => {
+        (RuleShape::SourceAndDestination | RuleShape::SourceAndNetwork, RuleAction::Route) => {
             if support.app_scoped_destination_route {
                 ShapeVerdict::Supported
             } else {
@@ -199,13 +233,20 @@ mod tests {
 
     const ACTIONS: [RuleAction; 2] = [RuleAction::Route, RuleAction::Block];
 
-    fn all_supports() -> [RuleShapeSupport; 4] {
-        [(false, false), (true, false), (false, true), (true, true)].map(|(block, route)| {
-            RuleShapeSupport {
-                app_scoped_destination_block: block,
-                app_scoped_destination_route: route,
+    fn all_supports() -> Vec<RuleShapeSupport> {
+        let mut out = Vec::new();
+        for block in [false, true] {
+            for route in [false, true] {
+                for network in [false, true] {
+                    out.push(RuleShapeSupport {
+                        app_scoped_destination_block: block,
+                        app_scoped_destination_route: route,
+                        network_destination: network,
+                    });
+                }
             }
-        })
+        }
+        out
     }
 
     fn rule(id: &str, address: bool, app: bool, action: RuleAction) -> CanonicalRule {
@@ -228,7 +269,7 @@ mod tests {
         let supports = all_supports();
         for (i, a) in supports.iter().enumerate() {
             for b in &supports[i + 1..] {
-                assert_ne!(a, b, "the four combinations are distinct");
+                assert_ne!(a, b, "the combinations are distinct");
             }
         }
     }
@@ -238,27 +279,34 @@ mod tests {
         for shape in RuleShape::ALL {
             for action in ACTIONS {
                 for support in all_supports() {
-                    let expected = match (shape, action) {
-                        (RuleShape::Destination | RuleShape::Source, _) => ShapeVerdict::Supported,
-                        (RuleShape::SourceAndDestination, RuleAction::Block)
-                            if support.app_scoped_destination_block =>
-                        {
-                            ShapeVerdict::Supported
+                    let app_scoped = matches!(
+                        shape,
+                        RuleShape::SourceAndDestination | RuleShape::SourceAndNetwork
+                    );
+                    let network = matches!(
+                        shape,
+                        RuleShape::NetworkDestination | RuleShape::SourceAndNetwork
+                    );
+                    let expected = if network && !support.network_destination {
+                        ShapeVerdict::Unsupported {
+                            reason: UnsupportedShapeReason::NetworkDestination,
                         }
-                        (RuleShape::SourceAndDestination, RuleAction::Block) => {
-                            ShapeVerdict::Unsupported {
+                    } else if !app_scoped {
+                        ShapeVerdict::Supported
+                    } else {
+                        match action {
+                            RuleAction::Block if support.app_scoped_destination_block => {
+                                ShapeVerdict::Supported
+                            }
+                            RuleAction::Block => ShapeVerdict::Unsupported {
                                 reason: UnsupportedShapeReason::AppScopedDestinationBlock,
+                            },
+                            RuleAction::Route if support.app_scoped_destination_route => {
+                                ShapeVerdict::Supported
                             }
-                        }
-                        (RuleShape::SourceAndDestination, RuleAction::Route)
-                            if support.app_scoped_destination_route =>
-                        {
-                            ShapeVerdict::Supported
-                        }
-                        (RuleShape::SourceAndDestination, RuleAction::Route) => {
-                            ShapeVerdict::Unsupported {
+                            RuleAction::Route => ShapeVerdict::Unsupported {
                                 reason: UnsupportedShapeReason::AppScopedDestinationRoute,
-                            }
+                            },
                         }
                     };
                     assert_eq!(
@@ -275,7 +323,7 @@ mod tests {
     fn one_flag_never_unlocks_the_other_action() {
         let block_only = RuleShapeSupport {
             app_scoped_destination_block: true,
-            app_scoped_destination_route: false,
+            ..RuleShapeSupport::NONE
         };
         assert!(!shape_verdict(
             RuleShape::SourceAndDestination,
@@ -284,8 +332,8 @@ mod tests {
         )
         .is_supported());
         let route_only = RuleShapeSupport {
-            app_scoped_destination_block: false,
             app_scoped_destination_route: true,
+            ..RuleShapeSupport::NONE
         };
         assert!(!shape_verdict(
             RuleShape::SourceAndDestination,
@@ -311,6 +359,18 @@ mod tests {
             Some(RuleShape::SourceAndDestination)
         );
         assert_eq!(RuleShape::of(&rule("n", false, false, a)), None);
+        let mut net = rule("net", true, false, a);
+        net.address_match = Some(CanonicalAddressMatch::Subnet(
+            nrr_shared::ip_block::IpBlock::parse("10.0.0.0/16").expect("subnet"),
+        ));
+        assert_eq!(RuleShape::of(&net), Some(RuleShape::NetworkDestination));
+        assert_eq!(
+            rule_verdict(&net, RuleShapeSupport::NONE),
+            ShapeVerdict::Unsupported {
+                reason: UnsupportedShapeReason::NetworkDestination
+            },
+            "a host-only platform refuses a network rather than widening it"
+        );
         assert!(rule_verdict(&rule("n", false, false, a), RuleShapeSupport::NONE).is_supported());
     }
 
@@ -344,6 +404,7 @@ mod tests {
         let all = RuleShapeSupport {
             app_scoped_destination_block: true,
             app_scoped_destination_route: true,
+            network_destination: true,
         };
         assert!(first_unsupported(&book, all).is_none());
     }

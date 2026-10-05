@@ -343,8 +343,12 @@ impl IpcHandler for BlockNoticeRouteToSecondaryHandler {
         }
         // A raw address has no hostname a suffix rule can match — the notice
         // falls back to the address only when the host was never learned, and
-        // there is nothing to route by in that case.
-        if destination.parse::<IpAddr>().is_ok() {
+        // there is nothing to route by in that case. A notice named by a
+        // blocked network has none either.
+        if destination.parse::<IpAddr>().is_ok()
+            || nrr_shared::ip_block::IpBlock::parse(&destination).is_some()
+            || nrr_shared::ip_block::IpRange::parse(&destination).is_some()
+        {
             return Err(IpcError {
                 code: IpcErrorCode::PreconditionFailed,
                 message: "this destination has no known hostname to route by".to_string(),
@@ -847,6 +851,26 @@ mod tests {
             )
             .expect_err("no hostname");
         assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+    }
+
+    #[test]
+    fn a_network_destination_is_refused_rather_than_authored_as_a_suffix() {
+        for destination in ["198.51.100.0/24", "198.51.100.5-198.51.100.40"] {
+            let author = Arc::new(RecordingAuthor::ok(1));
+            let h = BlockNoticeRouteToSecondaryHandler::new(
+                Arc::clone(&author) as Arc<dyn AutoRuleAuthor>
+            );
+            let err = h
+                .handle(
+                    &req(
+                        IpcOperationName::BlockNoticeRouteToSecondary,
+                        serde_json::json!({ "destination": destination }),
+                    ),
+                    &ctx(Some("S-A")),
+                )
+                .expect_err("a network has no hostname");
+            assert_eq!(err.code, IpcErrorCode::PreconditionFailed, "{destination}");
+        }
     }
 
     #[test]

@@ -78,6 +78,10 @@ pub struct OperationError {
     pub code: String,
     /// English operator-facing message.
     pub message: String,
+    /// Values the GUI substitutes into the localized text of `code`
+    /// (kebab-case keys); empty for a refusal that needs none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub args: std::collections::BTreeMap<String, String>,
 }
 
 /// Who owns an operation submitted through `ctx`, in stored form. `None` when
@@ -246,6 +250,7 @@ mod tests {
         s.fail(
             &id,
             OperationError {
+                args: Default::default(),
                 code: "mutation.rejected.policy-degraded".into(),
                 message: "service is degraded".into(),
             },

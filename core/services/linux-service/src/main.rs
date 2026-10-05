@@ -43,6 +43,13 @@ use cli::Command;
 const DAEMON_NAME: &str = nrr_shared::product_identity::BinaryRole::Service.unix_file_name();
 
 fn main() -> ExitCode {
+    // Before any handler runs, as on Windows: the handshake reports this
+    // version, and the boot-timing card measures from this instant.
+    #[cfg(target_os = "linux")]
+    {
+        nrr_service_runtime::set_service_binary_version(env!("CARGO_PKG_VERSION"));
+        let _ = nrr_service_runtime::process_started_at_ms();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match cli::parse_command(&args) {
         Command::Help => {

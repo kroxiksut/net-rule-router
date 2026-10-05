@@ -1193,7 +1193,8 @@ fn an_unreadable_preset_previews_as_a_refusal() {
     assert_eq!(
         review.risk_signals,
         vec![RiskSignalDto::ChangeRefused {
-            code: "file-encoding".into()
+            code: "file-encoding".into(),
+            args: Default::default(),
         }]
     );
     assert!(
@@ -1238,7 +1239,8 @@ fn preset_and_rules_payload_refuse_a_control_character_alike() {
     assert_eq!(
         review.risk_signals,
         vec![RiskSignalDto::ChangeRefused {
-            code: "control-character".into()
+            code: "control-character".into(),
+            args: Default::default(),
         }]
     );
 
@@ -1265,7 +1267,8 @@ fn preset_and_rules_payload_refuse_a_control_character_alike() {
     assert_eq!(
         review.risk_signals,
         vec![RiskSignalDto::ChangeRefused {
-            code: "control-character".into()
+            code: "control-character".into(),
+            args: Default::default(),
         }]
     );
 }
@@ -1859,7 +1862,8 @@ fn a_rule_naming_both_an_app_and_an_address_is_refused_at_submission() {
         assert_eq!(
             review.risk_signals,
             vec![RiskSignalDto::ChangeRefused {
-                code: "unsupported-rule-shape".into()
+                code: "unsupported-rule-shape".into(),
+                args: Default::default(),
             }],
             "the refused preview must not read as an unchanged rule set"
         );
@@ -2063,7 +2067,8 @@ fn a_rules_update_past_the_app_rule_budget_is_refused() {
         preview
             .risk_signals
             .contains(&RiskSignalDto::ChangeRefused {
-                code: "auto-rule-cap-exceeded".into()
+                code: "auto-rule-cap-exceeded".into(),
+                args: Default::default(),
             }),
         "{:?}",
         preview.risk_signals
@@ -2160,7 +2165,8 @@ fn a_book_past_the_app_budget_stays_editable_but_cannot_grow() {
         preview
             .risk_signals
             .contains(&RiskSignalDto::ChangeRefused {
-                code: "auto-rule-cap-exceeded".into()
+                code: "auto-rule-cap-exceeded".into(),
+                args: Default::default(),
             }),
         "{:?}",
         preview.risk_signals
@@ -2269,4 +2275,325 @@ fn the_review_names_where_a_rules_change_came_from() {
         sid,
     );
     assert_eq!(reset.provenance, "service");
+}
+
+// ── Rules of an unknown kind, network screening ─────────────────────────
+
+/// A book a newer build wrote: one rule this build reads, one it cannot.
+fn book_with_unknown_kind(known_value: &str) -> String {
+    serde_json::json!({
+        "schema-version": 3,
+        "primary": [
+            {
+                "id": "r-known",
+                "enabled": true,
+                "address-match": { "kind": "exact-fqdn", "value": known_value },
+                "comment": "",
+                "action": "route",
+            },
+            {
+                "id": "r-future",
+                "enabled": true,
+                "address-match": { "kind": "port-span", "from": 8000, "to": 8100 },
+                "comment": "",
+                "action": "route",
+            },
+        ],
+        "secondary": [],
+    })
+    .to_string()
+}
+
+fn rules_update_of(rules_json: &str) -> StoredMutation {
+    StoredMutation {
+        kind: MutationKind::RulesUpdate,
+        payload: serde_json::json!({
+            "rules-json": rules_json,
+            "content-hash": "client-supplied",
+        }),
+        correlation_id: None,
+        issuer_sid: String::new(),
+        caller_is_elevated: false,
+    }
+}
+
+fn active_rules_json(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>) -> String {
+    let g = conn.lock().unwrap();
+    nrr_storage::revisions::RevisionsRepository::new(&g)
+        .get_active()
+        .unwrap()
+        .expect("an active revision")
+        .rules_json
+}
+
+/// What the GUI submits after an edit: the rules it was shown, which never
+/// include a kind this build cannot read.
+fn gui_book(value: &str) -> String {
+    serde_json::json!({
+        "schema-version": 1,
+        "primary": [{
+            "id": "r-known",
+            "enabled": true,
+            "address-match": { "kind": "exact-fqdn", "value": value },
+            "comment": "",
+            "action": "route",
+        }],
+        "secondary": [],
+    })
+    .to_string()
+}
+
+#[test]
+fn an_edit_keeps_the_rules_of_a_kind_this_build_cannot_read() {
+    let (exec, conn) = build_test_executor();
+    let baseline = nrr_storage::BASELINE_PRINCIPAL;
+    let seeded = exec.execute(
+        rules_update_of(&book_with_unknown_kind("a.example")),
+        baseline,
+    );
+    assert!(
+        matches!(seeded, MutationOutcome::Completed(_)),
+        "{seeded:?}"
+    );
+
+    let outcome = exec.execute(rules_update_of(&gui_book("b.example")), baseline);
+
+    assert!(
+        matches!(outcome, MutationOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+    let active = active_rules_json(&conn);
+    assert!(active.contains("b.example"), "the edit landed: {active}");
+    assert!(!active.contains("a.example"));
+    assert!(
+        active.contains("r-future"),
+        "the unknown rule was kept: {active}"
+    );
+    assert!(active.contains("port-span"));
+}
+
+#[test]
+fn resubmitting_the_shown_book_is_a_no_op_not_a_deletion() {
+    let (exec, conn) = build_test_executor();
+    let baseline = nrr_storage::BASELINE_PRINCIPAL;
+    let seeded = exec.execute(
+        rules_update_of(&book_with_unknown_kind("a.example")),
+        baseline,
+    );
+    assert!(
+        matches!(seeded, MutationOutcome::Completed(_)),
+        "{seeded:?}"
+    );
+    let before = active_rules_json(&conn);
+
+    let outcome = exec.execute(rules_update_of(&gui_book("a.example")), baseline);
+
+    assert!(
+        matches!(&outcome, MutationOutcome::Completed(v) if v["outcome"] == "already-active"),
+        "{outcome:?}"
+    );
+    assert_eq!(active_rules_json(&conn), before);
+}
+
+#[test]
+fn a_preset_import_keeps_the_rules_of_a_kind_this_build_cannot_read() {
+    let (exec, conn) = build_test_executor();
+    let baseline = nrr_storage::BASELINE_PRINCIPAL;
+    let seeded = exec.execute(
+        rules_update_of(&book_with_unknown_kind("a.example")),
+        baseline,
+    );
+    assert!(
+        matches!(seeded, MutationOutcome::Completed(_)),
+        "{seeded:?}"
+    );
+    let payload = serde_json::json!({
+        "primary-bytes-b64": b64("--- Domains\nimported.example\n"),
+        "secondary-bytes-b64": b64("--- Domains\nother.example\n"),
+        "include-child-processes": false,
+    });
+
+    let outcome = exec.execute_preset_import(&payload, baseline);
+
+    assert!(
+        matches!(outcome, MutationOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+    let active = active_rules_json(&conn);
+    assert!(active.contains("imported.example"), "{active}");
+    assert!(active.contains("r-future"), "{active}");
+}
+
+#[test]
+fn carrying_forward_never_duplicates_an_id_the_submission_holds() {
+    let decode = |json: &str| {
+        rules_json_codec::decode(
+            nrr_shared::rules_json::from_canonical_string(json).unwrap(),
+            HostPlatform::Windows,
+        )
+        .unwrap()
+    };
+    let carried = decode(&book_with_unknown_kind("a.example")).unrecognized;
+    let mut fresh = decode(&gui_book("b.example"));
+    assert_eq!(carry_forward(&mut fresh, &carried), 1);
+    assert_eq!(fresh.unrecognized.primary.len(), 1);
+    // A second pass adds nothing.
+    assert_eq!(carry_forward(&mut fresh, &carried), 0);
+    // An id the submission reuses is the submission's.
+    let mut reuses_id = decode(&gui_book("c.example").replace("r-known", "r-future"));
+    assert_eq!(carry_forward(&mut reuses_id, &carried), 0);
+    assert!(reuses_id.unrecognized.is_empty());
+}
+
+/// The production screen over a machine attached to `192.168.1.0/24` with
+/// the tunnel server at `203.0.113.7`, and the default fake-IP pool.
+fn machine_screen() -> Arc<dyn NetworkRuleScreen> {
+    use crate::network_rule_screen::ProductionNetworkScreen;
+    use crate::route_codegen::network_routes::NetworkRouteFacts;
+    Arc::new(ProductionNetworkScreen::new(
+        Arc::new(|_| NetworkRouteFacts {
+            local_networks: vec![nrr_shared::ip_block::IpBlock::parse("192.168.1.0/24").unwrap()],
+            tunnel_servers: vec!["203.0.113.7".parse().unwrap()],
+            ..NetworkRouteFacts::default()
+        }),
+        Some(nrr_platform_api::fake_ip::FakeIpPoolConfig::default()),
+    ))
+}
+
+fn network_book(networks: &[&str]) -> String {
+    let rules: Vec<serde_json::Value> = networks
+        .iter()
+        .enumerate()
+        .map(|(i, network)| {
+            let address = match network.split_once('-') {
+                Some((first, last)) => {
+                    serde_json::json!({ "kind": "ip-range", "first": first, "last": last })
+                }
+                None => serde_json::json!({ "kind": "subnet", "network": network }),
+            };
+            serde_json::json!({
+                "id": format!("n-{i}"),
+                "enabled": true,
+                "address-match": address,
+                "comment": "",
+                "action": "route",
+            })
+        })
+        .collect();
+    serde_json::json!({ "schema-version": 2, "primary": [], "secondary": rules }).to_string()
+}
+
+fn refused_with(summary: &ReviewSummaryResponse, code: &str) -> bool {
+    summary
+        .risk_signals
+        .iter()
+        .any(|s| matches!(s, RiskSignalDto::ChangeRefused { code: c, .. } if c == code))
+}
+
+#[test]
+fn a_network_over_the_pool_or_a_link_is_refused_with_its_own_code() {
+    let (exec, _conn) = build_test_executor();
+    let exec = exec.with_network_screen(machine_screen());
+    let principal = "S-1-5-21-net";
+
+    let over_pool = network_book(&["198.18.0.0/16"]);
+    let error = exec
+        .network_refusal(&over_pool, principal)
+        .expect("refused");
+    assert_eq!(error.code, NETWORK_COVERS_FAKE_IP_POOL_CODE);
+    assert!(error.message.contains("198.18.0.0/16"), "{}", error.message);
+    assert_eq!(error.args["rule"], "n-0");
+    assert_eq!(error.args["network"], "198.18.0.0/16");
+    assert_eq!(error.args["covers-kind"], "fake-ip-pool");
+    assert!(!error.args.contains_key("covers"));
+
+    // A range is screened block by block.
+    let over_link = network_book(&["192.168.1.200-192.168.1.210"]);
+    let error = exec
+        .network_refusal(&over_link, principal)
+        .expect("refused");
+    assert_eq!(error.code, NETWORK_COVERS_LINK_CODE);
+    assert!(
+        error.message.contains("192.168.1.200-192.168.1.210"),
+        "{}",
+        error.message
+    );
+
+    let preview = exec.preview(
+        MutationKind::RulesUpdate,
+        &rules_update_of(&over_link).payload,
+        principal,
+    );
+    assert!(
+        refused_with(&preview, NETWORK_COVERS_LINK_CODE),
+        "{preview:?}"
+    );
+    assert!(
+        preview.risk_signals.iter().any(|s| matches!(
+            s,
+            RiskSignalDto::ChangeRefused { args, .. }
+                if args.get("covers-kind").map(String::as_str) == Some("local-network")
+                    && args.get("network").map(String::as_str)
+                        == Some("192.168.1.200-192.168.1.210")
+        )),
+        "the preview names the network and what it covers: {preview:?}"
+    );
+
+    let over_lan = network_book(&["192.168.0.0/16"]);
+    let error = exec.network_refusal(&over_lan, principal).expect("refused");
+    assert_eq!(error.code, NETWORK_COVERS_LINK_CODE);
+    assert!(
+        error.message.contains("192.168.1.0/24"),
+        "{}",
+        error.message
+    );
+    assert_eq!(error.args["covers-kind"], "local-network");
+    assert_eq!(error.args["covers"], "192.168.1.0/24");
+
+    let over_server = network_book(&["203.0.113.0/24"]);
+    let error = exec
+        .network_refusal(&over_server, principal)
+        .expect("refused");
+    assert_eq!(error.code, NETWORK_COVERS_LINK_CODE);
+    assert!(error.message.contains("203.0.113.7"), "{}", error.message);
+    assert_eq!(error.args["covers-kind"], "tunnel-server");
+    assert_eq!(error.args["covers"], "203.0.113.7");
+    assert_eq!(error.args["network"], "203.0.113.0/24");
+
+    // Positive control: a network clear of both is accepted.
+    assert!(exec
+        .network_refusal(&network_book(&["198.51.100.0/24"]), principal)
+        .is_none());
+}
+
+#[test]
+fn without_a_screen_networks_pass_on_their_values_alone() {
+    let (exec, _conn) = build_test_executor();
+    assert!(exec
+        .network_refusal(&network_book(&["198.18.0.0/16"]), "S-1-5-21-net")
+        .is_none());
+}
+
+#[test]
+fn a_network_the_book_in_force_holds_is_not_judged_again() {
+    // Built directly: what counts as new is `new_networks`' decision alone.
+    let book = |nets: &[&str]| {
+        decode_rule_book(&network_book(nets), HostPlatform::Windows).expect("network book")
+    };
+    // Saved before the machine moved onto this LAN: it stays editable.
+    let in_force = book(&["192.168.0.0/16"]);
+
+    assert!(
+        super::unrecognized::new_networks(&book(&["192.168.0.0/16"]), Some(&in_force)).is_empty()
+    );
+    // A different network over the same LAN is new and is judged.
+    assert_eq!(
+        super::unrecognized::new_networks(&book(&["192.168.1.0/25"]), Some(&in_force)).len(),
+        1
+    );
+    // With nothing in force every network is new.
+    assert_eq!(
+        super::unrecognized::new_networks(&book(&["192.168.0.0/16"]), None).len(),
+        1
+    );
 }

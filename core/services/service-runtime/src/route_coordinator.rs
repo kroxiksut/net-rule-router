@@ -33,7 +33,7 @@ use crate::machine_reading::MachineReading;
 use crate::per_sid_orchestrator::{
     PerSidBehaviorMode, PerSidBinding, RoutePolicySource, RulesProvider,
 };
-use crate::route_codegen::{generate_routes, SecondaryRouteTarget};
+use crate::route_codegen::SecondaryRouteTarget;
 use crate::route_reconciler::{
     bootstrap_server_ips, primary_local_subnets, RouteReconcileDelta, SecondaryRouteReconciler,
 };
@@ -48,8 +48,8 @@ mod notice_latches;
 // as `route_coordinator::…`, and moving a file should not move a caller.
 use binding_resolver::{
     adapter_answers_to_saved_name, binding_matches_live, derive_secondary_next_hop,
-    derive_secondary_next_hop_v6, diagnostic_tally, mac_anchor_id, preferred_display_name,
-    replacement_candidates,
+    derive_secondary_next_hop_v6, diagnostic_tally, has_own_way_out, mac_anchor_id,
+    preferred_display_name, replacement_candidates,
 };
 pub use binding_resolver::{adapter_binding_matches, adapter_entry_binding_matches};
 // The main-link derivation, for a platform that resolves egress without this
@@ -330,10 +330,14 @@ pub struct SecondaryRouteCoordinator {
     /// wire. `None` (tests / degraded boot) leaves the exemption sets
     /// unchanged (today's behaviour).
     learned_vpn_endpoints: Option<Arc<crate::vpn_endpoint_learning::LearnedVpnEndpoints>>,
+    /// The rule shapes the routes are planned under — this build's answer,
+    /// overridable in tests so network routing is exercised before it ships.
+    network_support: nrr_domain::rule_shape::RuleShapeSupport,
 }
 
 mod apply;
 mod liveness;
+mod network_facts;
 mod networks;
 mod recompute;
 mod resolve;

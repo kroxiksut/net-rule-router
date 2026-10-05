@@ -72,7 +72,7 @@ const MAX_OUTPUT_LINES: usize = 200_000;
 /// and succeeded.
 pub type HelperRunner = fn(tool: &str, args: &[&str], timeout: Duration) -> Option<String>;
 
-fn run_system_helper(tool: &str, args: &[&str], timeout: Duration) -> Option<String> {
+pub(crate) fn run_system_helper(tool: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let out = command::output_with_timeout(tool, args, timeout).ok()?;
     out.status
         .success()
@@ -393,18 +393,9 @@ impl LinuxVpnDiscovery {
 
     /// Links whose kernel driver runs a tunnel, whatever they are called.
     fn kernel_tunnel_links(&self) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(&self.sysfs_net) else {
-            return Vec::new();
-        };
-        entries
-            .flatten()
-            .take(MAX_LINKS)
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| {
-                read_sysfs_facts(&self.sysfs_net, name)
-                    .devtype
-                    .is_some_and(|d| KERNEL_TUNNEL_DEVTYPES.contains(&d.as_str()))
-            })
+        kernel_tunnel_links_in(&self.sysfs_net)
+            .into_iter()
+            .map(|(name, _)| name)
             .collect()
     }
 
@@ -481,6 +472,25 @@ fn parse_tunnel_unit(unit: &str, running: bool) -> Option<TunnelUnit> {
         instance: unescape_unit_name(instance),
         running,
     })
+}
+
+/// Links under `sysfs_net` whose kernel driver runs a tunnel, with that
+/// driver's device type, whatever the links are called.
+pub(crate) fn kernel_tunnel_links_in(sysfs_net: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(sysfs_net) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .take(MAX_LINKS)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| {
+            let devtype = read_sysfs_facts(sysfs_net, &name)
+                .devtype
+                .filter(|d| KERNEL_TUNNEL_DEVTYPES.contains(&d.as_str()))?;
+            Some((name, devtype))
+        })
+        .collect()
 }
 
 /// One row per kernel tunnel. Only a link seen in sysfs is up: a unit or a

@@ -120,6 +120,7 @@ impl SecondaryRouteCoordinator {
         secondary: &SecondaryRouteTarget,
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
         tunnel_catch_alls: &[(Ipv4Addr, u8)],
+        networks: &crate::route_codegen::network_routes::NetworkRouteFacts,
     ) -> crate::route_codegen::RouteCodegenOutput {
         // shared-IP denylist from the same enforcement rule
         // book + live cache, keyed on this SID's policy, so the route table and
@@ -141,7 +142,7 @@ impl SecondaryRouteCoordinator {
             self.fqdn_cache.as_ref(),
             shared_ip_policy,
         );
-        generate_routes(
+        crate::route_codegen::generate_routes_with(
             resolution.mode,
             rule_book,
             resolution.primary.as_ref(),
@@ -151,6 +152,8 @@ impl SecondaryRouteCoordinator {
             &denied,
             zone_order,
             tunnel_catch_alls,
+            networks,
+            self.network_support,
         )
     }
 
@@ -193,7 +196,14 @@ impl SecondaryRouteCoordinator {
             return 0;
         };
         let wanted: Vec<RouteEntry> = self
-            .planned_routes(sid, &resolution, &secondary, &snapshot.rule_book, &[])
+            .planned_routes(
+                sid,
+                &resolution,
+                &secondary,
+                &snapshot.rule_book,
+                &[],
+                &crate::route_codegen::network_routes::NetworkRouteFacts::default(),
+            )
             .routes
             .into_iter()
             .filter(|r| {

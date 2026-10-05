@@ -161,6 +161,10 @@ pub struct ExplainMatchSection {
     /// Localization key for the default route reason (if no rule matched).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_reason_key: Option<String>,
+    /// The network a subnet or range rule names, as the user wrote it
+    /// (`198.51.100.0/24`, `198.51.100.5-198.51.100.40`), when one decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_network: Option<String>,
 }
 
 /// Cache/lookup metadata section.

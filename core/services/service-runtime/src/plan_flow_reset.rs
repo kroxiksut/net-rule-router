@@ -3,13 +3,18 @@
 //!
 //! A socket keeps the path it was opened on: the page the user just added a
 //! rule for goes on loading over the old link until something breaks it. The
-//! trigger here is the plan itself — a host destination whose steering differs
-//! from the steering last made visible to connections, or, when the additional
-//! link has just become usable, every destination steered onto it (its
-//! addresses did not change while it was down, so the diff alone finds
-//! nothing). Who may be cut is [`flows_to_reset`]'s decision, the same one the
-//! per-SID activation path makes: the plan's owner only, nothing to an address
-//! the shared-IP census has seen serving a direct host.
+//! trigger here is the plan itself — a host destination, or a network a rule
+//! pins, whose steering differs from the steering last made visible to
+//! connections, or, when the additional link has just become usable, every
+//! destination steered onto it (its addresses did not change while it was
+//! down, so the diff alone finds nothing). Who may be cut is
+//! [`flows_to_reset`]'s decision, the same one the per-SID activation path
+//! makes: the plan's owner only, nothing to an address the shared-IP census has
+//! seen serving a direct host.
+//!
+//! Only networks a rule pins count: the plan also carries exemptions and route
+//! overlays as networks (loopback, the LAN, the split-default halves), and
+//! tearing those down would cut connections no rule changed.
 //!
 //! A destination that LEFT the plan is torn down only if it was steered onto the
 //! additional link: its route is gone, yet the socket keeps the tunnel's source
@@ -17,23 +22,25 @@
 //! interface and goes on working, so it is left alone.
 //!
 //! [`PrincipalEnforcementCycle`]: crate::principal_enforcement::PrincipalEnforcementCycle
+//! [`flows_to_reset`]: crate::routed_host_flow_refresh::flows_to_reset
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 
 use nrr_platform_api::enforcement::{
     DstMatch, EgressConstraint, EgressRef, EnforcementPlan, L4Proto, PrecedenceClass,
     RouteTableRef, UserPrincipal, Verdict,
 };
-use nrr_platform_api::fake_ip::stale_flows::StaleFlowReset;
+use nrr_platform_api::fake_ip::stale_flows::{FlowTargets, StaleFlowReset};
+use nrr_shared::ip_block::IpBlock;
 use nrr_shared::RouteRole;
 
 use crate::flow_reset_log::{log_reset_flows, ResetCause};
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
-use crate::routed_host_flow_refresh::flows_to_reset;
+use crate::routed_host_flow_refresh::reset_owner_flows;
 
-/// How a plan treats one IPv4 host — what a connection to it would notice
+/// How a plan treats one destination — what a connection to it would notice
 /// changing. Ordinals and application scope are left out: renumbering a rule
 /// or re-resolving a program's path moves no traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,20 +70,46 @@ impl Steer {
     }
 }
 
-type Steering = BTreeMap<Ipv4Addr, Vec<Steer>>;
+/// One steered IPv4 destination: a host, or a network a rule pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Dst {
+    Host(Ipv4Addr),
+    Network(IpBlock),
+}
+
+type Steering = BTreeMap<Dst, Vec<Steer>>;
+
+fn subnet_v4(dst: &DstMatch) -> Option<IpBlock> {
+    match *dst {
+        DstMatch::SubnetV4 { net, prefix } => IpBlock::new(IpAddr::V4(net), prefix),
+        _ => None,
+    }
+}
 
 fn steering_of(plan: &EnforcementPlan) -> Steering {
+    let rule_networks: HashSet<IpBlock> = plan
+        .flows
+        .iter()
+        .filter(|flow| matches!(flow.precedence.class, PrecedenceClass::RouteRule(_)))
+        .filter_map(|flow| subnet_v4(&flow.flow.dst))
+        .collect();
+    let dst_of = |dst: &DstMatch| match *dst {
+        DstMatch::HostV4(ip) => Some(Dst::Host(ip)),
+        _ => subnet_v4(dst)
+            .filter(|net| rule_networks.contains(net))
+            .map(Dst::Network),
+    };
     let mut steering: Steering = BTreeMap::new();
-    let mut add = |ip: Ipv4Addr, steer: Steer| {
-        let entry = steering.entry(ip).or_default();
+    let mut add = |dst: Dst, steer: Steer| {
+        let entry = steering.entry(dst).or_default();
         if !entry.contains(&steer) {
             entry.push(steer);
         }
     };
     for flow in &plan.flows {
-        if let DstMatch::HostV4(ip) = flow.flow.dst {
+        if let Some(dst) = dst_of(&flow.flow.dst) {
             add(
-                ip,
+                dst,
                 Steer::Flow {
                     verdict: flow.verdict,
                     class: flow.precedence.class,
@@ -88,9 +121,9 @@ fn steering_of(plan: &EnforcementPlan) -> Steering {
         }
     }
     for route in &plan.routes {
-        if let DstMatch::HostV4(ip) = route.dst {
+        if let Some(dst) = dst_of(&route.dst) {
             add(
-                ip,
+                dst,
                 Steer::Route {
                     egress: route.egress.clone(),
                     table: route.table.clone(),
@@ -113,27 +146,41 @@ fn destinations_to_refresh(
     previous: Option<&Steering>,
     current: &Steering,
     tunnel_came_up: bool,
-) -> Vec<Ipv4Addr> {
+) -> Vec<Dst> {
     current
         .iter()
-        .filter(|(ip, steer)| {
+        .filter(|(dst, steer)| {
             (tunnel_came_up && steer.iter().any(Steer::onto_secondary))
                 || previous
-                    .and_then(|p| p.get(ip))
+                    .and_then(|p| p.get(dst))
                     .is_none_or(|before| !same_steering(before, steer))
         })
-        .map(|(ip, _)| *ip)
+        .map(|(dst, _)| *dst)
         .collect()
 }
 
 /// The destinations `previous` steered onto the additional link that `current`
 /// no longer names at all. Sorted.
-fn destinations_left_tunnel(previous: &Steering, current: &Steering) -> Vec<Ipv4Addr> {
+fn destinations_left_tunnel(previous: &Steering, current: &Steering) -> Vec<Dst> {
     previous
         .iter()
-        .filter(|(ip, steer)| !current.contains_key(ip) && steer.iter().any(Steer::onto_secondary))
-        .map(|(ip, _)| *ip)
+        .filter(|(dst, steer)| {
+            !current.contains_key(dst) && steer.iter().any(Steer::onto_secondary)
+        })
+        .map(|(dst, _)| *dst)
         .collect()
+}
+
+fn flow_targets(dsts: &[Dst]) -> FlowTargets {
+    let mut hosts = Vec::new();
+    let mut networks = Vec::new();
+    for dst in dsts {
+        match *dst {
+            Dst::Host(ip) => hosts.push(ip),
+            Dst::Network(net) => networks.push(net),
+        }
+    }
+    FlowTargets::new(hosts, networks)
 }
 
 /// What one principal's connections last saw.
@@ -243,19 +290,16 @@ impl PlanFlowReset {
         memory.behind = false;
     }
 
-    fn tear_down(&self, sid: &str, targets: &[Ipv4Addr], cause: ResetCause) {
-        let candidates = self.reset.established_flows_to(targets);
-        if candidates.is_empty() {
-            return;
-        }
-        // Read only when something is connected: the census is a query.
-        let decision = flows_to_reset(
-            candidates,
+    fn tear_down(&self, sid: &str, targets: &[Dst], cause: ResetCause) {
+        let Some(outcome) = reset_owner_flows(
+            self.reset.as_ref(),
+            self.cache.as_ref(),
             sid,
-            &self.cache.shared_direct_ips(),
-            // No anchor: an apply routes addresses, it offers nothing.
-            &HashSet::new(),
-        );
+            &flow_targets(targets),
+        ) else {
+            return;
+        };
+        let decision = &outcome.decision;
         if decision.reset.is_empty() {
             tracing::debug!(
                 target: "nrr::enforcement",
@@ -267,8 +311,7 @@ impl PlanFlowReset {
             );
             return;
         }
-        let torn_down = self.reset.reset_established(&decision.reset);
-        if torn_down == 0 {
+        if outcome.torn_down == 0 {
             // The platform says why it refused; nothing here was reset.
             return;
         }
@@ -277,7 +320,7 @@ impl PlanFlowReset {
             target: "nrr::enforcement",
             msg_key = "persid-apply-flows-torn-down",
             sid,
-            torn_down,
+            torn_down = outcome.torn_down,
             destinations = targets.len(),
             tunnel_came_up = matches!(cause, ResetCause::TunnelCameUp),
             cause = cause.slug(),
@@ -551,6 +594,136 @@ mod tests {
         let p = plan_of(&[secondary(ip(1), 0), secondary(ip(2), 1)]);
         reset.after_apply(&[p], false, up);
         assert_eq!(mock.reset_flows(), vec![flow(ip(2), 50_000, UID)]);
+    }
+
+    fn subnet(dst: DstMatch, class: PrecedenceClass) -> FlowRule {
+        FlowRule {
+            verdict: Verdict::Permit,
+            precedence: Precedence { class, ordinal: 0 },
+            flow: FlowMatch {
+                dst,
+                dst_port: None,
+                protocol: None,
+            },
+            principal: PrincipalScope(Some(owner())),
+            app: AppScope::Any,
+            egress: EgressConstraint::Any,
+            coverage: Coverage::ConnectOnly,
+        }
+    }
+
+    fn net24() -> DstMatch {
+        DstMatch::SubnetV4 {
+            net: Ipv4Addr::new(198, 51, 100, 0),
+            prefix: 24,
+        }
+    }
+
+    fn inside(last: u8) -> Ipv4Addr {
+        Ipv4Addr::new(198, 51, 100, last)
+    }
+
+    fn network_rule(role: RouteRole, egress: EgressRef) -> EnforcementPlan {
+        plan(
+            vec![subnet(net24(), PrecedenceClass::RouteRule(role))],
+            vec![RouteIntent {
+                dst: net24(),
+                egress,
+                metric: 1,
+                table: RouteTableRef::Principal(owner()),
+            }],
+        )
+    }
+
+    #[test]
+    fn a_network_a_rule_starts_pinning_tears_down_the_owners_flows_inside_it() {
+        let (reset, mock) = refresher(&[]);
+        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up);
+        mock.set_flows(vec![
+            flow(inside(9), 50_000, UID),
+            flow(inside(10), 50_001, UID + 1),
+            flow(Ipv4Addr::new(198, 51, 101, 9), 50_002, UID),
+        ]);
+
+        reset.after_apply(
+            &[network_rule(RouteRole::Secondary, EgressRef::Secondary)],
+            true,
+            up,
+        );
+
+        assert_eq!(mock.reset_flows(), vec![flow(inside(9), 50_000, UID)]);
+        assert_eq!(
+            mock.queried_networks(),
+            vec![IpBlock::parse("198.51.100.0/24").expect("network")]
+        );
+    }
+
+    #[test]
+    fn a_network_moved_to_the_other_link_is_torn_down_and_an_unchanged_one_is_not() {
+        let (reset, mock) = refresher(&[]);
+        reset.after_apply(
+            &[network_rule(RouteRole::Primary, EgressRef::Primary)],
+            true,
+            up,
+        );
+        mock.set_flows(vec![flow(inside(9), 50_000, UID)]);
+        reset.after_apply(
+            &[network_rule(RouteRole::Primary, EgressRef::Primary)],
+            true,
+            up,
+        );
+        assert!(mock.reset_flows().is_empty(), "nothing moved");
+
+        reset.after_apply(
+            &[network_rule(RouteRole::Secondary, EgressRef::Secondary)],
+            true,
+            up,
+        );
+        assert_eq!(mock.reset_flows(), vec![flow(inside(9), 50_000, UID)]);
+    }
+
+    #[test]
+    fn a_network_that_left_the_tunnel_is_torn_down_sparing_a_shared_direct_address() {
+        let (reset, mock) = refresher(&[inside(7)]);
+        reset.after_apply(
+            &[network_rule(RouteRole::Secondary, EgressRef::Secondary)],
+            true,
+            up,
+        );
+        mock.set_flows(vec![
+            flow(inside(9), 50_000, UID),
+            flow(inside(7), 50_001, UID),
+        ]);
+        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up);
+        assert_eq!(mock.reset_flows(), vec![flow(inside(9), 50_000, UID)]);
+    }
+
+    /// Exemptions and route overlays are networks too, but no rule changed
+    /// where their traffic goes: a LAN or a split-default half must never be
+    /// swept.
+    #[test]
+    fn exemption_and_overlay_networks_are_never_swept() {
+        let (reset, mock) = refresher(&[]);
+        mock.set_flows(vec![
+            flow(inside(9), 50_000, UID),
+            flow(Ipv4Addr::new(10, 1, 2, 3), 50_001, UID),
+        ]);
+        let half = DstMatch::SubnetV4 {
+            net: Ipv4Addr::new(0, 0, 0, 0),
+            prefix: 1,
+        };
+        let p = plan(
+            vec![subnet(net24(), PrecedenceClass::CatchAllExempt)],
+            vec![RouteIntent {
+                dst: half,
+                egress: EgressRef::Secondary,
+                metric: 1,
+                table: RouteTableRef::Main,
+            }],
+        );
+        reset.after_apply(&[p], true, up);
+        assert!(mock.reset_flows().is_empty());
+        assert!(mock.queried_networks().is_empty());
     }
 
     #[test]

@@ -184,10 +184,11 @@ GroupBox {
     // are GONE: `_saveStabilityConfig` now goes through the merge-on-Get
     // `root.applyServiceStabilityPatch`, which preserves every field this panel
     // does not own, so nothing has to be re-sent here.
-    // Connection-egress trace toggles. Both
-    // default off (privacy-sensitive: per-connection process + remote IP).
-    property bool _stabilityDraftConnTraceNdjson: false
+    // Showing the connection trace in Diagnostics is drafted here. Writing it
+    // to the log is a live window like verbose logging (`root.serviceConnTraceLog*`);
+    // only a request parked while the service is down is kept here.
     property bool _stabilityDraftConnTraceGui: false
+    property string _connTraceParkedChange: ""
     // Rule-scope + routing-stop-policy MOVED to Routing
     // settings ("System-level routing"). No longer drafted / saved / loaded here;
     // they apply-on-change there through the shared clobber-safe writer.
@@ -239,10 +240,20 @@ GroupBox {
         }
     }
 
-    function _editConnTraceDraft(key, value) {
-        if (key === "conn-trace-ndjson") _stabilityDraftConnTraceNdjson = value
-        else _stabilityDraftConnTraceGui = value
+    function _editConnTraceGuiDraft(value) {
+        _stabilityDraftConnTraceGui = value
         _markStabilityDirty()
+    }
+
+    /// A trace-log window picked in either card: applied live, or parked and
+    /// shown as pending while the service is down.
+    function _requestConnTraceLog(change) {
+        if (!root._routingBackendConnected()) _connTraceParkedChange = change
+        root.applyConnTraceLog(change, "user:conn-trace-log")
+    }
+
+    function _parkedChangeOf(parked, key) {
+        return parked.hasOwnProperty(key) ? String(parked[key]) : ""
     }
 
     function _applyStabilityFromPayload(payload) {
@@ -258,15 +269,10 @@ GroupBox {
             || payload.ipc_accept_policy
             || payload
         root.adoptVerboseLogging(payload)
-        _verboseParkedChange = parked.hasOwnProperty("verbose-logging-change")
-            ? String(parked["verbose-logging-change"]) : ""
+        _verboseParkedChange = _parkedChangeOf(parked, "verbose-logging-change")
+        root.adoptConnTraceLog(payload)
+        _connTraceParkedChange = _parkedChangeOf(parked, "conn-trace-ndjson-change")
 
-        // Additive flags; older payloads lack
-        // them and default to false (= trace off).
-        var ctNdjson = payload["conn-trace-ndjson"]
-        if (ctNdjson === undefined) ctNdjson = payload.conn_trace_ndjson
-        if (!parked.hasOwnProperty("conn-trace-ndjson"))
-            _stabilityDraftConnTraceNdjson = !!ctNdjson
         var ctGui = payload["conn-trace-gui"]
         if (ctGui === undefined) ctGui = payload.conn_trace_gui
         if (!parked.hasOwnProperty("conn-trace-gui"))
@@ -314,8 +320,7 @@ GroupBox {
     /// display mirror on every successful read so a service-stopped launch shows
     /// the user's real values rather than the QML literal drafts.
     readonly property var _mirroredStabilityKeys: [
-        "ipc-accept-policy", "conn-trace-ndjson", "conn-trace-gui",
-        "cache-refresh-interval-secs"
+        "ipc-accept-policy", "conn-trace-gui", "cache-refresh-interval-secs"
     ]
 
     function _rememberStabilityFromPayload(payload) {
@@ -339,16 +344,15 @@ GroupBox {
         var mirror = (typeof root._readServiceMirror === "function")
             ? (root._readServiceMirror()["stability"] || {}) : {}
         var source = null
-        _verboseParkedChange = parked.hasOwnProperty("verbose-logging-change")
-            ? String(parked["verbose-logging-change"]) : ""
+        _verboseParkedChange = _parkedChangeOf(parked, "verbose-logging-change")
+        _connTraceParkedChange = _parkedChangeOf(parked, "conn-trace-ndjson-change")
         for (var i = 0; i < group._mirroredStabilityKeys.length; i += 1) {
             var key = group._mirroredStabilityKeys[i]
             source = parked.hasOwnProperty(key)
                 ? parked : (mirror.hasOwnProperty(key) ? mirror : null)
             if (source === null) continue
             var value = Pure.stabilityEffective(source, key)
-            if (key === "conn-trace-ndjson") _stabilityDraftConnTraceNdjson = value
-            else if (key === "conn-trace-gui") _stabilityDraftConnTraceGui = value
+            if (key === "conn-trace-gui") _stabilityDraftConnTraceGui = value
             else if (key === "cache-refresh-interval-secs") _stabilityDraftCacheRefreshSecs = value
             else if (key === "ipc-accept-policy") {
                 _stabilityDraftIsCritical = (String(value.kind) === "critical")
@@ -412,8 +416,7 @@ GroupBox {
         _stabilityDraftMaxRestarts = 20
         _stabilityDraftBackoffBaseMs = 100
         _stabilityDraftBackoffCapSec = 5
-        // Verbose logging is live, not drafted: Reset leaves the window alone.
-        _stabilityDraftConnTraceNdjson = false
+        // The log windows are live, not drafted: Reset leaves them alone.
         _stabilityDraftConnTraceGui = false
         _markStabilityDirty()
     }
@@ -451,7 +454,6 @@ GroupBox {
         // Only the keys this OS's service applies, parked or sent alike.
         var patch = root.stabilityPatchForPlatform({
             "ipc-accept-policy": _buildAcceptPolicy(),
-            "conn-trace-ndjson": _stabilityDraftConnTraceNdjson,
             "conn-trace-gui": _stabilityDraftConnTraceGui,
             "cache-refresh-interval-secs": _stabilityDraftCacheRefreshSecs
         })
@@ -1069,15 +1071,16 @@ GroupBox {
                         color: root.textColor
                         Layout.alignment: Qt.AlignVCenter
                     }
-                    VerboseLoggingDurationCombo {
+                    LogWindowDurationCombo {
                         id: verboseLoggingCombo
                         root: group.root
                         theme: group.root.uiTheme
+                        labelFor: function(change) { return group.root.verboseLoggingChangeLabel(change) }
                         Layout.fillWidth: true
                         Layout.maximumWidth: 420
                         currentIndex: {
                             if (group._verboseParkedChange !== "")
-                                return Pure.VERBOSE_LOGGING_CHANGES.indexOf(group._verboseParkedChange)
+                                return Pure.LOG_WINDOW_CHANGES.indexOf(group._verboseParkedChange)
                             if (group.root.serviceVerboseLoggingMode === "until-restart") return 3
                             return group.root.serviceVerboseLoggingMode === "off" ? 0 : -1
                         }
@@ -1137,15 +1140,15 @@ GroupBox {
                 spacing: root.uiTheme.spacingSm
                 ServiceIntentDivergenceNote {
                     root: group.root
-                    keys: ["conn-trace-ndjson", "conn-trace-gui"]
+                    keys: ["conn-trace-gui"]
                 }
                 ConnTraceSwitches {
                     root: group.root
                     Layout.fillWidth: true
-                    ndjsonChecked: group._stabilityDraftConnTraceNdjson
                     guiChecked: group._stabilityDraftConnTraceGui
-                    onNdjsonEdited: function(value) { group._editConnTraceDraft("conn-trace-ndjson", value) }
-                    onGuiEdited: function(value) { group._editConnTraceDraft("conn-trace-gui", value) }
+                    logParkedChange: group._connTraceParkedChange
+                    onGuiEdited: function(value) { group._editConnTraceGuiDraft(value) }
+                    onLogChangeRequested: function(change) { group._requestConnTraceLog(change) }
                 }
                 Label {
                     Layout.fillWidth: true
@@ -1243,8 +1246,7 @@ GroupBox {
                 }
                 ServiceIntentDivergenceNote {
                     root: group.root
-                    keys: ["ipc-accept-policy", "conn-trace-ndjson", "conn-trace-gui",
-                        "cache-refresh-interval-secs"]
+                    keys: ["ipc-accept-policy", "conn-trace-gui", "cache-refresh-interval-secs"]
                 }
 
                 GridLayout {
@@ -1485,10 +1487,10 @@ GroupBox {
                     root: group.root
                     Layout.fillWidth: true
                     Layout.topMargin: group.root.uiTheme.spacingSm
-                    ndjsonChecked: group._stabilityDraftConnTraceNdjson
                     guiChecked: group._stabilityDraftConnTraceGui
-                    onNdjsonEdited: function(value) { group._editConnTraceDraft("conn-trace-ndjson", value) }
-                    onGuiEdited: function(value) { group._editConnTraceDraft("conn-trace-gui", value) }
+                    logParkedChange: group._connTraceParkedChange
+                    onGuiEdited: function(value) { group._editConnTraceGuiDraft(value) }
+                    onLogChangeRequested: function(change) { group._requestConnTraceLog(change) }
                 }
 
                 // Save error gets its own line so the Save / Reset row
@@ -1578,7 +1580,6 @@ GroupBox {
                                 || group._stabilityDraftMaxRestarts !== 20
                                 || group._stabilityDraftBackoffBaseMs !== 100
                                 || group._stabilityDraftBackoffCapSec !== 5
-                                || group._stabilityDraftConnTraceNdjson
                                 || group._stabilityDraftConnTraceGui)
                         onClicked: group._resetStabilityToDefaults()
                     }

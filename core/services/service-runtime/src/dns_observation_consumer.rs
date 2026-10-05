@@ -178,6 +178,10 @@ mod wiring;
 /// attributed to a specific rule. Reads the same FQDN cache the codegen does.
 /// `pub(crate)`: the conn-trace handler reuses this map to stamp
 /// `expected_route` on trace rows (decision-vs-actual-egress mismatch flag).
+///
+/// Networks are left out: a host inside a subnet or range a rule names is what
+/// that rule asked for, never a co-tenant caught by accident, and counting it
+/// in the shared-address census would spare it from the rule's own resets.
 pub(crate) fn build_secondary_ip_owners(
     secondary: &CanonicalRuleSet,
     fqdn: &dyn FqdnCacheLookup,
@@ -214,7 +218,7 @@ pub(crate) fn build_secondary_ip_owners(
                     &mut owners,
                 );
             }
-            _ => {}
+            Some(CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_)) | None => {}
         }
     }
     owners
@@ -289,10 +293,11 @@ pub(crate) fn rule_covers(rule: &nrr_domain::canonical::CanonicalRule, hostname:
 
 /// the KIND of the strongest enabled address rule covering
 /// `(hostname, ip)`, walked along the runtime priority ladder (exact-fqdn >
-/// subdomain > zone > exact-ip). `SuffixDomain` and `Zone` share match
+/// subdomain > zone > exact-ip > subnet). `SuffixDomain` and `Zone` share match
 /// semantics but are reported distinctly: the cache viewer sorts zone-derived
-/// entries below direct rule matches. `None` when no address rule matches
-/// (app-only rules carry no address match by definition).
+/// entries below direct rule matches. A range reports as `subnet`: it is
+/// carried as the networks it decomposes into. `None` when no address rule
+/// matches (app-only rules carry no address match by definition).
 pub(crate) fn rule_set_match_kind(
     hostname: &str,
     ip: Option<std::net::Ipv4Addr>,
@@ -319,6 +324,14 @@ pub(crate) fn rule_set_match_kind(
                 if ip.map(std::net::IpAddr::V4) == Some(*rule_ip) =>
             {
                 consider(3, "exact-ip");
+            }
+            Some(m)
+                if ip.is_some_and(|ip| {
+                    m.ip_blocks()
+                        .is_some_and(|blocks| blocks.iter().any(|b| b.contains(ip.into())))
+                }) =>
+            {
+                consider(4, "subnet");
             }
             _ => {}
         }

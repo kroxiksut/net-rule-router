@@ -30,7 +30,7 @@
 //!   `*.x` rule's real job, the subdomains, is unaffected.
 //! - **`Zone`** (`ru`, `intra`) — **NOT** seeded at all: a zone rule does not
 //!   cover its bare label, so there is no concrete hostname to resolve.
-//! - **`ExactIp`** needs no DNS and is unaffected.
+//! - **`ExactIp`**, subnets and ranges name addresses: no DNS, nothing seeded.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};

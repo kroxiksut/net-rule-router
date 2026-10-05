@@ -51,17 +51,18 @@
 //! app refreshes its addresses on every flush, so the window only bites after the
 //! app has genuinely stopped using one.
 //!
-//! Addresses the user typed into the rule set are the opposite case and need
-//! nothing from this module: they are policy, not observation, and an `ExactIp`
-//! rule already emits its own host route and permit with no cache in the path.
+//! Addresses a rule names — exactly, or inside a subnet or range — are the
+//! opposite case: they are policy, not observation, and belong to that rule, so
+//! they are never written back as an application's destinations.
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use nrr_domain::canonical::{CanonicalAppPattern, CanonicalRuleSet};
-use nrr_domain::RuleAction;
+use nrr_domain::canonical::{CanonicalAppPattern, CanonicalRuleBook, CanonicalRuleSet};
+use nrr_domain::decision_matching::{MatchClass, RequestedRouteDecision, ZonePriorityPolicy};
+use nrr_domain::{RouteBehaviorMode, RuleAction};
 
 use crate::app_observation_lookup::{AppObservationLookup, AppObservationStore};
 use crate::fqdn_cache_lookup::ENFORCEMENT_CONFIRMATION_WINDOW;
@@ -211,8 +212,12 @@ impl AppDestinationMemory {
             // the `learned_at` they earned — the upsert only moves it forward
             // for the addresses named here.
             let seen = self.observations.take_seen_since_flush(&pattern);
-            let confirmed: Vec<Ipv4Addr> =
-                ips.iter().copied().filter(|ip| seen.contains(ip)).collect();
+            let confirmed: Vec<Ipv4Addr> = ips
+                .iter()
+                .copied()
+                .filter(|ip| seen.contains(ip))
+                .filter(|ip| !named_by_address_rule(&snapshot.rule_book, *ip))
+                .collect();
             if confirmed.is_empty() {
                 continue;
             }
@@ -221,6 +226,24 @@ impl AppDestinationMemory {
             summary.destinations = summary.destinations.saturating_add(confirmed.len() as u32);
         }
     }
+}
+
+/// Whether an address rule — an exact address, or a subnet or range holding it
+/// — names `ip` for every process. Asked of the engine, so "names" means what
+/// the matcher says, not a second reading of the rule kinds.
+fn named_by_address_rule(book: &CanonicalRuleBook, ip: Ipv4Addr) -> bool {
+    matches!(
+        nrr_domain::decision_engine_input::match_sample(
+            book,
+            None,
+            Some(std::net::IpAddr::V4(ip)),
+            None,
+            ZonePriorityPolicy::default(),
+            RouteBehaviorMode::PreferPrimary,
+        ),
+        RequestedRouteDecision::MatchedRoute { candidate }
+            if matches!(candidate.match_class, MatchClass::ExactIp | MatchClass::Subnet)
+    )
 }
 
 /// The application patterns of `set` whose rules actually produce host routes:
@@ -492,6 +515,43 @@ mod tests {
             table.rows.lock().unwrap_or_else(|p| p.into_inner())[0].0,
             "messenger"
         );
+    }
+
+    #[test]
+    fn an_address_a_network_or_exact_rule_names_is_not_remembered_for_an_app() {
+        let table = Arc::new(FakeTable::default());
+        let store = Arc::new(AppObservationStore::new());
+        let in_network = Ipv4Addr::new(198, 51, 100, 9);
+        let exact = ip(50);
+        for seen in [ip(5), in_network, exact] {
+            store.record("messenger.exe", seen);
+        }
+        let mut rules = book(vec![app_rule("r1", "messenger.exe")]);
+        let address = |id: &str, m: CanonicalAddressMatch| CanonicalRule {
+            address_match: Some(m),
+            app_match: None,
+            ..app_rule(id, "unused.exe")
+        };
+        rules.primary = CanonicalRuleSet::from_rules(vec![
+            address(
+                "n-1",
+                CanonicalAddressMatch::Subnet(
+                    nrr_shared::ip_block::IpBlock::parse("198.51.100.0/24").expect("network"),
+                ),
+            ),
+            address("i-1", CanonicalAddressMatch::ExactIp(IpAddr::V4(exact))),
+        ]);
+
+        let mem = memory(&store, rules, &table);
+        assert_eq!(
+            mem.flush(SystemTime::now()),
+            FlushSummary {
+                apps: 1,
+                destinations: 1
+            }
+        );
+        let rows = table.rows.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), vec![ip(5)]);
     }
 
     #[test]

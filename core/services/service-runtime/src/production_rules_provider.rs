@@ -187,6 +187,11 @@ pub fn decode_rules_snapshot(rules_json: &str, origin: &str) -> Option<ActiveRul
                 return None;
             }
         };
+    crate::production_mutation_executor::report_unrecognized_rules(
+        rules_json,
+        content.unrecognized.len(),
+        "",
+    );
     Some(ActiveRulesSnapshot {
         rule_book: content.rule_book,
         // placeholder: the per-SID `PerSidBehaviorMode` wins inside
@@ -433,6 +438,38 @@ mod tests {
     }
 
     #[test]
+    fn reading_a_book_with_unrecognized_rules_reports_it_once() {
+        let json = serde_json::json!({
+            "schema-version": 3,
+            "primary": [
+                {
+                    "id": "r-known",
+                    "enabled": true,
+                    "address-match": { "kind": "exact-fqdn", "value": "provider-unknown.example" },
+                    "comment": "",
+                    "action": "route",
+                },
+                {
+                    "id": "r-future",
+                    "enabled": true,
+                    "address-match": { "kind": "port-span", "from": 8000, "to": 8100 },
+                    "comment": "",
+                    "action": "route",
+                },
+            ],
+            "secondary": [],
+        })
+        .to_string();
+        let snap = decode_rules_snapshot(&json, "test").expect("the known rule loads");
+        assert_eq!(snap.rule_book.primary.rules().len(), 1);
+        // The read already took the one report this book gets.
+        assert!(!crate::production_mutation_executor::first_report_of_book(
+            &json
+        ));
+        assert!(decode_rules_snapshot(&json, "test").is_some());
+    }
+
+    #[test]
     fn returns_none_when_no_active_revision() {
         let conn = make_state_conn();
         let provider = ProductionRulesProvider::new(conn);
@@ -581,6 +618,7 @@ mod tests {
         assert_eq!(row_ids, ["r-1", "r-4"]);
 
         let saved = rules_json_codec::encode(&nrr_domain::rules_revision::RulesRevisionContent {
+            unrecognized: Default::default(),
             rule_book: snap.rule_book,
             format_version: nrr_domain::rules_revision::RULES_REVISION_FORMAT_VERSION,
         });
@@ -636,6 +674,7 @@ mod tests {
         assert_eq!(ids(&snap.rule_book.secondary), ["r-5"]);
 
         let saved = rules_json_codec::encode(&nrr_domain::rules_revision::RulesRevisionContent {
+            unrecognized: Default::default(),
             rule_book: snap.rule_book,
             format_version: nrr_domain::rules_revision::RULES_REVISION_FORMAT_VERSION,
         });
@@ -656,8 +695,19 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_schema_version_degrades_to_none() {
+    fn a_newer_schema_is_read_rather_than_dropped() {
+        // A revision a newer build wrote survives a downgrade: its unknown
+        // kinds are kept aside, the rest applies.
         let json = r#"{"schema-version":999,"primary":[],"secondary":[]}"#;
+        let conn = make_state_conn();
+        insert_active_revision(&conn, json);
+        let provider = ProductionRulesProvider::new(conn);
+        assert!(provider.active_rules().is_some());
+    }
+
+    #[test]
+    fn schema_zero_degrades_to_none() {
+        let json = r#"{"schema-version":0,"primary":[],"secondary":[]}"#;
         let conn = make_state_conn();
         insert_active_revision(&conn, json);
         let provider = ProductionRulesProvider::new(conn);

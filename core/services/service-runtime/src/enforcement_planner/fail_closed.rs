@@ -205,6 +205,60 @@ pub fn plan_fail_closed_destinations(
     flows
 }
 
+/// Plan the fail-closed block over the held networks: each blocked outright,
+/// narrowed like [`plan_fail_closed_destinations`], with the cut-outs inside
+/// them left open. Empty when no protocol is selected.
+pub fn plan_fail_closed_networks(
+    sid: &str,
+    holds: &NetworkHolds,
+    protocols: KillSwitchProtocols,
+) -> Vec<FlowRule> {
+    let any_selected = protocols.tcp
+        || protocols.udp
+        || protocols.icmp
+        || protocols.igmp
+        || protocols.gre
+        || protocols.esp
+        || protocols.other;
+    if !any_selected {
+        return Vec::new();
+    }
+    let principal = principal_scope(sid);
+    let mut flows = Vec::new();
+    for (i, net) in holds.held.iter().copied().enumerate() {
+        let ordinal = NETWORK_ORDINAL_BASE + i as u32;
+        let block = |protocol, coverage, ordinal| {
+            ks_flow(
+                &principal,
+                Verdict::Block,
+                PrecedenceClass::KillSwitchBlock,
+                block_match(net),
+                AppScope::Any,
+                EgressConstraint::Any,
+                protocol,
+                coverage,
+                ordinal,
+            )
+        };
+        if protocols.tcp || protocols.udp {
+            flows.push(block(
+                ale_protocol(protocols),
+                Coverage::ConnectOnly,
+                ordinal,
+            ));
+        }
+        if !net.is_ipv4() {
+            continue;
+        }
+        let base = ordinal * PACKET_SLOTS_PER_DEST;
+        for (k, proto) in selected_packet_protocols(protocols).into_iter().enumerate() {
+            flows.push(block(Some(proto), Coverage::AllPackets, base + k as u32));
+        }
+    }
+    flows.extend(plan_network_cut_outs(&principal, holds, protocols));
+    flows
+}
+
 /// Plan the **fail-closed per-app block** — block each protected
 /// app at the ALE layer (proto-agnostic, no egress permit). Neutral equivalent of
 /// `killswitch_codegen::fail_closed_block_apps`. Emits nothing unless TCP/UDP is

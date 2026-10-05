@@ -151,6 +151,11 @@ pub(crate) fn build_supervised_runtime_deps(
     // share its read-only `binding_view()`; persistence + factories attach to
     // the same Arc further down.
     let (fake_ip_scope, fake_ip_pool) = fake_ip_policy();
+    // The routing principal is only known once the route coordinator exists,
+    // further down; the network owner reads it through this slot.
+    let fake_ip_principal_slot: Arc<
+        std::sync::OnceLock<nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn>,
+    > = Arc::new(std::sync::OnceLock::new());
     let fake_ip_assembly = Arc::new(
         nrr_service_runtime::fake_ip::FakeIpAssembly::new(fake_ip_scope, fake_ip_pool)
             // The tunnel's own interior is off limits to virtual addresses: a
@@ -178,6 +183,17 @@ pub(crate) fn build_supervised_runtime_deps(
             // reset and sits on a dead connection instead of re-resolving.
             .with_stale_flow_reset(Arc::new(
                 nrr_platform_windows::stale_flows::WindowsStaleFlowReset::new(),
+            ))
+            // A host whose real address sits in a network the user routes over
+            // the additional link keeps its real answer. Empty cell, one miss.
+            .with_network_owner(Arc::new(
+                nrr_service_runtime::fake_ip::ActivePrincipalNetworks::new(
+                    nrr_service_runtime::fake_ip::global_rule_networks(),
+                    {
+                        let slot = Arc::clone(&fake_ip_principal_slot);
+                        Arc::new(move || slot.get().and_then(|active| active()))
+                    },
+                ),
             )),
     );
 
@@ -851,7 +867,7 @@ pub(crate) fn build_supervised_runtime_deps(
                         if read_routing_stop_persist(&conn) {
                             // persist (default): keep the /32 rule-routes on the
                             // VPN, remove NRR's overlays.
-                            match coord.teardown_keep_secondary_hosts() {
+                            match coord.teardown_keep_rule_routes() {
                                 Ok(delta) => tracing::info!(
                                     target: "nrr::route-coordinator",
                                     msg_key = "svc-boot-teardown-persist-routes",
@@ -903,6 +919,15 @@ pub(crate) fn build_supervised_runtime_deps(
             }
             _ => None,
         };
+
+    {
+        let registry = Arc::clone(&sid_registry);
+        let coord = route_coordinator.clone();
+        let _ = fake_ip_principal_slot.set(Arc::new(move || match coord.as_ref() {
+            Some(c) => c.effective_routing_sid(&registry.active_sids()),
+            None => registry.active_sids().first().cloned(),
+        }));
+    }
 
     // The routing-active SID for the seed task, console-SID-aware via the
     // coordinator's gate: the

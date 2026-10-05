@@ -240,6 +240,8 @@ pub struct PerSidApplyOrchestrator {
     /// Last logged `(kept, dropped, app_covered)` of the trimmed pin set per
     /// SID: the compute runs every few seconds and the trim rarely changes.
     pub(super) pin_trim_log_state: Mutex<HashMap<String, PinTrimCounts>>,
+    /// What each SID's held networks left open, as last logged.
+    pub(super) network_hold_log: crate::enforcement_planner::NetworkHoldLog,
     /// When the provider yields a context whose scope is enabled, the codegen is
     /// augmented: the fake pool is permitted, and the real IPs a fake-routed host
     /// shares with a directly-routed one lose their `/32` permit (fed into the

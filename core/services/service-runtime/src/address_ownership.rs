@@ -36,13 +36,20 @@
 //!    contest the engine runs: a zone Block does not drop an address an exact
 //!    route names, and an exact Block still drops what a zone route carries.
 //!    A literal-IP Block is the exception: it names the address itself and
-//!    vetoes every route on it.
+//!    vetoes every route on it. A network Block is not: it yields like a zone.
+//! 5. **Networks claim by longest prefix.** An exact address beats any network
+//!    holding it, a longer prefix beats a shorter one, a name beats the network
+//!    its address falls into, and a network beats a zone. Networks are never
+//!    expanded into addresses: every answer about one is a lookup.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::OnceLock;
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook, CanonicalRuleSet};
+use nrr_domain::rule_shape::{rule_verdict, RuleShapeSupport};
 use nrr_domain::RuleAction;
+use nrr_shared::ip_block::IpBlock;
 
 use crate::app_observation_lookup::AppObservationLookup;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
@@ -89,6 +96,16 @@ pub struct AddressOwnership {
     host_route_rank: HashMap<String, ClaimRank>,
     /// Addresses an enabled literal-IP Block names, with the rule id.
     literal_blocks: HashMap<IpAddr, String>,
+    /// Both links' route networks.
+    networks: NetworkClaims,
+    /// Addresses each link holds through a zone and nothing closer, under the
+    /// default order: a network on the other link outranks those. Empty when
+    /// no network is claimed.
+    main_zone_only: HashSet<IpAddr>,
+    additional_zone_only: HashSet<IpAddr>,
+    /// `route_rank`'s addresses in address order, built on the first interior
+    /// query so a compute that never asks pays nothing.
+    explicit_sorted: OnceLock<Vec<IpAddr>>,
     order: ZoneVsIpOrder,
 }
 
@@ -128,14 +145,48 @@ impl AddressOwnership {
         cache: &dyn FqdnCacheLookup,
         order: ZoneVsIpOrder,
     ) -> Self {
-        let (main_names, main_literal) = name_claims(&rule_book.primary, cache);
-        let (additional_names, additional_literal) = name_claims(&rule_book.secondary, cache);
+        Self::resolve_with_support(
+            rule_book,
+            cache,
+            order,
+            crate::wfp_codegen::current_rule_shape_support(),
+        )
+    }
+
+    /// [`Self::resolve_with_order`] against an explicit shape support: a rule
+    /// enforcement skips for its shape claims and vetoes nothing.
+    #[must_use]
+    pub fn resolve_with_support(
+        rule_book: &CanonicalRuleBook,
+        cache: &dyn FqdnCacheLookup,
+        order: ZoneVsIpOrder,
+        support: RuleShapeSupport,
+    ) -> Self {
+        let main_claims = name_claims(&rule_book.primary, cache, support);
+        let additional_claims = name_claims(&rule_book.secondary, cache, support);
+        let networks = NetworkClaims::new(&main_claims.networks, &additional_claims.networks);
+        let (main_names, main_literal) = (main_claims.names, main_claims.literal);
+        let (additional_names, additional_literal) =
+            (additional_claims.names, additional_claims.literal);
 
         let mut main: HashSet<IpAddr> = main_literal.clone();
         let mut additional: HashSet<IpAddr> = additional_literal.clone();
         // The strongest claim the main link holds on each address it carries,
         // which is what the literal contest below compares against.
         let mut main_claim: HashMap<IpAddr, NameClaim> = HashMap::new();
+        let mut additional_claim: HashMap<IpAddr, NameClaim> = HashMap::new();
+        let strongest = |claims: &mut HashMap<IpAddr, NameClaim>, ips: &[IpAddr], c: NameClaim| {
+            for ip in ips {
+                claims
+                    .entry(*ip)
+                    .and_modify(|best| {
+                        if c > *best {
+                            *best = c;
+                        }
+                    })
+                    .or_insert(c);
+            }
+        };
         let mut route_rank: HashMap<IpAddr, ClaimRank> = HashMap::new();
         let mut route_holder: HashMap<IpAddr, String> = HashMap::new();
         let mut host_route_rank: HashMap<String, ClaimRank> = HashMap::new();
@@ -179,21 +230,18 @@ impl AddressOwnership {
             }
             match (main_names.get(host), additional_names.get(host)) {
                 // A tie goes to the main link -- see `owner_of`.
-                (Some(m), Some(a)) if a > m => additional.extend(ips),
+                (Some(m), Some(a)) if a > m => {
+                    strongest(&mut additional_claim, &ips, *a);
+                    additional.extend(ips);
+                }
                 (Some(m), _) => {
-                    for ip in &ips {
-                        main_claim
-                            .entry(*ip)
-                            .and_modify(|best| {
-                                if m > best {
-                                    *best = *m;
-                                }
-                            })
-                            .or_insert(*m);
-                    }
+                    strongest(&mut main_claim, &ips, *m);
                     main.extend(ips);
                 }
-                (None, Some(_)) => additional.extend(ips),
+                (None, Some(a)) => {
+                    strongest(&mut additional_claim, &ips, *a);
+                    additional.extend(ips);
+                }
                 (None, None) => continue,
             }
         }
@@ -209,6 +257,25 @@ impl AddressOwnership {
             }
         }
 
+        // A network outranks a zone only in the default order; with zones
+        // first the zone keeps the address, so nothing is weak.
+        let zone_only = |held: &HashSet<IpAddr>,
+                         literal: &HashSet<IpAddr>,
+                         claims: &HashMap<IpAddr, NameClaim>| {
+            if order != ZoneVsIpOrder::ExactIpFirst || networks.is_empty() {
+                return HashSet::new();
+            }
+            claims
+                .iter()
+                .filter(|(ip, c)| {
+                    matches!(c, NameClaim::Zone(_)) && held.contains(ip) && !literal.contains(ip)
+                })
+                .map(|(ip, _)| *ip)
+                .collect()
+        };
+        let main_zone_only = zone_only(&main, &main_literal, &main_claim);
+        let additional_zone_only = zone_only(&additional, &additional_literal, &additional_claim);
+
         Self {
             main,
             additional,
@@ -216,7 +283,11 @@ impl AddressOwnership {
             route_rank,
             route_holder,
             host_route_rank,
-            literal_blocks: literal_blocks(rule_book),
+            literal_blocks: literal_blocks(rule_book, support),
+            networks,
+            main_zone_only,
+            additional_zone_only,
+            explicit_sorted: OnceLock::new(),
             order,
         }
     }
@@ -237,14 +308,24 @@ impl AddressOwnership {
     /// address both sides name is reachable on the main link, which is the
     /// outcome a user can still see and correct — the reverse is a site that
     /// works only while the tunnel is up.
+    ///
+    /// A network decides only what no closer claim holds: an address held
+    /// through a zone alone goes to the other link's network (rule 5).
     #[must_use]
     pub fn owner_of(&self, ip: IpAddr) -> Option<Link> {
+        let network = || self.networks.winner(ip);
         if self.main.contains(&ip) {
+            if self.main_zone_only.contains(&ip) && network() == Some(Link::Additional) {
+                return Some(Link::Additional);
+            }
             Some(Link::Main)
         } else if self.additional.contains(&ip) {
+            if self.additional_zone_only.contains(&ip) && network() == Some(Link::Main) {
+                return Some(Link::Main);
+            }
             Some(Link::Additional)
         } else {
-            None
+            network()
         }
     }
 
@@ -282,7 +363,7 @@ impl AddressOwnership {
     pub fn address_rule_may_steer(&self, ip: IpAddr, for_link: Link) -> bool {
         match for_link {
             Link::Main => true,
-            Link::Additional => !self.main.contains(&ip),
+            Link::Additional => self.owner_of(ip) != Some(Link::Main),
         }
     }
 
@@ -291,10 +372,22 @@ impl AddressOwnership {
     /// Reads what the main link NAMES, not what it won: an address whose
     /// steering went to the additional link because the user named it there
     /// literally is still an address a main-link rule points at, and blocking
-    /// it is the outcome neither of their rules asked for.
+    /// it is the outcome neither of their rules asked for. A main-link network
+    /// names every address inside it in the same sense.
     #[must_use]
     pub fn may_block(&self, ip: IpAddr) -> bool {
-        !self.main_claimed.contains(&ip)
+        !self.main_claimed.contains(&ip) && !self.networks.names(ip, Link::Main)
+    }
+
+    /// Whether `link`'s address rules name `ip` — literally, through a host or
+    /// through a network. For the main link this is `!may_block(ip)`.
+    #[must_use]
+    pub fn named_by(&self, ip: IpAddr, link: Link) -> bool {
+        let explicit = match link {
+            Link::Main => self.main_claimed.contains(&ip),
+            Link::Additional => self.additional.contains(&ip),
+        };
+        explicit || self.networks.names(ip, link)
     }
 
     /// Whether a Block rule matching `block` must leave `ip` alone because a
@@ -302,10 +395,11 @@ impl AddressOwnership {
     ///
     /// Per ADDRESS, like every other answer here: a zone Block over a host
     /// that shares its address with a narrowly routed one leaves the address
-    /// open, the same trade rule 2 makes for a contested address.
+    /// open, the same trade rule 2 makes for a contested address. A network
+    /// Block outside `ip` does not apply to it and keeps nothing open.
     #[must_use]
     pub fn block_yields(&self, ip: IpAddr, block: &CanonicalAddressMatch) -> bool {
-        block_rank(block, self.order).is_some_and(|own| self.outranked(ip, own))
+        block_rank(block, ip, self.order).is_some_and(|own| self.outranked(ip, own))
     }
 
     /// When a Block covering `host` leaves `ip` open although no narrower rule
@@ -322,11 +416,17 @@ impl AddressOwnership {
         ip: IpAddr,
         block: &CanonicalAddressMatch,
     ) -> Option<&str> {
-        let own = block_rank(block, self.order)?;
+        let own = block_rank(block, ip, self.order)?;
         if !self.outranked(ip, own) || self.host_route_rank.get(host).is_some_and(|h| *h > own) {
             return None;
         }
-        self.route_holder.get(&ip).map(String::as_str)
+        let explicit = self.route_rank.get(&ip).copied();
+        match self.networks.longest(ip) {
+            Some((net, claim)) if Some(subnet_rank(net.prefix_len(), self.order)) > explicit => {
+                Some(claim.label.as_str())
+            }
+            _ => self.route_holder.get(&ip).map(String::as_str),
+        }
     }
 
     /// The literal-IP Block rule naming `ip`, if any: its filter drops the
@@ -337,7 +437,11 @@ impl AddressOwnership {
     }
 
     fn outranked(&self, ip: IpAddr, own: ClaimRank) -> bool {
-        self.route_rank.get(&ip).is_some_and(|route| *route > own)
+        let network = self
+            .networks
+            .longest(ip)
+            .map(|(net, _)| subnet_rank(net.prefix_len(), self.order));
+        self.route_rank.get(&ip).copied().max(network) > Some(own)
     }
 
     /// The main link's named addresses, for callers that need the set itself
@@ -346,16 +450,60 @@ impl AddressOwnership {
     /// Everything the main link's rules name, for the same reason
     /// [`Self::may_block`] reads that set: a rescue permit exists so a
     /// main-named address keeps working, and that need does not disappear when
-    /// the steering contest went the other way.
+    /// the steering contest went the other way. Networks are not in it — see
+    /// [`Self::networks`].
     #[must_use]
     pub fn main_named(&self) -> &HashSet<IpAddr> {
         &self.main_claimed
     }
 
-    /// The additional link's named addresses.
+    /// The additional link's named addresses; networks are not in it.
     #[must_use]
     pub fn additional_named(&self) -> &HashSet<IpAddr> {
         &self.additional
+    }
+
+    /// The networks `link`'s route rules name, in address order. A network
+    /// both links name is listed for both.
+    pub fn networks(&self, link: Link) -> impl Iterator<Item = IpBlock> + '_ {
+        self.networks
+            .sorted
+            .iter()
+            .filter(move |net| self.networks.claim(**net).is_some_and(|c| c.has(link)))
+            .copied()
+    }
+
+    /// The narrowest network of `link`'s holding `ip`.
+    #[must_use]
+    pub fn network_of(&self, ip: IpAddr, link: Link) -> Option<IpBlock> {
+        self.networks
+            .holding(ip)
+            .find(|(_, claim)| claim.has(link))
+            .map(|(net, _)| net)
+    }
+
+    /// The addresses route rules name literally or through a host that lie
+    /// inside `network`, in address order — what an emitter carving `network`
+    /// asks [`Self::owner_of`] or [`Self::block_yields`] about, without walking
+    /// the network itself.
+    #[must_use]
+    pub fn explicit_inside(&self, network: IpBlock) -> &[IpAddr] {
+        let sorted = self.explicit_sorted.get_or_init(|| {
+            let mut ips: Vec<IpAddr> = self.route_rank.keys().copied().collect();
+            ips.sort_unstable();
+            ips
+        });
+        let start = sorted.partition_point(|ip| *ip < network.network());
+        let end = sorted.partition_point(|ip| *ip <= network.last());
+        &sorted[start..end]
+    }
+
+    /// Route networks strictly narrower than `network` and inside it, each
+    /// with the link that wins it (the main one on a tie).
+    pub fn networks_inside(&self, network: IpBlock) -> impl Iterator<Item = (IpBlock, Link)> + '_ {
+        self.networks
+            .inside(network)
+            .map(|(net, claim)| (net, claim.winner()))
     }
 
     /// Addresses of `candidates` an application rule on `for_link` may not take
@@ -412,26 +560,44 @@ impl ZoneVsIpOrder {
     }
 }
 
-/// A claim's place in the engine's tier order, with the literal address slotted
-/// where [`ZoneVsIpOrder`] puts it against a zone. Compared, never shown.
+/// A claim's place in the engine's tier order, with the literal address and
+/// the network slotted where [`ZoneVsIpOrder`] puts them against a zone.
+/// Compared, never shown.
 type ClaimRank = (u8, usize);
 
 fn host_rank(claim: NameClaim, order: ZoneVsIpOrder) -> ClaimRank {
     match claim {
         NameClaim::Zone(labels) => match order {
             ZoneVsIpOrder::ExactIpFirst => (0, labels),
-            ZoneVsIpOrder::ZoneFirst => (1, labels),
+            ZoneVsIpOrder::ZoneFirst => (2, labels),
         },
-        NameClaim::Suffix(labels) => (2, labels),
-        NameClaim::ExactFqdn => (3, 0),
+        NameClaim::Suffix(labels) => (3, labels),
+        NameClaim::ExactFqdn => (4, 0),
     }
 }
 
-/// A Block's own place in the contest; `None` for a literal one, which never
-/// yields.
-fn block_rank(block: &CanonicalAddressMatch, order: ZoneVsIpOrder) -> Option<ClaimRank> {
+/// Below an exact address in either order; the longer prefix is narrower.
+fn subnet_rank(prefix_len: u8, order: ZoneVsIpOrder) -> ClaimRank {
+    match order {
+        ZoneVsIpOrder::ExactIpFirst => (1, usize::from(prefix_len)),
+        ZoneVsIpOrder::ZoneFirst => (0, usize::from(prefix_len)),
+    }
+}
+
+/// A Block's own place in the contest at `ip`; `None` for a literal one, which
+/// never yields, and for a network that does not hold `ip`. A range ranks by
+/// its piece around the address, as the engine scores it.
+fn block_rank(
+    block: &CanonicalAddressMatch,
+    ip: IpAddr,
+    order: ZoneVsIpOrder,
+) -> Option<ClaimRank> {
     let own = match block {
         CanonicalAddressMatch::ExactIp(_) => return None,
+        CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_) => {
+            let piece = block.ip_blocks()?.iter().find(|net| net.contains(ip))?;
+            return Some(subnet_rank(piece.prefix_len(), order));
+        }
         CanonicalAddressMatch::ExactFqdn(_) => NameClaim::ExactFqdn,
         CanonicalAddressMatch::SuffixDomain(s) => NameClaim::Suffix(label_count(s)),
         CanonicalAddressMatch::Zone(z) => NameClaim::Zone(label_count(z)),
@@ -441,7 +607,10 @@ fn block_rank(block: &CanonicalAddressMatch, order: ZoneVsIpOrder) -> Option<Cla
 
 /// Enabled literal-IP Blocks on either link, the smallest rule id per address.
 /// A Block enforcement skips for its shape vetoes nothing.
-fn literal_blocks(rule_book: &CanonicalRuleBook) -> HashMap<IpAddr, String> {
+fn literal_blocks(
+    rule_book: &CanonicalRuleBook,
+    support: RuleShapeSupport,
+) -> HashMap<IpAddr, String> {
     let mut out: HashMap<IpAddr, String> = HashMap::new();
     for rule in rule_book
         .primary
@@ -451,7 +620,7 @@ fn literal_blocks(rule_book: &CanonicalRuleBook) -> HashMap<IpAddr, String> {
     {
         if !rule.enabled
             || !matches!(rule.action, RuleAction::Block)
-            || !crate::wfp_codegen::rule_shape_enforced(rule)
+            || !rule_verdict(rule, support).is_supported()
         {
             continue;
         }
@@ -470,8 +639,8 @@ fn literal_blocks(rule_book: &CanonicalRuleBook) -> HashMap<IpAddr, String> {
 
 fn literal_rank(order: ZoneVsIpOrder) -> ClaimRank {
     match order {
-        ZoneVsIpOrder::ExactIpFirst => (1, 0),
-        ZoneVsIpOrder::ZoneFirst => (0, 0),
+        ZoneVsIpOrder::ExactIpFirst => (2, 0),
+        ZoneVsIpOrder::ZoneFirst => (1, 0),
     }
 }
 
@@ -479,17 +648,25 @@ fn label_count(name: &str) -> usize {
     name.split('.').filter(|l| !l.is_empty()).count()
 }
 
-/// The hosts one rule set names (with the strongest claim on each) and the
-/// addresses it names literally.
-///
+/// What one rule set's route rules claim.
+struct SetClaims {
+    /// Each host named, with the strongest claim on it.
+    names: HashMap<String, NameClaim>,
+    literal: HashSet<IpAddr>,
+    /// Network blocks, a range as its pieces.
+    networks: Vec<IpBlock>,
+}
+
 /// Application rules and Block rules contribute nothing — see rules 1 and 3 in
-/// the module doc.
+/// the module doc — and neither does a network enforcement cannot carry.
 fn name_claims(
     rules: &CanonicalRuleSet,
     cache: &dyn FqdnCacheLookup,
-) -> (HashMap<String, NameClaim>, HashSet<IpAddr>) {
+    support: RuleShapeSupport,
+) -> SetClaims {
     let mut names: HashMap<String, NameClaim> = HashMap::new();
     let mut literal: HashSet<IpAddr> = HashSet::new();
+    let mut networks: Vec<IpBlock> = Vec::new();
     let claim = |names: &mut HashMap<String, NameClaim>, host: String, c: NameClaim| {
         names
             .entry(host)
@@ -523,10 +700,174 @@ fn name_claims(
                     claim(&mut names, sub, c);
                 }
             }
+            Some(m @ (CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_))) => {
+                if rule_verdict(rule, support).is_supported() {
+                    networks.extend(m.ip_blocks().into_iter().flatten().copied());
+                }
+            }
             None => {}
         }
     }
-    (names, literal)
+    SetClaims {
+        names,
+        literal,
+        networks,
+    }
+}
+
+/// Which links' route rules name one network.
+#[derive(Clone, Debug, Default)]
+struct NetworkClaim {
+    main: bool,
+    additional: bool,
+    /// The network as written in a conflict report.
+    label: String,
+}
+
+impl NetworkClaim {
+    fn has(&self, link: Link) -> bool {
+        match link {
+            Link::Main => self.main,
+            Link::Additional => self.additional,
+        }
+    }
+
+    /// The same network on both links goes to the main one, as the engine's
+    /// tie-break does.
+    fn winner(&self) -> Link {
+        if self.main {
+            Link::Main
+        } else {
+            Link::Additional
+        }
+    }
+}
+
+/// Both links' route networks, asked by longest prefix.
+///
+/// Aligned blocks either nest or are disjoint, so the networks holding an
+/// address are exactly its masks at the prefix lengths in use: a probe is one
+/// hash lookup per distinct length, never a walk of a network.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NetworkClaims {
+    by_block: HashMap<IpBlock, NetworkClaim>,
+    /// Distinct prefix lengths per family, longest first.
+    v4_lens: Vec<u8>,
+    v6_lens: Vec<u8>,
+    /// Every claimed block in address order, for interior queries.
+    sorted: Vec<IpBlock>,
+}
+
+impl NetworkClaims {
+    /// Both links' route networks alone, without resolving a single name.
+    pub(crate) fn of_book(rule_book: &CanonicalRuleBook, support: RuleShapeSupport) -> Self {
+        let networks = |rules: &CanonicalRuleSet| -> Vec<IpBlock> {
+            rules
+                .rules()
+                .iter()
+                .filter(|r| {
+                    r.enabled
+                        && r.app_match.is_none()
+                        && !matches!(r.action, RuleAction::Block)
+                        && rule_verdict(r, support).is_supported()
+                })
+                .filter_map(|r| r.address_match.as_ref()?.ip_blocks())
+                .flatten()
+                .copied()
+                .collect()
+        };
+        Self::new(
+            &networks(&rule_book.primary),
+            &networks(&rule_book.secondary),
+        )
+    }
+
+    fn new(main: &[IpBlock], additional: &[IpBlock]) -> Self {
+        let mut by_block: HashMap<IpBlock, NetworkClaim> = HashMap::new();
+        let tagged = main
+            .iter()
+            .map(|net| (net, Link::Main))
+            .chain(additional.iter().map(|net| (net, Link::Additional)));
+        for (net, link) in tagged {
+            let claim = by_block.entry(*net).or_insert_with(|| NetworkClaim {
+                label: net.to_string(),
+                ..NetworkClaim::default()
+            });
+            match link {
+                Link::Main => claim.main = true,
+                Link::Additional => claim.additional = true,
+            }
+        }
+        let mut sorted: Vec<IpBlock> = by_block.keys().copied().collect();
+        sorted.sort_unstable();
+        let lens = |v4: bool| {
+            let mut lens: Vec<u8> = sorted
+                .iter()
+                .filter(|net| net.is_ipv4() == v4)
+                .map(|net| net.prefix_len())
+                .collect();
+            lens.sort_unstable_by(|a, b| b.cmp(a));
+            lens.dedup();
+            lens
+        };
+        Self {
+            v4_lens: lens(true),
+            v6_lens: lens(false),
+            by_block,
+            sorted,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_block.is_empty()
+    }
+
+    /// Every claimed block in address order.
+    pub(crate) fn blocks(&self) -> &[IpBlock] {
+        &self.sorted
+    }
+
+    fn claim(&self, net: IpBlock) -> Option<&NetworkClaim> {
+        self.by_block.get(&net)
+    }
+
+    /// Every claimed network holding `ip`, narrowest first.
+    fn holding(&self, ip: IpAddr) -> impl Iterator<Item = (IpBlock, &NetworkClaim)> + '_ {
+        let lens = if ip.is_ipv4() {
+            &self.v4_lens
+        } else {
+            &self.v6_lens
+        };
+        lens.iter().filter_map(move |len| {
+            let net = IpBlock::new(ip, *len)?;
+            self.by_block.get(&net).map(|claim| (net, claim))
+        })
+    }
+
+    fn longest(&self, ip: IpAddr) -> Option<(IpBlock, &NetworkClaim)> {
+        self.holding(ip).next()
+    }
+
+    /// The link whose network holds `ip` most narrowly.
+    pub(crate) fn winner(&self, ip: IpAddr) -> Option<Link> {
+        self.longest(ip).map(|(_, claim)| claim.winner())
+    }
+
+    fn names(&self, ip: IpAddr, link: Link) -> bool {
+        self.holding(ip).any(|(_, claim)| claim.has(link))
+    }
+
+    /// Claimed networks strictly inside `outer`.
+    fn inside(&self, outer: IpBlock) -> impl Iterator<Item = (IpBlock, &NetworkClaim)> + '_ {
+        let start = self
+            .sorted
+            .partition_point(|net| net.network() < outer.network());
+        self.sorted[start..]
+            .iter()
+            .take_while(move |net| net.network() <= outer.last())
+            .filter(move |net| net.prefix_len() > outer.prefix_len() && outer.covers(**net))
+            .filter_map(move |net| self.by_block.get(net).map(|claim| (*net, claim)))
+    }
 }
 
 /// The addresses one rule set names, with hostnames expanded through the cache.
@@ -550,6 +891,8 @@ pub fn address_rule_ips(
                 out.insert(*ip);
             }
             Some(CanonicalAddressMatch::ExactIp(IpAddr::V6(_))) => {}
+            // Never expanded: see `address_rule_networks`.
+            Some(CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_)) => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 out.extend(
                     crate::dns_wire::only_v4(&cache.ips_for_hostname(host))
@@ -578,6 +921,25 @@ pub fn address_rule_ips(
             None => {}
         }
     }
+    out
+}
+
+/// The networks one rule set's route rules name, a range as its pieces, in
+/// address order and deduplicated — the counterpart of [`address_rule_ips`]
+/// for what cannot be listed address by address. Shape support is the
+/// caller's to check, as it is for every rule an emitter reads.
+#[must_use]
+pub fn address_rule_networks(rules: &CanonicalRuleSet) -> Vec<IpBlock> {
+    let mut out: Vec<IpBlock> = rules
+        .rules()
+        .iter()
+        .filter(|r| r.enabled && r.app_match.is_none() && !matches!(r.action, RuleAction::Block))
+        .filter_map(|r| r.address_match.as_ref()?.ip_blocks())
+        .flatten()
+        .copied()
+        .collect();
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -1081,5 +1443,422 @@ mod tests {
         // Nothing routes an unnamed address, so nothing overrules its block.
         let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
         assert!(!by_exact.block_yields(other, &zone("example")));
+    }
+
+    mod networks {
+        use super::*;
+        use nrr_domain::decision_engine_input::match_sample;
+        use nrr_domain::decision_matching::{RequestedRouteDecision, ZonePriorityPolicy};
+        use nrr_domain::{RouteBehaviorMode, RouteRole};
+        use nrr_shared::ip_block::IpRange;
+
+        /// Enforcement carries networks here whatever the shipped flag says.
+        fn with_networks() -> RuleShapeSupport {
+            RuleShapeSupport {
+                network_destination: true,
+                ..crate::wfp_codegen::current_rule_shape_support()
+            }
+        }
+
+        fn resolve(book: &CanonicalRuleBook, cache: &dyn FqdnCacheLookup) -> AddressOwnership {
+            resolve_in(book, cache, ZoneVsIpOrder::ExactIpFirst)
+        }
+
+        fn resolve_in(
+            book: &CanonicalRuleBook,
+            cache: &dyn FqdnCacheLookup,
+            order: ZoneVsIpOrder,
+        ) -> AddressOwnership {
+            AddressOwnership::resolve_with_support(book, cache, order, with_networks())
+        }
+
+        fn ip(text: &str) -> IpAddr {
+            text.parse().expect("address")
+        }
+
+        fn subnet(text: &str) -> CanonicalAddressMatch {
+            CanonicalAddressMatch::Subnet(IpBlock::parse(text).expect("subnet"))
+        }
+
+        fn range(text: &str) -> CanonicalAddressMatch {
+            CanonicalAddressMatch::ip_range(IpRange::parse(text).expect("range"))
+        }
+
+        fn literal(text: &str) -> CanonicalAddressMatch {
+            CanonicalAddressMatch::ExactIp(ip(text))
+        }
+
+        fn route(id: &str, m: CanonicalAddressMatch) -> CanonicalRule {
+            address_rule(id, m, RuleAction::Route)
+        }
+
+        fn link_of(role: RouteRole) -> Link {
+            match role {
+                RouteRole::Primary => Link::Main,
+                RouteRole::Secondary => Link::Additional,
+            }
+        }
+
+        /// The engine's answer for a bare address: the oracle every address-only
+        /// book here must agree with.
+        fn engine_owner(book: &CanonicalRuleBook, at: IpAddr) -> Option<Link> {
+            match match_sample(
+                book,
+                None,
+                Some(at),
+                None,
+                ZonePriorityPolicy::default(),
+                RouteBehaviorMode::PreferPrimary,
+            ) {
+                RequestedRouteDecision::MatchedRoute { candidate } => {
+                    Some(link_of(candidate.route_role))
+                }
+                _ => None,
+            }
+        }
+
+        fn assert_agrees(book: &CanonicalRuleBook, probes: &[&str]) {
+            let ownership = resolve(book, &MockFqdnCacheLookup::new());
+            for probe in probes {
+                let at = ip(probe);
+                assert_eq!(
+                    ownership.owner_of(at),
+                    engine_owner(book, at),
+                    "arbiter and engine disagree at {probe}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_exact_address_beats_a_subnet_on_the_other_link() {
+            let book = book(
+                vec![route("p1", literal("10.1.2.3"))],
+                vec![route("s1", subnet("10.1.0.0/16"))],
+            );
+            let ownership = resolve(&book, &MockFqdnCacheLookup::new());
+            assert_eq!(ownership.owner_of(ip("10.1.2.3")), Some(Link::Main));
+            assert_eq!(ownership.owner_of(ip("10.1.2.4")), Some(Link::Additional));
+            assert!(!ownership.address_rule_may_steer(ip("10.1.2.3"), Link::Additional));
+            assert!(ownership.address_rule_may_steer(ip("10.1.2.4"), Link::Additional));
+            assert_eq!(ownership.owner_of(ip("10.2.0.1")), None);
+            assert_agrees(&book, &["10.1.2.3", "10.1.2.4", "10.2.0.1"]);
+
+            let mirrored = book_swapped(&book);
+            let ownership = resolve(&mirrored, &MockFqdnCacheLookup::new());
+            assert_eq!(ownership.owner_of(ip("10.1.2.3")), Some(Link::Additional));
+            assert_eq!(ownership.owner_of(ip("10.1.2.4")), Some(Link::Main));
+            assert_agrees(&mirrored, &["10.1.2.3", "10.1.2.4"]);
+        }
+
+        fn book_swapped(b: &CanonicalRuleBook) -> CanonicalRuleBook {
+            CanonicalRuleBook {
+                primary: b.secondary.clone(),
+                secondary: b.primary.clone(),
+            }
+        }
+
+        #[test]
+        fn the_longer_prefix_wins_across_links() {
+            let book = book(
+                vec![route("p1", subnet("10.0.0.0/16"))],
+                vec![route("s1", subnet("10.0.5.0/24"))],
+            );
+            let ownership = resolve(&book, &MockFqdnCacheLookup::new());
+            assert_eq!(ownership.owner_of(ip("10.0.5.9")), Some(Link::Additional));
+            assert_eq!(ownership.owner_of(ip("10.0.6.1")), Some(Link::Main));
+            assert!(ownership.address_rule_may_steer(ip("10.0.5.9"), Link::Additional));
+            assert!(!ownership.address_rule_may_steer(ip("10.0.6.1"), Link::Additional));
+            // The main /16 still names the narrower network's addresses.
+            assert!(!ownership.may_block(ip("10.0.5.9")));
+            assert!(ownership.named_by(ip("10.0.5.9"), Link::Additional));
+            assert_agrees(&book, &["10.0.5.9", "10.0.6.1", "10.0.5.0", "10.0.255.255"]);
+            assert_agrees(&book_swapped(&book), &["10.0.5.9", "10.0.6.1"]);
+        }
+
+        #[test]
+        fn the_same_network_on_both_links_goes_to_the_main_one() {
+            let book = book(
+                vec![route("p1", subnet("10.0.0.0/24"))],
+                vec![route("s1", subnet("10.0.0.0/24"))],
+            );
+            assert_agrees(&book, &["10.0.0.1"]);
+            let ownership = resolve(&book, &MockFqdnCacheLookup::new());
+            assert_eq!(ownership.owner_of(ip("10.0.0.1")), Some(Link::Main));
+        }
+
+        #[test]
+        fn a_name_on_the_main_link_keeps_its_address_inside_an_additional_subnet() {
+            let cache = MockFqdnCacheLookup::new();
+            cache.set_ips("intranet.corp.example", vec![Ipv4Addr::new(10, 0, 0, 7)]);
+            let book = book(
+                vec![route(
+                    "p1",
+                    CanonicalAddressMatch::ExactFqdn("intranet.corp.example".into()),
+                )],
+                vec![route("s1", subnet("10.0.0.0/8"))],
+            );
+            let ownership = resolve(&book, &cache);
+            assert_eq!(ownership.owner_of(ip("10.0.0.7")), Some(Link::Main));
+            assert!(!ownership.address_rule_may_steer(ip("10.0.0.7"), Link::Additional));
+            assert_eq!(ownership.owner_of(ip("10.0.0.8")), Some(Link::Additional));
+
+            // And the other way round: a name on the additional link inside a
+            // main-link network is that link's.
+            let ownership = resolve(&book_swapped(&book), &cache);
+            assert_eq!(ownership.owner_of(ip("10.0.0.7")), Some(Link::Additional));
+            assert!(ownership.address_rule_may_steer(ip("10.0.0.7"), Link::Additional));
+            assert_eq!(ownership.owner_of(ip("10.0.0.8")), Some(Link::Main));
+        }
+
+        /// A network beats a zone in the default order and loses to one with
+        /// zones first, the same as an exact address does.
+        #[test]
+        fn a_network_beats_a_zone_only_in_the_default_order() {
+            let cache = MockFqdnCacheLookup::new();
+            cache.set_ips("files.corp.intra", vec![Ipv4Addr::new(10, 0, 0, 9)]);
+            let zone_main = book(
+                vec![route("p1", CanonicalAddressMatch::Zone("intra".into()))],
+                vec![route("s1", subnet("10.0.0.0/8"))],
+            );
+            let at = ip("10.0.0.9");
+            assert_eq!(
+                resolve(&zone_main, &cache).owner_of(at),
+                Some(Link::Additional)
+            );
+            assert_eq!(
+                resolve_in(&zone_main, &cache, ZoneVsIpOrder::ZoneFirst).owner_of(at),
+                Some(Link::Main)
+            );
+            let zone_additional = book_swapped(&zone_main);
+            assert_eq!(
+                resolve(&zone_additional, &cache).owner_of(at),
+                Some(Link::Main)
+            );
+            assert!(!resolve(&zone_additional, &cache).address_rule_may_steer(at, Link::Additional));
+            assert_eq!(
+                resolve_in(&zone_additional, &cache, ZoneVsIpOrder::ZoneFirst).owner_of(at),
+                Some(Link::Additional)
+            );
+        }
+
+        #[test]
+        fn an_app_rule_may_not_claim_inside_the_other_links_network() {
+            let book = book(
+                vec![route("p1", subnet("192.0.2.0/24"))],
+                vec![app_rule("s-app")],
+            );
+            let ownership = resolve(&book, &MockFqdnCacheLookup::new());
+            assert!(!ownership.app_rule_may_claim(ip("192.0.2.77"), Link::Additional));
+            assert!(ownership.app_rule_may_claim(ip("192.0.2.77"), Link::Main));
+            assert!(ownership.app_rule_may_claim(ip("198.51.100.1"), Link::Additional));
+        }
+
+        #[test]
+        fn a_blocked_subnet_yields_to_a_narrower_rule_inside_it() {
+            let cache = MockFqdnCacheLookup::new();
+            cache.set_ips("wiki.corp.example", vec![Ipv4Addr::new(10, 0, 1, 1)]);
+            cache.set_ips("x.corp.intra", vec![Ipv4Addr::new(10, 0, 3, 3)]);
+            let blocked = subnet("10.0.0.0/16");
+            let book = book(
+                vec![address_rule("p-block", blocked.clone(), RuleAction::Block)],
+                vec![
+                    route(
+                        "s-name",
+                        CanonicalAddressMatch::ExactFqdn("wiki.corp.example".into()),
+                    ),
+                    route("s-ip", literal("10.0.2.2")),
+                    route("s-24", subnet("10.0.4.0/24")),
+                    route("s-zone", CanonicalAddressMatch::Zone("intra".into())),
+                ],
+            );
+            let ownership = resolve(&book, &cache);
+            assert!(ownership.block_yields(ip("10.0.1.1"), &blocked), "a name");
+            assert!(
+                ownership.block_yields(ip("10.0.2.2"), &blocked),
+                "an exact address"
+            );
+            assert!(
+                ownership.block_yields(ip("10.0.4.4"), &blocked),
+                "a longer prefix"
+            );
+            // A zone is wider than a network.
+            assert!(!ownership.block_yields(ip("10.0.3.3"), &blocked));
+            assert!(
+                !ownership.block_yields(ip("10.0.9.9"), &blocked),
+                "nothing routes it"
+            );
+            // A network Block is no veto: the name's route is untouched.
+            assert_eq!(ownership.literal_block_of(ip("10.0.1.1")), None);
+            assert!(ownership.address_rule_may_steer(ip("10.0.1.1"), Link::Additional));
+            // Outside the network the Block does not apply at all.
+            assert!(!ownership.block_yields(ip("10.1.0.1"), &blocked));
+
+            // The same network routed is a tie, and a tie keeps the block.
+            let same = book_with_secondary(vec![route("s-16", subnet("10.0.0.0/16"))]);
+            assert!(!resolve(&same, &cache).block_yields(ip("10.0.9.9"), &blocked));
+            let wider = book_with_secondary(vec![route("s-8", subnet("10.0.0.0/8"))]);
+            let ownership = resolve(&wider, &cache);
+            assert!(
+                !ownership.block_yields(ip("10.0.9.9"), &blocked),
+                "a wider route"
+            );
+        }
+
+        fn book_with_secondary(secondary: Vec<CanonicalRule>) -> CanonicalRuleBook {
+            book(Vec::new(), secondary)
+        }
+
+        /// A zone Block over a host whose address a network routes: the network
+        /// is narrower, the address stays open, and the conflict names it.
+        #[test]
+        fn a_zone_block_reports_the_network_that_kept_an_address_open() {
+            let cache = MockFqdnCacheLookup::new();
+            cache.set_ips("shop.example.ru", vec![Ipv4Addr::new(203, 0, 113, 5)]);
+            let zone = CanonicalAddressMatch::Zone("ru".into());
+            let book = book(
+                vec![address_rule("p-block", zone.clone(), RuleAction::Block)],
+                vec![route("s1", subnet("203.0.113.0/24"))],
+            );
+            let ownership = resolve(&book, &cache);
+            let at = ip("203.0.113.5");
+            assert!(ownership.block_yields(at, &zone));
+            assert_eq!(
+                ownership.block_leak("shop.example.ru", at, &zone),
+                Some("203.0.113.0/24")
+            );
+        }
+
+        #[test]
+        fn ipv6_networks_claim_by_longest_prefix() {
+            let book = book(
+                vec![route("p1", subnet("2001:db8:1::/48"))],
+                vec![route("s1", subnet("2001:db8::/32"))],
+            );
+            let ownership = resolve(&book, &MockFqdnCacheLookup::new());
+            assert_eq!(ownership.owner_of(ip("2001:db8:1::5")), Some(Link::Main));
+            assert_eq!(
+                ownership.owner_of(ip("2001:db8:2::5")),
+                Some(Link::Additional)
+            );
+            assert_eq!(ownership.owner_of(ip("2001:db9::1")), None);
+            // A v4 address never falls into a v6 network.
+            assert_eq!(ownership.owner_of(ip("32.1.13.184")), None);
+            assert_agrees(&book, &["2001:db8:1::5", "2001:db8:2::5", "2001:db9::1"]);
+        }
+
+        /// A range is as narrow as its piece around the address, so it beats a
+        /// /24 at the addresses it holds and leaves the rest to it.
+        #[test]
+        fn a_range_claims_through_its_pieces() {
+            let book = book(
+                vec![route("p1", subnet("10.0.0.0/24"))],
+                vec![route("s1", range("10.0.0.5-10.0.0.40"))],
+            );
+            let ownership = resolve(&book, &MockFqdnCacheLookup::new());
+            for inside in ["10.0.0.5", "10.0.0.9", "10.0.0.31", "10.0.0.40"] {
+                assert_eq!(
+                    ownership.owner_of(ip(inside)),
+                    Some(Link::Additional),
+                    "{inside}"
+                );
+            }
+            for outside in ["10.0.0.4", "10.0.0.41", "10.0.0.200"] {
+                assert_eq!(
+                    ownership.owner_of(ip(outside)),
+                    Some(Link::Main),
+                    "{outside}"
+                );
+            }
+            assert_agrees(
+                &book,
+                &["10.0.0.4", "10.0.0.5", "10.0.0.9", "10.0.0.40", "10.0.0.41"],
+            );
+
+            // A blocked range yields to a narrower piece of route, not to an
+            // equal one.
+            let blocked = range("10.0.0.5-10.0.0.40");
+            let routed = |m| book_with_secondary(vec![route("s1", m)]);
+            let narrower = resolve(&routed(subnet("10.0.0.16/30")), &MockFqdnCacheLookup::new());
+            assert!(narrower.block_yields(ip("10.0.0.17"), &blocked));
+            let equal = resolve(&routed(subnet("10.0.0.16/28")), &MockFqdnCacheLookup::new());
+            assert!(!equal.block_yields(ip("10.0.0.17"), &blocked));
+        }
+
+        #[test]
+        fn a_network_enforcement_cannot_carry_claims_nothing() {
+            let book = book(Vec::new(), vec![route("s1", subnet("10.0.0.0/8"))]);
+            let ownership = AddressOwnership::resolve_with_support(
+                &book,
+                &MockFqdnCacheLookup::new(),
+                ZoneVsIpOrder::ExactIpFirst,
+                RuleShapeSupport::NONE,
+            );
+            assert_eq!(ownership.owner_of(ip("10.0.0.1")), None);
+            assert_eq!(ownership.networks(Link::Additional).count(), 0);
+        }
+
+        #[test]
+        fn interior_queries_answer_without_walking_the_network() {
+            let cache = MockFqdnCacheLookup::new();
+            cache.set_ips("a.example", vec![Ipv4Addr::new(10, 1, 0, 1)]);
+            let book = book(
+                vec![
+                    route(
+                        "p-name",
+                        CanonicalAddressMatch::ExactFqdn("a.example".into()),
+                    ),
+                    route("p-24", subnet("10.2.3.0/24")),
+                    route("p-out", literal("11.0.0.1")),
+                ],
+                vec![
+                    route("s-8", subnet("10.0.0.0/8")),
+                    route("s-ip", literal("10.9.9.9")),
+                ],
+            );
+            let ownership = resolve(&book, &cache);
+            let outer = IpBlock::parse("10.0.0.0/8").expect("block");
+            assert_eq!(
+                ownership.explicit_inside(outer),
+                &[ip("10.1.0.1"), ip("10.9.9.9")]
+            );
+            assert_eq!(
+                ownership.networks_inside(outer).collect::<Vec<_>>(),
+                vec![(IpBlock::parse("10.2.3.0/24").expect("block"), Link::Main)]
+            );
+            assert_eq!(
+                ownership.network_of(ip("10.2.3.4"), Link::Additional),
+                IpBlock::parse("10.0.0.0/8")
+            );
+            assert_eq!(
+                ownership.networks(Link::Main).collect::<Vec<_>>(),
+                vec![IpBlock::parse("10.2.3.0/24").expect("block")]
+            );
+            // What the carve-out of the additional /8 needs, asked per address.
+            let carved: Vec<IpAddr> = ownership
+                .explicit_inside(outer)
+                .iter()
+                .copied()
+                .filter(|at| ownership.owner_of(*at) == Some(Link::Main))
+                .collect();
+            assert_eq!(carved, vec![ip("10.1.0.1")]);
+        }
+
+        #[test]
+        fn address_rule_networks_lists_route_networks_only() {
+            let mut off = route("s-off", subnet("10.9.0.0/16"));
+            off.enabled = false;
+            let set = CanonicalRuleSet::from_rules(vec![
+                route("s-24", subnet("10.0.0.0/24")),
+                route("s-dup", subnet("10.0.0.0/24")),
+                route("s-range", range("10.1.0.0-10.1.0.2")),
+                address_rule("s-block", subnet("10.2.0.0/16"), RuleAction::Block),
+                off,
+            ]);
+            let nets: Vec<String> = address_rule_networks(&set)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(nets, vec!["10.0.0.0/24", "10.1.0.0/31", "10.1.0.2/32"]);
+        }
     }
 }

@@ -234,8 +234,12 @@ pub enum FreeRuleType {
     /// IP-subnet zones remain unsupported. The rule engine evaluates
     /// zone matches at tier 3 (after Exact FQDN and Subdomain/Suffix).
     Zone,
-    /// Matches one exact IP address. No CIDR prefix or range matching.
+    /// Matches one exact IP address.
     ExactIp,
+    /// Matches every address of one network, `10.0.0.0/8`.
+    Subnet,
+    /// Matches every address of an inclusive range, `10.0.0.5-10.0.0.40`.
+    IpRange,
 }
 
 impl FreeRuleType {
@@ -245,6 +249,8 @@ impl FreeRuleType {
             Self::Domain => "domain",
             Self::Zone => "zone",
             Self::ExactIp => "exact-ip",
+            Self::Subnet => "subnet",
+            Self::IpRange => "ip-range",
         }
     }
 
@@ -254,6 +260,8 @@ impl FreeRuleType {
             Self::Domain => "Domain",
             Self::Zone => "Zone",
             Self::ExactIp => "Exact IP",
+            Self::Subnet => "Subnet (CIDR)",
+            Self::IpRange => "IP range",
         }
     }
 
@@ -268,13 +276,17 @@ impl FreeRuleType {
     /// | `Domain`      | 1        | Pass 1 |
     /// | `Zone`        | 2        | Pass 1 |
     /// | `ExactIp`     | 3        | Pass 1 |
-    /// | `Application` | 4        | Pass 2 |
+    /// | `Subnet`      | 4        | Pass 1 |
+    /// | `IpRange`     | 5        | Pass 1 |
+    /// | `Application` | 6        | Pass 2 |
     pub const fn evaluation_priority(self) -> u8 {
         match self {
             Self::Domain => 1,
             Self::Zone => 2,
             Self::ExactIp => 3,
-            Self::Application => 4,
+            Self::Subnet => 4,
+            Self::IpRange => 5,
+            Self::Application => 6,
         }
     }
 }
@@ -297,6 +309,8 @@ impl FromStr for FreeRuleType {
             }
             "zone" => Ok(Self::Zone),
             "exact-ip" | "ip" => Ok(Self::ExactIp),
+            "subnet" | "cidr" => Ok(Self::Subnet),
+            "ip-range" | "range" => Ok(Self::IpRange),
             _ => Err("unknown free rule type"),
         }
     }
@@ -366,7 +380,7 @@ pub enum RulesViewSort {
     ByDisplayOrder,
     /// Alphabetical by match value (domain label, IP address, or process name).
     ByMatchValue,
-    /// Grouped by rule type: Domain → ExactIp → Application.
+    /// Grouped by rule type, in [`FreeRuleType::evaluation_priority`] order.
     ByType,
     /// Grouped by target route: Primary first, then Secondary.
     ByRoute,
@@ -473,8 +487,8 @@ impl FromStr for RulesEnabledFilter {
 /// Rule-type filter for the rules table view.
 ///
 /// `All` is the default and shows every rule regardless of type. Section-based
-/// variants (`Zones`, `Domain`, `ExactIp`, `Application`, `Windows`, `Linux`,
-/// `MacOS`) narrow the visible set to the corresponding rules-file section.
+/// variants (`Zones`, `Domain`, `ExactIp`, `Subnet`, `IpRange`, `Application`,
+/// `Windows`, `Linux`, `MacOS`) narrow the visible set to the corresponding rules-file section.
 ///
 /// `Application` is an alias for the current-platform application section
 /// (equivalent to `Windows` on Windows). `Windows`, `Linux`, and `MacOS` are
@@ -491,6 +505,10 @@ pub enum RulesTypeFilter {
     Domain,
     /// Show only rules in the `--- IP` section.
     ExactIp,
+    /// Show only rules in the `--- CIDR` section.
+    Subnet,
+    /// Show only rules in the `--- Ranges` section.
+    IpRange,
     /// Show only application rules for the current platform
     /// (on Windows, equivalent to `Windows`).
     Application,
@@ -503,11 +521,13 @@ pub enum RulesTypeFilter {
 }
 
 impl RulesTypeFilter {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::All,
         Self::Zones,
         Self::Domain,
         Self::ExactIp,
+        Self::Subnet,
+        Self::IpRange,
         Self::Application,
         Self::Windows,
         Self::Linux,
@@ -520,6 +540,8 @@ impl RulesTypeFilter {
             Self::Zones => "zones",
             Self::Domain => "domain",
             Self::ExactIp => "exact-ip",
+            Self::Subnet => "subnet",
+            Self::IpRange => "ip-range",
             Self::Application => "application",
             Self::Windows => "windows",
             Self::Linux => "linux",
@@ -533,6 +555,8 @@ impl RulesTypeFilter {
             Self::Zones => "Zones",
             Self::Domain => "Domain",
             Self::ExactIp => "Exact IP",
+            Self::Subnet => "Subnet (CIDR)",
+            Self::IpRange => "IP range",
             Self::Application => "Application",
             Self::Windows => "Windows",
             Self::Linux => "Linux",
@@ -564,6 +588,8 @@ impl FromStr for RulesTypeFilter {
             "zones" => Ok(Self::Zones),
             "domain" => Ok(Self::Domain),
             "exact-ip" | "ip" => Ok(Self::ExactIp),
+            "subnet" | "cidr" => Ok(Self::Subnet),
+            "ip-range" | "range" => Ok(Self::IpRange),
             "application" | "app" => Ok(Self::Application),
             "windows" => Ok(Self::Windows),
             "linux" => Ok(Self::Linux),

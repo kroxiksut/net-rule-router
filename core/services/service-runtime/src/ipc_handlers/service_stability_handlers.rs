@@ -139,7 +139,14 @@ impl ServiceStabilityConfigSetHandler {
 }
 
 const RULES_LOCK_WIRE_KEY: &str = "allow-user-rule-edits";
-const REPORTED_ONLY_WIRE_KEYS: &[&str] = &["verbose-logging-mode", "verbose-logging-until-ms"];
+const REPORTED_ONLY_WIRE_KEYS: &[&str] = &[
+    "verbose-logging-mode",
+    "verbose-logging-until-ms",
+    "conn-trace-ndjson-mode",
+    "conn-trace-ndjson-until-ms",
+    "conn-trace-ndjson-forced",
+    "conn-trace-ndjson-forced-by",
+];
 
 impl IpcHandler for ServiceStabilityConfigSetHandler {
     fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
@@ -192,6 +199,7 @@ impl IpcHandler for ServiceStabilityConfigSetHandler {
             origin = req.origin.as_deref().unwrap_or("unspecified"),
             requested_enforcement_mode = %req.config.enforcement_mode,
             requested_verbose = ?req.config.verbose_logging_change,
+            requested_conn_trace_log = ?req.config.conn_trace_ndjson_change,
             "service-stability set requested",
         );
         // Measure the write end-to-end. `elapsed_ms` here says whether the
@@ -511,6 +519,41 @@ mod tests {
         )
         .expect("an elevated caller may change it");
         assert!(writer.config.lock().unwrap().is_some());
+    }
+
+    /// A trace window reported before it ended, echoed back by a full-row
+    /// save, asks for nothing.
+    #[test]
+    fn a_stale_echo_of_the_trace_window_is_not_a_change() {
+        let writer = recording_writer();
+        let h = handler_with(Arc::clone(&writer) as Arc<dyn ServiceStabilityConfigWriter>);
+        let mut payload = set_lock_payload(false);
+        payload["config"]["conn-trace-ndjson-mode"] = serde_json::json!("timed");
+        payload["config"]["conn-trace-ndjson-until-ms"] = serde_json::json!(1_000);
+        payload["config"]["conn-trace-ndjson-forced"] = serde_json::json!(true);
+        h.handle(
+            &env(payload, IpcOperationName::ServiceStabilityConfigSet),
+            &non_elevated_ctx(),
+        )
+        .expect("reported state is not a request");
+        assert!(writer.config.lock().unwrap().is_some());
+    }
+
+    /// Writing every user's connections to disk is an administrator's call.
+    #[test]
+    fn a_non_elevated_caller_cannot_open_the_trace_window() {
+        let writer = recording_writer();
+        let h = handler_with(Arc::clone(&writer) as Arc<dyn ServiceStabilityConfigWriter>);
+        let mut payload = set_lock_payload(false);
+        payload["config"]["conn-trace-ndjson-change"] = serde_json::json!("one-hour");
+        let err = h
+            .handle(
+                &env(payload, IpcOperationName::ServiceStabilityConfigSet),
+                &non_elevated_ctx(),
+            )
+            .expect_err("opening the trace window is refused");
+        assert_eq!(err.code, IpcErrorCode::Forbidden);
+        assert!(writer.config.lock().unwrap().is_none());
     }
 
     /// The administrator sets and lifts it freely.

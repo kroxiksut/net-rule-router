@@ -18,7 +18,7 @@
 // Decision shape passed to `approved`:
 //   {
 //     duplicates:   {sectionName: "merge"|"last-wins"|"ignore"},
-//     reclassify:   {sectionName: "passthrough"|"zones"|"domains"|"ip"|"windows"|"skip"}
+//     reclassify:   {sectionName: "passthrough"|"zones"|"domains"|"ip"|"cidr"|"ranges"|"windows"|"skip"}
 //   }
 //
 // Width target: 720px. Height adapts to content; both groups scroll
@@ -344,6 +344,14 @@ Dialog {
                                               label: root._tr(
                                                 "dialog.preset-review.classify-ip",
                                                 "IP addresses") },
+                                            { value: "ranges",
+                                              label: root._tr(
+                                                "dialog.preset-review.classify-ranges",
+                                                "IP ranges") },
+                                            { value: "cidr",
+                                              label: root._tr(
+                                                "dialog.preset-review.classify-cidr",
+                                                "Subnets (CIDR)") },
                                             { value: "windows",
                                               label: root._tr(
                                                 "dialog.preset-review.classify-windows",

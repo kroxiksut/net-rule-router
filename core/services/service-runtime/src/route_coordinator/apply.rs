@@ -48,20 +48,36 @@ impl SecondaryRouteCoordinator {
         // The tunnel's own redirect prefixes shape mode A's counter-overlay.
         // Read here, not cached: a client that reconnects may lay them out
         // differently, and the reconcile that follows must answer that layout.
-        let tunnel_catch_alls = self
+        let table = self
             .api
             .get_ip_forward_table()
-            .map(|t| {
-                let t = self.stamped_with_ownership(t);
-                crate::route_codegen::tunnel_catch_all_prefixes(&t, secondary.interface_index)
-            })
+            .map(|t| self.stamped_with_ownership(t));
+        let tunnel_catch_alls = table
+            .as_ref()
+            .map(|t| crate::route_codegen::tunnel_catch_all_prefixes(t, secondary.interface_index))
             .unwrap_or_default();
+        // The rest of the machine reading only when a network rule will use it:
+        // the adapter enumeration is a cost the host-only book never pays.
+        let networks = match &table {
+            Ok(t)
+                if crate::route_codegen::network_routes::names_networks(
+                    &snapshot.rule_book,
+                    self.network_support,
+                ) =>
+            {
+                self.network_facts_from(resolution, t, false)
+            }
+            _ => crate::route_codegen::network_routes::NetworkRouteFacts::from_catch_alls(
+                &tunnel_catch_alls,
+            ),
+        };
         let mut out = self.planned_routes(
             sid,
             resolution,
             &secondary,
             &snapshot.rule_book,
             &tunnel_catch_alls,
+            &networks,
         );
         // DNS-over-secondary — the route half of the setting. Emitted here, not
         // in `generate_routes`, because it is not derived from the rule book:
@@ -119,19 +135,36 @@ impl SecondaryRouteCoordinator {
                 app_rule_dest_used_by_other_process = tally.app_rule_dest_used_by_other_process,
                 address_claimed_by_main_link = tally.address_claimed_by_main_link,
                 primary_exceptions_unavailable = tally.primary_exceptions_unavailable,
+                network_yields_to_local_network = tally.network_yields_to_local_network,
+                network_routed_around_tunnel_server = tally.network_routed_around_tunnel_server,
+                network_claimed_by_main_link = tally.network_claimed_by_main_link,
+                network_routes_capped = tally.network_routes_capped,
                 "route codegen produced diagnostics",
             );
         }
         // Route-shape breakdown so the log alone answers "is mode-A selectivity
-        // actually in place?" without Get-NetRoute: the `/2` counter-overlay
+        // actually in place?" without Get-NetRoute: the counter-overlay
         // (unmatched → primary) only exists when a primary target resolved; a
         // `counter_overlay=0` + `primary=false` in PreferPrimary is the
         // smoking gun for "unmatched traffic is still riding the secondary".
-        let counter_overlay = out.routes.iter().filter(|r| r.prefix_length == 2).count();
+        // Told apart by signature, not length: a rule network can be `/9`.
+        let counter_overlay = out
+            .routes
+            .iter()
+            .filter(|r| {
+                crate::route_codegen::is_overlay_route(r)
+                    && r.interface_index != secondary.interface_index
+            })
+            .count();
         let secondary_routes = out
             .routes
             .iter()
             .filter(|r| r.prefix_length == 32 && r.interface_index == secondary.interface_index)
+            .count();
+        let network_routes = out
+            .routes
+            .iter()
+            .filter(|r| r.metric == crate::route_codegen::NETWORK_ROUTE_METRIC)
             .count();
         let primary_present = resolution.primary.is_some();
         let delta = self.reconciler.reconcile(&out.routes)?;
@@ -164,6 +197,7 @@ impl SecondaryRouteCoordinator {
                 desired_routes = out.routes.len(),
                 secondary_routes,
                 counter_overlay,
+                network_routes,
                 added = delta.added,
                 removed = delta.removed,
                 "route table reconciled",

@@ -16,9 +16,13 @@ pub(super) struct NeutralPlanVerdict {
     pub(super) neutral: usize,
     pub(super) same_set: bool,
     pub(super) same_order: bool,
-    /// A few of the filters each side has and the other does not, rendered for
-    /// the log. Bounded: the point is to name the difference, and a set that
-    /// diverges wholesale is answered by the counts alone.
+    /// What KIND of filters each side has and the other does not, grouped and
+    /// counted — no address, path or interface, so the default log can say why
+    /// the plans differ.
+    differs_live: String,
+    differs_neutral: String,
+    /// A few of those filters with their addresses, for the verbose log. Bounded:
+    /// a set that diverges wholesale is answered by the counts alone.
     only_live: String,
     only_neutral: String,
 }
@@ -32,7 +36,7 @@ pub(super) const SHADOW_COMPARE_EVERY: std::time::Duration =
 /// a category; past it the counts already say the sets diverge wholesale.
 const NEUTRAL_DIFF_SAMPLE: usize = 4;
 
-/// Render a multiset difference as one short line.
+/// Render a multiset difference as one short line, addresses included.
 fn render_difference(
     entries: &[(nrr_platform_api::wfp_behavioral::BehavioralKey, usize)],
 ) -> String {
@@ -43,6 +47,7 @@ fn render_difference(
         .iter()
         .take(NEUTRAL_DIFF_SAMPLE)
         .map(|(key, count)| {
+            let key = key.addresses();
             if *count > 1 {
                 format!("{key} x{count}")
             } else {
@@ -54,6 +59,22 @@ fn render_difference(
         parts.push(format!("(+{} more)", entries.len() - NEUTRAL_DIFF_SAMPLE));
     }
     parts.join("; ")
+}
+
+/// Render a multiset difference by filter kind: every differing filter is
+/// counted under its shape, most frequent first.
+fn render_shapes(entries: &[(nrr_platform_api::wfp_behavioral::BehavioralKey, usize)]) -> String {
+    let mut by_shape: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (key, count) in entries {
+        *by_shape.entry(key.shape().to_string()).or_default() += count;
+    }
+    let mut shapes: Vec<(String, usize)> = by_shape.into_iter().collect();
+    shapes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    shapes
+        .into_iter()
+        .map(|(shape, count)| format!("{shape} x{count}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl NeutralPlanVerdict {
@@ -142,6 +163,8 @@ impl PerSidApplyOrchestrator {
             neutral = verdict.neutral,
             same_set = verdict.same_set,
             same_order = verdict.same_order,
+            differs_live = %verdict.differs_live,
+            differs_neutral = %verdict.differs_neutral,
             only_live = %verdict.only_live,
             only_neutral = %verdict.only_neutral,
             "neutral plan DIFFERS from the filters actually installed — enforcement is unaffected (the live path applied), but the neutral path cannot take over until this is explained",
@@ -218,6 +241,8 @@ impl PerSidApplyOrchestrator {
             neutral: lowered.len(),
             same_set: behaviorally_equivalent(live, &lowered),
             same_order: arbitration_order_preserved(live, &lowered),
+            differs_live: render_shapes(&difference.only_in_a),
+            differs_neutral: render_shapes(&difference.only_in_b),
             only_live: render_difference(&difference.only_in_a),
             only_neutral: render_difference(&difference.only_in_b),
         })
@@ -252,4 +277,54 @@ fn shadow_compare_fingerprint(
         fold(spec.weight);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey};
+    use nrr_platform_api::wfp_behavioral::behavioral_key;
+    use std::net::Ipv4Addr;
+
+    fn block(remote: [u8; 4], app: Option<&str>) -> WfpFilterSpec {
+        WfpFilterSpec {
+            layer: WfpLayerKey::OutboundIpPacketV4,
+            action: WfpAction::Block,
+            remote_ip: Some(Ipv4Addr::from(remote)),
+            remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
+            remote_port: None,
+            weight: 1,
+            id: WfpFilterId::from_raw(1),
+            user_sid: None,
+            app_pattern: app.map(str::to_string),
+            local_interface_luid: None,
+            remote_subnet: None,
+            remote_subnet_v6: None,
+            ip_protocol: None,
+        }
+    }
+
+    /// The default log line names the kind and count of the differing filters
+    /// and nothing that identifies a destination or an application.
+    #[test]
+    fn the_shape_summary_groups_by_kind_without_values() {
+        let entries = vec![
+            (behavioral_key(&block([198, 51, 100, 1], None)), 2),
+            (behavioral_key(&block([198, 51, 100, 2], None)), 1),
+            (
+                behavioral_key(&block([203, 0, 113, 9], Some(r"C:\app.exe"))),
+                1,
+            ),
+        ];
+        let line = render_shapes(&entries);
+        assert_eq!(line, "pkt4/block ip x3; pkt4/block ip app x1");
+
+        let detail = render_difference(&entries);
+        assert!(detail.contains("198.51.100.1"));
+        assert!(
+            !detail.contains("app.exe"),
+            "the verbose line carries no path: {detail}"
+        );
+    }
 }

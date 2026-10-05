@@ -120,13 +120,22 @@ pub fn output_with_input(
     run_with_budget(exe, args, Some(input.as_bytes().to_vec()), timeout)
 }
 
+/// A command for a system tool, without the service's systemd notify socket. A
+/// child that inherits it writes to the socket systemd keeps for the main
+/// process, and systemd logs every such message as a stranger's.
+pub(crate) fn tool_command(exe: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(exe);
+    command.env_remove("NOTIFY_SOCKET");
+    command
+}
+
 fn run_with_budget(
     exe: &str,
     args: &[&str],
     input: Option<Vec<u8>>,
     timeout: Duration,
 ) -> io::Result<Output> {
-    let mut child = Command::new(program_path(exe)?)
+    let mut child = tool_command(program_path(exe)?)
         .args(args)
         .env("LC_ALL", "C")
         .env("LANG", "C")

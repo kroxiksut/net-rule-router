@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Linux counterpart of uninstall-service.ps1. Counterpart of install-service.sh:
-# removes the unit AND the staged copy under /usr/lib/netrulerouter that
+# removes the unit AND the staged copy under /usr/libexec/netrulerouter that
 # install-service.sh put there.
 #
 # Difference from uninstall-service.ps1: `nrr-serviced uninstall` runs

@@ -19,7 +19,7 @@
 // `nrr_domain::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION`; the Rust test
 // `the_gui_writes_the_current_preset_format_version` reads this line and fails
 // when the two drift.
-var CANONICAL_PRESET_FORMAT_VERSION = 4
+var CANONICAL_PRESET_FORMAT_VERSION = 5
 
 // True for the rule types whose match value is a hostname (so callers know to
 // apply host-specific handling such as ACE encoding at the wire boundary).
@@ -111,6 +111,8 @@ function ruleTypeToSection(ruleType) {
     if (rt === "zone") return "Zones"
     if (rt === "domain" || rt === "suffix-domain" || rt === "exact-fqdn") return "Domains"
     if (rt === "exact-ip" || rt === "exact-ipv4" || rt === "exact-ipv6") return "IP"
+    if (rt === "subnet") return "CIDR"
+    if (rt === "ip-range") return "Ranges"
     if (rt === "application") return "Windows"
     return ""
 }
@@ -139,7 +141,7 @@ function oneLineField(value) {
 // live in the sidecar either way).
 function buildCanonicalRulesText(rulesModel, route, passthroughSections, includeComments) {
     var emitComments = (includeComments === undefined) ? true : !!includeComments
-    var sections = { Zones: [], Domains: [], Auto: [], IP: [], Windows: [] }
+    var sections = { Zones: [], Domains: [], Auto: [], IP: [], CIDR: [], Ranges: [], Windows: [] }
     if (rulesModel) {
         for (var i = 0; i < rulesModel.count; i += 1) {
             var row = rulesModel.get(i)
@@ -182,19 +184,17 @@ function buildCanonicalRulesText(rulesModel, route, passthroughSections, include
     }
     var nameLabel = (route === "secondary") ? "Secondary Route" : "Primary Route"
     var lines = []
-    // Must match nrr_domain::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION — the
-    // file may carry version-4 constructs (`--- Auto`, `+block`), and a header
-    // that claims 1 tells the next reader they are not there. Pinned from the
-    // Rust side by `the_gui_writes_the_current_preset_format_version`.
+    // A header claiming an older version tells the next reader the newer
+    // sections are not there; see CANONICAL_PRESET_FORMAT_VERSION.
     lines.push("# NetRuleRouter preset — version " + CANONICAL_PRESET_FORMAT_VERSION)
     lines.push("# name: NetRuleRouter Export - " + nameLabel)
     lines.push("# description: Exported from the NetRuleRouter app on "
         + (new Date()).toISOString())
     lines.push("# preset_version: 1")
     lines.push("")
-    // Auto comes last, matching the canonical section order the Rust writer
-    // emits (`nrr_domain::rules_file::Section::ALL`).
-    var order = ["Zones", "Domains", "IP", "Windows", "Auto"]
+    // The canonical section order the Rust writer emits
+    // (`nrr_domain::rules_file::RulesFileSection::ALL`).
+    var order = ["Zones", "Domains", "IP", "CIDR", "Ranges", "Windows", "Auto"]
     for (var s = 0; s < order.length; s += 1) {
         var key = order[s]
         lines.push("--- " + key)
@@ -262,6 +262,17 @@ function hostAddressMatchDto(value) {
     return { kind: "exact-fqdn", value: v }
 }
 
+// A range row reads `first-last`; neither family's address text has a `-`.
+// A value without one keeps all of it in `first`, so the service refuses it
+// by name instead of the GUI dropping it.
+function ipRangeAddressMatchDto(value) {
+    var v = String(value || "")
+    var dash = v.indexOf("-")
+    if (dash < 0) return { kind: "ip-range", first: v.trim(), last: "" }
+    return { kind: "ip-range", first: v.substring(0, dash).trim(),
+        last: v.substring(dash + 1).trim() }
+}
+
 // THE rules-model row -> canonical wire DTO mapper. Single serializer for every
 // caller: the Rules-section "Save and review", the window-level apply payload,
 // and the drift hasher. Per-caller copies risk diverging on fields like
@@ -321,6 +332,12 @@ function ruleRowToWireDto(row, aceEncodeHost, opts) {
                 kind: value.indexOf(":") >= 0 ? "exact-ipv6" : "exact-ipv4",
                 address: value
             }
+            break
+        case "subnet":
+            dto["address-match"] = { kind: "subnet", network: value.trim() }
+            break
+        case "ip-range":
+            dto["address-match"] = ipRangeAddressMatchDto(value)
             break
         case "application":
             // A `*` makes it a pattern, exactly as the preset parser reads it.
@@ -422,7 +439,10 @@ function driftSortKey(d) {
     var ap = d["app-match"] || null
     var pat = (ap && ap.pattern) || null
     var kind = am ? String(am.kind || "") : ""
-    var val = am ? String(am.value || am.suffix || am.name || am.address || "") : ""
+    // A range reads `first-last`, as `AddressMatchDto::value_text` writes it.
+    var val = !am ? ""
+        : (am.first !== undefined) ? String(am.first || "") + "-" + String(am.last || "")
+        : String(am.value || am.suffix || am.name || am.address || am.network || "")
     var appKind = pat ? "app:" + String(pat.kind || "") : ""
     var appVal = pat ? String(pat.value || "") : ""
     var children = (ap && ap["include-child-processes"]) ? "1" : "0"

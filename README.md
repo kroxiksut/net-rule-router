@@ -104,18 +104,22 @@ and stops at the first match:
 | 1 | Exact domain (FQDN) | `api.bank.com` |
 | 2 | Subdomain / suffix | `*.bank.com` |
 | 3 | Zone (TLD / internal suffix, domain zones) | `.ru`, `.com`, `.intra` |
-| 4 | Exact IP address (IPv4 or IPv6) | `203.0.113.7`, `2001:db8::7` |
-| 5 | Application (process name) | `chrome.exe` |
-| 6 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed |
+| 4 | Subnet (CIDR) or IP range | `10.0.0.0/8`, `192.0.2.10-192.0.2.40` |
+| 5 | Exact IP address (IPv4 or IPv6) | `203.0.113.7`, `2001:db8::7` |
+| 6 | Application (process name) | `chrome.exe` |
+| 7 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed |
 
 Notes:
 
-- An **exact IP** always wins over the zone it sits in: the narrower rule wins.
+- An **exact IP** always wins over any network containing it, and a network
+  wins over the zone it sits in: the narrower rule wins. Between two networks
+  the more specific one wins.
 - A rule names a destination **or** an application. A rule that limits an
   address to one application cannot be carried out yet, so the service refuses
   it rather than applying it to every application.
-- **CIDR subnets and IP ranges arrive in the next alpha.** Ports and protocols
-  are not supported.
+- **CIDR subnets and IP ranges** work as destinations: route a whole corporate
+  network or a block of addresses through either connection with one rule.
+  Ports and protocols are not supported.
 - IPv6 addresses work in rules. They travel the additional connection when it
   carries IPv6; when it does not, they are held back rather than slipping out
   over the main one.
@@ -254,11 +258,6 @@ then macOS.
 **In progress: full IPv6.** Rules already name IPv6 addresses and names that
 resolve to them, and route and protect them as they do IPv4; what remains is
 verifying it on real IPv6 networks before calling it finished.
-
-**Next alpha: CIDR subnets and IP ranges.** Route a whole network, such as
-the internal ranges a corporate VPN serves, with one rule instead of one rule
-per address. Very wide ranges are refused, so one rule cannot swallow a large
-share of the internet.
 
 **Right after that:** traffic history per connection, with a warning when the
 additional connection nears your data plan's limit.

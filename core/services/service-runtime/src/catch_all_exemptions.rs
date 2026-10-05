@@ -67,16 +67,9 @@ pub fn collect_exemptions(
     primary_name: Option<&str>,
     secondary_name: Option<&str>,
 ) -> CatchAllExemptions {
-    let (Some(primary), Some(secondary)) = (
-        primary_name.and_then(|n| adapter_by_name(adapters, n)),
-        secondary_name.and_then(|n| adapter_by_name(adapters, n)),
-    ) else {
-        return CatchAllExemptions::default();
-    };
-    // The gateway of the link that reaches the provider. A primary with no
-    // gateway is a machine with no way out, and a bootstrap route cannot be
-    // recognised without one.
-    let Some(primary_gateway) = primary.gateways.first().copied() else {
+    let Some((primary, secondary, primary_gateway)) =
+        resolve_links(adapters, primary_name, secondary_name)
+    else {
         return CatchAllExemptions::default();
     };
 
@@ -97,6 +90,31 @@ pub fn collect_exemptions(
         ),
         local_subnets_v6: primary_local_subnets_v6(routes, primary.index),
     }
+}
+
+/// Whether [`collect_exemptions`] can read anything for these bindings: both
+/// links present, and the primary with a gateway.
+#[must_use]
+pub fn links_resolve(
+    adapters: &[AdapterInfo],
+    primary_name: Option<&str>,
+    secondary_name: Option<&str>,
+) -> bool {
+    resolve_links(adapters, primary_name, secondary_name).is_some()
+}
+
+/// The bound links and the primary's gateway. A primary with no gateway is a
+/// machine with no way out, and a bootstrap route cannot be recognised
+/// without one.
+fn resolve_links<'a>(
+    adapters: &'a [AdapterInfo],
+    primary_name: Option<&str>,
+    secondary_name: Option<&str>,
+) -> Option<(&'a AdapterInfo, &'a AdapterInfo, Ipv4Addr)> {
+    let primary = primary_name.and_then(|n| adapter_by_name(adapters, n))?;
+    let secondary = secondary_name.and_then(|n| adapter_by_name(adapters, n))?;
+    let gateway = primary.gateways.first().copied()?;
+    Some((primary, secondary, gateway))
 }
 
 /// The adapter a bound display name refers to, matched the way the route

@@ -91,7 +91,11 @@ pub use crate::auto_rule::RuleOrigin as RuleOriginDto;
 /// Current canonical schema version. Bumped when the wire shape of
 /// any struct in this module changes in a way that could break
 /// content-hash idempotency or codec round-trips.
-pub const RULES_JSON_SCHEMA_VERSION: u16 = 1;
+///
+/// 2 added subnets and ranges. A book without them is still written at 1, so
+/// its bytes and content hash stay what they were; a reader accepts any
+/// version and keeps the kinds it does not know.
+pub const RULES_JSON_SCHEMA_VERSION: u16 = 2;
 
 /// Versioned canonical envelope for the rules of a single revision.
 ///
@@ -219,6 +223,69 @@ pub enum AddressMatchDto {
         /// IPv6 address, e.g. `"2001:db8::7"`.
         address: String,
     },
+    /// A network of either family, `"10.0.0.0/8"` — canonical, host bits clear.
+    Subnet { network: String },
+    /// An inclusive address range of one family.
+    IpRange { first: String, last: String },
+    /// A kind this build does not know, kept verbatim. A newer build may have
+    /// written it; the rule is stored and re-sent unchanged, never applied.
+    #[serde(untagged)]
+    Unrecognized(serde_json::Value),
+}
+
+impl AddressMatchDto {
+    /// The `kind` slug, also for a kind this build does not know.
+    pub fn kind(&self) -> &str {
+        match self {
+            Self::ExactFqdn { .. } => "exact-fqdn",
+            Self::SuffixDomain { .. } => "suffix-domain",
+            Self::Zone { .. } => "zone",
+            Self::ExactIpv4 { .. } => "exact-ipv4",
+            Self::ExactIpv6 { .. } => "exact-ipv6",
+            Self::Subnet { .. } => "subnet",
+            Self::IpRange { .. } => "ip-range",
+            Self::Unrecognized(value) => value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        }
+    }
+
+    /// The value as one text: a range as `first-last`, an unknown kind as its
+    /// JSON.
+    pub fn value_text(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+        match self {
+            Self::ExactFqdn { value } => Cow::Borrowed(value),
+            Self::SuffixDomain { suffix } => Cow::Borrowed(suffix),
+            Self::Zone { name } => Cow::Borrowed(name),
+            Self::ExactIpv4 { address } | Self::ExactIpv6 { address } => Cow::Borrowed(address),
+            Self::Subnet { network } => Cow::Borrowed(network),
+            Self::IpRange { first, last } => Cow::Owned(format!("{first}-{last}")),
+            Self::Unrecognized(value) => Cow::Owned(value.to_string()),
+        }
+    }
+
+    /// A kind this build knows that still fell through to the catch-all: its
+    /// fields are wrong, which is a broken payload rather than a newer one.
+    pub fn is_malformed(&self) -> bool {
+        const KNOWN: [&str; 7] = [
+            "exact-fqdn",
+            "suffix-domain",
+            "zone",
+            "exact-ipv4",
+            "exact-ipv6",
+            "subnet",
+            "ip-range",
+        ];
+        matches!(self, Self::Unrecognized(_)) && KNOWN.contains(&self.kind())
+    }
+
+    /// The kinds the subnet-and-range format added; a book without them is
+    /// written at schema 1, byte for byte as before.
+    pub fn needs_schema_2(&self) -> bool {
+        matches!(self, Self::Subnet { .. } | Self::IpRange { .. })
+    }
 }
 
 /// Application-side match condition.
@@ -278,6 +345,23 @@ impl From<serde_json::Error> for RulesJsonCodecError {
 }
 
 // ── Canonical (de)serialisation ─────────────────────────────────────────────
+
+/// The schema a book needs: 1 unless it holds a kind schema 2 added, or one
+/// this build does not know. Written by the encoder and settled by the
+/// comparison fold, so a GUI that still sends 1 never reads as diverged.
+pub fn required_schema_version(dto: &CanonicalRulesJsonV1) -> u16 {
+    let newer = dto
+        .primary
+        .iter()
+        .chain(&dto.secondary)
+        .filter_map(|rule| rule.address_match.as_ref())
+        .any(|m| m.needs_schema_2() || matches!(m, AddressMatchDto::Unrecognized(_)));
+    if newer {
+        RULES_JSON_SCHEMA_VERSION.max(dto.schema_version)
+    } else {
+        1
+    }
+}
 
 /// Serialise a [`CanonicalRulesJsonV1`] to its canonical UTF-8 JSON
 /// string.
@@ -382,6 +466,10 @@ pub fn first_forbidden_field_text(dto: &CanonicalRulesJsonV1) -> Option<Forbidde
             AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
                 bad(address)
             }
+            AddressMatchDto::Subnet { network } => bad(network),
+            AddressMatchDto::IpRange { first, last } => bad(first) || bad(last),
+            // Never written into the rules file: it carries no kind the file has.
+            AddressMatchDto::Unrecognized(_) => false,
         });
         let app = rule.app_match.as_ref().is_some_and(|m| match &m.pattern {
             AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => bad(value),
@@ -435,6 +523,7 @@ pub fn fold_for_comparison(dto: &mut CanonicalRulesJsonV1) {
     for rule in dto.primary.iter_mut().chain(dto.secondary.iter_mut()) {
         fold_rule(rule);
     }
+    dto.schema_version = required_schema_version(dto);
     // `sort_by_cached_key`, not `sort_by_key`: the key is an owned String and
     // this runs on every edit and every 30 s poll.
     dto.primary.sort_by_cached_key(comparison_key);
@@ -458,6 +547,15 @@ fn fold_rule(rule: &mut RuleDto) {
                 AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address },
                 _,
             ) => *address = address.trim().to_string(),
+            (AddressMatchDto::Subnet { network }, _) => {
+                if let Some(block) = crate::ip_block::IpBlock::parse(network) {
+                    *network = block.to_string();
+                }
+            }
+            (AddressMatchDto::IpRange { first, last }, _) => {
+                *first = first.trim().to_string();
+                *last = last.trim().to_string();
+            }
             _ => {}
         }
     }
@@ -493,7 +591,11 @@ pub fn folded_rule_name(address: &AddressMatchDto) -> Option<String> {
         AddressMatchDto::ExactFqdn { value } => Some(fold_host(value)),
         AddressMatchDto::SuffixDomain { suffix } => Some(fold_suffix(suffix)),
         AddressMatchDto::Zone { name } => Some(fold_suffix(name)),
-        AddressMatchDto::ExactIpv4 { .. } | AddressMatchDto::ExactIpv6 { .. } => None,
+        AddressMatchDto::ExactIpv4 { .. }
+        | AddressMatchDto::ExactIpv6 { .. }
+        | AddressMatchDto::Subnet { .. }
+        | AddressMatchDto::IpRange { .. }
+        | AddressMatchDto::Unrecognized(_) => None,
     }
 }
 
@@ -522,13 +624,10 @@ fn fold_suffix(raw: &str) -> String {
 /// this folding exists to prevent.
 fn comparison_key(rule: &RuleDto) -> String {
     let (kind, value) = match &rule.address_match {
-        Some(AddressMatchDto::ExactFqdn { value }) => ("exact-fqdn", value.as_str()),
-        Some(AddressMatchDto::SuffixDomain { suffix }) => ("suffix-domain", suffix.as_str()),
-        Some(AddressMatchDto::Zone { name }) => ("zone", name.as_str()),
-        Some(AddressMatchDto::ExactIpv4 { address }) => ("exact-ipv4", address.as_str()),
-        Some(AddressMatchDto::ExactIpv6 { address }) => ("exact-ipv6", address.as_str()),
-        None => ("", ""),
+        Some(m) => (m.kind(), m.value_text()),
+        None => ("", std::borrow::Cow::Borrowed("")),
     };
+    let value = value.as_ref();
     // The app side keeps its own discriminator: an `Exact` and a `Glob` of the
     // same text are different rules, and folding them into one slot left input
     // order to decide which came first.
@@ -742,8 +841,18 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_one() {
-        assert_eq!(RULES_JSON_SCHEMA_VERSION, 1);
+    fn a_book_of_the_older_kinds_needs_schema_one_only() {
+        assert_eq!(RULES_JSON_SCHEMA_VERSION, 2);
+        let mut dto = CanonicalRulesJsonV1 {
+            schema_version: 2,
+            primary: vec![sample_exact_fqdn("r-1", "api.example.com")],
+            secondary: vec![],
+        };
+        assert_eq!(required_schema_version(&dto), 1);
+        dto.primary[0].address_match = Some(AddressMatchDto::Subnet {
+            network: "10.0.0.0/8".into(),
+        });
+        assert_eq!(required_schema_version(&dto), 2);
     }
 
     #[test]
@@ -841,7 +950,7 @@ mod tests {
     #[test]
     fn empty_rule_book_serialises_to_minimal_json() {
         let dto = CanonicalRulesJsonV1 {
-            schema_version: RULES_JSON_SCHEMA_VERSION,
+            schema_version: 1,
             primary: vec![],
             secondary: vec![],
         };
@@ -1072,7 +1181,7 @@ mod tests {
     #[test]
     fn absent_origin_is_elided_from_canonical_bytes() {
         let dto = CanonicalRulesJsonV1 {
-            schema_version: RULES_JSON_SCHEMA_VERSION,
+            schema_version: 1,
             primary: vec![sample_exact_fqdn("r-1", "api.example.com")],
             secondary: vec![],
         };
@@ -1237,5 +1346,42 @@ mod tests {
             ..sample_exact_fqdn("r-6", "f.test")
         };
         assert_eq!(first_forbidden_field_text(&dto(plain)), None);
+    }
+}
+
+#[cfg(test)]
+mod unrecognized_kind_tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_kind_round_trips_verbatim() {
+        let wire = r#"{"schema-version":2,"primary":[{"id":"r-1","enabled":true,"address-match":{"kind":"port-range","from":80,"to":90}}],"secondary":[]}"#;
+        let dto = from_canonical_string(wire).expect("decodes");
+        let m = dto.primary[0].address_match.as_ref().expect("match");
+        assert!(matches!(m, AddressMatchDto::Unrecognized(_)));
+        assert_eq!(m.kind(), "port-range");
+        // Keys of an unknown object come back sorted: stable, though not the
+        // writer's byte order.
+        let again = to_canonical_string(&dto).expect("encodes");
+        let reread = from_canonical_string(&again).expect("decodes");
+        assert_eq!(reread, dto);
+        assert_eq!(to_canonical_string(&reread).expect("encodes"), again);
+    }
+
+    #[test]
+    fn known_kinds_still_decode_as_themselves() {
+        let wire = r#"{"schema-version":2,"primary":[{"id":"r-1","enabled":true,"address-match":{"kind":"subnet","network":"10.0.0.0/8"}},{"id":"r-2","enabled":true,"address-match":{"kind":"ip-range","first":"10.0.0.1","last":"10.0.0.9"}}],"secondary":[]}"#;
+        let dto = from_canonical_string(wire).expect("decodes");
+        assert_eq!(
+            dto.primary[0].address_match,
+            Some(AddressMatchDto::Subnet {
+                network: "10.0.0.0/8".into()
+            })
+        );
+        assert!(matches!(
+            dto.primary[1].address_match,
+            Some(AddressMatchDto::IpRange { .. })
+        ));
+        assert_eq!(to_canonical_string(&dto).expect("encodes"), wire);
     }
 }

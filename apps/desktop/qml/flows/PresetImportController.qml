@@ -152,7 +152,7 @@ QtObject {
     //
     // `decisions.reclassify[sectionName]` is one of:
     //   "passthrough" — leave in passthrough (default, no-op)
-    //   "zones" / "domains" / "ip" / "windows" — convert each line
+    //   "zones" / "domains" / "ip" / "cidr" / "ranges" / "windows" — convert each line
     //                 into a rule of that type, drop the passthrough block
     //   "skip"      — drop the passthrough block entirely
     function _applyPresetReviewDecisions(decisions) {
@@ -242,9 +242,10 @@ QtObject {
         var rows = []
         var nextId = Math.max(1, parseInt(startId || 1))
         // Map the reclassify dropdown's value to the parser's
-        // rule-type slug (the dropdown uses "ip" / "windows" while
-        // the parser uses "exact-ip" / "application").
+        // rule-type slug (the dropdown names sections, the parser types).
         var ruleType = (targetSlug === "ip") ? "exact-ip"
+                     : (targetSlug === "cidr") ? "subnet"
+                     : (targetSlug === "ranges") ? "ip-range"
                      : (targetSlug === "windows") ? "application"
                      : (targetSlug === "zones") ? "zone"
                      : (targetSlug === "domains") ? "domain"
@@ -1106,7 +1107,7 @@ QtObject {
         root.statusLine = root.tr("status.preset-import-failed",
             "Failed to import preset: ") +
             ((typeof root.ipcErrorLabel === "function")
-                ? root.ipcErrorLabel(String(code || "unknown"))
+                ? root.ipcErrorLabel(String(code || "unknown"), root.rpc.lastFailureArgs)
                 : String(code || "unknown"))
     }
 

@@ -134,6 +134,8 @@ pub mod system_theme;
 // WireGuard LLC's signed `wintun.dll` on Windows). Neutral descriptors +
 // verdict derivation; the hashing/signature MECHANISM is per-OS.
 pub mod third_party;
+// The servers kernel tunnels reach, which no route names.
+pub mod tunnel_endpoints;
 pub mod types;
 // A hypervisor's machines and what their network adapters mean for routing.
 pub mod vm_inventory;

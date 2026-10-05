@@ -19,6 +19,8 @@
 //! rule-book shapes, so the next way to reach the same contradiction fails here
 //! instead of on someone's machine.
 
+#![allow(clippy::expect_used)]
+
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -30,10 +32,14 @@ use nrr_domain::canonical::{
 use nrr_domain::{RouteBehaviorMode, RuleAction, RuleId};
 use nrr_platform_api::MockAppPathResolver;
 use nrr_service_runtime::app_observation_lookup::MockAppObservationLookup;
-use nrr_service_runtime::enforcement_planner::{plan_route_rules, PlannerInput};
+use nrr_service_runtime::enforcement_planner::{
+    plan_route_rules, plan_route_rules_with_shapes, PlannerInput,
+};
 use nrr_service_runtime::fqdn_cache_lookup::MockFqdnCacheLookup;
 use nrr_service_runtime::route_codegen::{address_rule_ips, generate_routes, SecondaryRouteTarget};
-use nrr_service_runtime::wfp_codegen::{generate_filters, CodegenInput};
+use nrr_service_runtime::wfp_codegen::{
+    generate_filters, generate_filters_with_shapes, CodegenInput,
+};
 
 /// The address two rules end up fighting over.
 const CONTESTED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 68);
@@ -1087,4 +1093,503 @@ fn the_planner_reports_the_conflicts_the_codegen_reports() {
             "{how}"
         );
     }
+}
+
+// ── Networks: every mechanism reaches the engine's answer ──────────────────
+//
+// A subnet filter covers every address inside it, so a narrower rule inside a
+// network is carved out of the network's filters rather than outweighing them.
+// These sweeps hold each mechanism's effective verdict, per sample address, to
+// `match_sample`.
+
+use nrr_domain::rule_shape::RuleShapeSupport;
+use nrr_shared::ip_block::{IpBlock, IpRange};
+use nrr_shared::RouteRole;
+
+/// What enforcement carries once routes and Fail-Closed carry networks too.
+const NETWORKS: RuleShapeSupport = RuleShapeSupport {
+    app_scoped_destination_block: false,
+    app_scoped_destination_route: false,
+    network_destination: true,
+};
+
+/// The rule bands' floors, from the crate-private `wfp_bands`: which route set
+/// a winning permit belongs to is its band.
+const BASE_PRIMARY: u64 = 0x0020_0000;
+const BASE_SECONDARY: u64 = 0x0010_0000;
+
+/// A planner principal the platform under test can lower.
+const PLAN_SID: &str = if cfg!(windows) {
+    "S-1-5-21-TEST"
+} else {
+    "unix:uid:1000"
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Route(RouteRole),
+    Block,
+    Default,
+}
+
+fn net_rule(id: &str, text: &str, action: RuleAction) -> CanonicalRule {
+    CanonicalRule {
+        action,
+        ..address_rule(
+            id,
+            CanonicalAddressMatch::Subnet(IpBlock::parse(text).expect("valid subnet")),
+        )
+    }
+}
+
+fn range_rule(id: &str, first: &str, last: &str) -> CanonicalRule {
+    address_rule(
+        id,
+        CanonicalAddressMatch::ip_range(
+            IpRange::new(
+                first.parse().expect("valid address"),
+                last.parse().expect("valid address"),
+            )
+            .expect("valid range"),
+        ),
+    )
+}
+
+fn literal(id: &str, ip: &str, action: RuleAction) -> CanonicalRule {
+    CanonicalRule {
+        action,
+        ..address_rule(
+            id,
+            CanonicalAddressMatch::ExactIp(ip.parse().expect("valid address")),
+        )
+    }
+}
+
+fn engine_outcome(rule_book: &CanonicalRuleBook, host: Option<&str>, ip: IpAddr) -> Outcome {
+    use nrr_domain::decision_matching::{RequestedRouteDecision, ZonePriorityPolicy};
+    match nrr_domain::decision_engine_input::match_sample(
+        rule_book,
+        host,
+        Some(ip),
+        None,
+        ZonePriorityPolicy::default(),
+        RouteBehaviorMode::PreferPrimary,
+    ) {
+        RequestedRouteDecision::MatchedRoute { candidate } => match candidate.action {
+            RuleAction::Block => Outcome::Block,
+            RuleAction::Route => Outcome::Route(candidate.route_role),
+        },
+        RequestedRouteDecision::DefaultRoute { .. } => Outcome::Default,
+    }
+}
+
+fn spec_covers(f: &Spec, ip: IpAddr) -> bool {
+    let in_subnet = |net: IpAddr, len: u8| IpBlock::new(net, len).is_some_and(|b| b.contains(ip));
+    match ip {
+        IpAddr::V4(v4) => {
+            f.covers_v4(v4)
+                || f.remote_subnet
+                    .is_some_and(|(net, len)| in_subnet(IpAddr::V4(net), len))
+        }
+        IpAddr::V6(v6) => {
+            f.covers_v6(v6)
+                || f.remote_subnet_v6
+                    .is_some_and(|(net, len)| in_subnet(IpAddr::V6(net), len))
+        }
+    }
+}
+
+/// The connect-layer filter that decides `ip`: the highest weight covering it.
+fn filter_outcome(filters: &[Spec], ip: IpAddr) -> Outcome {
+    use nrr_platform_api::types::WfpLayerKey;
+    let winner = filters
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.layer,
+                WfpLayerKey::AleAuthConnectV4 | WfpLayerKey::AleAuthConnectV6
+            )
+        })
+        .filter(|f| spec_covers(f, ip))
+        .max_by_key(|f| f.weight);
+    match winner {
+        None => Outcome::Default,
+        Some(f) if f.action == WfpAction::Block => Outcome::Block,
+        Some(f) if f.weight >= BASE_PRIMARY => Outcome::Route(RouteRole::Primary),
+        Some(f) => {
+            assert!(
+                f.weight >= BASE_SECONDARY,
+                "a rule permit below the rule bands: {f:?}"
+            );
+            Outcome::Route(RouteRole::Secondary)
+        }
+    }
+}
+
+fn flow_covers(dst: nrr_platform_api::enforcement::DstMatch, ip: IpAddr) -> bool {
+    use nrr_platform_api::enforcement::DstMatch;
+    match dst {
+        DstMatch::Any => true,
+        DstMatch::HostV4(h) => ip == IpAddr::V4(h),
+        DstMatch::HostV6(h) => ip == IpAddr::V6(h),
+        DstMatch::SubnetV4 { net, prefix } => {
+            IpBlock::new(IpAddr::V4(net), prefix).is_some_and(|b| b.contains(ip))
+        }
+        DstMatch::SubnetV6 { net, prefix } => {
+            IpBlock::new(IpAddr::V6(net), prefix).is_some_and(|b| b.contains(ip))
+        }
+    }
+}
+
+/// The neutral plan's winner for `ip`, by the precedence both lowerings realise.
+fn plan_outcome(flows: &[nrr_platform_api::enforcement::FlowRule], ip: IpAddr) -> Outcome {
+    use nrr_platform_api::enforcement::{PrecedenceClass, Verdict};
+    let mut winner: Option<&nrr_platform_api::enforcement::FlowRule> = None;
+    for flow in flows.iter().filter(|f| flow_covers(f.flow.dst, ip)) {
+        if winner.is_none_or(|w| flow.precedence.is_higher_priority_than(w.precedence)) {
+            winner = Some(flow);
+        }
+    }
+    match winner {
+        None => Outcome::Default,
+        Some(f) if f.verdict == Verdict::Block => Outcome::Block,
+        Some(f) => match f.precedence.class {
+            PrecedenceClass::RouteRule(role) => Outcome::Route(role),
+            other => panic!("a rule permit outside the rule bands: {other:?}"),
+        },
+    }
+}
+
+/// nftables evaluates top-down and stops at the first terminal rule.
+#[cfg(not(windows))]
+fn nft_outcome(flows: &[nrr_platform_api::enforcement::FlowRule], ip: IpAddr) -> Outcome {
+    use nrr_platform_api::enforcement::{EnforcementPlan, UserPrincipal};
+    use nrr_platform_linux::lower_linux::{lower_plan, EgressNames};
+    use nrr_platform_linux::nft_ir::{NftMatch, NftVerdict};
+    let lowered = lower_plan(
+        &EnforcementPlan {
+            principal: UserPrincipal::from_linux_uid(1000),
+            flows: flows.to_vec(),
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        },
+        &EgressNames::default(),
+    );
+    assert!(lowered.unsupported.is_empty(), "{:?}", lowered.unsupported);
+    let in_net =
+        |net: IpAddr, prefix: u8| IpBlock::new(net, prefix).is_some_and(|b| b.contains(ip));
+    let first = lowered.ruleset.rules.iter().find(|rule| {
+        rule.matches.iter().all(|m| match m {
+            NftMatch::DstV4 { net, prefix } => in_net(IpAddr::V4(*net), *prefix),
+            NftMatch::DstV6 { net, prefix } => in_net(IpAddr::V6(*net), *prefix),
+            NftMatch::SkUid(_) => true,
+            _ => false,
+        })
+    });
+    match first {
+        None => Outcome::Default,
+        Some(rule) if rule.verdict == NftVerdict::Drop => Outcome::Block,
+        Some(rule) if rule.comment.starts_with("route-primary") => {
+            Outcome::Route(RouteRole::Primary)
+        }
+        Some(rule) if rule.comment.starts_with("route-secondary") => {
+            Outcome::Route(RouteRole::Secondary)
+        }
+        Some(rule) => panic!("an accept outside the rule bands: {rule:?}"),
+    }
+}
+
+/// The Windows lowering of the neutral plan, read like the codegen.
+#[cfg(windows)]
+fn lowered_outcome(flows: &[nrr_platform_api::enforcement::FlowRule], ip: IpAddr) -> Outcome {
+    use nrr_platform_api::enforcement::{EnforcementPlan, UserPrincipal};
+    let lowered = nrr_platform_windows::lower_windows::lower_route_rules(&EnforcementPlan {
+        principal: UserPrincipal::from_windows_sid(PLAN_SID).expect("valid sid"),
+        flows: flows.to_vec(),
+        routes: Vec::new(),
+        policy_rules: Vec::new(),
+    });
+    filter_outcome(&lowered, ip)
+}
+
+struct NetworkCase {
+    how: &'static str,
+    rule_book: CanonicalRuleBook,
+    cache: MockFqdnCacheLookup,
+    samples: Vec<(Option<&'static str>, &'static str, Outcome)>,
+}
+
+fn network_cases() -> Vec<NetworkCase> {
+    use Outcome::{Block, Default, Route};
+    use RouteRole::{Primary as Main, Secondary as Tunnel};
+    let named_cache = || {
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips(NARROW_HOST, vec![NARROW_IP]);
+        cache.set_ips(ZONE_ONLY_HOST, vec![ZONE_ONLY_IP]);
+        cache
+    };
+    let book = |primary: Vec<CanonicalRule>, secondary: Vec<CanonicalRule>| CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(primary),
+        secondary: CanonicalRuleSet::from_rules(secondary),
+    };
+    let none = MockFqdnCacheLookup::new;
+    vec![
+        NetworkCase {
+            how: "a tunnel address inside a main network",
+            rule_book: book(
+                vec![net_rule("p-net", "10.0.0.0/8", RuleAction::Route)],
+                vec![literal("s-ip", "10.1.2.3", RuleAction::Route)],
+            ),
+            cache: none(),
+            samples: vec![
+                (None, "10.1.2.3", Route(Tunnel)),
+                (None, "10.1.2.4", Route(Main)),
+                (None, "10.200.0.1", Route(Main)),
+                (None, "11.0.0.1", Default),
+            ],
+        },
+        NetworkCase {
+            how: "a main address inside a tunnel network",
+            rule_book: book(
+                vec![literal("p-ip", "10.1.2.3", RuleAction::Route)],
+                vec![net_rule("s-net", "10.0.0.0/8", RuleAction::Route)],
+            ),
+            cache: none(),
+            samples: vec![
+                (None, "10.1.2.3", Route(Main)),
+                (None, "10.1.2.4", Route(Tunnel)),
+            ],
+        },
+        NetworkCase {
+            how: "nested prefixes alternating links, main outermost",
+            rule_book: book(
+                vec![
+                    net_rule("p-16", "10.1.0.0/16", RuleAction::Route),
+                    net_rule("p-28", "10.1.2.16/28", RuleAction::Route),
+                ],
+                vec![net_rule("s-24", "10.1.2.0/24", RuleAction::Route)],
+            ),
+            cache: none(),
+            samples: vec![
+                (None, "10.1.2.17", Route(Main)),
+                (None, "10.1.2.5", Route(Tunnel)),
+                (None, "10.1.3.1", Route(Main)),
+            ],
+        },
+        NetworkCase {
+            how: "nested prefixes alternating links, tunnel outermost",
+            rule_book: book(
+                vec![net_rule("p-24", "10.1.2.0/24", RuleAction::Route)],
+                vec![
+                    net_rule("s-16", "10.1.0.0/16", RuleAction::Route),
+                    net_rule("s-28", "10.1.2.16/28", RuleAction::Route),
+                ],
+            ),
+            cache: none(),
+            samples: vec![
+                (None, "10.1.2.17", Route(Tunnel)),
+                (None, "10.1.2.5", Route(Main)),
+                (None, "10.1.3.1", Route(Tunnel)),
+            ],
+        },
+        NetworkCase {
+            how: "a range inside a network of the other link",
+            rule_book: book(
+                vec![net_rule("p-24", "10.1.2.0/24", RuleAction::Route)],
+                vec![range_rule("s-range", "10.1.2.5", "10.1.2.40")],
+            ),
+            cache: none(),
+            samples: vec![
+                (None, "10.1.2.5", Route(Tunnel)),
+                (None, "10.1.2.9", Route(Tunnel)),
+                (None, "10.1.2.40", Route(Tunnel)),
+                (None, "10.1.2.41", Route(Main)),
+                (None, "10.1.2.4", Route(Main)),
+            ],
+        },
+        NetworkCase {
+            how: "a named host inside a network blocked on the main link",
+            rule_book: book(
+                vec![net_rule("b-net", "192.0.2.0/24", RuleAction::Block)],
+                vec![address_rule(
+                    "s-name",
+                    CanonicalAddressMatch::ExactFqdn(NARROW_HOST.into()),
+                )],
+            ),
+            cache: named_cache(),
+            samples: vec![
+                (Some(NARROW_HOST), "192.0.2.10", Route(Tunnel)),
+                (None, "192.0.2.21", Block),
+            ],
+        },
+        NetworkCase {
+            how: "a named host inside a network blocked on the tunnel",
+            rule_book: book(
+                vec![address_rule(
+                    "p-name",
+                    CanonicalAddressMatch::SuffixDomain(NARROW_HOST.into()),
+                )],
+                vec![net_rule("b-net", "192.0.2.0/24", RuleAction::Block)],
+            ),
+            cache: named_cache(),
+            samples: vec![
+                (Some(NARROW_HOST), "192.0.2.10", Route(Main)),
+                (None, "192.0.2.21", Block),
+            ],
+        },
+        NetworkCase {
+            // A network is narrower than a zone: its Block holds.
+            how: "a zone host inside a blocked network",
+            rule_book: book(
+                vec![net_rule("b-net", "192.0.2.0/24", RuleAction::Block)],
+                vec![address_rule(
+                    "s-zone",
+                    CanonicalAddressMatch::Zone("example".into()),
+                )],
+            ),
+            cache: named_cache(),
+            samples: vec![(Some(ZONE_ONLY_HOST), "192.0.2.20", Block)],
+        },
+        NetworkCase {
+            how: "a blocked network inside a route network",
+            rule_book: book(
+                vec![net_rule("p-net", "10.0.0.0/8", RuleAction::Route)],
+                vec![net_rule("b-16", "10.1.0.0/16", RuleAction::Block)],
+            ),
+            cache: none(),
+            samples: vec![(None, "10.1.0.1", Block), (None, "10.2.0.1", Route(Main))],
+        },
+        NetworkCase {
+            how: "a route network inside a blocked one",
+            rule_book: book(
+                vec![net_rule("b-net", "10.0.0.0/8", RuleAction::Block)],
+                vec![net_rule("s-16", "10.1.0.0/16", RuleAction::Route)],
+            ),
+            cache: none(),
+            samples: vec![(None, "10.1.0.1", Route(Tunnel)), (None, "10.2.0.1", Block)],
+        },
+        NetworkCase {
+            how: "a literal Block inside a route network",
+            rule_book: book(
+                vec![net_rule("p-net", "10.0.0.0/8", RuleAction::Route)],
+                vec![literal("b-ip", "10.1.2.3", RuleAction::Block)],
+            ),
+            cache: none(),
+            samples: vec![(None, "10.1.2.3", Block), (None, "10.1.2.4", Route(Main))],
+        },
+        NetworkCase {
+            how: "a network Block ties a route network of the same prefix",
+            rule_book: book(
+                vec![net_rule("p-net", "10.1.0.0/16", RuleAction::Route)],
+                vec![net_rule("b-net", "10.1.0.0/16", RuleAction::Block)],
+            ),
+            cache: none(),
+            samples: vec![(None, "10.1.0.1", Block)],
+        },
+        NetworkCase {
+            how: "an IPv6 main address inside a tunnel network",
+            rule_book: book(
+                vec![literal("p-ip6", "2001:db8::1", RuleAction::Route)],
+                vec![net_rule("s-net6", "2001:db8::/32", RuleAction::Route)],
+            ),
+            cache: none(),
+            samples: vec![
+                (None, "2001:db8::1", Route(Main)),
+                (None, "2001:db8::2", Route(Tunnel)),
+                (None, "2001:db9::1", Default),
+            ],
+        },
+    ]
+}
+
+#[test]
+fn every_mechanism_gives_a_network_rule_the_engines_answer() {
+    for case in network_cases() {
+        let filters = generate_filters_with_shapes(
+            CodegenInput {
+                sid: "S-1-5-21-TEST",
+                rule_book: &case.rule_book,
+                behavior_mode: RouteBehaviorMode::PreferPrimary,
+                fqdn_cache: &case.cache,
+                app_observations: &MockAppObservationLookup::new(),
+                app_resolver: &MockAppPathResolver::new(),
+                secondary_ip_denylist: &HashSet::new(),
+                zone_priority_over_ip: false,
+                families: nrr_service_runtime::enforcement_planner::FamilyScope::Both,
+            },
+            NETWORKS,
+        )
+        .filters;
+        let flows = plan_route_rules_with_shapes(
+            &case.rule_book,
+            PLAN_SID,
+            RouteBehaviorMode::PreferPrimary,
+            &PlannerInput {
+                ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::FiltersAndRoutes,
+                fqdn_cache: &case.cache,
+                app_resolver: &MockAppPathResolver::new(),
+                app_observations: &MockAppObservationLookup::new(),
+                zone_priority_over_ip: false,
+                secondary_ip_denylist: &HashSet::new(),
+            },
+            NETWORKS,
+        )
+        .0;
+        for (host, ip, expected) in &case.samples {
+            let ip: IpAddr = ip.parse().expect("valid sample");
+            let how = case.how;
+            assert_eq!(
+                engine_outcome(&case.rule_book, *host, ip),
+                *expected,
+                "{how}: the case misstates the engine for {ip}",
+            );
+            assert_eq!(
+                filter_outcome(&filters, ip),
+                *expected,
+                "{how}: codegen, {ip}"
+            );
+            assert_eq!(plan_outcome(&flows, ip), *expected, "{how}: planner, {ip}");
+            #[cfg(windows)]
+            assert_eq!(
+                lowered_outcome(&flows, ip),
+                *expected,
+                "{how}: Windows lowering, {ip}"
+            );
+            #[cfg(not(windows))]
+            assert_eq!(nft_outcome(&flows, ip), *expected, "{how}: nftables, {ip}");
+        }
+    }
+}
+
+/// Positive control for the sweep: an uncarved main network outranks the
+/// tunnel host inside it, and the reading must say so.
+#[test]
+fn the_network_sweep_notices_a_network_that_swallows_a_narrower_host() {
+    let net = Spec {
+        layer: nrr_platform_api::types::WfpLayerKey::AleAuthConnectV4,
+        action: WfpAction::Permit,
+        remote_ip: None,
+        remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
+        remote_port: None,
+        weight: BASE_PRIMARY,
+        id: nrr_platform_api::types::WfpFilterId { raw: 1 },
+        user_sid: None,
+        app_pattern: None,
+        local_interface_luid: None,
+        remote_subnet: Some((Ipv4Addr::new(10, 0, 0, 0), 8)),
+        remote_subnet_v6: None,
+        ip_protocol: None,
+    };
+    let host = Spec {
+        remote_subnet: None,
+        remote_ip: Some(Ipv4Addr::new(10, 1, 2, 3)),
+        weight: BASE_SECONDARY,
+        id: nrr_platform_api::types::WfpFilterId { raw: 2 },
+        ..net.clone()
+    };
+    assert_eq!(
+        filter_outcome(&[net, host], "10.1.2.3".parse().expect("ip")),
+        Outcome::Route(RouteRole::Primary)
+    );
 }

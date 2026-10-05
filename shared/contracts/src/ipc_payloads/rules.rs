@@ -732,6 +732,10 @@ pub enum RiskSignalDto {
     /// a client could not tell it from an unchanged rule set.
     ChangeRefused {
         code: String,
+        /// Placeholder values for the localized text of `code` (a refused
+        /// network names itself and what it covers); absent when none apply.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        args: std::collections::BTreeMap<String, String>,
     },
 }
 

@@ -50,7 +50,7 @@ pub struct SystemdServiceConfig {
     /// One-line `Description=` shown by `systemctl status`.
     pub description: String,
     /// Absolute path to the daemon binary
-    /// (e.g. `/usr/lib/netrulerouter/nrr-serviced`). The `ExecStart=` line and
+    /// (e.g. `/usr/libexec/netrulerouter/nrr-serviced`). The `ExecStart=` line and
     /// the alias symlink are both derived from it, so the unit can never point
     /// at one file while the alias points at another.
     pub binary_path: PathBuf,
@@ -460,11 +460,14 @@ pub fn runtime_dir() -> PathBuf {
     PathBuf::from("/run").join(RUNTIME_STATE_DIR)
 }
 
-/// Where the daemon is installed (`/usr/lib/netrulerouter/nrr-serviced`): the
-/// unit sets `ProtectHome=yes`, so a copy under `/home` can never be the one it
-/// runs. The install scripts stage the binary here.
+/// Where the daemon is installed (`/usr/libexec/netrulerouter/nrr-serviced`):
+/// the unit sets `ProtectHome=yes`, so a copy under `/home` can never be the
+/// one it runs. `libexec`, because SELinux labels a file there a program: under
+/// `/usr/lib` it is a library, the unit runs in systemd's own domain, and with
+/// `NoNewPrivileges` that domain may not run `nft` or `ip`. The install scripts
+/// stage the binary here.
 pub fn installed_daemon_path() -> PathBuf {
-    PathBuf::from("/usr/lib")
+    PathBuf::from("/usr/libexec")
         .join(RUNTIME_STATE_DIR)
         .join(nrr_shared::product_identity::BinaryRole::Service.unix_file_name())
 }
@@ -716,7 +719,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    const SAMPLE_BINARY: &str = "/usr/lib/netrulerouter/nrr-serviced";
+    const SAMPLE_BINARY: &str = "/usr/libexec/netrulerouter/nrr-serviced";
 
     /// The unit hides these trees from the service, so a binary living in one
     /// can be registered but never started. Both facts are declared in this
@@ -777,7 +780,7 @@ mod tests {
         let unit = render_service_unit(&sample_config());
         assert!(unit.contains("Type=notify"), "{unit}");
         assert!(
-            unit.contains(r#"ExecStart="/usr/lib/netrulerouter/nrr-serviced" run"#),
+            unit.contains(r#"ExecStart="/usr/libexec/netrulerouter/nrr-serviced" run"#),
             "{unit}"
         );
         assert!(unit.contains("Description=NetRuleRouter"), "{unit}");
@@ -807,7 +810,7 @@ mod tests {
         });
         assert!(unit.contains("Restart=on-failure"), "{unit}");
         assert!(
-            unit.contains(r#"ExecStopPost="/usr/lib/netrulerouter/nrr-serviced" restore-dns"#),
+            unit.contains(r#"ExecStopPost="/usr/libexec/netrulerouter/nrr-serviced" restore-dns"#),
             "{unit}"
         );
         assert!(unit.contains("RestartSec=7"), "{unit}");
@@ -1046,7 +1049,7 @@ mod tests {
         assert_eq!(
             plan.symlinks,
             vec![SymlinkSpec {
-                link_path: PathBuf::from("/usr/lib/netrulerouter/nrr-service"),
+                link_path: PathBuf::from("/usr/libexec/netrulerouter/nrr-service"),
                 target: PathBuf::from(SAMPLE_BINARY),
             }],
             "the alias lets a cross-platform script name one binary on every OS"
@@ -1070,7 +1073,7 @@ mod tests {
 
     #[test]
     fn a_daemon_already_named_like_the_alias_is_not_linked_to_itself() {
-        assert!(alias_link(Path::new("/usr/lib/netrulerouter/nrr-service")).is_none());
+        assert!(alias_link(Path::new("/usr/libexec/netrulerouter/nrr-service")).is_none());
     }
 
     #[test]

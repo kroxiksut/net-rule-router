@@ -26,6 +26,8 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+use nrr_shared::ip_block::IpBlock;
+
 use crate::hosts_file::normalize_hostname;
 
 /// Base of the default IPv4 fake-address pool (RFC 2544 benchmark range).
@@ -236,6 +238,20 @@ impl FakeIpPoolConfig {
     #[must_use]
     pub fn is_default_pool_addr(addr: IpAddr) -> bool {
         Self::default().contains(addr)
+    }
+
+    /// Whether `network` shares any address with this pool's ranges. A rule
+    /// network over the pool would steer virtual addresses onto a physical
+    /// link, away from the TUN that answers them.
+    #[must_use]
+    pub fn overlaps_block(&self, network: IpBlock) -> bool {
+        let pool = match network.network() {
+            IpAddr::V4(_) => IpBlock::new(IpAddr::V4(self.v4_base), self.v4_prefix_len),
+            IpAddr::V6(_) => self
+                .v6_base
+                .and_then(|base| IpBlock::new(IpAddr::V6(base), self.v6_prefix_len)),
+        };
+        pool.is_some_and(|pool| pool.overlaps(network))
     }
 
     /// Any of `local` subnets that overlap this pool's ranges.
@@ -641,6 +657,20 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().expect("test address literal")
+    }
+
+    #[test]
+    fn a_network_overlaps_the_pool_when_either_holds_the_other() {
+        let pool = FakeIpPoolConfig::default();
+        let net = |text: &str| IpBlock::parse(text).expect("test network literal");
+        assert!(pool.overlaps_block(net("198.18.0.0/15")));
+        assert!(pool.overlaps_block(net("198.19.4.0/24")), "inside the pool");
+        assert!(pool.overlaps_block(net("198.0.0.0/8")), "around the pool");
+        assert!(!pool.overlaps_block(net("198.20.0.0/16")));
+        assert!(!pool.overlaps_block(net("10.0.0.0/8")));
+        assert!(pool.overlaps_block(net("fc00::/32")));
+        assert!(!pool.overlaps_block(net("fd00::/8")));
+        assert!(!FakeIpPoolConfig::v4_only().overlaps_block(net("fc00::/32")));
     }
 
     /// Deliberately tiny v4-only pool, so the recycling path is reachable in a

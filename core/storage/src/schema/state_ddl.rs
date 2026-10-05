@@ -1443,3 +1443,13 @@ pub const STATE_DB_V67_DDL: &[&str] = &[
     "ALTER TABLE service_stability_config DROP COLUMN verbose_logging",
     "ALTER TABLE service_stability_config ADD COLUMN verbose_until_ms INTEGER      CHECK(verbose_until_ms IS NULL OR verbose_until_ms > 0)",
 ];
+
+/// Writing the connection trace to the log becomes a window with an end, the
+/// same as verbose logging: the flag goes, a timed window keeps its absolute
+/// deadline, and "until the service restarts" is never stored. A switch that
+/// was on reads as off afterwards. DEV schema; wiped freely.
+pub const STATE_DB_V68_DDL: &[&str] = &[
+    "ALTER TABLE service_stability_config DROP COLUMN conn_trace_ndjson",
+    "ALTER TABLE service_stability_config ADD COLUMN conn_trace_ndjson_until_ms INTEGER \
+     CHECK(conn_trace_ndjson_until_ms IS NULL OR conn_trace_ndjson_until_ms > 0)",
+];

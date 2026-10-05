@@ -6,8 +6,9 @@
 //! the user can see them and confirm or change the route. `nrr-domain` pins
 //! every reported winner against its matcher.
 //!
-//! Name rules only: an exact-IP rule claims an address, and whether it sits
-//! under a name rule is a question of resolution, not of the rule book.
+//! Names are compared with names and addresses with addresses: whether an
+//! address sits under a name rule is a question of resolution, not of the rule
+//! book. The address pass is [`addresses`].
 
 use std::cmp::Ordering;
 
@@ -25,6 +26,8 @@ pub enum RouteOverlapKind {
     Duplicate,
     /// One rule sits inside the other.
     Nested,
+    /// Two address rules share some addresses, neither holds the other.
+    Intersecting,
 }
 
 /// One side of a pair, as the rules screen names a rule.
@@ -34,7 +37,8 @@ pub struct OverlapRule {
     pub rule_id: String,
     /// `"primary"` / `"secondary"`.
     pub route: String,
-    /// `"exact-fqdn"` / `"suffix-domain"` / `"zone"` — the rule types of the table.
+    /// `"exact-fqdn"` / `"suffix-domain"` / `"zone"` / `"exact-ip"` /
+    /// `"subnet"` / `"ip-range"`.
     pub rule_type: String,
     pub value: String,
 }
@@ -53,6 +57,11 @@ pub struct RouteOverlap {
     /// narrowly and never applies, which the screen warns about.
     #[serde(default)]
     pub block_wins_tie: bool,
+    /// Addresses the main route names sit inside the additional route's
+    /// network: they stay on the main link when the additional one is down,
+    /// and the leak guard does not block them. The screen says so.
+    #[serde(default)]
+    pub main_stays_when_additional_down: bool,
 }
 
 /// Every pair of enabled name rules on different routes whose hosts
@@ -65,17 +74,14 @@ pub fn find_route_overlaps(
     dto: &CanonicalRulesJsonV1,
     include_subdomains: bool,
 ) -> Vec<RouteOverlap> {
+    let mut found = addresses::find(&dto.primary, &dto.secondary);
     let primary = name_rules(&dto.primary, PRIMARY, include_subdomains);
     let secondary = name_rules(&dto.secondary, SECONDARY, include_subdomains);
-    if primary.is_empty() || secondary.is_empty() {
-        return Vec::new();
-    }
     let primary_by_name = index_by_name(&primary, |r| r.name.as_str());
     let secondary_by_name = index_by_name(&secondary, |r| r.name.as_str());
 
     // A pair is found from the rule with the longer name, walking up its
     // labels; equal names are taken from the primary side only.
-    let mut found = Vec::new();
     for narrow in &primary {
         for wide in ancestors_in(&narrow.name, &secondary_by_name) {
             push_if_overlapping(narrow, wide, &mut found);
@@ -234,8 +240,11 @@ fn push_if_overlapping(narrow: &NameRule<'_>, wide: &NameRule<'_>, found: &mut V
         winner: winner.side(),
         loser: loser.side(),
         block_wins_tie: one_blocks && kind == RouteOverlapKind::Duplicate,
+        main_stays_when_additional_down: false,
     });
 }
+
+mod addresses;
 
 #[cfg(test)]
 mod tests;

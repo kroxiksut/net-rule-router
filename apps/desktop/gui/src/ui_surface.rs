@@ -406,12 +406,8 @@ pub fn write_qt_context_file_at(
         })
         .collect::<Vec<_>>();
 
-    // The Free contract's `FreeRuleType` enum tracks runtime-active matchers
-    // (Application, Domain, ExactIp). The Add-Rule dialog also offers `Zone`
-    // per docs/en/rules-file-format.md Match value syntax — it is a designed-but-not-yet-
-    // runtime-bound type, so we surface it alongside the runtime types as a
-    // synthetic entry. The QML dialog uses string ids and reads localized
-    // titles via `rules.type.<id>`, so adding "zone" here is non-invasive.
+    // The QML dialog uses the `FreeRuleType` slugs as ids and reads localized
+    // titles via `rules.type.<id>`.
     // Validation status is the per-row verdict of `nrr-domain` — the one the
     // Add/Edit dialog is gated on, so a typed and an imported row are judged
     // alike.
@@ -461,11 +457,8 @@ pub fn write_qt_context_file_at(
     // `RulesSection.qml`; users see "Add your first rule" instead of a
     // pre-populated invalid example.
 
-    // The rule-type list is sourced solely from the backend snapshot — do
-    // NOT prepend a hardcoded entry. `supported_rule_types` already contains
-    // `zone` (both the mock `SUPPORTED_FREE_RULE_TYPES` and production
-    // `rule_type_slugs()`), so a hardcoded `zone` seed rendered "Зона"/"Zone"
-    // TWICE in the Add-Rule dropdown.
+    // The rule-type list comes from the backend snapshot alone: a hardcoded
+    // entry next to it showed that type twice in the Add-Rule dropdown.
     let mut supported_rule_types: Vec<serde_json::Value> = Vec::new();
     supported_rule_types.extend(rules_snapshot.supported_rule_types.iter().map(|rule_type| {
         json!({

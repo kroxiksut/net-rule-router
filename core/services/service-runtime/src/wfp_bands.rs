@@ -62,6 +62,13 @@ pub(crate) const DOH_BLOCK_BASE: u64 = 0x0028_0000;
 /// instant it is not.
 pub(crate) const KILLSWITCH_BLOCK_BASE: u64 = 0x0030_0000;
 
+/// Held-network blocks: the kill switch's block band, past the per-address pins.
+pub(crate) const KILLSWITCH_NETWORK_BLOCK_BASE: u64 = KILLSWITCH_BLOCK_BASE + NETWORK_INDEX_BASE;
+
+/// Held-network egress permits. Still inside the block band: a hold's permit
+/// only has to beat the holds (disjoint) and the pins' blocks.
+pub(crate) const KILLSWITCH_NETWORK_PERMIT_BASE: u64 = KILLSWITCH_NETWORK_BLOCK_BASE + 0x0001_0000;
+
 /// The kill switch's per-destination egress-conditional permit. Above
 /// [`BASE_PRIMARY`] so it outranks the plain rule permit for the same address.
 pub(crate) const KILLSWITCH_PERMIT_BASE: u64 = 0x0040_0000;
@@ -73,6 +80,10 @@ pub(crate) const FAKEIP_POOL_PERMIT_BASE: u64 = KILLSWITCH_PERMIT_BASE + 0x000E_
 
 /// Catch-all exemptions: loopback, link-local, the link's own upkeep.
 pub(crate) const CATCHALL_EXEMPT_BASE: u64 = 0x0050_0000;
+
+/// Cut-outs inside held networks. Exemptions, so each outranks every hold;
+/// below the per-app exemptions and explicit user Blocks.
+pub(crate) const NETWORK_CUT_OUT_BASE: u64 = CATCHALL_EXEMPT_BASE + NETWORK_INDEX_BASE;
 
 /// Per-app exemptions (the VPN client's own process, and anything the user
 /// exempted by name).
@@ -94,9 +105,18 @@ const ALE_BANDS: &[(&str, u64)] = &[
     ("BASE_PRIMARY", BASE_PRIMARY),
     ("DOH_BLOCK_BASE", DOH_BLOCK_BASE),
     ("KILLSWITCH_BLOCK_BASE", KILLSWITCH_BLOCK_BASE),
+    (
+        "KILLSWITCH_NETWORK_BLOCK_BASE",
+        KILLSWITCH_NETWORK_BLOCK_BASE,
+    ),
+    (
+        "KILLSWITCH_NETWORK_PERMIT_BASE",
+        KILLSWITCH_NETWORK_PERMIT_BASE,
+    ),
     ("KILLSWITCH_PERMIT_BASE", KILLSWITCH_PERMIT_BASE),
     ("FAKEIP_POOL_PERMIT_BASE", FAKEIP_POOL_PERMIT_BASE),
     ("CATCHALL_EXEMPT_BASE", CATCHALL_EXEMPT_BASE),
+    ("NETWORK_CUT_OUT_BASE", NETWORK_CUT_OUT_BASE),
     ("APP_EXEMPT_BASE", APP_EXEMPT_BASE),
     ("BASE_BLOCK", BASE_BLOCK),
 ];
@@ -110,16 +130,28 @@ const ALE_BANDS: &[(&str, u64)] = &[
 
 /// Packet-layer blocks.
 pub(crate) const PACKET_BLOCK_BASE: u64 = 0x0030_0000;
+/// Held-network blocks, past the per-address pins' slot windows.
+pub(crate) const PACKET_NETWORK_BLOCK_BASE: u64 =
+    PACKET_BLOCK_BASE + NETWORK_INDEX_BASE * PACKET_SLOTS_PER_DESTINATION;
+/// Held-network egress permits; inside the block band for the reason the ALE
+/// twin gives.
+pub(crate) const PACKET_NETWORK_PERMIT_BASE: u64 = PACKET_NETWORK_BLOCK_BASE + 0x0010_0000;
 /// Packet-layer permits for protocols the kill switch did not select.
 pub(crate) const PACKET_PERMIT_BASE: u64 = 0x0140_0000;
 /// Packet-layer exemptions.
 pub(crate) const PACKET_EXEMPT_BASE: u64 = 0x0250_0000;
+/// Cut-outs inside held networks, past the per-address egress permits.
+pub(crate) const PACKET_NETWORK_CUT_OUT_BASE: u64 =
+    PACKET_EXEMPT_BASE + NETWORK_INDEX_BASE * PACKET_SLOTS_PER_DESTINATION;
 
 /// The packet-layer order, low to high.
 const PACKET_BANDS: &[(&str, u64)] = &[
     ("PACKET_BLOCK_BASE", PACKET_BLOCK_BASE),
+    ("PACKET_NETWORK_BLOCK_BASE", PACKET_NETWORK_BLOCK_BASE),
+    ("PACKET_NETWORK_PERMIT_BASE", PACKET_NETWORK_PERMIT_BASE),
     ("PACKET_PERMIT_BASE", PACKET_PERMIT_BASE),
     ("PACKET_EXEMPT_BASE", PACKET_EXEMPT_BASE),
+    ("PACKET_NETWORK_CUT_OUT_BASE", PACKET_NETWORK_CUT_OUT_BASE),
 ];
 
 // ── Widths and caps ─────────────────────────────────────────────────────────
@@ -144,7 +176,19 @@ pub const KILLSWITCH_MAX_DESTINATIONS: usize = 0x000D_FFFF;
 pub(crate) const APP_KILLSWITCH_MAX_APPS: usize = 0x0003_FFFF;
 
 /// Slots one packet-layer per-destination filter takes (`idx * 16 + k`).
-const PACKET_SLOTS_PER_DESTINATION: u64 = 16;
+pub(crate) const PACKET_SLOTS_PER_DESTINATION: u64 = 16;
+
+/// Where the kill switch's network windows start in each band they share with
+/// the per-address pins: one past the last pin, so neither reaches the other's
+/// slots. The neutral plan numbers its network ordinals from here too.
+pub(crate) const NETWORK_INDEX_BASE: u64 = 0x000E_0000;
+
+/// Held networks one plan accepts.
+pub const NETWORK_HOLD_MAX: usize = 0x0000_F000;
+
+/// Cut-outs one plan accepts. A hold whose cut-outs would pass it is not armed:
+/// blocking a destination the main link names is the outcome the cap must not buy.
+pub const NETWORK_CUT_OUT_MAX: usize = 0x0001_0000;
 
 // ── Reading a weight back ───────────────────────────────────────────────────
 
@@ -256,6 +300,24 @@ const _: () = {
         "packet-layer per-destination weight window overflows a band gap — widen \
          the packet bands or cap the packet destination count"
     );
+
+    // The network windows start past the per-address pins in the bands they
+    // share, and each fits below the next entry of its table.
+    let holds = NETWORK_HOLD_MAX as u64;
+    let hold_slots = holds * PACKET_SLOTS_PER_DESTINATION;
+    assert!((KILLSWITCH_MAX_DESTINATIONS as u64) < NETWORK_INDEX_BASE);
+    assert!(KILLSWITCH_NETWORK_BLOCK_BASE + holds <= KILLSWITCH_NETWORK_PERMIT_BASE);
+    assert!(KILLSWITCH_NETWORK_PERMIT_BASE + holds <= KILLSWITCH_PERMIT_BASE);
+    assert!(NETWORK_CUT_OUT_BASE + (NETWORK_CUT_OUT_MAX as u64) <= APP_EXEMPT_BASE);
+    assert!(PACKET_BLOCK_BASE + window <= PACKET_NETWORK_BLOCK_BASE);
+    assert!(PACKET_NETWORK_BLOCK_BASE + hold_slots <= PACKET_NETWORK_PERMIT_BASE);
+    assert!(PACKET_NETWORK_PERMIT_BASE + hold_slots <= PACKET_PERMIT_BASE);
+    assert!(
+        PACKET_EXEMPT_BASE + window <= PACKET_NETWORK_CUT_OUT_BASE,
+        "a network cut-out would share a slot with a per-address egress permit"
+    );
+    // The neutral plan carries the same indexes as `u32` ordinals.
+    assert!((NETWORK_INDEX_BASE + holds) * PACKET_SLOTS_PER_DESTINATION <= u32::MAX as u64);
 };
 
 #[cfg(test)]
@@ -279,8 +341,8 @@ mod tests {
     /// without a table entry changes this number.
     #[test]
     fn every_band_is_in_a_table() {
-        assert_eq!(ALE_BANDS.len(), 12);
-        assert_eq!(PACKET_BANDS.len(), 3);
+        assert_eq!(ALE_BANDS.len(), 15);
+        assert_eq!(PACKET_BANDS.len(), 6);
     }
 
     fn spec_at(

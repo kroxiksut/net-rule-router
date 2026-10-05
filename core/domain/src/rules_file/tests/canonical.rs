@@ -237,8 +237,10 @@ fn canonical_to_rules_file_full_round_trip_via_writer() {
                 r.address_match.as_ref().map(|a| match a {
                     crate::AddressMatch::ExactFqdn(s)
                     | crate::AddressMatch::SuffixDomain(s)
-                    | crate::AddressMatch::Zone(s) => s.clone(),
-                    crate::AddressMatch::ExactIp(ip) => ip.to_string(),
+                    | crate::AddressMatch::Zone(s)
+                    | crate::AddressMatch::ExactIp(s)
+                    | crate::AddressMatch::Subnet(s)
+                    | crate::AddressMatch::IpRange(s) => s.clone(),
                 }),
                 r.app_match.as_ref().map(|app| match &app.pattern {
                     crate::AppMatchPattern::Exact(s) | crate::AppMatchPattern::Glob(s) => s.clone(),
@@ -257,7 +259,7 @@ fn canonical_to_rules_file_full_round_trip_via_writer() {
                     CanonicalAddressMatch::ExactFqdn(s)
                     | CanonicalAddressMatch::SuffixDomain(s)
                     | CanonicalAddressMatch::Zone(s) => s.clone(),
-                    CanonicalAddressMatch::ExactIp(ip) => ip.to_string(),
+                    other => other.to_display_string(),
                 }),
                 r.app_match.as_ref().map(|app| match &app.pattern {
                     CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.clone(),
@@ -272,4 +274,72 @@ fn canonical_to_rules_file_full_round_trip_via_writer() {
         written_values, original_values,
         "round-trip values diverged (set comparison):\nwritten=\n{written}"
     );
+}
+
+/// Networks and ranges travel through their own sections and come back out of
+/// them, canonical.
+#[test]
+fn network_sections_round_trip_through_the_canonical_set() {
+    let input = "--- CIDR\n10.0.2.7/24\n2001:db8::/32  # lab\n--- Ranges\n10.0.0.5 - 10.0.0.40\n";
+    let set = canonical_set(input);
+    let written = write_rules_file(
+        &canonical_rule_set_to_rules_file_parsed(&set, RulesFileSection::Windows),
+        &[],
+        None,
+    );
+    assert!(
+        written.contains("--- CIDR\n10.0.2.0/24\n2001:db8::/32"),
+        "{written}"
+    );
+    assert!(
+        written.contains("--- Ranges\n10.0.0.5-10.0.0.40\n"),
+        "{written}"
+    );
+    assert_eq!(canonical_set(&written), set);
+}
+
+/// Section is type: a network under `--- IP` is a line error naming the
+/// section it belongs in, never silently re-filed.
+#[test]
+fn a_value_under_the_wrong_network_heading_is_refused_with_the_right_one() {
+    use crate::ip_network_policy::IpValueKind;
+    use crate::validation::ValidationError;
+    for (input, belongs_in) in [
+        ("--- IP\n10.0.0.0/8\n", IpValueKind::Subnet),
+        ("--- IP\n10.0.0.1-10.0.0.9\n", IpValueKind::Range),
+        ("--- CIDR\n10.0.0.1\n", IpValueKind::Address),
+        ("--- Ranges\n10.0.0.0/24\n", IpValueKind::Subnet),
+    ] {
+        let errors = canonical_errors(input);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ValidationError::WrongAddressSection { belongs_in: b, .. }] if *b == belongs_in
+            ),
+            "{input:?}: {errors:?}"
+        );
+    }
+}
+
+fn canonicalized(input: &str) -> crate::preset_canonicalize::PresetRulesCanonicalizeOutcome {
+    crate::preset_canonicalize::canonicalize_preset_rules(
+        &parse_rules_file(input),
+        nrr_shared::RouteRole::Primary,
+        HostPlatform::Windows,
+        false,
+    )
+}
+
+fn canonical_set(input: &str) -> CanonicalRuleSet {
+    canonicalized(input)
+        .rule_set()
+        .cloned()
+        .unwrap_or_else(|| panic!("{input:?} must be accepted"))
+}
+
+fn canonical_errors(input: &str) -> Vec<crate::validation::ValidationError> {
+    match canonicalized(input) {
+        crate::preset_canonicalize::PresetRulesCanonicalizeOutcome::Rejected { errors } => errors,
+        other => panic!("{input:?} accepted as {other:?}"),
+    }
 }

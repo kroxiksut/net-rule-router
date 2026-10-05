@@ -177,6 +177,14 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         if let Some(journal) = block_notice_journal_store.clone() {
             center = center.with_journal(journal);
         }
+        // A drop into a network the user blocked is named by that network.
+        if let Some(conn) = settings_conn.as_ref() {
+            let rules: Arc<dyn RulesProvider> =
+                Arc::new(ProductionRulesProvider::new(Arc::clone(conn)));
+            center = center.with_blocked_network(
+                nrr_service_runtime::block_notice_center::BlockedNetworks::new(rules).into_fn(),
+            );
+        }
         // Mutes are personal and must outlive a restart: without the store a
         // silenced host would start shouting again on every service start.
         match settings_conn.as_ref() {
@@ -382,39 +390,11 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         }
                     })
                 };
-                // Persist observed VPN bootstrap server
-                // IPs so the kill-switch exemption survives a service restart
-                // (the catch-all block-all refuses to arm without a server hole,
-                // and the live set is otherwise lost on restart). The write-
-                // through closure fires whenever the live route table yields a
-                // fresh set; the loader seeds the fail-closed exemptions at
-                // startup. Both use the SAME settings connection the other
-                // coordinator callbacks use, invoked OUTSIDE any recompute lock.
-                let server_ip_persist: nrr_service_runtime::route_coordinator::ServerIpPersistFn = {
-                    let conn = Arc::clone(state_conn);
-                    Arc::new(move |ips: &[std::net::Ipv4Addr]| {
-                        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
-                        if let Err(e) = nrr_storage::vpn_bootstrap_endpoints::VpnBootstrapEndpointsRepository::new(&guard)
-                                .upsert_observed(ips, now)
-                            {
-                                tracing::warn!(target: "nrr::route-coordinator", msg_key = "svc-persid-vpn-bootstrap-persist-failed", error = %e, "failed to persist observed VPN bootstrap server IPs — continuing");
-                            }
-                    })
-                };
-                let server_ip_loader: nrr_service_runtime::route_coordinator::ServerIpLoaderFn = {
-                    let conn = Arc::clone(state_conn);
-                    Arc::new(move || {
-                        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                        nrr_storage::vpn_bootstrap_endpoints::VpnBootstrapEndpointsRepository::new(
-                            &guard,
-                        )
-                        .load_ips()
-                        .unwrap_or_default()
-                    })
+                // The observed tunnel servers survive a restart: the catch-all refuses
+                // to arm without a server hole. Same connection as the other callbacks.
+                let (server_ip_persist, server_ip_loader) = {
+                    use nrr_service_runtime::tunnel_server_memory::persistence_over;
+                    persistence_over(Arc::clone(state_conn))
                 };
                 // Alongside the per-SID WFP orchestrator, the
                 // `SecondaryRouteCoordinator` drives the system route table for the

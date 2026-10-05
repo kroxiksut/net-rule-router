@@ -13,7 +13,7 @@ pub struct ServiceStabilityConfigDto {
     /// ignores it, because an echo of a window that has since ended would
     /// otherwise switch it back on.
     #[serde(default)]
-    pub verbose_logging_mode: VerboseLoggingMode,
+    pub verbose_logging_mode: LogWindowMode,
     /// UTC milliseconds at which a timed verbose window ends; `0` otherwise.
     /// Reported only, like `verbose_logging_mode`.
     #[serde(default)]
@@ -22,14 +22,30 @@ pub struct ServiceStabilityConfigDto {
     /// makes it. `None` leaves the running window alone, so saving an
     /// unrelated setting can neither extend nor cut it short. Never echoed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verbose_logging_change: Option<VerboseLoggingChange>,
-    /// When `true` the opt-in connection-egress
-    /// trace writes each observed connection to the operational NDJSON.
-    /// `#[serde(default)]` keeps it additive (older GUIs deserialise `false`).
+    pub verbose_logging_change: Option<LogWindowChange>,
+    /// Whether each observed connection is written to the operational log:
+    /// a window that ends by itself, like verbose logging. Reported only.
     #[serde(default)]
-    pub conn_trace_ndjson: bool,
+    pub conn_trace_ndjson_mode: LogWindowMode,
+    /// UTC milliseconds at which a timed trace window ends; `0` otherwise.
+    /// Reported only.
+    #[serde(default)]
+    pub conn_trace_ndjson_until_ms: i64,
+    /// The trace is written whatever the window says: the diagnostics file
+    /// in the service's data directory or the `NRR_CONN_TRACE` variable forces
+    /// it for the life of the process. Reported only.
+    #[serde(default)]
+    pub conn_trace_ndjson_forced: bool,
+    /// What forces it: the file's full path on this machine or the variable's
+    /// name — what the user removes. Empty when not forced. Reported only.
+    #[serde(default)]
+    pub conn_trace_ndjson_forced_by: String,
+    /// The one way to change the trace window, as `verbose_logging_change` is
+    /// for verbosity. Never echoed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_trace_ndjson_change: Option<LogWindowChange>,
     /// When `true` the Diagnostics connection-trace panel may show what was
-    /// observed. Independent of `conn_trace_ndjson` — it gates the VIEW, never
+    /// observed. Independent of the log window — it gates the VIEW, never
     /// the observation app routing and the learners depend on. Defaults to
     /// `true`: an absent field must not blank a panel that costs nothing on
     /// disk (the privacy-sensitive half is the NDJSON sink).
@@ -162,18 +178,19 @@ pub struct ServiceStabilityConfigDto {
     pub allow_user_rule_edits: Option<bool>,
 }
 
-/// How verbosely the service logs. Every verbose window ends by itself: at its
-/// deadline, or when the service restarts.
+/// State of a diagnostic log window (verbose logging, the connection trace on
+/// disk). Every window ends by itself: at its deadline, or when the service
+/// restarts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum VerboseLoggingMode {
+pub enum LogWindowMode {
     #[default]
     Off,
     Timed,
     UntilRestart,
 }
 
-impl VerboseLoggingMode {
+impl LogWindowMode {
     /// The wire slug, for log lines.
     #[must_use]
     pub fn as_slug(self) -> &'static str {
@@ -185,18 +202,18 @@ impl VerboseLoggingMode {
     }
 }
 
-/// What a client may ask verbosity to become. The windows are a closed list
-/// so no client can leave verbose logging on for good.
+/// What a client may ask a log window to become. The windows are a closed
+/// list so no client can leave a privacy-sensitive log on for good.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum VerboseLoggingChange {
+pub enum LogWindowChange {
     Off,
     OneHour,
     FourHours,
     UntilRestart,
 }
 
-impl VerboseLoggingChange {
+impl LogWindowChange {
     /// Length of a timed window; `None` for the two that have no deadline.
     #[must_use]
     pub fn window_ms(self) -> Option<i64> {
@@ -270,10 +287,14 @@ impl Default for ServiceStabilityConfigDto {
     fn default() -> Self {
         Self {
             ipc_accept_policy: IpcAcceptFailurePolicyDto::default(),
-            verbose_logging_mode: VerboseLoggingMode::Off,
+            verbose_logging_mode: LogWindowMode::Off,
             verbose_logging_until_ms: 0,
             verbose_logging_change: None,
-            conn_trace_ndjson: false,
+            conn_trace_ndjson_mode: LogWindowMode::Off,
+            conn_trace_ndjson_until_ms: 0,
+            conn_trace_ndjson_forced: false,
+            conn_trace_ndjson_forced_by: String::new(),
+            conn_trace_ndjson_change: None,
             conn_trace_gui: true,
             // Preserve the historical Rust-side default (`false`) for this
             // field; the wire/serde default is `true` via `rule_scope_default`.

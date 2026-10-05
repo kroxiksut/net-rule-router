@@ -28,6 +28,17 @@ sudo apt install build-essential cmake nftables \
      qt6-base-dev qt6-declarative-dev
 ```
 
+On RED OS, Fedora and other systems of the Red Hat family:
+
+```bash
+sudo dnf install gcc gcc-c++ cmake nftables \
+     qt6-qtbase-devel qt6-qtdeclarative-devel
+```
+
+These systems usually run SELinux in enforcing mode. Nothing extra is needed
+for it: the service is installed where SELinux expects a service's programs
+(see [Run](#run)).
+
 The toolchain version is pinned in `rust-toolchain.toml`, so rustup downloads
 the right one by itself on the first build.
 
@@ -58,6 +69,14 @@ That is what the CI job does, and it is the right switch on a headless machine.
 Do not set it when you intend to run the GUI: the launcher would have no host to
 start.
 
+A debug build with debug information takes about 9 GB in `target/`. On a small
+virtual machine, build without it — the programs work the same, only crash
+backtraces lose their line numbers — and the tree stays under 2 GB:
+
+```bash
+CARGO_PROFILE_DEV_DEBUG=0 ./scripts/build.sh
+```
+
 ## Run
 
 ```bash
@@ -74,10 +93,13 @@ The service normally runs as a systemd unit rather than from a terminal:
 ./scripts/uninstall-service.sh
 ```
 
-The unit is staged into `/usr/lib/netrulerouter` before it is registered: it
-runs with `ProtectHome=yes`, and a daemon left under `/home` could only ever
-fail at exec. Only the staging copy and the registration step use `sudo` — the
-build stays unprivileged, so nothing in `target/` ends up owned by root.
+The unit is staged into `/usr/libexec/netrulerouter` before it is registered:
+it runs with `ProtectHome=yes`, and a daemon left under `/home` could only ever
+fail at exec. `libexec` is where systems with SELinux enforcing (RED OS,
+Fedora and their relatives) expect a service's programs, so the service can
+manage the firewall and routes there without a policy change. Only the staging
+copy and the registration step use `sudo` — the build stays unprivileged, so
+nothing in `target/` ends up owned by root.
 
 Desktop integration (the application menu entry and the icon) is per-user
 session data and installs separately:

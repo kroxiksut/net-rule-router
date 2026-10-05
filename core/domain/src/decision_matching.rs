@@ -214,8 +214,11 @@ pub enum MatchClass {
     ExactFqdn,
     /// Tier 2 — subdomain wildcard match.
     SuffixDomain,
-    /// Tier 3a — exact IPv4 match (default: checked before Zone).
+    /// Tier 3a — exact address match (default: checked before Zone).
     ExactIp,
+    /// Tier 3a′ — subnet or range match, right after `ExactIp`: an exact
+    /// address beats any network, a longer prefix beats a shorter one.
+    Subnet,
     /// Tier 3b — TLD / internal domain zone match.
     Zone,
     /// Tier 4 — application process name match (address-less rules).
@@ -237,7 +240,8 @@ pub enum MatchClass {
 /// | `ExactFqdn`  | Number of DNS labels (e.g. `a.b.c` = 3)       |
 /// | `SuffixDomain` | Number of DNS labels in the base domain      |
 /// | `Zone`       | Number of DNS labels (`corp.intra` = 2)       |
-/// | `ExactIp`    | Always 1 (exact match; no CIDR in Free)       |
+/// | `ExactIp`    | Always 1 (the tier holds nothing else)        |
+/// | `Subnet`     | Prefix length of the matching block           |
 /// | `Application` | Exact name = 2, glob pattern = 1             |
 /// | `Default`    | Always 0                                      |
 ///
@@ -387,13 +391,14 @@ impl Default for ZonePriorityPolicy {
 }
 
 impl ZonePriorityPolicy {
-    /// Returns the two tier-3 match classes in the order they should be
-    /// evaluated for this policy.
-    pub fn tier3_order(self) -> [MatchClass; 2] {
+    /// The tier-3 match classes in evaluation order. Networks travel with the
+    /// exact address: the policy orders addresses against zones, never an
+    /// address against the network it sits in.
+    pub fn tier3_order(self) -> [MatchClass; 3] {
         if self.prefer_ip {
-            [MatchClass::ExactIp, MatchClass::Zone]
+            [MatchClass::ExactIp, MatchClass::Subnet, MatchClass::Zone]
         } else {
-            [MatchClass::Zone, MatchClass::ExactIp]
+            [MatchClass::Zone, MatchClass::ExactIp, MatchClass::Subnet]
         }
     }
 }
@@ -626,13 +631,19 @@ mod tests {
     fn zone_policy_default_prefers_ip() {
         let p = ZonePriorityPolicy::default();
         assert!(p.prefer_ip);
-        assert_eq!(p.tier3_order(), [MatchClass::ExactIp, MatchClass::Zone]);
+        assert_eq!(
+            p.tier3_order(),
+            [MatchClass::ExactIp, MatchClass::Subnet, MatchClass::Zone]
+        );
     }
 
     #[test]
     fn zone_policy_prefer_zone_reverses_order() {
         let p = ZonePriorityPolicy { prefer_ip: false };
-        assert_eq!(p.tier3_order(), [MatchClass::Zone, MatchClass::ExactIp]);
+        assert_eq!(
+            p.tier3_order(),
+            [MatchClass::Zone, MatchClass::ExactIp, MatchClass::Subnet]
+        );
     }
 
     #[test]

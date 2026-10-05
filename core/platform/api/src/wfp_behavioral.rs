@@ -176,6 +176,56 @@ fn layer_label(ord: u8) -> &'static str {
 /// to be readable in a log next to two thousand siblings.
 impl core::fmt::Display for BehavioralKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.write(f, KeyDetail::Full)
+    }
+}
+
+/// How much of a key a rendering discloses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyDetail {
+    Full,
+    /// Addresses but not whose they are: no application path, no interface id.
+    Addresses,
+    /// What kind of filter it is, with no value that identifies a person or a
+    /// destination.
+    Shape,
+}
+
+/// A rendering of a [`BehavioralKey`] at a chosen [`KeyDetail`].
+pub struct KeyView<'a> {
+    key: &'a BehavioralKey,
+    detail: KeyDetail,
+}
+
+impl core::fmt::Display for KeyView<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.key.write(f, self.detail)
+    }
+}
+
+impl BehavioralKey {
+    /// The key with its addresses, without the application path or interface
+    /// id — what a verbose log may carry.
+    #[must_use]
+    pub fn addresses(&self) -> KeyView<'_> {
+        KeyView {
+            key: self,
+            detail: KeyDetail::Addresses,
+        }
+    }
+
+    /// The kind of filter alone — layer, action, which conditions it has — safe
+    /// for the default log.
+    #[must_use]
+    pub fn shape(&self) -> KeyView<'_> {
+        KeyView {
+            key: self,
+            detail: KeyDetail::Shape,
+        }
+    }
+
+    fn write(&self, f: &mut core::fmt::Formatter<'_>, detail: KeyDetail) -> core::fmt::Result {
+        let values = detail != KeyDetail::Shape;
         write!(
             f,
             "{}/{}",
@@ -188,29 +238,37 @@ impl core::fmt::Display for BehavioralKey {
             }
         )?;
         if let Some(ip) = self.remote_ip {
-            write!(f, " ip={ip}")?;
+            if values {
+                write!(f, " ip={ip}")?;
+            } else {
+                write!(f, " ip")?;
+            }
         }
         if !self.remote_ip_set.is_empty() {
-            write!(
-                f,
-                " ip_set[{}]={:?}",
-                self.remote_ip_set.len(),
-                self.remote_ip_set
-            )?;
+            write!(f, " ip_set[{}]", self.remote_ip_set.len())?;
+            if values {
+                write!(f, "={:?}", self.remote_ip_set)?;
+            }
         }
         if !self.remote_ip_set_v6.is_empty() {
-            write!(
-                f,
-                " ip6_set[{}]={:?}",
-                self.remote_ip_set_v6.len(),
-                self.remote_ip_set_v6
-            )?;
+            write!(f, " ip6_set[{}]", self.remote_ip_set_v6.len())?;
+            if values {
+                write!(f, "={:?}", self.remote_ip_set_v6)?;
+            }
         }
         if let Some((net, len)) = self.remote_subnet {
-            write!(f, " net={net}/{len}")?;
+            if values {
+                write!(f, " net={net}/{len}")?;
+            } else {
+                write!(f, " net/{len}")?;
+            }
         }
         if let Some((net, len)) = self.remote_subnet_v6 {
-            write!(f, " net6={net}/{len}")?;
+            if values {
+                write!(f, " net6={net}/{len}")?;
+            } else {
+                write!(f, " net6/{len}")?;
+            }
         }
         if let Some(port) = self.remote_port {
             write!(f, " port={port}")?;
@@ -219,10 +277,18 @@ impl core::fmt::Display for BehavioralKey {
             write!(f, " proto={proto}")?;
         }
         if let Some(luid) = self.local_interface_luid {
-            write!(f, " if={luid}")?;
+            if detail == KeyDetail::Full {
+                write!(f, " if={luid}")?;
+            } else {
+                write!(f, " if")?;
+            }
         }
         if let Some(app) = self.app_pattern.as_deref() {
-            write!(f, " app={app}")?;
+            if detail == KeyDetail::Full {
+                write!(f, " app={app}")?;
+            } else {
+                write!(f, " app")?;
+            }
         }
         Ok(())
     }
@@ -422,5 +488,35 @@ mod tests {
         let mut any_user = specific.clone();
         any_user.user_sid = None; // system-wide vs per-user is a real difference
         assert!(!behaviorally_equivalent(&[specific], &[any_user]));
+    }
+
+    /// The default log sees what kind of filter differs, the verbose log sees
+    /// the addresses, and neither sees whose application or interface it is.
+    #[test]
+    fn each_view_discloses_only_its_own_detail() {
+        let mut spec = permit(ip(203, 0, 113, 5), 10, 1);
+        spec.app_pattern = Some(r"C:\Users\someone\app.exe".to_string());
+        spec.local_interface_luid = Some(42);
+        spec.remote_port = Some(443);
+        let key = behavioral_key(&spec);
+        let mut net = permit(ip(0, 0, 0, 0), 10, 2);
+        net.remote_ip = None;
+        net.remote_subnet = Some((ip(198, 51, 100, 0), 24));
+        let net = behavioral_key(&net);
+
+        let full = key.to_string();
+        assert!(full.contains("ip=203.0.113.5") && full.contains("app=") && full.contains("if=42"));
+
+        let addresses = key.addresses().to_string();
+        assert!(addresses.contains("ip=203.0.113.5") && addresses.contains("port=443"));
+        assert!(!addresses.contains("someone") && !addresses.contains("42"));
+        assert!(addresses.contains(" app") && addresses.contains(" if"));
+
+        assert_eq!(key.shape().to_string(), "ale4/permit ip port=443 if app");
+        assert_eq!(net.shape().to_string(), "ale4/permit net/24");
+        assert_eq!(
+            net.addresses().to_string(),
+            "ale4/permit net=198.51.100.0/24"
+        );
     }
 }

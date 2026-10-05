@@ -393,14 +393,38 @@ fn ip_section_treated_as_exact_ip() {
 }
 
 #[test]
-fn extended_section_cidr_goes_to_passthrough() {
-    // unsupported sections (CIDR, Ports) are not yet supported by
-    // this engine — they survive as passthrough so a round-trip does
-    // not lose them.
-    let result = parse_canonical_rules("--- Cidr\n10.0.0.0/8\n");
+fn network_sections_are_rule_sections() {
+    let result = parse_canonical_rules(
+        "--- CIDR
+10.0.0.0/8
+--- Ranges
+10.0.0.5-10.0.0.9
+",
+    );
+    assert_eq!(result.rules.len(), 2);
+    assert_eq!(result.rules[0].rule_type, ParsedRuleType::Subnet);
+    assert_eq!(result.rules[1].rule_type, ParsedRuleType::IpRange);
+    assert_eq!(ParsedRuleType::Subnet.slug(), "subnet");
+    assert_eq!(ParsedRuleType::IpRange.slug(), "ip-range");
+    assert!(result.passthrough.is_empty());
+}
+
+#[test]
+fn an_unknown_section_goes_to_passthrough() {
+    // A section this build does not know survives as passthrough, so a
+    // round-trip does not lose it.
+    let result = parse_canonical_rules(
+        "--- Geo
+de
+",
+    );
     assert!(result.rules.is_empty());
-    assert_eq!(result.passthrough[0].section_name, "Cidr");
-    assert_eq!(result.passthrough[0].raw_text, "10.0.0.0/8\n");
+    assert_eq!(result.passthrough[0].section_name, "Geo");
+    assert_eq!(
+        result.passthrough[0].raw_text,
+        "de
+"
+    );
 }
 
 #[test]

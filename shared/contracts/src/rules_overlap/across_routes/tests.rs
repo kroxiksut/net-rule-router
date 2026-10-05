@@ -250,3 +250,150 @@ fn only_a_block_against_a_route_raises_the_tie_warning() {
     assert_eq!(nested[0].kind, RouteOverlapKind::Nested);
     assert!(!nested[0].block_wins_tie);
 }
+
+// ── address rules ─────────────────────────────────────────────────────────
+
+fn ip(id: &str, address: &str) -> RuleDto {
+    rule(
+        id,
+        AddressMatchDto::ExactIpv4 {
+            address: address.into(),
+        },
+    )
+}
+
+fn subnet(id: &str, network: &str) -> RuleDto {
+    rule(
+        id,
+        AddressMatchDto::Subnet {
+            network: network.into(),
+        },
+    )
+}
+
+fn range(id: &str, first: &str, last: &str) -> RuleDto {
+    rule(
+        id,
+        AddressMatchDto::IpRange {
+            first: first.into(),
+            last: last.into(),
+        },
+    )
+}
+
+#[test]
+fn an_address_inside_the_other_routes_subnet_wins_over_it() {
+    let found = overlaps(&book(
+        vec![subnet("P1", "10.20.0.0/16")],
+        vec![ip("S1", "10.20.3.4")],
+    ));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].kind, RouteOverlapKind::Nested);
+    assert_eq!(found[0].winner.rule_id, "S1");
+    assert_eq!(found[0].winner.rule_type, "exact-ip");
+    assert_eq!(found[0].loser.rule_type, "subnet");
+}
+
+#[test]
+fn the_longer_prefix_wins_and_disjoint_networks_are_not_paired() {
+    let found = overlaps(&book(
+        vec![subnet("P1", "10.0.0.0/8"), subnet("P2", "192.168.0.0/16")],
+        vec![subnet("S1", "10.20.0.0/24")],
+    ));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].winner.rule_id, "S1");
+    assert_eq!(found[0].loser.rule_id, "P1");
+}
+
+#[test]
+fn the_same_network_on_both_routes_is_a_duplicate_the_main_route_wins() {
+    let found = overlaps(&book(
+        vec![subnet("P1", "10.20.0.0/24")],
+        vec![range("S1", "10.20.0.0", "10.20.0.255")],
+    ));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].kind, RouteOverlapKind::Duplicate);
+    assert_eq!(found[0].winner.rule_id, "P1");
+}
+
+#[test]
+fn a_blocked_network_wins_a_tie() {
+    let mut blocked = subnet("S1", "10.20.0.0/24");
+    blocked.action = RuleAction::Block;
+    let found = overlaps(&book(vec![subnet("P1", "10.20.0.0/24")], vec![blocked]));
+    assert_eq!(found[0].winner.rule_id, "S1");
+    assert!(found[0].block_wins_tie);
+}
+
+#[test]
+fn ranges_that_share_part_of_their_addresses_intersect() {
+    let found = overlaps(&book(
+        vec![range("P1", "10.0.0.0", "10.0.0.99")],
+        vec![range("S1", "10.0.0.50", "10.0.0.200")],
+    ));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].kind, RouteOverlapKind::Intersecting);
+}
+
+#[test]
+fn names_are_never_paired_with_addresses() {
+    let found = overlaps(&book(
+        vec![subnet("P1", "10.0.0.0/8")],
+        vec![exact("S1", "host.example")],
+    ));
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_main_address_inside_the_additional_network_stays_on_the_main_link() {
+    for primary in [ip("P1", "10.20.3.4"), subnet("P1", "10.20.3.0/24")] {
+        let found = overlaps(&book(vec![primary], vec![subnet("S1", "10.20.0.0/16")]));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].winner.rule_id, "P1");
+        assert!(found[0].main_stays_when_additional_down, "{found:?}");
+    }
+    let found = overlaps(&book(
+        vec![ip("P1", "10.0.0.7")],
+        vec![range("S1", "10.0.0.0", "10.0.0.99")],
+    ));
+    assert!(found[0].main_stays_when_additional_down, "{found:?}");
+}
+
+#[test]
+fn the_note_is_only_for_a_main_address_inside_an_additional_network() {
+    // The additional route's address inside the main route's network.
+    let found = overlaps(&book(
+        vec![subnet("P1", "10.20.0.0/16")],
+        vec![ip("S1", "10.20.3.4")],
+    ));
+    assert!(!found[0].main_stays_when_additional_down, "{found:?}");
+    // A blocked main address is not "staying" anywhere.
+    let found = overlaps(&book(
+        vec![blocking(ip("P1", "10.20.3.4"))],
+        vec![subnet("S1", "10.20.0.0/16")],
+    ));
+    assert!(!found[0].main_stays_when_additional_down, "{found:?}");
+    // The same network on both routes is a duplicate, not a nesting.
+    let found = overlaps(&book(
+        vec![subnet("P1", "10.20.0.0/24")],
+        vec![subnet("S1", "10.20.0.0/24")],
+    ));
+    assert!(!found[0].main_stays_when_additional_down, "{found:?}");
+    // Names carry no such note.
+    let found = overlaps(&book(
+        vec![exact("P1", "a.example")],
+        vec![suffix("S1", "example")],
+    ));
+    assert!(!found[0].main_stays_when_additional_down, "{found:?}");
+}
+
+#[test]
+fn an_older_overlap_without_the_note_still_reads() {
+    let json = serde_json::json!({
+        "key": "k", "kind": "nested",
+        "winner": { "rule-id": "a", "route": "primary", "rule-type": "exact-ip", "value": "10.0.0.1" },
+        "loser": { "rule-id": "b", "route": "secondary", "rule-type": "subnet", "value": "10.0.0.0/8" },
+    });
+    let overlap: RouteOverlap = serde_json::from_value(json).expect("older overlap");
+    assert!(!overlap.main_stays_when_additional_down);
+}

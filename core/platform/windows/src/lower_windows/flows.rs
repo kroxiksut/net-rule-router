@@ -84,6 +84,31 @@ pub(super) fn lower_flow(flow: &FlowRule) -> Vec<WfpFilterSpec> {
         }
     }
 
+    // A network rule's piece: one subnet filter, mirrored at the packet layer
+    // for a Block like a host is.
+    if let Some(subnet) = SubnetCondition::of(flow.flow.dst) {
+        if !matches!(flow.app, AppScope::Any) {
+            return Vec::new();
+        }
+        let mut out = vec![make_subnet_filter(
+            subnet.ale_layer(),
+            action,
+            subnet,
+            weight,
+            user_sid,
+        )];
+        if action == WfpAction::Block && flow.coverage == Coverage::AllPackets {
+            out.push(make_subnet_filter(
+                subnet.packet_layer(),
+                WfpAction::Block,
+                subnet,
+                weight,
+                None,
+            ));
+        }
+        return out;
+    }
+
     let DstMatch::HostV4(ip) = flow.flow.dst else {
         return Vec::new();
     };

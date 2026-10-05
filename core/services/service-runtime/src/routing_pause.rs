@@ -215,7 +215,7 @@ impl RoutingPauseCoordinator {
             )
         };
         let result = if persist {
-            coord.teardown_keep_secondary_hosts()
+            coord.teardown_keep_rule_routes()
         } else {
             coord.teardown()
         };
@@ -880,7 +880,7 @@ mod tests {
                 .set(
                     &IpcAcceptPolicyWrite::Critical,
                     None,
-                    false,
+                    None,
                     false,
                     true,
                     RoutingStopPolicy::Persist,
@@ -932,7 +932,7 @@ mod tests {
                 .set(
                     &IpcAcceptPolicyWrite::Critical,
                     None,
-                    false,
+                    None,
                     false,
                     true,
                     RoutingStopPolicy::Teardown,

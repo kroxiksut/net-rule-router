@@ -308,6 +308,16 @@ fn the_window_reads_the_refusals_the_service_sends() {
     })] });
     let shape = serde_json::json!({ "risk-signals": [signal(RiskSignalDto::ChangeRefused {
         code: "unsupported-rule-shape".into(),
+        args: Default::default(),
+    })] });
+    let network = serde_json::json!({ "risk-signals": [signal(RiskSignalDto::ChangeRefused {
+        code: "network-covers-link".into(),
+        args: std::collections::BTreeMap::from([
+            ("rule".to_owned(), "r1".to_owned()),
+            ("network".to_owned(), "10.0.0.0/8".to_owned()),
+            ("covers-kind".to_owned(), "tunnel-server".to_owned()),
+            ("covers".to_owned(), "10.1.2.3".to_owned()),
+        ]),
     })] });
     let other = serde_json::json!({
         "risk-signals": [{ "kind": "apply-will-be-refused" }]
@@ -326,7 +336,12 @@ fn the_window_reads_the_refusals_the_service_sends() {
          console.log(operationOutcome(false, null));\n\
          console.log(JSON.stringify(previewOutcome({{}}, reviewSummaryIsEmpty)));\n\
          console.log(previewOutcome({shape}, reviewSummaryIsEmpty));\n\
-         console.log(previewOutcome({{ 'rules-added': [{{}}] }}, reviewSummaryIsEmpty));\n",
+         console.log(previewOutcome({{ 'rules-added': [{{}}] }}, reviewSummaryIsEmpty));\n\
+         console.log(JSON.stringify(refusalDetail('network-covers-link', previewRefusal({network}).args)));\n\
+         console.log(fillPlaceholders('{{network}} / {{covers}}', {{ network: 'a', covers: 'b' }}));\n\
+         console.log(JSON.stringify(refusalDetail('network-covers-link', null)));\n\
+         console.log(JSON.stringify(refusalDetail('unsupported-rule-shape', {{ network: 'x' }})));\n\
+         console.log(JSON.stringify(operationFailureArgs({{ state: 'failed', error: {{ code: 'c', args: {{ network: 'n' }} }} }})));\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
     let Some(output) = run_node(&harness) else {
@@ -339,7 +354,7 @@ fn the_window_reads_the_refusals_the_service_sends() {
         [
             "123, 192.0.2.1",
             r#"{"code":"invalid-rule-value","values":"123, 192.0.2.1"}"#,
-            r#"{"code":"unsupported-rule-shape","values":""}"#,
+            r#"{"code":"unsupported-rule-shape","values":"","args":null}"#,
             "null",
             "null",
             // Why the refusal has to be asked first.
@@ -353,9 +368,43 @@ fn the_window_reads_the_refusals_the_service_sends() {
             r#""""#,
             "unsupported-rule-shape",
             "unknown",
+            // A refused network names itself and what it covers.
+            r#"{"key":"errors.network-covers-link-tunnel-server","values":{"network":"10.0.0.0/8","covers":"10.1.2.3"}}"#,
+            "a / b",
+            "null",
+            "null",
+            r#"{"network":"n"}"#,
         ],
         "{output}"
     );
+}
+
+/// The sentences a named network refusal reads as exist in both languages and
+/// keep their placeholders.
+#[test]
+fn a_refused_network_has_a_sentence_in_both_languages() {
+    for locale in ["en", "ru"] {
+        for (key, placeholders) in [
+            (
+                "network-covers-link-tunnel-server",
+                &["{network}", "{covers}"][..],
+            ),
+            (
+                "network-covers-link-local-network",
+                &["{network}", "{covers}"][..],
+            ),
+            ("network-covers-fake-ip-pool-named", &["{network}"][..]),
+        ] {
+            let text = locale_leaf(locale, &format!("errors.{key}"));
+            assert!(!text.is_empty(), "{locale}: errors.{key}");
+            for placeholder in placeholders {
+                assert!(
+                    text.contains(placeholder),
+                    "{locale}: errors.{key} lacks {placeholder}"
+                );
+            }
+        }
+    }
 }
 
 /// Feed a program to `node` on stdin. `None` when node is not installed.

@@ -28,6 +28,9 @@ fn the_gui_drift_key_reads_every_field_the_fold_orders_on() {
     let body = drift_sort_key_body();
     for needle in [
         "\"address-match\"",
+        "am.network",
+        "am.first",
+        "am.last",
         "\"app-match\"",
         "\"app:\"",
         "pattern",

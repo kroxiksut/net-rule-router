@@ -83,6 +83,7 @@ impl PerSidApplyOrchestrator {
             events: None,
             posture_log_state: Mutex::new(HashMap::new()),
             pin_trim_log_state: Mutex::new(HashMap::new()),
+            network_hold_log: crate::enforcement_planner::NetworkHoldLog::default(),
             // Default: fake-IP out of the plan. Production wires a live
             // provider via `with_fake_ip_context_provider`.
             fake_ip_context: Arc::new(|| None),
