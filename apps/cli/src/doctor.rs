@@ -203,7 +203,7 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     findings.push(match &facts.console_path {
         Some(path) => Finding::pass(
             "console",
-            format!("{} — {}", facts.console_version, path.display()),
+            format!("{} - {}", facts.console_version, path.display()),
         ),
         None => Finding::pass("console", facts.console_version),
     });
@@ -310,7 +310,7 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
                     format!("{service_version} (same as this console)")
                 } else {
                     format!(
-                        "{service_version} — this console is {}",
+                        "{service_version} - this console is {}",
                         facts.console_version
                     )
                 };
@@ -423,7 +423,7 @@ fn registered_binary_finding(facts: &Facts, registered: Option<&Path>) -> Findin
         Finding::warn(
             "registered binary",
             format!(
-                "registered: {} — shipped here: {}",
+                "registered: {} - shipped here: {}",
                 registered.display(),
                 shipped.display()
             ),
@@ -479,7 +479,7 @@ pub fn exit_code(findings: &[Finding], registration: &Registration) -> u8 {
 pub fn render(findings: &[Finding]) -> String {
     let width = findings.iter().map(|f| f.title.len()).max().unwrap_or(0);
     let mut out = String::with_capacity(512);
-    out.push_str(&format!("{PRODUCT_NAME} — installation check\n\n"));
+    out.push_str(&format!("{PRODUCT_NAME} - installation check\n\n"));
     for finding in findings {
         out.push_str(&format!(
             "[{}] {:width$}  {}\n",
@@ -501,8 +501,8 @@ pub fn render(findings: &[Finding]) -> String {
         count_of(failed, "problem")
     ));
     out.push_str(
-        "This report names paths and service states only — no rules, host names \
-         or addresses — so it is safe to attach to a bug report.\n",
+        "This report names paths and service states only - no rules, host names \
+         or addresses - so it is safe to attach to a bug report.\n",
     );
     out
 }
@@ -756,6 +756,22 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_report_is_plain_ascii() {
+        for registration in [
+            installed(Some(installed_binary(BinaryRole::Service)), "running"),
+            installed(Some(installed_binary(BinaryRole::Service)), "stopped"),
+            Registration::NotInstalled,
+        ] {
+            let report = render(&assess(&facts(registration)));
+            assert!(
+                report.is_ascii(),
+                "non-ASCII in report: {:?}",
+                report.chars().find(|c| !c.is_ascii())
+            );
         }
     }
 

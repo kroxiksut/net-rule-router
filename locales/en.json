@@ -119,7 +119,8 @@
     "show-details": "Show details",
     "hide-details": "Hide details",
     "load-more": "Load more",
-    "dismiss": "Dismiss"
+    "dismiss": "Dismiss",
+    "dont-show": "Don't show…"
   },
   "label": {
     "help": "Help",
@@ -152,6 +153,12 @@
     "time-left": {
       "hours-minutes": "{hours} h {minutes} min",
       "minutes": "{minutes} min"
+    },
+    "duration": {
+      "for-a-day": "For a day",
+      "forever": "Forever",
+      "for-7-days": "For 7 days",
+      "for-30-days": "For 30 days"
     }
   },
   "settings": {
@@ -164,7 +171,8 @@
     },
     "category": {
       "application": "Application",
-      "presets": "Presets and settings"
+      "presets": "Presets and settings",
+      "notifications": "Notifications"
     },
     "service": {
       "title": "Service management",
@@ -895,7 +903,6 @@
       }
     },
     "block-notices": {
-      "forever": "Forever",
       "mutes": {
         "heading": "Active mutes",
         "row-host": "Host: {name}",
@@ -931,6 +938,16 @@
     },
     "language": {
       "diagnostics-summary": "%1 locale file(s) reported problems. The affected keys fall back to English; everything else in the file is used."
+    },
+    "notifications": {
+      "hidden": {
+        "heading": "Hidden notifications",
+        "description": "Choose for how long each kind of notification stays hidden. The \"Don't show…\" button on a notification sets the same thing.",
+        "shown": "Shown",
+        "show": "Show",
+        "until": "Hidden until {timestamp}",
+        "forever": "Hidden for good"
+      }
     }
   },
   "vpn-onboarding": {
@@ -2766,8 +2783,7 @@
       "action": {
         "route-to-secondary": "To additional route",
         "open-routes": "Open routes",
-        "snooze": "Snooze",
-        "mute": "Don't show…"
+        "snooze": "Snooze"
       },
       "route-confirm": {
         "title": "Route {name} via the additional link?",
@@ -2780,12 +2796,10 @@
         "body-many": "Stop asking about these {count} addresses for a while.",
         "for-15-minutes": "15 minutes",
         "for-1-hour": "1 hour",
-        "for-8-hours": "8 hours",
-        "for-a-day": "For a day"
+        "for-8-hours": "8 hours"
       },
       "mute": {
         "title": "What should stop appearing?",
-        "body": "Mutes can be lifted later in Settings, General, under \"Active mutes\".",
         "this-host": "Only {name}",
         "these-hosts": "Only these {count} addresses",
         "this-app": "All from {name}",
@@ -2808,6 +2822,13 @@
           "other": "{count} addresses"
         }
       }
+    },
+    "mute": {
+      "lift-hint": "Mutes can be lifted later in Settings, Notifications."
+    },
+    "notice-mute": {
+      "title": "Stop showing this notification?",
+      "body": "\"{name}\" will not appear for as long as you choose."
     }
   },
   "diag": {
@@ -4007,6 +4028,10 @@
     "kill-switch-restored": {
       "title": "Leak protection restored",
       "body": "Leak protection was turned back on from your saved settings (the background service had been reset). If you didn't expect this, you can turn it off in Settings → Routing behavior."
+    },
+    "first-run-needs-admin": {
+      "title": "A setup answer needs an administrator",
+      "body": "“{setting}” applies to the whole computer, so only an administrator can turn it on. It stays off for now; an administrator can switch it on in the routing settings."
     },
     "service-operation-failed": {
       "title": "Service action failed: {operation}",

@@ -46,23 +46,83 @@ QtObject {
     function _applyProvisionedFirstRun() {
         root.logProgress(root.tr("progress.first-run-provisioned",
             "Setup answers were supplied before launch; applying them."), "progress")
-        var rp = root.routePolicyController
-        if (rp) {
-            if (typeof rp.applyKillSwitchEnabled === "function") {
-                rp.applyKillSwitchEnabled(provisioning.killSwitch === true)
-            }
-            if (typeof rp.applyDohLockdownEnabled === "function") {
-                rp.applyDohLockdownEnabled(provisioning.dohLockdown === true)
-            }
+        if (root.routePolicyController) {
+            root.routePolicyController.applyFirstRunProtections(
+                provisioning.killSwitch === true, provisioning.dohLockdown === true)
         }
-        if (typeof root.applyServiceStabilityPatch === "function") {
-            root.applyServiceStabilityPatch({ "fake-ip-enabled": provisioning.fakeIp === true },
-                function() {}, "provisioning")
-        }
+        applyFirstRunStability({ "fake-ip-enabled": provisioning.fakeIp === true }, "provisioning")
         _applyProvisionedConnections()
         _loadBundledRuleSet(String(provisioning.ruleSet || "none"))
         root.updatePrefs({ firstRunCompleted: true })
         root.emitPrefs()
+    }
+
+    /// Service-wide answers of the first run (wizard or answer file). A service
+    /// that is not reachable yet gets them parked for the next connect; a
+    /// refusal is named, because this setting covers the whole computer and a
+    /// non-elevated window may not turn it on — dropping it silently left the
+    /// user believing it was on.
+    ///
+    /// Every answer lands on the status line: this write is what raises the
+    /// administrator prompt, and the prompt's line stays until something
+    /// replaces it.
+    function applyFirstRunStability(patch, origin) {
+        if (typeof root.applyServiceStabilityPatch !== "function") return
+        root.applyServiceStabilityPatch(patch, function(ok, code, payload) {
+            if (ok) {
+                root.statusLine = _stabilityAppliedText(patch, payload)
+                return
+            }
+            var slug = String(code || "").toLowerCase().replace(/_/g, "-")
+            // A refused or declined elevation is an answer: the setting stays
+            // off, and the user hears so instead of a silent default.
+            if (slug === "forbidden" || slug === "uac-declined") {
+                if (patch["fake-ip-enabled"] === true) _noteFakeIpNeedsAdministrator()
+                root.statusLine = slug === "uac-declined"
+                    ? root.tr("status.route-policy-uac-declined",
+                        "Administrator approval was declined; the setting was not changed.")
+                    : root.tr("status.system-routing-failed", "Could not update the setting: ")
+                        + ((typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(code) : code)
+                return
+            }
+            if (slug === "unsupported-platform") return
+            for (var key in patch)
+                root._recordOfflineRoutingIntent("stability", key, patch[key])
+        }, origin)
+    }
+
+    /// What the service holds after the write, read from its echo rather than
+    /// the request, so a write it did not apply is not reported as applied.
+    function _stabilityAppliedText(patch, payload) {
+        if (patch["fake-ip-enabled"] === undefined)
+            return root.tr("status.system-routing-set", "System-level routing setting updated.")
+        var want = patch["fake-ip-enabled"] === true
+        if (payload && payload["fake-ip-enabled"] !== undefined
+                && (payload["fake-ip-enabled"] === true) !== want)
+            return root.tr("status.setting-not-applied",
+                "The background service did not apply this change — the switch "
+                + "was reset to what the service actually holds.")
+        return want
+            ? root.tr("status.fake-ip-on", "Virtual-address routing (fake-IP) is on.")
+            : root.tr("status.fake-ip-off", "Virtual-address routing (fake-IP) is off.")
+    }
+
+    function _noteFakeIpNeedsAdministrator() {
+        if (!root.notificationsController) return
+        root.notificationsController._addPushNotice({
+            "id": "first-run-needs-admin:fake-ip-enabled",
+            "kind": "service-control",
+            "severity": "warning",
+            "dismissible": true,
+            "title": root.tr("notifications.first-run-needs-admin.title",
+                "A setup answer needs an administrator"),
+            "body": root.tr("notifications.first-run-needs-admin.body",
+                "“{setting}” applies to the whole computer, so only an administrator can turn it on. It stays off for now; an administrator can switch it on in the routing settings.")
+                .replace("{setting}", root.tr("settings.routing.fake-ip.label",
+                    "Route sites over virtual addresses (fake-IP)")),
+            "actionKey": "open-routing-settings",
+            "actionText": root.tr("action.open-settings", "Open settings")
+        })
     }
 
     /// Import a bundled rule set named as `<country>/<pack>`, the same two

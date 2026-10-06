@@ -182,6 +182,11 @@ pub mod nft_ir;
 /// machine; delivering the result to the kernel is a separate concern.
 pub mod lower_linux;
 
+/// Folding the lowered per-address rules into anonymous sets: every packet
+/// walks the chain, and a set is one lookup where the rules were one compare
+/// each. Pure; order of meaning is preserved.
+pub mod nft_merge;
+
 /// Delivery of an [`nft_ir`] ruleset to the kernel through `nft --json`.
 /// Rendering the transaction is pure and tested on every host; only the call
 /// into `nft` is Linux-gated. A direct-netlink crate will replace this

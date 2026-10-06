@@ -1282,6 +1282,9 @@ fn nft_outcome(flows: &[nrr_platform_api::enforcement::FlowRule], ip: IpAddr) ->
         rule.matches.iter().all(|m| match m {
             NftMatch::DstV4 { net, prefix } => in_net(IpAddr::V4(*net), *prefix),
             NftMatch::DstV6 { net, prefix } => in_net(IpAddr::V6(*net), *prefix),
+            NftMatch::DstSetV4(blocks) | NftMatch::DstSetV6(blocks) => {
+                blocks.iter().any(|b| b.contains(ip))
+            }
             NftMatch::SkUid(_) => true,
             _ => false,
         })

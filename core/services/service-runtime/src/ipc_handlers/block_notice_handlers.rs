@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nrr_domain::block_notice::{Mute, MuteScope};
+use nrr_domain::block_notice::{Mute, MuteScope, NoticeKind};
 use nrr_shared::ipc_payloads::{
     BlockNoticeJournalAckRequest, BlockNoticeJournalAckResponse, BlockNoticeJournalEntryDto,
     BlockNoticeJournalListResponse, BlockNoticeMuteDto, BlockNoticeMuteScopeDto,
@@ -97,6 +97,13 @@ fn scope_from_dto(dto: BlockNoticeMuteScopeDto) -> Result<MuteScope, IpcError> {
                 })
         }
         BlockNoticeMuteScopeDto::All => Ok(MuteScope::All),
+        BlockNoticeMuteScopeDto::Notice { notice } => NoticeKind::from_slug(notice.trim())
+            .map(MuteScope::Notice)
+            .ok_or_else(|| IpcError {
+                code: IpcErrorCode::MalformedRequest,
+                message: format!("unknown notice kind {notice:?}"),
+                diagnostics_id: None,
+            }),
     }
 }
 
@@ -108,6 +115,9 @@ fn dto_from_scope(scope: &MuteScope) -> BlockNoticeMuteScopeDto {
             reason: reason.slug().to_string(),
         },
         MuteScope::All => BlockNoticeMuteScopeDto::All,
+        MuteScope::Notice(kind) => BlockNoticeMuteScopeDto::Notice {
+            notice: kind.slug().to_string(),
+        },
     }
 }
 
@@ -613,6 +623,44 @@ mod tests {
                 &ctx(Some("S-A")),
             )
             .expect_err("empty host");
+        assert_eq!(err.code, IpcErrorCode::MalformedRequest);
+    }
+
+    #[test]
+    fn a_notice_kind_mute_is_stored_and_an_unknown_kind_refused() {
+        let (store, center) = wired();
+        let set = BlockNoticeMutesSetHandler::new(store, center);
+        let value = set
+            .handle(
+                &req(
+                    IpcOperationName::BlockNoticeMutesSet,
+                    serde_json::json!({
+                        "scope": { "kind": "notice", "notice": "block-notice-backlog" },
+                        "until-unix-ms": 4_102_444_800_000_u64
+                    }),
+                ),
+                &ctx(Some("S-A")),
+            )
+            .expect("notice mute");
+        let parsed: BlockNoticeMutesSetResponse = serde_json::from_value(value).expect("decode");
+        assert_eq!(
+            parsed.mutes,
+            vec![BlockNoticeMuteDto {
+                scope: BlockNoticeMuteScopeDto::Notice {
+                    notice: "block-notice-backlog".into()
+                },
+                until_unix_ms: Some(4_102_444_800_000),
+            }]
+        );
+        let err = set
+            .handle(
+                &req(
+                    IpcOperationName::BlockNoticeMutesSet,
+                    serde_json::json!({ "scope": { "kind": "notice", "notice": "no-primary-route" } }),
+                ),
+                &ctx(Some("S-A")),
+            )
+            .expect_err("a fault notice cannot be muted");
         assert_eq!(err.code, IpcErrorCode::MalformedRequest);
     }
 

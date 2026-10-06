@@ -30,6 +30,7 @@ use crate::dns_resolver::{
 use crate::net_filter::is_non_routable;
 use crate::per_sid_orchestrator::RulesProvider;
 use crate::recent_rule_addresses::RecentRuleAddressIndex;
+use crate::secondary_address_owners::SecondaryAddressOwners;
 use crate::supervised_runtime::RouteRecomputeHook;
 use nrr_platform_api::dns::AddressFamily;
 
@@ -1110,10 +1111,10 @@ impl FactSink for CacheFactSink {
     }
 }
 
-/// production [`SecondaryOwnedIps`]: the pinned
-/// address set of the routing-active principal's secondary rules, derived from
-/// the same rule-book × FQDN-cache join the DNS observer uses
-/// ([`crate::dns_observation_consumer::build_secondary_ip_owners`]). Memoized
+/// production [`SecondaryOwnedIps`]: what the routing-active principal's
+/// secondary rules send over the additional link — the rule-book × FQDN-cache
+/// join the DNS observer uses, plus the networks the arbiter gives that link
+/// ([`crate::secondary_address_owners::SecondaryAddressOwners`]). Memoized
 /// for a few seconds — the listener consults it on every direct-host `A`
 /// answer, and the underlying join walks the whole secondary rule fan-out.
 ///
@@ -1139,7 +1140,7 @@ pub struct ActiveSecondaryOwnedIps {
     rules_provider: Arc<dyn RulesProvider>,
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     fqdn: Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
-    memo: Mutex<Option<(std::time::Instant, Arc<std::collections::HashSet<Ipv4Addr>>)>>,
+    memo: Mutex<Option<(std::time::Instant, Arc<SecondaryAddressOwners>)>>,
 }
 
 /// How long one computed owned-set snapshot serves steering before a rebuild.
@@ -1161,28 +1162,20 @@ impl ActiveSecondaryOwnedIps {
         }
     }
 
-    fn rebuild(&self) -> std::collections::HashSet<Ipv4Addr> {
+    fn rebuild(&self) -> SecondaryAddressOwners {
         let Some(sid) = (self.active_sid)() else {
-            return std::collections::HashSet::new();
+            return SecondaryAddressOwners::default();
         };
         let Some(snapshot) = self.rules_provider.active_rules_for(&sid) else {
-            return std::collections::HashSet::new();
+            return SecondaryAddressOwners::default();
         };
-        crate::dns_observation_consumer::build_secondary_ip_owners(
-            &snapshot.rule_book.secondary,
-            self.fqdn.as_ref(),
-        )
-        .into_keys()
-        .collect()
+        SecondaryAddressOwners::build(&snapshot.rule_book, self.fqdn.as_ref())
     }
 
     /// Memoized read with an injected `now` — the trait impl passes
     /// `Instant::now()`; tests advance `now` to cross the memo TTL without
     /// sleeping.
-    fn owned_ips_at(
-        &self,
-        now: std::time::Instant,
-    ) -> std::sync::Arc<std::collections::HashSet<Ipv4Addr>> {
+    fn owned_ips_at(&self, now: std::time::Instant) -> std::sync::Arc<SecondaryAddressOwners> {
         let mut guard = self.memo.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((at, set)) = guard.as_ref() {
             if now.saturating_duration_since(*at) < OWNED_SET_MEMO_TTL {
@@ -1198,7 +1191,7 @@ impl ActiveSecondaryOwnedIps {
 }
 
 impl crate::dns_resolver::SecondaryOwnedIps for ActiveSecondaryOwnedIps {
-    fn secondary_owned_ips(&self) -> std::sync::Arc<std::collections::HashSet<Ipv4Addr>> {
+    fn secondary_owned_ips(&self) -> std::sync::Arc<SecondaryAddressOwners> {
         self.owned_ips_at(std::time::Instant::now())
     }
 }

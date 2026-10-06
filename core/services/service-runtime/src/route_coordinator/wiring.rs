@@ -30,6 +30,8 @@ impl SecondaryRouteCoordinator {
             enforcement_status: Mutex::new(HashMap::new()),
             unassigned_tunnel_notified: Mutex::new(HashMap::new()),
             no_next_hop_logged: Mutex::new(std::collections::HashSet::new()),
+            no_policy_logged: Mutex::new(std::collections::HashSet::new()),
+            no_secondary_logged: Mutex::new(std::collections::HashSet::new()),
             probed_ifindex: Mutex::new(HashMap::new()),
             last_resolution: Mutex::new(HashMap::new()),
             rule_scope_service_driven,

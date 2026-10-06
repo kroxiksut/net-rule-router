@@ -687,7 +687,7 @@ impl MutationExecutor for ProductionMutationExecutor {
         self.emit_progress(&stored, principal, "started", None);
 
         if let Some(error) = self.gate_refusal(&stored, principal) {
-            self.emit_progress(&stored, principal, "failed", Some(error.code.clone()));
+            self.emit_progress(&stored, principal, "failed", Some(&error));
             return MutationOutcome::Failed(error);
         }
 
@@ -729,9 +729,8 @@ impl MutationExecutor for ProductionMutationExecutor {
             }
         };
 
-        // Terminal phase event — `completed` or `failed`. Error
-        // code threads through to the wire so the GUI can render a
-        // localised toast.
+        // Terminal phase event; the error's code and args reach the wire so
+        // the toast can say what was refused.
         match &outcome {
             MutationOutcome::Completed(_) => {
                 tracing::info!(
@@ -753,7 +752,7 @@ impl MutationExecutor for ProductionMutationExecutor {
                     error_message = %err.message,
                     "mutation execute failed",
                 );
-                self.emit_progress(&stored, principal, "failed", Some(err.code.clone()));
+                self.emit_progress(&stored, principal, "failed", Some(err));
             }
         }
         outcome

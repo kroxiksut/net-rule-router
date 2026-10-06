@@ -90,6 +90,114 @@ fn note_not_usable_once_dedups_until_cleared_or_changed() {
     assert!(coord.note_not_usable_once(sid, "primary", "win-adapter:{tap}"));
 }
 
+/// How many `msg_key` lines `run` writes to the operational log.
+fn count_logged(msg_key: &str, run: impl FnOnce()) -> usize {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let writer = Arc::new(nrr_diagnostics::LogWriter::open(
+        nrr_diagnostics::LogWriterConfig::new(dir.path()),
+    ));
+    let subscriber =
+        tracing_subscriber::registry().with(nrr_diagnostics::NdjsonTracingLayer::new(writer));
+    tracing::subscriber::with_default(subscriber, run);
+    let wanted = format!("diag.event.{msg_key}");
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir.path()).expect("logs dir") {
+        let text = std::fs::read_to_string(entry.expect("entry").path()).expect("read");
+        count += text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("ndjson"))
+            .filter(|line| line["message_key"] == wanted.as_str())
+            .count();
+    }
+    count
+}
+
+/// Before the first run writes a policy every resolve finds none; the log says
+/// so once per spell and per user, not at reconcile cadence.
+#[test]
+fn no_policy_is_logged_once_per_spell_and_again_after_a_policy_came_and_went() {
+    let policy = Arc::new(FakePolicy::new());
+    let coord = coordinator_with_policy(
+        Arc::new(MockWindowsApi::new()),
+        Arc::new(FakeRules::new()),
+        Arc::clone(&policy),
+    );
+    let key = "route-no-policy-for-user";
+
+    let first_spell = count_logged(key, || {
+        for _ in 0..5 {
+            let _ = coord.resolve("S-NOPOL");
+        }
+    });
+    assert_eq!(first_spell, 1, "repeated passes without a policy log once");
+
+    let other_user = count_logged(key, || {
+        let _ = coord.resolve("S-OTHER");
+        let _ = coord.resolve("S-NOPOL");
+    });
+    assert_eq!(
+        other_user, 1,
+        "another user is its own spell; the first stays quiet"
+    );
+
+    policy.bind_secondary("S-NOPOL", "win-adapter:{tunnel}");
+    let with_policy = count_logged(key, || {
+        let _ = coord.resolve("S-NOPOL");
+    });
+    assert_eq!(with_policy, 0);
+
+    policy.unbind("S-NOPOL");
+    let second_spell = count_logged(key, || {
+        for _ in 0..5 {
+            let _ = coord.resolve("S-NOPOL");
+        }
+    });
+    assert_eq!(
+        second_spell, 1,
+        "losing the policy again is a new state and logs again"
+    );
+}
+
+/// A policy with no additional link ("choose later") is the same steady state:
+/// said once per spell, and again only after a binding came and went.
+#[test]
+fn no_secondary_is_logged_once_per_spell_and_again_after_a_binding_came_and_went() {
+    let policy = Arc::new(FakePolicy::new());
+    let coord = coordinator_with_policy(
+        Arc::new(MockWindowsApi::new()),
+        Arc::new(FakeRules::new()),
+        Arc::clone(&policy),
+    );
+    let key = "route-no-secondary-bound";
+    policy.bind_without_secondary("S-LATER");
+
+    let first_spell = count_logged(key, || {
+        for _ in 0..5 {
+            let _ = coord.resolve("S-LATER");
+        }
+    });
+    assert_eq!(
+        first_spell, 1,
+        "repeated passes without a secondary log once"
+    );
+
+    policy.bind_secondary("S-LATER", "win-adapter:{tunnel}");
+    let bound = count_logged(key, || {
+        let _ = coord.resolve("S-LATER");
+    });
+    assert_eq!(bound, 0);
+
+    policy.bind_without_secondary("S-LATER");
+    let second_spell = count_logged(key, || {
+        for _ in 0..5 {
+            let _ = coord.resolve("S-LATER");
+        }
+    });
+    assert_eq!(second_spell, 1, "losing the binding again is a new state");
+}
+
 /// The derived next-hop is the answer to a question asked on every resolve, so
 /// only a CHANGED answer is news — and a reconnect that lands on a new peer
 /// must still say so.

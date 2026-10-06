@@ -119,6 +119,7 @@ Popup {
             delegate: Rectangle {
                 id: card
                 required property var modelData
+                property bool choosingMute: false
                 width: view.width
                 implicitHeight: cardRow.implicitHeight
                     + (root._theme ? root._theme.spacingSm : 8) * 2
@@ -207,6 +208,16 @@ Popup {
                                     }
                                 }
                             }
+                            // "Don't show…" for a whole notice kind: asks for how
+                            // long in place, then writes the service-kept mute.
+                            ThemedButton {
+                                theme: root._theme
+                                visible: !!card.modelData.noticeMuteKind && !card.choosingMute
+                                text: root.tr("action.dont-show", "Don't show…")
+                                Accessible.role: Accessible.Button
+                                Accessible.name: text
+                                onClicked: card.choosingMute = true
+                            }
                             ThemedButton {
                                 theme: root._theme
                                 // A non-dismissible notice (dismissible === false)
@@ -220,6 +231,40 @@ Popup {
                                         root.ownerRoot.notificationsController.dismissNotification(card.modelData.id)
                                     }
                                 }
+                            }
+                        }
+                        Flow {
+                            Layout.fillWidth: true
+                            visible: card.choosingMute
+                            spacing: root._theme ? root._theme.spacingSm : 8
+                            layoutDirection: Qt.RightToLeft
+                            Repeater {
+                                model: [
+                                    { choice: "1d", key: "label.duration.for-a-day", fallback: "For a day" },
+                                    { choice: "7d", key: "label.duration.for-7-days", fallback: "For 7 days" },
+                                    { choice: "30d", key: "label.duration.for-30-days", fallback: "For 30 days" },
+                                    { choice: "forever", key: "label.duration.forever", fallback: "Forever" }
+                                ]
+                                delegate: ThemedButton {
+                                    required property var modelData
+                                    theme: root._theme
+                                    text: root.tr(modelData.key, modelData.fallback)
+                                    Accessible.name: text
+                                    onClicked: {
+                                        card.choosingMute = false
+                                        if (root.ownerRoot) {
+                                            root.ownerRoot.notificationsController.muteNoticeFor(
+                                                card.modelData.noticeMuteKind, modelData.choice,
+                                                card.modelData.id)
+                                        }
+                                    }
+                                }
+                            }
+                            ThemedButton {
+                                theme: root._theme
+                                text: root.tr("action.cancel", "Cancel")
+                                Accessible.name: text
+                                onClicked: card.choosingMute = false
                             }
                         }
                     }

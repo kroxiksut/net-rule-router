@@ -112,30 +112,19 @@ Window {
     function _applyProtectionChoices() {
         if (_protectionApplied) return
         _protectionApplied = true
-        var rp = root.routePolicyController
-        if (rp) {
-            if (typeof rp.applyKillSwitchEnabled === "function") {
-                rp.applyKillSwitchEnabled(wantKillSwitch)
-            }
-            if (typeof rp.applyDohLockdownEnabled === "function") {
-                rp.applyDohLockdownEnabled(wantDohLockdown)
-            }
+        if (root.routePolicyController) {
+            root.routePolicyController.applyFirstRunProtections(wantKillSwitch, wantDohLockdown)
         }
         if (wantBlockNoticesMuted) {
             root.commitPrefs({ notifyBlockNotices: false })
         }
-        if (typeof root.applyServiceStabilityPatch !== "function") return
         var patch = { "fake-ip-enabled": wantFakeIp }
         if (wantDiagnosticLogs) {
             patch["verbose-logging-change"] = diagnosticLogsDuration
             patch["conn-trace-ndjson-change"] = diagnosticLogsDuration
             patch["conn-trace-gui"] = true
         }
-        root.applyServiceStabilityPatch(patch, function(ok, code) {
-            if (!ok) {
-                console.log("FirstRun: stability patch deferred: " + String(code || ""))
-            }
-        }, "first-run")
+        root.startupController.applyFirstRunStability(patch, "first-run")
     }
 
     /// What one connection reads as in the picker for `role`. A system name

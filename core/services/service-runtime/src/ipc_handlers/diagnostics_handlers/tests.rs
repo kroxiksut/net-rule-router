@@ -240,6 +240,134 @@ fn conn_trace_rows_name_virtual_addresses_from_the_pool() {
     assert!(bare.remote_fake_ip, "recycled, yet still marked virtual");
 }
 
+/// A conn-trace handler whose expectation reads `book`, over `remotes`
+/// (newest last, so the page lists them in reverse).
+fn conn_trace_with_book(
+    book: nrr_domain::canonical::CanonicalRuleBook,
+    remotes: &[&str],
+) -> ConnTraceEntriesListResponse {
+    use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
+    use crate::per_sid_orchestrator::ActiveRulesSnapshot;
+
+    struct BookRules(nrr_domain::canonical::CanonicalRuleBook);
+    impl RulesProvider for BookRules {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            Some(ActiveRulesSnapshot {
+                rule_book: self.0.clone(),
+                behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
+            })
+        }
+    }
+
+    let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+        8,
+    ));
+    for remote in remotes {
+        let mut row = trace_row();
+        row.remote = remote.parse().expect("remote");
+        ring.push(row);
+    }
+    let handler = ConnTraceEntriesListHandler::new(ring).with_route_expectation(
+        Arc::new(BookRules(book)),
+        Arc::new(MockFqdnCacheLookup::new()),
+        Arc::new(|| Some("S-1-5-21-T".to_string())),
+    );
+    conn_trace_list(&handler)
+}
+
+fn route_rule(
+    id: &str,
+    m: nrr_domain::canonical::CanonicalAddressMatch,
+) -> nrr_domain::canonical::CanonicalRule {
+    nrr_domain::canonical::CanonicalRule {
+        id: nrr_domain::RuleId(id.into()),
+        enabled: true,
+        address_match: Some(m),
+        app_match: None,
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Route,
+        origin: None,
+    }
+}
+
+fn subnet_match(net: &str) -> nrr_domain::canonical::CanonicalAddressMatch {
+    nrr_domain::canonical::CanonicalAddressMatch::Subnet(
+        nrr_shared::ip_block::IpBlock::parse(net).expect("test network literal"),
+    )
+}
+
+/// What enforcement carries decides what the trace expects: on a platform
+/// that routes no networks, a network rule expects nothing.
+fn expected_for_network(label: &str) -> (&'static str, String) {
+    if crate::wfp_codegen::current_rule_shape_support().network_destination {
+        ("secondary", label.to_string())
+    } else {
+        ("", String::new())
+    }
+}
+
+/// A flow into a network the additional link carries is expected there, so
+/// the GUI can flag one that left over the main link.
+#[test]
+fn conn_trace_expects_a_secondary_subnet_on_the_secondary() {
+    use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook, CanonicalRuleSet};
+    let book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![
+            route_rule(
+                "p-ip",
+                CanonicalAddressMatch::ExactIp("198.51.100.9".parse().expect("ip")),
+            ),
+            route_rule("p-net", subnet_match("198.51.100.128/25")),
+        ]),
+        secondary: CanonicalRuleSet::from_rules(vec![
+            route_rule("s-net", subnet_match("198.51.100.0/24")),
+            route_rule(
+                "s-range",
+                CanonicalAddressMatch::ip_range(
+                    nrr_shared::ip_block::IpRange::parse("203.0.113.10-203.0.113.20")
+                        .expect("test range literal"),
+                ),
+            ),
+        ]),
+    };
+    let resp = conn_trace_with_book(
+        book,
+        &[
+            "198.51.100.7:443",
+            "198.51.100.9:443",
+            "198.51.100.200:443",
+            "203.0.113.15:443",
+            "192.0.2.80:443",
+        ],
+    );
+    let rows: Vec<(&str, &str, &str)> = resp
+        .page
+        .items
+        .iter()
+        .map(|r| {
+            (
+                r.remote.as_str(),
+                r.expected_route.as_str(),
+                r.rule_host.as_str(),
+            )
+        })
+        .collect();
+    let (subnet_route, subnet_label) = expected_for_network("198.51.100.0/24");
+    let (range_route, range_label) = expected_for_network("203.0.113.10-203.0.113.20");
+    assert_eq!(
+        rows,
+        vec![
+            ("192.0.2.80:443", "", ""),
+            ("203.0.113.15:443", range_route, range_label.as_str()),
+            // A longer main-link prefix inside the secondary network wins.
+            ("198.51.100.200:443", "", ""),
+            // An exact main-link address inside it stays main.
+            ("198.51.100.9:443", "", ""),
+            ("198.51.100.7:443", subnet_route, subnet_label.as_str()),
+        ]
+    );
+}
+
 #[test]
 fn cache_clear_app_only_does_not_flush_os_cache() {
     let (_dir, cache) = temp_cache();

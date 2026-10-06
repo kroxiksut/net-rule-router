@@ -224,7 +224,7 @@ pub fn tail_log(
         Link::NotAnswering => "not answering",
     };
     printed.err(format!(
-        "The {PRODUCT_NAME} service is {why} — reading the log files directly; \
+        "The {PRODUCT_NAME} service is {why} - reading the log files directly; \
          lines of all users may be shown."
     ));
     report(disk(), exe, printed)

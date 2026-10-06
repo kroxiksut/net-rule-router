@@ -226,8 +226,9 @@ the final truth.
 ## Settings and appearance
 
 Settings → *Application* holds how the app behaves (the tray icon at sign-in,
-minimizing to the tray, tray notifications), the theme, accessibility options
-and the interface language — Russian or English.
+minimizing to the tray), the theme, accessibility options and the interface
+language — Russian or English. Settings → *Notifications* decides what the tray
+may tell you and which kinds of notifications stay hidden, and for how long.
 
 ![Settings → Application](images/settings.png)
 

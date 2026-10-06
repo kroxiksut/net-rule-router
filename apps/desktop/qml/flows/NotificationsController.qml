@@ -1,4 +1,5 @@
 import QtQuick 2.15
+import "../lib/pure.js" as Pure
 
 // Non-visual controller for PUSH-DRIVEN NOTICES: the stack of messages the
 // service raises, what each one offers to do, and when it expires.
@@ -55,6 +56,47 @@ QtObject {
         } else if (k === "rule-duplicates") {
             root.commitPrefs({ notifyRuleDuplicates: false })
         }
+    }
+
+    /// "Don't show…" on a card: the same service-kept mute the tray writes, so
+    /// both surfaces and the Settings list agree. `choice` is a chooser answer
+    /// (`Pure.NOTICE_MUTE_CHOICES_MS`).
+    function muteNoticeFor(noticeKind, choice, notificationId) {
+        var req = Pure.noticeMuteRequest(noticeKind, choice, Date.now())
+        if (req === null || !root.bridgeAvailable || !root.rpc
+                || typeof root.rpc.rpcBlockNoticeMutesSet !== "function") return
+        var corr = root.rpc.rpcBlockNoticeMutesSet(req)
+        if (!corr) return
+        root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+            if (!ok) {
+                root.statusLine = root.tr("settings.block-notices.add.failed",
+                    "Could not add the mute: ") + root.ipcErrorLabel(code)
+                return
+            }
+            notificationsController.dismissNotification(notificationId)
+        })
+    }
+
+    /// `_addPushNotice` for a kind the tray offers "Don't show…" on. The service
+    /// keeps that answer per user; it is read afresh because the tray writes it
+    /// and nothing tells this window. `stillWanted` re-checks after the read,
+    /// for a notice the next push may already have taken back.
+    function _addPushNoticeUnlessMuted(noticeKind, notice, stillWanted) {
+        var admit = function(mutes) {
+            if (Pure.noticeKindMuted(mutes, noticeKind, Date.now())) return
+            if (stillWanted && !stillWanted()) return
+            notificationsController._addPushNotice(notice)
+        }
+        var corr = (root.bridgeAvailable && root.rpc
+                && typeof root.rpc.rpcBlockNoticeMutesList === "function")
+            ? root.rpc.rpcBlockNoticeMutesList() : ""
+        if (!corr || corr === "") {
+            admit([])
+            return
+        }
+        root.rpc.registerRpcCallback(corr, function(ok, p) {
+            admit(ok && p ? (p.mutes || []) : [])
+        })
     }
 
     function _addPushNotice(notice) {

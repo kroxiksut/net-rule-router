@@ -134,4 +134,46 @@ impl SecondaryRouteCoordinator {
             .unwrap_or_else(|p| p.into_inner());
         guard.remove(&format!("{sid}|{role}"));
     }
+
+    /// `true` exactly once per spell in which `sid` has no route policy;
+    /// `false` while the same spell continues.
+    pub(super) fn note_no_policy_once(&self, sid: &str) -> bool {
+        let mut guard = self
+            .no_policy_logged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if guard.contains(sid) {
+            return false;
+        }
+        guard.insert(sid.to_owned());
+        true
+    }
+
+    /// Re-arm [`Self::note_no_policy_once`] for `sid` — called whenever a
+    /// policy is found, so losing it again is said out loud.
+    pub(super) fn clear_no_policy(&self, sid: &str) {
+        self.no_policy_logged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+    }
+
+    /// `true` exactly once per spell in which `sid` has a policy but no
+    /// additional link bound ("choose later" in the wizard); `false` while it
+    /// continues.
+    pub(super) fn note_no_secondary_once(&self, sid: &str) -> bool {
+        self.no_secondary_logged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(sid.to_owned())
+    }
+
+    /// Re-arm [`Self::note_no_secondary_once`] for `sid` — called whenever the
+    /// spell ends, by a binding or by the policy going away.
+    pub(super) fn clear_no_secondary(&self, sid: &str) {
+        self.no_secondary_logged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+    }
 }

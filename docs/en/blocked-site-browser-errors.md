@@ -58,7 +58,7 @@ a private/incognito window, which has no local cache to fall back on.
   Diagnostics: blocked connections are listed there with the process and
   destination.
 - Or let the tray tell you: with **Tell me when a connection gets blocked**
-  on (Settings → Application → Tray notifications), a notice names the program,
+  on (Settings → Notifications), a notice names the program,
   the destination and why it was blocked. On Windows it also shows which
   program started that one, so a blocked `curl.exe` launched by a script is
   easy to trace. When the reason is a setting rather than a rule of yours,
@@ -71,6 +71,11 @@ a private/incognito window, which has no local cache to fall back on.
   until you lift the mute. A notice reaches only the person whose connection
   was blocked, and **Hide addresses in these notifications** keeps the
   destination off screen while you share or record it.
+- Blocks that happened while neither the app nor the tray was running come
+  as one summary when the tray starts. Like the other tray notices that ask
+  nothing of you, it has **Don't show…**: for a day, 7 days, 30 days or for
+  good. Every such choice is listed in Settings → Notifications under
+  **Hidden notifications**, where it can be changed or lifted.
 - If you want such sites to open without protection while the additional
   adapter is down, that is a policy choice — review the leak protection
   settings rather than treating the error page as a bug.

@@ -129,6 +129,16 @@ impl FakePolicy {
             .unwrap()
             .insert(sid.to_string(), display_name.to_string());
     }
+    /// Forget `sid`'s policy, so it reads as never written.
+    fn unbind(&self, sid: &str) {
+        self.by_sid.lock().unwrap().remove(sid);
+        self.primary_by_sid.lock().unwrap().remove(sid);
+        self.secondary_names.lock().unwrap().remove(sid);
+    }
+    /// A policy with no additional link bound, as "choose later" leaves it.
+    fn bind_without_secondary(&self, sid: &str) {
+        self.bind_secondary(sid, "");
+    }
     fn bind_primary(&self, sid: &str, stable_id: &str) {
         self.primary_by_sid
             .lock()
@@ -161,7 +171,7 @@ impl RoutePolicySource for FakePolicy {
             .unwrap_or_default();
         Some(PerSidPolicySnapshot {
             primary,
-            secondary: Some(PerSidBinding {
+            secondary: (!stable.is_empty()).then(|| PerSidBinding {
                 stable_id: stable,
                 display_name: secondary_name,
                 user_confirmed: true,

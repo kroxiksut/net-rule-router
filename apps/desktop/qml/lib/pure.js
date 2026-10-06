@@ -135,6 +135,7 @@ function sectionGlyph(sectionId) {
 function settingsCategories() {
     return [
         { id: "application", key: "settings.category.application", fallback: "Application", icon: "settings" },
+        { id: "notifications", key: "settings.category.notifications", fallback: "Notifications", icon: "bell" },
         { id: "diagnostics", key: "settings.group.logs-diagnostics", fallback: "Logs and diagnostics", icon: "diagnostics" },
         { id: "traffic", key: "settings.traffic.category", fallback: "Traffic statistics", icon: "traffic-in" },
         { id: "routing", key: "settings.group.routing-behavior", fallback: "Routing behavior", icon: "routing" },
@@ -979,6 +980,56 @@ function fillPlaceholders(text, values) {
         out = out.split("{" + name + "}").join(String(values[name]))
     }
     return out
+}
+
+// ---- "Don't show…" for whole notice kinds ----
+
+// Notice kinds a user may silence, each with the title it is listed under.
+// Mirrors `NoticeKind` in nrr-domain, which refuses any other slug.
+var MUTABLE_NOTICE_KINDS = {
+    "block-notice-backlog": ["notifications.block-notice.backlog.title",
+        "Blocked while the app was closed"],
+    "external-address": ["tray.external-address.title", "Additional route connected"],
+    "enforcement-restored": ["notifications.enforcement.restored.title",
+        "Routing is working again"],
+    "unassigned-tunnel": ["notifications.unassigned-tunnel.title",
+        "The additional route is not assigned"],
+    "local-networks": ["notifications.local-networks.title", "A local network was found"],
+    "rules-drift": ["tray.rules-drift.title", "Your rules files differ from what is applied"],
+    "secondary-down": ["notifications.enforcement.secondary-down.title",
+        "The additional connection is not up"]
+}
+
+// How long each answer of the chooser holds; 0 is "until lifted".
+var NOTICE_MUTE_CHOICES_MS = {
+    "1d": 24 * 60 * 60 * 1000,
+    "7d": 7 * 24 * 60 * 60 * 1000,
+    "30d": 30 * 24 * 60 * 60 * 1000,
+    "forever": 0
+}
+
+// Whether a `block-notices.mutes.list` answer silences notice `kind` at `nowMs`.
+function noticeKindMuted(mutes, kind, nowMs) {
+    var list = mutes || []
+    for (var i = 0; i < list.length; i += 1) {
+        var mute = list[i] || {}
+        var scope = mute.scope || {}
+        if (scope.kind !== "notice" || String(scope.notice || "") !== String(kind)) continue
+        var until = Number(mute["until-unix-ms"] || 0)
+        if (!(until > 0) || nowMs < until) return true
+    }
+    return false
+}
+
+// The `block-notices.mutes.set` request for a chooser answer, or null for an
+// answer the chooser does not offer. "Until lifted" leaves the deadline off.
+function noticeMuteRequest(kind, choice, nowMs) {
+    if (!MUTABLE_NOTICE_KINDS.hasOwnProperty(String(kind))) return null
+    if (!NOTICE_MUTE_CHOICES_MS.hasOwnProperty(String(choice))) return null
+    var req = { "scope": { "kind": "notice", "notice": String(kind) } }
+    var span = NOTICE_MUTE_CHOICES_MS[choice]
+    if (span > 0) req["until-unix-ms"] = nowMs + span
+    return req
 }
 
 // Whether the "new version" notice shows for `offer` ({latestVersion, url} or

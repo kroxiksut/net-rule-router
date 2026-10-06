@@ -1032,6 +1032,7 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
     use nrr_platform_api::enforcement::EnforcementPlan;
     use nrr_platform_linux::lower_linux::{lower_plan, EgressNames};
     use nrr_platform_linux::nft_ir::{NftMatch, NftVerdict};
+    use nrr_shared::ip_block::IpBlock;
 
     let principal = nrr_platform_api::enforcement::UserPrincipal::from_linux_uid(1000);
     let sid = principal.as_stored().to_string();
@@ -1066,19 +1067,30 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
 
     // Every resolver is cut on 443 for both transports, and the global DoT
     // port is cut for both — the same twelve verdicts the Windows codegen
-    // installs, expressed as ten nft rules (the two `Any:853` cuts carry no
-    // address).
+    // installs. The resolvers of one family and transport share a set; the two
+    // `Any:853` cuts carry no address.
     let rules = &lowered.ruleset.rules;
+    let names = |r: &nrr_platform_linux::nft_ir::NftRule, ip: IpAddr| {
+        r.matches.iter().any(|m| match m {
+            NftMatch::DstV4 { net, prefix } => {
+                IpBlock::new(IpAddr::V4(*net), *prefix).is_some_and(|b| b.contains(ip))
+            }
+            NftMatch::DstV6 { net, prefix } => {
+                IpBlock::new(IpAddr::V6(*net), *prefix).is_some_and(|b| b.contains(ip))
+            }
+            NftMatch::DstSetV4(blocks) | NftMatch::DstSetV6(blocks) => {
+                blocks.iter().any(|b| b.contains(ip))
+            }
+            _ => false,
+        })
+    };
     for ip in resolvers {
         for proto in [6u8, 17u8] {
             assert!(
                 rules.iter().any(|r| {
                     r.verdict == NftVerdict::Drop
                         && r.comment.starts_with("doh-block#")
-                        && r.matches.contains(&NftMatch::DstV4 {
-                            net: ip,
-                            prefix: 32,
-                        })
+                        && names(r, IpAddr::V4(ip))
                         && r.matches.contains(&NftMatch::Protocol(proto))
                         && r.matches.contains(&NftMatch::DstPort(443))
                 }),
@@ -1093,10 +1105,7 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
                 rules.iter().any(|r| {
                     r.verdict == NftVerdict::Drop
                         && r.comment.starts_with("doh-block#")
-                        && r.matches.contains(&NftMatch::DstV6 {
-                            net: ip,
-                            prefix: 128,
-                        })
+                        && names(r, IpAddr::V6(ip))
                         && r.matches.contains(&NftMatch::Protocol(proto))
                         && r.matches.contains(&NftMatch::DstPort(443))
                 }),
@@ -1112,10 +1121,15 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
                 r.verdict == NftVerdict::Drop
                     && r.matches.contains(&NftMatch::Protocol(proto))
                     && r.matches.contains(&NftMatch::DstPort(853))
-                    && !r
-                        .matches
-                        .iter()
-                        .any(|m| matches!(m, NftMatch::DstV4 { .. } | NftMatch::DstV6 { .. }))
+                    && !r.matches.iter().any(|m| {
+                        matches!(
+                            m,
+                            NftMatch::DstV4 { .. }
+                                | NftMatch::DstV6 { .. }
+                                | NftMatch::DstSetV4(_)
+                                | NftMatch::DstSetV6(_)
+                        )
+                    })
             }),
             "the DoT cut must be global, not per-resolver: {rules:#?}"
         );

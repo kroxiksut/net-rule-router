@@ -2566,6 +2566,46 @@ fn a_network_over_the_pool_or_a_link_is_refused_with_its_own_code() {
         .is_none());
 }
 
+/// The toast reads the refusal from the progress push, not from the operation
+/// status, so the push must name the network too.
+#[test]
+fn a_refused_network_reaches_the_progress_event_with_its_args() {
+    const SID: &str = "S-1-5-21-9000-1";
+    let (exec, _conn) = build_test_executor();
+    let bus = Arc::new(EventBus::new());
+    let exec = exec
+        .with_network_screen(machine_screen())
+        .with_event_bus(Arc::clone(&bus));
+    let sub = bus.subscribe_as("gui".into(), Some(SID.into()), None);
+    let mut stored = rules_update_of(&network_book(&["203.0.113.0/24"]));
+    stored.correlation_id = Some("corr-net".into());
+    stored.issuer_sid = SID.to_string();
+    stored.caller_is_elevated = true;
+
+    let outcome = exec.execute(stored, SID);
+    assert!(
+        matches!(&outcome, MutationOutcome::Failed(e) if e.code == NETWORK_COVERS_LINK_CODE),
+        "{outcome:?}"
+    );
+    let failed = bus
+        .peek_pending_for(&sub.subscription_id, 64)
+        .into_iter()
+        .find_map(|e| match e.event {
+            StatusUpdateEvent::MutationProgress {
+                phase,
+                error_code,
+                error_args,
+                ..
+            } if phase == "failed" => Some((error_code, error_args)),
+            _ => None,
+        })
+        .expect("a failed progress event");
+    assert_eq!(failed.0.as_deref(), Some(NETWORK_COVERS_LINK_CODE));
+    assert_eq!(failed.1["network"], "203.0.113.0/24");
+    assert_eq!(failed.1["covers-kind"], "tunnel-server");
+    assert_eq!(failed.1["covers"], "203.0.113.7");
+}
+
 #[test]
 fn without_a_screen_networks_pass_on_their_values_alone() {
     let (exec, _conn) = build_test_executor();

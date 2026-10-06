@@ -22,6 +22,8 @@ import QtQuick.Window 2.15
 //   primaryAction    - { label, actionId, accent } (accent renders as the
 //   secondaryAction    highlighted/primary affordance; absent = plain button)
 //   tertiaryAction
+//   extraActions     - array of the same shape, laid out after tertiaryAction,
+//                      for a choice that needs more than three answers
 //   dismissAction    - { label, actionId }; rendered flat on the left. Closing
 //                      the window or pressing Esc emits the SAME action id, so
 //                      "closed it" and "clicked Dismiss" are one code path for
@@ -65,6 +67,7 @@ Window {
     property var primaryAction: null
     property var secondaryAction: null
     property var tertiaryAction: null
+    property var extraActions: []
     property var dismissAction: null
 
     /// Action id emitted when the window is closed without pressing a button
@@ -147,6 +150,7 @@ Window {
         primaryAction = c.primaryAction || null
         secondaryAction = c.secondaryAction || null
         tertiaryAction = c.tertiaryAction || null
+        extraActions = c.extraActions || []
         dismissAction = c.dismissAction || null
         dismissActionId = String(c.dismissActionId
             || (c.dismissAction ? c.dismissAction.actionId : "")
@@ -753,6 +757,17 @@ Window {
                     ? String(promptWindow.tertiaryAction.label || "") : ""
                 onClicked: promptWindow._trigger(promptWindow.tertiaryAction)
                 Accessible.name: text
+            }
+            Repeater {
+                model: promptWindow.extraActions
+                delegate: ThemedButton {
+                    required property var modelData
+                    theme: promptWindow.theme
+                    highlighted: modelData.accent === true
+                    text: String(modelData.label || "")
+                    onClicked: promptWindow._trigger(modelData)
+                    Accessible.name: text
+                }
             }
             // Copying must not count as answering: this is the one footer
             // button that leaves the notice standing.

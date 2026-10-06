@@ -148,14 +148,16 @@ impl SecondaryRouteCoordinator {
         // `counter_overlay=0` + `primary=false` in PreferPrimary is the
         // smoking gun for "unmatched traffic is still riding the secondary".
         // Told apart by signature, not length: a rule network can be `/9`.
-        let counter_overlay = out
+        let overlay_shapes: Vec<_> = out
             .routes
             .iter()
             .filter(|r| {
                 crate::route_codegen::is_overlay_route(r)
                     && r.interface_index != secondary.interface_index
             })
-            .count();
+            .map(|r| (r.destination, r.prefix_length))
+            .collect();
+        let counter_overlay = overlay_shapes.len();
         let secondary_routes = out
             .routes
             .iter()
@@ -172,8 +174,8 @@ impl SecondaryRouteCoordinator {
         // routes. Stripping its redirect `/1` pair made the client treat the
         // removal as a fault and reconnect, and in mode A it dropped
         // not-yet-resolved hosts (DoH-only names with no `/32`) to the primary
-        // with the real IP. Mode-A selectivity rides a `/2` counter-overlay via
-        // the primary instead — more specific than the VPN's `/1`, nothing
+        // with the real IP. Mode-A selectivity rides a counter-overlay via the
+        // primary instead — one bit longer than the VPN's catch-all, nothing
         // removed.
         if delta.is_noop() {
             // Steady state (no change this cycle) — debug, to keep the log
@@ -203,16 +205,19 @@ impl SecondaryRouteCoordinator {
                 "route table reconciled",
             );
         }
-        // Counter-overlay liveness audit (mode A): re-read the live table and
-        // report EVERY `/2` route, so the log alone shows whether mode-A
-        // selectivity is actually in force — our `/2` must sit on the PRIMARY
-        // interface to out-specific the VPN's `/1`. A `/2` on the VPN ifindex
-        // (or none at all) is the smoking gun for "unmatched still rides the
-        // tunnel". Only on a real change, to avoid per-cycle cost.
+        // Counter-overlay liveness audit (mode A): report every live route of
+        // a shape the codegen planned as an overlay. Its length follows the
+        // tunnel's catch-all (`/0` ⇒ `/1`, `/1` ⇒ `/2`), so a fixed length
+        // would cry "missing" over halves that are in force. One on the VPN
+        // ifindex, or none at all, means unmatched traffic still rides the
+        // tunnel. Only on a real change, to avoid per-cycle cost.
         if !delta.is_noop() && matches!(resolution.mode, RouteBehaviorMode::PreferPrimary) {
             if let Ok(live) = self.api.get_ip_forward_table() {
                 let mut any = false;
-                for r in live.iter().filter(|r| r.prefix_length == 2) {
+                for r in live
+                    .iter()
+                    .filter(|r| overlay_shapes.contains(&(r.destination, r.prefix_length)))
+                {
                     any = true;
                     tracing::info!(
                         target: "nrr::route-coordinator",
@@ -223,7 +228,7 @@ impl SecondaryRouteCoordinator {
                         next_hop = %r.next_hop,
                         metric = r.metric,
                         on_secondary = (r.interface_index == secondary.interface_index),
-                        "live /2 counter-overlay route",
+                        "live counter-overlay route",
                     );
                 }
                 if !any {
@@ -231,7 +236,7 @@ impl SecondaryRouteCoordinator {
                         target: "nrr::route-coordinator",
                         msg_key = "route-counter-overlay-missing",
                         sid = %sid,
-                        "no /2 counter-overlay routes in the live table — mode-A selectivity is NOT in force; unmatched traffic will ride the VPN's redirect",
+                        "no counter-overlay route in the live table — mode-A selectivity is NOT in force; unmatched traffic will ride the VPN's redirect",
                     );
                 }
             }

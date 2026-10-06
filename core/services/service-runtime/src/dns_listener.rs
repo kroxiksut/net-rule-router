@@ -1069,8 +1069,8 @@ impl DnsInterceptListener {
 
     /// steer one upstream reply for a DIRECT
     /// (non-rule) host: drop `A` records the kill-switch pins to the secondary
-    /// so the client connects via addresses that stay on the primary/default
-    /// path. A CDN front-end's answers rotate over a large pool, so filtering
+    /// (by host, literal or network) so the client connects via addresses that
+    /// stay on the primary/default path. A CDN front-end's answers rotate over a large pool, so filtering
     /// usually leaves usable addresses; when the whole answer is pinned, ONE
     /// upstream re-query is tried (a fresh answer usually rotates), and if
     /// that is also fully pinned the ORIGINAL reply is returned unchanged —
@@ -1119,6 +1119,12 @@ impl DnsInterceptListener {
                 build_a_response(query, &clean, self.response_ttl).unwrap_or(reply),
                 false,
             );
+        }
+        // Every address lies in a network the user routes over the additional
+        // link: the rule asked for this host, so there is no co-tenant to
+        // rescue and no re-query worth its round trip.
+        if answered.iter().all(|ip| owned.owned_by_network_only(ip)) {
+            return (reply, false);
         }
         // Whole answer pinned — try ONE fresh upstream answer (pools rotate).
         if let Some(retry) = self.forward_within(query, budget) {

@@ -31,6 +31,7 @@ use std::time::Duration;
 use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope};
 
 use crate::dns_address_sanity::{classify_answer, rejected_addresses, AnswerSanity};
+use crate::secondary_address_owners::SecondaryAddressOwners;
 use nrr_platform_api::dns::AddressFamily;
 
 /// Firefox's DoH "canary" domain. When
@@ -368,8 +369,9 @@ pub trait FactSink: Send + Sync {
     }
 }
 
-/// the set of IPv4 addresses currently owned by
-/// the active principal's SECONDARY rules (the pinned/committed set). The
+/// the addresses the active principal's SECONDARY rules send over the
+/// additional link — hosts and literals (the pinned/committed set) and the
+/// networks the arbiter gives that link. The
 /// listener steers DIRECT-host answers with it: an upstream answer for a
 /// non-rule host is filtered so the client never gets an address the
 /// kill-switch pins to the secondary — the DNS-level cure for the shared-CDN
@@ -380,15 +382,15 @@ pub trait SecondaryOwnedIps: Send + Sync {
     /// Handed out behind an `Arc`: the production impl memoizes one set and
     /// every DIRECT answer asks for it, so returning it by value copied the
     /// whole pinned set per DNS reply.
-    fn secondary_owned_ips(&self) -> Arc<std::collections::HashSet<Ipv4Addr>>;
+    fn secondary_owned_ips(&self) -> Arc<SecondaryAddressOwners>;
 }
 
 /// No-op [`SecondaryOwnedIps`]: empty set → direct-answer steering disabled.
 pub struct NoopSecondaryOwnedIps;
 
 impl SecondaryOwnedIps for NoopSecondaryOwnedIps {
-    fn secondary_owned_ips(&self) -> Arc<std::collections::HashSet<Ipv4Addr>> {
-        Arc::new(std::collections::HashSet::new())
+    fn secondary_owned_ips(&self) -> Arc<SecondaryAddressOwners> {
+        Arc::new(SecondaryAddressOwners::default())
     }
 }
 

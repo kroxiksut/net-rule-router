@@ -207,8 +207,9 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
         StatusUpdateEvent::MutationProgress {
             correlation_id: "corr-1".into(),
             mutation_kind: "rules-update".into(),
-            phase: "completed".into(),
-            error_code: None,
+            phase: "failed".into(),
+            error_code: Some("network-covers-fake-ip-pool".into()),
+            error_args: [("network".to_string(), "198.18.0.0/15".to_string())].into(),
             sid: Some("S-1-5-21".into()),
         },
         StatusUpdateEvent::HostUnreachableOnBothRoutes {
@@ -283,6 +284,7 @@ fn push_event_keys_the_ui_reads_are_stable() {
         mutation_kind: "rules-update".into(),
         phase: "completed".into(),
         error_code: None,
+        error_args: Default::default(),
         sid: None,
     })
     .expect("serialise");
@@ -425,12 +427,75 @@ fn mutation_progress_names_the_owner_of_the_changed_rules() {
         mutation_kind: "rules-update".into(),
         phase: "failed".into(),
         error_code: Some("invalid-rule-value".into()),
+        error_args: Default::default(),
         sid: sid.map(str::to_string),
     };
     assert_eq!(progress(Some("S-1-5-21-A")).addressee(), Some("S-1-5-21-A"));
     assert_eq!(progress(None).addressee(), None);
     let json = serde_json::to_value(progress(None)).expect("serialise");
     assert!(json.get("sid").is_none(), "{json}");
+}
+
+/// A refusal that names what it refused carries those values to the toast
+/// under `error-args`, with the same keys `OperationErrorResponse::args` uses;
+/// a refusal without them, and an event from before the field, read alike.
+#[test]
+fn mutation_progress_carries_the_refusal_args() {
+    let args: std::collections::BTreeMap<String, String> = [
+        ("network".to_string(), "192.0.2.0/24".to_string()),
+        ("covers-kind".to_string(), "tunnel-server".to_string()),
+        ("covers".to_string(), "192.0.2.10".to_string()),
+    ]
+    .into();
+    let refused = serde_json::to_value(StatusUpdateEvent::MutationProgress {
+        correlation_id: "corr-1".into(),
+        mutation_kind: "rules-update".into(),
+        phase: "failed".into(),
+        error_code: Some("network-covers-link".into()),
+        error_args: args.clone(),
+        sid: None,
+    })
+    .expect("serialise");
+    assert_eq!(refused["error-code"], "network-covers-link");
+    assert_eq!(
+        refused["error-args"],
+        serde_json::json!({
+            "network": "192.0.2.0/24",
+            "covers-kind": "tunnel-server",
+            "covers": "192.0.2.10",
+        })
+    );
+    let response = serde_json::to_value(OperationErrorResponse {
+        code: "network-covers-link".into(),
+        message: String::new(),
+        args,
+    })
+    .expect("serialise");
+    assert_eq!(refused["error-args"], response["args"]);
+
+    let plain = serde_json::to_value(StatusUpdateEvent::MutationProgress {
+        correlation_id: "corr-2".into(),
+        mutation_kind: "rules-update".into(),
+        phase: "failed".into(),
+        error_code: Some("invalid-rule-value".into()),
+        error_args: Default::default(),
+        sid: None,
+    })
+    .expect("serialise");
+    assert!(plain.get("error-args").is_none(), "{plain}");
+
+    let old: StatusUpdateEvent = serde_json::from_value(serde_json::json!({
+        "type": "mutation-progress",
+        "correlation-id": "corr-3",
+        "mutation-kind": "rules-update",
+        "phase": "failed",
+        "error-code": "invalid-rule-value",
+    }))
+    .expect("an event without error-args parses");
+    match old {
+        StatusUpdateEvent::MutationProgress { error_args, .. } => assert!(error_args.is_empty()),
+        other => panic!("expected MutationProgress, got {other:?}"),
+    }
 }
 
 /// The machine-wide policy is read by every user; who last wrote it is not
@@ -796,6 +861,13 @@ fn block_notice_mute_scope_dto_round_trips_every_variant() {
             Some("app"),
         ),
         (BlockNoticeMuteScopeDto::All, "all", None),
+        (
+            BlockNoticeMuteScopeDto::Notice {
+                notice: "external-address".into(),
+            },
+            "notice",
+            Some("notice"),
+        ),
     ] {
         let json = serde_json::to_value(&scope).expect("serialise");
         assert_eq!(json["kind"], expect_kind);

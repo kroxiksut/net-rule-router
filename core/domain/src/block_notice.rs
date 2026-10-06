@@ -15,9 +15,11 @@
 //!
 //! Muting lives here too, because "should this be shown" is policy, not
 //! mechanism: the same answer must hold for the tray, the notification centre
-//! and any future surface. Four scopes, deliberately no more — one host, one
-//! application, one reason, or block notices as a class — each either for a
-//! while or for good.
+//! and any future surface. Four scopes for blocks, deliberately no more — one
+//! host, one application, one reason, or block notices as a class — each either
+//! for a while or for good. A fifth scope silences another notice kind as a
+//! whole; it lives in the same list so the user lifts every silence in one
+//! place, and it never matches a block.
 //!
 //! Pure and I/O-free by construction: the caller supplies the clock, the caller
 //! persists the mutes. That keeps the storm-control rules testable without a
@@ -128,6 +130,61 @@ pub enum MuteScope {
     Reason(BlockReason),
     /// Block notices as a whole.
     All,
+    /// A notice kind other than a block, as a whole.
+    Notice(NoticeKind),
+}
+
+/// Notices other than blocks that a user may silence. Notices about a fault
+/// that keeps the rules from working are deliberately absent: the user has to
+/// fix those, not stop hearing about them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NoticeKind {
+    /// The summary of blocks raised while no surface was running.
+    BlockBacklog,
+    /// The additional route came up, with its external address.
+    ExternalAddress,
+    /// Routing works again after an outage.
+    RoutingRestored,
+    /// A tunnel is up and nothing is bound to the additional route.
+    UnassignedTunnel,
+    /// A local network awaits a decision about the kill switch.
+    LocalNetworks,
+    /// The rules files differ from what is applied.
+    RulesDrift,
+    /// The additional connection is down; routine for a VPN switched off.
+    SecondaryDown,
+}
+
+impl NoticeKind {
+    /// Stable slug for the wire, storage and locale keys.
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::BlockBacklog => "block-notice-backlog",
+            Self::ExternalAddress => "external-address",
+            Self::RoutingRestored => "enforcement-restored",
+            Self::UnassignedTunnel => "unassigned-tunnel",
+            Self::LocalNetworks => "local-networks",
+            Self::RulesDrift => "rules-drift",
+            Self::SecondaryDown => "secondary-down",
+        }
+    }
+
+    /// Inverse of [`Self::slug`]; `None` for anything else.
+    #[must_use]
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.slug() == slug)
+    }
+
+    pub const ALL: [Self; 7] = [
+        Self::BlockBacklog,
+        Self::ExternalAddress,
+        Self::RoutingRestored,
+        Self::UnassignedTunnel,
+        Self::LocalNetworks,
+        Self::RulesDrift,
+        Self::SecondaryDown,
+    ];
 }
 
 /// One mute: a scope plus how long it holds.
@@ -358,6 +415,7 @@ impl BlockNoticeLedger {
                 // process we could not name" would silence unrelated blocks.
                 MuteScope::App(a) => attempt.app.as_deref() == Some(a.as_str()),
                 MuteScope::Reason(r) => *r == attempt.reason,
+                MuteScope::Notice(_) => false,
             }
         })
     }
@@ -513,6 +571,28 @@ mod tests {
         all.set_mutes(vec![Mute::forever(MuteScope::All)]);
         assert!(all.record(0, &noisy).is_none());
         assert!(all.record(0, &other_host).is_none());
+    }
+
+    #[test]
+    fn a_notice_kind_mute_never_silences_a_block() {
+        let mut ledger = BlockNoticeLedger::default();
+        ledger.set_mutes(
+            NoticeKind::ALL
+                .into_iter()
+                .map(|kind| Mute::forever(MuteScope::Notice(kind)))
+                .collect(),
+        );
+        assert!(ledger
+            .record(0, &attempt("cdn.example", "chrome.exe"))
+            .is_some());
+    }
+
+    #[test]
+    fn every_notice_kind_slug_round_trips() {
+        for kind in NoticeKind::ALL {
+            assert_eq!(NoticeKind::from_slug(kind.slug()), Some(kind));
+        }
+        assert_eq!(NoticeKind::from_slug("no-primary-route"), None);
     }
 
     #[test]

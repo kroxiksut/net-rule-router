@@ -704,6 +704,21 @@ impl<'c> RouteBindingsRepository<'c> {
             .map_err(|e| StorageError::Internal(format!("anchor update binding: {e}")))
     }
 
+    /// Whether `sid` ever sent a `RoutePolicyUpdate` — a row in any of the
+    /// three tables. A user who turned protections on before binding an
+    /// adapter has a policy, just not a bound one.
+    pub fn has_policy_for_sid(&self, sid: &str) -> StorageResult<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM secondary_block_policy WHERE sid = ?1) \
+                 OR EXISTS(SELECT 1 FROM behavior_mode WHERE sid = ?1) \
+                 OR EXISTS(SELECT 1 FROM route_bindings WHERE sid = ?1)",
+                params![sid],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| StorageError::Internal(format!("has policy: {e}")))
+    }
+
     /// Read the current policy snapshot for `sid`. Returns
     /// `RoutePolicyRecord::empty(...)` if the SID has no rows in any of
     /// the three tables (i.e. the user has never sent a `RoutePolicyUpdate`).

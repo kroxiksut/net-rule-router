@@ -17,7 +17,7 @@ pub struct ConnTraceEntriesListHandler {
     /// VPN learners read the same observation stream and must keep running.
     gui_stream: Option<Arc<dyn ServiceStabilityConfigProvider>>,
     /// Optional inputs for the `expected_route` stamp: the active
-    /// user's rule book + the FQDN cache yield the set of IPv4s a secondary
+    /// user's rule book + the FQDN cache yield the addresses a secondary
     /// rule currently owns, so each trace row can carry where policy EXPECTS
     /// it to egress. All-or-nothing: absent deps simply leave the field empty.
     expectation: Option<ConnTraceExpectation>,
@@ -62,15 +62,15 @@ impl ConnTraceEntriesListHandler {
         self
     }
 
-    /// The secondary-owned IPv4 set for the active user, or `None` when the
-    /// expectation deps are absent / no user is routing-active. Built once per
-    /// page request (bounded by the owners fan-out cap), never per row.
-    fn secondary_owned_ips(&self) -> Option<std::collections::HashMap<std::net::Ipv4Addr, String>> {
+    /// What the active user's rules send over the secondary link, or `None`
+    /// when the expectation deps are absent / no user is routing-active. Built
+    /// once per page request (bounded by the owners fan-out cap), never per row.
+    fn secondary_owners(&self) -> Option<SecondaryAddressOwners> {
         let (rules, fqdn, active_sid) = self.expectation.as_ref()?;
         let sid = active_sid()?;
         let snapshot = rules.active_rules_for(&sid)?;
-        Some(build_secondary_ip_owners(
-            &snapshot.rule_book.secondary,
+        Some(SecondaryAddressOwners::build(
+            &snapshot.rule_book,
             fqdn.as_ref(),
         ))
     }
@@ -152,71 +152,75 @@ impl IpcHandler for ConnTraceEntriesListHandler {
             format!("{ip}:{}", sa.port())
         };
 
-        // The secondary-owned IPv4 set, built ONCE per page. A row
-        // whose remote is in this set is EXPECTED to egress the secondary link;
-        // the GUI flags expected=secondary + egress=primary permits as leaks.
-        let secondary_owned = self.secondary_owned_ips();
-        // The same map answers both questions: whether policy expects this
+        // Built ONCE per page. A row whose remote it owns is EXPECTED to
+        // egress the secondary link; the GUI flags expected=secondary +
+        // egress=primary permits as leaks.
+        let secondary_owners = self.secondary_owners();
+        // The same owners answer both questions: whether policy expects this
         // remote on the secondary link, and — for a flow the service itself
         // opened — whose traffic it is carrying.
-        let owner_of = |remote: &std::net::SocketAddr| -> Option<&String> {
-            match (remote.ip(), secondary_owned.as_ref()) {
-                (std::net::IpAddr::V4(v4), Some(owned)) => owned.get(&v4),
-                _ => None,
-            }
+        let owner_of = |remote: &std::net::SocketAddr| -> Option<String> {
+            secondary_owners
+                .as_ref()?
+                .owner_of(remote.ip())
+                .map(std::borrow::Cow::into_owned)
         };
-        let expected_route = |remote: &std::net::SocketAddr| -> String {
-            match owner_of(remote) {
-                Some(_) => "secondary".to_string(),
-                // An IPv6 remote is not "no rule covers it" — no rule CAN, the
-                // family is not routed in this edition. Say which of the two it
-                // is instead of letting the row read as an uncovered host.
-                None if remote.is_ipv6() => "ipv6".to_string(),
-                None => String::new(),
+        let expected_route = |remote: &std::net::SocketAddr, owned: bool| -> String {
+            if owned {
+                "secondary".to_string()
+            } else if remote.is_ipv6() {
+                // Host and literal owners are IPv4-only, so an IPv6 remote no
+                // network claims says so instead of reading as uncovered.
+                "ipv6".to_string()
+            } else {
+                String::new()
             }
         };
 
         let items: Vec<ConnTraceEntryDto> = rows
             .into_iter()
             .take(limit as usize)
-            .map(|r| ConnTraceEntryDto {
-                relay_for: match owner_of(&r.remote) {
-                    Some(host) if is_own_service(&exe_name(r.process_path.as_deref())) => {
-                        host.clone()
-                    }
-                    _ => String::new(),
-                },
-                process: exe_name(r.process_path.as_deref()),
-                process_path: r.process_path.clone().unwrap_or_default(),
-                proto: proto_str(r.protocol).to_string(),
-                local: fmt_addr(&r.local),
-                remote: fmt_addr(&r.remote),
-                egress_role: role_str(r.egress.role).to_string(),
-                egress_ifindex: r.egress.ifindex,
-                verdict: verdict_str(r.verdict).to_string(),
-                blocked_by: match r.blocked_by_nrr {
-                    Some(true) => "netrulerouter".to_string(),
-                    Some(false) => "other".to_string(),
-                    None => String::new(),
-                },
-                block_reason: r.nrr_block_reason.unwrap_or_default().to_string(),
-                rule_host: owner_of(&r.remote).cloned().unwrap_or_default(),
-                expected_route: expected_route(&r.remote),
-                observed_at_ms: r.observed_unix_ms.map(|v| v as i64).unwrap_or(0),
-                remote_hosts: r
-                    .remote_names
-                    .as_ref()
-                    .map(|n| n.names.clone())
-                    .unwrap_or_default(),
-                remote_host_count: r.remote_names.as_ref().map_or(0, |n| n.total),
-                remote_host_floor: r
-                    .remote_names
-                    .as_ref()
-                    .and_then(|n| n.names.first())
-                    .and_then(|name| nrr_domain::companion_affinity::registrable_domain(name))
-                    .unwrap_or_default()
-                    .to_string(),
-                remote_fake_ip: r.remote_names.as_ref().is_some_and(|n| n.fake_ip),
+            .map(|r| {
+                let owner = owner_of(&r.remote);
+                ConnTraceEntryDto {
+                    relay_for: match owner.as_ref() {
+                        Some(host) if is_own_service(&exe_name(r.process_path.as_deref())) => {
+                            host.clone()
+                        }
+                        _ => String::new(),
+                    },
+                    process: exe_name(r.process_path.as_deref()),
+                    process_path: r.process_path.clone().unwrap_or_default(),
+                    proto: proto_str(r.protocol).to_string(),
+                    local: fmt_addr(&r.local),
+                    remote: fmt_addr(&r.remote),
+                    egress_role: role_str(r.egress.role).to_string(),
+                    egress_ifindex: r.egress.ifindex,
+                    verdict: verdict_str(r.verdict).to_string(),
+                    blocked_by: match r.blocked_by_nrr {
+                        Some(true) => "netrulerouter".to_string(),
+                        Some(false) => "other".to_string(),
+                        None => String::new(),
+                    },
+                    block_reason: r.nrr_block_reason.unwrap_or_default().to_string(),
+                    expected_route: expected_route(&r.remote, owner.is_some()),
+                    rule_host: owner.unwrap_or_default(),
+                    observed_at_ms: r.observed_unix_ms.map(|v| v as i64).unwrap_or(0),
+                    remote_hosts: r
+                        .remote_names
+                        .as_ref()
+                        .map(|n| n.names.clone())
+                        .unwrap_or_default(),
+                    remote_host_count: r.remote_names.as_ref().map_or(0, |n| n.total),
+                    remote_host_floor: r
+                        .remote_names
+                        .as_ref()
+                        .and_then(|n| n.names.first())
+                        .and_then(|name| nrr_domain::companion_affinity::registrable_domain(name))
+                        .unwrap_or_default()
+                        .to_string(),
+                    remote_fake_ip: r.remote_names.as_ref().is_some_and(|n| n.fake_ip),
+                }
             })
             .collect();
 

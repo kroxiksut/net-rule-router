@@ -238,6 +238,24 @@ fn empty_sid_load_returns_default_record() {
 }
 
 #[test]
+fn a_policy_without_bindings_is_still_a_policy() {
+    let (_dir, conn) = fresh_db();
+    let repo = RouteBindingsRepository::new(&conn);
+    assert!(!repo.has_policy_for_sid("S-1-5-21-A").expect("probe"));
+    let mut rec = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+    rec.kill_switch_enabled = true;
+    repo.update_for_sid("S-1-5-21-A", &rec, 1_700_000_000)
+        .expect("update");
+    assert!(repo.has_policy_for_sid("S-1-5-21-A").expect("probe"));
+    assert!(
+        repo.load_for_sid("S-1-5-21-A")
+            .expect("load")
+            .kill_switch_enabled
+    );
+    assert!(!repo.has_policy_for_sid("S-1-5-21-B").expect("probe"));
+}
+
+#[test]
 fn update_then_load_round_trips_full_record() {
     let (_dir, conn) = fresh_db();
     let repo = RouteBindingsRepository::new(&conn);

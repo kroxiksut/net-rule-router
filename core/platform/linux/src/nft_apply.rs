@@ -189,6 +189,8 @@ fn render_match(m: &NftMatch) -> Statement<'static> {
     match m {
         NftMatch::DstV4 { net, prefix } => address_match("ip", &net.to_string(), *prefix, 32),
         NftMatch::DstV6 { net, prefix } => address_match("ip6", &net.to_string(), *prefix, 128),
+        NftMatch::DstSetV4(blocks) => set_match("ip", blocks),
+        NftMatch::DstSetV6(blocks) => set_match("ip6", blocks),
         NftMatch::Protocol(proto) => Statement::Match(Match {
             left: Expression::Named(NamedExpression::Meta(Meta {
                 key: MetaKey::L4proto,
@@ -248,6 +250,37 @@ fn address_match(
     Statement::Match(Match {
         left,
         right,
+        op: Operator::EQ,
+    })
+}
+
+/// `daddr` in an anonymous set: one lookup in the kernel however many blocks.
+fn set_match(
+    protocol: &'static str,
+    blocks: &[nrr_shared::ip_block::IpBlock],
+) -> Statement<'static> {
+    let items = blocks
+        .iter()
+        .map(|block| {
+            let address = Expression::String(Cow::Owned(block.network().to_string()));
+            nftables::expr::SetItem::Element(if block.is_single_address() {
+                address
+            } else {
+                Expression::Named(NamedExpression::Prefix(nftables::expr::Prefix {
+                    addr: Box::new(address),
+                    len: u32::from(block.prefix_len()),
+                }))
+            })
+        })
+        .collect();
+    Statement::Match(Match {
+        left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+            PayloadField {
+                protocol: Cow::Borrowed(protocol),
+                field: Cow::Borrowed("daddr"),
+            },
+        ))),
+        right: Expression::Named(NamedExpression::Set(items)),
         op: Operator::EQ,
     })
 }
@@ -1452,9 +1485,98 @@ mod cli_tests {
         let _ = std::fs::remove_file(&log);
     }
 
-    /// Live: a rule `nft --check` passes and only the kernel refuses (a `fib`
-    /// lookup by input interface, which the output hook cannot do), swapped in
-    /// by a wrapper since our IR cannot say it. Needs root, nft and nf_tables.
+    /// Live: the folded forms — address sets of both families, hosts beside
+    /// networks, next to the user and interface conditions — are taken by this
+    /// kernel and this `nft` as they are, not just by the parser. Needs root,
+    /// nft and nf_tables.
+    #[test]
+    #[ignore = "needs root, nft and nf_tables; run with --ignored"]
+    fn live_address_sets_apply_on_this_kernel() {
+        use nrr_shared::ip_block::IpBlock;
+        let table: &'static str =
+            Box::leak(format!("nrr_live_sets_{}", std::process::id()).into_boxed_str());
+        struct Guard(&'static str);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = NftCliEnforcement::new().teardown(self.0);
+            }
+        }
+        let _guard = Guard(table);
+        let blocks = |texts: &[&str]| -> Vec<IpBlock> {
+            texts
+                .iter()
+                .map(|t| IpBlock::parse(t).expect("block"))
+                .collect()
+        };
+        let set = NftRuleset {
+            family: crate::nft_ir::NftFamily::Inet,
+            table: table.to_owned(),
+            chain: "output".into(),
+            rules: vec![
+                NftRule {
+                    matches: vec![
+                        NftMatch::SkUid(65534),
+                        NftMatch::DstSetV4(blocks(&["192.0.2.1/32", "198.51.100.0/24"])),
+                        NftMatch::OutInterface("lo".into()),
+                    ],
+                    verdict: crate::nft_ir::NftVerdict::Accept,
+                    comment: "sets-via".into(),
+                },
+                NftRule {
+                    matches: vec![
+                        NftMatch::SkUid(65534),
+                        NftMatch::DstSetV4(blocks(&["192.0.2.1/32", "198.51.100.0/24"])),
+                    ],
+                    verdict: crate::nft_ir::NftVerdict::Drop,
+                    comment: "sets-guard".into(),
+                },
+                NftRule {
+                    matches: vec![
+                        NftMatch::SkUid(65534),
+                        NftMatch::DstSetV6(blocks(&["2001:db8::1/128", "2001:db8:1::/48"])),
+                        NftMatch::Protocol(6),
+                        NftMatch::DstPort(443),
+                    ],
+                    verdict: crate::nft_ir::NftVerdict::Drop,
+                    comment: "sets-v6".into(),
+                },
+            ],
+        };
+        let outcome = NftCliEnforcement::new()
+            .apply_best_effort(&set)
+            .expect("the folded rules must apply");
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        let out = std::process::Command::new("nft")
+            .args(["list", "table", "inet", table])
+            .output()
+            .expect("nft must be runnable");
+        let listed = String::from_utf8_lossy(&out.stdout);
+        for want in [
+            "192.0.2.1",
+            "198.51.100.0/24",
+            "2001:db8::1",
+            "2001:db8:1::/48",
+        ] {
+            assert!(
+                listed.contains(want),
+                "{want} missing from:
+{listed}"
+            );
+        }
+        for comment in ["sets-via", "sets-guard", "sets-v6"] {
+            assert!(
+                listed.contains(comment),
+                "{comment} missing from:
+{listed}"
+            );
+        }
+    }
+
+    /// Live: a rule the kernel refuses (a `fib` lookup by input interface,
+    /// which the output hook cannot do), swapped in by a wrapper since our IR
+    /// cannot say it. A current `nft --check` passes it and an older one (0.9.x)
+    /// already refuses it; the apply never asks `--check`, so either way it must
+    /// name that rule and keep the rest. Needs root, nft and nf_tables.
     #[test]
     #[ignore = "needs root, nft and nf_tables; run with --ignored"]
     fn live_a_kernel_only_refusal_is_attributed_through_the_probe_table() {
@@ -1484,9 +1606,6 @@ mod cli_tests {
             chain: "output".into(),
             rules: vec![host(1, "kept-1"), host(99, "refused"), host(3, "kept-3")],
         };
-        // Positive control: the refusal is one `--check` cannot see.
-        assert_eq!(cli.run_batch(&render_batch(&set), &["--check"]), Ok(()));
-
         let outcome = cli
             .apply_best_effort(&set)
             .expect("the other rules must apply");

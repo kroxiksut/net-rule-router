@@ -30,15 +30,17 @@ const SCOPE_HOST: &str = "host";
 const SCOPE_APP: &str = "app";
 const SCOPE_REASON: &str = "reason";
 const SCOPE_ALL: &str = "all";
+const SCOPE_NOTICE: &str = "notice";
 
 fn encode_scope(scope: &MuteScope) -> (&'static str, &str) {
     match scope {
         MuteScope::Host(host) => (SCOPE_HOST, host.as_str()),
         MuteScope::App(app) => (SCOPE_APP, app.as_str()),
-        // The reason's own slug is the value — the scope column is text, so a
-        // new scope kind costs no migration.
+        // The slug is the value: a new reason or notice kind costs no migration,
+        // a new scope kind widens the CHECK on `scope_kind`.
         MuteScope::Reason(reason) => (SCOPE_REASON, reason.slug()),
         MuteScope::All => (SCOPE_ALL, ""),
+        MuteScope::Notice(kind) => (SCOPE_NOTICE, kind.slug()),
     }
 }
 
@@ -52,6 +54,11 @@ fn decode_scope(kind: &str, value: String) -> StorageResult<MuteScope> {
                 StorageError::Internal(format!("block_notice_mutes: unknown reason {value:?}"))
             }),
         SCOPE_ALL => Ok(MuteScope::All),
+        SCOPE_NOTICE => nrr_domain::block_notice::NoticeKind::from_slug(&value)
+            .map(MuteScope::Notice)
+            .ok_or_else(|| {
+                StorageError::Internal(format!("block_notice_mutes: unknown notice {value:?}"))
+            }),
         other => Err(StorageError::Internal(format!(
             "block_notice_mutes: unknown scope_kind {other:?}"
         ))),
@@ -262,6 +269,23 @@ mod tests {
         assert!(mutes.contains(&Mute::forever(MuteScope::Reason(
             nrr_domain::block_notice::BlockReason::RouteUnavailable
         ))));
+    }
+
+    #[test]
+    fn a_notice_kind_mute_round_trips_beside_the_block_scopes() {
+        use nrr_domain::block_notice::NoticeKind;
+        let conn = migrated_conn();
+        let repo = BlockNoticeMutesRepository::new(&conn);
+        repo.upsert("S-A", &Mute::forever(MuteScope::All), 1)
+            .expect("all");
+        let notice = Mute::until(MuteScope::Notice(NoticeKind::BlockBacklog), 5_000);
+        repo.upsert("S-A", &notice, 2).expect("notice");
+        let mutes = repo.list_active("S-A", 100).expect("list");
+        assert_eq!(mutes.len(), 2);
+        assert!(mutes.contains(&notice));
+        assert!(repo
+            .remove("S-A", &MuteScope::Notice(NoticeKind::BlockBacklog))
+            .expect("remove"));
     }
 
     #[test]

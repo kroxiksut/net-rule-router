@@ -34,8 +34,8 @@ use nrr_domain::user_principal::UserPrincipal;
 use nrr_domain::RouteBehaviorMode;
 use nrr_platform_api::app_path_resolver::AppPathResolver;
 use nrr_platform_api::enforcement::{
-    ChannelAvailability, DstMatch, EgressBinding, EgressBindingSource, EnforcementPlan, FlowRule,
-    PrecedenceClass, UserPrincipal as PlanPrincipal, Verdict,
+    AppScope, ChannelAvailability, DstMatch, EgressBinding, EgressBindingSource, EgressConstraint,
+    EgressRef, EnforcementPlan, FlowRule, PrecedenceClass, UserPrincipal as PlanPrincipal, Verdict,
 };
 use nrr_shared::RouteRole;
 
@@ -43,7 +43,7 @@ use crate::catch_all_exemptions::{collect_exemptions, CatchAllExemptions};
 use crate::enforcement_planner::{
     never_blocked_networks, plan_catch_all_kill_switch, plan_doh_dot_block,
     plan_fail_closed_block_all, plan_fail_closed_destinations, plan_fail_closed_networks,
-    NetworkHoldLog, NetworkHolds,
+    plan_kill_switch_networks, NetworkHoldLog, NetworkHolds,
 };
 use crate::killswitch_codegen::KillSwitchProtocols;
 use crate::machine_reading::MachineReading;
@@ -354,21 +354,25 @@ impl ProductionPrincipalPlanSource {
         let unroutable_v6 = self.unroutable_v6_blocks(stored, &policy, ipv6, &flows, &ownership);
         flows.extend(unroutable_v6);
 
-        // The leak-guard, armed only while the link it guards against is gone.
-        // While the secondary is up, every secondary rule is already a pinned
-        // pair — permit over that link, block the same destination anywhere
-        // else — so the guard would be adding rules that change nothing.
-        let fail_closed = if availability.secondary || block_all_armed {
+        // The leak-guard: the pin while the link is up, the block once it is
+        // gone. A blanket block already states both.
+        let (guard, fail_closed_blocks) = if block_all_armed {
             self.network_hold_log.forget(stored);
-            Vec::new()
+            (Vec::new(), 0)
+        } else if availability.secondary {
+            (
+                self.pin_to_tunnel(stored, &policy, &mut flows, &ownership),
+                0,
+            )
         } else {
-            self.fail_closed_flows(stored, &policy, &flows, &ownership)
+            let fail_closed = self.fail_closed_flows(stored, &policy, &flows, &ownership);
+            let blocks = fail_closed
+                .iter()
+                .filter(|flow| flow.verdict == Verdict::Block)
+                .count();
+            (fail_closed, blocks)
         };
-        let fail_closed_blocks = fail_closed
-            .iter()
-            .filter(|flow| flow.verdict == Verdict::Block)
-            .count();
-        flows.extend(fail_closed);
+        flows.extend(guard);
 
         // Browser DoH hides the names wildcard rules learn from, so blocking it
         // sends the browser back to plaintext DNS. Same gate as the codegen.
@@ -763,6 +767,56 @@ impl ProductionPrincipalPlanSource {
             &protected,
             KillSwitchProtocols::from_bits(policy.kill_switch_protocols),
         )
+    }
+
+    /// The pin over the secondary rules while their link is up.
+    ///
+    /// A route steers only until another route is laid over it — a VPN client
+    /// reconnecting, a second tunnel — and the traffic then leaves by the main
+    /// link with nothing in its way. So each address rule's own permit becomes
+    /// the pin: accepted out the tunnel, dropped anywhere else — the pair
+    /// Windows states as separate kill-switch filters. Reshaping the permit,
+    /// rather than adding a pair beside it, keeps the chain every packet walks
+    /// one rule longer per address instead of two. Networks get the separate
+    /// pins, which leave their cut-outs (the tunnel's server, the LAN) open.
+    fn pin_to_tunnel(
+        &self,
+        stored: &str,
+        policy: &PerSidPolicySnapshot,
+        flows: &mut [FlowRule],
+        ownership: &crate::address_ownership::AddressOwnership,
+    ) -> Vec<FlowRule> {
+        let protocols = KillSwitchProtocols::from_bits(policy.kill_switch_protocols);
+        if !policy.kill_switch_enabled || !(protocols.tcp || protocols.udp) {
+            self.network_hold_log.forget(stored);
+            return Vec::new();
+        }
+        let mut pinned = Vec::new();
+        for flow in flows.iter_mut() {
+            if flow.verdict != Verdict::Permit
+                || flow.precedence.class != PrecedenceClass::RouteRule(RouteRole::Secondary)
+                || flow.app != AppScope::Any
+                || flow.egress != EgressConstraint::Any
+            {
+                continue;
+            }
+            let ip = match flow.flow.dst {
+                DstMatch::HostV4(ip) => std::net::IpAddr::V4(ip),
+                DstMatch::HostV6(ip) => std::net::IpAddr::V6(ip),
+                _ => continue,
+            };
+            // The same addresses the guard blocks once the link is gone.
+            if nrr_platform_api::is_exempt_from_blocking(ip) || !ownership.may_block(ip) {
+                continue;
+            }
+            flow.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+            pinned.push(ip);
+        }
+        let holds = NetworkHolds::for_pass(ownership, &pinned, || {
+            never_blocked(&self.exemptions_for(policy))
+        });
+        self.network_hold_log.note(stored, &holds);
+        plan_kill_switch_networks(stored, &holds, protocols)
     }
 
     /// The per-destination and per-network blocks that arm while the secondary
@@ -1554,10 +1608,7 @@ mod tests {
         assert_eq!(read.secondary.as_deref(), Some("tun0"));
     }
 
-    /// While the tunnel is up the guard adds nothing: the secondary rule is
-    /// already a pinned pair — permit over that link, block the same destination
-    /// anywhere else. Duplicating it would grow the ruleset without changing a
-    /// single verdict.
+    /// While the tunnel is up the guard is the pin, not a block.
     #[test]
     fn a_live_secondary_needs_no_fail_closed_blocks() {
         let (plan, coverage) = plan(
@@ -2039,7 +2090,7 @@ mod tests {
         use super::*;
         use crate::address_ownership::{AddressOwnership, ZoneVsIpOrder};
         use nrr_domain::rule_shape::RuleShapeSupport;
-        use nrr_platform_api::enforcement::{AppScope, Coverage};
+        use nrr_platform_api::enforcement::{AppScope, Coverage, EgressConstraint, EgressRef};
         use nrr_shared::ip_block::IpBlock;
 
         const MAIN_HOST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 77);
@@ -2292,6 +2343,63 @@ mod tests {
             assert!(blocks(Ipv4Addr::new(198, 51, 100, 0), 24));
             assert!(!blocks(Ipv4Addr::new(172, 16, 0, 0), 12));
             assert!(with_coverage.fail_closed_blocks > without_coverage.fail_closed_blocks);
+        }
+
+        /// The highest-precedence connect flow over `ip`.
+        fn top(flows: &[FlowRule], ip: Ipv4Addr) -> Option<&FlowRule> {
+            let mut best: Option<&FlowRule> = None;
+            for flow in flows.iter().filter(|f| {
+                f.coverage == Coverage::ConnectOnly
+                    && matches!(f.app, AppScope::Any)
+                    && dst_block(f.flow.dst).is_some_and(|b| b.contains(IpAddr::V4(ip)))
+            }) {
+                if best.is_none_or(|b| flow.precedence.is_higher_priority_than(b.precedence)) {
+                    best = Some(flow);
+                }
+            }
+            best
+        }
+
+        const PINNED: EgressConstraint = EgressConstraint::OnlyVia(EgressRef::Secondary);
+
+        /// With the tunnel up a route alone gives way to any route laid over
+        /// it, so the secondary address leaves only through the tunnel.
+        #[test]
+        fn a_live_tunnel_pins_the_secondary_address_to_its_link() {
+            let (plan, coverage) = plan(Book(address_book()), Policy::armed(), true);
+            assert_eq!(coverage.fail_closed_blocks, 0);
+            let pinned = top(&plan.flows, SECONDARY_HOST).expect("the secondary rule plans");
+            assert_eq!(pinned.verdict, Verdict::Permit);
+            assert_eq!(pinned.egress, PINNED);
+            let main = top(&plan.flows, MAIN_HOST).expect("the primary rule plans");
+            assert_eq!(main.egress, EgressConstraint::Any);
+        }
+
+        #[test]
+        fn a_disarmed_guard_leaves_the_live_route_unpinned() {
+            let (plan, _) = plan(Book(address_book()), Policy::disarmed(), true);
+            let flow = top(&plan.flows, SECONDARY_HOST).expect("the secondary rule plans");
+            assert_eq!(flow.egress, EgressConstraint::Any);
+        }
+
+        /// The held `/24` is pinned, the main-link address inside it stays on
+        /// its own link, and the `/12` too wide to hold is left to its route.
+        #[test]
+        fn a_live_tunnel_pins_the_held_network_and_spares_what_it_must() {
+            let (plan, _) = plan(Book(network_book()), Policy::armed(), true);
+            assert!(plan.flows.iter().any(|f| f.egress == PINNED
+                && f.flow.dst
+                    == DstMatch::SubnetV4 {
+                        net: Ipv4Addr::new(198, 51, 100, 0),
+                        prefix: 24,
+                    }));
+            let inside = top(&plan.flows, Ipv4Addr::new(198, 51, 100, 9)).expect("held");
+            assert_eq!(inside.egress, PINNED);
+            let main = top(&plan.flows, MAIN_HOST).expect("main host");
+            assert_eq!(main.verdict, Verdict::Permit);
+            assert_eq!(main.egress, EgressConstraint::Any);
+            assert!(!plan.flows.iter().any(|f| f.egress == PINNED
+                && dst_block(f.flow.dst).is_some_and(|b| b.prefix_len() == 12)));
         }
     }
 

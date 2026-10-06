@@ -132,12 +132,15 @@ impl SecondaryRouteCoordinator {
         reading: Option<&MachineReading>,
     ) -> RouteResolution {
         let Some(policy) = self.route_source.load_for_sid(sid) else {
-            tracing::info!(
-                target: "nrr::route-coordinator",
-                msg_key = "route-no-policy-for-user",
-                sid = %sid,
-                "no route policy for this user — no secondary routes will be applied",
-            );
+            self.clear_no_secondary(sid);
+            if self.note_no_policy_once(sid) {
+                tracing::info!(
+                    target: "nrr::route-coordinator",
+                    msg_key = "route-no-policy-for-user",
+                    sid = %sid,
+                    "no route policy for this user — no secondary routes will be applied",
+                );
+            }
             // From outside this is indistinguishable from a working product: the
             // service runs, the tray is green, and nothing is routed — without
             // this push the user has no way to see it.
@@ -148,6 +151,7 @@ impl SecondaryRouteCoordinator {
                 secondary: None,
             };
         };
+        self.clear_no_policy(sid);
         let mode = route_behavior_mode(policy.mode);
         let live;
         let infos = match reading {
@@ -177,16 +181,19 @@ impl SecondaryRouteCoordinator {
         };
         let secondary = match policy.secondary.as_ref() {
             Some(b) => {
+                self.clear_no_secondary(sid);
                 let raw = self.resolve_binding_target(sid, b, infos, "secondary", reading);
                 self.gate_secondary_on_liveness(sid, raw)
             }
             None => {
-                tracing::warn!(
-                    target: "nrr::route-coordinator",
-                    msg_key = "route-no-secondary-bound",
-                    sid = %sid,
-                    "NO SECONDARY ADAPTER BOUND — assign primary+secondary in 'Interfaces & routes' and apply (needs elevation). Without a secondary target nothing is routed out the secondary NIC.",
-                );
+                if self.note_no_secondary_once(sid) {
+                    tracing::warn!(
+                        target: "nrr::route-coordinator",
+                        msg_key = "route-no-secondary-bound",
+                        sid = %sid,
+                        "NO SECONDARY ADAPTER BOUND — assign primary+secondary in 'Interfaces & routes' and apply (needs elevation). Without a secondary target nothing is routed out the secondary NIC.",
+                    );
+                }
                 self.offer_unassigned_tunnel(sid, infos);
                 None
             }

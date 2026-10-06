@@ -63,7 +63,22 @@ impl RuleNetworkIndex {
     /// network inside it, or the same network on both links, keeps it main.
     #[must_use]
     pub fn additional_owns(&self, ip: Ipv4Addr) -> bool {
-        self.claims.winner(IpAddr::V4(ip)) == Some(Link::Additional)
+        self.additional_network_of(IpAddr::V4(ip)).is_some()
+    }
+
+    /// The narrowest network holding `ip`, when the additional link wins it.
+    #[must_use]
+    pub fn additional_network_of(&self, ip: IpAddr) -> Option<IpBlock> {
+        match self.claims.narrowest(ip)? {
+            (net, Link::Additional) => Some(net),
+            (_, Link::Main) => None,
+        }
+    }
+
+    /// The link whose network holds `ip` most narrowly.
+    #[must_use]
+    pub fn winner(&self, ip: IpAddr) -> Option<Link> {
+        self.claims.winner(ip)
     }
 }
 

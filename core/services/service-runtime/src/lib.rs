@@ -161,6 +161,7 @@ pub mod routing_pause;
 pub mod rule_conflicts;
 pub mod rule_hostname_seeder;
 pub mod runtime_loop;
+pub mod secondary_address_owners;
 pub mod secondary_external_address;
 pub mod secondary_ip_policy;
 pub mod secondary_liveness;

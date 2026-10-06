@@ -12,6 +12,8 @@
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use nrr_shared::ip_block::IpBlock;
+
 /// Address family of a table. `Inet` sees both IPv4 and IPv6 in one table,
 /// which is what the neutral plan wants: rules are written per destination
 /// family, not per table.
@@ -54,6 +56,11 @@ pub enum NftMatch {
     DstV4 { net: Ipv4Addr, prefix: u8 },
     /// `ip6 daddr <addr>/<prefix>` — a v6 destination host or subnet.
     DstV6 { net: Ipv6Addr, prefix: u8 },
+    /// `ip daddr { a, b/p, … }` — several v4 destinations answered by one set
+    /// lookup instead of one rule each. Disjoint, sorted blocks.
+    DstSetV4(Vec<IpBlock>),
+    /// `ip6 daddr { … }`, the v6 twin.
+    DstSetV6(Vec<IpBlock>),
     /// `meta l4proto <proto>` — by IANA protocol number, so protocols without a
     /// keyword still express.
     Protocol(u8),
@@ -140,6 +147,8 @@ fn render_match(m: &NftMatch) -> String {
                 format!("ip6 daddr {net}/{prefix}")
             }
         }
+        NftMatch::DstSetV4(blocks) => format!("ip daddr {{ {} }}", set_items(blocks)),
+        NftMatch::DstSetV6(blocks) => format!("ip6 daddr {{ {} }}", set_items(blocks)),
         NftMatch::Protocol(proto) => format!("meta l4proto {proto}"),
         NftMatch::DstPort(port) => format!("th dport {port}"),
         NftMatch::OutInterface(dev) => format!("oifname \"{dev}\""),
@@ -147,9 +156,35 @@ fn render_match(m: &NftMatch) -> String {
     }
 }
 
+fn set_items(blocks: &[IpBlock]) -> String {
+    blocks
+        .iter()
+        .map(|b| {
+            if b.is_single_address() {
+                b.network().to_string()
+            } else {
+                b.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_set_renders_hosts_bare_and_networks_with_their_prefix() {
+        let blocks = vec![
+            IpBlock::parse("10.0.0.0/8").expect("net"),
+            IpBlock::parse("192.0.2.4/32").expect("host"),
+        ];
+        assert_eq!(
+            render_match(&NftMatch::DstSetV4(blocks)),
+            "ip daddr { 10.0.0.0/8, 192.0.2.4 }"
+        );
+    }
 
     #[test]
     fn a_host_match_renders_without_a_redundant_prefix() {

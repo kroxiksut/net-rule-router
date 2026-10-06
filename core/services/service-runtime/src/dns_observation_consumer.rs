@@ -16,7 +16,7 @@
 //! avoids caching every site the user visits).
 
 use crate::bounded_set::BoundedRecentSet;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -176,29 +176,46 @@ mod wiring;
 /// Mirrors how [`crate::route_codegen::generate_secondary_routes`] fans rules
 /// out to `/32`s, but yields the source name so a collateral hit can be
 /// attributed to a specific rule. Reads the same FQDN cache the codegen does.
-/// `pub(crate)`: the conn-trace handler reuses this map to stamp
-/// `expected_route` on trace rows (decision-vs-actual-egress mismatch flag).
 ///
 /// Networks are left out: a host inside a subnet or range a rule names is what
 /// that rule asked for, never a co-tenant caught by accident, and counting it
 /// in the shared-address census would spare it from the rule's own resets.
+/// Readers that ask where policy sends an address use
+/// [`crate::secondary_address_owners::SecondaryAddressOwners`], which adds them.
 pub(crate) fn build_secondary_ip_owners(
     secondary: &CanonicalRuleSet,
     fqdn: &dyn FqdnCacheLookup,
 ) -> HashMap<Ipv4Addr, String> {
+    secondary_ip_claims(secondary, fqdn).owners
+}
+
+/// [`build_secondary_ip_owners`], plus which of its addresses some rule names
+/// more closely than a zone: a main-link network outranks only the others.
+pub(crate) struct SecondaryIpClaims {
+    pub(crate) owners: HashMap<Ipv4Addr, String>,
+    pub(crate) closer_than_zone: HashSet<Ipv4Addr>,
+}
+
+pub(crate) fn secondary_ip_claims(
+    secondary: &CanonicalRuleSet,
+    fqdn: &dyn FqdnCacheLookup,
+) -> SecondaryIpClaims {
     /// Cap suffix/zone fan-out to match the codegen's bound.
     const SUFFIX_FANOUT_LIMIT: usize = 1024;
     let mut owners: HashMap<Ipv4Addr, String> = HashMap::new();
+    let mut closer: HashSet<Ipv4Addr> = HashSet::new();
     for rule in secondary.rules().iter().filter(|r| r.enabled) {
         match &rule.address_match {
             Some(CanonicalAddressMatch::ExactIp(std::net::IpAddr::V4(ip))) => {
                 owners.entry(*ip).or_insert_with(|| ip.to_string());
+                closer.insert(*ip);
             }
             // An IPv4-keyed map, like the fan-out beside it.
             Some(CanonicalAddressMatch::ExactIp(std::net::IpAddr::V6(_))) => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 for ip in fqdn.ips_for_hostname(host).into_iter().filter_map(v4_only) {
                     owners.entry(ip).or_insert_with(|| host.clone());
+                    closer.insert(ip);
                 }
             }
             // The apex belongs to a `*.suffix` rule but not to a zone — mirror
@@ -209,6 +226,7 @@ pub(crate) fn build_secondary_ip_owners(
                     &fqdn.hostnames_for_suffix_domain(suffix, SUFFIX_FANOUT_LIMIT),
                     fqdn,
                     &mut owners,
+                    Some(&mut closer),
                 );
             }
             Some(CanonicalAddressMatch::Zone(zone)) => {
@@ -216,12 +234,16 @@ pub(crate) fn build_secondary_ip_owners(
                     &fqdn.hostnames_under_suffix(zone, SUFFIX_FANOUT_LIMIT),
                     fqdn,
                     &mut owners,
+                    None,
                 );
             }
             Some(CanonicalAddressMatch::Subnet(_) | CanonicalAddressMatch::IpRange(_)) | None => {}
         }
     }
-    owners
+    SecondaryIpClaims {
+        owners,
+        closer_than_zone: closer,
+    }
 }
 
 /// Attribute every cached IP of `hosts` to the first host that claims it.
@@ -229,10 +251,14 @@ fn claim_hosts(
     hosts: &[String],
     fqdn: &dyn FqdnCacheLookup,
     owners: &mut HashMap<Ipv4Addr, String>,
+    mut closer: Option<&mut HashSet<Ipv4Addr>>,
 ) {
     for host in hosts {
         for ip in fqdn.ips_for_hostname(host).into_iter().filter_map(v4_only) {
             owners.entry(ip).or_insert_with(|| host.clone());
+            if let Some(closer) = closer.as_deref_mut() {
+                closer.insert(ip);
+            }
         }
     }
 }

@@ -66,7 +66,8 @@ impl ProductionMutationExecutor {
     /// `correlation_id` and `event_bus` are present. Silent no-op
     /// otherwise (older clients / no GUI subscribers attached). The
     /// `phase` slug is one of `"started"` / `"completed"` /
-    /// `"failed"`; `error_code` is required only on `"failed"`.
+    /// `"failed"`; `error` is given only on `"failed"`, with its args so the
+    /// toast can name what was refused.
     // `pub(super)` because the impl is split across files and the caller
     // is now another module.
     pub(super) fn emit_progress(
@@ -74,7 +75,7 @@ impl ProductionMutationExecutor {
         stored: &StoredMutation,
         principal: &str,
         phase: &str,
-        error_code: Option<String>,
+        error: Option<&OperationError>,
     ) {
         let (Some(bus), Some(correlation_id)) =
             (self.event_bus.as_ref(), stored.correlation_id.as_ref())
@@ -85,7 +86,8 @@ impl ProductionMutationExecutor {
             correlation_id: correlation_id.clone(),
             mutation_kind: mutation_kind_slug(stored.kind).to_string(),
             phase: phase.to_string(),
-            error_code,
+            error_code: error.map(|e| e.code.clone()),
+            error_args: error.map(|e| e.args.clone()).unwrap_or_default(),
             sid: progress_addressee(stored.kind, principal),
         });
     }

@@ -196,8 +196,9 @@ fn without_networks_the_hold_is_free_and_adds_nothing() {
 
 /// End to end through an install: network rules add their own filters on top
 /// of everything the address book installs, in both postures; with the
-/// additional link unresolved Fail-Closed holds the `/24` and neither the
-/// too-wide `/12` nor the machine's own LAN.
+/// additional link resolved the kill switch pins the held `/24` to it, and with
+/// it unresolved Fail-Closed holds the `/24` and neither the too-wide `/12` nor
+/// the machine's own LAN.
 #[test]
 fn network_rules_install_on_top_of_the_address_book() {
     use nrr_platform_api::types::{WfpAction, WfpFilterRecord};
@@ -277,7 +278,49 @@ fn network_rules_install_on_top_of_the_address_book() {
         );
     }
 
+    // With the tunnel resolved the held network gets its own leak-proof pair,
+    // told apart from the rule's filter over the same /24 by id.
+    let held = "198.51.100.0/24";
+    let ks_net_id = |kind: &str, luid_seg: &str| {
+        crate::wfp_codegen::filter_id_for(
+            SID,
+            crate::killswitch_codegen::KILLSWITCH_ROLE,
+            luid_seg,
+            kind,
+            held,
+        )
+    };
+    let permit_id = ks_net_id(
+        "ks-net-permit",
+        &crate::killswitch_codegen::permit_luid_seg(KS_LUID),
+    );
+    let block_id = ks_net_id("ks-net-block", "");
+    let up = installed(network_book(), Some(full_ks_resolution()));
+    let ale_over_held = |f: &WfpFilterRecord| {
+        f.layer == WfpLayerKey::AleAuthConnectV4
+            && f.remote_subnet == Some(net(held))
+            && f.user_sid.as_deref() == Some(SID)
+    };
+    assert!(
+        up.iter().any(|f| f.id == permit_id
+            && ale_over_held(f)
+            && f.action == WfpAction::Permit
+            && f.local_interface_luid == Some(KS_LUID)),
+        "the held network is permitted through the tunnel"
+    );
+    assert!(
+        up.iter().any(|f| f.id == block_id
+            && ale_over_held(f)
+            && f.action == WfpAction::Block
+            && f.local_interface_luid.is_none()),
+        "and blocked on every other link"
+    );
+
     let down = installed(network_book(), None);
+    assert!(
+        !down.iter().any(|f| f.id == permit_id || f.id == block_id),
+        "the tunnel pair belongs to the resolved posture only"
+    );
     let blocked = |text: &str| {
         down.iter()
             .any(|f| f.action == WfpAction::Block && f.remote_subnet == Some(net(text)))

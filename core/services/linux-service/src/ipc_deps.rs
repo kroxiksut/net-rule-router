@@ -494,7 +494,17 @@ pub(crate) fn build_ipc_surface(
         )))
             as Arc<
                 dyn nrr_service_runtime::ipc_handlers::doh_resolvers::DohResolverListStore,
-            >);
+            >)
+        // Notice mutes ("don't show") are personal settings, not block
+        // observation: the centre stays unfed until this OS raises block notices.
+        .with_block_notice_mutes(
+            Arc::new(
+                nrr_service_runtime::block_notice_mute_store::SqliteBlockNoticeMuteStore::new(
+                    Arc::clone(&stats_state_conn),
+                ),
+            ),
+            Arc::new(nrr_service_runtime::block_notice_center::BlockNoticeCenter::new()),
+        );
     // The stability fields this daemon applies live are the verbose window,
     // resumed here from the stored deadline, and the connection trace's log
     // window; the rest of the row is stored and not read.

@@ -29,6 +29,14 @@ and NetRuleRouter is the one place that knows how much of it the additional
 connection used. Set the limit and the day your billing period starts, and get
 a notice as usage approaches it. It only warns: routing does not change.
 
+**Rules for the whole machine.** One set of rules for every program on the
+computer, system services included, and for servers where nobody is signed in.
+Today the rules follow the person at the keyboard.
+
+**Routing for other devices on your network** (Linux). A computer running
+NetRuleRouter routes, by the same rules, the traffic of devices that cannot run
+it themselves: a phone, a TV, the clients of your own VPN server.
+
 ## Once real-world usage data is in
 
 **Suggestions for programs, not only for sites.** Today NetRuleRouter suggests

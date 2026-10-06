@@ -670,6 +670,10 @@ pub enum StatusUpdateEvent {
         /// `IpcErrorCode` slugs).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_code: Option<String>,
+        /// Placeholder values for the localized text of `error_code`, the same
+        /// map `OperationErrorResponse::args` carries; absent when none.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        error_args: std::collections::BTreeMap<String, String>,
         /// Whose rules the mutation changes. `None` for the admin baseline,
         /// which every un-diverged user runs, and for machine-wide kinds.
         #[serde(default, skip_serializing_if = "Option::is_none")]

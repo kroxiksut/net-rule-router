@@ -209,7 +209,7 @@ pub fn lower_scoped(plans: &[ScopedPlan<'_>]) -> LoweredPlan {
             });
         }
     }
-    let rules = prune_unreachable(rules);
+    let rules = crate::nft_merge::fold_into_sets(prune_unreachable(rules));
 
     LoweredPlan {
         ruleset: NftRuleset {
@@ -544,14 +544,9 @@ mod tests {
             .iter()
             .map(|r| r.comment.as_str())
             .collect();
-        assert_eq!(
-            comments,
-            vec![
-                "route-secondary#0",
-                "route-secondary#1",
-                "route-secondary#2"
-            ],
-        );
+        // The three fold into one set, which carries the comment of the rule
+        // that came first: the lowest ordinal.
+        assert_eq!(comments, vec!["route-secondary#0 +2"]);
     }
 
     /// A pin that only accepts on the right interface is advice, not a pin:

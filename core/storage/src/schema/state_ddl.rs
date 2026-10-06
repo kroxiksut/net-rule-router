@@ -1453,3 +1453,25 @@ pub const STATE_DB_V68_DDL: &[&str] = &[
     "ALTER TABLE service_stability_config ADD COLUMN conn_trace_ndjson_until_ms INTEGER \
      CHECK(conn_trace_ndjson_until_ms IS NULL OR conn_trace_ndjson_until_ms > 0)",
 ];
+
+/// Mute a whole notice kind ("don't show") — a fifth scope beside the block
+/// ones. Widening the CHECK means rebuilding the table; the rows are copied
+/// across, so nobody loses a mute. DEV schema; wiped freely.
+pub const STATE_DB_V69_DDL: &[&str] = &[
+    "CREATE TABLE block_notice_mutes_v69 (
+    sid         TEXT    NOT NULL,
+    scope_kind  TEXT    NOT NULL CHECK(scope_kind IN ('host', 'app', 'reason', 'all', 'notice')),
+    scope_value TEXT    NOT NULL DEFAULT '',
+    until_ms    INTEGER,
+    updated_at  INTEGER NOT NULL,
+    CHECK ((scope_kind = 'all' AND scope_value = '')
+        OR (scope_kind != 'all' AND scope_value != '')),
+    PRIMARY KEY (sid, scope_kind, scope_value)
+)",
+    "INSERT INTO block_notice_mutes_v69 (sid, scope_kind, scope_value, until_ms, updated_at)
+     SELECT sid, scope_kind, scope_value, until_ms, updated_at FROM block_notice_mutes",
+    "DROP TABLE block_notice_mutes",
+    "ALTER TABLE block_notice_mutes_v69 RENAME TO block_notice_mutes",
+    "CREATE INDEX IF NOT EXISTS idx_block_notice_mutes_sid
+     ON block_notice_mutes(sid, updated_at DESC)",
+];

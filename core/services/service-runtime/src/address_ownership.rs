@@ -850,7 +850,12 @@ impl NetworkClaims {
 
     /// The link whose network holds `ip` most narrowly.
     pub(crate) fn winner(&self, ip: IpAddr) -> Option<Link> {
-        self.longest(ip).map(|(_, claim)| claim.winner())
+        self.narrowest(ip).map(|(_, link)| link)
+    }
+
+    /// The narrowest network holding `ip`, with the link that wins it.
+    pub(crate) fn narrowest(&self, ip: IpAddr) -> Option<(IpBlock, Link)> {
+        self.longest(ip).map(|(net, claim)| (net, claim.winner()))
     }
 
     fn names(&self, ip: IpAddr, link: Link) -> bool {

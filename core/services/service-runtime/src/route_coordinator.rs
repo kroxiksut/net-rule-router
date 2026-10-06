@@ -255,6 +255,11 @@ pub struct SecondaryRouteCoordinator {
     /// exemptions and probe paths, so without the latch each of them re-warns.
     /// Cleared whenever the binding resolves to a target again.
     no_next_hop_logged: Mutex<std::collections::HashSet<String>>,
+    /// SIDs already logged as having no route policy in the current spell.
+    /// Until the first-run wizard writes one, every resolve finds none — at
+    /// reconcile cadence that was a line every second or two.
+    no_policy_logged: Mutex<std::collections::HashSet<String>>,
+    no_secondary_logged: Mutex<std::collections::HashSet<String>>,
     ///  — the ifindex most recently probed per SID by
     /// [`Self::probe_active_secondaries`]. When the binding stops resolving
     /// (adapter down mid-reconnect) the probe can no longer run, and the

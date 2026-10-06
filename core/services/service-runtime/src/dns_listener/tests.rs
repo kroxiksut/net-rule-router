@@ -1,4 +1,5 @@
 use super::*;
+use crate::secondary_address_owners::SecondaryAddressOwners;
 use nrr_platform_api::dns::AddressFamily;
 
 /// A name one server calls non-existent is not settled: the machine may
@@ -347,21 +348,62 @@ fn https_rr_is_forwarded_raw_for_rule_and_direct_hosts() {
 
 // ── direct-answer steering ────────────────────────────────────────
 
-struct OwnedSet(Arc<std::collections::HashSet<Ipv4Addr>>);
+struct OwnedSet(Arc<SecondaryAddressOwners>);
 impl crate::dns_resolver::SecondaryOwnedIps for OwnedSet {
-    fn secondary_owned_ips(&self) -> Arc<std::collections::HashSet<Ipv4Addr>> {
+    fn secondary_owned_ips(&self) -> Arc<SecondaryAddressOwners> {
         Arc::clone(&self.0)
     }
 }
 
 fn steering_listener(owned: &[Ipv4Addr]) -> DnsInterceptListener {
+    steering_listener_over(SecondaryAddressOwners::from_named(owned.iter().copied()))
+}
+
+fn steering_listener_over(owners: SecondaryAddressOwners) -> DnsInterceptListener {
     listener(
         &["assistant.example"],
         Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
-    .with_direct_answer_steering(Arc::new(OwnedSet(Arc::new(
-        owned.iter().copied().collect(),
-    ))))
+    .with_direct_answer_steering(Arc::new(OwnedSet(Arc::new(owners))))
+}
+
+/// Steering over a secondary network, with an exact main-link address inside
+/// it, against the shape support that routes networks.
+fn network_steering_listener() -> DnsInterceptListener {
+    use nrr_domain::canonical::{
+        CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
+    };
+    let rule = |id: &str, m: CanonicalAddressMatch| CanonicalRule {
+        id: nrr_domain::RuleId(id.into()),
+        enabled: true,
+        address_match: Some(m),
+        app_match: None,
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Route,
+        origin: None,
+    };
+    let book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![rule(
+            "p-ip",
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))),
+        )]),
+        secondary: CanonicalRuleSet::from_rules(vec![rule(
+            "s-net",
+            CanonicalAddressMatch::Subnet(
+                nrr_shared::ip_block::IpBlock::parse("198.51.100.0/24")
+                    .expect("test network literal"),
+            ),
+        )]),
+    };
+    let support = nrr_domain::rule_shape::RuleShapeSupport {
+        network_destination: true,
+        ..crate::wfp_codegen::current_rule_shape_support()
+    };
+    steering_listener_over(SecondaryAddressOwners::build_with_support(
+        &book,
+        &crate::fqdn_cache_lookup::MockFqdnCacheLookup::new(),
+        support,
+    ))
 }
 
 /// Build an upstream-style reply to `query(name, A)` carrying `ips`.
@@ -435,6 +477,45 @@ fn steering_reports_a_fully_pinned_reply() {
     assert_eq!(
         l.steer_direct_answer(&q, &question(&q), reply.clone(), QUERY_BUDGET),
         (reply, true)
+    );
+}
+
+/// An address a secondary network carries is steered away from a direct host
+/// like a pinned one; an exact main-link address inside that network is not.
+#[test]
+fn steering_drops_addresses_inside_a_secondary_network() {
+    let inside = Ipv4Addr::new(198, 51, 100, 7);
+    let main_named = Ipv4Addr::new(198, 51, 100, 9);
+    let outside = Ipv4Addr::new(192, 0, 2, 1);
+    let l = network_steering_listener();
+    let q = query("www.search.example", QTYPE_A);
+    let reply = reply_for("www.search.example", &[inside, main_named, outside]);
+    let (steered, still_pinned) = l.steer_direct_answer(&q, &question(&q), reply, QUERY_BUDGET);
+    assert!(!still_pinned);
+    match crate::dns_wire::parse_address_response(0x1234, "www.search.example", QTYPE_A, &steered) {
+        crate::dns_wire::AddressResponseOutcome::Answers { addresses, .. } => {
+            assert_eq!(addresses, vec![main_named, outside]);
+        }
+        other => panic!("expected Answers, got {other:?}"),
+    }
+}
+
+/// A host whose every address the network carries is what the rule asked
+/// for: relayed as-is, never offered to the collateral rescue.
+#[test]
+fn steering_leaves_an_answer_wholly_inside_a_secondary_network() {
+    let l = network_steering_listener();
+    let q = query("intranet.example", QTYPE_A);
+    let reply = reply_for(
+        "intranet.example",
+        &[
+            Ipv4Addr::new(198, 51, 100, 7),
+            Ipv4Addr::new(198, 51, 100, 8),
+        ],
+    );
+    assert_eq!(
+        l.steer_direct_answer(&q, &question(&q), reply.clone(), QUERY_BUDGET),
+        (reply, false)
     );
 }
 

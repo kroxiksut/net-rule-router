@@ -482,6 +482,8 @@ pub enum BlockNoticeMuteScopeDto {
     Reason { reason: String },
     /// Block notices as a whole.
     All,
+    /// Another notice kind as a whole, by `NoticeKind` slug.
+    Notice { notice: String },
 }
 
 /// One active mute, as listed or just written.

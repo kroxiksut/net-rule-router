@@ -64,6 +64,7 @@ use crate::ipc_handlers::providers::{
     AdaptersSnapshotProvider, RoutePolicyProvider, ServiceStabilityConfigProvider,
 };
 use crate::per_sid_orchestrator::RulesProvider;
+use crate::secondary_address_owners::SecondaryAddressOwners;
 
 /// Inputs for the conn-trace `expected_route` stamp: the active
 /// user's rule book + the FQDN cache + the routing-active-SID resolver.

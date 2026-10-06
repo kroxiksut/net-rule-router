@@ -42,6 +42,8 @@ Rectangle {
     property string phase: "running"
     /// Wire IpcErrorCode slug when `phase === "failed"`; else "".
     property string errorCode: ""
+    /// The refusal's wire `error-args` as JSON; "" when it names nothing.
+    property string errorArgsJson: ""
 
     /// Auto-dismiss timeout (ms) for completed entries. Hover pauses.
     property int autoDismissCompletedMs: 4000
@@ -198,6 +200,15 @@ Rectangle {
         }
     }
 
+    function _errorArgs() {
+        if (root.errorArgsJson === "") return null
+        try {
+            return JSON.parse(root.errorArgsJson)
+        } catch (e) {
+            return null
+        }
+    }
+
     function _titleText() {
         var slug = root.kind || "unknown"
         return _tr("toast.operation.title." + slug,
@@ -211,13 +222,11 @@ Rectangle {
         if (root.phase === "completed") {
             return _tr("toast.operation.phase.completed", "Completed")
         }
-        // failed — resolve the wire code to a
-        // localised `errors.<code>` label instead of dumping raw
-        // kebab into the body. The raw code stays available via
-        // ToolTip for diagnostics.
+        // failed — the localised refusal, naming what was refused when the
+        // service says; the raw code stays in the ToolTip for diagnostics.
         if (root.errorCode && root.ownerRoot
                 && typeof root.ownerRoot.ipcErrorLabel === "function") {
-            return root.ownerRoot.ipcErrorLabel(root.errorCode)
+            return root.ownerRoot.ipcErrorLabel(root.errorCode, root._errorArgs())
         }
         if (root.errorCode) {
             // Bridge not yet wired (e.g. running in Tray context) —

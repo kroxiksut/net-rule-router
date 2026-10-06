@@ -603,8 +603,8 @@ fn behavior_mode_to_per_sid(mode: BehaviorMode) -> PerSidBehaviorMode {
 
 // ── IPC-shaped route policy provider/writer ──────────────────────────────────
 
-/// Returns the caller's per-SID `RoutePolicyDto`. Empty rows produce
-/// `None` (the documented "drive migration first" signal).
+/// Returns the caller's per-SID `RoutePolicyDto`; `None` only for a SID that
+/// never stored a policy.
 pub struct ProductionRoutePolicyProvider {
     conn: Arc<Mutex<Connection>>,
 }
@@ -619,10 +619,13 @@ impl RoutePolicyProvider for ProductionRoutePolicyProvider {
     fn get_for_sid(&self, sid: &str) -> Option<RoutePolicyDto> {
         let conn = self.conn.lock().ok()?;
         let repo = RouteBindingsRepository::new(&conn);
-        let record = repo.load_for_sid(sid).ok()?;
-        if record.primary.is_none() && record.secondary.is_none() {
+        // A policy with no adapter bound yet is still the user's: hiding it made
+        // every client rebuild the next full write from defaults, so binding an
+        // adapter after choosing the protections switched them off again.
+        if !repo.has_policy_for_sid(sid).ok()? {
             return None;
         }
+        let record = repo.load_for_sid(sid).ok()?;
         // Best-effort — a provider-set read failure must not hide the policy.
         let providers = repo
             .load_link_provider_apps(sid, "secondary")
@@ -1484,6 +1487,38 @@ mod route_binding_dto_tests {
         let wire = serde_json::to_value(&dto).expect("serializes");
         assert_eq!(wire["stable-id"], "win-adapter:{a}");
         assert!(wire.get("known-stable-ids").is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod route_policy_provider_tests {
+    use super::*;
+    use nrr_storage::repository::MigrationRunner;
+    use nrr_storage::route_bindings::BindingSource;
+
+    /// First run sends the protections before any adapter is bound; the
+    /// binding write that follows is built on this read.
+    #[test]
+    fn protections_chosen_before_any_binding_are_read_back() {
+        let runner = nrr_storage::migration::SqliteMigrationRunner::for_state_db(
+            Connection::open_in_memory().expect("in-memory"),
+        );
+        runner.run_pending_migrations().expect("migrate");
+        let conn = runner.into_connection();
+        let mut policy = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        policy.kill_switch_enabled = true;
+        policy.doh_lockdown_enabled = true;
+        RouteBindingsRepository::new(&conn)
+            .update_for_sid("S-1-5-21-A", &policy, 0)
+            .expect("write policy");
+        let provider = ProductionRoutePolicyProvider::new(Arc::new(Mutex::new(conn)));
+
+        let dto = provider.get_for_sid("S-1-5-21-A").expect("a stored policy");
+        assert!(dto.primary.is_none() && dto.secondary.is_none());
+        assert!(dto.kill_switch_enabled);
+        assert!(dto.doh_lockdown_enabled);
+        assert!(provider.get_for_sid("S-1-5-21-B").is_none());
     }
 }
 

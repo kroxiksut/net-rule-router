@@ -236,7 +236,7 @@ pub fn invocable() -> Vec<(String, &'static VerbSpec)> {
 pub fn render_help(exe: &str) -> String {
     let mut out = String::with_capacity(1024);
     out.push_str(&format!(
-        "{exe} — {} service console\n\n",
+        "{exe} - {} service console\n\n",
         nrr_shared::product_identity::PRODUCT_NAME
     ));
     out.push_str(&format!("USAGE:\n    {exe} <VERB> [FLAGS]\n\nVERBS:\n"));
@@ -270,12 +270,12 @@ pub fn render_help(exe: &str) -> String {
 
     out.push_str(
         "\nThe console manages the service itself: install, run, inspect. \
-         Routing policy — rules, adapters, applying changes — is edited in the \
+         Routing policy - rules, adapters, applying changes - is edited in the \
          application, not here.\n",
     );
     out.push_str(
         "\nPre-release: verbs, flags and exit codes may still change. \
-         The text this console prints is never a stable interface — do not \
+         The text this console prints is never a stable interface - do not \
          parse it. See docs/en/cli.md.\n",
     );
     out
@@ -297,6 +297,18 @@ mod tests {
             specs.extend(verb.subverbs.iter());
         }
         specs
+    }
+
+    /// Console output is piped and captured in an OEM code page, where any
+    /// non-ASCII character turns into mojibake.
+    #[test]
+    fn help_is_plain_ascii() {
+        let help = render_help("nrr-cli");
+        assert!(
+            help.is_ascii(),
+            "non-ASCII in help: {:?}",
+            help.chars().find(|c| !c.is_ascii())
+        );
     }
 
     #[test]

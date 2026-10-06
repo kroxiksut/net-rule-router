@@ -298,7 +298,7 @@ fn network_state_line(report: &ServiceUninstallReport, exe: &str) -> Option<Stri
     match report.machine_state_cleared {
         Some(true) => Some("  network state:     restored".to_string()),
         Some(false) => Some(format!(
-            "  network state:     NOT fully restored — run `{exe} reset-network` elevated, or reboot"
+            "  network state:     NOT fully restored - run `{exe} reset-network` elevated, or reboot"
         )),
         None => None,
     }
@@ -319,10 +319,10 @@ fn unfinished_removal_install_hint(exe: &str) -> String {
 /// the machine's current unregistered state.
 fn install_failure_hint(removed_old_registration: bool) -> &'static str {
     if removed_old_registration {
-        "The old registration was removed but the new one failed — \
+        "The old registration was removed but the new one failed - \
          the service is NOT registered right now."
     } else {
-        "Registration failed — the service is NOT registered."
+        "Registration failed - the service is NOT registered."
     }
 }
 
@@ -371,7 +371,7 @@ fn print_status(report: &ServiceStatusReport) {
     // version that is REGISTERED and the version that is RUNNING can differ.
     println!("  version:           {}", env!("CARGO_PKG_VERSION"));
     if running_predates_binary(report) {
-        println!("  running build:     older than the installed binary — restart to run it");
+        println!("  running build:     older than the installed binary - restart to run it");
     }
     match report.start_mode {
         Some(mode) => println!("  starts:            {}", parse::start_mode_word(mode)),

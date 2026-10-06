@@ -832,6 +832,43 @@ fn steering_set_follows_the_enforcement_confirmation_window() {
     assert!(owned.owned_ips_at(Instant::now()).is_empty());
 }
 
+/// A network the additional link carries is steered like a pinned host
+/// address, except where a narrower main-link rule names the address.
+#[test]
+fn steering_set_covers_secondary_networks() {
+    use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
+    use std::time::Instant;
+    let subnet = |id: &str, net: &str| CanonicalRule {
+        id: RuleId(id.into()),
+        enabled: true,
+        address_match: Some(CanonicalAddressMatch::Subnet(
+            nrr_shared::ip_block::IpBlock::parse(net).expect("test network literal"),
+        )),
+        app_match: None,
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Route,
+        origin: None,
+    };
+    let rules = Arc::new(FakeRules {
+        primary: CanonicalRuleSet::from_rules(vec![subnet("p", "198.51.100.128/25")]),
+        secondary: CanonicalRuleSet::from_rules(vec![subnet("s", "198.51.100.0/24")]),
+    });
+    let owned = ActiveSecondaryOwnedIps::new(
+        rules,
+        Arc::new(|| Some("S-1-5-21-1".to_string())),
+        Arc::new(MockFqdnCacheLookup::new()),
+    );
+    let set = owned.owned_ips_at(Instant::now());
+    // Steering follows what enforcement carries.
+    let carried = crate::wfp_codegen::current_rule_shape_support().network_destination;
+    assert_eq!(set.contains(&ip(198, 51, 100, 7)), carried);
+    assert!(
+        !set.contains(&ip(198, 51, 100, 200)),
+        "the longer main prefix wins"
+    );
+    assert!(!set.contains(&ip(192, 0, 2, 1)));
+}
+
 // ── build_resolution_entry ────────────────────────────────────────────────
 
 #[test]

@@ -60,6 +60,7 @@ Item {
                 kind: model.kind
                 phase: model.phase
                 errorCode: model.errorCode
+                errorArgsJson: model.errorArgsJson
                 onDismissRequested: function(id) { toastModel.dismissById(id) }
             }
         }

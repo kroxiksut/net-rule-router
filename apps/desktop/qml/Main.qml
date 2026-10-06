@@ -2859,6 +2859,28 @@ ApplicationWindow {
             }
         })
     }
+    // The administrator-prompt line belongs to the prompt. A write whose
+    // success is silent never replaced it, so once the prompt is answered the
+    // line goes back to what it said before — unless the write that raised it
+    // has already reported its outcome there.
+    property string _consentPromptLine: ""
+    property string _statusBeforeConsent: ""
+    property string _statusDetailBeforeConsent: ""
+    function _showConsentPromptLine() {
+        if (_consentPromptLine === "" || statusLine !== _consentPromptLine) {
+            _statusBeforeConsent = statusLine
+            _statusDetailBeforeConsent = statusDetail
+        }
+        _consentPromptLine = tr("status.admin-consent-pending",
+            "Waiting for you to approve administrator rights…")
+        statusLine = _consentPromptLine
+    }
+    function _endConsentPromptLine() {
+        if (_consentPromptLine === "") return
+        var stale = statusLine === _consentPromptLine
+        _consentPromptLine = ""
+        if (stale) setStatus(_statusBeforeConsent, _statusDetailBeforeConsent)
+    }
     function refreshBackendStatus() {
         if (!bridgeAvailable
                 || typeof nrrNativeBridge === "undefined"
@@ -2894,16 +2916,15 @@ ApplicationWindow {
                     if (!ok || !payload || payload.elevated === undefined) {
                         // Unknown is not "still asking": deadlines run again.
                         rpcTransport.consentPending = false
+                        window._endConsentPromptLine()
                         return
                     }
                     window._brokerSessionElevated = payload.elevated === true
                     var awaiting = payload["awaiting-consent"] === true
                     if (awaiting !== rpcTransport.consentPending) {
                         rpcTransport.consentPending = awaiting
-                        if (awaiting) {
-                            window.statusLine = tr("status.admin-consent-pending",
-                                "Waiting for you to approve administrator rights…")
-                        }
+                        if (awaiting) window._showConsentPromptLine()
+                        else window._endConsentPromptLine()
                     }
                     if (payload["auto-revoked"] === true) {
                         window.logProgress(
@@ -3366,7 +3387,8 @@ ApplicationWindow {
                 if (mpPhase === "started") {
                     _pushOperationToast(mpCorr, mpKind)
                 } else if (mpPhase === "completed" || mpPhase === "failed") {
-                    operationToastStack.model.settle(mpCorr, mpPhase, mpErr)
+                    operationToastStack.model.settle(mpCorr, mpPhase, mpErr,
+                                                     event["error-args"] || null)
                 }
                 // Refused behind an alert this window may not list yet.
                 if (mpPhase === "failed" && mpErr === rpcTransport.securityAlertGateCode)
@@ -3550,12 +3572,13 @@ ApplicationWindow {
             body = body + " " + tr("tray.external-address.adapter", "Adapter: {name}")
                 .replace("{name}", adapter)
         }
-        notificationsController._addPushNotice({
+        notificationsController._addPushNoticeUnlessMuted("external-address", {
             "id": "secondary-external-address:" + String(eventId || "") + ":" + address,
             "severity": "info",
             "dismissible": true,
             // The id restarts with the service; only a recent answer suppresses.
             "refractoryMs": 600000,
+            "noticeMuteKind": "external-address",
             "title": tr("tray.external-address.title", "Additional route connected"),
             "body": body,
             "bodyRichText": true
@@ -3572,7 +3595,7 @@ ApplicationWindow {
     /// while the channel was down keeps its error until it is reloaded, so the
     /// user is left thinking nothing changed.
     function _noteEnforcementRestored() {
-        notificationsController._addPushNotice({
+        notificationsController._addPushNoticeUnlessMuted("enforcement-restored", {
             "id": "enforcement-restored",
             "severity": "info",
             "dismissible": true,
@@ -3580,6 +3603,7 @@ ApplicationWindow {
             // The id repeats every time a channel returns; only a recent
             // dismissal silences it, so a flapping tunnel cannot nag.
             "refractoryMs": 600000,
+            "noticeMuteKind": "enforcement-restored",
             "title": tr("notifications.enforcement.restored.title",
                 "Routing is working again"),
             "body": tr("notifications.enforcement.restored.body",
@@ -3687,18 +3711,28 @@ ApplicationWindow {
             body = tr("notifications.enforcement.unknown.body",
                 "The service reported a state this version does not recognise. Open interfaces and routes to check the setup.")
         }
-        notificationsController._addPushNotice({
+        // A switched-off tunnel is the one state here the user may silence;
+        // the rest are faults to fix, so their cards offer no mute.
+        var routine = status === "secondary-down" && role !== "primary"
+        var card = {
             "id": noticeId,
             "severity": "warning",
             "dismissible": true,
             "kind": "enforcement-status",
-            "muteKind": "enforcement-status",
+            "noticeMuteKind": routine ? "secondary-down" : "",
             "title": title,
             "body": body,
             "actionKey": "open-interfaces",
             "actionText": tr("notifications.enforcement.action",
                 "Open interfaces")
-        })
+        }
+        // The mute read may outlast the outage.
+        if (routine) {
+            notificationsController._addPushNoticeUnlessMuted("secondary-down", card,
+                function() { return window._enforcementDownRoles.indexOf(role) >= 0 })
+            return
+        }
+        notificationsController._addPushNotice(card)
     }
 
     /// One reason slug -> the sentence explaining it. Mirrors the tray's own
@@ -3788,7 +3822,7 @@ ApplicationWindow {
             body = body + " " + tr("notifications.block-notice.backlog.destinations",
                 "Destinations: {list}.").replace("{list}", list)
         }
-        notificationsController._addPushNotice({
+        notificationsController._addPushNoticeUnlessMuted("block-notice-backlog", {
             "id": "block-notice-backlog:" + String(throughId),
             "severity": "warning",
             "dismissible": true,

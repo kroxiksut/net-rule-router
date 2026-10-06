@@ -370,20 +370,15 @@ QtObject {
             _releasePendingDialogFlag()
         }
         if (haveRp) {
-            var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
-            root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
-                if (!ok) { state.rpDone = true; state.rpOk = false; settle(); return }
-                var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
+            root.routePolicyController.mutateRoutePolicy(function(cur) {
                 var req = root._buildFullRoutePolicyReq(cur)
                 var changed = false
                 for (var k in rp) {
                     if (rp[k] !== root._routePolicyEffective(cur, k)) { req[k] = rp[k]; changed = true }
                 }
-                if (!changed) { state.rpDone = true; state.rpOk = true; settle(); return }
-                var wCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
-                root.rpc.registerRpcCallback(wCorr, function(ok2, p2, code2, msg2) {
-                    state.rpDone = true; state.rpOk = !!ok2; settle()
-                })
+                return changed ? req : null
+            }, function(ok) {
+                state.rpDone = true; state.rpOk = ok; settle()
             })
         }
         if (haveSt) {

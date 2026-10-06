@@ -171,12 +171,129 @@ SystemTrayIcon {
         _activeNoticeId = ""
         _autoRuleActiveIds = []
         _enforcementNoticeKind = ""
+        _noticeMuteKind = ""
         // A block notice nobody answered is not quieted: unseen is not seen.
         _blockNoticeShown = []
         _blockNoticeRows = []
         _blockNoticeListSerial = -1
         _scheduleDrain()
         _scheduleBlockNoticeBatch()
+    }
+
+    // ── "Don't show…" for whole notice kinds ─────────────────────────────────
+    //
+    // Kept by the service beside the block mutes, per user, so the main window
+    // honours the same answer and Settings lifts both from one list.
+
+    /// Last `block-notices.mutes.list` answer and when it came.
+    property var _noticeMutes: []
+    property double _noticeMutesReadAtMs: 0
+    /// Kind the chooser on screen is about.
+    property string _noticeMuteKind: ""
+
+    function _refreshNoticeMutes(onDone) {
+        var corr = (rpc && typeof rpc.rpcBlockNoticeMutesList === "function")
+            ? rpc.rpcBlockNoticeMutesList() : ""
+        if (!corr || corr === "") {
+            if (onDone) onDone()
+            return
+        }
+        rpc.registerRpcCallback(corr, function(ok, p) {
+            if (ok && p) {
+                tray._noticeMutes = p.mutes || []
+                tray._noticeMutesReadAtMs = Date.now()
+            }
+            if (onDone) onDone()
+        })
+    }
+
+    function _noticeMutedNow(kind) {
+        return Pure.noticeKindMuted(_noticeMutes, kind, Date.now())
+    }
+
+    /// Run `proceed` unless the user silenced `kind`. Read afresh: the main
+    /// window's Settings may have lifted the mute, and nothing tells the tray.
+    /// A lost answer leaves the last list in charge.
+    function _whenNoticeAllowed(kind, proceed) {
+        _refreshNoticeMutes(function() {
+            if (tray._noticeMutedNow(kind)) {
+                console.log("tray notice:", kind, "suppressed — the user muted it")
+                return
+            }
+            proceed()
+        })
+    }
+
+    /// `_presentOrQueue` for a kind the user may silence. Checked again when its
+    /// turn comes: it may have queued behind the chooser that muted it.
+    function _offerNotice(kind, queueKind, show) {
+        _whenNoticeAllowed(kind, function() {
+            tray._presentOrQueue(queueKind, function() {
+                if (tray._noticeMutedNow(kind)) {
+                    tray._scheduleDrain()
+                    return
+                }
+                show()
+            })
+        })
+    }
+
+    function _noticeMuteAction(kind) {
+        return {
+            label: tr("action.dont-show", "Don't show…"),
+            actionId: "notice-mute:" + kind,
+            keepsOpen: true
+        }
+    }
+
+    function _showNoticeMuteChoice(kind, name) {
+        _noticeMuteKind = kind
+        promptWindow.present({
+            titleText: tr("tray.notice-mute.title", "Stop showing this notification?"),
+            bodyText: tr("tray.notice-mute.body",
+                    "\"{name}\" will not appear for as long as you choose.")
+                .replace("{name}", name)
+                + " " + tr("tray.mute.lift-hint",
+                    "Mutes can be lifted later in Settings, Notifications."),
+            primaryAction: {
+                label: tr("label.duration.for-a-day", "For a day"),
+                actionId: "notice-mute-1d",
+                accent: false
+            },
+            secondaryAction: {
+                label: tr("label.duration.for-7-days", "For 7 days"),
+                actionId: "notice-mute-7d"
+            },
+            tertiaryAction: {
+                label: tr("label.duration.for-30-days", "For 30 days"),
+                actionId: "notice-mute-30d"
+            },
+            extraActions: [{
+                label: tr("label.duration.forever", "Forever"),
+                actionId: "notice-mute-forever"
+            }],
+            // Closing the chooser is not an answer — it must not pick a length.
+            dismissActionId: "notice-mute-cancel",
+            autoRetireMs: _promptAutoRetireMs
+        })
+    }
+
+    function _applyNoticeMute(choice) {
+        var req = Pure.noticeMuteRequest(_noticeMuteKind, choice, Date.now())
+        _noticeMuteKind = ""
+        if (req === null || !rpc || typeof rpc.rpcBlockNoticeMutesSet !== "function") return
+        // Held locally at once: a notice of this kind queued behind the chooser
+        // takes its turn before the service answers.
+        _noticeMutes = _noticeMutes.concat([req])
+        var corr = rpc.rpcBlockNoticeMutesSet(req)
+        rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+            if (!ok) {
+                console.warn("notice mute set failed:", code, msg)
+                return
+            }
+            tray._noticeMutes = (p && p.mutes) || []
+            tray._noticeMutesReadAtMs = Date.now()
+        })
     }
 
     // Shared record of answered notifications. Every notice the tray raises
@@ -805,7 +922,7 @@ SystemTrayIcon {
         // An informational notice must not shove a question off the screen —
         // but it must not be thrown away either, which is what "stay quiet"
         // turned into. It waits its turn.
-        _presentOrQueue("external-address", function() {
+        _offerNotice("external-address", "external-address", function() {
             tray._showExternalAddressNotice(noticeId, address, adapter)
         })
     }
@@ -831,11 +948,11 @@ SystemTrayIcon {
             // The address is the whole point of this notice — it has to be
             // takeable, not just readable.
             copyPayload: address,
-            // No footer button of its own. This notice asks nothing, the
-            // corner close box already closes it, and an accent "Close" here
-            // lands in the screen corner right on top of the main window's own
-            // "Close" — one notice retiring a moment early took the app down
-            // with it.
+            // No accent "Close": the corner close box closes it, and an accent
+            // button here lands right on top of the main window's own "Close" —
+            // one notice retiring a moment early took the app down with it.
+            // "Don't show…" only opens a chooser, so a stray click costs nothing.
+            secondaryAction: _noticeMuteAction("external-address"),
             // Timing out is not an answer: a user who was away never saw it,
             // so the notice stays undecided and the main window still offers
             // it. The window owns the countdown — one mechanism, and it fires
@@ -865,10 +982,20 @@ SystemTrayIcon {
     readonly property int _rulesDriftPostMutationQuietMs: 45000
     property double _rulesDriftQuietUntilMs: 0
 
+    /// How stale the mute list may get while the drift watch re-asks every
+    /// tick: it is read from cache here, so a lifted mute shows within this.
+    readonly property int _noticeMutesMaxAgeMs: 10 * 60 * 1000
+
     function _onRulesDriftDetected(details) {
         if (!showNotifications) return
         var noticeId = String((details || {}).signature || "")
         if (noticeId === "") return
+        if (Date.now() - _noticeMutesReadAtMs > _noticeMutesMaxAgeMs) _refreshNoticeMutes(null)
+        if (_noticeMutedNow("rules-drift")) {
+            // Unlatched, so the divergence is offered again once the mute lapses.
+            rulesDriftWatch.resetReported()
+            return
+        }
         if (Date.now() < _rulesDriftQuietUntilMs) {
             console.log("tray rules-drift: held back — a write is still settling")
             rulesDriftWatch.resetReported()
@@ -921,6 +1048,7 @@ SystemTrayIcon {
                 label: tr("tray.rules-drift.action.apply-files", "Apply the files"),
                 actionId: "rules-drift-apply"
             },
+            tertiaryAction: _noticeMuteAction("rules-drift"),
             dismissAction: {
                 label: tr("action.dismiss", "Dismiss"),
                 actionId: "rules-drift-dismiss"
@@ -1388,7 +1516,7 @@ SystemTrayIcon {
             keepsOpen: true
         }
         config.tertiaryAction = {
-            label: tr("tray.block-notice.action.mute", "Don't show"),
+            label: tr("action.dont-show", "Don't show…"),
             actionId: "block-notice-mute",
             keepsOpen: true
         }
@@ -1714,12 +1842,13 @@ SystemTrayIcon {
         if (!showNotifications) return
         var presence = guiPresence ? guiPresence.read() : { windowActive: false }
         if (presence.windowActive) return
-        _presentOrQueue("enforcement-restored", function() {
+        _offerNotice("enforcement-restored", "enforcement-restored", function() {
             promptWindow.present({
                 titleText: tray.tr("notifications.enforcement.restored.title",
                     "Routing is working again"),
                 bodyText: tray.tr("notifications.enforcement.restored.body",
                     "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs."),
+                secondaryAction: tray._noticeMuteAction("enforcement-restored"),
                 dismissActionId: "enforcement-restored-dismiss",
                 autoRetireMs: tray._infoNoticeMs
             })
@@ -1781,7 +1910,7 @@ SystemTrayIcon {
                     "{cidr} on {adapter} stays reachable while routed traffic is blocked. Keep it that way?")
                 .replace("{cidr}", String(first.cidr || ""))
                 .replace("{adapter}", String(first.adapter || ""))
-            tray._presentOrQueue("local-networks", function() {
+            tray._offerNotice("local-networks", "local-networks", function() {
                 promptWindow.present({
                     titleText: tray.tr("notifications.local-networks.title",
                         "A local network was found"),
@@ -1791,6 +1920,7 @@ SystemTrayIcon {
                         actionId: "block-notice-open-settings",
                         accent: true
                     },
+                    secondaryAction: tray._noticeMuteAction("local-networks"),
                     dismissActionId: "enforcement-dismiss"
                 })
             })
@@ -1817,7 +1947,7 @@ SystemTrayIcon {
         }
         var presence = guiPresence ? guiPresence.read() : { windowActive: false }
         if (presence.windowActive) return
-        _presentOrQueue("unassigned-tunnel", function() {
+        _offerNotice("unassigned-tunnel", "unassigned-tunnel", function() {
             promptWindow.present({
                 titleText: tr("notifications.unassigned-tunnel.title",
                     "The additional route is not assigned"),
@@ -1829,6 +1959,7 @@ SystemTrayIcon {
                     actionId: "enforcement-open-interfaces",
                     accent: true
                 },
+                secondaryAction: tray._noticeMuteAction("unassigned-tunnel"),
                 dismissActionId: "enforcement-dismiss",
                 autoRetireMs: tray._enforcementNoticeMs
             })
@@ -1862,6 +1993,7 @@ SystemTrayIcon {
             return
         }
         var candidates = event.candidates || []
+        var routine = status === "secondary-down" && role !== "primary"
         var title = ""
         var body = ""
         if (status === "adapter-choice-needed") {
@@ -1939,8 +2071,9 @@ SystemTrayIcon {
         // Keyed by role, not by "enforcement-status" alone: a missing primary
         // and a downed secondary are two questions, and the newer one must not
         // silently replace the older in the queue.
-        _presentOrQueue("enforcement-status:" + role, function() {
-            tray._enforcementNoticeKind = "enforcement-status:" + role
+        var queueKind = "enforcement-status:" + role
+        var show = function() {
+            tray._enforcementNoticeKind = queueKind
             promptWindow.present({
                 titleText: title,
                 bodyText: body,
@@ -1949,9 +2082,24 @@ SystemTrayIcon {
                     actionId: "enforcement-open-interfaces",
                     accent: true
                 },
+                // Only a switched-off tunnel may be silenced; every other state
+                // here is a fault the user has to fix.
+                secondaryAction: routine ? tray._noticeMuteAction("secondary-down") : null,
                 dismissActionId: "enforcement-dismiss",
                 autoRetireMs: tray._enforcementNoticeMs
             })
+        }
+        if (!routine) {
+            _presentOrQueue(queueKind, show)
+            return
+        }
+        _offerNotice("secondary-down", queueKind, function() {
+            // The mute list was read on the way here; the tunnel may be back.
+            if (tray._enforcementShownByRole[role] !== status) {
+                tray._scheduleDrain()
+                return
+            }
+            show()
         })
     }
 
@@ -2000,12 +2148,6 @@ SystemTrayIcon {
         })
     }
 
-    /// The longest quick option. A mute is a wall-clock deadline on the
-    /// service, and there is no restart event to expire one against, so this
-    /// says "a day" and means it — a label promising "until restart" would be
-    /// a promise the mechanism cannot keep.
-    readonly property int _blockNoticeSnoozeLongestMs: 24 * 60 * 60 * 1000
-
     function _showBlockNoticeSnoozeChoice() {
         promptWindow.present({
             titleText: tr("tray.block-notice.snooze.title", "Snooze this notice"),
@@ -2028,12 +2170,19 @@ SystemTrayIcon {
                 label: tr("tray.block-notice.snooze.for-8-hours", "8 hours"),
                 actionId: "block-notice-snooze-8h"
             },
-            dismissAction: {
-                label: tr("tray.block-notice.snooze.for-a-day", "For a day"),
+            // Wall-clock deadlines on the service: no option can promise
+            // "until restart", there is no restart event to expire one against.
+            extraActions: [{
+                label: tr("label.duration.for-a-day", "For a day"),
                 actionId: "block-notice-snooze-day"
-            },
-            // The X/Esc path is deliberately a DIFFERENT id than the longest
-            // option's button: closing this chooser must not silently pick it.
+            }, {
+                label: tr("label.duration.for-7-days", "For 7 days"),
+                actionId: "block-notice-snooze-7d"
+            }, {
+                label: tr("label.duration.for-30-days", "For 30 days"),
+                actionId: "block-notice-snooze-30d"
+            }],
+            // Closing this chooser is not an answer: it must not pick a length.
             dismissActionId: "block-notice-snooze-cancel",
             autoRetireMs: _promptAutoRetireMs
         })
@@ -2045,7 +2194,9 @@ SystemTrayIcon {
             case "block-notice-snooze-15m": ms = 15 * 60 * 1000; break
             case "block-notice-snooze-1h": ms = 60 * 60 * 1000; break
             case "block-notice-snooze-8h": ms = 8 * 60 * 60 * 1000; break
-            case "block-notice-snooze-day": ms = _blockNoticeSnoozeLongestMs; break
+            case "block-notice-snooze-day": ms = 24 * 60 * 60 * 1000; break
+            case "block-notice-snooze-7d": ms = 7 * 24 * 60 * 60 * 1000; break
+            case "block-notice-snooze-30d": ms = 30 * 24 * 60 * 60 * 1000; break
             default: return
         }
         var until = Date.now() + ms
@@ -2102,8 +2253,8 @@ SystemTrayIcon {
         })
         promptWindow.present({
             titleText: tr("tray.block-notice.mute.title", "What should stop appearing?"),
-            bodyText: tr("tray.block-notice.mute.body",
-                "Mutes can be lifted later in Settings, General, under active mutes."),
+            bodyText: tr("tray.mute.lift-hint",
+                "Mutes can be lifted later in Settings, Notifications."),
             primaryAction: slots[0] || null,
             secondaryAction: slots[1] || null,
             tertiaryAction: slots[2] || null,
@@ -2207,6 +2358,28 @@ SystemTrayIcon {
             promptWindow.detailsExpanded = !promptWindow.detailsExpanded
             return
         }
+        // "Don't show…" answers the notice on screen the way closing it would,
+        // then asks for how long.
+        if (action.indexOf("notice-mute:") === 0) {
+            if (_activeNoticeId !== "") noticeLedger.recordAll([_activeNoticeId])
+            _activeNoticeId = ""
+            _rulesDriftNoticeId = ""
+            _enforcementNoticeKind = ""
+            _showNoticeMuteChoice(action.substring("notice-mute:".length),
+                promptWindow.titleText)
+            return
+        }
+        if (action === "notice-mute-1d" || action === "notice-mute-7d"
+                || action === "notice-mute-30d" || action === "notice-mute-forever") {
+            _applyNoticeMute(action.substring("notice-mute-".length))
+            _scheduleDrain()
+            return
+        }
+        if (action === "notice-mute-cancel") {
+            _noticeMuteKind = ""
+            _scheduleDrain()
+            return
+        }
         // Block-notice actions swap the SAME window through a chain of
         // sub-screens (route confirm, snooze choice, mute choice) rather than
         // reusing the auto-rule id machinery below, which answers a different
@@ -2283,7 +2456,9 @@ SystemTrayIcon {
         }
         if (action === "block-notice-snooze-15m" || action === "block-notice-snooze-1h"
                 || action === "block-notice-snooze-8h"
-                || action === "block-notice-snooze-day") {
+                || action === "block-notice-snooze-day"
+                || action === "block-notice-snooze-7d"
+                || action === "block-notice-snooze-30d") {
             _applyBlockNoticeSnooze(action)
             _blockNoticeAnswered()
             return
@@ -3183,7 +3358,7 @@ SystemTrayIcon {
             body = body + "<br>" + tr("notifications.block-notice.backlog.destinations",
                 "Destinations: {list}.").replace("{list}", list)
         }
-        _presentOrQueue("block-notice-backlog", function() {
+        _offerNotice("block-notice-backlog", "block-notice-backlog", function() {
             promptWindow.present({
                 titleText: tr("notifications.block-notice.backlog.title",
                     "Blocked while the app was closed"),
@@ -3194,6 +3369,7 @@ SystemTrayIcon {
                     actionId: "block-notice-backlog-dismiss",
                     accent: true
                 },
+                secondaryAction: _noticeMuteAction("block-notice-backlog"),
                 dismissActionId: "block-notice-backlog-dismiss",
                 autoRetireMs: _promptAutoRetireMs
             })
@@ -3224,6 +3400,7 @@ SystemTrayIcon {
                 // The event stream is live, so the tray can now say what is
                 // actually being enforced instead of guessing.
                 tray._refreshEnforcementState()
+                tray._refreshNoticeMutes(null)
                 // Both surfaces drain the same backlog, and the main window
                 // does it immediately. Waiting lets its acknowledgement land
                 // first, so a user who has both up is told once, not twice.

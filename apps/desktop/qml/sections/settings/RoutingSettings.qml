@@ -598,7 +598,7 @@ ColumnLayout {
             // service-stopped seed reads back.
             panel._rememberRoutePolicy(cur)
             // Restore remembered toggle intent after a service-DB wipe.
-            panel._reseedTogglesFromPrefs(cur)
+            panel._reseedTogglesFromPrefs()
         })
     }
 
@@ -628,101 +628,102 @@ ColumnLayout {
     // a toggle but the mirror remembers a non-default choice, re-push it in ONE
     // atomic update so it is restored without the user re-entering it. Only
     // overrides at-default values → never clobbers a deliberate service choice.
-    function _reseedTogglesFromPrefs(cur) {
-        cur = cur || {}
-        if (!root.prefs
-                || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
-                || typeof nrrNativeBridge.rpcRoutePolicyUpdate !== "function")
-            return
-        // What the service currently holds, read through the shared defaults.
-        var svcSub = root._routePolicyEffective(cur, "include-subdomains")
-        var svcShared = root._routePolicyEffective(cur, "shared-ip-policy")
-        var svcBlockAll = root._routePolicyEffective(cur, "kill-switch-block-all")
-        var svcEnabled = root._routePolicyEffective(cur, "kill-switch-enabled")
-        var svcAllowDns = root._routePolicyEffective(cur, "allow-dns-over-primary")
-        var svcFailClosed = root._routePolicyEffective(cur, "kill-switch-fail-closed")
-        var svcProtocols = root._routePolicyEffective(cur, "kill-switch-protocols")
-        var svcCoverage = root._routePolicyEffective(cur, "mode-a-coverage-strategy")
-        var svcBypass = root._routePolicyEffective(cur, "resolve-hosts-bypass")
-        // What the local UiPrefs mirror remembers (same defaults again).
-        var memSub = _mirroredBool("include-subdomains", root.prefs.routeIncludeSubdomains)
-        var memShared = _mirroredString("shared-ip-policy", root.prefs.routeSharedIpPolicy)
-        var memBlockAll = _mirroredBool("kill-switch-block-all",
-            root.prefs.routeKillSwitchBlockAll)
-        var memEnabled = _mirroredBool("kill-switch-enabled", root.prefs.routeKillSwitchEnabled)
-        var memAllowDns = _mirroredBool("allow-dns-over-primary",
-            root.prefs.routeAllowDnsOverPrimary)
-        var memFailClosed = _mirroredBool("kill-switch-fail-closed",
-            root.prefs.routeKillSwitchFailClosed)
-        var memProtocols =
-            Pure.routePolicyCoerce("kill-switch-protocols", root.prefs.routeKillSwitchProtocols)
-        var memCoverage = _mirroredString("mode-a-coverage-strategy",
-            root.prefs.routeModeACoverageStrategy)
-        var memBypass = _mirroredBool("resolve-hosts-bypass", root.prefs.routeResolveHostsBypass)
-        var wantSub = _reseedWant("include-subdomains", svcSub, memSub)
-        var wantShared = _reseedWant("shared-ip-policy", svcShared, memShared)
-        var wantBlockAll = _reseedWant("kill-switch-block-all", svcBlockAll, memBlockAll)
-        var wantEnabled = _reseedWant("kill-switch-enabled", svcEnabled, memEnabled)
-        var wantAllowDns = _reseedWant("allow-dns-over-primary", svcAllowDns, memAllowDns)
-        var wantFailClosed = _reseedWant("kill-switch-fail-closed", svcFailClosed, memFailClosed)
-        var wantProtocols = _reseedWant("kill-switch-protocols", svcProtocols, memProtocols)
-        var wantCoverage = _reseedWant("mode-a-coverage-strategy", svcCoverage, memCoverage)
-        var wantBypass = _reseedWant("resolve-hosts-bypass", svcBypass, memBypass)
-        // Any key the user parked while the service was
-        // stopped is owned by the offline pending-changes dialog now. Do NOT
-        // auto-re-push it here (that would race the dialog and could clobber the
-        // parked intent). Reset each such key to the service's current value so the
-        // "all equal → return" guard below leaves it untouched.
-        var pendingRp = (typeof root._readPendingOffline === "function")
-            ? (root._readPendingOffline()["route-policy"] || {}) : {}
-        if (pendingRp.hasOwnProperty("include-subdomains")) wantSub = svcSub
-        if (pendingRp.hasOwnProperty("shared-ip-policy")) wantShared = svcShared
-        if (pendingRp.hasOwnProperty("kill-switch-block-all")) wantBlockAll = svcBlockAll
-        if (pendingRp.hasOwnProperty("kill-switch-enabled")) wantEnabled = svcEnabled
-        if (pendingRp.hasOwnProperty("allow-dns-over-primary")) wantAllowDns = svcAllowDns
-        if (pendingRp.hasOwnProperty("kill-switch-fail-closed")) wantFailClosed = svcFailClosed
-        if (pendingRp.hasOwnProperty("kill-switch-protocols")) wantProtocols = svcProtocols
-        if (pendingRp.hasOwnProperty("mode-a-coverage-strategy")) wantCoverage = svcCoverage
-        if (pendingRp.hasOwnProperty("resolve-hosts-bypass")) wantBypass = svcBypass
-        if (wantSub === svcSub && wantShared === svcShared && wantBlockAll === svcBlockAll
-                && wantEnabled === svcEnabled && wantAllowDns === svcAllowDns
-                && wantFailClosed === svcFailClosed && wantProtocols === svcProtocols
-                && wantCoverage === svcCoverage && wantBypass === svcBypass)
-            return
-        // Reflect the restored values in the panel immediately (push is async).
-        panel.includeSubdomains = wantSub
-        panel.sharedIpPolicy = wantShared
-        panel.ksBlockAll = wantBlockAll
-        panel.killSwitchEnabled = wantEnabled
-        panel.allowDnsOverPrimary = wantAllowDns
-        panel.ksFailClosed = wantFailClosed
-        panel.ksProtocols = wantProtocols
-        panel.modeACoverage = wantCoverage
-        panel.resolveHostsBypass = wantBypass
-        // route.policy.update is a full-replacement request: any field left out
-        // falls back to its serde default on the server, silently resetting it.
-        // Build from the shared SSOT (`root._buildFullRoutePolicyReq`, which
-        // carries every current field forward from `cur`) and overlay only the
-        // keys this re-seed is actually restoring — this is what keeps a future
-        // policy field from being forgotten here the way
-        // `kill-switch-strict-shared-ips` / `browser-history-auto-seed` were.
-        var req = root._buildFullRoutePolicyReq(cur)
-        req["kill-switch-fail-closed"] = wantFailClosed
-        req["kill-switch-protocols"] = wantProtocols
-        req["include-subdomains"] = wantSub
-        req["shared-ip-policy"] = wantShared
-        req["kill-switch-block-all"] = wantBlockAll
-        req["kill-switch-enabled"] = wantEnabled
-        req["allow-dns-over-primary"] = wantAllowDns
-        req["mode-a-coverage-strategy"] = wantCoverage
-        req["resolve-hosts-bypass"] = wantBypass
-        // Did we RE-ARM the kill-switch from the saved
-        // mirror because the service had lost it (e.g. a state-DB wipe)? If so,
-        // surface a visible notice so a restored kill-switch is never a surprise.
-        var killSwitchReArmed = (wantEnabled === true && svcEnabled === false)
-        var wCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
-        root.rpc.registerRpcCallback(wCorr, function(ok, p, code, msg) {
-            if (!ok) return
+    function _reseedTogglesFromPrefs() {
+        if (!root.prefs || !root.routePolicyController) return
+        // Decided against the row the write is built on, not the one the panel
+        // loaded: another write may land in between.
+        var req = null
+        var killSwitchReArmed = false
+        root.routePolicyController.mutateRoutePolicy(function(cur) {
+            // What the service currently holds, read through the shared defaults.
+            var svcSub = root._routePolicyEffective(cur, "include-subdomains")
+            var svcShared = root._routePolicyEffective(cur, "shared-ip-policy")
+            var svcBlockAll = root._routePolicyEffective(cur, "kill-switch-block-all")
+            var svcEnabled = root._routePolicyEffective(cur, "kill-switch-enabled")
+            var svcAllowDns = root._routePolicyEffective(cur, "allow-dns-over-primary")
+            var svcFailClosed = root._routePolicyEffective(cur, "kill-switch-fail-closed")
+            var svcProtocols = root._routePolicyEffective(cur, "kill-switch-protocols")
+            var svcCoverage = root._routePolicyEffective(cur, "mode-a-coverage-strategy")
+            var svcBypass = root._routePolicyEffective(cur, "resolve-hosts-bypass")
+            // What the local UiPrefs mirror remembers (same defaults again).
+            var memSub = _mirroredBool("include-subdomains", root.prefs.routeIncludeSubdomains)
+            var memShared = _mirroredString("shared-ip-policy", root.prefs.routeSharedIpPolicy)
+            var memBlockAll = _mirroredBool("kill-switch-block-all",
+                root.prefs.routeKillSwitchBlockAll)
+            var memEnabled = _mirroredBool("kill-switch-enabled", root.prefs.routeKillSwitchEnabled)
+            var memAllowDns = _mirroredBool("allow-dns-over-primary",
+                root.prefs.routeAllowDnsOverPrimary)
+            var memFailClosed = _mirroredBool("kill-switch-fail-closed",
+                root.prefs.routeKillSwitchFailClosed)
+            var memProtocols =
+                Pure.routePolicyCoerce("kill-switch-protocols", root.prefs.routeKillSwitchProtocols)
+            var memCoverage = _mirroredString("mode-a-coverage-strategy",
+                root.prefs.routeModeACoverageStrategy)
+            var memBypass = _mirroredBool("resolve-hosts-bypass", root.prefs.routeResolveHostsBypass)
+            var wantSub = _reseedWant("include-subdomains", svcSub, memSub)
+            var wantShared = _reseedWant("shared-ip-policy", svcShared, memShared)
+            var wantBlockAll = _reseedWant("kill-switch-block-all", svcBlockAll, memBlockAll)
+            var wantEnabled = _reseedWant("kill-switch-enabled", svcEnabled, memEnabled)
+            var wantAllowDns = _reseedWant("allow-dns-over-primary", svcAllowDns, memAllowDns)
+            var wantFailClosed = _reseedWant("kill-switch-fail-closed", svcFailClosed, memFailClosed)
+            var wantProtocols = _reseedWant("kill-switch-protocols", svcProtocols, memProtocols)
+            var wantCoverage = _reseedWant("mode-a-coverage-strategy", svcCoverage, memCoverage)
+            var wantBypass = _reseedWant("resolve-hosts-bypass", svcBypass, memBypass)
+            // Any key the user parked while the service was
+            // stopped is owned by the offline pending-changes dialog now. Do NOT
+            // auto-re-push it here (that would race the dialog and could clobber the
+            // parked intent). Reset each such key to the service's current value so the
+            // "all equal → return" guard below leaves it untouched.
+            var pendingRp = (typeof root._readPendingOffline === "function")
+                ? (root._readPendingOffline()["route-policy"] || {}) : {}
+            if (pendingRp.hasOwnProperty("include-subdomains")) wantSub = svcSub
+            if (pendingRp.hasOwnProperty("shared-ip-policy")) wantShared = svcShared
+            if (pendingRp.hasOwnProperty("kill-switch-block-all")) wantBlockAll = svcBlockAll
+            if (pendingRp.hasOwnProperty("kill-switch-enabled")) wantEnabled = svcEnabled
+            if (pendingRp.hasOwnProperty("allow-dns-over-primary")) wantAllowDns = svcAllowDns
+            if (pendingRp.hasOwnProperty("kill-switch-fail-closed")) wantFailClosed = svcFailClosed
+            if (pendingRp.hasOwnProperty("kill-switch-protocols")) wantProtocols = svcProtocols
+            if (pendingRp.hasOwnProperty("mode-a-coverage-strategy")) wantCoverage = svcCoverage
+            if (pendingRp.hasOwnProperty("resolve-hosts-bypass")) wantBypass = svcBypass
+            if (wantSub === svcSub && wantShared === svcShared && wantBlockAll === svcBlockAll
+                    && wantEnabled === svcEnabled && wantAllowDns === svcAllowDns
+                    && wantFailClosed === svcFailClosed && wantProtocols === svcProtocols
+                    && wantCoverage === svcCoverage && wantBypass === svcBypass)
+                return null
+            // Reflect the restored values in the panel immediately (push is async).
+            panel.includeSubdomains = wantSub
+            panel.sharedIpPolicy = wantShared
+            panel.ksBlockAll = wantBlockAll
+            panel.killSwitchEnabled = wantEnabled
+            panel.allowDnsOverPrimary = wantAllowDns
+            panel.ksFailClosed = wantFailClosed
+            panel.ksProtocols = wantProtocols
+            panel.modeACoverage = wantCoverage
+            panel.resolveHostsBypass = wantBypass
+            // route.policy.update is a full-replacement request: any field left out
+            // falls back to its serde default on the server, silently resetting it.
+            // Build from the shared SSOT (`root._buildFullRoutePolicyReq`, which
+            // carries every current field forward from `cur`) and overlay only the
+            // keys this re-seed is actually restoring — this is what keeps a future
+            // policy field from being forgotten here the way
+            // `kill-switch-strict-shared-ips` / `browser-history-auto-seed` were.
+            req = root._buildFullRoutePolicyReq(cur)
+            req["kill-switch-fail-closed"] = wantFailClosed
+            req["kill-switch-protocols"] = wantProtocols
+            req["include-subdomains"] = wantSub
+            req["shared-ip-policy"] = wantShared
+            req["kill-switch-block-all"] = wantBlockAll
+            req["kill-switch-enabled"] = wantEnabled
+            req["allow-dns-over-primary"] = wantAllowDns
+            req["mode-a-coverage-strategy"] = wantCoverage
+            req["resolve-hosts-bypass"] = wantBypass
+            // Did we RE-ARM the kill-switch from the saved
+            // mirror because the service had lost it (e.g. a state-DB wipe)? If so,
+            // surface a visible notice so a restored kill-switch is never a surprise.
+            killSwitchReArmed = (wantEnabled === true && svcEnabled === false)
+            return req
+        }, function(ok, code, stage) {
+            if (!ok || stage !== "write") return
             // The service now holds the re-seeded values; keep the display
             // mirror in step so a later offline launch shows them.
             panel._rememberRoutePolicy(req)

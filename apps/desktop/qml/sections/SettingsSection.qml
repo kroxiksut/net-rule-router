@@ -76,6 +76,15 @@ RowLayout {
                 Loader {
                     Layout.fillWidth: true
                     property bool keepLoaded: false
+                    active: section.activeCategory === "notifications" || keepLoaded
+                    onActiveChanged: if (active) keepLoaded = true
+                    visible: section.activeCategory === "notifications"
+                    asynchronous: root.sectionLoadsAsync
+                    sourceComponent: NotificationSettings { root: section.root; Layout.fillWidth: true }
+                }
+                Loader {
+                    Layout.fillWidth: true
+                    property bool keepLoaded: false
                     active: section.activeCategory === "diagnostics" || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "diagnostics"

@@ -63,6 +63,7 @@ ListModel {
             kind: String(kind || ""),
             phase: "running",
             errorCode: "",
+            errorArgsJson: "",
             startedAtMs: Date.now(),
             settledAtMs: 0
         })
@@ -72,12 +73,16 @@ ListModel {
     /// correlationId is unknown (e.g. service emits `completed`
     /// without our seeing `started` — possible on bridge reconnect)
     /// we still insert a fresh row so the user sees feedback.
-    function settle(correlationId, phase, errorCode) {
+    /// `errorArgs` (optional) is the refusal's wire `error-args` object.
+    function settle(correlationId, phase, errorCode, errorArgs) {
         if (!correlationId) return
         var idx = indexOf(correlationId)
         var ph = (phase === "completed" || phase === "failed")
             ? phase : "completed"
         var ec = String(errorCode || "")
+        // A ListModel role turns a JS object into a nested model; a string
+        // keeps the role one type across rows.
+        var ea = errorArgs ? JSON.stringify(errorArgs) : ""
         if (idx < 0) {
             _evictIfNeeded()
             model.append({
@@ -86,6 +91,7 @@ ListModel {
                 kind: "",
                 phase: ph,
                 errorCode: ec,
+                errorArgsJson: ea,
                 startedAtMs: Date.now(),
                 settledAtMs: Date.now()
             })
@@ -93,6 +99,7 @@ ListModel {
         }
         model.setProperty(idx, "phase", ph)
         model.setProperty(idx, "errorCode", ec)
+        model.setProperty(idx, "errorArgsJson", ea)
         model.setProperty(idx, "settledAtMs", Date.now())
     }
 

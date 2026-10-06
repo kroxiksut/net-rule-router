@@ -60,57 +60,108 @@ QtObject {
                 root._recordOfflineRoutingIntent("route-policy", keys[j], changes[keys[j]])
             return
         }
-        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
-        root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
-            // The write below is a FULL replacement built on top of what was
-            // just read. A failed read (a timeout answers ok=false, payload
-            // null) left `cur` empty, so the request was assembled from
-            // ROUTE_POLICY_FIELD_DEFAULTS — and those turn the kill switch,
-            // block-all and the DoH lockdown OFF. Any toggle in Routing could
-            // therefore disarm leak protection because one read timed out. The
-            // decision is parked instead, exactly like one made while the
-            // service is down: it is still what the user asked for.
-            if (!ok || !p) {
+        mutateRoutePolicy(function(cur) {
+            var req = root._buildFullRoutePolicyReq(cur)
+            for (var m = 0; m < keys.length; m += 1)
+                req[keys[m]] = changes[keys[m]]
+            return req
+        }, function(ok, code, stage) {
+            // A failed read used to leave `cur` empty and build the request from
+            // the field defaults, which turn the kill switch, block-all and the
+            // DoH lockdown OFF. The decision is parked instead, like one made
+            // while the service is down: it is still what the user asked for.
+            if (stage === "read") {
                 for (var k = 0; k < keys.length; k += 1)
                     root._recordOfflineRoutingIntent("route-policy", keys[k], changes[keys[k]])
-                var readCode = String(code || "")
                 var readLabel = (typeof root.ipcErrorLabel === "function")
-                    ? root.ipcErrorLabel(readCode) : readCode
+                    ? root.ipcErrorLabel(code) : code
                 root.statusLine = root.tr("status.route-policy-read-failed",
                     "Could not read the current routing policy, so nothing was "
                     + "changed. The setting is saved and will be sent again: ") + readLabel
                 return
             }
-            var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
-            var req = root._buildFullRoutePolicyReq(cur)
-            for (var m = 0; m < keys.length; m += 1)
-                req[keys[m]] = changes[keys[m]]
+            if (ok) {
+                // Display bookkeeping only — never a push source: panels with no
+                // dedicated prefs mirror read it back while the service is stopped.
+                if (typeof root._rememberServiceValues === "function") {
+                    var remembered = {}
+                    for (var n = 0; n < keys.length; n += 1)
+                        remembered[keys[n]] = changes[keys[n]]
+                    root._rememberServiceValues("route-policy", remembered)
+                }
+                if (o.onApplied) o.onApplied(changes)
+                root.statusLine = o.ok
+                return
+            }
+            if (code === "uac-declined") {
+                root.statusLine = o.uac
+            } else {
+                var label = (typeof root.ipcErrorLabel === "function")
+                    ? root.ipcErrorLabel(code) : code
+                root.statusLine = o.failPrefix + label
+            }
+            if (o.onFailed) o.onFailed(code)
+        })
+    }
+
+    property var _policyWrites: []
+    property bool _policyWriteInFlight: false
+
+    /// The ONE way to change the per-SID route policy from this window.
+    ///
+    /// `route.policy.update` replaces the whole row, so every write is built on
+    /// a fresh read. Two in flight read the same row and each carries the
+    /// other's field back to its old value: first-run sent the kill switch, the
+    /// DoH lockdown and both adapter bindings at once, and the service kept
+    /// neither protection. Writes therefore run one at a time, each reading
+    /// after the previous one landed.
+    ///
+    /// `build(cur)` returns the request, or null when there is nothing to
+    /// write. `done(ok, code, stage)`: `stage` is "read" (nothing was sent),
+    /// "unchanged" (build returned null, `ok` true) or "write".
+    function mutateRoutePolicy(build, done) {
+        _policyWrites.push({ build: build, done: done })
+        _drainPolicyWrites()
+    }
+
+    function _drainPolicyWrites() {
+        if (_policyWriteInFlight || _policyWrites.length === 0) return
+        var job = _policyWrites.shift()
+        _policyWriteInFlight = true
+        var finish = function(ok, code, stage) {
+            _policyWriteInFlight = false
+            try {
+                if (typeof job.done === "function") job.done(ok === true, String(code || ""), stage)
+            } catch (e) {
+                console.log("route-policy write: completion failed:", e)
+            }
+            _drainPolicyWrites()
+        }
+        if (typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function"
+                || typeof nrrNativeBridge.rpcRoutePolicyUpdate !== "function") {
+            finish(false, "bridge-unavailable", "read")
+            return
+        }
+        // A dropped correlation id never gets a callback; without this the
+        // queue would stall behind it for the rest of the session.
+        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+        if (!readCorr) { finish(false, "bridge-unavailable", "read"); return }
+        root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
+            if (!ok || !p) { finish(false, code, "read"); return }
+            var req = null
+            try {
+                req = job.build((p["route-policy"] || p.routePolicy) || {})
+            } catch (e) {
+                console.log("route-policy write: building the request failed:", e)
+                finish(false, "gui-internal", "read")
+                return
+            }
+            if (!req) { finish(true, "", "unchanged"); return }
             var wCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
+            if (!wCorr) { finish(false, "bridge-unavailable", "write"); return }
             root.rpc.registerRpcCallback(wCorr, function(ok2, p2, code2, msg2) {
-                if (ok2) {
-                    // The service accepted the value, so the GUI's display
-                    // mirror must carry it too: the panels that have no
-                    // dedicated prefs mirror read it back when the service is
-                    // stopped. Display bookkeeping only — never a push source.
-                    if (typeof root._rememberServiceValues === "function") {
-                        var remembered = {}
-                        for (var n = 0; n < keys.length; n += 1)
-                            remembered[keys[n]] = changes[keys[n]]
-                        root._rememberServiceValues("route-policy", remembered)
-                    }
-                    if (o.onApplied) o.onApplied(changes)
-                    root.statusLine = o.ok
-                    return
-                }
-                var c = String(code2 || "")
-                if (c === "uac-declined") {
-                    root.statusLine = o.uac
-                } else {
-                    var label = (typeof root.ipcErrorLabel === "function")
-                        ? root.ipcErrorLabel(c) : c
-                    root.statusLine = o.failPrefix + label
-                }
-                if (o.onFailed) o.onFailed(c)
+                finish(ok2, code2, "write")
             })
         })
     }
@@ -493,17 +544,35 @@ QtObject {
                 "Could not update the block-all setting: ")
         })
     }
+    /// The first-run protections (wizard or answer file) as ONE write, so the
+    /// kill switch and the DoH lockdown cannot be sent as two snapshots of the
+    /// same row.
+    function applyFirstRunProtections(killSwitch, dohLockdown) {
+        var ks = _mirrorKillSwitch(killSwitch)
+        _applyRoutePolicyKeys({
+            "kill-switch-enabled": ks,
+            "doh-lockdown-enabled": dohLockdown === true
+        }, _killSwitchMessages(ks))
+    }
     /// MASTER kill-switch toggle (the explicit opt-in). When OFF (default) the
     /// whole leak-guard is disarmed regardless of sub-settings; when ON the gated
-    /// sub-settings take effect. The strict-kill-switch notice is only meaningful
-    /// while the master is ON, so clear its mirror the moment it goes OFF.
+    /// sub-settings take effect.
     function applyKillSwitchEnabled(enabled) {
+        var want = _mirrorKillSwitch(enabled)
+        _applyRoutePolicyKey("kill-switch-enabled", want, _killSwitchMessages(want))
+    }
+    /// The strict-kill-switch notice only means something while the master is
+    /// ON, so its mirror is cleared the moment it goes OFF.
+    function _mirrorKillSwitch(enabled) {
         var want = enabled === true
         root.prefs.routeKillSwitchEnabled = want
         if (!want)
             root.strictKillSwitchActive = false
         root.emitPrefs()
-        _applyRoutePolicyKey("kill-switch-enabled", want, {
+        return want
+    }
+    function _killSwitchMessages(want) {
+        return {
             ok: want
                 ? root.tr("status.kill-switch-enabled-on",
                     "Kill-switch enabled. Choose how it blocks in the options below.")
@@ -513,7 +582,7 @@ QtObject {
                 "Administrator approval was declined; leak protection was not changed."),
             failPrefix: root.tr("status.kill-switch-enabled-failed",
                 "Could not update the kill-switch: ")
-        })
+        }
     }
     /// "Allow name resolution over the primary link while the block-all is
     /// engaged". ON (default) adds a port-scoped UDP/TCP-53 permit so zones keep
@@ -587,24 +656,18 @@ QtObject {
         }
         return req
     }
-    /// `onDone(ok, code)` runs before the status line is touched, so a caller
-    /// that retries can tell a declined prompt from a transient failure.
-    function _sendRoutePolicyUpdate(req, onDone) {
-        var wCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
-        root.rpc.registerRpcCallback(wCorr, function(ok, p, code, msg) {
-            var c = String(code || "")
-            if (typeof onDone === "function") onDone(ok === true, c)
-            if (ok) return // success is silent; the role-assign status already shows
-            if (c === "uac-declined") {
-                root.statusLine = root.tr("status.route-binding-uac-declined",
-                    "Administrator approval was declined; the adapter binding "
-                    + "was not saved to the service, so routing will not be enforced.")
-            } else {
-                var lbl = (typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(c) : c
-                root.statusLine = root.tr("status.route-binding-failed",
-                    "Could not save the adapter binding to the service: ") + lbl
-            }
-        })
+    /// Status line for a binding write that failed. Success is silent: the
+    /// role-assign status already shows.
+    function _reportBindingWriteFailure(code) {
+        if (code === "uac-declined") {
+            root.statusLine = root.tr("status.route-binding-uac-declined",
+                "Administrator approval was declined; the adapter binding "
+                + "was not saved to the service, so routing will not be enforced.")
+        } else {
+            var lbl = (typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(code) : code
+            root.statusLine = root.tr("status.route-binding-failed",
+                "Could not save the adapter binding to the service: ") + lbl
+        }
     }
     /// Push the current prefs binding to the service now. Reads the live policy
     /// first to preserve mode + failover (mirrors `applyRouteBehaviorMode`).
@@ -623,11 +686,13 @@ QtObject {
             settle(false, "bridge-unavailable")
             return
         }
-        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
-        root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
-            if (!ok) { settle(false, code); return }
-            var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
-            _sendRoutePolicyUpdate(_routeBindingReqFromPrefs(cur, opts), settle)
+        mutateRoutePolicy(function(cur) {
+            return _routeBindingReqFromPrefs(cur, opts)
+        }, function(ok, code, stage) {
+            // Settled before the status line, so a caller that retries can tell
+            // a declined prompt from a transient failure.
+            settle(ok, code)
+            if (!ok && stage === "write") _reportBindingWriteFailure(code)
         })
     }
     /// Attempts left in the current re-sync run, and the backoff between them.
@@ -761,32 +826,25 @@ QtObject {
             _routeBindingResyncSettled()
             return
         }
-        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
-        root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
-            if (!ok) {
-                _scheduleRouteBindingResyncRetry("read-failed:" + String(code || ""))
+        mutateRoutePolicy(function(cur) {
+            if (cur.primary || cur.secondary) return null // service already has a binding
+            _bindingResyncOutstanding = true
+            return _routeBindingReqFromPrefs(cur)
+        }, function(ok, code, stage) {
+            if (stage === "read") {
+                _scheduleRouteBindingResyncRetry("read-failed:" + code)
                 return
             }
-            var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
-            if (cur.primary || cur.secondary) { // service already has a binding
+            // A declined prompt is an answer, not a transient failure: retrying
+            // would re-prompt on every adapter change, and the policy-inactive
+            // notice keeps a manual button.
+            if (ok || code === "uac-declined") {
+                if (!ok) _reportBindingWriteFailure(code)
                 _routeBindingResyncSettled()
                 return
             }
-            _bindingResyncOutstanding = true
-            _sendRoutePolicyUpdate(_routeBindingReqFromPrefs(cur), function(ok2, code2) {
-                if (ok2) {
-                    _routeBindingResyncSettled()
-                    return
-                }
-                if (code2 === "uac-declined") {
-                    // A declined prompt is an answer, not a transient failure.
-                    // Retrying would re-prompt, and again on every adapter
-                    // change; the policy-inactive notice keeps a manual button.
-                    _routeBindingResyncSettled()
-                    return
-                }
-                _scheduleRouteBindingResyncRetry("write-failed:" + code2)
-            })
+            _reportBindingWriteFailure(code)
+            _scheduleRouteBindingResyncRetry("write-failed:" + code)
         })
     }
 
