@@ -436,13 +436,13 @@ pub fn validate_preset_bytes(bytes: &[u8]) -> PresetFileValidationOutcome {
                     supported: *supported,
                 })
             }
-            // Provenance defects in the app-authored section are not an import
-            // concern: the rule itself is imported intact either way, and the
-            // import-review dialog reports what the user must *decide* about
-            // (unsupported sections, format version). Callers that want to surface them
-            // read `ParseOutcome::warnings` directly.
+            // Line-level defects are not an import decision: the review dialog
+            // reports what the user must *decide* about (unsupported sections,
+            // format version). Callers that want to surface them read
+            // `ParseOutcome::warnings` directly.
             ParseWarning::AutoRuleMissingProvenance { .. }
-            | ParseWarning::AutoRuleIncompleteProvenance { .. } => None,
+            | ParseWarning::AutoRuleIncompleteProvenance { .. }
+            | ParseWarning::VerifyPrimaryWithBlock { .. } => None,
         })
         .collect();
 

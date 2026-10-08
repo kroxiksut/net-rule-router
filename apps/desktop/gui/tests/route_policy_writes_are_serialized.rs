@@ -90,3 +90,76 @@ fn first_run_protections_travel_as_one_write() {
         );
     }
 }
+
+/// The tray cannot share the window's queue, so both name what they change:
+/// the service lays the named fields over the stored row, and neither write
+/// reverts the other's.
+#[test]
+fn the_tray_and_the_window_name_what_they_change() {
+    let tray = read(&qml_root().join("Tray.qml"));
+    for field in ["auto-rules-mode", "kill-switch-enabled"] {
+        assert!(
+            tray.contains(&format!("req[\"apply-only\"] = [\"{field}\"]")),
+            "the tray's `{field}` write restates the whole row"
+        );
+    }
+    let queue = read(&qml_root().join("flows/RoutePolicyController.qml"));
+    assert!(
+        queue.contains("Pure.routePolicyChangedKeys("),
+        "the window sends a whole row"
+    );
+    assert!(queue.contains("req[\"apply-only\"] = changed"));
+}
+
+#[test]
+fn changed_keys_name_only_what_differs() {
+    // QML's `.pragma` / `.import` lines are not JavaScript node reads.
+    let pure: String = read(&qml_root().join("lib/pure.js"))
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('.'))
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    let program = format!(
+        "{pure}\nvar base = {{ mode: 'prefer-primary', primary: {{ 'stable-id': 'a' }}, \
+         'kill-switch-enabled': false, 'binding-source': 'recovery' }};\n\
+         var req = {{ mode: 'prefer-primary', 'kill-switch-enabled': true, \
+         'binding-source': 'user-assigned' }};\n\
+         console.log(JSON.stringify(routePolicyChangedKeys(base, req)));\n\
+         console.log(JSON.stringify(routePolicyChangedKeys(base, base)));\n"
+    );
+    let Some(output) = run_node(&program) else {
+        return;
+    };
+    assert_eq!(output.trim(), "[\"kill-switch-enabled\",\"primary\"]\n[]");
+}
+
+/// Feed a program to `node` on stdin. `None` when node is not installed.
+fn run_node(program: &str) -> Option<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("node")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .as_mut()
+        .unwrap_or_else(|| panic!("stdin was piped"))
+        .write_all(program.as_bytes())
+        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
+    assert!(
+        out.status.success(),
+        "node rejected the harness: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}

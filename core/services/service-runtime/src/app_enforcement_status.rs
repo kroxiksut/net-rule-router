@@ -21,11 +21,11 @@
 //! half of "what the last compute enforced differently from the rules", and
 //! riding the existing channel keeps one writer and one reader for both.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
-use nrr_shared::ipc_payloads::RuleConflictDto;
+use nrr_shared::ipc_payloads::{EnforcementStatusDto, RuleConflictDto};
 
 /// Ceiling on the conflicts kept per principal, so one pathological rule book
 /// cannot grow the snapshot past a frame.
@@ -235,6 +235,56 @@ impl FailClosedPostureStatus {
     }
 }
 
+/// The last enforcement report per principal and role: the route coordinator
+/// writes it as it decides whether to push, the `SnapshotInitial` handler reads
+/// the caller's own. The push fires on change only, so without this a client
+/// that connects later never learns a standing state.
+#[derive(Clone, Default)]
+pub struct RouteEnforcementStatus(Arc<Mutex<ReportsByPrincipal>>);
+
+/// Principal → role → report.
+type ReportsByPrincipal = HashMap<String, BTreeMap<String, EnforcementStatusDto>>;
+
+impl RouteEnforcementStatus {
+    /// Construct with nothing reported.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store `report` for `principal`. Returns whether it differs from the
+    /// stored one, which is what decides the push.
+    pub fn record(&self, principal: &str, report: &EnforcementStatusDto) -> bool {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let roles = guard.entry(principal.to_string()).or_default();
+        if roles.get(&report.role) == Some(report) {
+            return false;
+        }
+        roles.insert(report.role.clone(), report.clone());
+        true
+    }
+
+    /// `principal`'s last status for `role`, when one was reported.
+    pub fn status_of(&self, principal: &str, role: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(principal)
+            .and_then(|roles| roles.get(role))
+            .map(|r| r.status.clone())
+    }
+
+    /// `principal`'s reports, ordered by role. Never another principal's: the
+    /// candidates name that user's adapters.
+    pub fn for_principal(&self, principal: &str) -> Vec<EnforcementStatusDto> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(principal)
+            .map(|roles| roles.values().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
 /// The rule conflicts in one codegen pass, projected for the GUI.
 ///
 /// Read off the codegen's own diagnostics rather than re-derived, so what the
@@ -286,6 +336,38 @@ mod tests {
             !status.set_rule_conflicts("S-1", Vec::new()),
             "clearing an empty set is not a change"
         );
+    }
+
+    #[test]
+    fn route_enforcement_keeps_the_last_report_per_role_and_principal() {
+        let report = |status: &str, role: &str| EnforcementStatusDto {
+            status: status.into(),
+            role: role.into(),
+            candidates: Vec::new(),
+        };
+        let writer = RouteEnforcementStatus::new();
+        let reader = writer.clone();
+        assert!(writer.record("S-1", &report("secondary-down", "secondary")));
+        assert!(
+            !writer.record("S-1", &report("secondary-down", "secondary")),
+            "the same report again is not a change"
+        );
+        assert!(writer.record("S-1", &report("ok", "primary")));
+        assert!(writer.record("S-2", &report("adapter-gone", "secondary")));
+        assert_eq!(
+            reader.for_principal("S-1"),
+            vec![
+                report("ok", "primary"),
+                report("secondary-down", "secondary")
+            ]
+        );
+        assert!(writer.record("S-1", &report("ok", "secondary")));
+        assert_eq!(reader.status_of("S-1", "secondary").as_deref(), Some("ok"));
+        assert_eq!(
+            reader.for_principal("S-2"),
+            vec![report("adapter-gone", "secondary")]
+        );
+        assert!(reader.for_principal("S-3").is_empty());
     }
 
     #[test]

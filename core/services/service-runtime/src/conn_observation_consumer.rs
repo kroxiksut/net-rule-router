@@ -492,6 +492,8 @@ pub struct ConnectionObservationConsumer {
     /// Main-link resends and closes, folded to one outcome per connection
     /// before they reach the primary-health sink.
     primary_stall_evidence: Mutex<stall_evidence::ConnectionStallTracker>,
+    /// Connections on any link the far side stopped answering (see `unanswered`).
+    unanswered: Mutex<unanswered::UnansweredTracker>,
     /// The application measure's sink — see [`AppMainLinkFn`].
     app_main_link: Option<AppMainLinkFn>,
     /// Programs seen leaving over the additional link — see [`AppAdditionalLinkFn`].
@@ -707,6 +709,7 @@ mod consume;
 mod drop_reporter;
 mod stall_evidence;
 mod trace_tee;
+mod unanswered;
 
 pub use trace_tee::ConnTraceTee;
 

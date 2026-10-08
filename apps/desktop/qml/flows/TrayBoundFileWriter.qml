@@ -22,6 +22,8 @@ QtObject {
     property var rpc: null
     /// GuiPresence instance — supplies the linked rules-file paths.
     property var presence: null
+    /// `PlatformProfile.os`: picks the application section of the file.
+    property string os: ""
 
     /// ACE codec for the shared serializer; a `.pragma library` cannot reach
     /// the bridge, so the conversion crosses as a callback.
@@ -83,7 +85,7 @@ QtObject {
         var corr = nrrNativeBridge.rpcSidecarPassthroughRead(route)
         var build = function(sections) {
             var model = { count: rows.length, get: function(i) { return rows[i] } }
-            var text = Rules.buildCanonicalRulesText(model, route, sections, true)
+            var text = Rules.buildCanonicalRulesText(model, route, sections, true, os)
             // Compare the routing body, not the bytes: the header carries a
             // generation timestamp, so a byte compare rewrites every file on
             // every pass and the drift watch then sees its own mtime churn.

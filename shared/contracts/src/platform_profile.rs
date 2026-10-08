@@ -116,6 +116,10 @@ pub struct PlatformSupports {
     /// Where the observer only feeds the in-memory panel, the GUI does not
     /// offer a switch that would write nothing.
     pub conn_trace_log: bool,
+    /// The service can be registered to start only when the app opens. Where
+    /// nothing would start it then, a unit that does not start at boot never
+    /// runs, so the GUI offers start-with-the-system alone.
+    pub service_start_on_app_launch: bool,
 
     // ── Capability INVERSIONS ────────────────────────────────────────────────
     // Unlike the flags above (a Windows superset that other OSes may lack),
@@ -181,6 +185,7 @@ impl PlatformProfile {
                 block_notices: true,
                 audit_chain_restart: true,
                 conn_trace_log: true,
+                service_start_on_app_launch: true,
                 // Inversions: Windows blocks apps leak-proof (ALE_APP_ID) but
                 // cannot route per-user or scope a per-user block to all
                 // protocols (packet layer forces user_sid = None).
@@ -224,6 +229,8 @@ impl PlatformProfile {
                 // The observer tee writes the operational log behind the same
                 // live switch as on Windows.
                 conn_trace_log: true,
+                // No launcher starts the systemd unit with the app.
+                service_start_on_app_launch: false,
                 // Inversions: Linux routes per-user (ip rule uidrange) and
                 // scopes per-user blocks to all protocols (meta skuid), which
                 // Windows cannot — but its per-app block is NOT leak-proof
@@ -259,6 +266,7 @@ impl PlatformProfile {
                 block_notices: false,
                 audit_chain_restart: false,
                 conn_trace_log: false,
+                service_start_on_app_launch: false,
                 // Conservative until the macOS Network Extension backend is
                 // verified: claim none of the inversions (an unverified
                 // capability flag defaults to `false`, never a false promise).
@@ -294,6 +302,28 @@ mod tests {
         assert!(s.hosts_pin && s.background_service && s.autostart);
         assert!(s.service_stability_config && s.local_network_exceptions && s.block_notices);
         assert!(s.audit_chain_restart && s.conn_trace_log && s.verbose_logging);
+        assert!(s.service_start_on_app_launch);
+    }
+
+    /// Only the SCM path starts the service with the app; offering it where the
+    /// service control refuses it is a choice that can never work.
+    #[test]
+    fn starting_the_service_with_the_app_is_offered_on_windows_only() {
+        assert!(
+            PlatformProfile::windows()
+                .supports
+                .service_start_on_app_launch
+        );
+        assert!(
+            !PlatformProfile::linux()
+                .supports
+                .service_start_on_app_launch
+        );
+        assert!(
+            !PlatformProfile::macos()
+                .supports
+                .service_start_on_app_launch
+        );
     }
 
     /// The daemon applies a verbose window without the rest of the stability
@@ -354,6 +384,7 @@ mod tests {
         assert_eq!(v["supports"]["blockNotices"], true);
         assert_eq!(v["supports"]["auditChainRestart"], true);
         assert_eq!(v["supports"]["connTraceLog"], true);
+        assert_eq!(v["supports"]["serviceStartOnAppLaunch"], true);
         // Inversion flags reach QML under camelCase keys too.
         assert_eq!(v["supports"]["perAppBlockLeakproof"], true);
         assert_eq!(v["supports"]["perUserRouting"], false);

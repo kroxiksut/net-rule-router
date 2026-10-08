@@ -1,0 +1,16 @@
+{
+  "description": "pure.js noticeKindMuted",
+  "cases": [
+    { "name": "no mutes", "input": { "mutes": [], "kind": "rules-drift", "now": 1000 }, "expected": false },
+    { "name": "until lifted", "input": { "mutes": [{ "scope": { "kind": "notice", "notice": "rules-drift" } }], "kind": "rules-drift", "now": 1000 }, "expected": true },
+    { "name": "deadline ahead", "input": { "mutes": [{ "scope": { "kind": "notice", "notice": "rules-drift" }, "until-unix-ms": 5000 }], "kind": "rules-drift", "now": 1000 }, "expected": true },
+    { "name": "deadline passed", "input": { "mutes": [{ "scope": { "kind": "notice", "notice": "rules-drift" }, "until-unix-ms": 500 }], "kind": "rules-drift", "now": 1000 }, "expected": false },
+    { "name": "other kind", "input": { "mutes": [{ "scope": { "kind": "notice", "notice": "secondary-down" } }], "kind": "rules-drift", "now": 1000 }, "expected": false },
+    { "name": "block mute is not a notice mute", "input": { "mutes": [{ "scope": { "kind": "all" } }], "kind": "rules-drift", "now": 1000 }, "expected": false },
+    { "name": "unreadable deadline", "input": { "mutes": [{ "scope": { "kind": "notice", "notice": "rules-drift" }, "until-unix-ms": "abc" }], "kind": "rules-drift", "now": 1000 }, "expected": true },
+    { "name": "not a list", "input": { "mutes": null, "kind": "rules-drift", "now": 1000 }, "expected": false },
+    { "name": "deadline as text", "input": { "mutes": [{ "scope": { "kind": "notice", "notice": "rules-drift" }, "until-unix-ms": "2000" }], "kind": "rules-drift", "now": 1000 }, "expected": true },
+    { "name": "notice as a number", "input": { "mutes": [{ "scope": { "kind": "notice", "notice": 5 } }], "kind": "5", "now": 1000 }, "expected": true },
+    { "name": "a null entry is skipped", "input": { "mutes": [null, { "scope": { "kind": "notice", "notice": "local-networks" } }], "kind": "local-networks", "now": 1000 }, "expected": true }
+  ]
+}

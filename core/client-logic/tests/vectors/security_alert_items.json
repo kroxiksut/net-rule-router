@@ -1,0 +1,65 @@
+{
+  "description": "pure.js securityAlertItemsFromStatus: null for no answer or an unreadable store, else the listed alerts",
+  "cases": [
+    { "name": "no status", "input": {}, "expected": null },
+    {
+      "name": "stale",
+      "input": { "status": { "stale": true, "security_status": { "alerts_readable": true }, "active_alerts": [] } },
+      "expected": null
+    },
+    {
+      "name": "unreadable",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": false }, "active_alerts": [] } },
+      "expected": null
+    },
+    { "name": "no security card", "input": { "status": { "stale": false, "active_alerts": [] } }, "expected": null },
+    {
+      "name": "readable and empty",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": true }, "active_alerts": [] } },
+      "expected": []
+    },
+    {
+      "name": "no list",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": true } } },
+      "expected": null
+    },
+    {
+      "name": "one alert",
+      "input": {
+        "status": {
+          "stale": false,
+          "security_status": { "alerts_readable": true },
+          "active_alerts": [
+            { "alert_id": "alt-1", "kind": "db_tamper_detected", "state": "active", "reason_code": "integrity.revision", "raised_file": "audit.ndjson", "requires_action": true }
+          ]
+        }
+      },
+      "expected": [
+        { "alert_id": "alt-1", "kind": "db_tamper_detected", "state": "active", "reason_code": "integrity.revision", "raised_file": "audit.ndjson", "requires_action": true }
+      ]
+    },
+    {
+      "name": "falsy entries skipped, loose fields",
+      "input": {
+        "status": {
+          "stale": false,
+          "security_status": { "alerts_readable": true },
+          "active_alerts": [null, 0, { "alert_id": 7, "state": "acknowledged", "requires_action": "yes" }]
+        }
+      },
+      "expected": [
+        { "alert_id": "7", "kind": "", "state": "acknowledged", "reason_code": "", "raised_file": "", "requires_action": false }
+      ]
+    },
+    {
+      "name": "list is a number",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": true }, "active_alerts": 3 } },
+      "expected": null
+    },
+    {
+      "name": "readable flag is not true",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": "true" }, "active_alerts": [] } },
+      "expected": null
+    }
+  ]
+}

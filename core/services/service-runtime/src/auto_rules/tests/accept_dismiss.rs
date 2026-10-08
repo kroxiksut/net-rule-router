@@ -119,6 +119,63 @@ fn accepting_without_an_author_wired_refuses_cleanly_and_keeps_the_offer() {
     assert_eq!(engine.candidates(SID).len(), 1);
 }
 
+/// An earlier author wrote the widened book back, so the stored rules hold
+/// `<id>+sub` twins the user never wrote. The tick removes them once per
+/// principal, whatever the mode; a refusal rests for a while instead of being
+/// resubmitted on every tick.
+#[test]
+fn stored_subdomain_twins_are_removed_once_and_a_refusal_rests_before_the_retry() {
+    let rules = FixedRules::with_secondary(vec![exact_rule("site.example")]);
+    {
+        let mut book = rules.book.lock().unwrap_or_else(|p| p.into_inner());
+        *book = book.with_subdomain_coverage();
+        assert_eq!(book.secondary.len(), 2);
+    }
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        mode_fn(AutoRulesMode::Off),
+        Arc::new(InMemoryDismissalStore::new()),
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    );
+    let author = RecordingAuthor::new(Arc::clone(&rules));
+    engine.attach_author(Arc::clone(&author) as Arc<dyn AutoRuleAuthor>);
+    let stored = || {
+        rules
+            .book
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .secondary
+            .len()
+    };
+
+    author.fail("rules-locked");
+    engine.tick(SID, later());
+    assert_eq!(stored(), 2);
+    assert_eq!(author.rewrites.load(Ordering::SeqCst), 1);
+
+    // The lock lifted, but the next ticks do not ask yet.
+    *author.fail_with.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    engine.tick(SID, later() + Duration::from_secs(10));
+    engine.tick(SID, later() + Duration::from_secs(9 * 60));
+    assert_eq!(
+        author.rewrites.load(Ordering::SeqCst),
+        1,
+        "resting after a refusal"
+    );
+    assert_eq!(stored(), 2);
+
+    engine.tick(SID, later() + Duration::from_secs(10 * 60));
+    assert_eq!(stored(), 1);
+
+    engine.tick(SID, later() + Duration::from_secs(11 * 60));
+    assert_eq!(
+        author.rewrites.load(Ordering::SeqCst),
+        2,
+        "checked once after it succeeded"
+    );
+}
+
 // ── Dismiss ──────────────────────────────────────────────────────────────────
 
 #[test]

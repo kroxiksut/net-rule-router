@@ -231,6 +231,14 @@ impl BlockNoticeCenter {
     /// removes one, so "do not show this again" takes hold on the next block
     /// rather than after a restart.
     pub fn reload_mutes(&self, sid: &str) {
+        if let Some(bus) = self.events.as_ref() {
+            bus.publish_for(
+                sid,
+                StatusUpdateEvent::BlockNoticeMutesChanged {
+                    sid: sid.to_owned(),
+                },
+            );
+        }
         let Some(loader) = self.mute_loader.as_ref() else {
             return;
         };

@@ -1,0 +1,190 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Status
+Service: OK
+Routing state:
+  Routing active
+  Rules apply on this user session.
+Connections:
+  Main connection: Ethernet — Example Network Adapter — Available — Rules applied
+  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+Notifications:
+  No notifications.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Cache
+Service: OK
+Cache:
+  Loading cache entries...
+  c: Clear app cache   o: Clear OS DNS cache
+Cache entries:
+Selected entry:
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that entry, for example d 3
+  / and text: search the cache on the service, for example /example.com; / on its own clears the search
+  c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Cache: Entries on the service: 12.
+Cache entries: > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
+Cache entries: 2. host1.example.com → 192.0.2.21 · Additional (VPN) · Fresh
+Cache entries: 3. host2.example.com → 192.0.2.22 · Additional (VPN) · Fresh
+Cache entries: 4. host3.example.com → 192.0.2.23 · — · Fresh
+Cache entries: 5. host4.example.com → 192.0.2.24 · — · Fresh
+Cache entries: 6. host5.example.com → 192.0.2.25 · — · Fresh
+Cache entries: 7. host6.example.com → 192.0.2.26 · — · Fresh
+Cache entries: 8. host7.example.com → 192.0.2.27 · — · Fresh
+Cache entries: 9. host8.example.com → 192.0.2.28 · — · Fresh
+Cache entries: 10. host9.example.com → 192.0.2.29 · — · Fresh
+Cache entries: Rows 1–10 of 12.
+Selected entry: Host: host0.example.com
+Selected entry: IP: 192.0.2.20
+Selected entry: Route: Additional (VPN)
+Selected entry: Freshness: Fresh
+Selected entry: Source: DNS
+Selected entry: resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
+
+Screen: Cache
+Service: OK
+Cache:
+  Entries on the service: 12.
+  Clear the app cache? Names are resolved again as programs use them.
+  y: yes   n: no
+Cache entries:
+  > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
+    2. host1.example.com → 192.0.2.21 · Additional (VPN) · Fresh
+    3. host2.example.com → 192.0.2.22 · Additional (VPN) · Fresh
+    4. host3.example.com → 192.0.2.23 · — · Fresh
+    5. host4.example.com → 192.0.2.24 · — · Fresh
+    6. host5.example.com → 192.0.2.25 · — · Fresh
+    7. host6.example.com → 192.0.2.26 · — · Fresh
+    8. host7.example.com → 192.0.2.27 · — · Fresh
+    9. host8.example.com → 192.0.2.28 · — · Fresh
+    10. host9.example.com → 192.0.2.29 · — · Fresh
+  Rows 1–10 of 12.
+Selected entry:
+  Host: host0.example.com
+  IP: 192.0.2.20
+  Route: Additional (VPN)
+  Freshness: Fresh
+  Source: DNS
+  resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that entry, for example d 3
+  / and text: search the cache on the service, for example /example.com; / on its own clears the search
+  c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Not understood: x
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Cache
+Service: OK
+Cache:
+  Entries on the service: 12.
+  c: Clear app cache   o: Clear OS DNS cache
+Cache entries:
+  > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
+    2. host1.example.com → 192.0.2.21 · Additional (VPN) · Fresh
+    3. host2.example.com → 192.0.2.22 · Additional (VPN) · Fresh
+    4. host3.example.com → 192.0.2.23 · — · Fresh
+    5. host4.example.com → 192.0.2.24 · — · Fresh
+    6. host5.example.com → 192.0.2.25 · — · Fresh
+    7. host6.example.com → 192.0.2.26 · — · Fresh
+    8. host7.example.com → 192.0.2.27 · — · Fresh
+    9. host8.example.com → 192.0.2.28 · — · Fresh
+    10. host9.example.com → 192.0.2.29 · — · Fresh
+  Rows 1–10 of 12.
+Selected entry:
+  Host: host0.example.com
+  IP: 192.0.2.20
+  Route: Additional (VPN)
+  Freshness: Fresh
+  Source: DNS
+  resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that entry, for example d 3
+  / and text: search the cache on the service, for example /example.com; / on its own clears the search
+  c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Cache
+Service: OK
+Cache:
+  Entries on the service: 12.
+  Flush the operating system's DNS cache?
+  y: yes   n: no
+Cache entries:
+  > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
+    2. host1.example.com → 192.0.2.21 · Additional (VPN) · Fresh
+    3. host2.example.com → 192.0.2.22 · Additional (VPN) · Fresh
+    4. host3.example.com → 192.0.2.23 · — · Fresh
+    5. host4.example.com → 192.0.2.24 · — · Fresh
+    6. host5.example.com → 192.0.2.25 · — · Fresh
+    7. host6.example.com → 192.0.2.26 · — · Fresh
+    8. host7.example.com → 192.0.2.27 · — · Fresh
+    9. host8.example.com → 192.0.2.28 · — · Fresh
+    10. host9.example.com → 192.0.2.29 · — · Fresh
+  Rows 1–10 of 12.
+Selected entry:
+  Host: host0.example.com
+  IP: 192.0.2.20
+  Route: Additional (VPN)
+  Freshness: Fresh
+  Source: DNS
+  resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that entry, for example d 3
+  / and text: search the cache on the service, for example /example.com; / on its own clears the search
+  c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Cache
+Service: OK
+Cache:
+  Entries on the service: 12.
+  Clearing…
+Cache entries:
+  > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
+    2. host1.example.com → 192.0.2.21 · Additional (VPN) · Fresh
+    3. host2.example.com → 192.0.2.22 · Additional (VPN) · Fresh
+    4. host3.example.com → 192.0.2.23 · — · Fresh
+    5. host4.example.com → 192.0.2.24 · — · Fresh
+    6. host5.example.com → 192.0.2.25 · — · Fresh
+    7. host6.example.com → 192.0.2.26 · — · Fresh
+    8. host7.example.com → 192.0.2.27 · — · Fresh
+    9. host8.example.com → 192.0.2.28 · — · Fresh
+    10. host9.example.com → 192.0.2.29 · — · Fresh
+  Rows 1–10 of 12.
+Selected entry:
+  Host: host0.example.com
+  IP: 192.0.2.20
+  Route: Additional (VPN)
+  Freshness: Fresh
+  Source: DNS
+  resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that entry, for example d 3
+  / and text: search the cache on the service, for example /example.com; / on its own clears the search
+  c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Cache: Could not flush the OS DNS cache.
+Cache: c: Clear app cache   o: Clear OS DNS cache

@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use nrr_domain::user_principal::UserPrincipal;
 use nrr_platform_api::active_principals::ActivePrincipalSource;
 use nrr_platform_api::enforcement::{
-    ApplyReport, ChannelAvailability, EnforcementPlan, PolicyEnforcer,
+    plan_delta, ApplyReport, ChannelAvailability, EnforcementPlan, PolicyEnforcer,
 };
 
 /// Produces one principal's neutral plan from the stored policy.
@@ -151,7 +151,8 @@ pub struct PrincipalEnforcementCycle {
     /// Three callers drive this cycle (the timer, an apply from the GUI, a link
     /// change), and two of them planning concurrently would let the slower one
     /// install its older view of the machine last.
-    last_applied: Mutex<Option<Vec<EnforcementPlan>>>,
+    /// Shared so the change can be described after the lock is released.
+    last_applied: Mutex<Option<Arc<Vec<EnforcementPlan>>>>,
     /// Mirrors "this pass is holding destinations back" for readers that must
     /// not treat a rule host as covered while it is armed — today the rule
     /// hostname seeder's retry pacing. `None` leaves them on calm pacing.
@@ -173,22 +174,19 @@ pub struct PrincipalEnforcementCycle {
     /// Breaks the connections a pass left on their old path. `None` leaves
     /// them to finish there.
     flow_reset: Option<Arc<crate::plan_flow_reset::PlanFlowReset>>,
+    /// Told after each pass that found somebody present. Set once, after
+    /// construction: its consumer is built from hooks that drive this cycle.
+    presence_listener: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    /// Whether the last pass's authority named anybody.
+    someone_present: AtomicBool,
 }
 
-/// Whether this plan asks for something the packet layer will apply to the
-/// WHOLE machine.
-///
-/// The packet layer carries no user context (`FWPM_CONDITION_ALE_USER_ID` exists
-/// only on the ALE layers), so a block emitted there is machine-wide no matter
-/// whose plan produced it. `AllPackets` coverage on a Block is exactly that
-/// shape.
-/// One line naming what changed between two passes: counts per principal plus
-/// one example each way. Runs only on a change, so its quadratic diff never
-/// costs the steady state anything.
+/// One line counting what changed between two passes, per principal. Counts
+/// only: the line has no principal of its own, so every user may read it, and
+/// a destination in it would tell one user where another's rules send them.
 fn describe_change(old: &[EnforcementPlan], new: &[EnforcementPlan]) -> String {
-    use nrr_platform_api::enforcement::plan_delta;
-    // Principals by position, not name: the name is redacted elsewhere on the
-    // same line, and free text would carry it past the redaction.
+    // Principals by position, not name: the names are redacted elsewhere on
+    // the same line, and free text would carry them past the redaction.
     let mut parts = Vec::new();
     for (n, plan) in new.iter().enumerate() {
         let Some(before) = old.iter().find(|p| p.principal == plan.principal) else {
@@ -196,32 +194,13 @@ fn describe_change(old: &[EnforcementPlan], new: &[EnforcementPlan]) -> String {
             continue;
         };
         let flows = plan_delta(before, plan);
-        let routes_added = plan
-            .routes
-            .iter()
-            .filter(|r| !before.routes.contains(r))
-            .count();
-        let routes_removed = before
-            .routes
-            .iter()
-            .filter(|r| !plan.routes.contains(r))
-            .count();
-        let sample = |f: &nrr_platform_api::enforcement::FlowRule| {
-            format!("{:?} {:?} {:?}", f.verdict, f.precedence.class, f.flow.dst)
-        };
-        let mut line = format!(
+        let (routes_added, routes_removed) = route_delta(before, plan);
+        parts.push(format!(
             "#{n}: flows +{} -{}{}, routes +{routes_added} -{routes_removed}",
             flows.added.len(),
             flows.removed.len(),
             if flows.reordered { " reordered" } else { "" },
-        );
-        if let Some(&i) = flows.added.first() {
-            line.push_str(&format!("; +[{}]", sample(&plan.flows[i])));
-        }
-        if let Some(&i) = flows.removed.first() {
-            line.push_str(&format!("; -[{}]", sample(&before.flows[i])));
-        }
-        parts.push(line);
+        ));
     }
     let gone = old
         .iter()
@@ -233,6 +212,53 @@ fn describe_change(old: &[EnforcementPlan], new: &[EnforcementPlan]) -> String {
     parts.join(" | ")
 }
 
+/// One example each way per changed principal, at debug and stamped with
+/// that principal: the destination is theirs, and the audience scoping and
+/// field redaction apply only to a line that says whose it is.
+fn log_change_samples(old: &[EnforcementPlan], new: &[EnforcementPlan]) {
+    if !tracing::enabled!(target: "nrr::enforcement", tracing::Level::DEBUG) {
+        return;
+    }
+    for plan in new {
+        let Some(before) = old.iter().find(|p| p.principal == plan.principal) else {
+            continue;
+        };
+        let flows = plan_delta(before, plan);
+        let sample = |f: &nrr_platform_api::enforcement::FlowRule| {
+            format!("{:?} {:?} {:?}", f.verdict, f.precedence.class, f.flow.dst)
+        };
+        let added = flows.added.first().map(|&i| sample(&plan.flows[i]));
+        let removed = flows.removed.first().map(|&i| sample(&before.flows[i]));
+        if added.is_none() && removed.is_none() {
+            continue;
+        }
+        tracing::debug!(
+            target: "nrr::enforcement",
+            sid = plan.principal.as_stored(),
+            added_address = added.as_deref().unwrap_or("-"),
+            removed_address = removed.as_deref().unwrap_or("-"),
+            "plan change sample",
+        );
+    }
+}
+
+fn route_delta(old: &EnforcementPlan, new: &EnforcementPlan) -> (usize, usize) {
+    use std::collections::HashSet;
+    let before: HashSet<_> = old.routes.iter().collect();
+    let after: HashSet<_> = new.routes.iter().collect();
+    (
+        after.difference(&before).count(),
+        before.difference(&after).count(),
+    )
+}
+
+/// Whether this plan asks for something the packet layer will apply to the
+/// WHOLE machine.
+///
+/// The packet layer carries no user context (`FWPM_CONDITION_ALE_USER_ID` exists
+/// only on the ALE layers), so a block emitted there is machine-wide no matter
+/// whose plan produced it. `AllPackets` coverage on a Block is exactly that
+/// shape.
 fn plan_cuts_machine_wide(plan: &EnforcementPlan) -> bool {
     use nrr_platform_api::enforcement::{Coverage, Verdict};
     plan.flows
@@ -260,7 +286,16 @@ impl PrincipalEnforcementCycle {
             last_pass_at: AtomicU64::new(epoch_secs()),
             inputs: None,
             flow_reset: None,
+            presence_listener: std::sync::OnceLock::new(),
+            someone_present: AtomicBool::new(false),
         }
+    }
+
+    /// Call `listener` after every pass that finds somebody present, with the
+    /// pass lock released: the presence poll for a consumer no sign-in event
+    /// reaches. A second listener is ignored.
+    pub fn set_presence_listener(&self, listener: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.presence_listener.set(listener);
     }
 
     /// Tear down, after each pass that changes what a destination's traffic
@@ -321,14 +356,20 @@ impl PrincipalEnforcementCycle {
     fn pass(&self, skip_if_unchanged: bool) -> CycleOutcome {
         let outcome = self.run_pass(skip_if_unchanged);
         self.last_pass_at.store(epoch_secs(), Ordering::Relaxed);
+        if self.someone_present.load(Ordering::Acquire) {
+            if let Some(listener) = self.presence_listener.get() {
+                listener();
+            }
+        }
         outcome
     }
 
     /// Let the next pass hand over plans refused before — for an explicit
     /// request (an apply from the GUI), which may follow a fix the plans do not
-    /// show.
+    /// show, or somebody else removing what was installed.
     pub fn request_retry(&self) {
         self.retry_requested.store(true, Ordering::Release);
+        self.enforcer.distrust_installed();
     }
 
     /// When the last pass finished, in epoch seconds — a watchdog's evidence
@@ -349,12 +390,15 @@ impl PrincipalEnforcementCycle {
         let active = match self.principals.active_principals() {
             Ok(active) => active,
             Err(e) => {
+                self.someone_present.store(false, Ordering::Release);
                 return CycleOutcome::AuthorityUnavailable {
                     reason: e.to_string(),
-                }
+                };
             }
         };
 
+        self.someone_present
+            .store(!active.is_empty(), Ordering::Release);
         let availability: Vec<ChannelAvailability> = active
             .iter()
             .map(|principal| self.enforcer.channel_availability(principal))
@@ -395,10 +439,7 @@ impl PrincipalEnforcementCycle {
             plans.push(planned.plan);
         }
 
-        let changed = last.as_deref() != Some(plans.as_slice());
-        let delta = changed
-            .then(|| last.as_deref().map(|old| describe_change(old, &plans)))
-            .flatten();
+        let changed = last.as_deref().map(Vec::as_slice) != Some(plans.as_slice());
         timings.mark("plan");
 
         // Planning above is not instant, and a stop can land inside it.
@@ -421,7 +462,10 @@ impl PrincipalEnforcementCycle {
             _ => None,
         };
         drop(refused);
-        let outcome = match result {
+        // The plans this pass replaced and installed, when they differ; the
+        // change is described once the pass lock is released.
+        let mut replaced = None;
+        let mut outcome = match result {
             Ok(report) => {
                 let principals = plans
                     .iter()
@@ -442,17 +486,23 @@ impl PrincipalEnforcementCycle {
                     })
                 });
                 timings.mark("routes");
+                let routes_failed = routes.as_ref().is_some_and(|r| r.failure.is_some());
 
                 if let Some(flow_reset) = self.flow_reset.as_ref() {
-                    if routes.as_ref().is_some_and(|r| r.failure.is_some()) {
+                    if routes_failed {
                         flow_reset.defer();
                     } else {
-                        flow_reset.after_apply(&plans, changed, |principal| {
-                            active
-                                .iter()
-                                .zip(&availability)
-                                .any(|(p, a)| p == principal && a.secondary)
-                        });
+                        flow_reset.after_apply(
+                            &plans,
+                            changed,
+                            |principal| {
+                                active
+                                    .iter()
+                                    .zip(&availability)
+                                    .any(|(p, a)| p == principal && a.secondary)
+                            },
+                            |principal| self.enforcer.flow_links(principal),
+                        );
                     }
                     timings.mark("flow-reset");
                 }
@@ -463,15 +513,25 @@ impl PrincipalEnforcementCycle {
                 if let Some(posture) = self.fail_closed_posture.as_ref() {
                     posture.set(guarded > 0);
                 }
-                *last = Some(plans);
-                if let (Some(inputs), Some(fp)) = (self.inputs.as_ref(), fingerprint) {
-                    inputs.settle(fp);
+                let installed = Arc::new(plans);
+                if let Some(previous) = last.replace(Arc::clone(&installed)) {
+                    if changed {
+                        replaced = Some((previous, installed));
+                    }
+                }
+                // A failed route apply usually leaves the table as it was, so
+                // nothing in the inputs would move to bring the retry back.
+                if let Some(inputs) = self.inputs.as_ref() {
+                    match fingerprint {
+                        Some(fp) if !routes_failed => inputs.settle(fp),
+                        _ => inputs.unsettle(),
+                    }
                 }
                 CycleOutcome::Applied {
                     principals,
                     report,
                     changed,
-                    delta,
+                    delta: None,
                     unprotected,
                     guarded,
                     routes,
@@ -489,6 +549,13 @@ impl PrincipalEnforcementCycle {
                 }
             }
         };
+        drop(last);
+        if let Some((previous, installed)) = replaced {
+            if let CycleOutcome::Applied { delta, .. } = &mut outcome {
+                *delta = Some(describe_change(&previous, &installed));
+            }
+            log_change_samples(&previous, &installed);
+        }
         crate::phase_timings::report_if_slow(
             &timings,
             "principal-enforcement",
@@ -516,14 +583,6 @@ impl PrincipalEnforcementCycle {
         outcome
     }
 
-    /// Remove everything this product installed. Called on graceful stop: a
-    /// daemon that exits leaving its policy in the kernel leaves the machine
-    /// enforcing rules nothing is maintaining any more.
-    ///
-    /// Filters first, then routes — the opposite order to applying them. A
-    /// moment with routes but no filters still carries traffic over the link
-    /// the user chose; the reverse leaves the leak-guard `drop` in place with
-    /// nothing steering around it, which is a machine with no network.
     /// Tell the principals who need to know, and only them.
     ///
     /// Published on a CHANGE, never on the identical re-apply that follows every
@@ -564,6 +623,14 @@ impl PrincipalEnforcementCycle {
         }
     }
 
+    /// Remove everything this product installed. Called on graceful stop: a
+    /// daemon that exits leaving its policy in the kernel leaves the machine
+    /// enforcing rules nothing is maintaining any more.
+    ///
+    /// Filters first, then routes — the opposite order to applying them. A
+    /// moment with routes but no filters still carries traffic over the link
+    /// the user chose; the reverse leaves the leak-guard `drop` in place with
+    /// nothing steering around it, which is a machine with no network.
     pub fn teardown(&self) -> Result<(), String> {
         // Held for the whole teardown, and the latch is set inside it: a pass
         // already under way finishes, no later one starts, and the last word on
@@ -873,6 +940,7 @@ mod tests {
         inside: AtomicUsize,
         overlaps: AtomicUsize,
         teardowns: AtomicUsize,
+        distrusts: AtomicUsize,
     }
     impl RecordingEnforcer {
         fn new(fail: bool) -> Self {
@@ -885,6 +953,7 @@ mod tests {
                 inside: AtomicUsize::new(0),
                 overlaps: AtomicUsize::new(0),
                 teardowns: AtomicUsize::new(0),
+                distrusts: AtomicUsize::new(0),
             }
         }
         fn calls(&self) -> Vec<Vec<String>> {
@@ -924,6 +993,10 @@ mod tests {
         fn teardown(&self) -> Result<(), EnforcementFailure> {
             self.teardowns.fetch_add(1, Ordering::AcqRel);
             Ok(())
+        }
+
+        fn distrust_installed(&self) {
+            self.distrusts.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -1068,6 +1141,145 @@ mod tests {
         assert_eq!(enforcer.calls().len(), 3);
     }
 
+    /// Filters landing while the routes fail is not a settled pass: a failed
+    /// route apply usually leaves the table as it was, so no input moves to
+    /// bring the retry back before the periodic full pass.
+    #[test]
+    fn a_pass_whose_routes_failed_is_not_remembered_as_settled() {
+        use nrr_platform_api::adapters::{AdapterEventSource, AdapterInfo};
+        use nrr_platform_api::enforcement::{EgressBinding, EgressBindingSource};
+        use nrr_platform_api::error::PlatformError;
+        use std::sync::atomic::AtomicBool;
+
+        struct Adapters(Arc<AtomicBool>);
+        impl AdapterEventSource for Adapters {
+            fn enumerate_all(&self) -> Result<Vec<AdapterInfo>, PlatformError> {
+                if self.0.load(Ordering::Acquire) {
+                    Err(PlatformError::Transient {
+                        operation: "enumerate",
+                        detail: "busy".into(),
+                    })
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+        struct Unbound;
+        impl EgressBindingSource for Unbound {
+            fn bindings_for(&self, _: &UserPrincipal) -> EgressBinding {
+                EgressBinding {
+                    primary: None,
+                    secondary: None,
+                }
+            }
+        }
+
+        let failing = Arc::new(AtomicBool::new(true));
+        let enforcer = Arc::new(RecordingEnforcer::new(false));
+        let c = cycle(Some(vec![uid(1000)]), Vec::new(), Arc::clone(&enforcer))
+            .with_routes(Arc::new(crate::route_apply::PlannedRouteApplier::new(
+                Arc::new(nrr_platform_api::MockWindowsApi::new()),
+                Arc::new(Adapters(Arc::clone(&failing))),
+                Arc::new(Unbound),
+            )))
+            .with_pass_inputs(
+                crate::pass_inputs::PassInputs::new().with_source("test", Arc::new(|| Some(7))),
+            );
+
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Applied { routes: Some(ref r), .. } if r.failure.is_some()
+        ));
+        assert!(
+            !matches!(c.tick_if_changed_logged("timer"), CycleOutcome::Unchanged),
+            "the route retry waited for the periodic full pass",
+        );
+
+        failing.store(false, Ordering::Release);
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Applied { routes: Some(ref r), .. } if r.failure.is_none()
+        ));
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Unchanged
+        ));
+    }
+
+    /// The change line has no principal, so every user may read it: it counts
+    /// what changed and never names where anybody's traffic goes.
+    #[test]
+    fn the_change_line_counts_and_names_no_destination() {
+        use nrr_platform_api::enforcement::{
+            AppScope, Coverage, DstMatch, EgressConstraint, EgressRef, FlowMatch, FlowRule,
+            Precedence, PrecedenceClass, PrincipalScope, RouteIntent, RouteTableRef, Verdict,
+        };
+        let host = |last: u8| FlowRule {
+            verdict: Verdict::Permit,
+            precedence: Precedence {
+                class: PrecedenceClass::RouteRule(nrr_shared::RouteRole::Secondary),
+                ordinal: 0,
+            },
+            flow: FlowMatch {
+                dst: DstMatch::HostV4(std::net::Ipv4Addr::new(203, 0, 113, last)),
+                dst_port: None,
+                protocol: None,
+            },
+            principal: PrincipalScope(None),
+            app: AppScope::Any,
+            egress: EgressConstraint::Any,
+            coverage: Coverage::ConnectOnly,
+        };
+        let route = |last: u8| RouteIntent {
+            dst: DstMatch::HostV4(std::net::Ipv4Addr::new(203, 0, 113, last)),
+            egress: EgressRef::Secondary,
+            metric: 1,
+            table: RouteTableRef::Main,
+        };
+        let plan = |flows: Vec<FlowRule>, routes: Vec<RouteIntent>| EnforcementPlan {
+            principal: uid(1000),
+            flows,
+            routes,
+            policy_rules: Vec::new(),
+        };
+        let old = vec![plan(vec![host(1), host(2)], vec![route(1)])];
+        let new = vec![plan(vec![host(2), host(3), host(4)], vec![route(3)])];
+
+        let line = describe_change(&old, &new);
+        assert_eq!(line, "#0: flows +2 -1, routes +1 -1");
+        assert!(!line.contains("203.0.113"), "{line}");
+    }
+
+    /// The presence poll a consumer without a sign-in event relies on: told
+    /// after a pass that finds somebody, never after one that finds nobody.
+    #[test]
+    fn the_presence_listener_hears_only_passes_that_find_somebody() {
+        let heard = Arc::new(AtomicUsize::new(0));
+        let listener = {
+            let heard = Arc::clone(&heard);
+            Arc::new(move || {
+                heard.fetch_add(1, Ordering::AcqRel);
+            })
+        };
+        let nobody = cycle(
+            Some(Vec::new()),
+            Vec::new(),
+            Arc::new(RecordingEnforcer::new(false)),
+        );
+        nobody.set_presence_listener(listener.clone());
+        nobody.tick();
+        assert_eq!(heard.load(Ordering::Acquire), 0);
+
+        let somebody = cycle(
+            Some(vec![uid(1000)]),
+            Vec::new(),
+            Arc::new(RecordingEnforcer::new(false)),
+        );
+        somebody.set_presence_listener(listener);
+        somebody.tick();
+        assert_eq!(heard.load(Ordering::Acquire), 1);
+    }
+
     /// A refused pass leaves nothing settled: the next one must try again
     /// rather than call the refused state applied.
     #[test]
@@ -1150,7 +1362,10 @@ mod tests {
         assert!(matches!(c.tick(), CycleOutcome::RefusalStands { .. }));
 
         *enforcer.fail.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        assert_eq!(enforcer.distrusts.load(Ordering::Acquire), 0);
         c.request_retry();
+        // The platform must re-check what it installed, not trust a cache.
+        assert_eq!(enforcer.distrusts.load(Ordering::Acquire), 1);
         assert!(matches!(c.tick(), CycleOutcome::Applied { .. }));
         assert!(matches!(c.tick(), CycleOutcome::Applied { .. }));
         assert_eq!(enforcer.calls().len(), 3);

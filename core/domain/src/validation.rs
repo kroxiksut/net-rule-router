@@ -34,7 +34,7 @@ use crate::{
     address_class::AddressClass,
     canonical::{
         CanonicalAddressMatch, CanonicalAppMatch, CanonicalAppPattern, CanonicalProfile,
-        CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
+        CanonicalRule, CanonicalRuleBook, CanonicalRuleSet, RuleAction,
     },
     ip_network_policy::{self, IpValueKind},
     rules_file::HostPlatform,
@@ -431,6 +431,11 @@ pub enum ValidationWarning {
     /// was dropped instead of blocking the rest of the file — the same policy
     /// as an address that is never a destination.
     AppPatternRefusedDropped { rule_id: RuleId, value: String },
+
+    /// A "try the primary route first" rule (`?host`) outside the one place it
+    /// means something — a host-name rule in the secondary set. It was kept as
+    /// a plain route rule of its own set.
+    VerifyPrimaryIgnored { rule_id: RuleId, role: RouteRole },
 }
 
 impl fmt::Display for ValidationWarning {
@@ -559,6 +564,12 @@ impl fmt::Display for ValidationWarning {
                 write!(
                     f,
                     "rule {rule_id}: application value '{value}' is refused; the rule was dropped"
+                )
+            }
+            Self::VerifyPrimaryIgnored { rule_id, role } => {
+                write!(
+                    f,
+                    "rule {rule_id}: '?' applies to a secondary domain rule only; kept as a plain {role:?} rule"
                 )
             }
         }
@@ -798,18 +809,45 @@ fn collect_rule_errors_only(config: &ActiveConfiguration, errors: &mut Vec<Valid
 /// the final profile from being produced.
 fn normalize_rule_set(
     rules: &[Rule],
-    _role: RouteRole,
+    role: RouteRole,
     naming: ExecutableNaming,
     errors: &mut Vec<ValidationError>,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Vec<CanonicalRule> {
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
-        if let Some(canonical) = normalize_rule(rule, naming, errors, warnings) {
+        if let Some(mut canonical) = normalize_rule(rule, naming, errors, warnings) {
+            if settle_verify_primary(&mut canonical, role) {
+                warnings.push(ValidationWarning::VerifyPrimaryIgnored {
+                    rule_id: canonical.id.clone(),
+                    role,
+                });
+            }
             out.push(canonical);
         }
     }
     out
+}
+
+/// Turns a `?` that means nothing where it stands into a plain route rule of
+/// its own set; `true` when it did. The rules file and the wire both go
+/// through here, so one rule has one meaning whichever way it arrives.
+pub(crate) fn settle_verify_primary(rule: &mut CanonicalRule, role: RouteRole) -> bool {
+    if rule.action == RuleAction::VerifyPrimary && !verify_primary_applies(rule, role) {
+        rule.action = RuleAction::Route;
+        return true;
+    }
+    false
+}
+
+/// "Try the primary route first" is a question about a host name the
+/// secondary set claims; in the primary set the answer is already "primary".
+fn verify_primary_applies(rule: &CanonicalRule, role: RouteRole) -> bool {
+    role == RouteRole::Secondary
+        && matches!(
+            rule.address_match,
+            Some(CanonicalAddressMatch::ExactFqdn(_) | CanonicalAddressMatch::SuffixDomain(_))
+        )
 }
 
 /// Normalizes a single rule. Returns `None` when a blocking error was found and
@@ -1359,7 +1397,7 @@ pub(crate) struct MatchKey {
     address: Option<CanonicalAddressMatch>,
     app_pattern: Option<CanonicalAppPattern>,
     app_children: Option<bool>,
-    action: crate::canonical::RuleAction,
+    action: RuleAction,
     enabled: bool,
 }
 
@@ -1373,33 +1411,70 @@ impl MatchKey {
             enabled: rule.enabled,
         }
     }
+
+    /// The key within ONE set. `?x` there is `x` with a check in front of it,
+    /// so the two are one rule and [`deduplicate_set`] keeps the plain one;
+    /// across sets they stay two instructions, which [`Self::from_rule`] keeps
+    /// apart.
+    fn within_set(rule: &CanonicalRule) -> Self {
+        let mut key = Self::from_rule(rule);
+        if key.action == RuleAction::VerifyPrimary {
+            key.action = RuleAction::Route;
+        }
+        key
+    }
+
+    /// The key a rule is compared under against the OTHER set: a range that
+    /// is exactly one network is that network, so `10.0.0.0/24` on one route
+    /// and `10.0.0.0-10.0.0.255` on the other are the same tie the matcher
+    /// breaks by itself.
+    fn across_sets(rule: &CanonicalRule) -> Self {
+        let mut key = Self::from_rule(rule);
+        if let Some(CanonicalAddressMatch::IpRange(range)) = &key.address {
+            if let [block] = range.blocks() {
+                key.address = Some(CanonicalAddressMatch::Subnet(*block));
+            }
+        }
+        key
+    }
 }
 
 /// Removes duplicate rules within a single route rule set.
 ///
 /// When two rules share identical match conditions, the first one encountered
-/// is kept. A [`ValidationWarning::DuplicateRuleInSameSet`] is emitted for
-/// each removed duplicate.
+/// is kept — except that a plain rule beats its `?` twin wherever either
+/// stands: the user already confirmed the route, and line order must not
+/// decide which link the traffic takes. A
+/// [`ValidationWarning::DuplicateRuleInSameSet`] names the kept and the
+/// removed rule.
 fn deduplicate_set(
     rules: Vec<CanonicalRule>,
     role: RouteRole,
     warnings: &mut Vec<ValidationWarning>,
 ) -> Vec<CanonicalRule> {
-    let mut seen: std::collections::HashMap<MatchKey, RuleId> = std::collections::HashMap::new();
-    let mut out = Vec::with_capacity(rules.len());
+    let mut seen: std::collections::HashMap<MatchKey, usize> = std::collections::HashMap::new();
+    let mut out: Vec<CanonicalRule> = Vec::with_capacity(rules.len());
 
     for rule in rules {
-        let key = MatchKey::from_rule(&rule);
+        let key = MatchKey::within_set(&rule);
         match seen.get(&key) {
-            Some(kept_id) => {
+            Some(&slot) => {
+                let kept = &mut out[slot];
+                let removed = if kept.action == RuleAction::VerifyPrimary
+                    && rule.action != RuleAction::VerifyPrimary
+                {
+                    std::mem::replace(kept, rule)
+                } else {
+                    rule
+                };
                 warnings.push(ValidationWarning::DuplicateRuleInSameSet {
-                    kept_rule_id: kept_id.clone(),
-                    removed_rule_id: rule.id.clone(),
+                    kept_rule_id: out[slot].id.clone(),
+                    removed_rule_id: removed.id,
                     role,
                 });
             }
             None => {
-                seen.insert(key, rule.id.clone());
+                seen.insert(key, out.len());
                 out.push(rule);
             }
         }
@@ -1431,6 +1506,38 @@ pub struct CrossSetDuplicate {
 /// Enabled on both sides is the whole condition: a disabled copy is exactly the
 /// state the user is offered as the resolution, so reporting it again would ask
 /// the same question forever.
+/// The networks both routes name as the same addresses, both routing them, as
+/// the secondary rule spells them. Which link such a network takes would be a
+/// tie, and the product refuses a tie rather than settling it quietly. A range
+/// that is exactly one subnet is that subnet; a block is not a route, and an
+/// equal route network loses to it.
+#[must_use]
+pub fn networks_on_both_routes(book: &CanonicalRuleBook) -> Vec<String> {
+    let routed_network = |rule: &&CanonicalRule| {
+        rule.enabled
+            && rule.action == crate::canonical::RuleAction::Route
+            && rule
+                .address_match
+                .as_ref()
+                .is_some_and(|m| m.ip_blocks().is_some())
+    };
+    let primary: std::collections::HashSet<MatchKey> = book
+        .primary
+        .rules()
+        .iter()
+        .filter(routed_network)
+        .map(MatchKey::across_sets)
+        .collect();
+    book.secondary
+        .rules()
+        .iter()
+        .filter(routed_network)
+        .filter(|rule| primary.contains(&MatchKey::across_sets(rule)))
+        .filter_map(|rule| rule.address_match.as_ref())
+        .map(CanonicalAddressMatch::to_display_string)
+        .collect()
+}
+
 pub fn enabled_duplicates_across_sets(book: &CanonicalRuleBook) -> Vec<CrossSetDuplicate> {
     let primary: Vec<&CanonicalRule> = book
         .primary
@@ -1443,17 +1550,17 @@ pub fn enabled_duplicates_across_sets(book: &CanonicalRuleBook) -> Vec<CrossSetD
     }
     let by_match: std::collections::HashMap<MatchKey, &CanonicalRule> = primary
         .iter()
-        .map(|rule| (MatchKey::from_rule(rule), *rule))
+        .map(|rule| (MatchKey::across_sets(rule), *rule))
         .collect();
 
     let mut found = Vec::new();
     for secondary in book.secondary.rules().iter().filter(|rule| rule.enabled) {
-        if let Some(primary) = by_match.get(&MatchKey::from_rule(secondary)) {
+        if let Some(primary) = by_match.get(&MatchKey::across_sets(secondary)) {
             found.push(CrossSetDuplicate {
                 identity_key: crate::review::rule_identity_key(secondary),
                 primary_rule_id: primary.id.clone(),
                 secondary_rule_id: secondary.id.clone(),
-                match_summary: describe_match(secondary),
+                match_summary: describe_pair(primary, secondary),
             });
         }
     }
@@ -1463,6 +1570,17 @@ pub fn enabled_duplicates_across_sets(book: &CanonicalRuleBook) -> Vec<CrossSetD
             .then_with(|| a.primary_rule_id.as_str().cmp(b.primary_rule_id.as_str()))
     });
     found
+}
+
+/// What a cross-set pair matches. Two spellings of one network are both shown:
+/// the user looks for each in its own list.
+fn describe_pair(primary: &CanonicalRule, secondary: &CanonicalRule) -> String {
+    let (p, s) = (describe_match(primary), describe_match(secondary));
+    if p == s {
+        s
+    } else {
+        format!("{p} = {s}")
+    }
 }
 
 /// What a rule matches, spelled for a person. Falls back to the rule id when a
@@ -1492,11 +1610,11 @@ fn detect_cross_set_duplicates(
 ) {
     let primary_keys: std::collections::HashMap<MatchKey, &RuleId> = primary
         .iter()
-        .map(|r| (MatchKey::from_rule(r), &r.id))
+        .map(|r| (MatchKey::across_sets(r), &r.id))
         .collect();
 
     for sec_rule in secondary {
-        let key = MatchKey::from_rule(sec_rule);
+        let key = MatchKey::across_sets(sec_rule);
         if let Some(pri_id) = primary_keys.get(&key) {
             warnings.push(ValidationWarning::DuplicateRuleAcrossSets {
                 primary_rule_id: (*pri_id).clone(),

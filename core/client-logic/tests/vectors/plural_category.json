@@ -1,0 +1,28 @@
+{
+  "description": "pure.js pluralCategory: CLDR category by rule family",
+  "cases": [
+    { "name": "ru 0", "input": { "rule": "east-slavic", "n": 0 }, "expected": "many" },
+    { "name": "ru 1", "input": { "rule": "east-slavic", "n": 1 }, "expected": "one" },
+    { "name": "ru 2", "input": { "rule": "east-slavic", "n": 2 }, "expected": "few" },
+    { "name": "ru 4", "input": { "rule": "east-slavic", "n": 4 }, "expected": "few" },
+    { "name": "ru 5", "input": { "rule": "east-slavic", "n": 5 }, "expected": "many" },
+    { "name": "ru 11", "input": { "rule": "east-slavic", "n": 11 }, "expected": "many" },
+    { "name": "ru 12", "input": { "rule": "east-slavic", "n": 12 }, "expected": "many" },
+    { "name": "ru 14", "input": { "rule": "east-slavic", "n": 14 }, "expected": "many" },
+    { "name": "ru 21", "input": { "rule": "east-slavic", "n": 21 }, "expected": "one" },
+    { "name": "ru 22", "input": { "rule": "east-slavic", "n": 22 }, "expected": "few" },
+    { "name": "ru 101", "input": { "rule": "east-slavic", "n": 101 }, "expected": "one" },
+    { "name": "ru 111", "input": { "rule": "east-slavic", "n": 111 }, "expected": "many" },
+    { "name": "ru 112", "input": { "rule": "east-slavic", "n": 112 }, "expected": "many" },
+    { "name": "ru negative 1", "input": { "rule": "east-slavic", "n": -1 }, "expected": "one" },
+    { "name": "ru negative 3", "input": { "rule": "east-slavic", "n": -3 }, "expected": "few" },
+    { "name": "en 1", "input": { "rule": "english", "n": 1 }, "expected": "one" },
+    { "name": "en 0", "input": { "rule": "english", "n": 0 }, "expected": "other" },
+    { "name": "en 2", "input": { "rule": "english", "n": 2 }, "expected": "other" },
+    { "name": "en negative 1", "input": { "rule": "english", "n": -1 }, "expected": "one" },
+    { "name": "none 1", "input": { "rule": "none", "n": 1 }, "expected": "other" },
+    { "name": "unknown family counts like English", "input": { "rule": "unknown-family", "n": 1 }, "expected": "one" },
+    { "name": "absent family", "input": { "n": 1 }, "expected": "one" },
+    { "name": "large ru", "input": { "rule": "east-slavic", "n": 1000000 }, "expected": "many" }
+  ]
+}

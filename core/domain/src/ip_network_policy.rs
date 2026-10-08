@@ -9,7 +9,7 @@ use std::net::IpAddr;
 
 use nrr_shared::ip_block::{IpBlock, IpRange};
 
-use crate::address_class::{canonical_ip, AddressClass};
+use crate::address_class::AddressClass;
 
 /// A rule network wider than this prefix is refused. IPv4: `10.0.0.0/8` is the
 /// widest corporate network a router has to carry. IPv6: `/16`, far wider than
@@ -80,20 +80,7 @@ pub fn prefix_of_width(is_ipv4: bool, width_bits: u32) -> u32 {
     bits - width_bits.min(bits)
 }
 
-/// An IPv4-mapped IPv6 network (`::ffff:10.0.0.0/104`) is its IPv4 network.
-pub fn canonical_block(block: IpBlock) -> IpBlock {
-    match block.network() {
-        IpAddr::V6(_) if block.prefix_len() >= 96 => {
-            let mapped = canonical_ip(block.network());
-            if mapped.is_ipv4() {
-                IpBlock::new(mapped, block.prefix_len() - 96).unwrap_or(block)
-            } else {
-                block
-            }
-        }
-        _ => block,
-    }
-}
+pub use nrr_shared::ip_block::canonical_block;
 
 /// Address classes no rule network may touch: routing them breaks the machine
 /// itself rather than reaching a site.

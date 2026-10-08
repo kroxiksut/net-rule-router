@@ -11,6 +11,10 @@
 
 use super::*;
 
+/// How long a missing bound adapter must stay missing before it is announced
+/// as removed. A few reconciles: long enough for the OS to report a switch-off.
+pub(super) const GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl SecondaryRouteCoordinator {
     /// Returns `true` the first time a given `stale → healed` binding mapping
     /// is observed for `(sid, role)` (and again whenever it changes), `false`
@@ -106,8 +110,39 @@ impl SecondaryRouteCoordinator {
     /// Re-arm [`Self::note_not_usable_once`] for `(sid, role)` — called once
     /// the binding resolves to a usable adapter again, so the next
     /// usable→not-usable transition warns instead of staying silent forever.
+    /// `true` once the binding `stable_id` of `(sid, role)` has been missing
+    /// for [`GONE_GRACE`]. Switching an adapter off reports "no such device"
+    /// for a few seconds before "disabled", and "removed" asks the user to
+    /// pick another connection — the wrong advice for a switch they just
+    /// flipped.
+    pub(super) fn gone_long_enough(&self, sid: &str, role: &str, stable_id: &str) -> bool {
+        let key = format!("{sid}|{role}");
+        let mut guard = self.gone_since.lock().unwrap_or_else(|p| p.into_inner());
+        let since = guard
+            .entry(key)
+            .and_modify(|(id, at)| {
+                if id != stable_id {
+                    *id = stable_id.to_string();
+                    *at = std::time::Instant::now();
+                }
+            })
+            .or_insert_with(|| (stable_id.to_string(), std::time::Instant::now()));
+        since.1.elapsed() >= self.gone_grace
+    }
+
+    /// Tests that are about the announcement, not its delay.
+    #[cfg(test)]
+    pub(crate) fn with_gone_grace(mut self, grace: std::time::Duration) -> Self {
+        self.gone_grace = grace;
+        self
+    }
+
     pub(super) fn clear_not_usable(&self, sid: &str, role: &str) {
         let key = format!("{sid}|{role}");
+        self.gone_since
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
         let mut guard = self
             .not_usable_logged
             .lock()

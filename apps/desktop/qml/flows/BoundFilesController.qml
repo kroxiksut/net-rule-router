@@ -87,7 +87,8 @@ QtObject {
         _readPassthroughSections(route, function(sections) {
             var text = Rules.buildCanonicalRulesText(
                 root.rulesModel, route, sections,
-                (includeComments === undefined) ? _emitComments() : !!includeComments)
+                (includeComments === undefined) ? _emitComments() : !!includeComments,
+                root.platformProfile.os)
             if (_fileHoldsText(path, text)) { done(true, false); return }
             if (!nrrNativeBridge.writeTextFile(path, text)) {
                 console.log("[bound-file] writeTextFile failed:", route, path)
@@ -299,8 +300,7 @@ QtObject {
         for (var i = 0; i < root.rulesModel.count; i += 1) {
             var row = root.rulesModel.get(i)
             if (!row) continue
-            var r = String(row.targetRoute || "")
-            if ((r === "block" ? "secondary" : r) === String(route)) return true
+            if (Rules.routeBucket(row.targetRoute) === String(route)) return true
         }
         return false
     }
@@ -462,8 +462,26 @@ QtObject {
     ///
     /// Local edits win: re-pulling would discard whatever the user is in the
     /// middle of typing, so a dirty rules editor is told rather than clobbered.
-    function handleAutoRulesAuthored() {
+    function handleAutoRulesAuthored(correlationId) {
+        // The service also removes rule twins it once stored by mistake; that
+        // is not "addresses added".
+        var tidied = String(correlationId || "").indexOf("auto-rules-cleanup-") === 0
+        // A `?` rule moving is told by its own notice; the line only says so.
+        var moved = String(correlationId || "").indexOf("auto-rules-verify-") === 0
         if (root.unsavedChangesRegistry && root.unsavedChangesRegistry["rules"]) {
+            if (moved) {
+                root.statusLine = root.tr("tray.verify-moved.title",
+                    "Site moved to the additional route")
+                return
+            }
+            if (tidied) {
+                root.setStatus(
+                    root.tr("status.rules-tidied-unsaved-short",
+                        "Rules tidied — reload to see them"),
+                    root.tr("status.rules-tidied-unsaved",
+                        "Duplicate subdomain rules the app had added were removed from your rules. Save or discard your edits, then reload the rules to see them."))
+                return
+            }
             root.setStatus(
                 root.tr("status.auto-rules-added-unsaved-short",
                     "Addresses added — reload to see them"),
@@ -475,12 +493,12 @@ QtObject {
             silent: true,
             onComplete: function(ok) {
                 if (!ok) return
-                _markBoundFilesDirtyForAutoRules()
+                _markBoundFilesDirtyForAutoRules(tidied, moved)
             }
         })
     }
 
-    function _markBoundFilesDirtyForAutoRules() {
+    function _markBoundFilesDirtyForAutoRules(tidied, moved) {
         var hasPrimary = root.prefs.lastSavedPathPrimary
             && String(root.prefs.lastSavedPathPrimary) !== ""
         var hasSecondary = root.prefs.lastSavedPathSecondary
@@ -491,8 +509,13 @@ QtObject {
             _writeBoundFiles(true, null, true)
             return
         }
-        root.statusLine = root.tr("status.auto-rules-added",
-            "Addresses a routed site needs were added to your rules.")
+        root.statusLine = moved
+            ? root.tr("tray.verify-moved.title", "Site moved to the additional route")
+            : tidied
+            ? root.tr("status.rules-tidied",
+                "Duplicate subdomain rules the app had added were removed from your rules.")
+            : root.tr("status.auto-rules-added",
+                "Addresses a routed site needs were added to your rules.")
     }
 
     /// The routes that BOTH have a linked file and no longer match it. That
@@ -583,6 +606,12 @@ QtObject {
     /// flags cannot be trusted here anyway, because the reconcile that sets
     /// them is async and often has not answered yet when an apply completes.
     function _persistBoundFilesAfterApply() {
+        // The table now matches the service; a route with no file has nothing
+        // left to save, and only an apply or a pull can tell it so.
+        if (String(root.prefs.lastSavedPathPrimary || "") === "")
+            root._filesSyncDirtyPrimary = false
+        if (String(root.prefs.lastSavedPathSecondary || "") === "")
+            root._filesSyncDirtySecondary = false
         _writeBoundFiles(false, null, true)
     }
 
@@ -636,7 +665,7 @@ QtObject {
     function writeRouteDiffers(route, path, onResult) {
         _readPassthroughSections(route, function(sections) {
             var text = Rules.buildCanonicalRulesText(
-                root.rulesModel, route, sections, _emitComments())
+                root.rulesModel, route, sections, _emitComments(), root.platformProfile.os)
             onResult(!_fileHoldsText(path, text))
         })
     }

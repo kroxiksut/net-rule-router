@@ -317,13 +317,11 @@ pub(crate) fn rule_covers(rule: &nrr_domain::canonical::CanonicalRule, hostname:
     }
 }
 
-/// the KIND of the strongest enabled address rule covering
-/// `(hostname, ip)`, walked along the runtime priority ladder (exact-fqdn >
-/// subdomain > zone > exact-ip > subnet). `SuffixDomain` and `Zone` share match
-/// semantics but are reported distinctly: the cache viewer sorts zone-derived
-/// entries below direct rule matches. A range reports as `subnet`: it is
-/// carried as the networks it decomposes into. `None` when no address rule
-/// matches (app-only rules carry no address match by definition).
+/// The KIND of the strongest enabled address rule covering `(hostname, ip)`,
+/// in the engine's default order (exact-fqdn > subdomain > exact-ip > subnet >
+/// zone): the narrower rule wins. A range reports as `subnet`: it is carried as
+/// the networks it decomposes into. `None` when no address rule matches
+/// (app-only rules carry no address match by definition).
 pub(crate) fn rule_set_match_kind(
     hostname: &str,
     ip: Option<std::net::Ipv4Addr>,
@@ -344,12 +342,12 @@ pub(crate) fn rule_set_match_kind(
                 consider(1, "subdomain");
             }
             Some(CanonicalAddressMatch::Zone(z)) if match_zone(hostname, z) => {
-                consider(2, "zone");
+                consider(4, "zone");
             }
             Some(CanonicalAddressMatch::ExactIp(rule_ip))
                 if ip.map(std::net::IpAddr::V4) == Some(*rule_ip) =>
             {
-                consider(3, "exact-ip");
+                consider(2, "exact-ip");
             }
             Some(m)
                 if ip.is_some_and(|ip| {
@@ -357,7 +355,7 @@ pub(crate) fn rule_set_match_kind(
                         .is_some_and(|blocks| blocks.iter().any(|b| b.contains(ip.into())))
                 }) =>
             {
-                consider(4, "subnet");
+                consider(3, "subnet");
             }
             _ => {}
         }

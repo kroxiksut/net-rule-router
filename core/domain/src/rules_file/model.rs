@@ -164,6 +164,12 @@ impl RulesFileSection {
     pub const fn is_app_authored(self) -> bool {
         matches!(self, Self::Auto)
     }
+
+    /// `true` for the sections whose values are host names, the only ones a
+    /// `?` (try the primary route first) prefix is read in.
+    pub const fn takes_domain_values(self) -> bool {
+        matches!(self, Self::Domains | Self::Auto)
+    }
 }
 
 impl fmt::Display for RulesFileSection {
@@ -229,6 +235,10 @@ pub struct RulesFileEntry {
     /// `true` when the line carried the `+block` flag: matching traffic is
     /// dropped (hard WFP block) regardless of which file the rule lives in.
     pub blocked: bool,
+    /// `true` when the value carried the `?` prefix (`?example.com`): try the
+    /// primary route first. Read in the domain-value sections only, and
+    /// meaningful only in the secondary file.
+    pub verify_primary: bool,
     /// Provenance of an app-authored entry, parsed from the structured
     /// `auto:… anchor:… added:…` prefix of the inline comment.
     ///
@@ -247,6 +257,7 @@ impl RulesFileEntry {
             inline_comment: None,
             enabled: true,
             blocked: false,
+            verify_primary: false,
             origin: None,
         }
     }
@@ -261,6 +272,7 @@ impl RulesFileEntry {
             inline_comment: Some(comment.into()),
             enabled: true,
             blocked: false,
+            verify_primary: false,
             origin: None,
         }
     }
@@ -272,6 +284,7 @@ impl RulesFileEntry {
             inline_comment: None,
             enabled: false,
             blocked: false,
+            verify_primary: false,
             origin: None,
         }
     }
@@ -284,6 +297,7 @@ impl RulesFileEntry {
             inline_comment: None,
             enabled: true,
             blocked: false,
+            verify_primary: false,
             origin: Some(origin),
         }
     }

@@ -3069,51 +3069,57 @@ ColumnLayout {
                     text: root.tr("settings.routing.kill-switch.protocols.label",
                         "Protocols leak protection cuts")
                 }
-                Flow {
+                Item {
                     Layout.fillWidth: true
                     visible: panel.killSwitchEnabled && panel.ksFailClosed
-                    spacing: root.uiTheme.spacingMd
-                    Repeater {
-                        model: [
-                            { slug: "tcp", bit: 1, tip: "Most web, email and app traffic (HTTP/HTTPS and similar)." },
-                            { slug: "udp", bit: 2, tip: "DNS, video calls, games and other real-time traffic." },
-                            { slug: "icmp", bit: 4, tip: "Ping and traceroute. These live only at the packet layer, so ICMP must be checked for the block to stop a ping." },
-                            { slug: "igmp", bit: 8, tip: "Multicast group membership on the local network." },
-                            { slug: "gre", bit: 16, tip: "A tunnelling protocol used by some VPNs (e.g. PPTP)." },
-                            { slug: "esp", bit: 32, tip: "Encrypted IPsec VPN payloads." }
-                        ]
-                        delegate: CheckBox {
-                            // The last ticked box stays ticked: the service
-                            // refuses a selection that blocks nothing. The
-                            // stored "other" bit has no box and is kept as is.
-                            readonly property bool lastOne:
-                                Pure.killSwitchProtocolLocked(panel.ksProtocols, modelData.bit)
-                            text: root.tr("settings.routing.kill-switch.protocols." + modelData.slug,
-                                modelData.slug === "icmp"
-                                    ? "ICMP (ping)"
-                                    : modelData.slug.toUpperCase())
-                            checked: (panel.ksProtocols & modelData.bit) !== 0
-                            enabled: !lastOne
-                            onToggled: {
-                                var m = checked
-                                    ? (panel.ksProtocols | modelData.bit)
-                                    : (panel.ksProtocols & ~modelData.bit)
-                                panel.ksProtocols = m & 0x7F
-                                if (typeof root.routePolicyController.applyKillSwitchProtocols === "function")
-                                    root.routePolicyController.applyKillSwitchProtocols(panel.ksProtocols)
+                    Layout.preferredHeight: ksProtocolsFlow.height
+                    Flow {
+                        id: ksProtocolsFlow
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        spacing: root.uiTheme.spacingMd
+                        Repeater {
+                            model: [
+                                { slug: "tcp", bit: 1, tip: "Most web, email and app traffic (HTTP/HTTPS and similar)." },
+                                { slug: "udp", bit: 2, tip: "DNS, video calls, games and other real-time traffic." },
+                                { slug: "icmp", bit: 4, tip: "Ping and traceroute. These live only at the packet layer, so ICMP must be checked for the block to stop a ping." },
+                                { slug: "igmp", bit: 8, tip: "Multicast group membership on the local network." },
+                                { slug: "gre", bit: 16, tip: "A tunnelling protocol used by some VPNs (e.g. PPTP)." },
+                                { slug: "esp", bit: 32, tip: "Encrypted IPsec VPN payloads." }
+                            ]
+                            delegate: CheckBox {
+                                // The last ticked box stays ticked: the service
+                                // refuses a selection that blocks nothing. The
+                                // stored "other" bit has no box and is kept as is.
+                                readonly property bool lastOne:
+                                    Pure.killSwitchProtocolLocked(panel.ksProtocols, modelData.bit)
+                                text: root.tr("settings.routing.kill-switch.protocols." + modelData.slug,
+                                    modelData.slug === "icmp"
+                                        ? "ICMP (ping)"
+                                        : modelData.slug.toUpperCase())
+                                checked: (panel.ksProtocols & modelData.bit) !== 0
+                                enabled: !lastOne
+                                onToggled: {
+                                    var m = checked
+                                        ? (panel.ksProtocols | modelData.bit)
+                                        : (panel.ksProtocols & ~modelData.bit)
+                                    panel.ksProtocols = m & 0x7F
+                                    if (typeof root.routePolicyController.applyKillSwitchProtocols === "function")
+                                        root.routePolicyController.applyKillSwitchProtocols(panel.ksProtocols)
+                                }
+                                // Per-protocol hover tooltip + Accessible
+                                // (a tooltip must never be the sole source of meaning,
+                                // so the same text is also the accessible description).
+                                ToolTip.visible: hovered
+                                ToolTip.delay: 400
+                                ToolTip.text: root.tr(
+                                    "settings.routing.kill-switch.protocols." + modelData.slug + "-tooltip",
+                                    modelData.tip)
+                                Accessible.name: text
+                                Accessible.description: lastOne
+                                    ? ToolTip.text + " " + ksLastProtocolHint.text
+                                    : ToolTip.text
                             }
-                            // Per-protocol hover tooltip + Accessible
-                            // (a tooltip must never be the sole source of meaning,
-                            // so the same text is also the accessible description).
-                            ToolTip.visible: hovered
-                            ToolTip.delay: 400
-                            ToolTip.text: root.tr(
-                                "settings.routing.kill-switch.protocols." + modelData.slug + "-tooltip",
-                                modelData.tip)
-                            Accessible.name: text
-                            Accessible.description: lastOne
-                                ? ToolTip.text + " " + ksLastProtocolHint.text
-                                : ToolTip.text
                         }
                     }
                 }

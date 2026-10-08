@@ -440,23 +440,35 @@ fn run_primary(
     let mut prefs_writer =
         crate::prefs_persistence::DebouncedPreferenceWriter::new(tag, store, preferences);
 
+    // Closed pipes are the usual end of a session, but a process the host
+    // started (the tray) can inherit them and hold them open after the host is
+    // gone. Its own exit ends the session then, or this launcher keeps the
+    // single-instance lock and no later launch can open a window.
+    const HOST_EXIT_POLL: Duration = Duration::from_secs(1);
+    // Lines the host wrote just before exiting (its last preferences among
+    // them) are still on their way through the reader threads.
+    const HOST_EXIT_DRAIN: Duration = Duration::from_millis(300);
+    let mut host_gone = false;
     loop {
-        let line = match prefs_writer.due_at() {
-            Some(due) => {
-                let wait = due.saturating_duration_since(Instant::now());
-                match receiver.recv_timeout(wait) {
-                    Ok(line) => line,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        prefs_writer.flush_if_due(Instant::now());
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        let poll = if host_gone {
+            HOST_EXIT_DRAIN
+        } else {
+            HOST_EXIT_POLL
+        };
+        let wait = prefs_writer.due_at().map_or(poll, |due| {
+            due.saturating_duration_since(Instant::now()).min(poll)
+        });
+        let line = match receiver.recv_timeout(wait) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                prefs_writer.flush_if_due(Instant::now());
+                if host_gone {
+                    break;
                 }
+                host_gone = matches!(child.try_wait(), Ok(Some(_)));
+                continue;
             }
-            None => match receiver.recv() {
-                Ok(line) => line,
-                Err(_) => break,
-            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         // Checked on every line, not just on the timeout branch: a chatty child
         // keeps the loop out of that branch and would otherwise starve a write
@@ -513,10 +525,14 @@ fn run_primary(
     }
     diag_log(
         tag,
-        "NRR_LAUNCHER[primary] child stdio drained (both pipes closed)",
+        if host_gone {
+            "NRR_LAUNCHER[primary] child exited with its pipes still held by another process"
+        } else {
+            "NRR_LAUNCHER[primary] child stdio drained (both pipes closed)"
+        },
     );
-    // Nothing more can arrive on the channel, so the tail of the last burst is
-    // written here rather than after the wait — which has its own failure exit.
+    // The tail of the last burst is written here rather than after the wait —
+    // which has its own failure exit.
     prefs_writer.flush();
 
     let exit_status = match child.wait() {

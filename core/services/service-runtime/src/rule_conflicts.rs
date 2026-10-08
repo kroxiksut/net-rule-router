@@ -42,6 +42,13 @@ pub enum RuleConflict {
         rule_id: String,
         reason: UnsupportedShapeReason,
     },
+    /// Carving the narrower rules out of this network needed more than `cap`
+    /// pieces: it covers its whole network and the narrower rules inside lose.
+    NetworkCarvingOverCap {
+        rule_id: String,
+        pieces: usize,
+        cap: usize,
+    },
 }
 
 /// One address rule's fan-out: decides per target whether the rule's filter
@@ -95,7 +102,7 @@ impl<'a> AddressRuleWalk<'a> {
                 }
                 !ownership.block_yields(ip, self.addr_match)
             }
-            RuleAction::Route => {
+            RuleAction::Route | RuleAction::VerifyPrimary => {
                 let steers = ownership.address_rule_may_steer(ip, self.link);
                 if steers {
                     if let Some(block) = ownership.literal_block_of(ip) {
@@ -205,6 +212,33 @@ pub fn rule_conflict_dtos(
                     .map(|a| a.pattern.as_str().to_string())
                     .unwrap_or_default(),
             },
+            RuleConflict::NetworkCarvingOverCap { rule_id, .. } => RuleConflictDto {
+                kind: RuleConflictKind::NetworkCarvingOverCap,
+                rule_id: rule_id.clone(),
+                rule_value: value_of(rule_id),
+                ip: String::new(),
+                count: 0,
+                other_rule_id: String::new(),
+                host: String::new(),
+                via_host: String::new(),
+                app: String::new(),
+            },
+        })
+        .collect()
+}
+
+/// `rule (pieces/cap)` for each network rule carved past the cap, for the log.
+#[must_use]
+pub fn over_cap_networks(conflicts: &[RuleConflict]) -> Vec<String> {
+    conflicts
+        .iter()
+        .filter_map(|c| match c {
+            RuleConflict::NetworkCarvingOverCap {
+                rule_id,
+                pieces,
+                cap,
+            } => Some(format!("{rule_id} ({pieces}/{cap})")),
+            _ => None,
         })
         .collect()
 }

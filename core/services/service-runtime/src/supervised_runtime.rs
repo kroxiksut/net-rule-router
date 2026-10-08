@@ -710,6 +710,14 @@ pub fn run_supervised_runtime(
                         "logon observer active — Mode B arms on sign-in, not during the logon phase",
                     );
                     logon_rearm = Some(rearm);
+                    // A sign-in between the boot apply and this subscription
+                    // was reported to nobody.
+                    if let Some(controller) = resolver_controller.as_ref() {
+                        controller.arm_if_signed_in();
+                    }
+                    if let Some(gate) = deps.sign_in_gate.as_ref() {
+                        gate.fire_if_signed_in();
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -718,7 +726,29 @@ pub fn run_supervised_runtime(
                         error = %e,
                         "logon observer registration failed; Mode B will arm on a later re-arm instead",
                     );
+                    if let Some(controller) = resolver_controller.as_ref() {
+                        controller.poll_for_sign_in();
+                    }
+                    if let Some(gate) = deps.sign_in_gate.as_ref() {
+                        crate::logon_rearm::SignInGate::poll_until_fired(
+                            Arc::clone(gate),
+                            stop.clone(),
+                            crate::logon_rearm::SIGN_IN_POLL_EVERY,
+                        );
+                    }
                 }
+            }
+        } else {
+            // No sign-in event on this platform: the watchdog and the gate ask.
+            if let Some(controller) = resolver_controller.as_ref() {
+                controller.poll_for_sign_in();
+            }
+            if let Some(gate) = deps.sign_in_gate.as_ref() {
+                crate::logon_rearm::SignInGate::poll_until_fired(
+                    Arc::clone(gate),
+                    stop.clone(),
+                    crate::logon_rearm::SIGN_IN_POLL_EVERY,
+                );
             }
         }
     }

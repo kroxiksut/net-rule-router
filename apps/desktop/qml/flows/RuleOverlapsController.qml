@@ -94,9 +94,16 @@ QtObject {
         return at >= 0 ? String(root.rulesModel.get(at).targetRoute) : String(side.route)
     }
     /// Offering "send over the other route" only makes sense between two
-    /// routing rules; a block on either side is edited in the rules list.
+    /// routing rules; a block or verify rule on either side is edited in the
+    /// rules list.
     function canReroute(overlap) {
-        return routeOf(overlap.winner) !== "block" && routeOf(overlap.loser) !== "block"
+        return _isPlainRoute(routeOf(overlap.winner)) && _isPlainRoute(routeOf(overlap.loser))
+    }
+    function _isPlainRoute(route) { return route === "primary" || route === "secondary" }
+    /// True when the pair holds a block rule; otherwise the pseudo-route that
+    /// stops a reroute is "verify".
+    function hasBlockSide(overlap) {
+        return routeOf(overlap.winner) === "block" || routeOf(overlap.loser) === "block"
     }
 
     /// Send the shared hosts over the loser's route. A nested winner moves to

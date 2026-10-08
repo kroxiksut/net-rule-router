@@ -1,0 +1,36 @@
+{
+  "description": "pure.js reviewSummaryIsEmpty, previewRefusal and previewOutcome over one dry-run summary. Each case is `base-summary` with `patch` laid over it.",
+  "base-summary": {
+    "diff-summary": "1 SID(s); 3 filter(s)",
+    "provenance": "gui-rules-edit",
+    "risk-level": "low",
+    "requires-review": true,
+    "changed-fields": []
+  },
+  "cases": [
+    { "name": "nothing changed", "input": { "patch": {} },
+      "expected": { "empty": true, "refusal": null, "outcome": "" } },
+    { "name": "one rule added", "input": { "patch": { "rules-added": [{ "id": "R-0001", "display": "example.com", "route": "primary" }] } },
+      "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },
+    { "name": "one rule removed", "input": { "patch": { "rules-removed": [{ "id": "R-0002", "display": "192.0.2.1", "route": "block" }] } },
+      "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },
+    { "name": "modified only", "input": { "patch": { "rules-modified": [{ "id": "R-0003", "display": "a.example", "route": "verify", "enabled": false }] } },
+      "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },
+    { "name": "retargeted only", "input": { "patch": { "rules-retargeted": [{ "id": "R-0004", "display": "b.example (primary → secondary)", "route": "secondary" }] } },
+      "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },
+    { "name": "a changed field counts", "input": { "patch": { "changed-fields": ["behavior-mode"] } },
+      "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },
+    { "name": "invalid values are named", "input": { "patch": { "risk-signals": [{ "kind": "invalid-rule-value", "rules": ["bad host", "300.1.1.1"] }] } },
+      "expected": { "empty": true, "refusal": { "code": "invalid-rule-value", "values": "bad host, 300.1.1.1", "args": {} }, "outcome": "invalid-rule-value" } },
+    { "name": "invalid with no values", "input": { "patch": { "risk-signals": [{ "kind": "invalid-rule-value", "rules": [] }] } },
+      "expected": { "empty": true, "refusal": { "code": "invalid-rule-value", "values": "", "args": {} }, "outcome": "invalid-rule-value" } },
+    { "name": "change refused with args", "input": { "patch": { "risk-signals": [{ "kind": "change-refused", "code": "network-covers-link", "args": { "network": "10.0.0.0/8", "covers": "198.51.100.7", "covers-kind": "tunnel-server" } }] } },
+      "expected": { "empty": true, "refusal": { "code": "network-covers-link", "values": "", "args": { "network": "10.0.0.0/8", "covers": "198.51.100.7", "covers-kind": "tunnel-server" } }, "outcome": "network-covers-link" } },
+    { "name": "change refused without a code", "input": { "patch": { "risk-signals": [{ "kind": "change-refused", "code": "" }] } },
+      "expected": { "empty": true, "refusal": { "code": "unknown", "values": "", "args": {} }, "outcome": "unknown" } },
+    { "name": "the first refusal wins", "input": { "patch": { "risk-signals": [{ "kind": "mass-change-count", "count": 40 }, { "kind": "change-refused", "code": "rule-cap-exceeded" }, { "kind": "invalid-rule-value", "rules": ["x"] }] } },
+      "expected": { "empty": true, "refusal": { "code": "rule-cap-exceeded", "values": "", "args": {} }, "outcome": "rule-cap-exceeded" } },
+    { "name": "a warning is not a refusal", "input": { "patch": { "risk-signals": [{ "kind": "secondary-reroute", "rule-count": 2 }], "rules-added": [{ "id": "R-0005", "display": "c.example", "route": "secondary" }] } },
+      "expected": { "empty": false, "refusal": null, "outcome": "unknown" } }
+  ]
+}

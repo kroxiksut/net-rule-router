@@ -95,6 +95,10 @@ pub struct PlannerInput<'a> {
     /// this planner is pure and never sees an adapter — [`Ipv6Guard::from_links`]
     /// is where the machine's answer comes from.
     pub ipv6: Ipv6Guard,
+    /// A Block covers every packet (Windows mirrors it at the packet layer, for
+    /// every account) only in the administrator's baseline; a user's own Block
+    /// is connect-only there. Linux holds both at its per-user output hook.
+    pub packet_blocks: bool,
 }
 
 /// Within-band ordinal slots reserved per rule, mirroring
@@ -245,15 +249,20 @@ pub fn plan_route_rules_with_shapes(
                 continue;
             }
             let (verdict, class, coverage) = match rule.action {
-                RuleAction::Route => (
+                RuleAction::Route | RuleAction::VerifyPrimary => (
                     Verdict::Permit,
                     PrecedenceClass::RouteRule(role),
                     Coverage::ConnectOnly,
                 ),
-                RuleAction::Block => (
+                RuleAction::Block if input.packet_blocks => (
                     Verdict::Block,
                     PrecedenceClass::HardBlock,
                     Coverage::AllPackets,
+                ),
+                RuleAction::Block => (
+                    Verdict::Block,
+                    PrecedenceClass::HardBlock,
+                    Coverage::ConnectOnly,
                 ),
             };
             let base_ordinal = (pos as u32) * SLOTS_PER_RULE;
@@ -277,6 +286,15 @@ pub fn plan_route_rules_with_shapes(
             if let Some(blocks) = rule.address_match.as_ref().and_then(|m| m.ip_blocks()) {
                 // A network is planned as the subnets it wins, never as hosts.
                 let carved = carving.pieces(blocks, link, rule.action, families);
+                if let Some(pieces) = carved.over_cap {
+                    report.conflicts.push(
+                        crate::rule_conflicts::RuleConflict::NetworkCarvingOverCap {
+                            rule_id: rule.id.as_str().to_string(),
+                            pieces,
+                            cap: NETWORK_PIECE_CAP,
+                        },
+                    );
+                }
                 for (idx, piece) in carved.pieces.into_iter().enumerate() {
                     flows.push(FlowRule {
                         flow: FlowMatch {

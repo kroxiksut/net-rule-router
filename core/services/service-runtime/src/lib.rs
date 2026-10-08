@@ -175,6 +175,7 @@ pub mod state;
 pub mod supervised_runtime;
 pub mod tamper_bootstrap;
 pub mod timed_window;
+pub mod tls_hello;
 pub mod traffic_sampler;
 pub mod tunnel_server_memory;
 pub mod verbose_logging;

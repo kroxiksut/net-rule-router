@@ -60,6 +60,45 @@ example.com
     let shared = nrr_shared::preset_parser::parse_canonical_rules(text);
     assert_eq!(shared.rules.len(), 1, "the GUI parser must see it too");
 }
+
+/// `?` (try the primary route first) is read the same way by both parsers:
+/// on host-name lines only, enabled or not, and a line also carrying
+/// `+block` is no rule for either of them.
+#[test]
+fn both_parsers_agree_on_the_verify_prefix() {
+    let text = "--- Domains
+?accounts.example.com
+?*.mail.example
+# ?off.example.com
+plain.example.com
+? spaced.example.com
+?both.example.com +block
+--- Auto
+?learned.example.com  # auto:user-confirmed anchor:learned.example.com added:2026-01-01
+--- IP
+?192.0.2.10
+";
+    let outcome = parse_rules_file(text);
+    let mut service: Vec<(String, bool, bool)> = outcome
+        .parsed
+        .sections
+        .iter()
+        .flat_map(|s| &s.entries)
+        .map(|e| (e.match_value.clone(), e.enabled, e.verify_primary))
+        .collect();
+    let mut gui: Vec<(String, bool, bool)> = nrr_shared::preset_parser::parse_canonical_rules(text)
+        .rules
+        .into_iter()
+        .map(|r| (r.match_value, r.enabled, r.verify_primary))
+        .collect();
+    service.sort();
+    gui.sort();
+    assert_eq!(service, gui);
+    // Positive control: the prefix was actually read somewhere.
+    assert!(service.contains(&("accounts.example.com".to_string(), true, true)));
+    assert!(service.contains(&("?192.0.2.10".to_string(), true, false)));
+    assert!(!service.iter().any(|(v, ..)| v.contains("both.example.com")));
+}
 use super::*;
 
 use crate::canonical::{CanonicalAddressMatch, CanonicalRule, CanonicalRuleSet};
@@ -112,4 +151,5 @@ mod canonical;
 mod conversion;
 mod model;
 mod parsing;
+mod verify_primary;
 mod writing;

@@ -16,6 +16,10 @@
 //! overlays as networks (loopback, the LAN, the split-default halves), and
 //! tearing those down would cut connections no rule changed.
 //!
+//! Of those connections, one riding a link that is neither of the principal's
+//! is spared, and so is one already on the link its destination is steered
+//! onto: no route of ours moves either.
+//!
 //! A destination that LEFT the plan is torn down only if it was steered onto the
 //! additional link: its route is gone, yet the socket keeps the tunnel's source
 //! address and hangs until a timeout. One that left the main link keeps its
@@ -32,13 +36,13 @@ use nrr_platform_api::enforcement::{
     DstMatch, EgressConstraint, EgressRef, EnforcementPlan, L4Proto, PrecedenceClass,
     RouteTableRef, UserPrincipal, Verdict,
 };
-use nrr_platform_api::fake_ip::stale_flows::{FlowTargets, StaleFlowReset};
+use nrr_platform_api::fake_ip::stale_flows::{FlowLinks, FlowTargets, StaleFlowReset};
 use nrr_shared::ip_block::IpBlock;
 use nrr_shared::RouteRole;
 
 use crate::flow_reset_log::{log_reset_flows, ResetCause};
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
-use crate::routed_host_flow_refresh::reset_owner_flows;
+use crate::routed_host_flow_refresh::{reset_owner_flows, Course, Courses, FlowPaths};
 
 /// How a plan treats one destination — what a connection to it would notice
 /// changing. Ordinals and application scope are left out: renumbering a rule
@@ -66,6 +70,32 @@ impl Steer {
                     || *egress == EgressConstraint::OnlyVia(EgressRef::Secondary)
             }
             Self::Route { egress, .. } => *egress == EgressRef::Secondary,
+        }
+    }
+
+    /// The link this steer sends its destination over, `None` when it says
+    /// nothing about one.
+    fn course(&self) -> Option<Course> {
+        let of = |egress: &EgressRef| match egress {
+            EgressRef::Primary => Some(Course::Primary),
+            EgressRef::Secondary => Some(Course::Secondary),
+            EgressRef::Adapter(_) => None,
+        };
+        match self {
+            Self::Flow {
+                egress: EgressConstraint::OnlyVia(egress),
+                ..
+            } => of(egress),
+            Self::Flow {
+                class: PrecedenceClass::RouteRule(RouteRole::Primary),
+                ..
+            } => Some(Course::Primary),
+            Self::Flow {
+                class: PrecedenceClass::RouteRule(RouteRole::Secondary),
+                ..
+            } => Some(Course::Secondary),
+            Self::Flow { .. } => None,
+            Self::Route { egress, .. } => of(egress),
         }
     }
 }
@@ -171,6 +201,37 @@ fn destinations_left_tunnel(previous: &Steering, current: &Steering) -> Vec<Dst>
         .collect()
 }
 
+/// The course of each destination whose steers agree on one link and none of
+/// which blocks it: a block, or two links, leaves its connections no course.
+fn courses_of(steering: &Steering) -> Courses {
+    let mut courses = Courses::default();
+    for (dst, steers) in steering {
+        if steers.iter().any(|s| {
+            matches!(
+                s,
+                Steer::Flow {
+                    verdict: Verdict::Block,
+                    ..
+                }
+            )
+        }) {
+            continue;
+        }
+        let mut said = steers.iter().filter_map(Steer::course);
+        let Some(first) = said.next() else {
+            continue;
+        };
+        if said.any(|c| c != first) {
+            continue;
+        }
+        match *dst {
+            Dst::Host(ip) => courses.insert_host(ip, first),
+            Dst::Network(net) => courses.insert_network(net, first),
+        }
+    }
+    courses
+}
+
 fn flow_targets(dsts: &[Dst]) -> FlowTargets {
     let mut hosts = Vec::new();
     let mut networks = Vec::new();
@@ -187,6 +248,10 @@ fn flow_targets(dsts: &[Dst]) -> FlowTargets {
 struct Remembered {
     steering: Steering,
     secondary_up: bool,
+    /// Left out of the last pass. A plan that failed to read for one pass is
+    /// not a sign-out: forgetting at once would reset every connection of
+    /// theirs when the next pass reads it again.
+    missed: bool,
 }
 
 #[derive(Default)]
@@ -225,11 +290,13 @@ impl PlanFlowReset {
     /// Call once `plans` are in force, filters AND routes. `changed` is the
     /// cycle's own "the plans differ from the last pass" — without it, a link
     /// edge or a deferred pass, nothing can have moved and nothing is read.
+    /// `links` is read only for a principal with a connection to decide on.
     pub fn after_apply(
         &self,
         plans: &[EnforcementPlan],
         changed: bool,
         secondary_up: impl Fn(&UserPrincipal) -> bool,
+        links: impl Fn(&UserPrincipal) -> FlowLinks,
     ) {
         let mut memory = self.memory.lock().unwrap_or_else(|p| p.into_inner());
         let came_up: HashSet<&str> = plans
@@ -268,12 +335,20 @@ impl PlanFlowReset {
                 } else {
                     ResetCause::NewDestination
                 };
-                self.tear_down(sid, &targets, cause);
+                self.tear_down(sid, &targets, cause, || FlowPaths {
+                    links: links(&plan.principal),
+                    courses: courses_of(&steering),
+                });
             }
             if let Some(previous) = previous.as_ref() {
                 let left = destinations_left_tunnel(&previous.steering, &steering);
                 if !left.is_empty() {
-                    self.tear_down(sid, &left, ResetCause::LeftTunnel);
+                    // A destination that left has no course: it goes wherever
+                    // it runs on the principal's links.
+                    self.tear_down(sid, &left, ResetCause::LeftTunnel, || FlowPaths {
+                        links: links(&plan.principal),
+                        courses: Courses::default(),
+                    });
                 }
             }
             next.insert(
@@ -281,21 +356,36 @@ impl PlanFlowReset {
                 Remembered {
                     steering,
                     secondary_up: secondary_up(&plan.principal),
+                    missed: false,
                 },
             );
         }
-        // A principal absent from the pass is forgotten, so their return finds
-        // every destination new: their sockets were opened under no policy.
+        // A principal absent for a second pass in a row is forgotten, so their
+        // return finds every destination new: their sockets were opened under
+        // no policy.
+        for (sid, mut remembered) in memory.principals.drain() {
+            if !remembered.missed {
+                remembered.missed = true;
+                next.insert(sid, remembered);
+            }
+        }
         memory.principals = next;
         memory.behind = false;
     }
 
-    fn tear_down(&self, sid: &str, targets: &[Dst], cause: ResetCause) {
+    fn tear_down(
+        &self,
+        sid: &str,
+        targets: &[Dst],
+        cause: ResetCause,
+        paths: impl FnOnce() -> FlowPaths,
+    ) {
         let Some(outcome) = reset_owner_flows(
             self.reset.as_ref(),
             self.cache.as_ref(),
             sid,
             &flow_targets(targets),
+            paths,
         ) else {
             return;
         };
@@ -307,6 +397,8 @@ impl PlanFlowReset {
                 kept_shared = decision.kept_shared,
                 kept_other_owner = decision.kept_other_owner,
                 kept_unknown_owner = decision.kept_unknown_owner,
+                kept_other_link = decision.kept_other_link,
+                kept_on_course = decision.kept_on_course,
                 "no connection on a changed destination is this principal's to reset",
             );
             return;
@@ -327,6 +419,8 @@ impl PlanFlowReset {
             kept_shared = decision.kept_shared,
             kept_other_owner = decision.kept_other_owner,
             kept_unknown_owner = decision.kept_unknown_owner,
+            kept_other_link = decision.kept_other_link,
+            kept_on_course = decision.kept_on_course,
             "tore down connections that predate the steering this pass put in force — the application reconnects over the route the rule now assigns",
         );
     }
@@ -437,6 +531,10 @@ mod tests {
         (reset, mock)
     }
 
+    fn no_links(_: &UserPrincipal) -> FlowLinks {
+        FlowLinks::default()
+    }
+
     fn up(_: &UserPrincipal) -> bool {
         true
     }
@@ -448,13 +546,14 @@ mod tests {
     #[test]
     fn a_destination_a_change_adds_is_torn_down_and_one_already_in_force_is_not() {
         let (reset, mock) = refresher(&[]);
-        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up);
+        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up, no_links);
         mock.set_flows(vec![flow(ip(1), 50_000, UID), flow(ip(2), 50_001, UID)]);
 
         reset.after_apply(
             &[plan_of(&[secondary(ip(1), 0), secondary(ip(2), 1)])],
             true,
             up,
+            no_links,
         );
 
         assert_eq!(mock.reset_flows(), vec![flow(ip(2), 50_001, UID)]);
@@ -464,7 +563,7 @@ mod tests {
     fn the_first_pass_finds_every_destination_new() {
         let (reset, mock) = refresher(&[]);
         mock.set_flows(vec![flow(ip(1), 50_000, UID)]);
-        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up);
+        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up, no_links);
         assert_eq!(mock.reset_flows(), vec![flow(ip(1), 50_000, UID)]);
     }
 
@@ -475,10 +574,10 @@ mod tests {
             vec![pin(ip(1), RouteRole::Primary, 0)],
             vec![route(ip(1), EgressRef::Primary)],
         );
-        reset.after_apply(&[primary], true, up);
+        reset.after_apply(&[primary], true, up, no_links);
         mock.set_flows(vec![flow(ip(1), 50_000, UID)]);
 
-        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up);
+        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up, no_links);
 
         assert_eq!(mock.reset_flows().len(), 1);
     }
@@ -486,9 +585,9 @@ mod tests {
     #[test]
     fn renumbering_a_rule_moves_nothing() {
         let (reset, mock) = refresher(&[]);
-        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up);
+        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up, no_links);
         mock.set_flows(vec![flow(ip(1), 50_000, UID)]);
-        reset.after_apply(&[plan_of(&[secondary(ip(1), 7)])], true, up);
+        reset.after_apply(&[plan_of(&[secondary(ip(1), 7)])], true, up, no_links);
         assert!(mock.reset_flows().is_empty());
     }
 
@@ -499,9 +598,10 @@ mod tests {
             &[plan_of(&[secondary(ip(1), 0), secondary(ip(2), 1)])],
             true,
             up,
+            no_links,
         );
         mock.set_flows(vec![flow(ip(1), 50_001, UID), flow(ip(2), 50_000, UID)]);
-        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up);
+        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up, no_links);
         assert_eq!(mock.reset_flows(), vec![flow(ip(2), 50_000, UID)]);
     }
 
@@ -512,28 +612,51 @@ mod tests {
             vec![pin(ip(1), RouteRole::Primary, 0)],
             vec![route(ip(1), EgressRef::Primary)],
         );
-        reset.after_apply(&[primary], true, up);
+        reset.after_apply(&[primary], true, up, no_links);
         mock.set_flows(vec![flow(ip(1), 50_000, UID)]);
-        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up);
+        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up, no_links);
         assert!(mock.reset_flows().is_empty());
     }
 
     #[test]
     fn a_shared_direct_address_that_left_the_tunnel_is_spared() {
         let (reset, mock) = refresher(&[ip(2)]);
-        reset.after_apply(&[plan_of(&[secondary(ip(2), 0)])], true, up);
+        reset.after_apply(&[plan_of(&[secondary(ip(2), 0)])], true, up, no_links);
         mock.set_flows(vec![flow(ip(2), 50_000, UID)]);
-        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up);
+        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up, no_links);
         assert!(mock.reset_flows().is_empty());
+    }
+
+    #[test]
+    fn a_principal_missing_from_one_pass_comes_back_without_a_reset() {
+        let (reset, mock) = refresher(&[]);
+        let p = plan_of(&[secondary(ip(1), 0)]);
+        reset.after_apply(std::slice::from_ref(&p), true, up, no_links);
+        mock.set_flows(vec![flow(ip(1), 50_000, UID)]);
+        reset.after_apply(&[], true, up, no_links);
+        reset.after_apply(&[p], true, up, no_links);
+        assert!(mock.reset_flows().is_empty(), "{:?}", mock.reset_flows());
+    }
+
+    #[test]
+    fn a_principal_gone_for_two_passes_returns_to_find_everything_new() {
+        let (reset, mock) = refresher(&[]);
+        let p = plan_of(&[secondary(ip(1), 0)]);
+        reset.after_apply(std::slice::from_ref(&p), true, up, no_links);
+        mock.set_flows(vec![flow(ip(1), 50_000, UID)]);
+        reset.after_apply(&[], true, up, no_links);
+        reset.after_apply(&[], true, up, no_links);
+        reset.after_apply(&[p], true, up, no_links);
+        assert_eq!(mock.reset_flows(), vec![flow(ip(1), 50_000, UID)]);
     }
 
     #[test]
     fn an_unchanged_pass_reads_nothing() {
         let (reset, mock) = refresher(&[]);
         let p = plan_of(&[secondary(ip(1), 0)]);
-        reset.after_apply(std::slice::from_ref(&p), true, up);
+        reset.after_apply(std::slice::from_ref(&p), true, up, no_links);
         let asked = mock.queried().len();
-        reset.after_apply(&[p], false, up);
+        reset.after_apply(&[p], false, up, no_links);
         assert_eq!(mock.queried().len(), asked, "the connection table was read");
     }
 
@@ -549,6 +672,7 @@ mod tests {
             &[plan_of(&[secondary(ip(1), 0), secondary(ip(2), 1)])],
             true,
             up,
+            no_links,
         );
         assert_eq!(mock.reset_flows(), vec![flow(ip(1), 50_000, UID)]);
     }
@@ -568,15 +692,15 @@ mod tests {
                 route(ip(2), EgressRef::Primary),
             ],
         );
-        reset.after_apply(std::slice::from_ref(&p), true, down);
-        reset.after_apply(std::slice::from_ref(&p), false, down);
+        reset.after_apply(std::slice::from_ref(&p), true, down, no_links);
+        reset.after_apply(std::slice::from_ref(&p), false, down, no_links);
         mock.set_flows(vec![flow(ip(1), 50_000, UID), flow(ip(2), 50_001, UID)]);
 
-        reset.after_apply(std::slice::from_ref(&p), false, up);
+        reset.after_apply(std::slice::from_ref(&p), false, up, no_links);
         assert_eq!(mock.reset_flows(), vec![flow(ip(1), 50_000, UID)]);
 
         // Up and staying up is no edge.
-        reset.after_apply(&[p], false, up);
+        reset.after_apply(&[p], false, up, no_links);
         assert_eq!(mock.reset_flows().len(), 1);
     }
 
@@ -585,14 +709,14 @@ mod tests {
     #[test]
     fn a_deferred_change_is_torn_down_by_the_next_steering_pass() {
         let (reset, mock) = refresher(&[]);
-        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up);
+        reset.after_apply(&[plan_of(&[secondary(ip(1), 0)])], true, up, no_links);
         mock.set_flows(vec![flow(ip(2), 50_000, UID)]);
 
         reset.defer();
         assert!(mock.reset_flows().is_empty());
 
         let p = plan_of(&[secondary(ip(1), 0), secondary(ip(2), 1)]);
-        reset.after_apply(&[p], false, up);
+        reset.after_apply(&[p], false, up, no_links);
         assert_eq!(mock.reset_flows(), vec![flow(ip(2), 50_000, UID)]);
     }
 
@@ -638,7 +762,7 @@ mod tests {
     #[test]
     fn a_network_a_rule_starts_pinning_tears_down_the_owners_flows_inside_it() {
         let (reset, mock) = refresher(&[]);
-        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up);
+        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up, no_links);
         mock.set_flows(vec![
             flow(inside(9), 50_000, UID),
             flow(inside(10), 50_001, UID + 1),
@@ -649,6 +773,7 @@ mod tests {
             &[network_rule(RouteRole::Secondary, EgressRef::Secondary)],
             true,
             up,
+            no_links,
         );
 
         assert_eq!(mock.reset_flows(), vec![flow(inside(9), 50_000, UID)]);
@@ -665,12 +790,14 @@ mod tests {
             &[network_rule(RouteRole::Primary, EgressRef::Primary)],
             true,
             up,
+            no_links,
         );
         mock.set_flows(vec![flow(inside(9), 50_000, UID)]);
         reset.after_apply(
             &[network_rule(RouteRole::Primary, EgressRef::Primary)],
             true,
             up,
+            no_links,
         );
         assert!(mock.reset_flows().is_empty(), "nothing moved");
 
@@ -678,6 +805,7 @@ mod tests {
             &[network_rule(RouteRole::Secondary, EgressRef::Secondary)],
             true,
             up,
+            no_links,
         );
         assert_eq!(mock.reset_flows(), vec![flow(inside(9), 50_000, UID)]);
     }
@@ -689,12 +817,13 @@ mod tests {
             &[network_rule(RouteRole::Secondary, EgressRef::Secondary)],
             true,
             up,
+            no_links,
         );
         mock.set_flows(vec![
             flow(inside(9), 50_000, UID),
             flow(inside(7), 50_001, UID),
         ]);
-        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up);
+        reset.after_apply(&[plan(Vec::new(), Vec::new())], true, up, no_links);
         assert_eq!(mock.reset_flows(), vec![flow(inside(9), 50_000, UID)]);
     }
 
@@ -721,19 +850,76 @@ mod tests {
                 table: RouteTableRef::Main,
             }],
         );
-        reset.after_apply(&[p], true, up);
+        reset.after_apply(&[p], true, up, no_links);
         assert!(mock.reset_flows().is_empty());
         assert!(mock.queried_networks().is_empty());
     }
 
+    /// A connection on a tunnel the user runs beside ours, or already on the
+    /// link its destination is steered onto, has nowhere new to go.
     #[test]
-    fn a_principal_who_returns_finds_every_destination_new() {
+    fn a_connection_on_another_link_or_already_on_course_is_spared() {
+        let main_link = Ipv4Addr::new(192, 0, 2, 1);
+        let tunnel_link = Ipv4Addr::new(198, 51, 100, 41);
+        let corporate_link = Ipv4Addr::new(172, 16, 0, 150);
+        let links = |_: &UserPrincipal| {
+            FlowLinks::new(
+                vec![
+                    (IpAddr::V4(main_link), 2),
+                    (IpAddr::V4(tunnel_link), 3),
+                    (IpAddr::V4(corporate_link), 4),
+                ],
+                Some(2),
+                Some(3),
+            )
+        };
+        let via = |local: Ipv4Addr, remote: Ipv4Addr, port: u16| EstablishedFlow {
+            local: SocketAddrV4::new(local, port),
+            ..flow(remote, port, UID)
+        };
         let (reset, mock) = refresher(&[]);
-        let p = plan_of(&[secondary(ip(1), 0)]);
-        reset.after_apply(std::slice::from_ref(&p), true, up);
-        reset.after_apply(&[], true, up);
-        mock.set_flows(vec![flow(ip(1), 50_000, UID)]);
-        reset.after_apply(&[p], true, up);
-        assert_eq!(mock.reset_flows().len(), 1);
+        let stranded = via(main_link, ip(1), 50_000);
+        mock.set_flows(vec![
+            stranded.clone(),
+            via(tunnel_link, ip(1), 50_001),
+            via(corporate_link, ip(1), 50_002),
+            via(main_link, ip(2), 50_003),
+            via(corporate_link, ip(2), 50_004),
+        ]);
+        let p = plan(
+            vec![
+                pin(ip(1), RouteRole::Secondary, 0),
+                pin(ip(2), RouteRole::Primary, 1),
+            ],
+            vec![
+                route(ip(1), EgressRef::Secondary),
+                route(ip(2), EgressRef::Primary),
+            ],
+        );
+
+        reset.after_apply(&[p], true, up, links);
+
+        assert_eq!(mock.reset_flows(), vec![stranded]);
+    }
+
+    #[test]
+    fn a_blocked_destination_has_no_course_and_goes_on_any_of_the_owners_links() {
+        let mut blocked = pin(ip(1), RouteRole::Secondary, 0);
+        blocked.verdict = Verdict::Block;
+        let steering = steering_of(&plan(
+            vec![blocked],
+            vec![route(ip(1), EgressRef::Secondary)],
+        ));
+        assert_eq!(courses_of(&steering).of(ip(1)), None);
+
+        let both_ways = steering_of(&plan(
+            vec![pin(ip(2), RouteRole::Primary, 0)],
+            vec![route(ip(2), EgressRef::Secondary)],
+        ));
+        assert_eq!(
+            courses_of(&both_ways).of(ip(2)),
+            None,
+            "two links, no course"
+        );
     }
 }

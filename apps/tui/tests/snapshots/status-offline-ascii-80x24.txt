@@ -1,0 +1,24 @@
+Service: offline — Service offline — showing locally-cached data
+Checking again every 2 seconds.
+> Screens                  Routing state
+> 1 Status                 Service not connected
+  2 First run              Status data may be outdated
+  3 Interfaces and routes  Connections
+  4 Rules                  Main connection: Ethernet — Example Network Adapter —
+  5 Overlaps               Available — Not known without the service
+  6 Suggested addresses    Additional connection: Example Tunnel — Example
+  7 Connection trace       Network Adapter — Available — Not known without the
+  8 Cache                  service
+  9 Diagnostics and logs
+  0 Settings
+                           Notifications
+                           No notifications.
+
+
+
+
+
+
+
+
+F1: help   q: quit

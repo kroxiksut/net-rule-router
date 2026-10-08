@@ -13,13 +13,35 @@
 // serialization stays here.
 //
 // Row shape (subset used here): { id, ruleType, matchValue, targetRoute,
-// enabled, comment }.
+// enabled, comment }. Besides the two adapter routes, `targetRoute` carries
+// two pseudo-routes that live in the secondary bucket: "block" (drop) and
+// "verify" (main link until the service confirms it cannot reach the host).
+
+// The secondary bucket a pseudo-route rides in; an adapter route is its own.
+function routeBucket(targetRoute) {
+    var t = String(targetRoute || "")
+    return (t === "block" || t === "verify") ? "secondary" : t
+}
+
+// Only a name can be tried on the primary link first; the rules file reads
+// `?` on host names only.
+function ruleTypeAllowsVerify(ruleType) {
+    var rt = String(ruleType || "")
+    return rt === "domain" || rt === "suffix-domain" || rt === "exact-fqdn"
+}
+
+// `route` as a rule of `ruleType` can carry it: "verify" on a type that cannot
+// take it becomes "secondary", where it would have ended up anyway.
+function routeForRuleType(route, ruleType) {
+    var r = String(route || "")
+    return (r === "verify" && !ruleTypeAllowsVerify(ruleType)) ? "secondary" : r
+}
 
 // The preset format version this build writes. Mirrors
 // `nrr_domain::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION`; the Rust test
 // `the_gui_writes_the_current_preset_format_version` reads this line and fails
 // when the two drift.
-var CANONICAL_PRESET_FORMAT_VERSION = 5
+var CANONICAL_PRESET_FORMAT_VERSION = 6
 
 // True for the rule types whose match value is a hostname (so callers know to
 // apply host-specific handling such as ACE encoding at the wire boundary).
@@ -27,6 +49,25 @@ function isHostlikeRuleType(ruleType) {
     var rt = String(ruleType || "")
     return rt === "zone" || rt === "domain"
         || rt === "suffix-domain" || rt === "exact-fqdn"
+}
+
+// A URL copied from a browser reduced to its bare host, for the hostname
+// types only and only when the text has URL punctuation, so typing a plain
+// hostname is never disturbed. Broad-match types also drop a leading `www.`;
+// `exact-fqdn` keeps it, since there the exact host is the point.
+function normalizeHostInput(ruleType, raw) {
+    if (!isHostlikeRuleType(ruleType)) return raw
+    var s = String(raw || "")
+    if (!/[:\/@?#]/.test(s)) return raw
+    s = s.replace(/^[A-Za-z][A-Za-z0-9\u0080-\uFFFF-]*:\/\//, "") // scheme://
+    s = s.replace(/^[^@\/]*@/, "")                        // user:pass@
+    s = s.replace(/[\/?#].*$/, "")                        // path/query/fragment
+    s = s.replace(/:\d+$/, "")                            // :port
+    s = s.toLowerCase()
+    if (ruleType === "domain" || ruleType === "suffix-domain") {
+        s = s.replace(/^www\./, "")
+    }
+    return s
 }
 
 // The one spelling of a rule-type slug. `suffix-domain` and `domain` describe
@@ -102,18 +143,25 @@ function sidecarRuleSignatureString(row) {
 
 // ---- canonical rules-file (docs/en/rules-file-format.md) text ----
 
+// The application section of `os` (`PlatformProfile.os`): the only one the
+// parser on that OS applies. The profile names no other OS.
+function appSectionHeader(os) {
+    if (os === "linux") return "Linux"
+    if (os === "macos") return "MacOS"
+    return "Windows"
+}
+
 // Map a rules-model rule-type slug to its canonical docs/en/rules-file-format.md section header.
-// Types we don't know about — including the platform-filtered Linux/MacOS app
-// sections on Windows — return "" and the rule is skipped, mirroring what the
-// parser does on the way in.
-function ruleTypeToSection(ruleType) {
+// Types we don't know about return "" and the rule is skipped, mirroring what
+// the parser does on the way in.
+function ruleTypeToSection(ruleType, os) {
     var rt = String(ruleType || "")
     if (rt === "zone") return "Zones"
     if (rt === "domain" || rt === "suffix-domain" || rt === "exact-fqdn") return "Domains"
     if (rt === "exact-ip" || rt === "exact-ipv4" || rt === "exact-ipv6") return "IP"
     if (rt === "subnet") return "CIDR"
     if (rt === "ip-range") return "Ranges"
-    if (rt === "application") return "Windows"
+    if (rt === "application") return appSectionHeader(os)
     return ""
 }
 
@@ -138,20 +186,22 @@ function oneLineField(value) {
 // GUI <-> service boundary ACE-encodes separately, on the wire side.
 // `includeComments` defaults to true — the Save-As option flow passes false to
 // strip ` # comment` suffixes, which only changes the file shape (comments
-// live in the sidecar either way).
-function buildCanonicalRulesText(rulesModel, route, passthroughSections, includeComments) {
+// live in the sidecar either way). `os` is the `PlatformProfile.os` the file is
+// written on; application rules go under its section.
+function buildCanonicalRulesText(rulesModel, route, passthroughSections, includeComments, os) {
     var emitComments = (includeComments === undefined) ? true : !!includeComments
-    var sections = { Zones: [], Domains: [], Auto: [], IP: [], CIDR: [], Ranges: [], Windows: [] }
+    var appSection = appSectionHeader(os)
+    var sections = { Zones: [], Domains: [], Auto: [], IP: [], CIDR: [], Ranges: [] }
+    sections[appSection] = []
     if (rulesModel) {
         for (var i = 0; i < rulesModel.count; i += 1) {
             var row = rulesModel.get(i)
             if (!row) continue
-            // A "block" rule has no adapter route — it rides in the secondary
-            // file, carrying the `+block` flag.
+            // A "block" or "verify" rule rides in the secondary file, marked
+            // by `+block` or a `?` before the value.
             var rowRoute = String(row.targetRoute || "")
-            var effRoute = (rowRoute === "block") ? "secondary" : rowRoute
-            if (effRoute !== String(route)) continue
-            var section = ruleTypeToSection(row.ruleType)
+            if (routeBucket(rowRoute) !== String(route)) continue
+            var section = ruleTypeToSection(row.ruleType, os)
             if (section === "" || !sections.hasOwnProperty(section)) continue
             // An app-authored rule keeps its provenance across the file: it
             // moves to `--- Auto` and carries the structured inline comment the
@@ -163,6 +213,7 @@ function buildCanonicalRulesText(rulesModel, route, passthroughSections, include
             if (isAuto) section = "Auto"
             var line = oneLineField(row.matchValue).trim()
             if (line === "") continue
+            if (rowRoute === "verify") line = "?" + line
             if (rowRoute === "block") line += " +block"
             if (!row.enabled) line = "# " + line
             var c = emitComments ? oneLineField(row.comment).trim() : ""
@@ -194,7 +245,7 @@ function buildCanonicalRulesText(rulesModel, route, passthroughSections, include
     lines.push("")
     // The canonical section order the Rust writer emits
     // (`nrr_domain::rules_file::RulesFileSection::ALL`).
-    var order = ["Zones", "Domains", "IP", "CIDR", "Ranges", "Windows", "Auto"]
+    var order = ["Zones", "Domains", "IP", "CIDR", "Ranges", appSection, "Auto"]
     for (var s = 0; s < order.length; s += 1) {
         var key = order[s]
         lines.push("--- " + key)
@@ -357,9 +408,11 @@ function ruleRowToWireDto(row, aceEncodeHost, opts) {
             // `*.` prefix so wildcard rules don't die as exact-fqdn.
             dto["address-match"] = hostAddressMatchDto(value)
     }
-    // A "block" row carries the per-rule action; route rows omit it so their
-    // canonical bytes/hash stay identical to the pre-block format.
-    if (String(row.targetRoute || "") === "block") dto.action = "block"
+    // A pseudo-route row carries the per-rule action; route rows omit it so
+    // their canonical bytes/hash stay identical to the pre-block format.
+    var rowRoute = String(row.targetRoute || "")
+    if (rowRoute === "block") dto.action = "block"
+    else if (rowRoute === "verify") dto.action = "verify-primary"
     // Provenance of an app-authored rule travels back to the service, or the
     // first apply the user makes for any OTHER reason silently rewrites every
     // auto-rule as one they typed (badge gone, "why is this here?" back).
@@ -402,12 +455,9 @@ function buildDriftRulesJsonForRoute(rows, route, aceEncodeHost) {
     for (var i = 0; i < rows.length; i += 1) {
         var r = rows[i]
         if (!r) continue
-        // A "block" rule belongs to the secondary bucket (matching the
-        // service's canonical placement) so it is captured by the drift /
-        // dirty signature rather than silently dropped.
-        var t = String(r.targetRoute || "")
-        var effBucket = (t === "block") ? "secondary" : t
-        if (effBucket !== String(route)) continue
+        // Pseudo-routes belong to the secondary bucket (the service's
+        // canonical placement), so drift and dirty signatures see them.
+        if (routeBucket(r.targetRoute) !== String(route)) continue
         var dto = ruleRowToWireDto(r, aceEncodeHost,
             { keepId: false, keepComment: false })
         if (route === "secondary") secondary.push(dto)
@@ -460,8 +510,7 @@ function ruleRoutingKeys(rows, aceEncodeHost) {
     for (var i = 0; i < rows.length; i += 1) {
         var r = rows[i]
         if (!r) continue
-        var t = String(r.targetRoute || "")
-        var bucket = (t === "block") ? "secondary" : t
+        var bucket = routeBucket(r.targetRoute)
         if (bucket !== "primary" && bucket !== "secondary") continue
         var dto = ruleRowToWireDto(r, aceEncodeHost,
             { keepId: false, keepComment: false })
@@ -525,14 +574,23 @@ function fileRowFromServiceWire(w, aceDecode) {
     }
 }
 
+// The route a `preset.parse` rule takes when read from the file for `route`.
+// `+block` wins; `?` means something only in the secondary file, so the
+// primary file keeps its own route for it.
+function parsedRuleTargetRoute(r, route) {
+    if (r.blocked === true) return "block"
+    if (r["verify-primary"] === true && String(route) === "secondary") return "verify"
+    return String(route)
+}
+
 // Minimal drift row from one `preset.parse` result rule. `route` is the file's
-// own route; a parsed `+block` rule overrides it, exactly as the import path
+// own route; a parsed pseudo-route overrides it, exactly as the import path
 // does when it builds full model rows.
 function driftRowFromParsedRule(r, route) {
     return {
         enabled: !!r.enabled,
         ruleType: String(r["rule-type"] || ""),
         matchValue: String(r["match-value"] || ""),
-        targetRoute: (r.blocked === true) ? "block" : String(route)
+        targetRoute: parsedRuleTargetRoute(r, route)
     }
 }

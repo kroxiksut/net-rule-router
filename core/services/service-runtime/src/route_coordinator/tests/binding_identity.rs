@@ -236,7 +236,11 @@ fn a_bound_adapter_that_no_longer_exists_asks_the_user_instead_of_going_quiet() 
     let mut tun = adapter("wg", 64, true, true, Some([10, 88, 0, 191]));
     tun.description = "WireGuard Tunnel".into();
     tun.friendly_name = "Tunnel 1".into();
-    api.set_adapter_infos(vec![nic, tun]);
+    // Our own fake-IP adapter is up too and must never be offered.
+    let mut own = adapter("own", 70, true, true, Some([198, 18, 0, 1]));
+    own.description = "Wintun Userspace Tunnel".into();
+    own.friendly_name = nrr_shared::product_identity::TUN_ADAPTER_NAME.into();
+    api.set_adapter_infos(vec![nic, tun, own]);
 
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary_named(
@@ -254,7 +258,8 @@ fn a_bound_adapter_that_no_longer_exists_asks_the_user_instead_of_going_quiet() 
         Arc::new(FakeRules::new()),
         Arc::clone(&policy),
     )
-    .with_event_bus(Arc::clone(&bus));
+    .with_event_bus(Arc::clone(&bus))
+    .with_gone_grace(std::time::Duration::ZERO);
 
     let r = coord.resolve("S-GONE");
     assert!(r.secondary.is_none(), "nothing to route through");
@@ -306,7 +311,9 @@ fn a_bound_adapter_whose_driver_will_not_start_is_reported_as_broken_not_gone() 
 
     // Same world for every run: the bound adapter is absent from the
     // enumeration and nothing answers to its name.
-    let statuses = |port: Option<Arc<dyn NetworkDeviceStatusPort>>| -> Vec<String> {
+    let statuses_after = |port: Option<Arc<dyn NetworkDeviceStatusPort>>,
+                          grace: std::time::Duration|
+     -> Vec<String> {
         let api = Arc::new(MockWindowsApi::new());
         let mut nic = adapter("nic", 19, true, true, Some([192, 168, 0, 2]));
         nic.description = "Ethernet Controller".into();
@@ -327,7 +334,8 @@ fn a_bound_adapter_whose_driver_will_not_start_is_reported_as_broken_not_gone() 
             Arc::new(FakeRules::new()),
             Arc::clone(&policy),
         )
-        .with_event_bus(Arc::clone(&bus));
+        .with_event_bus(Arc::clone(&bus))
+        .with_gone_grace(grace);
         if let Some(port) = port {
             coord = coord.with_device_status(port);
         }
@@ -344,6 +352,7 @@ fn a_bound_adapter_whose_driver_will_not_start_is_reported_as_broken_not_gone() 
             })
             .collect()
     };
+    let statuses = |port| statuses_after(port, std::time::Duration::ZERO);
 
     assert_eq!(
         statuses(Some(Arc::new(Fixed(Some(DeviceState::FailedToStart))))),
@@ -351,8 +360,8 @@ fn a_bound_adapter_whose_driver_will_not_start_is_reported_as_broken_not_gone() 
     );
     assert_eq!(
         statuses(Some(Arc::new(Fixed(Some(DeviceState::Disabled))))),
-        vec!["adapter-failed".to_string()],
-        "switched off is also present-but-unusable",
+        vec!["secondary-down".to_string()],
+        "switched off by the user is a link that is down, not a broken driver",
     );
     assert_eq!(
         statuses(Some(Arc::new(Fixed(Some(DeviceState::Absent))))),
@@ -365,6 +374,15 @@ fn a_bound_adapter_whose_driver_will_not_start_is_reported_as_broken_not_gone() 
         vec!["adapter-gone".to_string()],
     );
     assert_eq!(statuses(None), vec!["adapter-gone".to_string()]);
+
+    // Switching an adapter off reads as "no such device" for a few seconds:
+    // "removed" waits out the grace, "switched off" does not.
+    let fresh = std::time::Duration::from_secs(60);
+    assert!(statuses_after(Some(Arc::new(Fixed(Some(DeviceState::Absent)))), fresh).is_empty());
+    assert_eq!(
+        statuses_after(Some(Arc::new(Fixed(Some(DeviceState::Disabled)))), fresh),
+        vec!["secondary-down".to_string()],
+    );
 }
 
 /// Control for the test above, and the field case as it actually stands: the
@@ -470,6 +488,103 @@ fn a_binding_that_resolves_clears_the_standing_enforcement_notice() {
             ("primary".to_string(), "no-primary-route".to_string()),
         ],
         "published on change only, per role"
+    );
+}
+
+/// The push fires on change only, so a client that subscribes after it has
+/// nothing pending; the standing state must still be readable, and only for
+/// the user it is about.
+#[test]
+fn a_late_subscriber_reads_the_standing_status_instead_of_waiting_for_a_change() {
+    use crate::ipc_handlers::event_bus::EventBus;
+    use nrr_shared::ipc_payloads::{EnforcementStatusDto, StatusUpdateEvent};
+
+    let api = Arc::new(MockWindowsApi::new());
+    api.set_adapter_infos(vec![adapter("nic", 30, true, true, Some([10, 0, 0, 1]))]);
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary_named("S-LATE", "win-adapter:nic", "desc nic");
+    let bus = Arc::new(EventBus::new());
+    let coord = coordinator_with_policy(
+        Arc::clone(&api),
+        Arc::new(FakeRules::new()),
+        Arc::clone(&policy),
+    )
+    .with_event_bus(Arc::clone(&bus));
+    let _ = coord.resolve("S-LATE");
+
+    let late = bus
+        .subscribe_as("late".into(), Some("S-LATE".into()), None)
+        .subscription_id;
+    let _ = coord.resolve("S-LATE");
+    assert!(
+        !bus.peek_pending_for(&late, 16)
+            .iter()
+            .any(|e| matches!(e.event, StatusUpdateEvent::EnforcementStatusChanged { .. })),
+        "positive control: nothing changed, so nothing is pushed to the late subscriber"
+    );
+
+    let report = |status: &str, role: &str| EnforcementStatusDto {
+        status: status.into(),
+        role: role.into(),
+        candidates: Vec::new(),
+    };
+    let board = coord.enforcement_status();
+    assert_eq!(
+        board.for_principal("S-LATE"),
+        vec![
+            report("no-primary-route", "primary"),
+            report("ok", "secondary"),
+        ]
+    );
+    assert!(
+        board.for_principal("S-OTHER").is_empty(),
+        "another user's state is not this one's"
+    );
+}
+
+/// "No settings yet" is reported for no single role, so no role's `ok` ends
+/// it; getting past it has to, or the notice and the snapshot entry outlive it.
+#[test]
+fn a_policy_that_appears_ends_the_machine_wide_no_policy_report() {
+    use crate::ipc_handlers::event_bus::EventBus;
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+    let api = Arc::new(MockWindowsApi::new());
+    api.set_adapter_infos(vec![adapter("nic", 30, true, true, Some([10, 0, 0, 1]))]);
+    let policy = Arc::new(FakePolicy::new());
+    let bus = Arc::new(EventBus::new());
+    let sub = bus
+        .subscribe_as("test".into(), Some("S-NEW".into()), None)
+        .subscription_id;
+    let coord = coordinator_with_policy(
+        Arc::clone(&api),
+        Arc::new(FakeRules::new()),
+        Arc::clone(&policy),
+    )
+    .with_event_bus(Arc::clone(&bus));
+
+    let _ = coord.resolve("S-NEW");
+    policy.bind_secondary_named("S-NEW", "win-adapter:nic", "desc nic");
+    let _ = coord.resolve("S-NEW");
+    let _ = coord.resolve("S-NEW");
+
+    let machine_wide: Vec<String> = bus
+        .peek_pending_for(&sub, 16)
+        .iter()
+        .filter_map(|e| match &e.event {
+            StatusUpdateEvent::EnforcementStatusChanged { status, role, .. } if role.is_empty() => {
+                Some(status.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        machine_wide,
+        vec!["no-policy".to_string(), "ok".to_string()]
+    );
+    assert_eq!(
+        coord.enforcement_status().status_of("S-NEW", "").as_deref(),
+        Some("ok")
     );
 }
 

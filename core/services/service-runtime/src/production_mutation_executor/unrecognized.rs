@@ -22,6 +22,31 @@ use super::*;
 pub const NETWORK_COVERS_LINK_CODE: &str = "network-covers-link";
 /// Refusal code for a network over the service's virtual address pool.
 pub const NETWORK_COVERS_FAKE_IP_POOL_CODE: &str = "network-covers-fake-ip-pool";
+/// Refusal code for a submitted rule of a kind or action this build cannot read.
+pub const RULE_KIND_UNKNOWN_CODE: &str = "rule-kind-unknown";
+
+/// A client never sees the rules this build cannot read, so one arriving in a
+/// submission is a broken payload: stored, it would neither apply nor show.
+/// A malformed known kind is left for the codec to refuse with its own code.
+pub(super) fn unreadable_submitted_rule(rules_json: &str) -> Option<OperationError> {
+    let dto =
+        serde_json::from_str::<nrr_shared::rules_json::CanonicalRulesJsonV1>(rules_json).ok()?;
+    let rule = dto.primary.iter().chain(&dto.secondary).find(|rule| {
+        rule.is_unrecognized()
+            && !rule
+                .address_match
+                .as_ref()
+                .is_some_and(nrr_shared::rules_json::AddressMatchDto::is_malformed)
+    })?;
+    Some(OperationError {
+        args: Default::default(),
+        code: RULE_KIND_UNKNOWN_CODE.into(),
+        message: format!(
+            "Rule {} has a kind or action this version cannot read; nothing was saved.",
+            rule.id
+        ),
+    })
+}
 
 /// Why a network rule cannot be accepted on this machine as it is now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,9 +70,8 @@ pub trait NetworkRuleScreen: Send + Sync {
 }
 
 impl ProductionMutationExecutor {
-    /// Screen every NEW network rule of a submission. A network the book in
-    /// force already holds is not re-judged: a book saved before a link moved
-    /// must stay editable.
+    /// Screen every network rule a submission newly enforces (see
+    /// [`new_networks`]): a book saved before a link moved must stay editable.
     pub(super) fn network_refusal(
         &self,
         rules_json: &str,
@@ -196,9 +220,10 @@ pub(crate) fn first_report_of_book(rules_json: &str) -> bool {
     reported.insert(hasher.finish())
 }
 
-/// The enabled network rules of `incoming` that the book in force does not
-/// already hold. Only these are screened: a book saved before a link moved
-/// must stay editable.
+/// The enabled network rules of `incoming` the book in force did not already
+/// enforce on the same route with the same action. Only these are screened: a
+/// book saved before a link moved must stay editable, while enabling a stored
+/// network or moving it to the other route makes it newly enforced.
 pub(super) fn new_networks<'a>(
     incoming: &'a nrr_domain::canonical::CanonicalRuleBook,
     carried: Option<&nrr_domain::canonical::CanonicalRuleBook>,
@@ -206,19 +231,26 @@ pub(super) fn new_networks<'a>(
     &'a nrr_domain::canonical::CanonicalRule,
     &'a nrr_domain::canonical::CanonicalAddressMatch,
 )> {
-    let held: HashSet<&nrr_domain::canonical::CanonicalAddressMatch> = carried
-        .iter()
-        .flat_map(|book| book.primary.rules().iter().chain(book.secondary.rules()))
-        .filter_map(|rule| rule.address_match.as_ref())
+    use nrr_domain::canonical::{CanonicalRule, CanonicalRuleBook};
+    fn enforced(book: &CanonicalRuleBook) -> impl Iterator<Item = (bool, &CanonicalRule)> {
+        let primary = book.primary.rules().iter().map(|rule| (false, rule));
+        let secondary = book.secondary.rules().iter().map(|rule| (true, rule));
+        primary.chain(secondary).filter(|(_, rule)| rule.enabled)
+    }
+    let held: HashSet<_> = carried
+        .into_iter()
+        .flat_map(enforced)
+        .filter_map(|(secondary, rule)| {
+            Some((secondary, rule.action, rule.address_match.as_ref()?))
+        })
         .collect();
-    incoming
-        .primary
-        .rules()
-        .iter()
-        .chain(incoming.secondary.rules())
-        .filter(|rule| rule.enabled)
-        .filter_map(|rule| Some((rule, rule.address_match.as_ref()?)))
-        .filter(|(_, address)| address.ip_blocks().is_some() && !held.contains(address))
+    enforced(incoming)
+        .filter_map(|(secondary, rule)| {
+            let address = rule.address_match.as_ref()?;
+            let screened =
+                address.ip_blocks().is_some() && !held.contains(&(secondary, rule.action, address));
+            screened.then_some((rule, address))
+        })
         .collect()
 }
 

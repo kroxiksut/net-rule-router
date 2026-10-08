@@ -303,9 +303,11 @@ pub(super) fn mac_anchor_id(info: &AdapterInfo) -> Option<String> {
 /// Guessing is still refused; only the order changes, which is what lets the
 /// surface above put a button on the first entry.
 pub(super) fn replacement_candidates(infos: &[AdapterInfo], role: &str) -> Vec<String> {
+    // Our own fake-IP adapter carries traffic back into us; it is never a route.
     let usable = infos.iter().filter(|i| {
         crate::route_coordinator::classify_availability(i)
             == Some(crate::route_coordinator::AdapterAvailability::Available)
+            && i.friendly_name.trim() != nrr_shared::product_identity::TUN_ADAPTER_NAME
     });
     if role != "secondary" {
         return usable

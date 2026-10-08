@@ -464,7 +464,7 @@ pub(crate) fn build_supervised_runtime_deps(
     let pass_inputs = {
         use nrr_platform_api::adapters::AdapterEventSource;
         use nrr_service_runtime::pass_inputs::{
-            hashed, table_writes, PassInputs, PLAN_BLIND_STATE_TABLES,
+            applying_revision, hashed, table_writes, PassInputs, PLAN_BLIND_STATE_TABLES,
         };
         let state_db = artifacts.topology.state_db_path.clone();
         let cache = cache_store.clone();
@@ -507,6 +507,7 @@ pub(crate) fn build_supervised_runtime_deps(
                     Arc::new(move || Some(u64::from(fake_ip.is_running()))),
                 )
                 .with_source("state", table_writes(state_db, PLAN_BLIND_STATE_TABLES))
+                .with_source("applying", applying_revision())
                 .with_source(
                     "cache",
                     Arc::new(move || cache.as_ref()?.lock().ok()?.change_generation()),
@@ -516,7 +517,7 @@ pub(crate) fn build_supervised_runtime_deps(
                     "app-walks",
                     Arc::new(move || Some(walks.load(std::sync::atomic::Ordering::Relaxed))),
                 )
-                .with_source("routes", hashed(move || routes_api.get_ip_forward_table()))
+                .with_own_writes_source("routes", hashed(move || routes_api.get_ip_forward_table()))
                 // A dead-but-Up tunnel changes the plan without changing the
                 // adapter, so each link's liveness verdict is read with it.
                 .with_source(
@@ -951,7 +952,7 @@ pub(crate) fn build_supervised_runtime_deps(
         let reg = Arc::clone(&sid_registry);
         Arc::new(move || {
             !reg.active_sids().is_empty()
-                || nrr_platform_windows::win32_ffi::console_session::active_console_user_sid()
+                || nrr_platform_windows::win32_ffi::console_session::interactive_user_sid()
                     .is_some()
         })
     };
@@ -1415,6 +1416,7 @@ pub(crate) fn build_supervised_runtime_deps(
         route_coordinator.clone(),
     ) {
         dns_resolver_controller.set_factory(factory);
+        dns_resolver_controller.set_sign_in_probe(Arc::clone(&signed_in));
     }
     // DNS-over-secondary — seed the shared live flag from storage at boot, so
     // the setting holds from the first query instead of only after the user

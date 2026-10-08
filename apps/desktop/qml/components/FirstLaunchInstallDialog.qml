@@ -97,34 +97,40 @@ Window {
         Item { Layout.fillHeight: true }
 
         // Action row wraps to two lines on narrow displays via Flow.
-        Flow {
+        Item {
             Layout.fillWidth: true
             Layout.topMargin: 6
-            spacing: 8
-            ThemedButton {
-                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("dialog.first-launch-install.learn-more",
-                    "Learn more")
-                onClicked: { root.learnMoreRequested(); }
-            }
-            ThemedButton {
-                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("dialog.first-launch-install.skip-button",
-                    "Continue without service (limited)")
-                onClicked: { root.skipRequested(); root.close() }
-            }
-            ThemedButton {
-                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("dialog.first-launch-install.stop-offering",
-                    "Stop offering")
-                onClicked: { root.stopOfferingRequested(); root.close() }
-            }
-            ThemedButton {
-                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                text: root.tr("dialog.first-launch-install.install-button",
-                    "Install and start service (recommended)")
-                highlighted: true
-                onClicked: { root.installRequested(); root.close() }
+            Layout.preferredHeight: actionsFlow.height
+            Flow {
+                id: actionsFlow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: 8
+                ThemedButton {
+                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                    text: root.tr("dialog.first-launch-install.learn-more",
+                        "Learn more")
+                    onClicked: { root.learnMoreRequested(); }
+                }
+                ThemedButton {
+                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                    text: root.tr("dialog.first-launch-install.skip-button",
+                        "Continue without service (limited)")
+                    onClicked: { root.skipRequested(); root.close() }
+                }
+                ThemedButton {
+                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                    text: root.tr("dialog.first-launch-install.stop-offering",
+                        "Stop offering")
+                    onClicked: { root.stopOfferingRequested(); root.close() }
+                }
+                ThemedButton {
+                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                    text: root.tr("dialog.first-launch-install.install-button",
+                        "Install and start service (recommended)")
+                    highlighted: true
+                    onClicked: { root.installRequested(); root.close() }
+                }
             }
         }
     }

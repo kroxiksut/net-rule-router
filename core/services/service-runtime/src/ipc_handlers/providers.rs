@@ -144,6 +144,17 @@ pub trait MutationExecutor: Send + Sync {
     /// from the envelope class + `IpcRequestContext.caller_stored()`.
     fn execute(&self, payload: StoredMutation, principal: &str) -> MutationOutcome;
 
+    /// The refusal [`Self::execute`] would open with — the administrator's
+    /// rules lock or the tamper gate — read without logging or progress
+    /// events, so a background writer can skip a submission the gate refuses.
+    fn closed_gate(
+        &self,
+        _kind: MutationKind,
+        _caller_is_elevated: bool,
+    ) -> Option<OperationError> {
+        None
+    }
+
     /// Execute a rollback of `principal`'s active revision to
     /// `target_revision_id` (or LKG when `None`). Rollback is scoped
     /// per-principal.
@@ -194,6 +205,12 @@ pub trait RoutePolicyWriter: Send + Sync {
         sid: &str,
         request: &RoutePolicyUpdateRequest,
     ) -> Result<RoutePolicyDto, RoutePolicyWriteError>;
+
+    /// The row an `apply-only` request lands on; `None` when there is none yet,
+    /// and the request then writes whole.
+    fn stored_for_sid(&self, _sid: &str) -> Option<RoutePolicyDto> {
+        None
+    }
 }
 
 /// Wire-format application of a per-SID

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Linux counterpart of uninstall-service.ps1. Counterpart of install-service.sh:
-# removes the unit AND the staged copy under /usr/libexec/netrulerouter that
-# install-service.sh put there.
+# removes the unit AND the staged copies under /usr/libexec/netrulerouter that
+# install-service.sh put there, with their links in /usr/bin.
 #
 # Difference from uninstall-service.ps1: `nrr-serviced uninstall` runs
 # `systemctl disable --now`, which stops the unit as part of removing it — no
@@ -66,10 +66,17 @@ nrr_run_privileged "$exe_path" uninstall
 
 # The uninstall plan removes the unit, the drop-ins and the alias symlink; the
 # staged binary is this script's own footprint, so this script clears it.
+nrr_cyan "==> remove the console and the terminal interface"
+nrr_remove_console_binaries
+
 if [ -f "$NRR_STAGED_SERVICE_BINARY" ]; then
   nrr_cyan "==> remove $NRR_STAGED_SERVICE_BINARY"
   nrr_run_privileged rm -f "$NRR_STAGED_SERVICE_BINARY" "$NRR_SERVICE_INSTALL_DIR/$NRR_SERVICE_ALIAS_NAME"
   nrr_run_privileged rmdir --ignore-fail-on-non-empty "$NRR_SERVICE_INSTALL_DIR"
+fi
+if [ -d "$NRR_LEGACY_SERVICE_INSTALL_DIR" ]; then
+  nrr_cyan "==> remove the earlier install directory $NRR_LEGACY_SERVICE_INSTALL_DIR"
+  nrr_run_privileged rm -rf -- "$NRR_LEGACY_SERVICE_INSTALL_DIR"
 fi
 
 nrr_green "Service uninstalled. State DB and audit logs preserved."

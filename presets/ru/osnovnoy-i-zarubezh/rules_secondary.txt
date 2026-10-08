@@ -6,6 +6,8 @@
 
 --- Domains
 account.jetbrains.com
+?accounts.google.com
+?accounts.google.ru
 ai.google.dev
 aistudio.google.com
 api.jetbrains.ai
@@ -20,6 +22,8 @@ downloads.marketplace.jetbrains.com
 gemini.google.com
 lechat.mistral.ai
 notebooklm.google.com
+?play-lh.googleusercontent.com
+?play.google.com
 plugins.jetbrains.com
 redd.it
 resources.jetbrains.com
@@ -70,6 +74,10 @@ youtu.be
 *.pinimg.com
 *.pinterest.com
 *.poe.com
+?*.proton.me
+?*.protonmail.ch
+?*.protonmail.com
+?*.protonvpn.com
 *.qq.com
 *.reddit.com
 *.redditmedia.com

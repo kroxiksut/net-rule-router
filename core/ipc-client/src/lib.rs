@@ -63,6 +63,26 @@ pub mod transport_unix;
 
 mod push_handover;
 
+/// Set by [`silence_diagnostics`]; read by the client's stderr trace.
+static DIAGNOSTICS_SILENCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Stop the client's stderr trace. For a process that owns the terminal: a
+/// full-screen or screen-reader interface would get the lines in its output.
+pub fn silence_diagnostics() {
+    DIAGNOSTICS_SILENCED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `eprintln!` unless the process silenced the client. The one stderr path
+/// of both clients, so [`silence_diagnostics`] holds on every OS.
+macro_rules! client_trace {
+    ($($arg:tt)*) => {
+        if !$crate::DIAGNOSTICS_SILENCED.load(::std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 #[cfg(target_os = "windows")]
 mod client;
 

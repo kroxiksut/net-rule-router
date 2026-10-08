@@ -17,6 +17,7 @@ Rectangle {
         if (statusKey === "no-rules") return theme.colorTextMuted
         if (statusKey === "disconnected") return theme.colorTextMuted
         if (statusKey === "error") return theme.colorWarning
+        if (statusKey === "limited") return theme.colorWarning
         return theme.colorSuccess
     }
     readonly property string labelText: {
@@ -30,6 +31,8 @@ Rectangle {
             return root.tr("routing.status.disconnected", "Service not connected")
         if (statusKey === "error")
             return root.tr("routing.status.error", "Routing error")
+        if (statusKey === "limited")
+            return root.tr("routing.status.limited", "Routing limited")
         return root.tr("routing.status.active", "Routing active")
     }
 
@@ -78,6 +81,12 @@ Rectangle {
             if (chip.statusKey === "disconnected")
                 return root.tr("routing.status.detail-disconnected",
                     "Showing preview data. Install and start the NetRuleRouter service to apply rules.")
+            // The notices' own headlines: what happens to the traffic differs
+            // per status, and only the notice beside the chip says which.
+            if (chip.statusKey === "limited")
+                return root.enforcementDownDetail()
+                    || root.tr("routing.status.detail-limited",
+                        "Some rules are not being applied right now. The notices say why.")
             return root.tr("routing.status.detail-active",
                 "Rules apply on this user session.")
         }

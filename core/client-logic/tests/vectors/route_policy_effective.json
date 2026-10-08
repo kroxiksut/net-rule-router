@@ -1,0 +1,16 @@
+{
+  "description": "pure.js routePolicyEffective: current value of one key, null for a key that is not a route-policy field",
+  "cases": [
+    { "name": "empty snapshot text", "input": { "snapshot": {}, "key": "mode" } },
+    { "name": "empty snapshot bool", "input": { "snapshot": {}, "key": "allow-dns-over-primary" } },
+    { "name": "empty snapshot number", "input": { "snapshot": {}, "key": "primary-probe-repeat-secs" } },
+    { "name": "null snapshot", "input": { "snapshot": null, "key": "include-subdomains" } },
+    { "name": "absent snapshot", "input": { "key": "doh-lockdown-scope" } },
+    { "name": "value present", "input": { "snapshot": { "mode": "prefer-secondary" }, "key": "mode" } },
+    { "name": "bool present false", "input": { "snapshot": { "include-subdomains": false }, "key": "include-subdomains" } },
+    { "name": "invalid protocols", "input": { "snapshot": { "kill-switch-protocols": 0 }, "key": "kill-switch-protocols" } },
+    { "name": "unknown key", "input": { "snapshot": { "future-field": 1 }, "key": "future-field" } },
+    { "name": "snapshot-only key", "input": { "snapshot": { "secondary-link-provider-apps": [] }, "key": "secondary-link-provider-apps" } },
+    { "name": "binding-source is not a field", "input": { "snapshot": { "binding-source": "recovery" }, "key": "binding-source" } }
+  ]
+}

@@ -128,6 +128,7 @@
     "primary": "Primary",
     "secondary": "Additional",
     "block": "Block",
+    "verify-primary": "Primary first, additional if unreachable",
     "service": "Service",
     "version": "Version",
     "license": "License",
@@ -212,7 +213,8 @@
         "on-app-launch": {
           "label": "Start when the app opens"
         },
-        "help": "“Start with the system” keeps your rules enforced from boot, before anyone logs in (best for always-on or managed setups). “Start when the app opens” runs the service only while you use NetRuleRouter and lets the app start it without an administrator prompt every time. Changing this needs administrator approval."
+        "help": "“Start with the system” keeps your rules enforced from boot, before anyone logs in (best for always-on or managed setups). “Start when the app opens” runs the service only while you use NetRuleRouter and lets the app start it without an administrator prompt every time. Changing this needs administrator approval.",
+        "help-with-system-only": "“Start with the system” keeps your rules enforced from boot, before anyone logs in. Changing this needs administrator approval."
       },
       "launch-tray": {
         "label": "Also start the tray at sign-in",
@@ -1026,8 +1028,10 @@
       "no-rules": "No rules configured",
       "disconnected": "Service not connected",
       "error": "Routing error",
+      "limited": "Routing limited",
       "card-title": "Routing state",
       "detail-active": "Rules apply on this user session.",
+      "detail-limited": "Some rules are not being applied right now. The notices say why.",
       "detail-paused": "Rules are disabled until you re-enable them.",
       "detail-no-tray": "Run the tray icon to apply rules on this session.",
       "detail-no-rules": "Add rules in the Rules section, then click Save and review.",
@@ -1160,7 +1164,8 @@
       "duplicate-open-existing": "Open existing",
       "coverage-with-subdomains": "Covers {host} and every subdomain of it.",
       "coverage-exact-only": "Covers {host} only. Type *.{host} to include its subdomains.",
-      "include-subdomains": "Include subdomains"
+      "include-subdomains": "Include subdomains",
+      "route-verify-hint": "Opens through the primary route first. Once NetRuleRouter confirms the primary route cannot reach the site, the rule moves to the additional route by itself."
     },
     "load-list": {
       "title": "Load rule list",
@@ -1931,6 +1936,9 @@
     "hosts-bypass-set": "Rule-domain resolution updated.",
     "hosts-bypass-failed": "Could not update rule-domain resolution: ",
     "auto-rules-added": "Addresses a routed site needs were added to your rules.",
+    "rules-tidied-unsaved-short": "Rules tidied — reload to see them",
+    "rules-tidied-unsaved": "Duplicate subdomain rules the app had added were removed from your rules. Save or discard your edits, then reload the rules to see them.",
+    "rules-tidied": "Duplicate subdomain rules the app had added were removed from your rules.",
     "auto-rules-added-unsaved-short": "Addresses added — reload to see them",
     "auto-rules-added-unsaved": "Addresses a routed site needs were added to your rules. Save or discard your edits, then reload the rules to see them.",
     "bound-file-factory-not-saved": "Nothing was saved — the linked file is part of the app's own rule sets.",
@@ -2032,7 +2040,9 @@
     "remembered": {
       "toggle": "Show remembered adapters that are currently absent",
       "badge": "remembered · currently absent",
-      "recovery-hint": "If the connection is back up, send the binding to the service again. Otherwise assign another adapter to this role in the list below."
+      "recovery-hint": "If the connection is back up, send the binding to the service again. Otherwise assign another adapter to this role in the list below.",
+      "badge-switched-off": "remembered · switched off",
+      "switched-off-hint": "The adapter is switched off. Turn it back on, or assign another adapter to this role in the list below."
     },
     "search": {
       "label": "Find",
@@ -2573,6 +2583,7 @@
       "block-tie-warning": "The other rule names the same sites and never applies.",
       "main-stays": "Addresses of the main link inside this network stay on the main link even when the additional link is down. Leak protection does not block them.",
       "block-note": "A block rule is part of this pair; change it in the rules list.",
+      "verify-note": "A rule that tries the primary route first is part of this pair; change it in the rules list.",
       "confirm": "Correct",
       "confirm-all": "Confirm all",
       "confirmed": "Confirmed",
@@ -2600,7 +2611,8 @@
         "literal-block": "{rule}: {host} resolves to {ip}, and a block of that address wins over any name rule, so the address is blocked.",
         "leak": "{rule} does not block {host}: it shares {ip} with {via}, which a narrower rule routes, so the address stays open.",
         "more": "Addresses affected besides this one: {count}.",
-        "unsupported-shape": "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application."
+        "unsupported-shape": "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application.",
+        "carving-over-cap": "{rule} holds more narrower rules than can be carved out of it, so it applies to its whole network and the narrower rules inside it do not take effect. Split it into smaller networks."
       },
       "intersecting": "{winner} and {loser} on {loser-route} share some addresses. Each shared address takes the narrower rule; most of them go over {winner-route}.",
       "send-over-whole": "This moves the whole rule, including addresses the other rule does not cover."
@@ -2738,6 +2750,10 @@
       "title": "Turn on “Apply automatically”?",
       "body": "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime in Settings → Routing, by switching back to “Suggest only”.",
       "confirm": "Turn on"
+    },
+    "verify-moved": {
+      "title": "Site moved to the additional route",
+      "body": "{host} does not open over the primary route, so its rule now uses the additional route."
     },
     "external-address": {
       "title": "Additional route connected",
@@ -3196,6 +3212,7 @@
       }
     },
     "event": {
+      "auto-rules-verify-moved": "The main route does not reach {host}; its ? rule now uses the additional route.",
       "conn-observation-tick": "Connections observed: {total} (Main {primary}, Additional {secondary}, blocked {blocked_nrr})",
       "dns-refresh-tick": "DNS refresh: {succeeded} of {attempted} names resolved",
       "system-routes-reconciled": "System routes updated: {added} added, {removed} removed",
@@ -3296,6 +3313,9 @@
       "connobs-stale-flows-torn-down": "Reset {torn_down} connection(s) across {destinations} destination(s) that a destination pin had caught on the wrong link; affected applications will reconnect over the correct route.",
       "connobs-app-pin-first-contact-drop": "An application-pinned process was blocked {count} time(s) on destinations not yet routed through the additional link; this is expected on first contact and resolves on the next policy update.",
       "connobs-blocked-connection-first-seen": "Blocked connection observed: process {process}, destination {remote_ip}:{remote_port} ({protocol}), blocked by {blocked_by}{purpose}.",
+      "conn-unanswered": "The far side stopped answering a connection of {program} (pid {pid}) over the {link} link (interface {ifindex}, {adapter}) to {remote} from local port {local_port}: no answer for {silent_s} s, {resends} resends. NetRuleRouter did not block this connection.",
+      "conn-unanswered-closed": "The system closed a connection of {program} (pid {pid}) over the {link} link (interface {ifindex}, {adapter}) to {remote} from local port {local_port}: the far side had not answered for {silent_s} s.",
+      "conn-unanswered-omitted": "{omitted} more unanswered connection(s) in the last minute were not listed.",
       "dnsobs-collateral-pin-skipped-secondary-unusable": "Skipped pinning shared address {shared_ip} (also used by {secondary_rule_host}) to the additional link because it is currently unusable; {direct_host} stays on the primary link and will be re-evaluated once the link recovers.",
       "dnsobs-os-cache-seeded": "Seeded the address cache from the OS DNS cache: {matched} matched, {refreshed} refreshed, {ignored} ignored.",
       "dnsobs-reverse-confirmed-rule-host-cached": "Cached rule host {hostname} ({addresses} address(es)) confirmed by reverse lookup from a blocked connection.",
@@ -3589,6 +3609,7 @@
       "dns-resolver-stopped-restored": "Local DNS resolver stopped — system DNS restored",
       "dns-resolver-serve-loop-error": "Local DNS resolver: the serve loop ended with an error ({error})",
       "dns-resolver-watchdog-rearm": "Local DNS resolver: enabled but its serve thread had exited — restarting it",
+      "dns-resolver-signed-in-arm": "Local DNS resolver: a user is signed in — starting the resolver that was waiting for one",
       "dns-resolver-no-factory": "Local DNS resolver: start requested but no resolver is configured — staying in reactive mode",
       "dns-resolver-arm-failed": "Local DNS resolver: could not start (no upstream server or missing dependencies) — staying in reactive mode",
       "dns-resolver-thread-started": "Local DNS resolver thread started",
@@ -3832,7 +3853,9 @@
       "conn-trace-log-window-ended": "Connection trace log window ended; connections are no longer written to the log.",
       "conn-trace-log-expiry-unarmed": "Connection trace log timer could not start ({error}); the window ends at the next service restart.",
       "conn-trace-log-at-boot": "Connection trace log at service start: {mode} (until {until_ms}, forced: {forced}).",
-      "storage-kill-switch-protocols-reset": "A stored leak protection protocol selection blocked nothing; every protocol is blocked instead."
+      "storage-kill-switch-protocols-reset": "A stored leak protection protocol selection blocked nothing; every protocol is blocked instead.",
+      "persid-plan-network-carving-over-cap": "{count} network rule(s) hold more narrower rules than can be carved out, so each applies to its whole network and the narrower rules inside it do not take effect ({rules}).",
+      "linux-flow-reset-dump-capped": "The connection table holds more {family} sockets than one listing reads ({cap}); connections past that are not reset."
     }
   },
   "logs": {
@@ -3910,6 +3933,7 @@
     "revision-integrity-rejected": "That version of the rules failed the integrity check and was not used.",
     "storage-failure": "The service could not read or write its rules storage.",
     "not-implemented": "This is not available on this system yet.",
+    "unsupported-platform": "This is not available on this system, so nothing was changed.",
     "precondition-failed": "Operation precondition not met",
     "confirmation-expired": "Confirmation token expired — re-run review",
     "confirmation-unknown": "Confirmation token unknown — re-run review",
@@ -3935,6 +3959,8 @@
     "network-covers-link-local-network": "The network {network} overlaps {covers}, a network this computer is connected to, so routing it would cut the connection its own traffic uses. Choose a network that does not overlap it.",
     "network-covers-fake-ip-pool-named": "The network {network} overlaps the address range the program reserves for name-based routing. Choose a different network.",
     "security-alert-unacknowledged": "Rules cannot be changed until the security alert in Diagnostics is reviewed and acknowledged.",
+    "terminal-needs-elevation-unix": "This needs administrator rights, and nrr-tui does not ask for them. Quit and start it again with the command sudo nrr-tui.",
+    "terminal-needs-elevation-windows": "This needs administrator rights, and nrr-tui does not ask for them. Quit and start it again from a terminal opened with Run as administrator.",
     "revision-status-mismatch": "These changes were already applied — nothing was sent again.",
     "token-already-consumed": "These changes were already applied — nothing was sent again.",
     "unknown": "Unknown error",
@@ -3954,7 +3980,10 @@
     "alert-not-found": "The service no longer has this alert.",
     "illegal-state-transition": "This alert has already been handled, so it cannot be changed again.",
     "alerts-storage-failure": "The service could not read or save the security alerts.",
-    "alerts-store-unavailable": "Security alerts are not available in the service."
+    "alerts-store-unavailable": "Security alerts are not available in the service.",
+    "rule-kind-unknown": "One of the rules is of a kind this version cannot read, so nothing was saved. Update the app, or remove that rule.",
+    "network-on-both-routes": "A network is set on both routes. Each network takes one route, so the change was not applied. Remove it from one of them.",
+    "network-on-both-routes-named": "The network {network} is set on both routes. Each network takes one route, so the change was not applied. Remove it from one of them."
   },
   "unsaved-changes": {
     "title": "Unsaved changes",
@@ -4159,5 +4188,364 @@
     "dns-lockdown": "Blocks of apps using their own DNS",
     "unattributed": "Blocks without an identified filter",
     "any": "Blocks of this kind"
+  },
+  "tui": {
+    "suggestions": {
+      "notice-open": "To answer, open screen {key}, {screen}.",
+      "loading": "Reading the suggestions from the service...",
+      "added": "Added to your rules: {count}.",
+      "declined": "Will not be suggested again: {count}.",
+      "restored": "Can be suggested again: {count}.",
+      "auto-on": "Suggested addresses are now added automatically.",
+      "failed": "Not done: {error}",
+      "no-item": "There is no item {n} in the list. Use the number shown before an item.",
+      "nothing-to-do": "Item {n} has nothing this command can act on.",
+      "confirm": "y: turn it on and add item {n}. n: cancel.",
+      "confirm-prompt": "Type y to turn it on or n to cancel, then press Enter.",
+      "cancelled": "Nothing was changed.",
+      "help": {
+        "select": "Enter or Tab: go to the list; Up and Down: choose an item",
+        "add": "a: add the chosen item to the additional route",
+        "never": "n: do not suggest the chosen item again",
+        "restore": "r: allow the chosen item to be suggested again",
+        "always": "m: add the chosen item and add suggestions automatically from now on (asks first)",
+        "check": "c: check the addresses over the main connection",
+        "toggles": "s: show or hide answered addresses; v: show or hide addresses the main connection handles",
+        "order": "o: change the order of the list"
+      },
+      "plain": {
+        "add": "a and an item number, for example a 2: add that item to the additional route",
+        "never": "n and an item number: do not suggest that item again",
+        "restore": "r and an item number: allow that item to be suggested again",
+        "always": "m and an item number: add that item and add suggestions automatically from now on (asks first)",
+        "check": "c: check the addresses over the main connection",
+        "toggles": "s: show or hide answered addresses; v: show or hide addresses the main connection handles",
+        "order": "o: change the order of the list"
+      }
+    },
+    "overlaps": {
+      "pairs-title": "Rules that cover the same sites",
+      "not-confirmed": "Not confirmed",
+      "apply-on-rules": "Review and apply the change on screen {key}, {screen}.",
+      "loading": "Reading your rules from the service...",
+      "failed": "Could not read your rules: {error}",
+      "no-item": "There is no item {n} in the list. Use the number shown before an item.",
+      "cannot-send": "Item {n} cannot be sent over the other route here; change it in the rules list.",
+      "gone": "The rules of item {n} changed in the meantime; nothing was sent.",
+      "help": {
+        "select": "Enter or Tab: go to the list; Up and Down: choose an item",
+        "confirm": "c: confirm the chosen item is correct",
+        "confirm-all": "Shift+C: confirm every item",
+        "unconfirm": "u: ask about the chosen item again",
+        "send-over": "o: send the chosen item's sites over the other route instead",
+        "show-resolved": "s: show or hide confirmed items"
+      },
+      "plain": {
+        "confirm": "c and an item number, for example c 2: confirm that item is correct; c all: confirm every item",
+        "unconfirm": "u and an item number: ask about that item again",
+        "send-over": "o and an item number: send that item's sites over the other route instead",
+        "show-resolved": "s: show or hide confirmed items"
+      }
+    },
+    "screen": {
+      "status": "Status",
+      "diagnostics-logs": "Diagnostics and logs"
+    },
+    "menu": {
+      "title": "Screens"
+    },
+    "placeholder": "This screen will be in the next version.",
+    "list": {
+      "page": "Rows {from}–{to} of {total}.",
+      "more-on-service": "The service has more: going past the last row asks for them.",
+      "help-pages": "PageUp and PageDown: previous and next page; Home and End: first and last row",
+      "plain-pages": "n: next page (more)   p: previous page (back)",
+      "help-refresh": "r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.",
+      "typing-hint": "Enter: done   Esc: cancel",
+      "yes-no": "y: yes   n: no"
+    },
+    "trace": {
+      "list-title": "Connections",
+      "detail-title": "Selected connection",
+      "shown": "Shown: {shown} of {total}.",
+      "search": "Search: {text}",
+      "path": "Path: {path}",
+      "help-explain": "Enter: why the chosen connection took its route (opens Diagnostics)",
+      "help-search": "/: search all fields; Enter applies the search, Esc cancels",
+      "help-filters": "b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off",
+      "plain-details": "d and a row number: show that connection, for example d 3",
+      "plain-explain": "e and a row number: why that connection took its route, for example e 3",
+      "plain-search": "/ and text: search all fields, for example /example; / on its own clears the search"
+    },
+    "cache": {
+      "detail-title": "Selected entry",
+      "total": "Entries on the service: {total}.",
+      "search": "Search: {text}",
+      "clear-app-question": "Clear the app cache? Names are resolved again as programs use them.",
+      "clear-os-question": "Flush the operating system's DNS cache?",
+      "clearing": "Clearing…",
+      "help-search": "/: search the cache on the service; Enter applies the search, Esc cancels",
+      "help-clear": "c: clear the app cache   o: flush the operating system's DNS cache (each asks first)",
+      "plain-details": "d and a row number: show that entry, for example d 3",
+      "plain-search": "/ and text: search the cache on the service, for example /example.com; / on its own clears the search"
+    },
+    "diagnostics": {
+      "acknowledging": "Acknowledging…",
+      "archive-unreadable": "The service wrote the archive, but this account cannot open it.",
+      "kind-any": "any",
+      "help-switch": "l: switch between diagnostics and the log",
+      "help-ack": "Up and Down: choose an alert; a: acknowledge it",
+      "help-explain": "e: type a host name or address and see which rule decides it",
+      "help-export": "x: export a diagnostic archive; the service writes it and the path is shown here",
+      "help-log-filters": "In the log: v changes the lowest level shown, / filters by event type, s switches between this session and all history",
+      "plain-ack": "a and an alert number: acknowledge it, for example a 1",
+      "plain-explain": "e and a host or address: which rule decides it, for example e example.com",
+      "plain-export": "x: export a diagnostic archive",
+      "plain-log-filters": "In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history"
+    },
+    "startup": {
+      "not-interactive": "{tui} works only interactively, in a terminal. For reading and diagnostics, use {console}.",
+      "usage": "Usage: {tui} [options]\n  --lang <language>\n      interface language, for example en or ru\n  --plain\n      line mode for screen readers: no redrawing, every change on a new line\n  --no-color\n      no colours (the NO_COLOR variable does the same)\n  --ascii\n      plain characters instead of frame lines\n  --wizard\n      open the first-run setup\n  --bell\n      sound the terminal bell on a new notification",
+      "unknown-option": "Unknown option: {option}. Run {tui} --help for the list.",
+      "missing-value": "The option {option} needs a value.",
+      "terminal-failed": "Could not prepare the terminal: {error}"
+    },
+    "connection": {
+      "fix-install": "To install it, run: {command}",
+      "fix-start": "To start it, run: {command}",
+      "versions": "The service speaks protocol version {server}, this program version {client}. Update NetRuleRouter so both match.",
+      "refused-reason": "The service said: {reason}",
+      "retrying": "Checking again every 2 seconds."
+    },
+    "status": {
+      "fetch-failed": "Could not read the state from the service: {error}",
+      "connections-title": "Connections",
+      "adapter-missing": "Not found",
+      "rules-applied": "Rules applied",
+      "rules-not-applied": "Rules not applied",
+      "rules-unknown": "Not known without the service"
+    },
+    "help": {
+      "screens": "1 to 9 and 0: open a screen",
+      "move": "Up and Down: move through the list",
+      "panels": "Tab and Shift+Tab: move between panels",
+      "open": "Enter: open the screen chosen in the list",
+      "help": "F1 or ?: help for this screen",
+      "back": "Esc: back, or close this help",
+      "quit": "q: quit",
+      "status-feed": "On this screen, Up and Down scroll the notifications when that panel has the focus.",
+      "settings-focus": "Tab: give this screen the focus; then Up and Down move through the sections and the settings.",
+      "settings-enter": "Enter: open a section, change the chosen setting, or run the chosen action.",
+      "settings-esc": "Esc: cancel a change, or go back to the list of sections."
+    },
+    "footer": "F1: help   q: quit",
+    "plain": {
+      "screen": "Screen: {name}",
+      "prompt": "Type a screen number, h for help or q to quit, then press Enter.",
+      "help-number": "A number: open that screen",
+      "help-enter": "Enter on its own: show this screen again",
+      "help-help": "h or ?: this help",
+      "unknown": "Not understood: {input}",
+      "commands": "Commands on this screen"
+    },
+    "interfaces": {
+      "adapters-title": "Adapters",
+      "details-title": "Chosen adapter: {name}",
+      "result-title": "Last action",
+      "no-adapters": "The service reports no adapters that can take a role.",
+      "saving": "Saving…",
+      "read-failed": "Could not read the current routing settings, so nothing was changed: {error}",
+      "role-set": "{role}: {name}.",
+      "cancelled": "Nothing was changed.",
+      "setup-finished": "Setup finished. Check here that the connections are the ones you meant.",
+      "pick-adapter": "Which adapter?",
+      "pick-role": "What should {name} carry?",
+      "help-select": "Tab, then Up and Down: choose an adapter",
+      "help-primary": "p: make the chosen adapter the main connection, or unassign it",
+      "help-secondary": "s: make the chosen adapter the additional connection, or unassign it",
+      "help-check": "x: check each adapter's external address (sends one small packet per adapter)",
+      "help-refresh": "r: read the adapter list again",
+      "help-bluetooth": "b: show or hide Bluetooth adapters",
+      "plain-assign": "a: give an adapter a role or take it away (asks for the adapter's number)"
+    },
+    "choice": {
+      "hint": "Answer with the number, or with Up, Down and Enter. Esc or an empty answer cancels.",
+      "prompt": "Type the number of your answer and press Enter; an empty line cancels."
+    },
+    "rules": {
+      "state-title": "Rule list",
+      "list-title": "Rules",
+      "changes": "Changes",
+      "pending": "Not applied",
+      "in-force": "Same as in the service",
+      "not-loaded": "The rules in force are not known without the service.",
+      "loading": "Reading the rules from the service…",
+      "load-failed": "Could not read the rules from the service: {error}",
+      "previewing": "Comparing with the rules in force…",
+      "applying": "Applying the rules…",
+      "phase-started": "The service has started applying the rules.",
+      "phase-completed": "The service has finished applying the rules.",
+      "phase-failed": "The service could not apply the rules: {error}",
+      "busy": "Wait until the rules are applied; the list cannot change meanwhile.",
+      "apply-offline": "The service is not connected, so the rules cannot be applied now. Export them to files with x to keep them.",
+      "expired": "The review is out of date — the rules in force changed meanwhile. Press s to compare again.",
+      "on": "on",
+      "off": "off",
+      "shown": "Rules {first} to {last} of {shown}; {total} in all.",
+      "none-shown": "No rule matches the filter. {total} in all.",
+      "verdict-empty": "Type a value to check it.",
+      "choice-hint": "Up and Down choose, Enter confirms, Esc cancels; or type the number.",
+      "input-hint": "Type, then Enter; Backspace deletes, Esc cancels.",
+      "form-hint": "Up and Down: field. Left and Right: change a choice. Space: on or off. Enter: save. Esc: cancel.",
+      "review-hint": "Enter: apply these changes. Esc: back to editing. Up, Down, Page Up, Page Down: scroll the list.",
+      "review-hint-critical": "Space: tick the box above; Enter applies only once it is ticked. Esc: back to editing.",
+      "review-window": "Change lines {first} to {last} of {total}.",
+      "ticked": "[x]",
+      "unticked": "[ ]",
+      "filter-question": "Show the rules of which route?",
+      "search-question": "Search by value or comment. A pasted web address is reduced to its site. Empty shows all.",
+      "import-question": "Folder with rules_primary.txt and rules_secondary.txt to import:",
+      "export-question": "Folder to write rules_primary.txt and rules_secondary.txt to:",
+      "preset-question": "Which rule set to load?",
+      "no-presets": "No rule sets were found beside the program.",
+      "mode-question": "What to do with the rules on screen?",
+      "mode-replace": "Replace them with the rules from the files",
+      "mode-add": "Keep them and add the rules from the files that are not there yet",
+      "overwrite-question": "The folder already has rules files. Replace them?",
+      "overwrite": "Replace the files",
+      "reload-question": "Load the rules the service applies? The changes on screen will be lost.",
+      "quit-apply": "Apply, then quit",
+      "quit-discard": "Discard the changes and quit",
+      "quit-stay": "Stay",
+      "imported": "Read {count} rules from {path}. They are not applied yet.",
+      "import-nothing": "Neither rules_primary.txt nor rules_secondary.txt is in {path}.",
+      "read-failed": "Could not read {path}: {error}",
+      "exported": "The rules were written to {path}.",
+      "write-failed": "Could not write {path}: {error}",
+      "plain-prompt": "Type the answer and press Enter. Enter alone keeps what is shown; ! cancels.",
+      "plain-choice-prompt": "Type the number of your choice and press Enter; ! cancels.",
+      "plain-review-prompt": "Type y and press Enter to apply these changes, or n to go back to editing; > and < scroll the list.",
+      "plain-review-critical-prompt": "The risk is critical. Type c and press Enter to tick the box above, then y to apply; n goes back to editing.",
+      "help": {
+        "focus": "Tab or Enter in the menu: move into the rule list; Esc: back to the menu",
+        "move": "Up, Down, Page Up, Page Down, Home, End: choose a rule",
+        "edit": "a: add a rule. e or Enter: edit the chosen rule",
+        "delete": "Delete or d: delete the chosen rule. Space or t: switch it on or off",
+        "filter": "f: show the rules of one route. /: search; a pasted web address is reduced to its site",
+        "apply": "Ctrl+S or s: apply. The changes are shown first; Enter applies them, Esc returns",
+        "files": "i: import the two rules files. x: export them. p: load a country rule set",
+        "reload": "r: show the rules the service applies, dropping the changes on screen",
+        "form": "In the rule form: Up and Down move between fields, Left and Right change a choice, Space switches the rule on or off, Enter saves, Esc cancels"
+      },
+      "plain": {
+        "add": "a: add a rule",
+        "edit": "e and a number: edit that rule, for example e 3",
+        "delete": "d and a number: delete that rule",
+        "toggle": "t and a number: switch that rule on or off",
+        "filter": "f: choose which route's rules to show",
+        "search": "/ and text: search, for example / example.com; / alone shows all",
+        "pages": "> and <: next and previous page",
+        "apply": "s: apply the changes; they are shown first",
+        "files": "i: import files. x: export files. p: load a country rule set",
+        "reload": "r: show the rules the service applies"
+      },
+      "title-baseline": "Rules — baseline for every user",
+      "baseline-note": "Running as root: these rules are the baseline every user without rules of their own follows, as Set as baseline does in the window."
+    },
+    "settings": {
+      "sections": "Settings sections",
+      "terminal": {
+        "title": "Terminal",
+        "plain": "Line mode for screen readers",
+        "no-color": "No colours",
+        "ascii": "Plain characters instead of frame lines",
+        "note": "These take effect the next time the program starts. The command-line options and the NO_COLOR and NRR_TUI_PLAIN variables still switch them on.",
+        "saved": "Saved. Takes effect the next time the program starts.",
+        "no-file": "There is no configuration folder for this user, so the setting cannot be saved.",
+        "save-failed": "Could not save the setting: {error}"
+      },
+      "on": "On",
+      "off": "Off",
+      "not-set": "not set",
+      "saving": "Saving…",
+      "saved": "Saved.",
+      "not-saved": "Not saved: {error}",
+      "load-failed": "Could not read this from the service: {error}",
+      "offline": "The service is not connected, so nothing was changed. The values shown are the last ones known.",
+      "number-range": "Type a whole number from {min} to {max}.",
+      "result": "Result",
+      "new-value": "New value: {value}",
+      "edit-hint": "Enter saves, Esc cancels.",
+      "pick-hint": "Up and Down choose, Enter saves, Esc cancels.",
+      "confirm": "Press Enter again to confirm, or Esc to cancel.",
+      "confirm-word": "yes",
+      "more-above": "{count} more lines above",
+      "plain": {
+        "sections": "c and a number, for example c2: open that section",
+        "items": "i and a number, for example i3: change that setting or run that action. With a value after it, for example i3 2 or i3 30, it is set at once.",
+        "back": "b: back to the list of sections",
+        "pick-prompt": "Type the number of an option, or press Enter alone to cancel.",
+        "edit-prompt": "Type the new value and press Enter; Enter alone cancels.",
+        "confirm-prompt": "Type yes to confirm; anything else cancels.",
+        "no-item": "There is no {code} here."
+      },
+      "notifications": {
+        "unit": "Unit",
+        "need-target": "Type the host or application name first."
+      },
+      "routing": {
+        "liveness-range": "Seconds from 5 to 3600, or 0 to turn it off."
+      },
+      "service": {
+        "state": "State: {state}",
+        "start-mode": "Starts: {mode}",
+        "note": "Starting and stopping the service needs administrator rights, and nrr-tui never asks for them. To use these actions, start nrr-tui as administrator or with sudo.",
+        "done": "Done. State: {state}",
+        "query-failed": "Could not ask the system about the service: {error}",
+        "no-manager": "This system has no service manager this program can ask."
+      },
+      "presets": {
+        "export-path": "File to write",
+        "export": "Export full settings",
+        "need-path": "Type the file name first.",
+        "exists": "{path} already exists. Choose another name; nothing was overwritten.",
+        "written": "Full settings exported to {path}.",
+        "write-failed": "Could not write {path}: {error}",
+        "rules-note": "Rules files are imported and exported on the Rules screen."
+      },
+      "logs": {
+        "window-until": "On until {timestamp}"
+      },
+      "traffic": {
+        "reset-done": "Traffic statistics were reset."
+      },
+      "updates": {
+        "note": "This program does not check for new versions on its own."
+      }
+    },
+    "wizard": {
+      "step": "Step {number} of {total}: {name}",
+      "answers-title": "Your answer",
+      "language-note": "The language of this terminal session. To start in it every time, run the program with --lang.",
+      "current": "{name} (current)",
+      "setting": "{name}: {value}",
+      "protection-saved": "Protection settings saved.",
+      "rules-title": "Starting rules",
+      "other-country": "Another country's preset",
+      "path-prompt": "Type the full path to the file, then press Enter. An empty line leaves this route without a file.",
+      "typing": "Typing the path: Enter keeps it, Esc leaves it as it was.",
+      "file-unreadable": "Could not read {path}: {error}",
+      "file-too-large": "{path} is larger than 1 MiB. The service refuses a rules file that large.",
+      "file-not-text": "{path} is not UTF-8 text.",
+      "file-rules": "{route} {file}: {count} rules",
+      "previewing": "Asking the service what these rules would change…",
+      "applying": "Applying the rules…",
+      "needs-service": "The background service is not connected, so this cannot be saved yet. The setup can continue once it is.",
+      "close": "Close the setup",
+      "help-choose": "Tab, then Up and Down: move between the answers; Enter: take the marked one",
+      "help-type": "While typing a path: Enter keeps it, Esc leaves it as it was",
+      "plain-number": "A number: take that answer. To leave the setup, take the answer that closes it.",
+      "plain-prompt": "Type the number of your answer and press Enter."
+    }
   }
 }

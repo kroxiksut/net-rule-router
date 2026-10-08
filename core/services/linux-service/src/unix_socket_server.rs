@@ -13,7 +13,7 @@
 //! ## Model vs the Windows server (honest inversions)
 //!
 //! - **No exe-basename whitelist / no per-connection reject.** The Windows pipe
-//!   accepts only `NetRuleRouter(.Tray).exe`; on Linux the connecting exe is not
+//!   accepts only the product's own executables; on Linux the connecting exe is not
 //!   part of the peer credential, and there is no directory gate either: the
 //!   daemon is root and its clients are ordinary users, so a `0700` runtime
 //!   directory would lock out every client the product has. Any local user may
@@ -30,7 +30,8 @@
 //!   further. Authorization that matters still flows through
 //!   `caller_principal` (`unix:uid:<n>`), `caller_is_elevated` (`uid == 0`)
 //!   and — for privileged operations from an ordinary user — polkit, which the
-//!   router consults using the pid captured here.
+//!   router consults using the pid captured here. Never for `nrr-tui`: a
+//!   terminal is not prompted, so it does privileged work only as root.
 //!
 //! ## Shutdown
 //!
@@ -116,6 +117,7 @@ fn profile_for_program(program: &str) -> Option<IpcClientProfile> {
         p if p == BinaryRole::Gui.unix_file_name() => Some(IpcClientProfile::GuiInteractive),
         p if p == BinaryRole::Tray.unix_file_name() => Some(IpcClientProfile::TrayLightweight),
         p if p == BinaryRole::Console.unix_file_name() => Some(IpcClientProfile::AdminConsole),
+        p if p == BinaryRole::Tui.unix_file_name() => Some(IpcClientProfile::Tui),
         _ => None,
     }
 }
@@ -657,6 +659,47 @@ mod tests {
         assert_eq!(
             profile_for_program(BinaryRole::Console.unix_file_name()),
             Some(IpcClientProfile::AdminConsole)
+        );
+        assert_eq!(
+            profile_for_program(BinaryRole::Tui.unix_file_name()),
+            Some(IpcClientProfile::Tui)
+        );
+    }
+
+    /// The terminal declaring itself the console is held to the console; a
+    /// program we cannot name declaring itself the terminal stays read-only.
+    #[test]
+    fn a_terminal_handshake_narrows_and_never_widens() {
+        use nrr_shared::ipc::IpcOperationName;
+        use nrr_shared::ipc_payloads::{ContractNegotiateClientKind, ContractNegotiateRequest};
+        let negotiate = |kind: ContractNegotiateClientKind| IpcRequestEnvelope {
+            payload: serde_json::to_value(ContractNegotiateRequest {
+                client_version: nrr_shared::ipc::IPC_PROTOCOL_VERSION,
+                client_kind: kind,
+                supported_features: Vec::new(),
+            })
+            .expect("handshake payload"),
+            ..request_for(IpcOperationName::ContractNegotiate)
+        };
+        let tui = IpcClientProfile::Tui;
+        assert_eq!(
+            narrow_profile_from_handshake(tui, &negotiate(ContractNegotiateClientKind::Tui)),
+            IpcClientProfile::Tui
+        );
+        assert_eq!(
+            narrow_profile_from_handshake(tui, &negotiate(ContractNegotiateClientKind::Gui)),
+            IpcClientProfile::Tui
+        );
+        assert_eq!(
+            narrow_profile_from_handshake(tui, &negotiate(ContractNegotiateClientKind::Console)),
+            IpcClientProfile::AdminConsole
+        );
+        assert_eq!(
+            narrow_profile_from_handshake(
+                UNKNOWN_CLIENT_PROFILE,
+                &negotiate(ContractNegotiateClientKind::Tui)
+            ),
+            IpcClientProfile::AdminConsole
         );
     }
 

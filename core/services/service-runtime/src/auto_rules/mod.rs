@@ -475,6 +475,18 @@ fn quiet_note_is_news(previous: Option<&QuietNote>, current: &QuietNote) -> bool
     previous != Some(current)
 }
 
+/// How long the engine waits after the executor refused one of its own
+/// rewrites. A rules lock or a security alert lifts by an act the tick does
+/// not see, so the retry runs on a slow clock rather than every tick.
+const REFUSED_REWRITE_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// Whether a wait of `wait` begun at `since` still runs at `now`. A clock set
+/// back ends it rather than stretching it.
+fn still_waiting(since: SystemTime, wait: Duration, now: SystemTime) -> bool {
+    now.duration_since(since)
+        .is_ok_and(|elapsed| elapsed < wait)
+}
+
 pub struct AutoRulesEngine {
     ledgers: Mutex<HashMap<String, SidLedger>>,
     pending: Mutex<HashMap<String, Vec<PendingCandidate>>>,
@@ -527,13 +539,25 @@ pub struct AutoRulesEngine {
     /// When each principal's evidence was last written, so the save rides the
     /// proposal tick without writing on every one of them.
     evidence_saved_at: Mutex<HashMap<String, Instant>>,
+    /// Per principal, the subdomain-twin cleanup (see
+    /// [`Self::drop_stored_subdomain_twins`]): `None` once done, `Some(at)`
+    /// when the rewrite was last refused at `at`.
+    twin_cleanup: Mutex<HashMap<String, Option<SystemTime>>>,
+    /// `?host` rules and the state of their checks, per principal.
+    verify: Mutex<HashMap<String, verify_primary::VerifyState>>,
+    /// Set once at the composition root; without it `?` rules stay on the
+    /// main link and are never checked.
+    verify_wiring: OnceLock<VerifyPrimaryWiring>,
 }
 
 mod inbox;
 mod intake;
 mod ledger;
 mod tick;
+mod verify_primary;
 mod wiring;
+
+pub use verify_primary::VerifyPrimaryWiring;
 
 /// `value (anchor)` for the first few suggestions — enough to recognise them in
 /// a log without printing a browsing session.

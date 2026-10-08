@@ -544,6 +544,7 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         shared_ip_exemptions: crate::app_enforcement_status::SharedIpExemptionStatus::new(),
         // Disarmed block-all posture in test deps (no banner).
         block_all_posture: crate::app_enforcement_status::BlockAllPostureStatus::new(),
+        route_enforcement: crate::app_enforcement_status::RouteEnforcementStatus::new(),
         // No fake-IP datapath probe in test deps; health payloads omit the
         // `fake-ip-datapath` field.
         fake_ip_datapath_probe: None,

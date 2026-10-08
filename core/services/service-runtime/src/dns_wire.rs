@@ -78,7 +78,10 @@ fn parse_qname(packet: &[u8], mut off: usize) -> Option<(String, usize)> {
         off += 1;
         let end = off.checked_add(len)?;
         let label = packet.get(off..end)?;
-        // A hostname label is ASCII; bail on non-UTF8 rather than lossy-decode.
+        // A name we would learn is plain LDH; anything else is forwarded raw.
+        if !nrr_shared::dns_name::is_learnable_label(label) {
+            return None;
+        }
         let s = std::str::from_utf8(label).ok()?.to_ascii_lowercase();
         // Guard against a pathological name length (defensive; real names ≤255).
         total = total.checked_add(len + 1)?;
@@ -347,8 +350,7 @@ fn decode_name(packet: &[u8], mut off: usize) -> Option<String> {
         }
         off += 1;
         let label = packet.get(off..off + len)?;
-        // Reject non-ASCII / control to keep the learned hostname sane.
-        if !label.iter().all(|&b| b.is_ascii_graphic() || b == b'-') {
+        if !nrr_shared::dns_name::is_learnable_label(label) {
             return None;
         }
         total += len + 1;
@@ -720,6 +722,23 @@ mod tests {
             u32::from_be_bytes([minimum[0], minimum[1], minimum[2], minimum[3]]),
             60,
             "SOA MINIMUM is the negative TTL — this is the field that caches",
+        );
+    }
+
+    /// A question naming markup is not ours to learn: it is forwarded raw.
+    #[test]
+    fn a_question_with_markup_is_not_parsed() {
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["a<b>", "example"] {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.extend_from_slice(&[0, 0, 1, 0, 1]);
+        assert!(super::parse_question(&q).is_none());
+        let plain = super::build_address_query(0x1234, "ab.example", QTYPE_A).expect("query");
+        assert_eq!(
+            super::parse_question(&plain).expect("plain").qname,
+            "ab.example"
         );
     }
 

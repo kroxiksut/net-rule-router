@@ -578,7 +578,11 @@ impl<C: DnsCommands> SystemDnsServersPort for ResolvedDnsServers<C> {
                 continue;
             }
             for server in link.values.iter().filter_map(|v| server_ip(v)) {
-                if server.is_loopback() || out.iter().any(|c| c.server == server) {
+                // `0.0.0.0` is delivered to this machine, as loopback is.
+                if server.is_loopback()
+                    || server.is_unspecified()
+                    || out.iter().any(|c| c.server == server)
+                {
                     continue;
                 }
                 out.push(UpstreamDnsCandidate::new(Some(link.index), server));

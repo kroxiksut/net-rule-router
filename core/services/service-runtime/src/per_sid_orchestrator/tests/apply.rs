@@ -535,10 +535,15 @@ fn a_coverage_reconcile_records_and_sweeps_what_it_starts_covering() {
 /// The tunnel coming up changes no address, so the "only new destinations"
 /// rule would sweep nothing — and every socket the browser opened while the
 /// link was down would finish on the main link. The edge itself has to
-/// count as a reason to sweep.
+/// count as a reason to sweep, but only for what the link now carries: a
+/// destination of the main link, or a connection on a tunnel the user runs
+/// beside ours, has nowhere new to go.
 #[test]
-fn the_additional_link_coming_up_sweeps_every_pinned_destination() {
-    let ip = Ipv4Addr::new(203, 0, 113, 9);
+fn the_additional_link_coming_up_sweeps_what_is_steered_onto_it_and_nothing_else() {
+    use nrr_platform_api::fake_ip::stale_flows::{EstablishedFlow, FlowLinks};
+    use std::net::SocketAddrV4;
+    let tunnel_ip = Ipv4Addr::new(203, 0, 113, 9);
+    let direct_ip = Ipv4Addr::new(203, 0, 113, 20);
     let api = Arc::new(MockWindowsApi::new());
     let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
     let src = Arc::new(ScriptedSource::default());
@@ -550,6 +555,8 @@ fn the_additional_link_coming_up_sweeps_every_pinned_destination() {
     let live = Arc::new(Mutex::new(None::<KillSwitchResolution>));
     let resolver_state = Arc::clone(&live);
     let reset = Arc::new(nrr_platform_api::fake_ip::stale_flows::MockStaleFlowReset::new());
+    let main_link = Ipv4Addr::new(192, 0, 2, 7);
+    let corporate_link = Ipv4Addr::new(172, 16, 0, 150);
     let orch = Arc::new(
         PerSidApplyOrchestrator::new(
             session,
@@ -564,24 +571,55 @@ fn the_additional_link_coming_up_sweeps_every_pinned_destination() {
                 .unwrap_or_else(|p| p.into_inner())
                 .clone()
         }))
+        .with_flow_links_resolver(Arc::new(move |_, _| {
+            FlowLinks::new(
+                vec![
+                    (IpAddr::V4(main_link), 23),
+                    (IpAddr::V4(corporate_link), 20),
+                ],
+                Some(23),
+                Some(28),
+            )
+        }))
         .with_stale_flow_reset(
             Arc::clone(&reset) as Arc<dyn nrr_platform_api::fake_ip::stale_flows::StaleFlowReset>
         ),
     );
-    rules.set(rules_with_secondary_ip(ip));
+    let mut book = rules_with_secondary_ip(tunnel_ip);
+    book.rule_book.primary =
+        CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-pri", direct_ip)]);
+    rules.set(book);
     src.set("S-1-5-21-A", snap_full("Wi-Fi", "TAP"));
 
     orch.install_for_sid("S-1-5-21-A").unwrap();
     let after_first = reset.queried().len();
 
+    let flow = |local: Ipv4Addr, remote: Ipv4Addr, port: u16| EstablishedFlow {
+        local: SocketAddrV4::new(local, port),
+        remote: SocketAddrV4::new(remote, 443),
+        owner: Some("S-1-5-21-A".to_owned()),
+        pid: None,
+        image: None,
+    };
+    let stranded = flow(main_link, tunnel_ip, 50_001);
+    reset.set_flows(vec![
+        stranded.clone(),
+        flow(corporate_link, tunnel_ip, 50_002),
+        flow(main_link, direct_ip, 50_003),
+    ]);
     *live.lock().unwrap_or_else(|p| p.into_inner()) = Some(full_ks_resolution());
     orch.install_for_sid("S-1-5-21-A").unwrap();
 
     let swept: Vec<Ipv4Addr> = reset.queried().into_iter().skip(after_first).collect();
     assert!(
-        swept.contains(&ip),
+        swept.contains(&tunnel_ip),
         "the destination was pinned before and after, so only the up-edge can explain sweeping it: {swept:?}"
     );
+    assert!(
+        !swept.contains(&direct_ip),
+        "the main link's destination has nowhere new to go: {swept:?}"
+    );
+    assert_eq!(reset.reset_flows(), vec![stranded]);
 
     // Steady state afterwards: the same install must not keep tearing the
     // reconnected sockets down.
@@ -592,6 +630,76 @@ fn the_additional_link_coming_up_sweeps_every_pinned_destination() {
         before_third,
         "an unchanged, already-up link sweeps nothing"
     );
+}
+
+/// A host a rule just pinned to the main link, reached over a corporate
+/// tunnel the user runs beside ours (an RD gateway, say), stays connected:
+/// none of our routes moves it. One already on the main link stays too; one
+/// on the additional link is off course and goes.
+#[test]
+fn a_new_destination_spares_connections_on_another_link_and_on_course() {
+    use nrr_platform_api::fake_ip::stale_flows::{
+        EstablishedFlow, FlowLinks, MockStaleFlowReset, StaleFlowReset,
+    };
+    use std::net::SocketAddrV4;
+    const OWNER: &str = "S-1-5-21-A";
+    let gateway = Ipv4Addr::new(203, 0, 113, 25);
+    let main_link = Ipv4Addr::new(192, 0, 2, 7);
+    let tunnel_link = Ipv4Addr::new(198, 51, 100, 41);
+    let corporate_link = Ipv4Addr::new(172, 16, 0, 150);
+    let flow = |local: Ipv4Addr, port: u16| EstablishedFlow {
+        local: SocketAddrV4::new(local, port),
+        remote: SocketAddrV4::new(gateway, 443),
+        owner: Some(OWNER.to_owned()),
+        pid: None,
+        image: None,
+    };
+    let off_course = flow(tunnel_link, 50_003);
+    let reset = Arc::new(MockStaleFlowReset::new());
+    reset.set_flows(vec![
+        flow(corporate_link, 50_001),
+        flow(main_link, 50_002),
+        off_course.clone(),
+    ]);
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let rules = Arc::new(ScriptedRules::default());
+    let src = Arc::new(ScriptedSource::default());
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(SharedCensus(Default::default())) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_flow_links_resolver(Arc::new(move |_, _| {
+        FlowLinks::new(
+            vec![
+                (IpAddr::V4(main_link), 23),
+                (IpAddr::V4(tunnel_link), 28),
+                (IpAddr::V4(corporate_link), 20),
+            ],
+            Some(23),
+            Some(28),
+        )
+    }))
+    .with_stale_flow_reset(Arc::clone(&reset) as Arc<dyn StaleFlowReset>);
+    rules.set(ActiveRulesSnapshot {
+        rule_book: CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-pri", gateway)]),
+            secondary: CanonicalRuleSet::default(),
+        },
+        behavior_mode: RouteBehaviorMode::PreferPrimary,
+    });
+    src.set(OWNER, snap_full("Wi-Fi", "TAP"));
+
+    orch.install_for_sid(OWNER).unwrap();
+
+    assert!(
+        reset.queried().contains(&gateway),
+        "the address is newly enforced"
+    );
+    assert_eq!(reset.reset_flows(), vec![off_course]);
 }
 
 /// A cache whose only answer is the shared-address census.
@@ -715,12 +823,12 @@ fn a_new_rule_network_tears_down_only_the_owners_connections_inside_it() {
     )
     .with_stale_flow_reset(Arc::clone(&reset) as Arc<dyn StaleFlowReset>);
 
-    orch.tear_down_flows_to_new_destinations(OWNER, &[], &[net], false);
+    orch.tear_down_flows_to_new_destinations(OWNER, &[], &[], &[net], false);
     assert_eq!(reset.queried_networks(), vec![net]);
     assert_eq!(reset.reset_flows(), vec![owners]);
 
     orch.upsert_state_with_destinations(OWNER, Vec::new(), Vec::new(), vec![net], false);
-    orch.tear_down_flows_to_new_destinations(OWNER, &[], &[net], false);
+    orch.tear_down_flows_to_new_destinations(OWNER, &[], &[], &[net], false);
     assert_eq!(
         reset.queried_networks(),
         vec![net],

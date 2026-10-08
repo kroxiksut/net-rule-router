@@ -92,10 +92,11 @@ pub use crate::auto_rule::RuleOrigin as RuleOriginDto;
 /// any struct in this module changes in a way that could break
 /// content-hash idempotency or codec round-trips.
 ///
-/// 2 added subnets and ranges. A book without them is still written at 1, so
-/// its bytes and content hash stay what they were; a reader accepts any
-/// version and keeps the kinds it does not know.
-pub const RULES_JSON_SCHEMA_VERSION: u16 = 2;
+/// Cumulative: 2 added subnets and ranges, 3 the `verify-primary` action. A
+/// book is written at the lowest version its content needs, so its bytes and
+/// content hash stay what they were; a reader accepts any version and keeps
+/// the kinds it does not know.
+pub const RULES_JSON_SCHEMA_VERSION: u16 = 3;
 
 /// Versioned canonical envelope for the rules of a single revision.
 ///
@@ -162,13 +163,23 @@ pub struct RuleDto {
     pub origin: Option<RuleOriginDto>,
 }
 
+impl RuleDto {
+    /// A rule of a kind or action this build does not know (a newer build
+    /// wrote it, or the payload is broken). It is kept aside: never applied,
+    /// never shown to a client.
+    pub fn is_unrecognized(&self) -> bool {
+        matches!(self.address_match, Some(AddressMatchDto::Unrecognized(_)))
+            || matches!(self.action, RuleAction::Unrecognized(_))
+    }
+}
+
 /// Per-rule enforcement action on the wire.
 ///
 /// `Route` (default) routes matching traffic via the rule's bucket
 /// (primary/secondary adapter). `Block` drops matching traffic entirely.
 /// Kept distinct from `nrr_domain::RuleAction`; the codec maps between them.
 /// The wire slug is kebab-case `"route"` / `"block"`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuleAction {
     /// Route matching traffic via the rule's bucket. Default action.
@@ -176,6 +187,13 @@ pub enum RuleAction {
     Route,
     /// Drop matching traffic (hard WFP block); install no route.
     Block,
+    /// `?host` in the secondary set: via the primary route until the service
+    /// confirms the primary cannot reach the host.
+    VerifyPrimary,
+    /// An action this build does not know, kept verbatim. A newer build may
+    /// have written it; the rule is stored and re-sent unchanged, never applied.
+    #[serde(untagged)]
+    Unrecognized(String),
 }
 
 impl RuleAction {
@@ -186,6 +204,20 @@ impl RuleAction {
     pub fn is_route(&self) -> bool {
         matches!(self, Self::Route)
     }
+
+    /// An unknown action that is not even a slug: a broken payload rather
+    /// than a newer one.
+    pub fn is_malformed(&self) -> bool {
+        matches!(self, Self::Unrecognized(slug) if !is_slug(slug))
+    }
+}
+
+/// A kind or action name as a newer build would write it.
+fn is_slug(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Address-side match condition. Tagged enum with kebab-case slug in
@@ -266,8 +298,9 @@ impl AddressMatchDto {
         }
     }
 
-    /// A kind this build knows that still fell through to the catch-all: its
-    /// fields are wrong, which is a broken payload rather than a newer one.
+    /// A kind this build knows that still fell through to the catch-all (its
+    /// fields are wrong), or no kind slug at all: a broken payload rather than
+    /// a newer one.
     pub fn is_malformed(&self) -> bool {
         const KNOWN: [&str; 7] = [
             "exact-fqdn",
@@ -278,7 +311,8 @@ impl AddressMatchDto {
             "subnet",
             "ip-range",
         ];
-        matches!(self, Self::Unrecognized(_)) && KNOWN.contains(&self.kind())
+        matches!(self, Self::Unrecognized(_))
+            && (KNOWN.contains(&self.kind()) || !is_slug(self.kind()))
     }
 
     /// The kinds the subnet-and-range format added; a book without them is
@@ -346,21 +380,28 @@ impl From<serde_json::Error> for RulesJsonCodecError {
 
 // ── Canonical (de)serialisation ─────────────────────────────────────────────
 
-/// The schema a book needs: 1 unless it holds a kind schema 2 added, or one
-/// this build does not know. Written by the encoder and settled by the
+/// The schema a book needs: 1 unless it holds a kind or action a later schema
+/// added, or one this build does not know. Written by the encoder and settled by the
 /// comparison fold, so a GUI that still sends 1 never reads as diverged.
 pub fn required_schema_version(dto: &CanonicalRulesJsonV1) -> u16 {
-    let newer = dto
-        .primary
-        .iter()
-        .chain(&dto.secondary)
-        .filter_map(|rule| rule.address_match.as_ref())
-        .any(|m| m.needs_schema_2() || matches!(m, AddressMatchDto::Unrecognized(_)));
-    if newer {
-        RULES_JSON_SCHEMA_VERSION.max(dto.schema_version)
-    } else {
-        1
+    let mut needed = 1;
+    for rule in dto.primary.iter().chain(&dto.secondary) {
+        match &rule.address_match {
+            Some(AddressMatchDto::Unrecognized(_)) => {
+                return RULES_JSON_SCHEMA_VERSION.max(dto.schema_version)
+            }
+            Some(m) if m.needs_schema_2() => needed = needed.max(2),
+            _ => {}
+        }
+        match rule.action {
+            RuleAction::Unrecognized(_) => {
+                return RULES_JSON_SCHEMA_VERSION.max(dto.schema_version)
+            }
+            RuleAction::VerifyPrimary => needed = needed.max(3),
+            RuleAction::Route | RuleAction::Block => {}
+        }
     }
+    needed
 }
 
 /// Serialise a [`CanonicalRulesJsonV1`] to its canonical UTF-8 JSON
@@ -535,29 +576,7 @@ fn fold_rule(rule: &mut RuleDto) {
     rule.comment.clear();
     rule.origin = None;
     if let Some(address) = rule.address_match.as_mut() {
-        let folded = folded_rule_name(address);
-        match (address, folded) {
-            (AddressMatchDto::ExactFqdn { value: written }, Some(name))
-            | (AddressMatchDto::SuffixDomain { suffix: written }, Some(name))
-            | (AddressMatchDto::Zone { name: written }, Some(name)) => *written = name,
-            // An address has one spelling already: the validator rejects
-            // leading zeros rather than folding them, so trimming is all a
-            // comparison may do without inventing a difference of its own.
-            (
-                AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address },
-                _,
-            ) => *address = address.trim().to_string(),
-            (AddressMatchDto::Subnet { network }, _) => {
-                if let Some(block) = crate::ip_block::IpBlock::parse(network) {
-                    *network = block.to_string();
-                }
-            }
-            (AddressMatchDto::IpRange { first, last }, _) => {
-                *first = first.trim().to_string();
-                *last = last.trim().to_string();
-            }
-            _ => {}
-        }
+        fold_address_match(address);
     }
     if let Some(app) = rule.app_match.as_mut() {
         match &mut app.pattern {
@@ -575,6 +594,64 @@ fn fold_rule(rule: &mut RuleDto) {
                 *value = crate::app_identity::canonical_glob_process_pattern(value)
             }
         }
+    }
+}
+
+/// An address the way the service stores it: IPv4-mapped forms are their IPv4
+/// address or network ([`crate::ip_block::canonical_ip`], the service's own
+/// reading), under the kind of their family. A value that does not parse is
+/// only trimmed: the validator refuses rather than folds it (leading zeros),
+/// and a comparison must not invent a difference of its own.
+fn fold_address_match(address: &mut AddressMatchDto) {
+    use crate::ip_block::{canonical_block, canonical_ip, IpBlock};
+    use std::net::IpAddr;
+
+    if let Some(name) = folded_rule_name(address) {
+        if let AddressMatchDto::ExactFqdn { value: written }
+        | AddressMatchDto::SuffixDomain { suffix: written }
+        | AddressMatchDto::Zone { name: written } = address
+        {
+            *written = name;
+        }
+        return;
+    }
+    let fold_bound = |bound: &mut String| {
+        let trimmed = bound.trim();
+        *bound = trimmed
+            .parse::<IpAddr>()
+            .map_or_else(|_| trimmed.to_string(), |ip| canonical_ip(ip).to_string());
+    };
+    let exact = match address {
+        AddressMatchDto::ExactIpv4 { address: text }
+        | AddressMatchDto::ExactIpv6 { address: text } => {
+            *text = text.trim().to_string();
+            text.parse::<IpAddr>().ok().map(canonical_ip)
+        }
+        AddressMatchDto::Subnet { network } => {
+            if let Some(block) = IpBlock::parse(network) {
+                *network = canonical_block(block).to_string();
+            }
+            None
+        }
+        AddressMatchDto::IpRange { first, last } => {
+            fold_bound(first);
+            fold_bound(last);
+            None
+        }
+        _ => None,
+    };
+    match exact {
+        Some(IpAddr::V4(v4)) => {
+            *address = AddressMatchDto::ExactIpv4 {
+                address: v4.to_string(),
+            }
+        }
+        Some(IpAddr::V6(v6)) => {
+            *address = AddressMatchDto::ExactIpv6 {
+                address: v6.to_string(),
+            }
+        }
+        None => {}
     }
 }
 
@@ -651,10 +728,11 @@ fn comparison_key(rule: &RuleDto) -> String {
         key.push(if flag { '1' } else { '0' });
         key.push('\0');
     }
-    key.push_str(if rule.action.is_route() {
-        "route"
-    } else {
-        "block"
+    key.push_str(match &rule.action {
+        RuleAction::Route => "route",
+        RuleAction::Block => "block",
+        RuleAction::VerifyPrimary => "verify-primary",
+        RuleAction::Unrecognized(slug) => slug,
     });
     key
 }
@@ -720,6 +798,74 @@ mod tests {
         assert_eq!(
             to_canonical_string(&typed).expect("typed"),
             to_canonical_string(&validated).expect("validated")
+        );
+    }
+
+    /// Each pair: as a client may send it, as the service stores it.
+    #[test]
+    fn address_spellings_fold_to_the_stored_form() {
+        let folded = |address: AddressMatchDto| {
+            let mut dto = CanonicalRulesJsonV1 {
+                schema_version: RULES_JSON_SCHEMA_VERSION,
+                primary: vec![RuleDto {
+                    address_match: Some(address),
+                    ..sample_exact_fqdn("r-1", "unused.example")
+                }],
+                secondary: vec![],
+            };
+            fold_for_comparison(&mut dto);
+            to_canonical_string(&dto).expect("canonical")
+        };
+        let range = |first: &str, last: &str| AddressMatchDto::IpRange {
+            first: first.into(),
+            last: last.into(),
+        };
+        let subnet = |network: &str| AddressMatchDto::Subnet {
+            network: network.into(),
+        };
+        let pairs = [
+            (
+                range("2001:DB8::1", "2001:DB8:0::FF"),
+                range("2001:db8::1", "2001:db8::ff"),
+            ),
+            (
+                range("::ffff:10.0.0.1", " ::ffff:10.0.0.9"),
+                range("10.0.0.1", "10.0.0.9"),
+            ),
+            (subnet("::ffff:10.0.0.0/104"), subnet("10.0.0.0/8")),
+            (
+                AddressMatchDto::ExactIpv6 {
+                    address: "::ffff:192.0.2.7".into(),
+                },
+                AddressMatchDto::ExactIpv4 {
+                    address: "192.0.2.7".into(),
+                },
+            ),
+            (
+                AddressMatchDto::ExactIpv6 {
+                    address: "2001:DB8::7".into(),
+                },
+                AddressMatchDto::ExactIpv6 {
+                    address: "2001:db8::7".into(),
+                },
+            ),
+        ];
+        for (sent, stored) in pairs {
+            assert_eq!(folded(sent.clone()), folded(stored), "{sent:?}");
+        }
+        // Positive control: different networks stay different.
+        assert_ne!(
+            folded(range("10.0.0.1", "10.0.0.9")),
+            folded(range("10.0.0.1", "10.0.0.8"))
+        );
+        // A value the validator refuses is not repaired into another one.
+        assert_ne!(
+            folded(AddressMatchDto::ExactIpv4 {
+                address: "010.0.0.1".into()
+            }),
+            folded(AddressMatchDto::ExactIpv4 {
+                address: "10.0.0.1".into()
+            })
         );
     }
 
@@ -842,7 +988,7 @@ mod tests {
 
     #[test]
     fn a_book_of_the_older_kinds_needs_schema_one_only() {
-        assert_eq!(RULES_JSON_SCHEMA_VERSION, 2);
+        assert_eq!(RULES_JSON_SCHEMA_VERSION, 3);
         let mut dto = CanonicalRulesJsonV1 {
             schema_version: 2,
             primary: vec![sample_exact_fqdn("r-1", "api.example.com")],
@@ -1383,5 +1529,41 @@ mod unrecognized_kind_tests {
             Some(AddressMatchDto::IpRange { .. })
         ));
         assert_eq!(to_canonical_string(&dto).expect("encodes"), wire);
+    }
+
+    #[test]
+    fn an_unknown_action_round_trips_verbatim_and_asks_for_the_newest_schema() {
+        let wire = r#"{"schema-version":9,"primary":[{"action":"throttle","address-match":{"kind":"zone","name":"example"},"enabled":true,"id":"r-1"}],"secondary":[]}"#;
+        let dto = from_canonical_string(wire).expect("decodes");
+        assert_eq!(
+            dto.primary[0].action,
+            RuleAction::Unrecognized("throttle".into())
+        );
+        assert!(!dto.primary[0].action.is_malformed());
+        assert_eq!(required_schema_version(&dto), 9);
+        let again =
+            from_canonical_string(&to_canonical_string(&dto).expect("encodes")).expect("decodes");
+        assert_eq!(again, dto);
+    }
+
+    #[test]
+    fn a_kind_or_action_that_is_no_slug_is_a_broken_payload() {
+        for address in [
+            r#"{}"#,
+            r#"{"kind":""}"#,
+            r#"{"kind":"Exact FQDN","value":"a"}"#,
+        ] {
+            let m: AddressMatchDto = serde_json::from_str(address).expect("catch-all");
+            assert!(m.is_malformed(), "{address}");
+        }
+        let newer: AddressMatchDto =
+            serde_json::from_str(r#"{"kind":"port-range","from":1}"#).expect("catch-all");
+        assert!(!newer.is_malformed());
+        for action in ["", "Route", "via primary"] {
+            assert!(
+                RuleAction::Unrecognized(action.into()).is_malformed(),
+                "{action:?}"
+            );
+        }
     }
 }

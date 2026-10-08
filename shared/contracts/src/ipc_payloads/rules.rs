@@ -35,10 +35,10 @@ pub struct RuleRowEntry {
     pub id: String,
     pub rule_type: String,
     pub match_value: String,
-    /// Display route slug: `"primary"`, `"secondary"`, or `"block"`. The
-    /// producer emits `"block"` for a `RuleAction::Block` rule regardless of
-    /// which bucket it lives in; the GUI maps it back to the «Блокировать»
-    /// label and its own bucket-plus-`action` wire form on save.
+    /// Display route slug: `"primary"`, `"secondary"`, `"block"` or `"verify"`.
+    /// `"block"` is a `RuleAction::Block` rule in either bucket, `"verify"` a
+    /// `RuleAction::VerifyPrimary` (`?host`) rule; the GUI maps each back to its
+    /// label and to its own bucket-plus-`action` wire form on save.
     pub target_route: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
@@ -629,7 +629,8 @@ pub struct RuleSummaryEntryDto {
     pub id: String,
     /// Human-readable display for the review UI.
     pub display: String,
-    /// `"primary"` or `"secondary"`. For retargeted rules: the
+    /// `"primary"` or `"secondary"`, or `"block"` / `"verify"` for a rule
+    /// with that action, as in the rules list. For retargeted rules: the
     /// destination route.
     pub route: String,
     /// Whether the rule takes part in routing. A disabled rule is a

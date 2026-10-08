@@ -118,6 +118,8 @@ pub enum BinaryRole {
     Gui,
     /// Tray shell.
     Tray,
+    /// Terminal interface: the policy surface for a machine without a desktop.
+    Tui,
 }
 
 impl BinaryRole {
@@ -127,6 +129,7 @@ impl BinaryRole {
         BinaryRole::Console,
         BinaryRole::Gui,
         BinaryRole::Tray,
+        BinaryRole::Tui,
     ];
 
     /// Windows executable file name, including the `.exe` extension.
@@ -139,6 +142,7 @@ impl BinaryRole {
             Self::Console => "nrr-cli.exe",
             Self::Gui => "NetRuleRouter.exe",
             Self::Tray => "NetRuleRouterTray.exe",
+            Self::Tui => "nrr-tui.exe",
         }
     }
 
@@ -149,6 +153,7 @@ impl BinaryRole {
             Self::Console => "nrr-cli",
             Self::Gui => "netrulerouter",
             Self::Tray => "netrulerouter-tray",
+            Self::Tui => "nrr-tui",
         }
     }
 
@@ -235,6 +240,19 @@ mod tests {
             BinaryRole::Tray.unix_file_name(),
             format!("{PRODUCT_NAME_UNIX}-tray")
         );
+    }
+
+    /// Terminal programs are typed by name, so one spelling serves every OS.
+    #[test]
+    fn terminal_programs_keep_one_name_across_families() {
+        for role in [BinaryRole::Console, BinaryRole::Tui] {
+            assert_eq!(
+                Some(role.unix_file_name()),
+                role.windows_file_name().strip_suffix(".exe"),
+                "{role:?}"
+            );
+        }
+        assert_eq!(BinaryRole::Tui.unix_file_name(), "nrr-tui");
     }
 
     #[test]

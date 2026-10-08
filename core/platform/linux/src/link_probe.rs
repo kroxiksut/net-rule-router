@@ -60,6 +60,21 @@ pub fn connect_over_link(
     source: Ipv4Addr,
     timeout: Duration,
 ) -> LinkProbeOutcome {
+    match socket_over_link(target, port, source, timeout) {
+        Ok(_) => LinkProbeOutcome::Connected,
+        Err(outcome) => outcome,
+    }
+}
+
+/// [`connect_over_link`], keeping the connected socket for a caller that has
+/// more to say over it (a TLS hello).
+#[cfg(target_os = "linux")]
+pub fn socket_over_link(
+    target: Ipv4Addr,
+    port: u16,
+    source: Ipv4Addr,
+    timeout: Duration,
+) -> Result<socket2::Socket, LinkProbeOutcome> {
     let addresses = crate::adapters_addr::unicast_addresses_by_interface();
     let Some(link) = link_carrying(
         addresses
@@ -67,9 +82,9 @@ pub fn connect_over_link(
             .map(|(name, a)| (name.as_str(), a.v4.as_slice())),
         source,
     ) else {
-        return LinkProbeOutcome::NotRun;
+        return Err(LinkProbeOutcome::NotRun);
     };
-    connect_bound(target, port, source, link, timeout)
+    socket_bound(target, port, source, link, timeout)
 }
 
 /// [`connect_over_link`] with the link already named.
@@ -81,28 +96,38 @@ pub fn connect_bound(
     link: &str,
     timeout: Duration,
 ) -> LinkProbeOutcome {
+    match socket_bound(target, port, source, link, timeout) {
+        Ok(_) => LinkProbeOutcome::Connected,
+        Err(outcome) => outcome,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn socket_bound(
+    target: Ipv4Addr,
+    port: u16,
+    source: Ipv4Addr,
+    link: &str,
+    timeout: Duration,
+) -> Result<socket2::Socket, LinkProbeOutcome> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     // A zero budget reports as a timeout, which would read as silence.
     if timeout.is_zero() {
-        return LinkProbeOutcome::NotRun;
+        return Err(LinkProbeOutcome::NotRun);
     }
-    let Ok(socket) = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) else {
-        return LinkProbeOutcome::NotRun;
-    };
-    if socket.bind_device(Some(link.as_bytes())).is_err() {
-        return LinkProbeOutcome::NotRun;
-    }
-    if socket
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|_| LinkProbeOutcome::NotRun)?;
+    socket
+        .bind_device(Some(link.as_bytes()))
+        .map_err(|_| LinkProbeOutcome::NotRun)?;
+    socket
         .bind(&std::net::SocketAddr::from((source, 0)).into())
-        .is_err()
-    {
-        return LinkProbeOutcome::NotRun;
-    }
-    match socket.connect_timeout(&std::net::SocketAddr::from((target, port)).into(), timeout) {
-        Ok(()) => LinkProbeOutcome::Connected,
-        Err(e) => outcome_of_connect_error(e.kind()),
-    }
+        .map_err(|_| LinkProbeOutcome::NotRun)?;
+    socket
+        .connect_timeout(&std::net::SocketAddr::from((target, port)).into(), timeout)
+        .map_err(|e| outcome_of_connect_error(e.kind()))?;
+    Ok(socket)
 }
 
 #[cfg(test)]

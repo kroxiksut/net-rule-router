@@ -256,9 +256,9 @@ pub(super) fn drain_push_frames(
                     .and_then(|v| v.as_str())
                     .is_some_and(|s| !s.is_empty());
                 if has_id {
-                    eprintln!("nrr-ipc-client(unix): discarding idle frame with a request_id");
+                    client_trace!("nrr-ipc-client(unix): discarding idle frame with a request_id");
                 } else if crate::protocol::is_server_refusal(&frame) {
-                    eprintln!("nrr-ipc-client(unix): service refused while idle");
+                    client_trace!("nrr-ipc-client(unix): service refused while idle");
                     break false;
                 } else {
                     route_push_frame(inner, &frame, "idle");

@@ -34,7 +34,7 @@ NetRuleRouter\
   README.txt            end-user notes (English)
   README.ru.txt         the same notes in Russian
   build-info.json       version, revision, build time
-  <tray, service, console, Qt host, the Qt runtime, wintun.dll>
+  <tray, service, console, terminal interface, Qt host, the Qt runtime, wintun.dll>
   qml\                  Qt's own modules
   apps\desktop\qml\     the application's QML
   locales\  presets\  configs\  assets\  scripts\

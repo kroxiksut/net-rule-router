@@ -328,6 +328,7 @@ SystemTrayIcon {
     property var boundFileWriter: TrayBoundFileWriter {
         rpc: tray.rpc
         presence: tray.guiPresence
+        os: tray.platformProfile.os || ""
     }
 
     // Service status snapshot for icon + menu state.
@@ -403,6 +404,9 @@ SystemTrayIcon {
                 break
             case "secondary-external-address-observed":
                 _onSecondaryExternalAddress(event, eventId)
+                break
+            case "verify-primary-moved":
+                _onVerifyPrimaryMoved(event)
                 break
             case "block-notice-raised":
                 _onBlockNoticeRaised(event)
@@ -927,17 +931,36 @@ SystemTrayIcon {
         })
     }
 
+    /// A `?` rule moved to the additional route. Happens once per rule, so it
+    /// is told once and needs no "Don't show…".
+    function _onVerifyPrimaryMoved(event) {
+        if (!showNotifications) return
+        var host = String(event.host || "")
+        if (host === "") return
+        _presentOrQueue("verify-moved", function() {
+            promptWindow.present({
+                titleText: tr("tray.verify-moved.title", "Site moved to the additional route"),
+                bodyText: Pure.fillPlaceholders(tr("tray.verify-moved.body",
+                        "{host} does not open over the primary route, so its rule now uses the additional route."),
+                    { host: "<b>" + _escapeMarkup(host) + "</b>" }),
+                bodyRichText: true,
+                autoRetireMs: _infoNoticeMs
+            })
+        })
+    }
+
     function _showExternalAddressNotice(noticeId, address, adapter) {
         // Bold only the address itself, not the surrounding sentence — the
         // markup lives here, not in the translated string, so the localized
         // text stays plain prose in both locale files.
         var body = tr("tray.external-address.body",
                 "External address of the additional route: {address}")
-            .replace("{address}", "<b>" + address + "</b>")
+            .replace("{address}", "<b>" + _escapeMarkup(address) + "</b>")
         if (adapter !== "") {
             // `<br>`, not `\n`: StyledText collapses a bare newline.
-            body = body + "<br>" + tr("tray.external-address.adapter", "Adapter: {name}")
-                .replace("{name}", adapter)
+            body = body + "<br>" + Pure.fillPlaceholders(
+                tr("tray.external-address.adapter", "Adapter: {name}"),
+                { name: _escapeMarkup(adapter) })
         }
         _activeNoticeId = noticeId
         promptWindow.present({
@@ -1486,10 +1509,10 @@ SystemTrayIcon {
             : _blockNoticeDestination
     }
 
-    /// `&` is legal in a Windows path and in a host label; StyledText would
-    /// eat it as an entity. `<` cannot occur in either, so one rule is enough.
+    /// Every value placed into a StyledText body goes through this: a path may
+    /// hold `&`, and a name learned from DNS may hold `<`.
     function _escapeMarkup(text) {
-        return String(text).replace(/&/g, "&amp;")
+        return Pure.escapeMarkup(text)
     }
 
     /// Whether a switch, not a rule, governs this block: the closed IPv6
@@ -2678,6 +2701,8 @@ SystemTrayIcon {
             var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
             var req = tray._buildFullRoutePolicyReq(cur)
             req["auto-rules-mode"] = String(mode)
+            // The window may be writing other fields meanwhile; name ours.
+            req["apply-only"] = ["auto-rules-mode"]
             var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
             tray.rpc.registerRpcCallback(writeCorr, function(ok2, p2, code2, msg2) {
                 if (!ok2) {
@@ -2891,6 +2916,7 @@ SystemTrayIcon {
             var cur = (payload && (payload["route-policy"] || payload.routePolicy)) || {}
             var req = tray._buildFullRoutePolicyReq(cur)
             req["kill-switch-enabled"] = (want === true)
+            req["apply-only"] = ["kill-switch-enabled"]
             var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
             tray.rpc.registerRpcCallback(writeCorr, function(ok2, p2, code2, msg2) {
                 if (!ok2) {

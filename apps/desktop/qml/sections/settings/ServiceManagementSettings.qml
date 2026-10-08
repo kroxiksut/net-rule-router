@@ -83,7 +83,7 @@ GroupBox {
     Connections {
         target: group._serviceAvailable() ? nrrServiceController : null
         ignoreUnknownSignals: true
-        function onOperationCompleted(operation, success, errorMessage) {
+        function onOperationCompleted(operation, success, errorMessage, errorCode) {
             if (success) {
                 root.statusLine = root.tr(
                     "settings.service.action." + String(operation), String(operation))
@@ -91,7 +91,7 @@ GroupBox {
             } else {
                 root.statusLine = root.tr(
                     "settings.service.action." + String(operation), String(operation))
-                    + ": " + String(errorMessage || "")
+                    + ": " + root.serviceOperationErrorText(errorCode, errorMessage)
             }
         }
         function onUacDeclined(operation) {
@@ -520,6 +520,9 @@ GroupBox {
                 id: startModeOnLaunchRadio
                 theme: root.uiTheme
                 Layout.fillWidth: true
+                // Where nothing starts the service with the app, the service
+                // control refuses this mode.
+                visible: root.supports("serviceStartOnAppLaunch")
                 ButtonGroup.group: startModeGroup
                 enabled: !group._busy()
                 Binding {
@@ -541,8 +544,11 @@ GroupBox {
                 Layout.leftMargin: root.uiTheme.spacingLg
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
-                text: root.tr("settings.service.start-mode.help",
-                    "“Start with the system” keeps your rules enforced from boot, before anyone logs in (best for always-on or managed setups). “Start when the app opens” runs the service only while you use NetRuleRouter and lets the app start it without an administrator prompt every time. Changing this needs administrator approval.")
+                text: !root.supports("serviceStartOnAppLaunch")
+                    ? root.tr("settings.service.start-mode.help-with-system-only",
+                        "“Start with the system” keeps your rules enforced from boot, before anyone logs in. Changing this needs administrator approval.")
+                    : root.tr("settings.service.start-mode.help",
+                        "“Start with the system” keeps your rules enforced from boot, before anyone logs in (best for always-on or managed setups). “Start when the app opens” runs the service only while you use NetRuleRouter and lets the app start it without an administrator prompt every time. Changing this needs administrator approval.")
             }
         }
 

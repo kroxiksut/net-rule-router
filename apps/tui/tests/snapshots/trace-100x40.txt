@@ -1,0 +1,40 @@
+Service: OK
+> Screens                  Connection trace
+  1 Status                 Shown: 12 of 14.
+  2 First run              Show blocked: No · Show local connections: No · IPv6 only: No
+  3 Interfaces and routes  Connections
+  4 Rules                  > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
+  5 Overlaps                 2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) ·
+  6 Suggested addresses    Allowed
+> 7 Connection trace         3. browser.exe → 203.0.113.3:443 · site.example — Primary · Allowed
+  8 Cache                    4. browser.exe → 203.0.113.4:443 · site.example — Additional (VPN) ·
+  9 Diagnostics and logs   Allowed
+  0 Settings                 5. browser.exe → 203.0.113.5:443 · site.example — Primary · Allowed
+                             6. browser.exe → 203.0.113.6:443 · site.example — Additional (VPN) ·
+                           Allowed
+                             7. browser.exe → 203.0.113.7:443 · site.example — Primary · Allowed
+                             8. browser.exe → 203.0.113.8:443 · site.example — Additional (VPN) ·
+                           Allowed
+                             9. browser.exe → 203.0.113.9:443 · site.example — Primary · Allowed
+                             10. browser.exe → 203.0.113.10:443 · site.example — Additional (VPN) ·
+                           Allowed
+                           Rows 1–10 of 12.
+
+
+
+
+
+                           Selected connection
+                           Process: browser.exe
+                           Remote: 203.0.113.1:443 · site.example
+                           Names this address was answered for (1): site.example
+                           Egress: Primary
+                           Verdict: Allowed
+                           TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
+                           Enter / e: Why this route?
+
+
+
+
+
+F1: help   q: quit

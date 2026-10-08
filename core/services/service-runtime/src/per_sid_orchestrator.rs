@@ -111,8 +111,8 @@ mod state;
 use state::*;
 pub use state::{
     FailClosedExemptionsResolver, FakeIpContextProvider, FilterFailureModeSource,
-    Ipv6GuardResolver, KillSwitchResolver, MachineReader, PerSidApplyOrchestrator, RouteSyncHook,
-    UnresolvedHostsSink, VpnClientAppsProvider,
+    FlowLinksResolver, Ipv6GuardResolver, KillSwitchResolver, MachineReader,
+    PerSidApplyOrchestrator, RouteSyncHook, UnresolvedHostsSink, VpnClientAppsProvider,
 };
 
 mod posture;

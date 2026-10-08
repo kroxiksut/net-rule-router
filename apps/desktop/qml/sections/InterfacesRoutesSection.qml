@@ -58,12 +58,13 @@ ColumnLayout {
         // tunnel may already be back up. Re-read silently: the global Refresh
         // action writes a status line, and navigation is not a user report.
         root.interfacesRolesController.refreshInterfacesFromService()
-        _refreshSecondaryState()
     }
 
+    // Read from the controller, so the push-driven refresh that ends the state
+    // clears it too, not only a visit or the Refresh action.
     readonly property bool _failClosedReported:
-        section._secondaryRouteState !== null
-        && section._secondaryRouteState.failClosedActive === true
+        root.interfacesRolesController.secondaryRouteState !== null
+        && root.interfacesRolesController.secondaryRouteState.failClosedActive === true
 
     /// Is the adapter bound as the additional route missing right now? Drives
     /// the on-screen explanation even when leak protection is not blocking.
@@ -72,48 +73,9 @@ ColumnLayout {
         && root.interfacesRolesController.rememberedAbsentBindings()
             .some(function(binding) { return String(binding.role || "") === "secondary" })
 
-    // Runtime secondary-route posture surfaced
-    // by `SnapshotInterfacesResponse.secondary`. `null` when the server
-    // does not carry the field (older builds / pre-routing-resolution
-    // boot path); the GUI treats `null` as "no banner". The flag is
-    // refreshed on section enter + on every global Refresh trigger.
-    property var _secondaryRouteState: null
-
-    function _refreshSecondaryState() {
-        if (!root.bridgeAvailable
-                || typeof nrrNativeBridge === "undefined"
-                || nrrNativeBridge === null
-                || typeof nrrNativeBridge.rpcSnapshotInterfacesGet !== "function") {
-            return
-        }
-        var corr = nrrNativeBridge.rpcSnapshotInterfacesGet()
-        root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-            if (!ok) {
-                section._secondaryRouteState = null
-                return
-            }
-            var secondary = (payload && payload.secondary) || null
-            if (secondary === null || secondary === undefined) {
-                section._secondaryRouteState = null
-                return
-            }
-            // Wire key is kebab-case (`fail-closed-active`); fall back
-            // to snake_case for forward-compat with a service that
-            // ever drops the rename_all attribute.
-            section._secondaryRouteState = {
-                failClosedActive: !!(secondary["fail-closed-active"]
-                    || secondary.fail_closed_active)
-            }
-        })
-    }
-
     Component.onCompleted: {
-        _refreshSecondaryState()
+        root.interfacesRolesController.refreshInterfacesFromService()
         _takeAdapterFocusRequest()
-    }
-    Connections {
-        target: root.refreshAction
-        function onTriggered() { section._refreshSecondaryState() }
     }
 
     /// Traffic sample for one adapter over the period selected in Settings,
@@ -342,246 +304,258 @@ ColumnLayout {
         wrapMode: Text.WordWrap
     }
     // First row: Mode selector + Refresh button. Wraps if both don't fit.
-    Flow {
+    Item {
         Layout.fillWidth: true
-        spacing: root.uiTheme.spacingMd
-        Row {
-            spacing: root.uiTheme.spacingSm
-            Label {
-                text: root.tr("label.mode", "Mode")
-                color: root.textColor
-                anchors.verticalCenter: parent.verticalCenter
-            }
-            ThemedComboBox {
-                id: behaviorCombo
-                theme: root.uiTheme
-                width: 340
-                model: root.behaviorModeModel
-                textRole: "id"
-                labelResolver: function(item) {
-                    return item ? root.behaviorModeLabel(item.id) : ""
+        Layout.preferredHeight: modeRefreshFlow.height
+        Flow {
+            id: modeRefreshFlow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingMd
+            Row {
+                spacing: root.uiTheme.spacingSm
+                Label {
+                    text: root.tr("label.mode", "Mode")
+                    color: root.textColor
+                    anchors.verticalCenter: parent.verticalCenter
                 }
-                // Hover hint explaining the
-                // selected mode (e.g. what "Strict secondary" does). Reuses
-                // the existing settings.routing-behavior.mode.<slug>.description
-                // keys (the catalog is flat: the JSON nests these under
-                // `settings`, so the lookup key MUST carry that prefix).
-                ToolTip.visible: hovered
-                ToolTip.text: {
-                    if (root.uiRevision < 0 || currentIndex < 0
-                            || currentIndex >= root.behaviorModeModel.count) return ""
-                    var id = String(root.behaviorModeModel.get(currentIndex).id || "")
-                    return id === ""
-                        ? ""
-                        : root.tr("settings.routing-behavior.mode." + id + ".description", "")
-                }
-                Component.onCompleted: {
-                    currentIndex = Pure.optionIndexById(
-                        ((root.context.interfaces || {}).supportedBehaviorModes) || [],
-                        (root.context.interfaces || {}).selectedBehaviorMode || "", 0)
-                    if (currentIndex >= 0 && currentIndex < root.behaviorModeModel.count)
-                        displayText = root.behaviorModeLabel(root.behaviorModeModel.get(currentIndex).id)
-                }
-                popup.width: root.comboPopupWidth(behaviorCombo, root.behaviorModeModel, "id",
-                    function(item) { return root.behaviorModeLabel(item.id) })
-                onActivated: {
-                    var id = root.behaviorModeModel.get(currentIndex).id
-                    root.updatePrefs({ routeBehaviorMode: id })
-                    root.emitPrefs()
-                    // Also persist to the SERVICE
-                    // per-SID policy (the authoritative source for WFP). The
-                    // updatePrefs/emitPrefs above only touches the deprecated
-                    // UiPreferences mirror and never reaches enforcement.
-                    if (typeof root.routePolicyController.applyRouteBehaviorMode === "function") {
-                        root.routePolicyController.applyRouteBehaviorMode(id)
+                ThemedComboBox {
+                    id: behaviorCombo
+                    theme: root.uiTheme
+                    width: 340
+                    model: root.behaviorModeModel
+                    textRole: "id"
+                    labelResolver: function(item) {
+                        return item ? root.behaviorModeLabel(item.id) : ""
                     }
-                    behaviorCombo.displayText = root.behaviorModeLabel(id)
-                }
-                Connections {
-                    target: root
-                    function onUiRevisionChanged() {
-                        if (behaviorCombo.currentIndex >= 0 && behaviorCombo.currentIndex < root.behaviorModeModel.count)
-                            behaviorCombo.displayText = root.behaviorModeLabel(root.behaviorModeModel.get(behaviorCombo.currentIndex).id)
+                    // Hover hint explaining the
+                    // selected mode (e.g. what "Strict secondary" does). Reuses
+                    // the existing settings.routing-behavior.mode.<slug>.description
+                    // keys (the catalog is flat: the JSON nests these under
+                    // `settings`, so the lookup key MUST carry that prefix).
+                    ToolTip.visible: hovered
+                    ToolTip.text: {
+                        if (root.uiRevision < 0 || currentIndex < 0
+                                || currentIndex >= root.behaviorModeModel.count) return ""
+                        var id = String(root.behaviorModeModel.get(currentIndex).id || "")
+                        return id === ""
+                            ? ""
+                            : root.tr("settings.routing-behavior.mode." + id + ".description", "")
+                    }
+                    Component.onCompleted: {
+                        currentIndex = Pure.optionIndexById(
+                            ((root.context.interfaces || {}).supportedBehaviorModes) || [],
+                            (root.context.interfaces || {}).selectedBehaviorMode || "", 0)
+                        if (currentIndex >= 0 && currentIndex < root.behaviorModeModel.count)
+                            displayText = root.behaviorModeLabel(root.behaviorModeModel.get(currentIndex).id)
+                    }
+                    popup.width: root.comboPopupWidth(behaviorCombo, root.behaviorModeModel, "id",
+                        function(item) { return root.behaviorModeLabel(item.id) })
+                    onActivated: {
+                        var id = root.behaviorModeModel.get(currentIndex).id
+                        root.updatePrefs({ routeBehaviorMode: id })
+                        root.emitPrefs()
+                        // Also persist to the SERVICE
+                        // per-SID policy (the authoritative source for WFP). The
+                        // updatePrefs/emitPrefs above only touches the deprecated
+                        // UiPreferences mirror and never reaches enforcement.
+                        if (typeof root.routePolicyController.applyRouteBehaviorMode === "function") {
+                            root.routePolicyController.applyRouteBehaviorMode(id)
+                        }
+                        behaviorCombo.displayText = root.behaviorModeLabel(id)
+                    }
+                    Connections {
+                        target: root
+                        function onUiRevisionChanged() {
+                            if (behaviorCombo.currentIndex >= 0 && behaviorCombo.currentIndex < root.behaviorModeModel.count)
+                                behaviorCombo.displayText = root.behaviorModeLabel(root.behaviorModeModel.get(behaviorCombo.currentIndex).id)
+                        }
                     }
                 }
             }
-        }
-        // What the tray is allowed to do about the companion domains a routed
-        // site pulls. It lives in Settings too, but this is the screen the user
-        // opens first and the tray is where the offers arrive, so the state and
-        // the switch belong in sight of each other.
-        Row {
-            spacing: root.uiTheme.spacingSm
-            Label {
-                text: root.tr("settings.routing.auto-rules.label",
-                    "Missing companion domains")
-                color: root.textColor
-                anchors.verticalCenter: parent.verticalCenter
+            // What the tray is allowed to do about the companion domains a routed
+            // site pulls. It lives in Settings too, but this is the screen the user
+            // opens first and the tray is where the offers arrive, so the state and
+            // the switch belong in sight of each other.
+            Row {
+                spacing: root.uiTheme.spacingSm
+                Label {
+                    text: root.tr("settings.routing.auto-rules.label",
+                        "Missing companion domains")
+                    color: root.textColor
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                ThemedComboBox {
+                    id: autoRulesModeCombo
+                    theme: root.uiTheme
+                    width: 260
+                    anchors.verticalCenter: parent.verticalCenter
+                    model: ListModel {
+                        ListElement { slug: "off"; label: "" }
+                        ListElement { slug: "suggest"; label: "" }
+                        ListElement { slug: "auto"; label: "" }
+                    }
+                    textRole: "label"
+                    function _slugLabel(slug) {
+                        if (slug === "off")
+                            return root.tr("settings.routing.auto-rules.mode-off", "Off")
+                        if (slug === "auto")
+                            return root.tr("settings.routing.auto-rules.mode-auto",
+                                "Apply automatically")
+                        return root.tr("settings.routing.auto-rules.mode-suggest",
+                            "Suggest only (default)")
+                    }
+                    labelResolver: function(item) {
+                        return item ? autoRulesModeCombo._slugLabel(String(item.slug)) : ""
+                    }
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 400
+                    ToolTip.text: root.tr("settings.routing.auto-rules.note", "")
+                    function _indexOfSlug(slug) {
+                        for (var i = 0; i < autoRulesModeCombo.model.count; i += 1)
+                            if (String(autoRulesModeCombo.model.get(i).slug) === slug)
+                                return i
+                        // Unknown value → "Suggest only": never start applying by
+                        // accident.
+                        return 1
+                    }
+                    function _syncFromState() {
+                        var idx = _indexOfSlug(String(
+                            (root.routingState || {}).autoRulesMode || "suggest"))
+                        currentIndex = idx
+                        displayText = _slugLabel(String(
+                            autoRulesModeCombo.model.get(idx).slug))
+                    }
+                    function _refreshLabels() {
+                        var m = autoRulesModeCombo.model
+                        for (var i = 0; i < m.count; i += 1)
+                            m.setProperty(i, "label", _slugLabel(String(m.get(i).slug)))
+                        _syncFromState()
+                    }
+                    Component.onCompleted: _refreshLabels()
+                    onActivated: {
+                        var slug = String(model.get(currentIndex).slug)
+                        // "Apply automatically" means unattended writes to the
+                        // user's rules, so it asks first — same gate as Settings.
+                        // The selection snaps back until the answer arrives.
+                        if (slug === "auto"
+                                && String((root.routingState || {}).autoRulesMode) !== "auto") {
+                            _syncFromState()
+                            autoRulesModeConfirmDialog.open()
+                            return
+                        }
+                        displayText = _slugLabel(slug)
+                        root.updateRoutingState({ autoRulesMode: slug })
+                        if (typeof root.routePolicyController.applyAutoRulesMode === "function")
+                            root.routePolicyController.applyAutoRulesMode(slug)
+                    }
+                    Connections {
+                        target: root
+                        // `routingState` is replaced wholesale on every patch, so
+                        // the revision counter is what says "read it again".
+                        function onUiRevisionChanged() { autoRulesModeCombo._refreshLabels() }
+                    }
+                }
             }
-            ThemedComboBox {
-                id: autoRulesModeCombo
+            ThemedButton {
                 theme: root.uiTheme
-                width: 260
-                anchors.verticalCenter: parent.verticalCenter
-                model: ListModel {
-                    ListElement { slug: "off"; label: "" }
-                    ListElement { slug: "suggest"; label: "" }
-                    ListElement { slug: "auto"; label: "" }
-                }
-                textRole: "label"
-                function _slugLabel(slug) {
-                    if (slug === "off")
-                        return root.tr("settings.routing.auto-rules.mode-off", "Off")
-                    if (slug === "auto")
-                        return root.tr("settings.routing.auto-rules.mode-auto",
-                            "Apply automatically")
-                    return root.tr("settings.routing.auto-rules.mode-suggest",
-                        "Suggest only (default)")
-                }
-                labelResolver: function(item) {
-                    return item ? autoRulesModeCombo._slugLabel(String(item.slug)) : ""
-                }
+                text: root.refreshAction.text
+                onClicked: root.refreshAction.trigger()
+            }
+            // Separate from Refresh on purpose: this one leaves the machine (one
+            // small packet per adapter) to find out how each link looks from
+            // outside, so it only ever runs when the user asks for it.
+            ThemedButton {
+                theme: root.uiTheme
+                enabled: !root.interfacesRolesController.externalIpProbeBusy
+                text: root.interfacesRolesController.externalIpProbeBusy
+                    ? root.tr("interfaces.external-ip.probe-busy", "Checking…")
+                    : root.tr("interfaces.external-ip.probe-button", "Check external address")
                 ToolTip.visible: hovered
                 ToolTip.delay: 400
-                ToolTip.text: root.tr("settings.routing.auto-rules.note", "")
-                function _indexOfSlug(slug) {
-                    for (var i = 0; i < autoRulesModeCombo.model.count; i += 1)
-                        if (String(autoRulesModeCombo.model.get(i).slug) === slug)
-                            return i
-                    // Unknown value → "Suggest only": never start applying by
-                    // accident.
-                    return 1
-                }
-                function _syncFromState() {
-                    var idx = _indexOfSlug(String(
-                        (root.routingState || {}).autoRulesMode || "suggest"))
-                    currentIndex = idx
-                    displayText = _slugLabel(String(
-                        autoRulesModeCombo.model.get(idx).slug))
-                }
-                function _refreshLabels() {
-                    var m = autoRulesModeCombo.model
-                    for (var i = 0; i < m.count; i += 1)
-                        m.setProperty(i, "label", _slugLabel(String(m.get(i).slug)))
-                    _syncFromState()
-                }
-                Component.onCompleted: _refreshLabels()
-                onActivated: {
-                    var slug = String(model.get(currentIndex).slug)
-                    // "Apply automatically" means unattended writes to the
-                    // user's rules, so it asks first — same gate as Settings.
-                    // The selection snaps back until the answer arrives.
-                    if (slug === "auto"
-                            && String((root.routingState || {}).autoRulesMode) !== "auto") {
-                        _syncFromState()
-                        autoRulesModeConfirmDialog.open()
-                        return
-                    }
-                    displayText = _slugLabel(slug)
-                    root.updateRoutingState({ autoRulesMode: slug })
-                    if (typeof root.routePolicyController.applyAutoRulesMode === "function")
-                        root.routePolicyController.applyAutoRulesMode(slug)
-                }
-                Connections {
-                    target: root
-                    // `routingState` is replaced wholesale on every patch, so
-                    // the revision counter is what says "read it again".
-                    function onUiRevisionChanged() { autoRulesModeCombo._refreshLabels() }
-                }
+                ToolTip.text: root.tr("interfaces.external-ip.probe-tooltip",
+                    "Asks a public address-reflection server what each adapter's address looks like from the internet. Sends one small packet per adapter; nothing else leaves the machine.")
+                Accessible.name: text
+                onClicked: root.interfacesRolesController.probeExternalAddresses()
             }
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            text: root.refreshAction.text
-            onClicked: root.refreshAction.trigger()
-        }
-        // Separate from Refresh on purpose: this one leaves the machine (one
-        // small packet per adapter) to find out how each link looks from
-        // outside, so it only ever runs when the user asks for it.
-        ThemedButton {
-            theme: root.uiTheme
-            enabled: !root.interfacesRolesController.externalIpProbeBusy
-            text: root.interfacesRolesController.externalIpProbeBusy
-                ? root.tr("interfaces.external-ip.probe-busy", "Checking…")
-                : root.tr("interfaces.external-ip.probe-button", "Check external address")
-            ToolTip.visible: hovered
-            ToolTip.delay: 400
-            ToolTip.text: root.tr("interfaces.external-ip.probe-tooltip",
-                "Asks a public address-reflection server what each adapter's address looks like from the internet. Sends one small packet per adapter; nothing else leaves the machine.")
-            Accessible.name: text
-            onClicked: root.interfacesRolesController.probeExternalAddresses()
-        }
-        // Entry point to the application-group route
-        // assignment (VMs / emulators + torrents / P2P). Opens the dialog wired
-        // in Main.qml (`openAppGroupRouting()`); available whether or not the
-        // service is running (discovery is launcher-local).
-        ThemedButton {
-            theme: root.uiTheme
-            visible: typeof root.openAppGroupRouting === "function"
-            text: root.tr("app-groups.open-button", "Set up routes")
-            onClicked: root.openAppGroupRouting()
+            // Entry point to the application-group route
+            // assignment (VMs / emulators + torrents / P2P). Opens the dialog wired
+            // in Main.qml (`openAppGroupRouting()`); available whether or not the
+            // service is running (discovery is launcher-local).
+            ThemedButton {
+                theme: root.uiTheme
+                visible: typeof root.openAppGroupRouting === "function"
+                text: root.tr("app-groups.open-button", "Set up routes")
+                onClicked: root.openAppGroupRouting()
+            }
         }
     }
     // Second row (own line): the Bluetooth/unavailable/remembered "Show"
     // toggles + sort. Always starts on a new line so the toggles are not
     // shifted by the Refresh button on medium-narrow widths.
-    Flow {
+    Item {
         Layout.fillWidth: true
-        spacing: root.uiTheme.spacingMd
-        CheckBox {
-            text: root.tr("interfaces.toggle.show-bluetooth-adapters", "Show Bluetooth adapters")
-            checked: !!root.prefs.showBluetoothAdapters
-            onToggled: {
-                root.updatePrefs({ showBluetoothAdapters: checked })
-                root.interfacesRolesController.rebuildInterfacesModel()
-                root.emitPrefs()
-            }
-        }
-        CheckBox {
-            text: root.tr("interfaces.toggle.show-unavailable-adapters",
-                "Show unavailable adapters")
-            checked: section.showUnavailable
-            onToggled: section.showUnavailable = checked
-        }
-        // Show "remembered but currently absent" ghost rows (a device-local
-        // display preference, default ON). Toggling only bumps uiRevision via
-        // updatePrefs, which re-evaluates the ghost Repeater model below; no
-        // interfaces-model rebuild is needed since the live list is untouched.
-        CheckBox {
-            text: root.tr("interfaces.remembered.toggle",
-                "Show remembered adapters that are currently absent")
-            checked: root.uiRevision >= 0 ? !!root.prefs.showRememberedAdapters : true
-            onToggled: {
-                root.updatePrefs({ showRememberedAdapters: checked })
-                root.emitPrefs()
-            }
-        }
-        Row {
-            spacing: root.uiTheme.spacingSm
-            Label {
-                text: root.tr("interfaces.sort.label", "Sort")
-                color: root.textColor
-                anchors.verticalCenter: parent.verticalCenter
-            }
-            ThemedComboBox {
-                id: adapterSortCombo
-                theme: root.uiTheme
-                width: 240
-                model: [ "default", "vpn-like", "primary-candidate" ]
-                function sortKeyLabel(id) { return root.tr("interfaces.sort." + id, id) }
-                labelResolver: function(item) { return adapterSortCombo.sortKeyLabel(item) }
-                currentIndex: 0
-                Component.onCompleted: displayText = sortKeyLabel(model[currentIndex])
-                popup.width: root.comboPopupWidth(adapterSortCombo, model, "",
-                    function(item) { return adapterSortCombo.sortKeyLabel(item) })
-                onActivated: {
-                    section.adapterSortBy = model[currentIndex]
-                    adapterSortCombo.displayText = sortKeyLabel(model[currentIndex])
+        Layout.preferredHeight: adapterTogglesFlow.height
+        Flow {
+            id: adapterTogglesFlow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingMd
+            CheckBox {
+                text: root.tr("interfaces.toggle.show-bluetooth-adapters", "Show Bluetooth adapters")
+                checked: !!root.prefs.showBluetoothAdapters
+                onToggled: {
+                    root.updatePrefs({ showBluetoothAdapters: checked })
+                    root.interfacesRolesController.rebuildInterfacesModel()
+                    root.emitPrefs()
                 }
-                Connections {
-                    target: root
-                    function onUiRevisionChanged() {
-                        adapterSortCombo.displayText = adapterSortCombo.sortKeyLabel(adapterSortCombo.model[adapterSortCombo.currentIndex])
+            }
+            CheckBox {
+                text: root.tr("interfaces.toggle.show-unavailable-adapters",
+                    "Show unavailable adapters")
+                checked: section.showUnavailable
+                onToggled: section.showUnavailable = checked
+            }
+            // Show "remembered but currently absent" ghost rows (a device-local
+            // display preference, default ON). Toggling only bumps uiRevision via
+            // updatePrefs, which re-evaluates the ghost Repeater model below; no
+            // interfaces-model rebuild is needed since the live list is untouched.
+            CheckBox {
+                text: root.tr("interfaces.remembered.toggle",
+                    "Show remembered adapters that are currently absent")
+                checked: root.uiRevision >= 0 ? !!root.prefs.showRememberedAdapters : true
+                onToggled: {
+                    root.updatePrefs({ showRememberedAdapters: checked })
+                    root.emitPrefs()
+                }
+            }
+            Row {
+                spacing: root.uiTheme.spacingSm
+                Label {
+                    text: root.tr("interfaces.sort.label", "Sort")
+                    color: root.textColor
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                ThemedComboBox {
+                    id: adapterSortCombo
+                    theme: root.uiTheme
+                    width: 240
+                    model: [ "default", "vpn-like", "primary-candidate" ]
+                    function sortKeyLabel(id) { return root.tr("interfaces.sort." + id, id) }
+                    labelResolver: function(item) { return adapterSortCombo.sortKeyLabel(item) }
+                    currentIndex: 0
+                    Component.onCompleted: displayText = sortKeyLabel(model[currentIndex])
+                    popup.width: root.comboPopupWidth(adapterSortCombo, model, "",
+                        function(item) { return adapterSortCombo.sortKeyLabel(item) })
+                    onActivated: {
+                        section.adapterSortBy = model[currentIndex]
+                        adapterSortCombo.displayText = sortKeyLabel(model[currentIndex])
+                    }
+                    Connections {
+                        target: root
+                        function onUiRevisionChanged() {
+                            adapterSortCombo.displayText = adapterSortCombo.sortKeyLabel(adapterSortCombo.model[adapterSortCombo.currentIndex])
+                        }
                     }
                 }
             }
@@ -648,6 +622,12 @@ ColumnLayout {
                 model: (root.uiRevision >= 0 && !!root.prefs.showRememberedAdapters)
                     ? root.interfacesRolesController.rememberedAbsentBindings() : []
                 delegate: Frame {
+                    id: rememberedCard
+                    // Absent from the list but known to the OS as switched off:
+                    // nothing to re-send, the user only has to turn it back on.
+                    readonly property bool switchedOff:
+                        String((root.enforcementStatusByRole || {})[String(modelData.role || "")] || "")
+                            === "secondary-down"
                     Layout.fillWidth: true
                     padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
                     opacity: 0.85
@@ -676,20 +656,24 @@ ColumnLayout {
                             }
                             Label {
                                 Layout.fillWidth: true
-                                text: root.uiRevision >= 0
-                                    ? root.tr("interfaces.remembered.badge",
+                                text: root.uiRevision < 0 ? ""
+                                    : rememberedCard.switchedOff
+                                    ? root.tr("interfaces.remembered.badge-switched-off",
+                                        "remembered · switched off")
+                                    : root.tr("interfaces.remembered.badge",
                                         "remembered · currently absent")
-                                    : ""
                                 color: root.uiTheme.colorWarning
                                 wrapMode: Text.WordWrap
                                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                             }
                             Label {
                                 Layout.fillWidth: true
-                                text: root.uiRevision >= 0
-                                    ? root.tr("interfaces.remembered.recovery-hint",
+                                text: root.uiRevision < 0 ? ""
+                                    : rememberedCard.switchedOff
+                                    ? root.tr("interfaces.remembered.switched-off-hint",
+                                        "The adapter is switched off. Turn it back on, or assign another adapter to this role in the list below.")
+                                    : root.tr("interfaces.remembered.recovery-hint",
                                         "If the connection is back up, send the binding to the service again. Otherwise assign another adapter to this role in the list below.")
-                                    : ""
                                 color: root.mutedTextColor
                                 wrapMode: Text.WordWrap
                                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
@@ -708,6 +692,7 @@ ColumnLayout {
                             }
                             ThemedButton {
                                 Layout.alignment: Qt.AlignRight
+                                visible: !rememberedCard.switchedOff
                                 theme: root.uiTheme
                                 text: root.tr("status.policy-inactive-send", "Send adapter to the service")
                                 Accessible.role: Accessible.Button

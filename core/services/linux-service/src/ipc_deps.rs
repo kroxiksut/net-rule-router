@@ -346,6 +346,9 @@ pub(crate) fn build_ipc_surface(
     if let Some(writer) = audit_writer.as_ref() {
         mutation_executor = mutation_executor.with_audit_writer(Arc::clone(writer));
     }
+    // Shared with the rule author, so a rule the service changes on its own
+    // passes the same gates as one the user saves.
+    let mutation_executor = Arc::new(mutation_executor);
 
     // Wired but shadowed: the launcher answers `autostart.*` before the socket
     // hop because autostart is per-user and this daemon runs as root, where
@@ -395,7 +398,8 @@ pub(crate) fn build_ipc_surface(
             // Restarts the service sealed are honoured; any other is an event.
             .with_chain_restart_key(coordinator.audit_restart_key()),
         ),
-        Arc::new(mutation_executor),
+        Arc::clone(&mutation_executor)
+            as Arc<dyn nrr_service_runtime::ipc_handlers::MutationExecutor>,
         Arc::clone(&mutation_tokens),
         Arc::default(),
         Arc::clone(&event_bus),
@@ -543,6 +547,15 @@ pub(crate) fn build_ipc_surface(
     let mut auto_probe = None;
     let deps = match auto_rules {
         Some(engine) => {
+            // Lets the service change the user's rules itself: a `?` rule the
+            // main link is shown not to reach, twins an old build stored.
+            engine.attach_author(Arc::new(
+                nrr_service_runtime::auto_rules::ProductionAutoRuleAuthor::new(
+                    Arc::new(ProductionRulesProvider::new(Arc::clone(&stats_state_conn))),
+                    Arc::clone(&mutation_executor)
+                        as Arc<dyn nrr_service_runtime::ipc_handlers::MutationExecutor>,
+                ),
+            ));
             let runner = main_link_probe(
                 Arc::clone(&engine),
                 probe_cache,
@@ -603,11 +616,15 @@ fn browser_history_seeder(
     copy_dir: PathBuf,
     dns_resolver: Arc<dyn nrr_platform_api::dns::DnsResolverPort>,
 ) -> Arc<BrowserHistorySeeder> {
+    use nrr_platform_api::browser_history::BrowserHistoryReadPort as _;
+
     let resolver: Arc<dyn nrr_platform_api::dns::DnsResolverPort> = Arc::new(
         nrr_platform_api::dns_budget::BudgetedDnsResolver::new(dns_resolver),
     );
+    let history = nrr_platform_linux::browser_history::LinuxBrowserHistoryRead::new(copy_dir);
+    history.discard_leftover_copies();
     Arc::new(BrowserHistorySeeder::new(
-        Arc::new(nrr_platform_linux::browser_history::LinuxBrowserHistoryRead::new(copy_dir)),
+        Arc::new(history),
         Arc::new(ProductionRulesProvider::new(state_conn)),
         resolver,
         cache,
@@ -684,14 +701,27 @@ fn main_link_probe(
         ProductionAutoRuleProbe, StoredBindingEgress,
     };
 
-    let egress = Arc::new(StoredBindingEgress::new(
-        Arc::new(
-            nrr_service_runtime::production_handlers_misc::ProductionRoutePolicySource::new(
-                Arc::clone(&state_conn),
+    let egress: Arc<dyn nrr_service_runtime::production_auto_rule_probe::EgressSources> =
+        Arc::new(StoredBindingEgress::new(
+            Arc::new(
+                nrr_service_runtime::production_handlers_misc::ProductionRoutePolicySource::new(
+                    Arc::clone(&state_conn),
+                ),
             ),
-        ),
-        route_table,
-    ));
+            route_table,
+        ));
+    // `?host` rules: the TLS check runs from the engine's own tick.
+    engine.attach_verify_primary(nrr_service_runtime::auto_rules::VerifyPrimaryWiring {
+        probe: Arc::new(LinkBoundPathProbe),
+        egress: Arc::clone(&egress),
+        include_subdomains: {
+            let conn = Arc::clone(&state_conn);
+            Arc::new(move |sid: &str| {
+                let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                nrr_service_runtime::production_rules_provider::include_subdomains_for(&guard, sid)
+            })
+        },
+    });
     // The user's own bounds, clamped by `ProbeLimits::new`.
     let limits_for = Arc::new(move |sid: &str| {
         let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -745,6 +775,26 @@ impl nrr_service_runtime::path_probe::PathProbe for LinkBoundPathProbe {
             LinkProbeOutcome::Connected => PathVerdict::Answered,
             LinkProbeOutcome::NoAnswer => PathVerdict::Silent,
             LinkProbeOutcome::NotRun => PathVerdict::Indeterminate,
+        }
+    }
+
+    fn probe_tls(
+        &self,
+        target: std::net::Ipv4Addr,
+        server_name: &str,
+        source: Option<std::net::Ipv4Addr>,
+        timeout: std::time::Duration,
+    ) -> nrr_service_runtime::path_probe::PathVerdict {
+        use nrr_platform_linux::link_probe::{socket_over_link, LinkProbeOutcome};
+        use nrr_service_runtime::path_probe::{tls_exchange, PathVerdict};
+
+        let Some(source) = source else {
+            return PathVerdict::Indeterminate;
+        };
+        match socket_over_link(target, 443, source, timeout) {
+            Ok(socket) => tls_exchange(&mut socket.into(), server_name, timeout),
+            Err(LinkProbeOutcome::NoAnswer) => PathVerdict::Silent,
+            Err(_) => PathVerdict::Indeterminate,
         }
     }
 }

@@ -63,6 +63,11 @@ pub struct ParsedRule {
     /// so the field is optional across the `preset.parse` RPC wire.
     #[serde(default)]
     pub blocked: bool,
+    /// Whether the value carried the `?` prefix (docs/en/rules-file-format.md
+    /// Verify the main route first): try the primary route first. Read in the
+    /// host-name sections only; it means something only in the secondary file.
+    #[serde(default)]
+    pub verify_primary: bool,
     /// Provenance of an app-authored rule — `Some` only for entries in the
     /// `--- Auto` section (docs/en/rules-file-format.md App-authored rules). The structured tokens are
     /// removed from `comment`, which keeps only the free text that followed

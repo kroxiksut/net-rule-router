@@ -230,73 +230,79 @@ Dialog {
         }
 
         // ── Buttons ──────────────────────────────────────────────
-        Flow {
+        Item {
             Layout.fillWidth: true
             Layout.topMargin: 8
-            spacing: 8
-            ThemedButton {
-                id: notNowButton
-                theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.drift.not-now", "Not now")
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                Accessible.description: dialog.tr(
-                    "dialog.drift.not-now-description",
-                    "Dismiss the dialog. The banner stays until the drift is resolved.")
-                onClicked: { dialog.cancelled(); dialog.close() }
-            }
-            ThemedButton {
-                theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.drift.show-diff", "Show differences")
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                Accessible.description: dialog.tr(
-                    "dialog.drift.show-diff-description",
-                    "Open a read-only diff of the current app rules against the service.")
-                onClicked: { dialog.showDiffRequested(); dialog.close() }
-            }
-            ThemedButton {
-                theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.drift.load-from-file", "Load from file")
-                enabled: dialog._anyFileExists()
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                Accessible.description: dialog.tr(
-                    "dialog.drift.load-from-file-description",
-                    "Re-import the saved file(s). Local edits are replaced.")
-                onClicked: { dialog.loadFromFileRequested(); dialog.close() }
-            }
-            ThemedButton {
-                theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.drift.accept-service",
-                    "Accept service state")
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                Accessible.description: dialog.tr(
-                    "dialog.drift.accept-service-description",
-                    "Discard local edits and roll back the app to what the service holds.")
-                onClicked: { dialog.acceptServiceStateRequested(); dialog.close() }
-            }
-            ThemedButton {
-                theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.drift.apply-gui", "Apply app state")
-                highlighted: true
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                Accessible.description: dialog.tr(
-                    "dialog.drift.apply-gui-description",
-                    "Open the review flow and push the current app state to the service.")
-                onClicked: { dialog.applyGuiStateRequested(); dialog.close() }
-            }
-            ThemedButton {
-                theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.drift.clear-all", "Clear everything")
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                Accessible.description: dialog.tr(
-                    "dialog.drift.clear-all-description",
-                    "Remove all rules from the app and the service. This cannot be undone.")
-                onClicked: { dialog.clearAllRequested(); dialog.close() }
+            Layout.preferredHeight: buttonsFlow.height
+            Flow {
+                id: buttonsFlow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: 8
+                ThemedButton {
+                    id: notNowButton
+                    theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                    text: dialog.tr("dialog.drift.not-now", "Not now")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    Accessible.description: dialog.tr(
+                        "dialog.drift.not-now-description",
+                        "Dismiss the dialog. The banner stays until the drift is resolved.")
+                    onClicked: { dialog.cancelled(); dialog.close() }
+                }
+                ThemedButton {
+                    theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                    text: dialog.tr("dialog.drift.show-diff", "Show differences")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    Accessible.description: dialog.tr(
+                        "dialog.drift.show-diff-description",
+                        "Open a read-only diff of the current app rules against the service.")
+                    onClicked: { dialog.showDiffRequested(); dialog.close() }
+                }
+                ThemedButton {
+                    theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                    text: dialog.tr("dialog.drift.load-from-file", "Load from file")
+                    enabled: dialog._anyFileExists()
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    Accessible.description: dialog.tr(
+                        "dialog.drift.load-from-file-description",
+                        "Re-import the saved file(s). Local edits are replaced.")
+                    onClicked: { dialog.loadFromFileRequested(); dialog.close() }
+                }
+                ThemedButton {
+                    theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                    text: dialog.tr("dialog.drift.accept-service",
+                        "Accept service state")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    Accessible.description: dialog.tr(
+                        "dialog.drift.accept-service-description",
+                        "Discard local edits and roll back the app to what the service holds.")
+                    onClicked: { dialog.acceptServiceStateRequested(); dialog.close() }
+                }
+                ThemedButton {
+                    theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                    text: dialog.tr("dialog.drift.apply-gui", "Apply app state")
+                    highlighted: true
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    Accessible.description: dialog.tr(
+                        "dialog.drift.apply-gui-description",
+                        "Open the review flow and push the current app state to the service.")
+                    onClicked: { dialog.applyGuiStateRequested(); dialog.close() }
+                }
+                ThemedButton {
+                    theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                    text: dialog.tr("dialog.drift.clear-all", "Clear everything")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    Accessible.description: dialog.tr(
+                        "dialog.drift.clear-all-description",
+                        "Remove all rules from the app and the service. This cannot be undone.")
+                    onClicked: { dialog.clearAllRequested(); dialog.close() }
+                }
             }
         }
     }

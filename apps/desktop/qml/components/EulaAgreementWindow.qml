@@ -184,33 +184,39 @@ Window {
                 }
             }
 
-            Item { Layout.fillWidth: true }
-
-            // Accept / decline wrap on narrow displays via Flow.
-            Flow {
-                spacing: 8
-                layoutDirection: Qt.RightToLeft
-                ThemedButton {
-                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                    text: root.tr("dialog.eula.accept", "Accept and continue")
-                    highlighted: true
-                    enabled: acknowledgeCheckbox.checked
-                    Accessible.role: Accessible.Button
-                    Accessible.name: text
-                    onClicked: {
-                        root._accepted = true
-                        root.accepted()
-                        root.close()
+            // Accept / decline take the rest of the row, right-aligned, and wrap
+            // on narrow displays.
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: decisionFlow.height
+                Flow {
+                    id: decisionFlow
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    spacing: 8
+                    layoutDirection: Qt.RightToLeft
+                    ThemedButton {
+                        theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                        text: root.tr("dialog.eula.accept", "Accept and continue")
+                        highlighted: true
+                        enabled: acknowledgeCheckbox.checked
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                        onClicked: {
+                            root._accepted = true
+                            root.accepted()
+                            root.close()
+                        }
                     }
-                }
-                ThemedButton {
-                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                    text: root.tr("dialog.eula.decline", "Decline and exit")
-                    Accessible.role: Accessible.Button
-                    Accessible.name: text
-                    // Just close; `onClosing` emits `declined()` exactly once,
-                    // covering both this button and the title-bar X.
-                    onClicked: root.close()
+                    ThemedButton {
+                        theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                        text: root.tr("dialog.eula.decline", "Decline and exit")
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                        // Just close; `onClosing` emits `declined()` exactly once,
+                        // covering both this button and the title-bar X.
+                        onClicked: root.close()
+                    }
                 }
             }
         }

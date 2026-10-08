@@ -508,9 +508,12 @@ impl ServiceControlPort for LinuxServiceControl {
             };
             return Err(ServiceControlError::Mechanism {
                 detail: format!(
-                    "the service cannot run from {}: {why}. Copy the binary somewhere system-wide, e.g. /usr/lib/{}/, and install it from there — scripts/install-service.sh does this.",
+                    "the service cannot run from {}: {why}. Copy the binary to {}/ and install it from there — scripts/install-service.sh does this.",
                     spec.binary_path.display(),
-                    nrr_shared::product_identity::PRODUCT_NAME_UNIX,
+                    crate::systemd::installed_daemon_path()
+                        .parent()
+                        .unwrap_or(std::path::Path::new("/usr/libexec"))
+                        .display(),
                 ),
             });
         }

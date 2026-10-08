@@ -18,8 +18,9 @@
 // Signals:
 //   - statusChanged: emitted whenever `refreshStatus()` observes a
 //     transition. QML uses it for badge + Timer-driven polling.
-//   - operationCompleted(operation, success, errorMessage): emitted at
-//     the end of every async install/uninstall/start/stop.
+//   - operationCompleted(operation, success, errorMessage, errorCode): emitted
+//     at the end of every async install/uninstall/start/stop. `errorCode` is
+//     the launcher's refusal slug when it gave one, so QML can word it.
 //   - uacDeclined(operation): emitted when `ShellExecuteExW` returned
 //     `FALSE` with `GetLastError() == ERROR_CANCELLED` (1223). QML
 //     uses this to record the decline in `prefs.serviceInstallUacDeclined*`
@@ -331,7 +332,8 @@ signals:
     /// Fires once per leg, so a restart raises it twice ("stop" then
     /// "start") and an install raises it for "install" then "start".
     void operationStarted(QString operation);
-    void operationCompleted(QString operation, bool success, QString errorMessage);
+    void operationCompleted(QString operation, bool success, QString errorMessage,
+                            QString errorCode);
     void uacDeclined(QString operation);
     /// Emitted when a service-control action
     /// succeeds via the session elevation broker (non-elevated GUI). Reaching
@@ -343,7 +345,7 @@ signals:
 
 private slots:
     void onWorkerResult(QString operation, bool success, QString errorMessage) {
-        emit operationCompleted(operation, success, errorMessage);
+        emit operationCompleted(operation, success, errorMessage, QString());
         // Auto-start on successful install: registering the service with
         // SCM does not run it, but the user clicked "Install" expecting
         // a working service. Mirror the PowerShell scripts' install →
@@ -526,7 +528,7 @@ private:
         if (servicePath_.isEmpty()) {
             setBusy(false, QString());
             emit operationCompleted(operation, false,
-                QStringLiteral("Service binary not found"));
+                QStringLiteral("Service binary not found"), QString());
             return;
         }
         setBusy(true, operation);
@@ -594,12 +596,12 @@ private:
             return;
         }
         if (!ok) {
-            emit operationCompleted(operation, false, errorMessage);
+            emit operationCompleted(operation, false, errorMessage, errorCode);
             setBusy(false, QString());
             refreshStatus();
             return;
         }
-        emit operationCompleted(operation, true, QString());
+        emit operationCompleted(operation, true, QString(), QString());
 #ifdef Q_OS_WIN
         // Reaching here means a service-control
         // action succeeded through the broker (non-elevated path), so the

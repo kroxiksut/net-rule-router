@@ -566,7 +566,7 @@ fn serve_requests(
     let mut io = match PipeIo::new(pipe_handle) {
         Ok(io) => io,
         Err(e) => {
-            eprintln!("nrr-ipc-client: serve_requests PipeIo::new failed: {e}");
+            client_trace!("nrr-ipc-client: serve_requests PipeIo::new failed: {e}");
             transport::close_pipe(pipe_handle);
             inner.set_status(ConnectionStatus::Disconnected {
                 last_error: format!("serve_requests PipeIo init: {e}"),
@@ -706,7 +706,7 @@ fn serve_requests(
                 break;
             }
             // Mismatched request_id on the wire — log and continue.
-            eprintln!(
+            client_trace!(
                 "nrr-ipc-client: discarding frame with unexpected request_id={frame_request_id}",
             );
         }
@@ -759,7 +759,7 @@ fn drain_push_frames(inner: &Arc<ClientInner>, io: &mut PipeIo) -> bool {
             // A response with nothing waiting for it — the request that owned
             // it is long gone. Dropping it is the only sane action, but it
             // means the two ends disagree about what is in flight.
-            eprintln!(
+            client_trace!(
                 "nrr-ipc-client: discarding unsolicited response frame request_id={frame_request_id}",
             );
             continue;
@@ -829,7 +829,7 @@ fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, io: &mut S) ->
     drop(guard);
 
     if let Err(e) = write_frame(io, &replay) {
-        eprintln!("nrr-ipc-client: resubscribe write failed: {e}");
+        client_trace!("nrr-ipc-client: resubscribe write failed: {e}");
         return !e.is_transport_dead();
     }
     // Read until the matching response arrives; push frames may already be
@@ -841,7 +841,7 @@ fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, io: &mut S) ->
         let frame: Value = match read_frame(io) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("nrr-ipc-client: resubscribe read failed: {e}");
+                client_trace!("nrr-ipc-client: resubscribe read failed: {e}");
                 return false;
             }
         };
@@ -852,7 +852,7 @@ fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, io: &mut S) ->
             .unwrap_or("");
         if frame_request_id.is_empty() {
             if crate::protocol::is_server_refusal(&frame) {
-                eprintln!("nrr-ipc-client: resubscribe refused by the service");
+                client_trace!("nrr-ipc-client: resubscribe refused by the service");
                 return false;
             }
             route_push_frame(inner, &frame, "resubscribe");
@@ -865,7 +865,7 @@ fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, io: &mut S) ->
                 // the id from the caller's original subscribe is dead.
                 remember_subscription_id(inner, &frame);
             }
-            eprintln!(
+            client_trace!(
                 "nrr-ipc-client: resubscribed after reconnect, ok={ok} (subscription={})",
                 inner
                     .subscription_id
@@ -879,7 +879,7 @@ fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, io: &mut S) ->
         // A frame belonging to some other request: on a single-in-flight pipe
         // this means the two ends are out of step, and continuing to read on it
         // would pair later answers with the wrong requests.
-        eprintln!(
+        client_trace!(
             "nrr-ipc-client: resubscribe saw a foreign request_id={frame_request_id}; reconnecting"
         );
         return false;
@@ -891,7 +891,7 @@ fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, io: &mut S) ->
 /// never arrived, and that ambiguity has cost us two test runs.
 fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: &str) {
     let Some(payload) = frame.get("payload").cloned() else {
-        eprintln!("nrr-ipc-client: push frame without payload (source={source})");
+        client_trace!("nrr-ipc-client: push frame without payload (source={source})");
         return;
     };
     let event_type = payload
@@ -901,11 +901,11 @@ fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: &str) {
         .unwrap_or("unknown")
         .to_string();
     let Ok(guard) = inner.push_tx.lock() else {
-        eprintln!("nrr-ipc-client: push {event_type} lost — subscriber lock poisoned");
+        client_trace!("nrr-ipc-client: push {event_type} lost — subscriber lock poisoned");
         return;
     };
     let Some(tx) = guard.as_ref() else {
-        eprintln!("nrr-ipc-client: push {event_type} discarded — nobody subscribed");
+        client_trace!("nrr-ipc-client: push {event_type} discarded — nobody subscribed");
         return;
     };
     // A dropped frame is a hole in the event stream, and the subscriber has no
@@ -919,9 +919,9 @@ fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: &str) {
         }
     }
     match tx.try_send(payload) {
-        Ok(()) => eprintln!("nrr-ipc-client: push {event_type} delivered (source={source})"),
+        Ok(()) => client_trace!("nrr-ipc-client: push {event_type} delivered (source={source})"),
         Err(e) => {
-            eprintln!("nrr-ipc-client: push {event_type} dropped — channel full ({e})");
+            client_trace!("nrr-ipc-client: push {event_type} dropped — channel full ({e})");
             inner.push_gap.store(true, Ordering::SeqCst);
         }
     }

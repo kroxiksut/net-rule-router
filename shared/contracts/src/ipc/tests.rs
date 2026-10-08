@@ -2,9 +2,10 @@
 
 use super::{
     ipc_lifecycle_stages, ipc_operation_catalog, CompatibilityClientBehavior, IpcClientProfile,
-    IpcExecutionModel, IpcInteractionClass, IpcOperationName, VersionCompatibilityCase,
-    IPC_CONTRACT_VERSION_POLICY, IPC_CORRELATION_MODEL, IPC_ENVELOPE_PAYLOAD_BOUNDARY,
-    IPC_RETRY_POLICY, IPC_STATE_UPDATE_MODEL, IPC_VERSION_COMPATIBILITY_MATRIX,
+    IpcExecutionModel, IpcInteractionClass, IpcOperationName, IpcOperationSpec,
+    VersionCompatibilityCase, IPC_CONTRACT_VERSION_POLICY, IPC_CORRELATION_MODEL,
+    IPC_ENVELOPE_PAYLOAD_BOUNDARY, IPC_RETRY_POLICY, IPC_STATE_UPDATE_MODEL,
+    IPC_VERSION_COMPATIBILITY_MATRIX,
 };
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -30,24 +31,27 @@ fn catalog_uses_canonical_operation_names_and_non_empty_client_sets() {
     assert_eq!(catalog.len(), IpcOperationName::ALL.len());
 }
 
-/// `capability_rank` places the tray below the window, and that is only
-/// true while every operation open to the tray is also open to the window.
-/// The day a tray-only operation lands, the order is fiction again — and
-/// `narrowed_by` would then quietly take a capability away from a caller
-/// that declared itself the tray.
+fn open_to(item: &IpcOperationSpec, profile: IpcClientProfile) -> bool {
+    item.allowed_clients.contains(&profile)
+}
+
+/// `is_within` places the tray and the terminal inside the window, and that is
+/// only true while every operation open to either is also open to the window.
+/// The day a tray-only or terminal-only operation lands, the order is fiction
+/// again — and `narrowed_by` would then quietly take a capability away from a
+/// caller that declared itself the narrower surface.
 #[test]
-fn no_operation_is_open_to_the_tray_but_closed_to_the_gui() {
-    for item in ipc_operation_catalog() {
-        if item
-            .allowed_clients
-            .contains(&IpcClientProfile::TrayLightweight)
-        {
-            assert!(
-                item.allowed_clients
-                    .contains(&IpcClientProfile::GuiInteractive),
-                "{} is tray-only, so the tray is no longer the narrower surface",
-                item.name.slug(),
-            );
+fn no_operation_is_open_to_a_narrower_surface_but_closed_to_the_gui() {
+    for narrower in [IpcClientProfile::TrayLightweight, IpcClientProfile::Tui] {
+        for item in ipc_operation_catalog() {
+            if item.allowed_clients.contains(&narrower) {
+                assert!(
+                    open_to(item, IpcClientProfile::GuiInteractive),
+                    "{} is open to {} but not the window",
+                    item.name.slug(),
+                    narrower.slug(),
+                );
+            }
         }
     }
 }
@@ -57,17 +61,84 @@ fn no_operation_is_open_to_the_tray_but_closed_to_the_gui() {
 /// the OS proved" and kept window capabilities.
 #[test]
 fn a_declaration_narrows_and_never_widens() {
-    use IpcClientProfile::{AdminConsole, GuiInteractive, TrayLightweight};
+    use IpcClientProfile::{AdminConsole, GuiInteractive, TrayLightweight, Tui};
     // Proven window, declared tray: taken at its word.
     assert_eq!(GuiInteractive.narrowed_by(TrayLightweight), TrayLightweight);
     // Proven tray, declared window: the proof stands.
     assert_eq!(TrayLightweight.narrowed_by(GuiInteractive), TrayLightweight);
+    // The terminal sits inside the window the same way.
+    assert_eq!(GuiInteractive.narrowed_by(Tui), Tui);
+    assert_eq!(Tui.narrowed_by(GuiInteractive), Tui);
+    // Tray and terminal each hold what the other lacks: only the console is
+    // inside both.
+    assert_eq!(TrayLightweight.narrowed_by(Tui), AdminConsole);
+    assert_eq!(Tui.narrowed_by(TrayLightweight), AdminConsole);
     // The console is narrowest from either side.
-    assert_eq!(GuiInteractive.narrowed_by(AdminConsole), AdminConsole);
-    assert_eq!(AdminConsole.narrowed_by(GuiInteractive), AdminConsole);
+    for profile in IpcClientProfile::ALL {
+        assert_eq!(profile.narrowed_by(AdminConsole), AdminConsole);
+        assert_eq!(AdminConsole.narrowed_by(profile), AdminConsole);
+    }
     // A profile narrowed by itself is itself.
     for profile in IpcClientProfile::ALL {
         assert_eq!(profile.narrowed_by(profile), profile);
+    }
+}
+
+/// The narrowing never hands out an operation either side lacks.
+#[test]
+fn narrowing_keeps_only_what_both_profiles_may_invoke() {
+    for proven in IpcClientProfile::ALL {
+        for declared in IpcClientProfile::ALL {
+            let narrowed = proven.narrowed_by(declared);
+            for item in ipc_operation_catalog() {
+                if item.allowed_clients.contains(&narrowed) {
+                    assert!(
+                        item.allowed_clients.contains(&proven)
+                            && item.allowed_clients.contains(&declared),
+                        "{proven:?} narrowed by {declared:?} reaches {}",
+                        item.name.slug(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The terminal is the window's policy surface minus the desktop session:
+/// exactly these are closed to it, and nothing else the window may do.
+#[test]
+fn the_terminal_has_every_window_operation_but_the_desktop_session_ones() {
+    let desktop_only = [
+        IpcOperationName::AutostartGet,
+        IpcOperationName::AutostartToggle,
+        IpcOperationName::MigrationStatusGet,
+        IpcOperationName::MigrationMarkComplete,
+    ];
+    for item in ipc_operation_catalog() {
+        let gui = open_to(item, IpcClientProfile::GuiInteractive);
+        let tui = open_to(item, IpcClientProfile::Tui);
+        if desktop_only.contains(&item.name) {
+            assert!(gui && !tui, "{}", item.name.slug());
+        } else {
+            assert_eq!(gui, tui, "{}", item.name.slug());
+        }
+    }
+}
+
+/// The window and the terminal may be prompted for elevation; the tray and the
+/// console never are.
+#[test]
+fn only_the_window_and_the_terminal_may_be_prompted_for_elevation() {
+    for profile in IpcClientProfile::ALL {
+        assert_eq!(
+            profile.may_prompt_for_elevation(),
+            matches!(
+                profile,
+                IpcClientProfile::GuiInteractive | IpcClientProfile::Tui
+            ),
+            "{}",
+            profile.slug()
+        );
     }
 }
 

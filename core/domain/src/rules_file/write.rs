@@ -2,7 +2,7 @@
 
 use super::parse::BLOCK_FLAG;
 use super::*;
-use nrr_shared::preset_parser::neutralize_field;
+use nrr_shared::preset_parser::{neutralize_field, VERIFY_PRIMARY_PREFIX};
 
 /// Serialises a [`RulesFileParsed`] (and optional unsupported sections) back to
 /// canonical rules-file text.
@@ -154,6 +154,7 @@ pub fn write_rules_file_with_passthrough(
 ///
 /// - Active rule: `value` or `value  # comment`.
 /// - Disabled rule: `# value` or `# value  # comment`.
+/// - "Try the primary route first": `?value`, or `# ?value` when disabled.
 ///
 /// The two-space separator before the inline `#` mirrors the canonical form
 /// shown in docs/en/rules-file-format.md Complete example examples.
@@ -165,6 +166,9 @@ pub fn write_rules_file_with_passthrough(
 fn write_entry_line(out: &mut String, entry: &RulesFileEntry, emit_origin: bool) {
     if !entry.enabled {
         out.push_str("# ");
+    }
+    if entry.verify_primary {
+        out.push(VERIFY_PRIMARY_PREFIX);
     }
     out.push_str(&neutralize_field(&entry.match_value));
     if entry.blocked {

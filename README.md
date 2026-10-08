@@ -89,6 +89,7 @@ The full walkthrough, including what to do if you lose network access, is in
   stops a site you route.
 - **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
 - **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
+- **Rules that adapt to your provider** — put `?` before a site in the additional-route file and it goes over your main connection for as long as that works. Once your provider is shown to block it, the app moves the rule to the additional route by itself and tells you. The bundled presets use this for services some providers block and others do not, so one pack fits any provider.
 - **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a background service that applies policy at startup. The tray menu and its notices are still being shaped ahead of the first release; what they contain and how they look may change between builds.
 - **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme.
 - **RU / EN out of the box**, with drop-in community locales (no rebuild needed).
@@ -153,7 +154,10 @@ alibaba.com
 *.alibaba.com
 ```
 
-The full format is documented in [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md).
+Lines marked with `?` (for example `?accounts.google.com`) are tried over the
+main route first and move to the additional route only where your provider
+blocks them. The full format is documented in
+[`docs/en/rules-file-format.md`](docs/en/rules-file-format.md).
 
 > The bundled country presets are AI-authored drafts meant as a convenient
 > starting point, not authoritative routing advice — review and adapt them
@@ -213,7 +217,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -Zip
 
 The package lands in `C:\temp\NetRuleRouter\dist\NetRuleRouter`; `-Zip` puts
 `NetRuleRouter-windows-x64-<version>+<commit>.zip` beside it. It carries the
-GUI, tray, service, console, the Qt runtime, and the QML / locale / preset /
+GUI, tray, service, console, terminal interface, the Qt runtime, and the QML / locale / preset /
 config tree, plus a `build-info.json` stamp (version, revision, build time)
 and short `README.txt` / `README.ru.txt` notes for whoever unpacks it.
 Parameters and layout:
@@ -234,6 +238,15 @@ paste into a bug instead of three screenshots. Routing policy stays in the app �
 the console never edits or applies rules and has no machine-readable output, so
 it is a way to keep one machine healthy, not an automation API. See
 [`docs/en/cli.md`](docs/en/cli.md).
+
+## Terminal interface
+
+`nrr-tui` is the application in a terminal: status, setup, rules, suggestions,
+diagnostics and settings for a machine reached over SSH, a server without a
+desktop, or anyone who prefers the keyboard. It works with screen readers
+(`--plain`), never relies on colour alone, and needs no administrator rights
+for your own rules. It runs only interactively — scripts use `nrr-cli`. See
+[`docs/en/tui.md`](docs/en/tui.md).
 
 ## Security & privacy
 
@@ -280,6 +293,7 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 | [`docs/en/diagnostic-archive.md`](docs/en/diagnostic-archive.md) | What goes into a diagnostic archive, and what never does |
 | [`docs/en/recovering-network-access.md`](docs/en/recovering-network-access.md) | Getting the network back if something goes wrong |
 | [`docs/en/cli.md`](docs/en/cli.md) | The `nrr-cli` console: verbs, exit codes, and what it deliberately does not do |
+| [`docs/en/tui.md`](docs/en/tui.md) | The `nrr-tui` terminal interface: starting it, screens, keys, accessibility, rights |
 | [`docs/en/building-windows.md`](docs/en/building-windows.md) | Building from source on Windows: toolchain, Qt, common failures |
 | [`docs/en/packaging-windows.md`](docs/en/packaging-windows.md) | Producing a portable package for distribution |
 

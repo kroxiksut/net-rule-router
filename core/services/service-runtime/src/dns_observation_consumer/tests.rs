@@ -948,3 +948,62 @@ fn a_cached_address_inside_a_network_reports_the_subnet_kind() {
         Some("exact-fqdn")
     );
 }
+
+/// The ladder is the engine's: a network beats the zone it sits in, and an
+/// exact address beats both.
+#[test]
+fn the_cache_kind_follows_the_narrower_rule_wins_order() {
+    let mut rules = vec![
+        network_rule("z1", CanonicalAddressMatch::Zone("test".into())),
+        network_rule(
+            "n1",
+            CanonicalAddressMatch::Subnet(
+                nrr_shared::ip_block::IpBlock::parse("198.51.100.0/24").expect("network"),
+            ),
+        ),
+    ];
+    let at = Some(Ipv4Addr::new(198, 51, 100, 7));
+    let kind = |rules: &[CanonicalRule]| {
+        rule_set_match_kind(
+            "host.test",
+            at,
+            &CanonicalRuleSet::from_rules(rules.to_vec()),
+        )
+    };
+    assert_eq!(kind(&rules), Some("subnet"));
+    rules.push(network_rule(
+        "i1",
+        CanonicalAddressMatch::ExactIp(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+    ));
+    assert_eq!(kind(&rules), Some("exact-ip"));
+    assert_eq!(
+        rule_set_match_kind("other.test", None, &CanonicalRuleSet::from_rules(rules)),
+        Some("zone")
+    );
+}
+
+/// A name carrying markup would style or spoof whatever screen lists it; it
+/// never reaches the cache, while a plain name in the same drain does.
+#[test]
+fn a_name_with_markup_never_reaches_the_cache() {
+    let (cache, lookup) = in_memory_cache();
+    let c = consumer(
+        vec![zone_rule("z1", "example")],
+        Arc::clone(&cache),
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        active_sid("S-A"),
+    );
+    let summary = c.consume(
+        &[
+            obs("a<b>.example", [203, 0, 113, 1]),
+            obs("x&y.example", [203, 0, 113, 2]),
+            obs("ok.example", [203, 0, 113, 3]),
+        ],
+        // Now, not the epoch: the lookup below judges freshness by the clock.
+        SystemTime::now(),
+    );
+    assert_eq!(summary.ignored, 2);
+    assert!(lookup.ips_for_hostname("a<b>.example").is_empty());
+    assert!(lookup.ips_for_hostname("x&y.example").is_empty());
+    assert!(!lookup.ips_for_hostname("ok.example").is_empty());
+}

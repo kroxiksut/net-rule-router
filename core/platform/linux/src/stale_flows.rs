@@ -31,10 +31,35 @@ use nrr_platform_api::fake_ip::stale_flows::{
 /// Production [`StaleFlowReset`] over `sock_diag`.
 #[derive(Debug, Default)]
 pub struct LinuxStaleFlowReset {
-    /// The kernel's id of each connection the last listing returned, so a reset
+    /// The kernel's id of each connection recent listings returned, so a reset
     /// names exactly that socket — bound interface and cookie included — rather
     /// than whatever holds the same four-tuple by then.
-    listed: Mutex<HashMap<(SocketAddrV4, SocketAddrV4), SockId>>,
+    listed: Mutex<Listings>,
+}
+
+type FourTuple = (SocketAddrV4, SocketAddrV4);
+
+/// The ids the two latest listings returned. Two, so a listing another caller
+/// makes between a caller's own listing and its reset does not take that
+/// caller's ids away.
+#[derive(Debug, Default)]
+struct Listings {
+    current: HashMap<FourTuple, SockId>,
+    previous: HashMap<FourTuple, SockId>,
+}
+
+impl Listings {
+    fn record(&mut self, ids: impl IntoIterator<Item = (FourTuple, SockId)>) {
+        self.previous = std::mem::take(&mut self.current);
+        self.current.extend(ids);
+    }
+
+    fn get(&self, tuple: &FourTuple) -> Option<SockId> {
+        self.current
+            .get(tuple)
+            .or_else(|| self.previous.get(tuple))
+            .copied()
+    }
 }
 
 impl LinuxStaleFlowReset {
@@ -98,11 +123,10 @@ impl StaleFlowReset for LinuxStaleFlowReset {
                 wanted.matches(*remote.ip()).then_some((local, remote, s))
             })
             .collect();
-        {
-            let mut listed = self.listed.lock().unwrap_or_else(|p| p.into_inner());
-            listed.clear();
-            listed.extend(matched.iter().map(|(l, r, s)| ((*l, *r), s.id)));
-        }
+        self.listed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record(matched.iter().map(|(l, r, s)| ((*l, *r), s.id)));
         if matched.is_empty() {
             return Vec::new();
         }
@@ -145,16 +169,12 @@ impl StaleFlowReset for LinuxStaleFlowReset {
 /// The kernel id to destroy for each flow: the one its listing returned, or —
 /// for a flow this instance never listed — one built from the endpoints, which
 /// finds an unbound socket.
-fn ids_for(
-    flows: &[EstablishedFlow],
-    listed: &HashMap<(SocketAddrV4, SocketAddrV4), SockId>,
-) -> Vec<SockId> {
+fn ids_for(flows: &[EstablishedFlow], listed: &Listings) -> Vec<SockId> {
     flows
         .iter()
         .map(|f| {
             listed
                 .get(&(f.local, f.remote))
-                .copied()
                 .unwrap_or_else(|| SockId::for_v4(f.local, f.remote))
         })
         .collect()
@@ -542,13 +562,30 @@ fn processes_holding<'a>(
 
 #[cfg(target_os = "linux")]
 fn dump_established() -> Result<Vec<DiagSocket>, String> {
-    let socket = DiagNetlink::open().map_err(|e| e.to_string())?;
-    let mut sockets = socket
-        .dump(AF_INET, 1)
-        .map_err(|e| format!("IPv4 dump: {e}"))?;
+    let mut sockets = dump_family(AF_INET, "IPv4")?;
     // A kernel without IPv6 refuses this family; its v4 answer still stands.
-    if let Ok(v6) = socket.dump(AF_INET6, 2) {
+    if let Ok(v6) = dump_family(AF_INET6, "IPv6") {
         sockets.extend(v6);
+    }
+    Ok(sockets)
+}
+
+/// One family on a socket of its own: a dump stopped at the cap leaves the
+/// rest of its answer queued, which the next request on that socket would read.
+#[cfg(target_os = "linux")]
+fn dump_family(family: u8, name: &str) -> Result<Vec<DiagSocket>, String> {
+    let socket = DiagNetlink::open().map_err(|e| e.to_string())?;
+    let sockets = socket
+        .dump(family, 1)
+        .map_err(|e| format!("{name} dump: {e}"))?;
+    if sockets.len() >= MAX_DUMP_SOCKETS {
+        tracing::warn!(
+            target: "nrr::flow-reset",
+            msg_key = "linux-flow-reset-dump-capped",
+            family = name,
+            cap = MAX_DUMP_SOCKETS,
+            "the connection table holds more sockets than one listing reads; connections past the cap are not reset",
+        );
     }
     Ok(sockets)
 }
@@ -987,7 +1024,8 @@ mod tests {
                 remote.port(),
             ),
         };
-        let listed = HashMap::from([((local, remote), listed_id)]);
+        let mut listed = Listings::default();
+        listed.record([((local, remote), listed_id)]);
         let flow = |local, remote| EstablishedFlow {
             local,
             remote,
@@ -999,6 +1037,17 @@ mod tests {
         let ids = ids_for(&[flow(local, remote), flow(other_local, remote)], &listed);
         assert_eq!(ids[0], listed_id);
         assert_eq!(ids[1], SockId::for_v4(other_local, remote));
+
+        // Another caller's listing in between keeps this one's id.
+        listed.record([((other_local, remote), SockId::for_v4(other_local, remote))]);
+        assert_eq!(ids_for(&[flow(local, remote)], &listed), [listed_id]);
+        listed.record([]);
+        listed.record([]);
+        assert_eq!(
+            ids_for(&[flow(local, remote)], &listed),
+            [SockId::for_v4(local, remote)],
+            "two listings later the id is gone"
+        );
     }
 
     #[test]

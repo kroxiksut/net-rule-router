@@ -164,10 +164,10 @@ impl ActiveSidRegistry {
             IpcClientProfile::TrayLightweight => {
                 entry.tray_connections = entry.tray_connections.saturating_add(1);
             }
-            // The console is counted as a connection but is neither a GUI
-            // session nor a routing signal: an operator running `status` must
-            // not make a user routing-active, nor keep them so.
-            IpcClientProfile::AdminConsole => {}
+            // The console and the terminal are counted as connections but are
+            // neither a GUI session nor a routing signal: an operator running
+            // `status` must not make a user routing-active, nor keep them so.
+            IpcClientProfile::AdminConsole | IpcClientProfile::Tui => {}
         }
         entry.last_event_at = now;
         let is_routing_active = entry.tray_connections > 0;
@@ -207,7 +207,7 @@ impl ActiveSidRegistry {
                     entry.tray_connections = entry.tray_connections.saturating_sub(1);
                 }
                 // Mirrors `on_connect`: never counted, never decremented.
-                IpcClientProfile::AdminConsole => {}
+                IpcClientProfile::AdminConsole | IpcClientProfile::Tui => {}
             }
             entry.last_event_at = now;
             entry.connection_count == 0
@@ -366,6 +366,21 @@ mod tests {
         assert_eq!(reg.known_sids(), vec![SID_A.to_string()]);
         // Disconnect: entry removed.
         reg.on_disconnect(SID_A, IpcClientProfile::GuiInteractive);
+        assert!(!reg.is_known(SID_A));
+    }
+
+    /// The terminal manages policy like the window, and like it is no routing
+    /// signal: an SSH session must not switch a user's routing on or off.
+    #[test]
+    fn a_terminal_connection_is_never_a_routing_signal() {
+        let reg = ActiveSidRegistry::new();
+        reg.on_connect(SID_A, IpcClientProfile::Tui);
+        assert!(reg.is_known(SID_A));
+        assert!(!reg.is_active(SID_A));
+        reg.on_connect(SID_A, IpcClientProfile::TrayLightweight);
+        reg.on_disconnect(SID_A, IpcClientProfile::Tui);
+        assert!(reg.is_active(SID_A), "the tray keeps routing on");
+        reg.on_disconnect(SID_A, IpcClientProfile::TrayLightweight);
         assert!(!reg.is_known(SID_A));
     }
 

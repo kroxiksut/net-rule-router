@@ -3,6 +3,8 @@
 # systemd unit. Mirrors the GUI's service-install bridge call: same
 # ServiceControlPort implementation (LinuxServiceControl), different driver.
 #
+# It also puts `nrr-cli` and `nrr-tui` on PATH through links in /usr/bin.
+#
 # Two differences from install-service.ps1:
 #   * the build output is staged into /usr/libexec/netrulerouter first — the unit
 #     sets ProtectHome=yes and `install` refuses a daemon under /home, which
@@ -55,8 +57,8 @@ exe_path="$(nrr_built_service_binary "$target_root" "$profile")"
 
 if [ ! -f "$exe_path" ]; then
   echo "Service binary not found at $exe_path" >&2
-  nrr_cyan "Building (cargo build -p nrr-linux-service)..."
-  (cd "$repo_root" && cargo build -p nrr-linux-service) >/dev/null
+  nrr_cyan "Building (cargo build -p nrr-linux-service -p nrr-cli -p nrr-tui)..."
+  (cd "$repo_root" && cargo build -p nrr-linux-service -p nrr-cli -p nrr-tui) >/dev/null
   exe_path="$(nrr_built_service_binary "$target_root" "$profile")"
   if [ ! -f "$exe_path" ]; then
     echo "Service binary still missing after build at $exe_path" >&2
@@ -74,6 +76,9 @@ fi
 
 nrr_cyan "==> stage $exe_path -> $NRR_STAGED_SERVICE_BINARY"
 nrr_stage_service_binary "$exe_path"
+
+nrr_cyan "==> stage the console and the terminal interface"
+nrr_stage_console_binaries "$(dirname "$exe_path")" "$repo_root"
 
 # `install` registers the path it is invoked from (`current_exe()`), which is
 # why this runs the staged copy and not the build output.

@@ -474,6 +474,13 @@ pub struct RoutePolicyUpdateRequest {
     /// The network domain the user named; empty when unset.
     #[serde(default)]
     pub short_name_suffix: String,
+    /// When not empty, only these fields (wire names) are taken from this
+    /// request; the rest stay as stored. Two clients each writing the row they
+    /// read lose each other's change; naming what changed keeps both.
+    /// `binding-source` always comes from the request: it is this write's
+    /// provenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apply_only: Vec<String>,
 }
 
 impl RoutePolicyUpdateRequest {
@@ -526,6 +533,7 @@ impl RoutePolicyUpdateRequest {
             short_name_completion,
             short_name_suffix,
             binding_source: _,
+            apply_only: _,
         } = self;
         let RoutePolicyDto {
             primary: stored_primary,

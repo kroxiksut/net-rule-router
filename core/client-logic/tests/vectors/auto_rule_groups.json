@@ -1,0 +1,142 @@
+{
+  "description": "pure.js suggestion pipeline as the suggestions screen runs it: groupAutoRuleRows, filterAutoRuleGroupsByStatus, filterAutoRuleGroupsServedByMainLink, searchAutoRuleGroups, sortAutoRuleGroups, the two counts and autoRuleRowsShownByDefault. Each candidate is `base-candidate` with its patch laid over it.",
+  "base-candidate": {
+    "id": "c1",
+    "anchor": "site.example",
+    "proposed-match": "cdn.example.com",
+    "match-kind": "suffix",
+    "route": "secondary",
+    "affinity": 0.5,
+    "observations": 3,
+    "first-seen-unix-ms": 1000,
+    "last-seen-unix-ms": 2000
+  },
+  "cases": [
+    {
+      "name": "hosts of one domain group together; a stall sorts first",
+      "input": {
+        "candidates": [
+          {},
+          { "id": "c2", "proposed-match": "img.example.com", "consumers-changed-unix-ms": 5000, "primary-behavior": "responds" },
+          { "id": "c3", "proposed-match": "other.test", "primary-behavior": "stalls", "affinity": 1 }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false, "query": "", "sort": "main-route"
+      }
+    },
+    {
+      "name": "answered rows are hidden by default but counted",
+      "input": {
+        "candidates": [{}],
+        "dismissed": [
+          { "candidate-id": "d1", "anchor": "site.example", "proposed-match": "old.example.com", "dismissed-at-unix-ms": 9000 }
+        ],
+        "show-dismissed": false, "show-served": false, "query": "", "sort": "main-route"
+      }
+    },
+    {
+      "name": "answered rows shown on request",
+      "input": {
+        "candidates": [{}],
+        "dismissed": [
+          { "candidate-id": "d1", "anchor": "site.example", "proposed-match": "old.example.com", "dismissed-at-unix-ms": 9000 },
+          { "candidate-id": "d2", "anchor": "", "proposed-match": "gone.example", "dismissed-at-unix-ms": 7000 }
+        ],
+        "show-dismissed": true, "show-served": false, "query": "", "sort": "newest"
+      }
+    },
+    {
+      "name": "a group with nothing pending leaves the default list",
+      "input": {
+        "candidates": [{}],
+        "dismissed": [
+          { "candidate-id": "d2", "anchor": "site.example", "proposed-match": "gone.example", "dismissed-at-unix-ms": 7000 }
+        ],
+        "show-dismissed": false, "show-served": false, "query": "", "sort": "name"
+      }
+    },
+    {
+      "name": "hosts the main route serves are hidden and counted",
+      "input": {
+        "candidates": [
+          { "served-by-main-link": true },
+          { "id": "c2", "proposed-match": "img.example.com" },
+          { "id": "c3", "proposed-match": "all-served.test", "served-by-main-link": true }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false, "query": "", "sort": "main-route"
+      }
+    },
+    {
+      "name": "hosts the main route serves shown on request",
+      "input": {
+        "candidates": [
+          { "served-by-main-link": true },
+          { "id": "c2", "proposed-match": "img.example.com" }
+        ],
+        "dismissed": [], "show-dismissed": true, "show-served": true, "query": "", "sort": "main-route"
+      }
+    },
+    {
+      "name": "an application is its own group",
+      "input": {
+        "candidates": [
+          { "id": "a1", "proposed-match": "Player.exe", "match-kind": "application", "signal": "app-main-link-blocked", "third-party": false },
+          { "id": "c2", "proposed-match": "player.example.com", "third-party": true, "observed-members": ["a.player.example.com", "b.player.example.com"] }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false, "query": "", "sort": "name"
+      }
+    },
+    {
+      "name": "sites merge by name, a later mention replaces the earlier in place",
+      "input": {
+        "candidates": [
+          { "consumers": [ { "hostname": "a.example", "route": "secondary" }, { "hostname": "b.example", "route": "primary" } ] },
+          { "id": "c2", "proposed-match": "img.example.com", "consumers": [ { "hostname": "b.example", "route": "secondary" }, { "hostname": "", "route": "secondary" } ] },
+          { "id": "c3", "proposed-match": "solo.test", "consumers": [ { "hostname": "c.example", "route": "secondary" } ] }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false, "query": "", "sort": "consumers"
+      }
+    },
+    {
+      "name": "search finds a site relying on a group, ignoring case and spaces",
+      "input": {
+        "candidates": [
+          { "consumers": [ { "hostname": "news.example", "route": "secondary" } ] },
+          { "id": "c3", "proposed-match": "other.test" }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false, "query": "  NEWS.Ex ", "sort": "main-route"
+      }
+    },
+    {
+      "name": "search finds a host inside a group",
+      "input": {
+        "candidates": [
+          {},
+          { "id": "c2", "proposed-match": "video.example.com" },
+          { "id": "c3", "proposed-match": "other.test" }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false, "query": "video", "sort": "main-route"
+      }
+    },
+    {
+      "name": "an unknown order sorts newest first, ties by name",
+      "input": {
+        "candidates": [
+          { "id": "c1", "proposed-match": "b.test", "first-seen-unix-ms": 3000 },
+          { "id": "c2", "proposed-match": "a.test", "first-seen-unix-ms": 3000 },
+          { "id": "c3", "proposed-match": "c.test", "first-seen-unix-ms": 4000 }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false, "query": "", "sort": "sideways"
+      }
+    },
+    {
+      "name": "an empty proposed match is skipped; no visit count reads as zero",
+      "input": {
+        "candidates": [
+          { "id": "x", "proposed-match": "" },
+          { "id": "c2", "proposed-match": "self.example.org", "anchor": "", "observations": null, "signal": "main-link-blocked", "anchor-refuses-main-link": true }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false, "query": "", "sort": "main-route"
+      }
+    }
+  ]
+}

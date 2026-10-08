@@ -206,6 +206,47 @@ fn the_outcome_is_read_in_one_place() {
     }
 }
 
+/// A refusal's values travel with that refusal. Kept in one shared slot, the
+/// next failure without values was worded with the previous one's network.
+#[test]
+fn a_failure_is_worded_with_its_own_values() {
+    let transport = repo_file("apps/desktop/qml/flows/RpcTransport.qml");
+    assert!(
+        transport.contains("else done(failure, Pure.operationFailureArgs(status))"),
+        "RpcTransport.qml: the outcome read hands the failure's values to `done`"
+    );
+    for (file, announce) in [
+        (
+            "apps/desktop/qml/flows/ReviewFlowController.qml",
+            "_announceRulesActivationFailed",
+        ),
+        (
+            "apps/desktop/qml/flows/PresetImportController.qml",
+            "_announcePresetImportFailed",
+        ),
+    ] {
+        let source = repo_file(file);
+        assert!(
+            !source.contains("lastFailureArgs"),
+            "{file}: values read from a shared slot may belong to another refusal"
+        );
+        let (_, body) = function_body(file, &source, announce);
+        assert!(
+            body.contains("ipcErrorLabel(String(code || \"unknown\"), args || null)"),
+            "{file}: `{announce}` words the failure with the values it was given"
+        );
+        assert!(
+            source.contains(&format!("{announce}(code, null)")),
+            "{file}: a refusal of the confirm itself carries no outcome values"
+        );
+        assert!(
+            source.contains(&format!("{announce}(failure, failureArgs)")),
+            "{file}: a refused outcome passes its own values"
+        );
+    }
+    assert!(!transport.contains("lastFailureArgs"));
+}
+
 /// The audit-chain restart reads its verdict through the same helper; only its
 /// own answers to a changed or intact chain stay in the dialog.
 #[test]

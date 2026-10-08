@@ -108,13 +108,12 @@ fn stale_lock_with_dead_pid_is_cleaned() {
     use std::io::Write;
 
     let key = unique_key("stale-lock");
-    let lock_directory = std::env::temp_dir().join("NetRuleRouter");
-    fs::create_dir_all(&lock_directory).expect("temp lock dir must be creatable");
+    let lock_directory =
+        nrr_platform_api::paths::ensure_user_runtime_dir().expect("lock dir must be creatable");
     let lock_path = lock_directory.join(format!("{key}.lock"));
 
-    // Use PID=1 which is reserved on Windows (System Idle Process); tasklist
-    // will not return our launcher process for it, so cleanup_stale_lock_file
-    // treats it as stale.
+    // PID 1 is never this product's binary (System Idle on Windows, init on
+    // Linux), so the lock reads as stale.
     {
         let mut handle = fs::OpenOptions::new()
             .create_new(true)
@@ -128,4 +127,5 @@ fn stale_lock_with_dead_pid_is_cleaned() {
         .expect("acquire must not error after seeding stale lock")
         .expect("stale lock must be cleaned up and acquire must succeed");
     drop(guard);
+    assert!(!lock_path.exists(), "the guard must leave no lock behind");
 }

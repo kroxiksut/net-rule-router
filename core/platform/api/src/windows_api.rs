@@ -175,7 +175,7 @@ impl MockWindowsApi {
         }
     }
 
-    /// Set the SID returned by `active_console_user_sid` — the service-driven
+    /// Set the SID returned by `interactive_user_sid` — the service-driven
     /// routing gate's fallback when no tray is connected.
     pub fn set_console_user_sid(&self, sid: Option<&str>) {
         *self.console_user_sid.lock().unwrap() = sid.map(|s| s.to_string());
@@ -308,7 +308,7 @@ impl RouteTablePort for MockWindowsApi {
         Ok(self.route_table.lock().unwrap().clone())
     }
 
-    fn active_console_user_sid(&self) -> Option<String> {
+    fn interactive_user_sid(&self) -> Option<String> {
         self.console_user_sid.lock().unwrap().clone()
     }
 

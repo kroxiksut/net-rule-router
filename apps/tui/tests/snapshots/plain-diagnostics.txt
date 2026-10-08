@@ -1,0 +1,208 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Status
+Service: OK
+Routing state:
+  Routing active
+  Rules apply on this user session.
+Connections:
+  Main connection: Ethernet — Example Network Adapter — Available — Rules applied
+  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+Notifications:
+  No notifications.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Diagnostics and logs
+Service: OK
+Service:
+  Service unavailable
+  Loading...
+  l: switch between diagnostics and the log
+Audit trail:
+  No data from the service yet
+  No data from the service yet
+Explain sample:
+  No probe has been run yet. Enter a query above and click Probe.
+  e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Diagnostic archive export:
+  The archive is saved in the service archives directory (per-user).
+  Ready
+  x: Diagnostic archive export
+Commands on this screen:
+  l: switch between diagnostics and the log
+  a and an alert number: acknowledge it, for example a 1
+  e and a host or address: which rule decides it, for example e example.com
+  x: export a diagnostic archive
+  In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
+  n: next page (more)   p: previous page (back)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Service: Service running
+Service: Active revision: rev-7
+Service: The service started 2.4 s before this boot reached the sign-in screen.
+Service: Cache healthy · Entries: 42
+Service: 3 log file(s)
+Audit trail: Audit chain intact
+Audit trail: Security alerts requiring attention: 1
+Audit trail: > 1. Active security alert: Database tampering detected · integrity.revision_signature
+Audit trail: Rows 1–1 of 1.
+Audit trail: audit-2026-10-06.ndjson
+Audit trail: a: Acknowledge
+
+Screen: Diagnostics and logs
+Service: OK
+Service:
+  Service running
+  Active revision: rev-7
+  The service started 2.4 s before this boot reached the sign-in screen.
+  Cache healthy · Entries: 42
+  3 log file(s)
+  l: switch between diagnostics and the log
+Audit trail:
+  Audit chain intact
+  Security alerts requiring attention: 1
+  > 1. Active security alert: Database tampering detected · integrity.revision_signature
+  Rows 1–1 of 1.
+  audit-2026-10-06.ndjson
+  a: Acknowledge
+  Acknowledging…
+Explain sample:
+  No probe has been run yet. Enter a query above and click Probe.
+  e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Diagnostic archive export:
+  The archive is saved in the service archives directory (per-user).
+  Ready
+  x: Diagnostic archive export
+Commands on this screen:
+  l: switch between diagnostics and the log
+  a and an alert number: acknowledge it, for example a 1
+  e and a host or address: which rule decides it, for example e example.com
+  x: export a diagnostic archive
+  In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
+  n: next page (more)   p: previous page (back)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Audit trail: Acknowledge security alert
+Audit trail: The rule set below was changed outside the app. Acknowledging trusts its contents as listed. If it changes again before you confirm, it stays untrusted and a new alert is raised.
+Audit trail: - 2026-10-06 09:46 · edited in the app · user rules · 12 rules · in use
+Audit trail: y: yes   n: no
+
+Screen: Diagnostics and logs
+Service: OK
+Service:
+  Service running
+  Active revision: rev-7
+  The service started 2.4 s before this boot reached the sign-in screen.
+  Cache healthy · Entries: 42
+  3 log file(s)
+  l: switch between diagnostics and the log
+Audit trail:
+  Audit chain intact
+  Security alerts requiring attention: 1
+  > 1. Active security alert: Database tampering detected · integrity.revision_signature
+  Rows 1–1 of 1.
+  audit-2026-10-06.ndjson
+  a: Acknowledge
+  Acknowledging…
+Explain sample:
+  No probe has been run yet. Enter a query above and click Probe.
+  e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Diagnostic archive export:
+  The archive is saved in the service archives directory (per-user).
+  Ready
+  x: Diagnostic archive export
+Commands on this screen:
+  l: switch between diagnostics and the log
+  a and an alert number: acknowledge it, for example a 1
+  e and a host or address: which rule decides it, for example e example.com
+  x: export a diagnostic archive
+  In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
+  n: next page (more)   p: previous page (back)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Audit trail: Security alert acknowledged.
+
+Screen: Diagnostics and logs
+Service: OK
+Service:
+  Service running
+  Active revision: rev-7
+  The service started 2.4 s before this boot reached the sign-in screen.
+  Cache healthy · Entries: 42
+  3 log file(s)
+  l: switch between diagnostics and the log
+Audit trail:
+  Audit chain intact
+  Security alerts requiring attention: 1
+  > 1. Active security alert: Database tampering detected · integrity.revision_signature
+  Rows 1–1 of 1.
+  audit-2026-10-06.ndjson
+  a: Acknowledge
+  Security alert acknowledged.
+Explain sample:
+  hostname or IP: example.com
+  Probing...
+  e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Diagnostic archive export:
+  The archive is saved in the service archives directory (per-user).
+  Ready
+  x: Diagnostic archive export
+Commands on this screen:
+  l: switch between diagnostics and the log
+  a and an alert number: acknowledge it, for example a 1
+  e and a host or address: which rule decides it, for example e example.com
+  x: export a diagnostic archive
+  In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
+  n: next page (more)   p: previous page (back)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Explain sample: site.example  →  Additional — Allowed
+Explain sample: Blocked by an address rule: this name resolves to a blocked address (203.0.113.2)
+
+Screen: Diagnostics and logs
+Service: OK
+Operational logs:
+  Level: All levels · Event type: any · Time range: Current session
+  Loading...
+  l: switch between diagnostics and the log
+Commands on this screen:
+  l: switch between diagnostics and the log
+  a and an alert number: acknowledge it, for example a 1
+  e and a host or address: which rule decides it, for example e example.com
+  x: export a diagnostic archive
+  In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
+  n: next page (more)   p: previous page (back)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Operational logs: > 1. 2026-10-06 12:00:00 +00:00 · Info · dns: DNS refresh: 12 of 14 names resolved
+Operational logs: 2. 2026-10-06 11:59:59 +00:00 · Warning · service: Apply took long
+Operational logs: Rows 1–2 of 2.
+
+Screen: Diagnostics and logs
+Service: OK
+Operational logs:
+  Level: Info · Event type: any · Time range: Current session
+  Loading...
+  l: switch between diagnostics and the log
+Commands on this screen:
+  l: switch between diagnostics and the log
+  a and an alert number: acknowledge it, for example a 1
+  e and a host or address: which rule decides it, for example e example.com
+  x: export a diagnostic archive
+  In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
+  n: next page (more)   p: previous page (back)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Operational logs: > 1. 2026-10-06 12:00:00 +00:00 · Info · dns: DNS refresh: 12 of 14 names resolved
+Operational logs: 2. 2026-10-06 11:59:59 +00:00 · Warning · service: Apply took long
+Operational logs: Rows 1–2 of 2.

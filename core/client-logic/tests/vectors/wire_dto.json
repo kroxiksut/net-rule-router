@@ -1,0 +1,29 @@
+{
+  "description": "rules.js ruleRowToWireDto: a table row as a canonical wire RuleDto. `encode` passes the harness IDN stand-in (non-ASCII gains `ace:`, `ace-fails.example` encodes to nothing).",
+  "cases": [
+    { "name": "exact-fqdn", "input": { "row": { "id": "R-0001", "enabled": true, "ruleType": "exact-fqdn", "matchValue": "api.example", "targetRoute": "primary", "comment": "" } } },
+    { "name": "suffix-domain strips the star prefix", "input": { "row": { "id": "R-0002", "enabled": true, "ruleType": "suffix-domain", "matchValue": "*.video.example", "targetRoute": "secondary", "comment": "media" } } },
+    { "name": "suffix-domain without prefix", "input": { "row": { "id": "R-0003", "enabled": false, "ruleType": "suffix-domain", "matchValue": "video.example", "targetRoute": "secondary" } } },
+    { "name": "domain with star is a suffix", "input": { "row": { "id": "R-0004", "enabled": true, "ruleType": "domain", "matchValue": "*.cdn.example", "targetRoute": "secondary" } } },
+    { "name": "domain without star is exact", "input": { "row": { "id": "R-0005", "enabled": true, "ruleType": "domain", "matchValue": "cdn.example", "targetRoute": "primary" } } },
+    { "name": "zone encoded", "input": { "row": { "id": "R-0006", "enabled": true, "ruleType": "zone", "matchValue": "рф", "targetRoute": "primary" }, "encode": true } },
+    { "name": "IDN host encoded", "input": { "row": { "id": "R-0007", "enabled": true, "ruleType": "domain", "matchValue": "*.пример.рф", "targetRoute": "secondary" }, "encode": true } },
+    { "name": "encoder answering nothing keeps the value", "input": { "row": { "id": "R-0008", "enabled": true, "ruleType": "exact-fqdn", "matchValue": "ace-fails.example", "targetRoute": "primary" }, "encode": true } },
+    { "name": "non-host type is not encoded", "input": { "row": { "id": "R-0009", "enabled": true, "ruleType": "application", "matchValue": "приложение.exe", "targetRoute": "secondary" }, "encode": true } },
+    { "name": "exact-ip v4", "input": { "row": { "id": "R-0010", "enabled": true, "ruleType": "exact-ip", "matchValue": "192.0.2.7", "targetRoute": "secondary" } } },
+    { "name": "exact-ipv4 slug with v6 text", "input": { "row": { "id": "R-0011", "enabled": true, "ruleType": "exact-ipv4", "matchValue": "2001:db8::7", "targetRoute": "secondary" } } },
+    { "name": "subnet trimmed", "input": { "row": { "id": "R-0012", "enabled": true, "ruleType": "subnet", "matchValue": "  198.51.100.0/24 ", "targetRoute": "secondary" } } },
+    { "name": "range split at the dash", "input": { "row": { "id": "R-0013", "enabled": true, "ruleType": "ip-range", "matchValue": "192.0.2.10 - 192.0.2.20", "targetRoute": "primary" } } },
+    { "name": "range without a dash", "input": { "row": { "id": "R-0014", "enabled": true, "ruleType": "ip-range", "matchValue": " 192.0.2.10 ", "targetRoute": "primary" } } },
+    { "name": "application glob", "input": { "row": { "id": "R-0015", "enabled": true, "ruleType": "application", "matchValue": "disko*.exe", "targetRoute": "secondary" } } },
+    { "name": "application exact", "input": { "row": { "id": "R-0016", "enabled": true, "ruleType": "application", "matchValue": "client.exe", "targetRoute": "primary" } } },
+    { "name": "block action", "input": { "row": { "id": "R-0017", "enabled": true, "ruleType": "domain", "matchValue": "ads.example", "targetRoute": "block" } } },
+    { "name": "verify action", "input": { "row": { "id": "R-0018", "enabled": true, "ruleType": "exact-fqdn", "matchValue": "shop.example", "targetRoute": "verify" } } },
+    { "name": "auto origin kept", "input": { "row": { "id": "auto-1", "enabled": true, "ruleType": "domain", "matchValue": "img.site.example", "targetRoute": "secondary", "comment": "note", "originReason": "site-companion", "originAnchor": "site.example", "originAdded": "2026-01-01" } } },
+    { "name": "routing only drops id, comment and origin", "input": { "row": { "id": "auto-2", "enabled": true, "ruleType": "domain", "matchValue": "img.site.example", "targetRoute": "secondary", "comment": "note", "originReason": "site-companion", "originAnchor": "site.example", "originAdded": "2026-01-01" }, "opts": { "keepId": false, "keepComment": false } } },
+    { "name": "keepId false only", "input": { "row": { "id": "R-0019", "enabled": true, "ruleType": "zone", "matchValue": "example", "targetRoute": "primary", "comment": "kept" }, "opts": { "keepId": false } } },
+    { "name": "empty reason is no origin", "input": { "row": { "id": "R-0020", "enabled": true, "ruleType": "domain", "matchValue": "x.example", "targetRoute": "secondary", "originReason": "", "originAnchor": "site.example" } } },
+    { "name": "unknown type reads as a host", "input": { "row": { "id": "R-0021", "enabled": true, "ruleType": "linux-application", "matchValue": "*.odd.example", "targetRoute": "secondary" }, "encode": true } },
+    { "name": "empty row", "input": { "row": {} } }
+  ]
+}

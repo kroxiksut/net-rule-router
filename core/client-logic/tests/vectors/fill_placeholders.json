@@ -1,0 +1,17 @@
+{
+  "description": "pure.js fillPlaceholders: {name} filled pair by pair, in order",
+  "cases": [
+    { "name": "one value", "input": { "text": "Hello {name}", "values": [["name", "World"]] }, "expected": "Hello World" },
+    { "name": "every occurrence", "input": { "text": "{a} and {a}", "values": [["a", "x"]] }, "expected": "x and x" },
+    { "name": "no placeholder", "input": { "text": "plain", "values": [["a", "x"]] }, "expected": "plain" },
+    { "name": "empty text and values", "input": { "text": "", "values": [] }, "expected": "" },
+    { "name": "unfilled stays", "input": { "text": "{a} {b}", "values": [["a", "1"]] }, "expected": "1 {b}" },
+    { "name": "earlier value is re-filled by a later pair", "input": { "text": "{a}-{b}", "values": [["a", "{b}"], ["b", "z"]] }, "expected": "z-z" },
+    { "name": "later value is not re-filled", "input": { "text": "{a}-{b}", "values": [["b", "z"], ["a", "{b}"]] }, "expected": "{b}-z" },
+    { "name": "replacement patterns stay literal", "input": { "text": "{a}", "values": [["a", "$& $1 $$"]] }, "expected": "$& $1 $$" },
+    { "name": "cyrillic text", "input": { "text": "Сеть {network} покрывает {covers}", "values": [["network", "10.0.0.0/8"], ["covers", "туннель"]] }, "expected": "Сеть 10.0.0.0/8 покрывает туннель" },
+    { "name": "doubled braces", "input": { "text": "{{a}}", "values": [["a", "x"]] }, "expected": "{x}" },
+    { "name": "dashed name", "input": { "text": "{covers-kind}", "values": [["covers-kind", "tunnel-server"]] }, "expected": "tunnel-server" },
+    { "name": "empty value", "input": { "text": "a{x}b", "values": [["x", ""]] }, "expected": "ab" }
+  ]
+}

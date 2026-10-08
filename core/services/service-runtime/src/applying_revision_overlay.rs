@@ -19,6 +19,17 @@ struct Entry {
     generation: u64,
 }
 
+/// Moves on every publish and withdrawal, on any database.
+static CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// A number that moves whenever what the overlay serves changes. An
+/// enforcement pass counts it among its inputs: a pass settled from an overlay
+/// that is then withdrawn with no stored write (an unrecorded commit) would
+/// otherwise keep the withdrawn rules until the next full pass.
+pub(crate) fn changes() -> u64 {
+    CHANGES.load(Ordering::Acquire)
+}
+
 fn registry() -> &'static RwLock<HashMap<String, Entry>> {
     static REGISTRY: OnceLock<RwLock<HashMap<String, Entry>>> = OnceLock::new();
     REGISTRY.get_or_init(Default::default)
@@ -43,6 +54,7 @@ impl Drop for OverlayGuard {
         // Only our own entry: a newer publish on the same database must survive.
         if map.get(&key).is_some_and(|e| e.generation == generation) {
             map.remove(&key);
+            CHANGES.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -65,6 +77,7 @@ pub(crate) fn publish(conn: &Connection, principal: &str, rules_json: &str) -> O
                 generation,
             },
         );
+    CHANGES.fetch_add(1, Ordering::AcqRel);
     OverlayGuard {
         slot: Some((key, generation)),
     }
@@ -118,6 +131,18 @@ mod tests {
         let _new = publish(&conn, "S-A", "{new}");
         drop(old);
         assert_eq!(applying_for(&conn, "S-A").as_deref(), Some("{new}"));
+    }
+
+    #[test]
+    fn publishing_and_withdrawing_both_move_the_change_number() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = file_conn(&dir, "state.db");
+        let before = changes();
+        let guard = publish(&conn, "S-A", "{new}");
+        let published = changes();
+        assert!(published > before);
+        drop(guard);
+        assert!(changes() > published);
     }
 
     #[test]

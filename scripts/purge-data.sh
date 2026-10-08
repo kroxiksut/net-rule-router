@@ -206,6 +206,14 @@ purge_path "$NRR_UNIT_FILE" system
 purge_path "$NRR_LOGROTATE_CONFIG" system
 purge_path "$NRR_POLKIT_POLICY" system
 purge_path "$NRR_SERVICE_INSTALL_DIR" system
+purge_path "$NRR_LEGACY_SERVICE_INSTALL_DIR" system
+# Only a link into the install directory is ours; a same-named program is not.
+for console_name in "${NRR_CONSOLE_EXE_NAMES[@]}"; do
+  console_link="$NRR_COMMAND_LINK_DIR/$console_name"
+  if [ -L "$console_link" ] && [ "$(readlink "$console_link")" = "$NRR_SERVICE_INSTALL_DIR/$console_name" ]; then
+    purge_path "$console_link" system
+  fi
+done
 purge_state_dir
 purge_path "$NRR_LOG_DIR" system
 purge_path "$NRR_RUNTIME_DIR" system

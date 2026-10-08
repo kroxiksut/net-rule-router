@@ -68,16 +68,19 @@ QtObject {
     /// replaces it.
     function applyFirstRunStability(patch, origin) {
         if (typeof root.applyServiceStabilityPatch !== "function") return
+        // What reaches this platform's service: the answer speaks of nothing else.
+        var sent = (typeof root.stabilityPatchForPlatform === "function")
+            ? root.stabilityPatchForPlatform(patch) : patch
         root.applyServiceStabilityPatch(patch, function(ok, code, payload) {
             if (ok) {
-                root.statusLine = _stabilityAppliedText(patch, payload)
+                root.statusLine = _stabilityAppliedText(sent, payload)
                 return
             }
             var slug = String(code || "").toLowerCase().replace(/_/g, "-")
             // A refused or declined elevation is an answer: the setting stays
             // off, and the user hears so instead of a silent default.
             if (slug === "forbidden" || slug === "uac-declined") {
-                if (patch["fake-ip-enabled"] === true) _noteFakeIpNeedsAdministrator()
+                if (sent["fake-ip-enabled"] === true) _noteFakeIpNeedsAdministrator()
                 root.statusLine = slug === "uac-declined"
                     ? root.tr("status.route-policy-uac-declined",
                         "Administrator approval was declined; the setting was not changed.")

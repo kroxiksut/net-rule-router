@@ -1,0 +1,73 @@
+{
+  "description": "rules.js buildCanonicalRulesText: the rules file of one route. The export timestamp is fixed by the harness.",
+  "cases": [
+    { "name": "empty table, primary", "input": { "rows": [], "route": "primary" } },
+    { "name": "application rules on Linux go under --- Linux", "input": { "route": "secondary", "os": "linux", "rows": [
+        { "enabled": true, "ruleType": "application", "matchValue": "client", "targetRoute": "secondary" }
+      ], "passthrough": { "Windows": "client.exe\n" } } },
+    { "name": "application rules on macOS go under --- MacOS", "input": { "route": "primary", "os": "macos", "rows": [
+        { "enabled": false, "ruleType": "application", "matchValue": "Client.app", "targetRoute": "primary" }
+      ] } },
+    { "name": "empty table, secondary", "input": { "rows": [], "route": "secondary", "passthrough": null } },
+    { "name": "every section in order", "input": { "route": "secondary", "rows": [
+        { "enabled": true, "ruleType": "application", "matchValue": "client.exe", "targetRoute": "secondary" },
+        { "enabled": true, "ruleType": "ip-range", "matchValue": "192.0.2.10-192.0.2.20", "targetRoute": "secondary" },
+        { "enabled": true, "ruleType": "subnet", "matchValue": "198.51.100.0/24", "targetRoute": "secondary" },
+        { "enabled": true, "ruleType": "exact-ipv6", "matchValue": "2001:db8::7", "targetRoute": "secondary" },
+        { "enabled": true, "ruleType": "exact-ip", "matchValue": "192.0.2.7", "targetRoute": "secondary" },
+        { "enabled": true, "ruleType": "suffix-domain", "matchValue": "*.video.example", "targetRoute": "secondary" },
+        { "enabled": true, "ruleType": "exact-fqdn", "matchValue": "api.example", "targetRoute": "secondary" },
+        { "enabled": true, "ruleType": "zone", "matchValue": "example", "targetRoute": "secondary" }
+      ] } },
+    { "name": "rows of the other route are left out", "input": { "route": "primary", "rows": [
+        { "enabled": true, "ruleType": "domain", "matchValue": "one.example", "targetRoute": "primary" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "two.example", "targetRoute": "secondary" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "three.example", "targetRoute": "block" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "four.example", "targetRoute": "verify" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "five.example", "targetRoute": "" }
+      ] } },
+    { "name": "pseudo-routes in the secondary file", "input": { "route": "secondary", "rows": [
+        { "enabled": true, "ruleType": "domain", "matchValue": "ads.example", "targetRoute": "block" },
+        { "enabled": false, "ruleType": "domain", "matchValue": "shop.example", "targetRoute": "verify", "comment": "try main first" },
+        { "enabled": false, "ruleType": "exact-ip", "matchValue": "192.0.2.9", "targetRoute": "block" },
+        { "enabled": true, "ruleType": "subnet", "matchValue": "198.51.100.0/24", "targetRoute": "verify" }
+      ] } },
+    { "name": "comments kept and stripped", "input": { "route": "primary", "includeComments": false, "rows": [
+        { "enabled": true, "ruleType": "zone", "matchValue": "example", "targetRoute": "primary", "comment": "dropped" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "img.site.example", "targetRoute": "primary", "comment": "dropped too", "originReason": "site-companion", "originAnchor": "site.example", "originAdded": "2026-01-01" }
+      ] } },
+    { "name": "auto provenance with comment", "input": { "route": "secondary", "includeComments": true, "rows": [
+        { "enabled": true, "ruleType": "domain", "matchValue": "img.site.example", "targetRoute": "secondary", "comment": "  user note  ", "originReason": "site-companion", "originAnchor": "site.example", "originAdded": "2026-01-01" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "boot.vpn.example", "targetRoute": "secondary", "originReason": "vpn-client-bootstrap", "originAnchor": " ", "originAdded": "" },
+        { "enabled": true, "ruleType": "exact-ip", "matchValue": "192.0.2.50", "targetRoute": "secondary", "originReason": "site-companion", "originAnchor": "site.example" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "plain.example", "targetRoute": "secondary", "originReason": "", "originAnchor": "ignored.example" }
+      ] } },
+    { "name": "control characters neutralised", "input": { "route": "primary", "rows": [
+        { "enabled": true, "ruleType": "domain", "matchValue": "evil.example\n--- Zones", "targetRoute": "primary", "comment": "line\rbreak\u0085end" },
+        { "enabled": true, "ruleType": "application", "matchValue": "tab\tkept.exe", "targetRoute": "primary", "comment": "\u0007bell" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "auto.example", "targetRoute": "primary", "originReason": "user\nconfirmed", "originAnchor": "a\u0000b", "originAdded": "2026-01-01\n" }
+      ] } },
+    { "name": "blank and whitespace values skipped", "input": { "route": "primary", "rows": [
+        { "enabled": true, "ruleType": "domain", "matchValue": "", "targetRoute": "primary" },
+        { "enabled": true, "ruleType": "zone", "matchValue": "    ", "targetRoute": "primary" },
+        { "enabled": true, "ruleType": "zone", "matchValue": "  padded.example　", "targetRoute": "primary" }
+      ] } },
+    { "name": "unknown types skipped", "input": { "route": "primary", "rows": [
+        { "enabled": true, "ruleType": "linux-application", "matchValue": "/usr/bin/tool", "targetRoute": "primary" },
+        { "enabled": true, "ruleType": "Domain", "matchValue": "case.example", "targetRoute": "primary" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "kept.example", "targetRoute": "primary" }
+      ] } },
+    { "name": "passthrough sections by name", "input": { "route": "secondary", "rows": [
+        { "enabled": true, "ruleType": "zone", "matchValue": "example", "targetRoute": "secondary" }
+      ], "passthrough": {
+        "MacOS": "Safari.app\n# disabled.app\n",
+        "Linux": "firefox\n\n",
+        "Geo": "",
+        "Custom": "single line without newline"
+      } } },
+    { "name": "unicode hosts stay unicode", "input": { "route": "primary", "rows": [
+        { "enabled": true, "ruleType": "zone", "matchValue": "рф", "targetRoute": "primary", "comment": "кириллица" },
+        { "enabled": false, "ruleType": "domain", "matchValue": "*.пример.рф", "targetRoute": "primary" }
+      ] } }
+  ]
+}

@@ -86,13 +86,32 @@ fn the_gui_writes_every_rule_section_in_the_canonical_order() {
         .collect();
     assert_eq!(
         names,
-        ["Zones", "Domains", "IP", "CIDR", "Ranges", "Windows", "Auto"],
+        [
+            "Zones",
+            "Domains",
+            "IP",
+            "CIDR",
+            "Ranges",
+            "appSection",
+            "Auto"
+        ],
         "`nrr_domain::rules_file::RulesFileSection::ALL` order, the app section in place"
     );
-    for name in names {
+    for name in names.into_iter().filter(|name| *name != "appSection") {
         assert!(
             nrr_shared::preset_parser::classify_section(name).is_some(),
             "the parser does not read back `--- {name}`"
         );
     }
+    // The app section is the host's own (`appSectionHeader`), which the parser
+    // on that host reads as rules.
+    let host = match nrr_shared::platform_profile::PlatformProfile::current().os {
+        "linux" => "Linux",
+        "macos" => "MacOS",
+        _ => "Windows",
+    };
+    assert!(
+        nrr_shared::preset_parser::classify_section_lenient(host).is_some(),
+        "the parser does not read back `--- {host}` on its own OS"
+    );
 }

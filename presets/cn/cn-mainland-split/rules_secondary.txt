@@ -66,6 +66,10 @@ redd.it  # Community and professional platforms
 *.whatsapp.net  # Foreign messengers and communication tools
 *.signal.org  # Foreign messengers and communication tools
 *.signal.me  # Foreign messengers and communication tools
+?*.proton.me  # Foreign messengers and communication tools
+?*.protonmail.com  # Foreign messengers and communication tools
+?*.protonmail.ch  # Foreign messengers and communication tools
+?*.protonvpn.com  # Foreign messengers and communication tools
 *.viber.com  # Foreign messengers and communication tools
 *.viber.me  # Foreign messengers and communication tools
 *.line.me  # Foreign messengers and communication tools
@@ -101,6 +105,7 @@ api.mistral.ai  # Foreign AI and developer AI ecosystems
 *.grok.com  # Foreign AI and developer AI ecosystems
 
 *.google.com  # Google (unreachable from the main link here) and Microsoft AI entry points
+?accounts.google.ru  # Google (unreachable from the main link here) and Microsoft AI entry points
 ai.google.dev  # Google (unreachable from the main link here) and Microsoft AI entry points
 copilot.microsoft.com  # Google (unreachable from the main link here) and Microsoft AI entry points
 

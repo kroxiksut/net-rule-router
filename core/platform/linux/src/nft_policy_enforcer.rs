@@ -20,6 +20,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,20 +29,23 @@ use nrr_platform_api::enforcement::{
     ApplyReport, ChannelAvailability, EgressBindingSource, EnforcementFailure, EnforcementPlan,
     PolicyEnforcer, UserPrincipal,
 };
+use nrr_platform_api::fake_ip::stale_flows::FlowLinks;
 
 use crate::lower_linux::{lower_scoped, EgressNames, ScopedPlan};
 use crate::nft_apply::{NftApplyError, NftCliEnforcement};
 use crate::nft_ir::NftRuleset;
 
-/// How long a ruleset identical to the one applied is trusted to still be in
-/// the kernel. Past it the same ruleset is applied again, which is what puts
-/// back a table somebody else flushed.
-const UNCHANGED_RECHECK: Duration = Duration::from_secs(5 * 60);
+/// How long an unchanged ruleset is trusted to still be in the kernel without
+/// asking. Past it the next pass lists our chain (a terse `nft list`, far
+/// cheaper than an apply) and reapplies only if it is gone. Shorter than the
+/// cycle's 5-min full pass, so every full pass checks and the two clocks cannot
+/// add up to a longer blind window.
+const UNCHANGED_RECHECK: Duration = Duration::from_secs(60);
 
-/// The last ruleset the kernel took whole, and when.
+/// The last ruleset the kernel took whole, and when it was last seen there.
 struct Applied {
     ruleset: NftRuleset,
-    at: Instant,
+    verified_at: Instant,
     rules: usize,
 }
 
@@ -64,6 +68,9 @@ pub struct NftPolicyEnforcer {
     /// Lets a pass whose ruleset did not change skip the `nft` run — the most
     /// expensive part of an idle pass.
     applied: Mutex<Option<Applied>>,
+    /// Set by an explicit apply: the next unchanged pass checks the kernel
+    /// whatever the recheck clock says.
+    verify_next: AtomicBool,
 }
 
 /// `false` = this interface has been declared dead. Anything else — alive,
@@ -83,6 +90,7 @@ impl NftPolicyEnforcer {
             table: crate::lower_linux::NRR_TABLE.to_owned(),
             liveness: None,
             applied: Mutex::new(None),
+            verify_next: AtomicBool::new(false),
         }
     }
 
@@ -189,14 +197,28 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         };
 
         let mut applied = self.applied.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(last) = applied.as_ref() {
-            if last.ruleset == lowered.ruleset && last.at.elapsed() < UNCHANGED_RECHECK {
-                return Ok(ApplyReport {
-                    applied: last.rules,
-                    skipped: lowered.unsupported.len(),
-                    failed: 0,
-                    notes: notes_for_unsupported(),
-                });
+        let verify_requested = self.verify_next.swap(false, Ordering::AcqRel);
+        if let Some(last) = applied.as_mut() {
+            if last.ruleset == lowered.ruleset {
+                let verify = verify_requested || last.verified_at.elapsed() >= UNCHANGED_RECHECK;
+                // Anything but "our chain, holding every rule" reapplies: a
+                // check that failed proves nothing about the kernel.
+                let in_place = !verify
+                    || matches!(
+                        self.cli.installed_rule_count(&self.table, &lowered.ruleset.chain),
+                        Ok(Some(n)) if n == last.rules
+                    );
+                if in_place {
+                    if verify {
+                        last.verified_at = Instant::now();
+                    }
+                    return Ok(ApplyReport {
+                        applied: last.rules,
+                        skipped: lowered.unsupported.len(),
+                        failed: 0,
+                        notes: notes_for_unsupported(),
+                    });
+                }
             }
         }
         // Forgotten before the run: a failed or partial apply leaves the kernel
@@ -217,7 +239,7 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         if outcome.skipped.is_empty() {
             *applied = Some(Applied {
                 ruleset: lowered.ruleset.clone(),
-                at: Instant::now(),
+                verified_at: Instant::now(),
                 rules: outcome.applied,
             });
         }
@@ -267,9 +289,32 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         }
     }
 
+    fn flow_links(&self, principal: &UserPrincipal) -> FlowLinks {
+        let Ok(adapters) = self.adapters.enumerate_all() else {
+            return FlowLinks::default();
+        };
+        let names = self.resolve(principal, &adapters);
+        let index_of = |name: Option<&String>| {
+            let name = name?;
+            adapters
+                .iter()
+                .find(|a| &a.friendly_name == name || &a.adapter_name == name)
+                .map(|a| a.index)
+        };
+        FlowLinks::from_adapters(
+            &adapters,
+            index_of(names.primary.as_ref()),
+            index_of(names.secondary.as_ref()),
+        )
+    }
+
     fn teardown(&self) -> Result<(), EnforcementFailure> {
         *self.applied.lock().unwrap_or_else(|p| p.into_inner()) = None;
         self.cli.teardown(&self.table).map_err(failure)
+    }
+
+    fn distrust_installed(&self) {
+        self.verify_next.store(true, Ordering::Release);
     }
 }
 
@@ -286,10 +331,21 @@ mod tests {
         }
     }
 
-    /// An enforcer whose `nft` is a shell stand-in that records each run.
-    fn counting(log: &std::path::Path) -> NftPolicyEnforcer {
-        let script: &'static str =
-            Box::leak(format!("cat >/dev/null; echo run >> '{}'", log.display()).into_boxed_str());
+    /// An enforcer whose `nft` is a shell stand-in: each apply logs `run`, each
+    /// listing logs `list` and answers with `listing` if that file exists, or
+    /// as `nft` does for a table that is gone.
+    fn counting(log: &std::path::Path, listing: &std::path::Path) -> NftPolicyEnforcer {
+        let script: &'static str = Box::leak(
+            format!(
+                "case \"$*\" in *list*) echo list >> '{log}'; \
+                 if [ -f '{listing}' ]; then exec cat '{listing}'; fi; \
+                 echo 'Error: No such file or directory' >&2; exit 1;; \
+                 *) cat >/dev/null; echo run >> '{log}';; esac",
+                log = log.display(),
+                listing = listing.display(),
+            )
+            .into_boxed_str(),
+        );
         let args: &'static [&'static str] = Box::leak(Box::new(["-c", script, "nft"]));
         let mut enforcer =
             NftPolicyEnforcer::new(Arc::new(Unbound), Arc::new(MockAdapterEventSource::new()));
@@ -297,49 +353,114 @@ mod tests {
         enforcer
     }
 
-    fn runs(log: &std::path::Path) -> usize {
-        std::fs::read_to_string(log).map_or(0, |s| s.lines().count())
+    fn logged(log: &std::path::Path, what: &str) -> usize {
+        std::fs::read_to_string(log).map_or(0, |s| s.lines().filter(|l| *l == what).count())
     }
 
-    /// An idle pass hands the kernel nothing new, so it must not pay for an
-    /// `nft` run — but the same ruleset is still reapplied once the recheck
-    /// window has passed, and after a teardown, both of which may have left the
-    /// kernel without it.
-    #[test]
-    fn an_unchanged_ruleset_is_not_applied_again_until_the_recheck() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let log = dir.path().join("runs");
-        let enforcer = counting(&log);
+    /// The kernel's answer for our chain holding `rules` rules.
+    fn put_listing(listing: &std::path::Path, rules: usize) {
+        let mut objects = vec![r#"{"chain":{}}"#];
+        objects.extend(std::iter::repeat_n(r#"{"rule":{}}"#, rules));
+        let body = format!(r#"{{"nftables":[{}]}}"#, objects.join(","));
+        std::fs::write(listing, body).expect("write listing");
+    }
 
-        enforcer.enforce(&[]).expect("first apply");
-        enforcer.enforce(&[]).expect("unchanged apply");
-        assert_eq!(
-            runs(&log),
-            1,
-            "the unchanged ruleset was handed to nft again"
-        );
+    fn installed_rules(enforcer: &NftPolicyEnforcer) -> usize {
+        enforcer
+            .applied
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(0, |a| a.rules)
+    }
 
+    fn age_past_recheck(enforcer: &NftPolicyEnforcer) {
         if let Some(applied) = enforcer
             .applied
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_mut()
         {
-            applied.at = Instant::now()
+            applied.verified_at = Instant::now()
                 .checked_sub(UNCHANGED_RECHECK)
                 .expect("the clock is past one window");
         }
-        enforcer.enforce(&[]).expect("recheck apply");
-        assert_eq!(runs(&log), 2, "the recheck did not reapply");
+    }
+
+    /// An unchanged pass inside the window costs no `nft` run at all; past it,
+    /// a listing that finds our chain whole is enough, and a teardown always
+    /// means a real apply.
+    #[test]
+    fn an_unchanged_ruleset_is_not_applied_again_while_it_is_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs");
+        let listing = dir.path().join("listing");
+        let enforcer = counting(&log, &listing);
+
+        enforcer.enforce(&[]).expect("first apply");
+        put_listing(&listing, installed_rules(&enforcer));
+        enforcer.enforce(&[]).expect("unchanged apply");
+        assert_eq!(
+            logged(&log, "run"),
+            1,
+            "the unchanged ruleset was handed to nft again"
+        );
+        assert_eq!(
+            logged(&log, "list"),
+            0,
+            "a pass inside the window asked the kernel"
+        );
+
+        age_past_recheck(&enforcer);
+        enforcer.enforce(&[]).expect("recheck");
+        assert_eq!(logged(&log, "list"), 1, "the recheck did not look");
+        assert_eq!(
+            logged(&log, "run"),
+            1,
+            "a table found in place was reapplied"
+        );
 
         enforcer.teardown().expect("teardown");
-        let after_teardown = runs(&log);
+        let after_teardown = logged(&log, "run");
         enforcer.enforce(&[]).expect("apply after teardown");
         assert_eq!(
-            runs(&log),
+            logged(&log, "run"),
             after_teardown + 1,
             "a teardown must not be mistaken for the ruleset still being in force"
         );
+    }
+
+    /// Somebody else's `flush ruleset` took our table: an explicit apply must
+    /// put it back at once, not trust the cache until the window runs out.
+    #[test]
+    fn an_explicit_apply_restores_a_table_flushed_behind_our_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs");
+        let listing = dir.path().join("listing");
+        let enforcer = counting(&log, &listing);
+
+        enforcer.enforce(&[]).expect("first apply");
+        put_listing(&listing, installed_rules(&enforcer));
+
+        // Positive control: the table is in place, so the check alone answers.
+        enforcer.distrust_installed();
+        enforcer.enforce(&[]).expect("verified apply");
+        assert_eq!(logged(&log, "list"), 1, "an explicit apply did not look");
+        assert_eq!(logged(&log, "run"), 1);
+
+        std::fs::remove_file(&listing).expect("flush");
+        enforcer.enforce(&[]).expect("cached pass");
+        assert_eq!(logged(&log, "run"), 1, "a request is consumed by one pass");
+
+        enforcer.distrust_installed();
+        enforcer.enforce(&[]).expect("restoring apply");
+        assert_eq!(logged(&log, "run"), 2, "a flushed table was not put back");
+
+        // A chain holding other than our rules is not in place either.
+        put_listing(&listing, installed_rules(&enforcer) + 1);
+        enforcer.distrust_installed();
+        enforcer.enforce(&[]).expect("restoring apply");
+        assert_eq!(logged(&log, "run"), 3, "a chain that differs was trusted");
     }
 
     #[test]

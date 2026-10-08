@@ -282,6 +282,7 @@ impl ProductionPrincipalPlanSource {
             zone_priority_over_ip: policy.zone_priority_over_ip,
             secondary_ip_denylist: &secondary_ip_denylist,
             ipv6,
+            packet_blocks: self.rules.rules_are_baseline_for(stored),
         };
         let (mut flows, plan_report) =
             plan_route_rules(&rules.rule_book, stored, rules.behavior_mode, &input);
@@ -424,6 +425,22 @@ impl ProductionPrincipalPlanSource {
     }
 }
 
+/// One line naming the network rules carved past the cap: their narrower rules
+/// quietly lose, so it is worth a look. Both planners call it.
+pub(crate) fn log_networks_over_cap(principal: &str, rules: &[String]) {
+    if rules.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        target: "nrr::enforcement",
+        msg_key = "persid-plan-network-carving-over-cap",
+        sid = %principal,
+        count = rules.len(),
+        rules = %rules.join(", "),
+        "network rules hold more narrower rules than can be carved out, so each covers its whole network and the narrower rules inside lose (rule: pieces/cap)",
+    );
+}
+
 impl ProductionPrincipalPlanSource {
     /// Store `principal`'s conflicts for the Overlaps screen; `None` clears
     /// them. The pass re-plans on a timer, so only a change is logged.
@@ -462,6 +479,10 @@ impl ProductionPrincipalPlanSource {
                 "rules not enforced: they limit an address to one application, which enforcement cannot scope yet, so they were skipped rather than applied to every application",
             );
         }
+        let over_cap = planned
+            .map(|(report, _)| crate::rule_conflicts::over_cap_networks(&report.conflicts))
+            .unwrap_or_default();
+        log_networks_over_cap(principal, &over_cap);
     }
 
     /// The blanket block-all, or nothing.

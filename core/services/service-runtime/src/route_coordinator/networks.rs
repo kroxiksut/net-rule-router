@@ -257,33 +257,40 @@ impl SecondaryRouteCoordinator {
         role: &str,
         candidates: Vec<String>,
     ) {
-        let Some(bus) = self.events.as_ref() else {
-            return;
-        };
         // Keyed by role: one user can have a resolved secondary and a missing
         // primary at the same time, and a single per-SID latch made the two
         // states overwrite each other into an endless alternating push.
-        let key = format!("{sid}|{role}");
-        let fingerprint = format!("{status}|{}", candidates.join(","));
-        {
-            let mut seen = self
-                .enforcement_status
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if seen.get(&key) == Some(&fingerprint) {
-                return;
-            }
-            seen.insert(key, fingerprint);
+        // Recorded with or without a bus: the snapshot reads it too.
+        let report = nrr_shared::ipc_payloads::EnforcementStatusDto {
+            status: status.to_string(),
+            role: role.to_string(),
+            candidates,
+        };
+        if !self.enforcement_status.record(sid, &report) {
+            return;
         }
+        let Some(bus) = self.events.as_ref() else {
+            return;
+        };
         bus.publish_for(
             sid,
             nrr_shared::ipc_payloads::StatusUpdateEvent::EnforcementStatusChanged {
                 sid: sid.to_string(),
-                status: status.to_string(),
-                role: role.to_string(),
-                candidates,
+                status: report.status,
+                role: report.role,
+                candidates: report.candidates,
             },
         );
+    }
+
+    /// The machine-wide report (`no-policy`, `adapters-unreadable`) ends once a
+    /// resolve gets past both; without this its notice and snapshot entry would
+    /// outlive the cause, since no role-specific report replaces it.
+    pub(super) fn clear_machine_wide_enforcement_status(&self, sid: &str) {
+        let standing = self.enforcement_status.status_of(sid, "");
+        if standing.is_some_and(|s| s != "ok") {
+            self.publish_enforcement_status(sid, "ok", "", Vec::new());
+        }
     }
 
     /// Resolve one route binding (primary or secondary) to a
@@ -431,20 +438,31 @@ impl SecondaryRouteCoordinator {
                                 // two statuses overwriting each other in the
                                 // per-role latch — an endless alternating push.
                                 if !ambiguous {
-                                    let choices = replacement_candidates(infos, role);
-                                    // "Removed" and "here but its driver
-                                    // will not start" arrive identically —
-                                    // as nothing — yet they need opposite
-                                    // advice: pick another connection, or
-                                    // repair a driver. Only the OS can tell
-                                    // them apart, and only when asked.
-                                    let status = self
+                                    // "Removed", "switched off by the user" and
+                                    // "its driver will not start" all arrive as
+                                    // nothing, yet need different advice. Only
+                                    // the OS can tell them apart, and only when
+                                    // asked. Switched off is the same state as
+                                    // a link that is down: nothing to replace.
+                                    let state = self
                                         .device_status
                                         .as_ref()
-                                        .and_then(|p| p.device_state(&binding.stable_id))
-                                        .filter(|s| s.is_present_but_unusable())
-                                        .map_or("adapter-gone", |_| "adapter-failed");
-                                    self.publish_enforcement_status(sid, status, role, choices);
+                                        .and_then(|p| p.device_state(&binding.stable_id));
+                                    let (status, choices) = match state {
+                                        Some(nrr_platform_api::device_status::DeviceState::Disabled) => {
+                                            ("secondary-down", Vec::new())
+                                        }
+                                        Some(nrr_platform_api::device_status::DeviceState::FailedToStart) => {
+                                            ("adapter-failed", replacement_candidates(infos, role))
+                                        }
+                                        _ => ("adapter-gone", replacement_candidates(infos, role)),
+                                    };
+                                    // Fail-closed already holds; only the advice waits.
+                                    if status != "adapter-gone"
+                                        || self.gone_long_enough(sid, role, &binding.stable_id)
+                                    {
+                                        self.publish_enforcement_status(sid, status, role, choices);
+                                    }
                                 }
                                 let live: Vec<String> = infos
                                     .iter()

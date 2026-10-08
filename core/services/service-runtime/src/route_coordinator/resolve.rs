@@ -77,11 +77,6 @@ impl SecondaryRouteCoordinator {
         })
     }
 
-    /// The active user's primary/secondary egress SOURCE addresses (the
-    /// adapters' own IPv4 unicast addresses), for binding sockets that must
-    /// leave over a specific role's link — the fake-IP relay dials with these.
-    /// A role yields `None` when it is unbound, unresolvable, or its adapter
-    /// currently has no IPv4 address.
     /// Interface index of the user's usable PRIMARY link, or `None` while it is
     /// unbound or unresolvable. Callers that must send over the link the policy
     /// routes traffic over — rather than over whichever link owns the OS default
@@ -90,6 +85,37 @@ impl SecondaryRouteCoordinator {
         self.resolve(sid).primary.map(|t| t.interface_index)
     }
 
+    /// Which link each of `sid`'s connections leaves through, against
+    /// `machine`. A tunnel the liveness probe declared dead is still the link
+    /// its sockets ride, so the bound secondary counts as theirs even then:
+    /// otherwise its stranded connections would read as another link's and be
+    /// spared.
+    pub fn flow_links(
+        &self,
+        sid: &str,
+        machine: &MachineReading,
+    ) -> nrr_platform_api::fake_ip::stale_flows::FlowLinks {
+        let Some(infos) = machine.adapters() else {
+            return Default::default();
+        };
+        let r = self.resolve_from(sid, Some(machine));
+        let secondary = r.secondary.map(|t| t.interface_index).or_else(|| {
+            let binding = self.route_source.load_for_sid(sid)?.secondary?;
+            self.resolve_binding_target(sid, &binding, infos, "secondary", Some(machine))
+                .map(|t| t.interface_index)
+        });
+        nrr_platform_api::fake_ip::stale_flows::FlowLinks::from_adapters(
+            infos,
+            r.primary.map(|t| t.interface_index),
+            secondary,
+        )
+    }
+
+    /// The active user's primary/secondary egress SOURCE addresses (the
+    /// adapters' own IPv4 unicast addresses), for binding sockets that must
+    /// leave over a specific role's link — the fake-IP relay dials with these.
+    /// A role yields `None` when it is unbound, unresolvable, or its adapter
+    /// currently has no IPv4 address.
     pub fn resolve_egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
         let r = self.resolve(sid);
         let infos = match self.api.get_adapter_infos() {
@@ -179,6 +205,7 @@ impl SecondaryRouteCoordinator {
                 };
             }
         };
+        self.clear_machine_wide_enforcement_status(sid);
         let secondary = match policy.secondary.as_ref() {
             Some(b) => {
                 self.clear_no_secondary(sid);

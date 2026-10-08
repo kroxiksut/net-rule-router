@@ -106,8 +106,11 @@ pub enum RulesJsonCodecError {
     AppNameInvalid { rule_id: String, raw: String },
     /// A subnet or range the rule pipeline refuses.
     InvalidNetwork { rule_id: String, raw: String },
-    /// An address match of a known kind with the wrong fields.
+    /// An address match of a known kind with the wrong fields, or with no
+    /// kind slug at all.
     MalformedAddressMatch { rule_id: String },
+    /// An action that is not even a slug.
+    MalformedAction { rule_id: String },
 }
 
 impl core::fmt::Display for RulesJsonCodecError {
@@ -139,6 +142,9 @@ impl core::fmt::Display for RulesJsonCodecError {
             }
             Self::MalformedAddressMatch { rule_id } => {
                 write!(f, "rule {rule_id:?}: malformed address match")
+            }
+            Self::MalformedAction { rule_id } => {
+                write!(f, "rule {rule_id:?}: malformed action")
             }
         }
     }
@@ -195,13 +201,18 @@ fn encode_action(action: crate::canonical::RuleAction) -> WireRuleAction {
     match action {
         crate::canonical::RuleAction::Route => WireRuleAction::Route,
         crate::canonical::RuleAction::Block => WireRuleAction::Block,
+        crate::canonical::RuleAction::VerifyPrimary => WireRuleAction::VerifyPrimary,
     }
 }
 
-fn decode_action(action: WireRuleAction) -> crate::canonical::RuleAction {
+/// `None` for an action this build does not know; `decode_route` keeps such a
+/// rule aside before it gets here.
+fn decode_action(action: WireRuleAction) -> Option<crate::canonical::RuleAction> {
     match action {
-        WireRuleAction::Route => crate::canonical::RuleAction::Route,
-        WireRuleAction::Block => crate::canonical::RuleAction::Block,
+        WireRuleAction::Route => Some(crate::canonical::RuleAction::Route),
+        WireRuleAction::Block => Some(crate::canonical::RuleAction::Block),
+        WireRuleAction::VerifyPrimary => Some(crate::canonical::RuleAction::VerifyPrimary),
+        WireRuleAction::Unrecognized(_) => None,
     }
 }
 
@@ -287,15 +298,21 @@ fn decode_route(
 ) -> Result<Vec<CanonicalRule>, RulesJsonCodecError> {
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
-        match &rule.address_match {
-            Some(m @ AddressMatchDto::Unrecognized(_)) => {
-                if m.is_malformed() {
-                    return Err(RulesJsonCodecError::MalformedAddressMatch { rule_id: rule.id });
-                }
-                kept.push(rule);
-            }
-            _ => out.push(decode_rule(rule, naming)?),
+        if !rule.is_unrecognized() {
+            out.push(decode_rule(rule, naming)?);
+            continue;
         }
+        if rule
+            .address_match
+            .as_ref()
+            .is_some_and(AddressMatchDto::is_malformed)
+        {
+            return Err(RulesJsonCodecError::MalformedAddressMatch { rule_id: rule.id });
+        }
+        if rule.action.is_malformed() {
+            return Err(RulesJsonCodecError::MalformedAction { rule_id: rule.id });
+        }
+        kept.push(rule);
     }
     kept.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
@@ -316,13 +333,16 @@ fn decode_rule(
     if address_match.is_none() && app_match.is_none() {
         return Err(RulesJsonCodecError::EmptyMatch { rule_id: dto.id });
     }
+    let Some(action) = decode_action(dto.action) else {
+        return Err(RulesJsonCodecError::MalformedAction { rule_id: dto.id });
+    };
     Ok(CanonicalRule {
         id: RuleId(dto.id),
         enabled: dto.enabled,
         address_match,
         app_match,
         comment: dto.comment,
-        action: decode_action(dto.action),
+        action,
         origin: dto.origin,
     })
 }
@@ -895,6 +915,60 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_with_an_unknown_action_is_kept_not_applied() {
+        let wire = r#"{"schema-version":999,"primary":[{"action":"throttle","address-match":{"kind":"exact-fqdn","value":"y.test"},"enabled":true,"id":"r-x"},{"id":"r-1","enabled":true,"address-match":{"kind":"exact-fqdn","value":"x.test"}}],"secondary":[]}"#;
+        let dto = nrr_shared::rules_json::from_canonical_string(wire).expect("wire");
+        let content = decode(dto, HostPlatform::Windows).expect("a newer book is read");
+        let applied: Vec<&str> = content
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(applied, ["r-1"]);
+        assert_eq!(content.unrecognized.primary[0].id, "r-x");
+        let again = encode(&content);
+        assert_eq!(again.primary.len(), 2, "a rewrite keeps the unknown rule");
+    }
+
+    #[test]
+    fn a_kind_or_action_that_is_no_slug_is_refused_not_kept() {
+        for (rule, broken_action) in [
+            (
+                r#"{"id":"r-x","enabled":true,"address-match":{"value":"x.test"}}"#,
+                false,
+            ),
+            (
+                r#"{"id":"r-x","enabled":true,"address-match":{"kind":"Exact FQDN","value":"x.test"}}"#,
+                false,
+            ),
+            (
+                r#"{"id":"r-x","enabled":true,"action":"Via Primary","address-match":{"kind":"zone","name":"test"}}"#,
+                true,
+            ),
+        ] {
+            let wire = format!(r#"{{"schema-version":3,"primary":[{rule}],"secondary":[]}}"#);
+            let dto = nrr_shared::rules_json::from_canonical_string(&wire).expect("wire");
+            let refused = decode(dto, HostPlatform::Windows);
+            if broken_action {
+                assert!(
+                    matches!(refused, Err(RulesJsonCodecError::MalformedAction { .. })),
+                    "{rule}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        refused,
+                        Err(RulesJsonCodecError::MalformedAddressMatch { .. })
+                    ),
+                    "{rule}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_known_kind_with_wrong_fields_is_refused_not_kept() {
         let wire = r#"{"schema-version":2,"primary":[{"id":"r-x","enabled":true,"address-match":{"kind":"subnet","net":"10.0.0.0/8"}}],"secondary":[]}"#;
         let dto = nrr_shared::rules_json::from_canonical_string(wire).expect("wire");
@@ -1150,6 +1224,20 @@ mod tests {
         let content = RulesRevisionContent::new(book(vec![exact_fqdn("r-1", "x.test")], vec![]));
         let dto = encode(&content);
         assert_eq!(dto.schema_version, 1, "its bytes and hash must not move");
+    }
+
+    /// A build that predates `?` cannot read the action, so a book holding one
+    /// says so; the same book without it keeps its older number.
+    #[test]
+    fn a_verify_primary_rule_needs_schema_three() {
+        let verify = CanonicalRule {
+            action: crate::canonical::RuleAction::VerifyPrimary,
+            ..suffix("r-v", "mail.example")
+        };
+        let content = RulesRevisionContent::new(book(vec![], vec![verify]));
+        assert_eq!(encode(&content).schema_version, 3);
+        let plain = RulesRevisionContent::new(book(vec![], vec![suffix("r-v", "mail.example")]));
+        assert_eq!(encode(&plain).schema_version, 1);
     }
 
     #[test]

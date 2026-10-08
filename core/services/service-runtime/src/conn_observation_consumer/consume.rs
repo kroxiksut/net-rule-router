@@ -87,6 +87,7 @@ impl ConnectionObservationConsumer {
             // is that they went and it did not work.
             self.confirm_placeholder_use(obs.remote.ip(), obs.observed_unix_ms.unwrap_or(now_ms));
             let mut rec = classify_connection(obs, &unicast, primary_ifindex, secondary_ifindex);
+            self.note_unanswered(obs, &rec, now_ms);
             // A resend or an orderly close is evidence about a peer, not a
             // connection of its own: it must never become a trace row, an
             // NDJSON line, an app→IP fact or a drop statistic. Only the primary
@@ -108,14 +109,15 @@ impl ConnectionObservationConsumer {
             // Our own filter dropped it, and the stack now resends into that
             // filter: those resends must not read as the main link not answering.
             if obs.blocked_by_nrr == Some(true) {
+                let at_ms = obs.observed_unix_ms.unwrap_or(now_ms);
                 self.primary_stall_evidence
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .exclude(
-                        obs.local,
-                        obs.remote,
-                        obs.observed_unix_ms.unwrap_or(now_ms),
-                    );
+                    .exclude(obs.local, obs.remote, at_ms);
+                self.unanswered
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .exclude(obs.local, obs.remote, at_ms);
             }
             summary.total += 1;
             // Role verification, shared by the VPN-endpoint learner and the

@@ -144,6 +144,7 @@ fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
             secondary_ip_denylist: &HashSet::new(),
             zone_priority_over_ip: false,
             families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
+            packet_blocks: true,
         });
         let routes = generate_routes(
             RouteBehaviorMode::PreferPrimary,
@@ -208,6 +209,7 @@ fn every_protected_destination_is_one_the_routes_actually_steer() {
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let routes = generate_routes(
         RouteBehaviorMode::PreferPrimary,
@@ -299,6 +301,7 @@ fn an_address_rule_wins_over_an_app_rule_on_either_link() {
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
 
     assert!(
@@ -338,6 +341,7 @@ fn a_destination_another_process_uses_is_pinned_by_neither_mechanism() {
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let routes = generate_routes(
         RouteBehaviorMode::PreferPrimary,
@@ -394,6 +398,7 @@ fn the_neutral_planner_reads_the_same_arbiter() {
             app_observations: &observations,
             zone_priority_over_ip: false,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            packet_blocks: true,
         },
     )
     .0;
@@ -540,6 +545,7 @@ fn codegen(rule_book: &CanonicalRuleBook, cache: &MockFqdnCacheLookup) -> Vec<Sp
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     })
     .filters
 }
@@ -566,6 +572,7 @@ fn blocked_by_planner(
             app_observations: &MockAppObservationLookup::new(),
             zone_priority_over_ip: false,
             secondary_ip_denylist: &HashSet::new(),
+            packet_blocks: true,
         },
     )
     .0
@@ -724,6 +731,7 @@ fn codegen_output(
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     })
 }
 
@@ -959,6 +967,7 @@ fn an_app_scoped_block_is_skipped_by_both_mechanisms_and_reported() {
             app_observations: &MockAppObservationLookup::new(),
             zone_priority_over_ip: false,
             secondary_ip_denylist: &HashSet::new(),
+            packet_blocks: true,
         },
     );
     assert_eq!(
@@ -1080,6 +1089,7 @@ fn the_planner_reports_the_conflicts_the_codegen_reports() {
                 app_observations: &MockAppObservationLookup::new(),
                 zone_priority_over_ip: false,
                 secondary_ip_denylist: &HashSet::new(),
+                packet_blocks: true,
             },
         );
         assert_eq!(
@@ -1177,7 +1187,7 @@ fn engine_outcome(rule_book: &CanonicalRuleBook, host: Option<&str>, ip: IpAddr)
     ) {
         RequestedRouteDecision::MatchedRoute { candidate } => match candidate.action {
             RuleAction::Block => Outcome::Block,
-            RuleAction::Route => Outcome::Route(candidate.route_role),
+            RuleAction::Route | RuleAction::VerifyPrimary => Outcome::Route(candidate.route_role),
         },
         RequestedRouteDecision::DefaultRoute { .. } => Outcome::Default,
     }
@@ -1519,6 +1529,7 @@ fn every_mechanism_gives_a_network_rule_the_engines_answer() {
                 secondary_ip_denylist: &HashSet::new(),
                 zone_priority_over_ip: false,
                 families: nrr_service_runtime::enforcement_planner::FamilyScope::Both,
+                packet_blocks: true,
             },
             NETWORKS,
         )
@@ -1534,6 +1545,7 @@ fn every_mechanism_gives_a_network_rule_the_engines_answer() {
                 app_observations: &MockAppObservationLookup::new(),
                 zone_priority_over_ip: false,
                 secondary_ip_denylist: &HashSet::new(),
+                packet_blocks: true,
             },
             NETWORKS,
         )

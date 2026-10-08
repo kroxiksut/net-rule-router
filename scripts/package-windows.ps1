@@ -12,7 +12,7 @@
         NetRuleRouter\
           NetRuleRouter.exe     start here
           README.txt  README.ru.txt
-          <tray, service, console, Qt host, the Qt runtime, wintun.dll>
+          <tray, service, console, terminal interface, Qt host, the Qt runtime, wintun.dll>
           <*.pdb>               line tables, so a panic names file:line
           qml\                  Qt's own modules, written by windeployqt
           apps\desktop\qml\     the app's own QML
@@ -291,8 +291,8 @@ Write-Step "version $productVersion, revision $($revision.commit)$(if ($revision
 
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot 'clean-sync-duplicates.ps1')
-    Write-Step 'cargo build --release (launcher, service, console)'
-    & cargo build --release -p nrr-launcher -p nrr-windows-service -p nrr-cli
+    Write-Step 'cargo build --release (launcher, service, console, terminal interface)'
+    & cargo build --release -p nrr-launcher -p nrr-windows-service -p nrr-cli -p nrr-tui
     if ($LASTEXITCODE -ne 0) {
         throw 'Release build failed. A running service or open GUI holds its own binary - stop it and retry.'
     }
@@ -311,7 +311,8 @@ $executables = @(
     'NetRuleRouter.exe',
     'NetRuleRouterTray.exe',
     'nrr-service.exe',
-    'nrr-cli.exe'
+    'nrr-cli.exe',
+    'nrr-tui.exe'
 )
 foreach ($exe in $executables) {
     $source = Join-Path $releaseDir $exe
@@ -523,7 +524,8 @@ confirmation. This build carries no separate installer.
 
 What is inside
 --------------
-    NetRuleRouter.exe   the app; the tray, service, console and libraries sit beside it
+    NetRuleRouter.exe   the app; the tray, service, console, terminal
+                        interface and libraries sit beside it
     qml\        Qt's own modules
     apps\       the interface (QML). The nesting is deliberate: the interface
                 addresses its icons relative to itself
@@ -539,6 +541,10 @@ machine without network: nrr-cli.exe reset-network --confirm (administrator).
 scripts\reset-network.ps1 does the same recovery and also works when the
 console cannot start. scripts\uninstall-service.ps1 and scripts\purge-data.ps1
 remove the service and the data it left.
+
+Without a window - over SSH, or if you prefer the keyboard - nrr-tui.exe does
+what the app does, in the terminal. Run it from a terminal in this folder;
+--plain suits screen readers.
 
 If nothing happens when you start it
 ------------------------------------
@@ -582,7 +588,8 @@ English: см. README.txt.
 
 Что внутри
 ----------
-    NetRuleRouter.exe   программа; рядом трей, служба, консоль и библиотеки
+    NetRuleRouter.exe   программа; рядом трей, служба, консоль, терминальный
+                        интерфейс и библиотеки
     qml\        модули Qt
     apps\       интерфейс (QML). Вложенность не случайна: интерфейс
                 адресует значки относительно себя
@@ -599,6 +606,10 @@ scripts\reset-network.ps1 делает то же восстановление и
 консоль не запускается. scripts\uninstall-service.ps1 и scripts\purge-data.ps1
 удаляют службу и оставленные ею данные.
 
+Без окна - по SSH или если удобнее клавиатура - nrr-tui.exe делает то же, что
+программа, прямо в терминале. Запускайте его из терминала в этой папке;
+для экранного чтеца - с ключом --plain.
+
 Если ничего не происходит при запуске
 -------------------------------------
 Программа не открывает консоль, поэтому ошибки пишет в файл. Смотрите
@@ -613,6 +624,7 @@ $required = @(
     'NetRuleRouterTray.exe',
     'nrr-service.exe',
     'nrr-cli.exe',
+    'nrr-tui.exe',
     'nrr_qt_native_host.exe',
     'wintun.dll',
     'Qt6Core.dll',

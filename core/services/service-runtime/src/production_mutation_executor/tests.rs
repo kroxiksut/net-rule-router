@@ -27,6 +27,33 @@ fn parse_rules_payload_rejects_missing_fields() {
 }
 
 #[test]
+fn a_submitted_rule_this_build_cannot_read_is_refused() {
+    let submit = |rule: &str| {
+        let rules_json = format!(r#"{{"schema-version":3,"primary":[{rule}],"secondary":[]}}"#);
+        ProductionMutationExecutor::parse_rules_payload(&serde_json::json!({
+            "rules-json": rules_json,
+            "content-hash": "abc",
+        }))
+    };
+    for rule in [
+        r#"{"id":"r-1","enabled":true,"address-match":{"kind":"port-range","from":1}}"#,
+        r#"{"id":"r-1","enabled":true,"action":"throttle","address-match":{"kind":"zone","name":"test"}}"#,
+    ] {
+        let err = submit(rule).unwrap_err();
+        assert_eq!(err.code, unrecognized::RULE_KIND_UNKNOWN_CODE, "{rule}");
+    }
+    // A known kind with wrong fields keeps its own refusal further on.
+    assert!(
+        submit(r#"{"id":"r-1","enabled":true,"address-match":{"kind":"subnet","net":"x"}}"#)
+            .is_ok()
+    );
+    assert!(
+        submit(r#"{"id":"r-1","enabled":true,"address-match":{"kind":"zone","name":"test"}}"#)
+            .is_ok()
+    );
+}
+
+#[test]
 fn a_rule_written_into_both_route_sets_is_reported_with_the_preview() {
     // Neither copy is wrong on its own; together they claim the same
     // traffic for two different routes, and the service cannot pick.
@@ -1844,7 +1871,7 @@ fn a_rule_naming_both_an_app_and_an_address_is_refused_at_submission() {
         (WireAction::Route, "app-scoped-destination-route"),
         (WireAction::Block, "app-scoped-destination-block"),
     ] {
-        let payload = shaped_rules_update(true, true, action, "corr-shape");
+        let payload = shaped_rules_update(true, true, action.clone(), "corr-shape");
         match exec.execute_rules_update(&payload, nrr_storage::BASELINE_PRINCIPAL) {
             MutationOutcome::Failed(e) => {
                 assert_eq!(e.code, "unsupported-rule-shape");
@@ -1883,7 +1910,7 @@ fn address_only_and_app_only_rules_are_accepted() {
     for (address, app) in [(true, false), (false, true)] {
         for action in [WireAction::Route, WireAction::Block] {
             let (exec, _conn) = build_test_executor();
-            let payload = shaped_rules_update(address, app, action, "corr-ok");
+            let payload = shaped_rules_update(address, app, action.clone(), "corr-ok");
             assert!(
                 matches!(
                     exec.execute_rules_update(&payload, nrr_storage::BASELINE_PRINCIPAL),
@@ -2304,6 +2331,17 @@ fn book_with_unknown_kind(known_value: &str) -> String {
     .to_string()
 }
 
+/// A revision a newer build wrote: stored through the coordinator in canonical
+/// bytes, as that build would, since a client of this one may not send it.
+fn seed_from_a_newer_build(exec: &ProductionMutationExecutor, principal: &str, rules_json: &str) {
+    let dto = nrr_shared::rules_json::from_canonical_string(rules_json).expect("book");
+    let content = rules_json_codec::decode(dto, HostPlatform::compiled()).expect("decodes");
+    let canonical =
+        nrr_shared::rules_json::to_canonical_string(&rules_json_codec::encode(&content))
+            .expect("encodes");
+    seed_active_book(exec, principal, canonical);
+}
+
 fn rules_update_of(rules_json: &str) -> StoredMutation {
     StoredMutation {
         kind: MutationKind::RulesUpdate,
@@ -2347,14 +2385,7 @@ fn gui_book(value: &str) -> String {
 fn an_edit_keeps_the_rules_of_a_kind_this_build_cannot_read() {
     let (exec, conn) = build_test_executor();
     let baseline = nrr_storage::BASELINE_PRINCIPAL;
-    let seeded = exec.execute(
-        rules_update_of(&book_with_unknown_kind("a.example")),
-        baseline,
-    );
-    assert!(
-        matches!(seeded, MutationOutcome::Completed(_)),
-        "{seeded:?}"
-    );
+    seed_from_a_newer_build(&exec, baseline, &book_with_unknown_kind("a.example"));
 
     let outcome = exec.execute(rules_update_of(&gui_book("b.example")), baseline);
 
@@ -2376,14 +2407,7 @@ fn an_edit_keeps_the_rules_of_a_kind_this_build_cannot_read() {
 fn resubmitting_the_shown_book_is_a_no_op_not_a_deletion() {
     let (exec, conn) = build_test_executor();
     let baseline = nrr_storage::BASELINE_PRINCIPAL;
-    let seeded = exec.execute(
-        rules_update_of(&book_with_unknown_kind("a.example")),
-        baseline,
-    );
-    assert!(
-        matches!(seeded, MutationOutcome::Completed(_)),
-        "{seeded:?}"
-    );
+    seed_from_a_newer_build(&exec, baseline, &book_with_unknown_kind("a.example"));
     let before = active_rules_json(&conn);
 
     let outcome = exec.execute(rules_update_of(&gui_book("a.example")), baseline);
@@ -2399,14 +2423,7 @@ fn resubmitting_the_shown_book_is_a_no_op_not_a_deletion() {
 fn a_preset_import_keeps_the_rules_of_a_kind_this_build_cannot_read() {
     let (exec, conn) = build_test_executor();
     let baseline = nrr_storage::BASELINE_PRINCIPAL;
-    let seeded = exec.execute(
-        rules_update_of(&book_with_unknown_kind("a.example")),
-        baseline,
-    );
-    assert!(
-        matches!(seeded, MutationOutcome::Completed(_)),
-        "{seeded:?}"
-    );
+    seed_from_a_newer_build(&exec, baseline, &book_with_unknown_kind("a.example"));
     let payload = serde_json::json!({
         "primary-bytes-b64": b64("--- Domains\nimported.example\n"),
         "secondary-bytes-b64": b64("--- Domains\nother.example\n"),
@@ -2636,4 +2653,128 @@ fn a_network_the_book_in_force_holds_is_not_judged_again() {
         super::unrecognized::new_networks(&book(&["192.168.0.0/16"]), None).len(),
         1
     );
+}
+
+#[test]
+fn enabling_a_held_network_or_moving_it_to_the_other_route_is_judged() {
+    // One network rule `n-0`, placed on a route and switched on or off.
+    let book = |secondary: bool, enabled: bool| {
+        let rule = serde_json::json!({
+            "id": "n-0",
+            "enabled": enabled,
+            "address-match": { "kind": "subnet", "network": "203.0.113.0/24" },
+            "comment": "",
+            "action": "route",
+        });
+        let (primary, other) = if secondary {
+            (vec![], vec![rule])
+        } else {
+            (vec![rule], vec![])
+        };
+        let json = serde_json::json!({
+            "schema-version": 2, "primary": primary, "secondary": other,
+        });
+        decode_rule_book(&json.to_string(), HostPlatform::Windows).expect("network book")
+    };
+    fn new(
+        incoming: &nrr_domain::canonical::CanonicalRuleBook,
+        in_force: &nrr_domain::canonical::CanonicalRuleBook,
+    ) -> usize {
+        super::unrecognized::new_networks(incoming, Some(in_force)).len()
+    }
+
+    // Positive control: unchanged and still enforced, not judged again.
+    assert_eq!(new(&book(true, true), &book(true, true)), 0);
+    // Saved disabled, then enabled: newly enforced.
+    assert_eq!(new(&book(true, true), &book(true, false)), 1);
+    // Enforced on the main route, moved to the additional one.
+    assert_eq!(new(&book(true, true), &book(false, true)), 1);
+    // Disabled in the submission: nothing to screen.
+    assert_eq!(new(&book(true, false), &book(false, false)), 0);
+}
+
+fn two_route_book(primary: &str, secondary: &str, extra: &str) -> String {
+    let rule = |id: &str, network: &str| {
+        serde_json::json!({
+            "id": id, "enabled": true,
+            "address-match": { "kind": "subnet", "network": network },
+        })
+    };
+    let mut secondary_rules = vec![rule("r-s", secondary)];
+    if !extra.is_empty() {
+        secondary_rules.push(serde_json::json!({
+            "id": "r-x", "enabled": true,
+            "address-match": { "kind": "exact-fqdn", "value": extra },
+        }));
+    }
+    serde_json::json!({
+        "schema-version": 2,
+        "primary": [rule("r-p", primary)],
+        "secondary": secondary_rules,
+    })
+    .to_string()
+}
+
+/// One network on both routes is a tie the product refuses, in the preview
+/// and on save, naming the network. A book in force that already held one
+/// stays editable: the refusal is for a new tie, not a lock on old data.
+#[test]
+fn a_network_on_both_routes_is_refused_unless_the_book_in_force_held_it() {
+    let (exec, _conn) = build_test_executor();
+    let baseline = nrr_storage::BASELINE_PRINCIPAL;
+    let tie = two_route_book("10.0.0.0/24", "10.0.0.0/24", "");
+
+    let refused = exec.execute(rules_update(tie.clone()), baseline);
+    match refused {
+        MutationOutcome::Failed(e) => {
+            assert_eq!(e.code, "network-on-both-routes");
+            assert_eq!(
+                e.args.get("network").map(String::as_str),
+                Some("10.0.0.0/24")
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let review = exec.preview_rules_update(
+        &serde_json::json!({ "rules-json": tie.clone(), "content-hash": "h" }),
+        baseline,
+    );
+    assert!(
+        review.diff_summary.contains("10.0.0.0/24"),
+        "{}",
+        review.diff_summary
+    );
+
+    // Positive control: two different networks go through.
+    assert!(matches!(
+        exec.execute(
+            rules_update(two_route_book("10.0.0.0/24", "10.0.1.0/24", "")),
+            baseline
+        ),
+        MutationOutcome::Completed(_)
+    ));
+
+    // Saved before the refusal existed: stored as it was, past today's gate.
+    let (exec, conn) = build_test_executor();
+    conn.lock()
+        .expect("db")
+        .execute(
+            "INSERT INTO revisions (
+                principal, revision_id, content_hash, rules_json, status, source,
+                correlation_id, created_at, activated_at
+             ) VALUES (?1, 'rev-tie', 'h-tie', ?2, 'active', 'gui-rules-edit', 'c', 1, 1)",
+            rusqlite::params![baseline, tie],
+        )
+        .expect("insert");
+    assert!(matches!(
+        exec.execute(
+            rules_update(two_route_book(
+                "10.0.0.0/24",
+                "10.0.0.0/24",
+                "added.example"
+            )),
+            baseline
+        ),
+        MutationOutcome::Completed(_)
+    ));
 }

@@ -1,0 +1,19 @@
+{
+  "description": "pure.js refusalDetail: the named sentence of a refused network, or null for the code's own text",
+  "cases": [
+    { "name": "tunnel server", "input": { "code": "network-covers-link", "args": { "network": "10.0.0.0/8", "covers": "198.51.100.7", "covers-kind": "tunnel-server" } },
+      "expected": { "key": "errors.network-covers-link-tunnel-server", "values": [["network", "10.0.0.0/8"], ["covers", "198.51.100.7"]] } },
+    { "name": "local network", "input": { "code": "network-covers-link", "args": { "network": "192.0.2.0/24", "covers": "192.0.2.0/25", "covers-kind": "local-network" } },
+      "expected": { "key": "errors.network-covers-link-local-network", "values": [["network", "192.0.2.0/24"], ["covers", "192.0.2.0/25"]] } },
+    { "name": "unknown kind", "input": { "code": "network-covers-link", "args": { "network": "10.0.0.0/8", "covers": "x", "covers-kind": "other" } }, "expected": null },
+    { "name": "link without covers", "input": { "code": "network-covers-link", "args": { "network": "10.0.0.0/8", "covers-kind": "tunnel-server" } }, "expected": null },
+    { "name": "fake-ip pool", "input": { "code": "network-covers-fake-ip-pool", "args": { "network": "198.18.0.0/15" } },
+      "expected": { "key": "errors.network-covers-fake-ip-pool-named", "values": [["network", "198.18.0.0/15"]] } },
+    { "name": "no network", "input": { "code": "network-covers-fake-ip-pool", "args": { "covers": "x" } }, "expected": null },
+    { "name": "one network on both routes", "input": { "code": "network-on-both-routes", "args": { "network": "10.0.0.0/24" } },
+      "expected": { "key": "errors.network-on-both-routes-named", "values": [["network", "10.0.0.0/24"]] } },
+    { "name": "no args", "input": { "code": "network-covers-link", "args": {} }, "expected": null },
+    { "name": "another code", "input": { "code": "rule-cap-exceeded", "args": { "network": "10.0.0.0/8" } }, "expected": null },
+    { "name": "empty network", "input": { "code": "network-covers-fake-ip-pool", "args": { "network": "" } }, "expected": null }
+  ]
+}

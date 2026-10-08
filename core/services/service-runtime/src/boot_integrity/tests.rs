@@ -16,14 +16,13 @@ use crate::state::ServiceRuntimeState;
 const NOW: i64 = 1_745_000_000_000;
 const OUTAGE_KIND: &str = "integrity_check_unavailable";
 
-fn open_state() -> Arc<Mutex<Connection>> {
-    let path = tempfile::tempdir()
-        .expect("tempdir")
-        .keep()
-        .join("state.db");
-    let runner = SqliteMigrationRunner::for_state_db(open_connection(&path).expect("open"));
+fn open_state() -> (tempfile::TempDir, Arc<Mutex<Connection>>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = SqliteMigrationRunner::for_state_db(
+        open_connection(&dir.path().join("state.db")).expect("open"),
+    );
     runner.run_pending_migrations().expect("migrate");
-    Arc::new(Mutex::new(runner.into_connection()))
+    (dir, Arc::new(Mutex::new(runner.into_connection())))
 }
 
 fn seed_signed_row(conn: &Arc<Mutex<Connection>>) {
@@ -228,7 +227,7 @@ fn every_bootstrap_failure_is_raised_audited_and_left_unsigned() {
         ),
     ];
     for (name, key_store, seed_rows, source) in cases {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         if seed_rows {
             seed_signed_row(&conn);
         }
@@ -252,7 +251,7 @@ fn every_bootstrap_failure_is_raised_audited_and_left_unsigned() {
 
 #[test]
 fn a_broken_alert_store_turns_the_health_report_degraded() {
-    let conn = open_state();
+    let (_dir, conn) = open_state();
     let key_store = FaultyKeyStore {
         fail_load: true,
         ..Default::default()
@@ -316,7 +315,7 @@ fn an_outage_without_an_audit_trail_is_still_raised() {
 
 #[test]
 fn a_healthy_bootstrap_reports_no_outage() {
-    let conn = open_state();
+    let (_dir, conn) = open_state();
     let h = Harness::new(Arc::new(InMemorySecurityAlertsRepository::new()));
     assert!(h
         .boot(NOW)

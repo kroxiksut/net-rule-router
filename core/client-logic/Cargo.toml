@@ -1,0 +1,29 @@
+[package]
+name = "nrr-client-logic"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Client-side decisions for a client without QML (the terminal UI): the same
+# pure functions the GUI keeps in `apps/desktop/qml/lib/*.js`, over the wire
+# DTOs of nrr-shared. No I/O, no IPC. `tests/parity.rs` runs the JS twins and
+# this port through one set of vectors, so the two cannot drift silently.
+#
+# Runtime dependency: nrr-shared only; `tests/dependency_boundary.rs` holds it.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nrr-shared = { path = "../../shared/contracts" }
+serde_json = "1"
+
+[dev-dependencies]
+# An in-process JS engine for the parity harness: the GUI's own pure.js and
+# rules.js run against the vectors, with no node or Qt on the test machine.
+boa_engine = { version = "0.21", default-features = false }
+
+[lints]
+workspace = true

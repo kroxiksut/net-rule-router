@@ -225,6 +225,10 @@ pub struct SecondaryRouteCoordinator {
     /// a legitimately-absent secondary (VPN off) repeats every reconcile.
     /// Re-logs when the live adapter landscape actually changes.
     not_found_logged: Mutex<HashMap<String, (String, String)>>,
+    /// When each `(sid, role)` binding was first found missing, so a device
+    /// the OS is still switching off is not announced as removed.
+    gone_since: Mutex<HashMap<String, (String, std::time::Instant)>>,
+    gone_grace: std::time::Duration,
     /// latch backing the once-per-transition dedup of the
     /// "bound adapter found but NOT usable" WARN. Keyed by `"{sid}|{role}"` →
     /// the `stable_id` currently latched not-usable. A flapping adapter (e.g.
@@ -234,9 +238,9 @@ pub struct SecondaryRouteCoordinator {
     /// usable again (see [`Self::clear_not_usable`]), so the NEXT
     /// usable→not-usable transition warns again.
     not_usable_logged: Mutex<HashMap<String, String>>,
-    /// Last enforcement status published per SID, so the push fires on change
-    /// instead of at reconcile cadence.
-    enforcement_status: Mutex<HashMap<String, String>>,
+    /// Last enforcement status per SID and role: the push fires on change
+    /// instead of at reconcile cadence, and the connect-time snapshot reads it.
+    enforcement_status: crate::app_enforcement_status::RouteEnforcementStatus,
     /// When each SID was last told a tunnel is up with no additional route
     /// assigned, keyed by `"{sid}|{adapter}"`. Resolve runs at reconcile
     /// cadence — hundreds of times an hour — so without this the reminder would

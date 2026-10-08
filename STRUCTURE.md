@@ -14,6 +14,7 @@ Maintenance rules:
 ### apps/
 Application entry points and UI shells:
 - **`apps/cli`** — Administrative console crate (`nrr-cli`): service lifecycle management, diagnostics, and network recovery. Never mutates policy.
+- **`apps/tui`** — Terminal interface crate (`nrr-tui`): the GUI's screens for a live terminal, full-screen or line mode (`--plain`) for screen readers; refuses to run without a terminal. No Qt.
 - **`apps/desktop`** — Desktop runtime: Rust launcher process that spawns the C++ Qt host, Rust library crates for UI integration (`gui`, `tray`, `broker`), and build-only crate (`qt-host`) that compiles the C++ native host. Produces three binaries: `NetRuleRouter.exe` (main GUI), `NetRuleRouterTray.exe` (system tray), and `nrr_qt_native_host.exe` (C++ Qt rendering host).
   - `launcher` — User-facing Rust entry point, single-instance lock holder, preferences persistence, child process lifecycle. Also a library (`nrr_launcher`) consumed by tests and the broker
   - `gui` — GUI context and preference round-trip library
@@ -38,6 +39,7 @@ Core product domain logic and service runtime:
 - **`core/storage-sidecar`** — GUI-owned SQLite sidecar (rule labels, passthrough, not-yet-applied edits); never holds routing policy
 - **`core/diagnostics`** — Audit logs, operational logs, retention, archive generation
 - **`core/ipc-client`** — IPC client (named pipe on Windows, `AF_UNIX` socket on Unix) the GUI, tray, console and broker use to reach the service; depends on `contracts` only
+- **`core/client-logic`** — Client-side decisions of the GUI's `qml/lib/*.js` (rules-table wire form, rules files, route-policy request, adapter eligibility, placeholders) for clients without QML; pure functions, depends on `contracts` only, parity with the JS pinned by shared test vectors
 - **`core/ui-support`** — UI-runtime-only modules (theme, first-run flow, preferences, tray)
 - **`core/mock-backend`** — Preview/mock snapshots for development
 
@@ -111,6 +113,7 @@ Working documents that stay out of the published repository (architecture and te
 
 Cargo workspace with these primary crates:
 - `nrr-cli` — Console tool (apps/cli)
+- `nrr-tui` — Terminal interface (apps/tui)
 - `nrr-launcher` — Desktop app entry point (apps/desktop/launcher)
 - `nrr-desktop-gui` — GUI library (apps/desktop/gui)
 - `nrr-desktop-tray` — Tray library (apps/desktop/tray)
@@ -130,6 +133,7 @@ Cargo workspace with these primary crates:
 - `nrr-storage-sidecar` — GUI-owned SQLite sidecar
 - `nrr-diagnostics` — Audit and logs
 - `nrr-ipc-client` — IPC communication
+- `nrr-client-logic` — Client-side decisions shared with the GUI's JS
 - `nrr-ui-support` — UI runtime support
 - `nrr-mock-backend` — Preview/mock snapshots
 - `nrr-shared` — Contracts and shared types
@@ -143,6 +147,7 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - Desktop binaries: `apps/desktop/launcher` produces both `NetRuleRouter.exe` and `NetRuleRouterTray.exe` via separate `[[bin]]` entries
 - Service binary: `core/services/windows-service/` produces `nrr-service.exe` (Windows background service); `core/services/linux-service/` produces `nrr-serviced` with an `nrr-service` alias (the `d` suffix is the Unix convention, the alias keeps cross-platform scripts on one name)
 - Console binary: `apps/cli/` produces `nrr-cli.exe` (administrative tool)
+- Terminal interface binary: `apps/tui/` produces `nrr-tui.exe` / `nrr-tui`
 - C++ Qt host: `apps/desktop/qt-host/` is build-only (drives CMake, produces `nrr_qt_native_host.exe`)
 
 **Developer scripts** (in `scripts/`):
@@ -173,6 +178,7 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 
 - `apps/desktop/launcher` can depend on: `gui/`, `tray/`, `broker/`, `qt-host/`, `application/`, `ui-support/`, `mock-backend/`, `contracts/`, `ipc-client/`, `storage-sidecar/`, `platform-api/` and the platform crate of the target OS
 - `apps/cli` can depend on: `platform-api/`, `contracts/`, `ipc-client/`, plus the platform crate of the target OS
+- `apps/tui` can depend on: `client-logic/`, `ipc-client/`, `contracts/`, `platform-api/`, plus the platform crate of the target OS
 - `services/*-service` can depend on: `service-runtime/`, `contracts/`, `platform/`
 - `service-runtime` can depend on: `platform/`, `domain/`, `contracts/`, `storage/`, `diagnostics/`
 - `platform-api/` and the per-OS platform crates can depend on: `domain/`, `contracts/`
@@ -180,6 +186,7 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `storage-sidecar/` can depend on: `sqlite-support/` only
 - `sqlite-support/` depends on no `nrr-*` crate
 - `domain/` can depend on: `contracts/` only
+- `client-logic/` can depend on: `contracts/` only
 
 ### Forbidden Dependencies
 
@@ -191,6 +198,8 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `storage-sidecar/` must not depend on `storage/`: the two meet in `sqlite-support/`
 - `ipc-client/` must not depend on `service-runtime` at runtime (forces wire-protocol SSOT in contracts)
 - `apps/cli` and `ipc-client/` must not reach `application/`, `ui-support/`, `mock-backend/` or any desktop crate at any depth (`apps/cli/tests/dependency_boundary.rs`)
+- `client-logic/` must not reach any desktop, launcher, IPC-client or service crate at any depth (`core/client-logic/tests/dependency_boundary.rs`)
+- `apps/tui` must not reach Qt, desktop, launcher, broker or service crates at any depth (`apps/tui/tests/dependency_boundary.rs`)
 - `nftlink` must not depend on any `nrr-*` crate, so it can be published on its own (enforced by `core/platform/nftlink/tests/independence.rs`)
 
 ## Key Design Invariants

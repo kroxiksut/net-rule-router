@@ -495,17 +495,13 @@ ColumnLayout {
         if (filterRoute !== "all" && String(item.targetRoute || "") !== filterRoute) return false
         if (filterAutoAddedOnly && String(item.originReason || "") === "") return false
         if (searchText !== "") {
-            // Normalize the search NEEDLE the same way the add dialog
-            // normalizes a rule value, so pasting a full URL (e.g.
-            // `https://www.whatismyip.com/`) finds the stored `whatismyip.com`
-            // rule. Guarded/soft: for plain typing it is a no-op (only URL-shaped
-            // text is rewritten), and it falls back to the raw text if the dialog
-            // helper is unreachable. Only the internal needle is normalized — the
-            // visible search box is left exactly as the user typed it.
-            var needle = ((root && root.ruleDialog
-                    && typeof root.ruleDialog.normalizeHostInput === "function")
-                ? root.ruleDialog.normalizeHostInput("domain", searchText)
-                : searchText).toLowerCase()
+            // The needle is normalized like a rule value too, for URL-shaped
+            // text without a scheme (`site.com/page`), which the search box
+            // leaves as typed.
+            var typed = String(searchText).trim().toLowerCase()
+            var needle = String(Rules.normalizeHostInput("domain", typed))
+            // Bare punctuation (`/`) normalizes to nothing, which would match all.
+            if (needle === "") needle = typed
             // Search across both the Unicode value the
             // user typed and its precomputed lowercase ACE form, so
             // typing `xn--p1ai` finds `рф` and vice versa. Rows from
@@ -515,8 +511,7 @@ ColumnLayout {
                 + String(item.comment || "")).toLowerCase()
             // The text as typed too: a subnet's `/` and an IPv6 address's
             // `:` read as URL punctuation to the host normalizer above.
-            if (hay.indexOf(needle) < 0
-                    && hay.indexOf(String(searchText).trim().toLowerCase()) < 0) return false
+            if (hay.indexOf(needle) < 0 && hay.indexOf(typed) < 0) return false
         }
         return true
     }
@@ -874,53 +869,59 @@ ColumnLayout {
     // Hidden entirely once neither is true and the service is reachable —
     // nothing to say when everything genuinely matches. "Check now" moved to
     // the sidebar's Rules submenu, so it no longer lives in this row.
-    Flow {
+    Item {
         Layout.fillWidth: true
-        spacing: root.uiTheme.spacingSm
         visible: root.rulesNotAppliedToService || root.rulesNotSavedToFile
             || !root.backendStatus || root.backendStatus.kind !== "connected"
+        Layout.preferredHeight: rulesStateFlow.height
+        Flow {
+            id: rulesStateFlow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingSm
 
-        Label {
-            text: (root.rulesNotAppliedToService || root.rulesNotSavedToFile)
-                ? root.tr("rules.state.pending-label", "Pending:")
-                : (!root.backendStatus || root.backendStatus.kind !== "connected")
-                    ? root.tr("rules.state.unknown",
-                        "Not verified — the service isn't reachable right now.")
-                    : root.tr("rules.state.in-sync",
-                        "The rules match the service and your rules file.")
-            color: (root.rulesNotAppliedToService || root.rulesNotSavedToFile)
-                ? root.textColor : root.mutedTextColor
-            // Padded to the button height so the row reads as one line; the
-            // Flow top-aligns its children.
-            topPadding: root.uiTheme.spacingXs
-            bottomPadding: root.uiTheme.spacingXs
-            verticalAlignment: Text.AlignVCenter
-            Accessible.role: Accessible.StaticText
-            Accessible.name: text
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            visible: root.rulesNotAppliedToService
-            text: root.tr("rules.state.not-applied", "Not applied to the service")
-            icon.source: root.uiIconSource("apply")
-            enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            ToolTip.visible: hovered && root.prefs.tooltipsEnabled
-            ToolTip.text: root.tr("rules.state.not-applied-tooltip",
-                "The rules shown here differ from the ones the service is enforcing. Apply them.")
-            onClicked: section._triggerReviewFlow()
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            visible: root.rulesNotSavedToFile
-            text: root.tr("status.bound-file-save", "Save to file")
-            icon.source: root.uiIconSource("save")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            ToolTip.visible: hovered && root.prefs.tooltipsEnabled
-            ToolTip.text: root.boundFilesController._boundFileChipTooltip()
-            onClicked: root.boundFilesController._saveBoundFilesNow()
+            Label {
+                text: (root.rulesNotAppliedToService || root.rulesNotSavedToFile)
+                    ? root.tr("rules.state.pending-label", "Pending:")
+                    : (!root.backendStatus || root.backendStatus.kind !== "connected")
+                        ? root.tr("rules.state.unknown",
+                            "Not verified — the service isn't reachable right now.")
+                        : root.tr("rules.state.in-sync",
+                            "The rules match the service and your rules file.")
+                color: (root.rulesNotAppliedToService || root.rulesNotSavedToFile)
+                    ? root.textColor : root.mutedTextColor
+                // Padded to the button height so the row reads as one line; the
+                // Flow top-aligns its children.
+                topPadding: root.uiTheme.spacingXs
+                bottomPadding: root.uiTheme.spacingXs
+                verticalAlignment: Text.AlignVCenter
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                visible: root.rulesNotAppliedToService
+                text: root.tr("rules.state.not-applied", "Not applied to the service")
+                icon.source: root.uiIconSource("apply")
+                enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+                ToolTip.text: root.tr("rules.state.not-applied-tooltip",
+                    "The rules shown here differ from the ones the service is enforcing. Apply them.")
+                onClicked: section._triggerReviewFlow()
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                visible: root.rulesNotSavedToFile
+                text: root.tr("status.bound-file-save", "Save to file")
+                icon.source: root.uiIconSource("save")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+                ToolTip.text: root.boundFilesController._boundFileChipTooltip()
+                onClicked: root.boundFilesController._saveBoundFilesNow()
+            }
         }
     }
 
@@ -1632,9 +1633,9 @@ ColumnLayout {
         if (root.rulesModel) {
             for (var i = 0; i < root.rulesModel.count; i += 1) {
                 var entry = root.rulesModel.get(i)
-                // A "block" rule nominally lives in the secondary bucket; its
-                // action:"block" field (set by the serializer) overrides route.
-                var bucket = (entry.targetRoute === "secondary" || entry.targetRoute === "block")
+                // Pseudo-routes live in the secondary bucket; their `action`
+                // field (set by the serializer) overrides routing.
+                var bucket = (Rules.routeBucket(entry.targetRoute) === "secondary")
                     ? secondary : primary
                 bucket.push(Rules.ruleRowToWireDto(entry, ace))
             }
@@ -1854,7 +1855,20 @@ ColumnLayout {
                 ? root.tr("rules.search.placeholder", "Search by match value or comment")
                 : ""
             text: section.searchText
-            onTextChanged: section.searchText = text
+            onTextChanged: {
+                // A URL pasted from a browser is cleaned the way the add dialog
+                // cleans it. Only scheme-prefixed text: the host normalizer
+                // reads a subnet's `/` and an IPv6 address's `:` as URL parts.
+                if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(text)) {
+                    var norm = Rules.normalizeHostInput("domain", text)
+                    if (norm !== text) {
+                        text = norm    // re-enters with clean text and stores it
+                        text = Qt.binding(function() { return section.searchText })
+                        return
+                    }
+                }
+                section.searchText = text
+            }
             // Live search; explicit Search button below also commits the
             // current value (no-op other than clearing focus, since live
             // filtering already runs on every key press).
@@ -2009,7 +2023,7 @@ ColumnLayout {
             id: routeFilterCombo
             theme: root.uiTheme
             implicitWidth: 200
-            model: [ "all", "primary", "secondary", "block" ]
+            model: [ "all", "primary", "secondary", "verify", "block" ]
             function routeLabelFor(id) {
                 if (id === "all") return root.tr("rules.filter.route.all", "All routes")
                 return root.routeLabel(id)
@@ -2545,13 +2559,22 @@ ColumnLayout {
                     Label {
                         Layout.preferredWidth: section.colRouteWidth
                         Layout.alignment: Qt.AlignVCenter
-                        // routeLabel resolves primary/secondary/block; do NOT
-                        // use a binary ternary (block would mislabel as
-                        // Secondary via the fall-through).
+                        // routeLabel resolves primary/secondary/verify/block; do
+                        // NOT use a binary ternary (a pseudo-route would
+                        // mislabel as Secondary via the fall-through).
                         text: root.routeLabel(model.targetRoute)
                         color: root.textColor
                         wrapMode: Text.WordWrap
                         opacity: model.enabled ? 1.0 : 0.5
+                        // The label names the order; how the switch happens
+                        // is worth a hover.
+                        HoverHandler { id: routeCellHover }
+                        ToolTip.visible: routeCellHover.hovered && model.targetRoute === "verify"
+                        ToolTip.delay: 400
+                        ToolTip.text: root.uiRevision >= 0 && model.targetRoute === "verify"
+                            ? root.tr("dialog.rule.route-verify-hint",
+                                "Opens through the primary route first. Once NetRuleRouter confirms the primary route cannot reach the site, the rule moves to the additional route by itself.")
+                            : ""
                     }
                     // Compact per-row enable toggle. Was
                     // the leftmost column; moved here so the leading

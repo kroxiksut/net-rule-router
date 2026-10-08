@@ -45,7 +45,7 @@ $targetRoot = Resolve-TargetRoot $root
 $exePath = Resolve-RepoServiceBinary -TargetRoot $targetRoot -Mode $Profile
 if (-not $exePath) {
     Write-Host "Service binary not found under $targetRoot" -ForegroundColor Yellow
-    $buildArgs = @('build', '-p', 'nrr-windows-service', '-p', 'nrr-cli')
+    $buildArgs = @('build', '-p', 'nrr-windows-service', '-p', 'nrr-cli', '-p', 'nrr-tui')
     if ($Profile -eq 'release') { $buildArgs += '--release' }
     Write-Host "Building (cargo $($buildArgs -join ' '))..." -ForegroundColor Cyan
     Push-Location $root
@@ -64,10 +64,13 @@ $buildDir = Join-Path $targetRoot $(if ($Profile -eq 'release') { 'release' } el
 # The console is staged next to the service because it registers the service it
 # finds beside itself, which is how the SCM ends up pointing here and not at
 # the build tree. wintun.dll travels with them: the service checks it by hash
-# and, in release, looks for it only next to its own binary.
+# and, in release, looks for it only next to its own binary. The terminal
+# interface rides along when built, so an administrator terminal finds both
+# consoles in one place.
 $payload = @(
     @{ Name = 'nrr-service.exe'; From = (Join-Path $buildDir 'nrr-service.exe'); Required = $true },
     @{ Name = 'nrr-cli.exe';     From = (Join-Path $buildDir 'nrr-cli.exe');     Required = $true },
+    @{ Name = 'nrr-tui.exe';     From = (Join-Path $buildDir 'nrr-tui.exe');     Required = $false },
     @{ Name = 'wintun.dll';      From = (Join-Path $root 'third_party\wintun\bin\amd64\wintun.dll'); Required = $true }
 )
 

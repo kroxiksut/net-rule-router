@@ -10,6 +10,12 @@ targets = [
 
 [advisories]
 yanked = "deny"
+ignore = [
+  # `paste` is unmaintained, not vulnerable: a build-time macro reached only
+  # through `boa_engine`, the JS engine the client-logic parity TESTS run the
+  # GUI's own scripts in. Nothing shipped links it.
+  { id = "RUSTSEC-2024-0436", reason = "test-only: boa_engine dev-dependency of nrr-client-logic" },
+]
 
 [licenses]
 version = 2

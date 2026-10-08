@@ -17,8 +17,10 @@ use crate::boot_integrity::{AuditTrail, BootIntegrity};
 use crate::health::HealthAggregator;
 
 /// Whether the database was committed to by another connection since the
-/// last look. The first look only records where it stands: the boot sweep
-/// has just checked that state.
+/// last look. Built right after the boot sweep, so it starts from the state
+/// the sweep checked: a commit between the sweep and the first poll counts.
+/// The service's own other connections move it too; the recheck that costs
+/// is a few HMACs, off the traffic path, at most once a poll.
 pub struct OutsideWrites {
     conn: Arc<Mutex<Connection>>,
     seen: Option<i64>,
@@ -27,18 +29,23 @@ pub struct OutsideWrites {
 impl OutsideWrites {
     #[must_use]
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn, seen: None }
+        let mut writes = Self { conn, seen: None };
+        // Unreadable now: the first poll that reads it only records.
+        writes.seen = writes.version().ok();
+        writes
+    }
+
+    fn version(&self) -> Result<i64, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
     }
 
     /// `Err` when the version cannot be read; the last one seen is kept.
     pub fn changed(&mut self) -> Result<bool, rusqlite::Error> {
-        let version: i64 = {
-            let conn = self
-                .conn
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            conn.query_row("PRAGMA data_version", [], |row| row.get(0))?
-        };
+        let version = self.version()?;
         Ok(self
             .seen
             .replace(version)
@@ -115,10 +122,7 @@ mod tests {
             .expect("table");
         let mut writes = OutsideWrites::new(Arc::clone(&own));
 
-        assert!(
-            !writes.changed().expect("first look"),
-            "first look only records"
-        );
+        assert!(!writes.changed().expect("first look"), "nothing since");
         own.lock()
             .expect("own")
             .execute("INSERT INTO t VALUES (1)", [])
@@ -131,5 +135,24 @@ mod tests {
             .expect("outside write");
         assert!(writes.changed().expect("after outside write"));
         assert!(!writes.changed().expect("nothing since"));
+    }
+
+    /// The watch starts where the boot sweep left off: an edit landing before
+    /// its first poll is still an edit.
+    #[test]
+    fn a_commit_before_the_first_poll_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nrr_service_state.db");
+        let own = Arc::new(Mutex::new(open_connection(&path).expect("own")));
+        own.lock()
+            .expect("own")
+            .execute_batch("CREATE TABLE t (v INTEGER);")
+            .expect("table");
+        let mut writes = OutsideWrites::new(Arc::clone(&own));
+        open_connection(&path)
+            .expect("other")
+            .execute("INSERT INTO t VALUES (1)", [])
+            .expect("outside write");
+        assert!(writes.changed().expect("first poll"));
     }
 }

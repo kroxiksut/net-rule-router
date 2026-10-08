@@ -654,6 +654,12 @@ struct ControllerInner {
     /// The last arm was refused because nobody is signed in: the watchdog
     /// leaves it to the sign-in event, which comes through `start`.
     awaiting_sign_in: bool,
+    /// "Is anyone signed in?" — the question the arm was refused on, asked
+    /// again without building a resolver.
+    sign_in_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// No sign-in event will come (no observer, or it failed to register):
+    /// the watchdog asks the probe instead.
+    poll_sign_in: bool,
 }
 
 impl DnsResolverController {
@@ -673,6 +679,46 @@ impl DnsResolverController {
     /// Called once during boot wiring, before any live `apply`.
     pub fn set_factory(&self, factory: DnsResolverFactory) {
         self.lock().factory = Some(factory);
+    }
+
+    /// Installs the cheap "is anyone signed in" check an arm waiting for a
+    /// sign-in is retried on.
+    pub fn set_sign_in_probe(&self, probe: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.lock().sign_in_probe = Some(probe);
+    }
+
+    /// No sign-in event reaches this controller: let the watchdog tick arm
+    /// a waiting resolver once the probe sees a user.
+    pub fn poll_for_sign_in(&self) {
+        self.lock().poll_sign_in = true;
+    }
+
+    /// Arm a resolver that is waiting for a sign-in, if a user is signed in
+    /// now. For the moment an event source comes up: a sign-in that landed
+    /// before it was listening would otherwise never arrive.
+    pub fn arm_if_signed_in(&self) {
+        let mut inner = self.lock();
+        Self::arm_on_sign_in_locked(&mut inner);
+    }
+
+    /// Clear the sign-in wait and arm when the probe sees a user. `false`
+    /// when not waiting, or still nobody.
+    fn arm_on_sign_in_locked(inner: &mut ControllerInner) -> bool {
+        if inner.disarmed || !inner.desired || !inner.awaiting_sign_in {
+            return false;
+        }
+        if !inner.sign_in_probe.as_ref().is_some_and(|probe| probe()) {
+            return false;
+        }
+        tracing::info!(
+            target: "nrr::dns-resolver",
+            msg_key = "dns-resolver-signed-in-arm",
+            "Mode B: a user is signed in — arming the resolver that was waiting for one",
+        );
+        inner.awaiting_sign_in = false;
+        inner.restart_cooldown = 0;
+        Self::start_locked(inner);
+        true
     }
 
     /// Idempotently reconcile the running resolver to `mode`: `Resolver` → ensure
@@ -777,10 +823,31 @@ impl DnsResolverController {
     /// or while backing off after a failed re-arm. Idempotent and cheap.
     pub fn tick(&self) {
         let mut inner = self.lock();
-        if inner.disarmed || !inner.desired || inner.awaiting_sign_in {
+        Self::tick_locked(&mut inner);
+    }
+
+    /// [`Self::tick`] that gives way when a start or stop holds the controller:
+    /// for callers that may run on a thread such a stop is joining.
+    pub fn try_tick(&self) {
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        Self::tick_locked(&mut inner);
+    }
+
+    fn tick_locked(inner: &mut ControllerInner) {
+        if inner.disarmed || !inner.desired {
             return;
         }
-        Self::reap_finished(&mut inner);
+        if inner.awaiting_sign_in {
+            if inner.poll_sign_in {
+                Self::arm_on_sign_in_locked(inner);
+            }
+            return;
+        }
+        Self::reap_finished(inner);
         if inner.running.is_some() {
             inner.restart_cooldown = 0; // healthy — clear any backoff
             return;
@@ -795,7 +862,7 @@ impl DnsResolverController {
             "Mode B: resolver is enabled but its serve thread has exited — re-arming (watchdog)",
         );
         inner.restart_cooldown = RESOLVER_RESTART_BACKOFF_TICKS;
-        Self::start_locked(&mut inner);
+        Self::start_locked(inner);
     }
 
     fn start_locked(inner: &mut ControllerInner) {
@@ -2014,5 +2081,66 @@ mod tests {
 
         controller.start();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "sign-in arms again");
+    }
+
+    /// A controller refusing for "nobody signed in" whose probe answers
+    /// `signed`, with the factory call count.
+    fn waiting_for_sign_in(
+        signed: &Arc<AtomicBool>,
+    ) -> (DnsResolverController, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let controller = DnsResolverController::new();
+        controller.set_factory(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(ArmRefusal::AwaitingSignIn)
+        }));
+        let probe = Arc::clone(signed);
+        controller.set_sign_in_probe(Arc::new(move || probe.load(Ordering::SeqCst)));
+        controller.apply(EnforcementMode::Resolver);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        (controller, calls)
+    }
+
+    /// A sign-in that lands before the event source is listening is never
+    /// reported; the moment the source comes up asks once instead.
+    #[test]
+    fn a_sign_in_before_the_observer_listens_still_arms() {
+        let signed = Arc::new(AtomicBool::new(false));
+        let (controller, calls) = waiting_for_sign_in(&signed);
+        controller.arm_if_signed_in();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "nobody yet: no arm");
+
+        signed.store(true, Ordering::SeqCst);
+        controller.arm_if_signed_in();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the missed sign-in armed nothing"
+        );
+    }
+
+    /// With no sign-in event coming, the watchdog asks the probe: it retries
+    /// once a user is there, and never before.
+    #[test]
+    fn without_a_sign_in_event_the_watchdog_arms_once_a_user_is_there() {
+        let signed = Arc::new(AtomicBool::new(false));
+        let (controller, calls) = waiting_for_sign_in(&signed);
+        controller.tick();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no polling unless asked");
+
+        controller.poll_for_sign_in();
+        for _ in 0..3 {
+            controller.try_tick();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "armed with nobody signed in"
+        );
+
+        signed.store(true, Ordering::SeqCst);
+        controller.try_tick();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the watchdog never armed");
     }
 }

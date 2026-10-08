@@ -280,6 +280,9 @@ fn read_name(message: &[u8], start: usize) -> Result<(String, usize), DnsDecodeE
         let from = at + 1;
         let to = from + length;
         let label = message.get(from..to).ok_or(DnsDecodeError::Truncated)?;
+        if !nrr_shared::dns_name::is_learnable_label(label) {
+            return Err(DnsDecodeError::MalformedName);
+        }
         total += length + 1;
         if total > MAX_NAME {
             return Err(DnsDecodeError::MalformedName);
@@ -343,6 +346,20 @@ mod tests {
 
     fn response(id: u16, answers: &[Vec<u8>], rcode: u16) -> Vec<u8> {
         response_of(id, answers, rcode, TYPE_A)
+    }
+
+    /// A name carrying markup is not learned: the answer is refused whole.
+    #[test]
+    fn a_name_with_markup_is_refused() {
+        let mut m = header(7, 0x8180, 1, 1);
+        m.extend_from_slice(&name(&["a<b>", "example"]));
+        m.extend_from_slice(&TYPE_A.to_be_bytes());
+        m.extend_from_slice(&CLASS_IN.to_be_bytes());
+        m.extend_from_slice(&a_record(60, [203, 0, 113, 1]));
+        assert!(matches!(
+            decode_response(&m, 7, "a<b>.example", AddressFamily::Ipv4),
+            Err(DnsDecodeError::MalformedName)
+        ));
     }
 
     fn response_of(id: u16, answers: &[Vec<u8>], rcode: u16, qtype: u16) -> Vec<u8> {

@@ -1,0 +1,140 @@
+{
+  "description": "pure.js routePolicyChangedKeys: the fields an apply-only write names",
+  "cases": [
+    {
+      "name": "nothing changed",
+      "input": {
+        "base": {
+          "mode": "prefer-primary",
+          "kill-switch-enabled": false
+        },
+        "request": {
+          "mode": "prefer-primary",
+          "kill-switch-enabled": false
+        }
+      }
+    },
+    {
+      "name": "one flag flipped",
+      "input": {
+        "base": {
+          "kill-switch-enabled": false,
+          "doh-lockdown-enabled": true
+        },
+        "request": {
+          "kill-switch-enabled": true,
+          "doh-lockdown-enabled": true
+        }
+      }
+    },
+    {
+      "name": "a slot unbound",
+      "input": {
+        "base": {
+          "primary": {
+            "stable-id": "a"
+          },
+          "mode": "prefer-primary"
+        },
+        "request": {
+          "mode": "prefer-primary"
+        }
+      }
+    },
+    {
+      "name": "a slot bound",
+      "input": {
+        "base": {
+          "mode": "prefer-primary"
+        },
+        "request": {
+          "mode": "prefer-primary",
+          "secondary": {
+            "stable-id": "b",
+            "user-confirmed": true
+          }
+        }
+      }
+    },
+    {
+      "name": "provenance is not a change",
+      "input": {
+        "base": {
+          "binding-source": "recovery",
+          "mode": "x"
+        },
+        "request": {
+          "binding-source": "user-assigned",
+          "mode": "x"
+        }
+      }
+    },
+    {
+      "name": "sorted names",
+      "input": {
+        "base": {
+          "zone-priority-over-ip": false,
+          "auto-rules-mode": "suggest"
+        },
+        "request": {
+          "zone-priority-over-ip": true,
+          "auto-rules-mode": "auto"
+        }
+      }
+    },
+    {
+      "name": "an earlier apply-only is not itself a change",
+      "input": {
+        "base": {
+          "mode": "x"
+        },
+        "request": {
+          "mode": "x",
+          "apply-only": [
+            "mode"
+          ]
+        }
+      }
+    },
+    {
+      "name": "empty base, full request",
+      "input": {
+        "base": {},
+        "request": {
+          "mode": "prefer-primary",
+          "kill-switch-enabled": true
+        }
+      }
+    },
+    {
+      "name": "a number field changed",
+      "input": {
+        "base": {
+          "kill-switch-protocols": 127,
+          "primary-probe-timeout-ms": 1500
+        },
+        "request": {
+          "kill-switch-protocols": 3,
+          "primary-probe-timeout-ms": 1500
+        }
+      }
+    },
+    {
+      "name": "a binding renamed only",
+      "input": {
+        "base": {
+          "primary": {
+            "stable-id": "a",
+            "display-name": "Wi-Fi"
+          }
+        },
+        "request": {
+          "primary": {
+            "stable-id": "a",
+            "display-name": "Wireless"
+          }
+        }
+      }
+    }
+  ]
+}

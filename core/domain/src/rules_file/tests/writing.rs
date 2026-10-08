@@ -125,6 +125,7 @@ fn write_disabled_entry_with_inline_comment() {
                 inline_comment: Some("was active".to_string()),
                 enabled: false,
                 blocked: false,
+                verify_primary: false,
                 origin: None,
             }],
         }],
@@ -176,6 +177,28 @@ example.com
     let written = write_rules_file(&parsed_first, &[], None);
     let parsed_again = parse_rules_file(&written).parsed;
     assert_eq!(parsed_first, parsed_again);
+}
+
+/// A spaced network is a valid enabled value, so unticking it must not turn it
+/// into a note that the next save drops.
+#[test]
+fn a_disabled_spaced_network_survives_write_and_parse() {
+    let input = "\
+--- CIDR
+# 10.9.0.0 / 16
+--- Ranges
+# 10.0.0.5 - 10.0.0.40
+";
+    let parsed_first = parse_rules_file(input).parsed;
+    assert_eq!(
+        parsed_first.entries_for(RulesFileSection::Ranges).len(),
+        1,
+        "{parsed_first:#?}"
+    );
+    assert_eq!(parsed_first.entries_for(RulesFileSection::Cidr).len(), 1);
+    let written = write_rules_file(&parsed_first, &[], None);
+    let parsed_again = parse_rules_file(&written).parsed;
+    assert_eq!(parsed_first, parsed_again, "written=\n{written}");
 }
 
 #[test]

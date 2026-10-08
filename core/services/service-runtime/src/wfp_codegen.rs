@@ -226,6 +226,10 @@ pub struct CodegenInput<'a> {
     /// twin of `PlannerInput::ipv6`. `V4Only` reproduces the shape from before
     /// IPv6 existed, filter for filter and weight for weight.
     pub families: crate::enforcement_planner::FamilyScope,
+    /// A Block may also drop at the packet layer, which has no user condition
+    /// and so acts for every account: only for the administrator's baseline.
+    /// A user's own Block holds at the connect layer, scoped to that user.
+    pub packet_blocks: bool,
 }
 
 /// Result of one codegen invocation.
@@ -518,6 +522,15 @@ impl CodegenDiagnostic {
                     reason: *reason,
                 })
             }
+            Self::NetworkCarvingOverCap {
+                rule_id,
+                pieces,
+                cap,
+            } => Some(RuleConflict::NetworkCarvingOverCap {
+                rule_id: rule_id.clone(),
+                pieces: *pieces,
+                cap: *cap,
+            }),
             _ => None,
         }
     }
@@ -556,6 +569,15 @@ impl From<crate::rule_conflicts::RuleConflict> for CodegenDiagnostic {
             RuleConflict::UnsupportedRuleShape { rule_id, reason } => {
                 Self::UnsupportedRuleShape { rule_id, reason }
             }
+            RuleConflict::NetworkCarvingOverCap {
+                rule_id,
+                pieces,
+                cap,
+            } => Self::NetworkCarvingOverCap {
+                rule_id,
+                pieces,
+                cap,
+            },
         }
     }
 }
@@ -652,6 +674,7 @@ pub fn generate_filters_with_shapes(
                 &carving,
                 input.app_resolver,
                 input.families,
+                input.packet_blocks,
                 shapes,
                 &mut out,
             );
@@ -775,11 +798,13 @@ struct EmitContext {
     /// passed alongside it so every emitter reached from here answers the
     /// question the same way.
     families: crate::enforcement_planner::FamilyScope,
+    /// A Block also drops at the packet layer (`CodegenInput::packet_blocks`).
+    packet_mirror: bool,
 }
 
 impl EmitContext {
-    /// True when this rule drops traffic (hard block). Block rules additionally
-    /// get a packet-layer (`OUTBOUND_IPPACKET_V4`) mirror per resolved IP so
+    /// True when this rule drops traffic (hard block). In the baseline it also
+    /// gets a packet-layer (`OUTBOUND_IPPACKET_V4`) mirror per resolved IP so
     /// ICMP/other-protocol traffic is dropped, not just TCP/UDP.
     fn is_block(&self) -> bool {
         matches!(self.action, WfpAction::Block)
@@ -799,6 +824,7 @@ fn generate_for_rule(
     carving: &crate::enforcement_planner::NetworkCarving,
     app_resolver: &dyn nrr_platform_api::AppPathResolver,
     families: crate::enforcement_planner::FamilyScope,
+    packet_blocks: bool,
     shapes: RuleShapeSupport,
     out: &mut CodegenOutput,
 ) {
@@ -832,17 +858,19 @@ fn generate_for_rule(
     // A Block rule overrides the route: it drops its destination regardless of
     // which set (primary/secondary) it lives in, using the BASE_BLOCK band.
     let ctx = match rule.action {
-        RuleAction::Route => EmitContext {
+        RuleAction::Route | RuleAction::VerifyPrimary => EmitContext {
             action: WfpAction::Permit,
             base_weight,
             kind_prefix: "",
             families,
+            packet_mirror: false,
         },
         RuleAction::Block => EmitContext {
             action: WfpAction::Block,
             base_weight: BASE_BLOCK,
             kind_prefix: "block-",
             families,
+            packet_mirror: packet_blocks,
         },
     };
 
@@ -1319,7 +1347,7 @@ fn emit_network_filters(
         let mut spec = network_spec(*piece, false, ctx.action, weight, id);
         spec.user_sid = Some(sid.to_string());
         out.filters.push(spec);
-        if ctx.is_block() {
+        if ctx.packet_mirror {
             let id = filter_id_for(sid, role_slug, rule.id.as_str(), &pkt_kind, &target);
             out.filters
                 .push(network_spec(*piece, true, WfpAction::Block, weight, id));
@@ -1406,7 +1434,7 @@ fn emit_packed_ip_filters(
         let mut spec = chunk_spec(&chunk, ale_layer(&chunk), ctx.action, weight, id);
         spec.user_sid = Some(sid.to_string());
         out.filters.push(spec);
-        if ctx.is_block() {
+        if ctx.packet_mirror {
             push_packed_packet_block_mirror(
                 sid, role_slug, rule, &kind, &target, &chunk, weight, out,
             );

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::Connection;
 
 /// Row changes per table, per database path.
@@ -27,6 +28,10 @@ fn key(path: &Path) -> Arc<str> {
 
 /// Count every row `conn` changes against the database at `path`.
 pub fn watch(conn: &Connection, path: &Path) {
+    // A `DELETE` with no `WHERE` takes SQLite's truncate shortcut, which skips
+    // the update hook: a cleared table would never move the ledger. `Ignore`
+    // on a row delete makes it go row by row (and is a no-op otherwise).
+    conn.authorizer(Some(row_by_row_deletes()));
     let db = key(path);
     conn.update_hook(Some(
         move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
@@ -40,6 +45,40 @@ pub fn watch(conn: &Connection, path: &Path) {
             }
         },
     ));
+}
+
+/// `DROP TABLE t` asks for `DropTable(t)` and then `Delete(t)` — the same
+/// question a bare `DELETE FROM t` asks — and `Ignore` there cancels the drop
+/// without an error. So the delete that follows a drop of its table is allowed,
+/// as is any on the schema table.
+fn row_by_row_deletes() -> impl for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static {
+    let mut dropping: Option<String> = None;
+    move |ctx| match ctx.action {
+        AuthAction::DropTable { table_name } | AuthAction::DropTempTable { table_name } => {
+            dropping = Some(table_name.to_owned());
+            Authorization::Allow
+        }
+        AuthAction::Delete { table_name } => {
+            if dropping
+                .take()
+                .is_some_and(|t| t.eq_ignore_ascii_case(table_name))
+                || is_schema_table(table_name)
+            {
+                Authorization::Allow
+            } else {
+                Authorization::Ignore
+            }
+        }
+        _ => {
+            dropping = None;
+            Authorization::Allow
+        }
+    }
+}
+
+fn is_schema_table(name: &str) -> bool {
+    name.get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sqlite_"))
 }
 
 /// Row changes so far per table of the database at `path`.
@@ -97,5 +136,45 @@ mod tests {
         first.execute("UPDATE plan SET x = 2", []).expect("update");
         assert_eq!(changes_outside(&path, &["journal"]), start + 2);
         assert_eq!(snapshot(&path).get("journal"), Some(&1));
+    }
+
+    /// A table cleared by a bare `DELETE` (SQLite's truncate shortcut) must
+    /// move the ledger like any other write, and the schema stays editable.
+    #[test]
+    fn clearing_a_whole_table_is_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.db");
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch("CREATE TABLE list (x INTEGER); INSERT INTO list VALUES (1), (2);")
+            .expect("schema");
+        watch(&conn, &path);
+
+        // Positive control: a filtered delete always reached the hook.
+        conn.execute("DELETE FROM list WHERE x = 1", [])
+            .expect("filtered delete");
+        let before = snapshot(&path).get("list").copied().unwrap_or(0);
+        assert_eq!(before, 1);
+
+        conn.execute("DELETE FROM list", []).expect("bare delete");
+        assert_eq!(
+            snapshot(&path).get("list").copied().unwrap_or(0),
+            before + 1,
+            "a cleared table did not move the ledger"
+        );
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM list", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(left, 0, "the delete must still delete");
+
+        conn.execute_batch("DROP TABLE list; CREATE TABLE gone (x INTEGER); DROP TABLE gone;")
+            .expect("schema changes still run");
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN ('list', 'gone')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count tables");
+        assert_eq!(tables, 0, "a DROP was silently cancelled");
     }
 }

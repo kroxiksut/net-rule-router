@@ -1,0 +1,244 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Status
+Service: OK
+Routing state:
+  Routing active
+  Rules apply on this user session.
+Connections:
+  Main connection: Ethernet — Example Network Adapter — Available — Rules applied
+  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+Notifications:
+  No notifications.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Suggested addresses
+Service: OK
+Addresses your sites need:
+  These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.
+  Mode: Suggest only (default)
+  Sort: What the main route can't reach first
+  Show answered (0): No
+  Show ones the main connection already handles (0): No
+  Reading the suggestions from the service...
+Suggested addresses:
+Commands on this screen:
+  a and an item number, for example a 2: add that item to the additional route
+  n and an item number: do not suggest that item again
+  r and an item number: allow that item to be suggested again
+  m and an item number: add that item and add suggestions automatically from now on (asks first)
+  c: check the addresses over the main connection
+  s: show or hide answered addresses; v: show or hide addresses the main connection handles
+  o: change the order of the list
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Suggested addresses
+Service: OK
+Addresses your sites need:
+  These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.
+  Mode: Suggest only (default)
+  Sort: What the main route can't reach first
+  Show answered (1): No
+  Show ones the main connection already handles (1): No
+Suggested addresses:
+  1. example.org — Pending (1)
+     Needed by: news.example, shop.example
+     *.video.example.org — Pending; connections to it stall on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under video.example.org.
+  2. example.com — Pending (2)
+     Needed by: news.example
+     *.cdn.example.com — Pending; the main route reaches it; a third-party service the site pulls in
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under cdn.example.com.
+     *.img.example.com — Pending; not checked on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
+Commands on this screen:
+  a and an item number, for example a 2: add that item to the additional route
+  n and an item number: do not suggest that item again
+  r and an item number: allow that item to be suggested again
+  m and an item number: add that item and add suggestions automatically from now on (asks first)
+  c: check the addresses over the main connection
+  s: show or hide answered addresses; v: show or hide addresses the main connection handles
+  o: change the order of the list
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Suggested addresses
+Service: OK
+Addresses your sites need:
+  These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.
+  Mode: Suggest only (default)
+  Sort: What the main route can't reach first
+  Show answered (1): No
+  Show ones the main connection already handles (1): No
+Suggested addresses:
+  1. example.org — Pending (1)
+     Needed by: news.example, shop.example
+     *.video.example.org — Pending; connections to it stall on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under video.example.org.
+  2. example.com — Pending (2)
+     Needed by: news.example
+     *.cdn.example.com — Pending; the main route reaches it; a third-party service the site pulls in
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under cdn.example.com.
+     *.img.example.com — Pending; not checked on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
+Commands on this screen:
+  a and an item number, for example a 2: add that item to the additional route
+  n and an item number: do not suggest that item again
+  r and an item number: allow that item to be suggested again
+  m and an item number: add that item and add suggestions automatically from now on (asks first)
+  c: check the addresses over the main connection
+  s: show or hide answered addresses; v: show or hide addresses the main connection handles
+  o: change the order of the list
+Type a screen number, h for help or q to quit, then press Enter.
+Addresses your sites need: Will not be suggested again: 2.
+
+Screen: Suggested addresses
+Service: OK
+Addresses your sites need:
+  These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.
+  Mode: Suggest only (default)
+  Sort: What the main route can't reach first
+  Show answered (1): No
+  Show ones the main connection already handles (1): No
+  There is no item 9 in the list. Use the number shown before an item.
+Suggested addresses:
+  1. example.org — Pending (1)
+     Needed by: news.example, shop.example
+     *.video.example.org — Pending; connections to it stall on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under video.example.org.
+  2. example.com — Pending (2)
+     Needed by: news.example
+     *.cdn.example.com — Pending; the main route reaches it; a third-party service the site pulls in
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under cdn.example.com.
+     *.img.example.com — Pending; not checked on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
+Commands on this screen:
+  a and an item number, for example a 2: add that item to the additional route
+  n and an item number: do not suggest that item again
+  r and an item number: allow that item to be suggested again
+  m and an item number: add that item and add suggestions automatically from now on (asks first)
+  c: check the addresses over the main connection
+  s: show or hide answered addresses; v: show or hide addresses the main connection handles
+  o: change the order of the list
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Suggested addresses
+Service: OK
+Addresses your sites need:
+  These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.
+  Mode: Suggest only (default)
+  Sort: What the main route can't reach first
+  Show answered (1): No
+  Show ones the main connection already handles (1): No
+  Turn on “Apply automatically”?
+  From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime by switching back to “Suggest only”.
+  y: turn it on and add item 1. n: cancel.
+Suggested addresses:
+  1. example.org — Pending (1)
+     Needed by: news.example, shop.example
+     *.video.example.org — Pending; connections to it stall on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under video.example.org.
+  2. example.com — Pending (2)
+     Needed by: news.example
+     *.cdn.example.com — Pending; the main route reaches it; a third-party service the site pulls in
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under cdn.example.com.
+     *.img.example.com — Pending; not checked on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
+Commands on this screen:
+  a and an item number, for example a 2: add that item to the additional route
+  n and an item number: do not suggest that item again
+  r and an item number: allow that item to be suggested again
+  m and an item number: add that item and add suggestions automatically from now on (asks first)
+  c: check the addresses over the main connection
+  s: show or hide answered addresses; v: show or hide addresses the main connection handles
+  o: change the order of the list
+Type y to turn it on or n to cancel, then press Enter.
+
+Screen: Suggested addresses
+Service: OK
+Addresses your sites need:
+  These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.
+  Mode: Suggest only (default)
+  Sort: What the main route can't reach first
+  Show answered (1): No
+  Show ones the main connection already handles (1): No
+  Nothing was changed.
+Suggested addresses:
+  1. example.org — Pending (1)
+     Needed by: news.example, shop.example
+     *.video.example.org — Pending; connections to it stall on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under video.example.org.
+  2. example.com — Pending (2)
+     Needed by: news.example
+     *.cdn.example.com — Pending; the main route reaches it; a third-party service the site pulls in
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under cdn.example.com.
+     *.img.example.com — Pending; not checked on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
+Commands on this screen:
+  a and an item number, for example a 2: add that item to the additional route
+  n and an item number: do not suggest that item again
+  r and an item number: allow that item to be suggested again
+  m and an item number: add that item and add suggestions automatically from now on (asks first)
+  c: check the addresses over the main connection
+  s: show or hide answered addresses; v: show or hide addresses the main connection handles
+  o: change the order of the list
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Suggested addresses
+Service: OK
+Addresses your sites need:
+  These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.
+  Mode: Suggest only (default)
+  Sort: What the main route can't reach first
+  Show answered (1): No
+  Show ones the main connection already handles (1): No
+  Checking...
+  Nothing was changed.
+Suggested addresses:
+  1. example.org — Pending (1)
+     Needed by: news.example, shop.example
+     *.video.example.org — Pending; connections to it stall on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under video.example.org.
+  2. example.com — Pending (2)
+     Needed by: news.example
+     *.cdn.example.com — Pending; the main route reaches it; a third-party service the site pulls in
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under cdn.example.com.
+     *.img.example.com — Pending; not checked on the main route
+       keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
+       The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
+Commands on this screen:
+  a and an item number, for example a 2: add that item to the additional route
+  n and an item number: do not suggest that item again
+  r and an item number: allow that item to be suggested again
+  m and an item number: add that item and add suggestions automatically from now on (asks first)
+  c: check the addresses over the main connection
+  s: show or hide answered addresses; v: show or hide addresses the main connection handles
+  o: change the order of the list
+Type a screen number, h for help or q to quit, then press Enter.
+Addresses your sites need: Checking 3 addresses over the main connection...

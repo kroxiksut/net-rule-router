@@ -249,6 +249,7 @@ pub(crate) fn resolver_controller(
         return None;
     };
     let mechanism = Arc::clone(mechanism);
+    let sign_in_probe = inputs.signed_in.clone();
     let servers = Arc::clone(&mechanism.servers);
     let pool = upstream_dns_pool(Arc::clone(&servers) as _);
     let armed = Mutex::new(armed_through(
@@ -285,6 +286,9 @@ pub(crate) fn resolver_controller(
     });
     let controller = Arc::new(DnsResolverController::new());
     controller.set_factory(factory);
+    if let Some(probe) = sign_in_probe {
+        controller.set_sign_in_probe(probe);
+    }
     Some(controller)
 }
 

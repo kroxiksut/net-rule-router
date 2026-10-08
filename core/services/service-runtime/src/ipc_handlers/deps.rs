@@ -213,6 +213,10 @@ pub struct IpcHandlerDeps {
     /// blocking unknown traffic" banner. Defaults to disarmed; production
     /// wires the orchestrator's clone via `with_block_all_posture_status`.
     pub block_all_posture: crate::app_enforcement_status::BlockAllPostureStatus,
+    /// The route coordinator's standing per-role enforcement reports, which
+    /// `SnapshotInitial` serves to the caller. Empty by default; production
+    /// wires the coordinator's own via `with_route_enforcement_status`.
+    pub route_enforcement: crate::app_enforcement_status::RouteEnforcementStatus,
     /// Live fake-IP datapath probe over the `FakeIpController`, so
     /// `service.health.get` / `snapshot.initial.get` can surface a
     /// "toggle ON but datapath dead" outage. `None` (default) omits the
@@ -321,6 +325,7 @@ impl IpcHandlerDeps {
             // Disarmed by default (no banner). Production shares the
             // orchestrator's clone via `with_block_all_posture_status`.
             block_all_posture: crate::app_enforcement_status::BlockAllPostureStatus::new(),
+            route_enforcement: crate::app_enforcement_status::RouteEnforcementStatus::new(),
             // No probe by default (degraded boot / tests) — the health
             // payload omits the field. Production wires the controller's
             // probe via `with_fake_ip_datapath_probe`.
@@ -687,6 +692,17 @@ impl IpcHandlerDeps {
         status: crate::app_enforcement_status::BlockAllPostureStatus,
     ) -> Self {
         self.block_all_posture = status;
+        self
+    }
+
+    /// Share the route coordinator's standing enforcement reports, so a client
+    /// that connects after the push still reads the current state.
+    #[must_use]
+    pub fn with_route_enforcement_status(
+        mut self,
+        status: crate::app_enforcement_status::RouteEnforcementStatus,
+    ) -> Self {
+        self.route_enforcement = status;
         self
     }
 }

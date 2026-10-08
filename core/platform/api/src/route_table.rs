@@ -58,7 +58,7 @@ pub trait RouteTablePort: Send + Sync {
     /// routing scope uses it to pick the routing user when no GUI/tray is
     /// connected, so a managed policy is enforced from boot. `None` when there
     /// is no interactive user or the identity cannot be resolved.
-    fn active_console_user_sid(&self) -> Option<String> {
+    fn interactive_user_sid(&self) -> Option<String> {
         None
     }
 

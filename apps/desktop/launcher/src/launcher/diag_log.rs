@@ -2,8 +2,7 @@
 // `launcher-{surface}.log` path, session rotation, and the `diag_log` writer.
 
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::LauncherSurface;
@@ -68,7 +67,22 @@ pub(super) fn diag_log_path(surface_tag: &str) -> PathBuf {
 /// detached-tray spawns (`QProcess::startDetached` from the C++ host) and
 /// double-click launches.
 pub(crate) fn diag_log(surface_tag: &str, message: &str) {
-    let path = diag_log_path(surface_tag);
+    // Tests keep their lines in the harness's captured stderr, never on disk.
+    #[cfg(not(test))]
+    append_line(&diag_log_path(surface_tag), message);
+    #[cfg(test)]
+    let _ = surface_tag;
+    // Mirror to the error stream — visible when launched from a console. Once
+    // that stream has been pointed at this very file, echoing would only write
+    // the same line twice, so it stops.
+    if !crate::diag_stream::error_stream_is_captured() {
+        eprintln!("{message}");
+    }
+}
+
+#[cfg(not(test))]
+fn append_line(path: &Path, message: &str) {
+    use std::io::Write;
     // The directory is created once per process, not once per line. This is
     // called for every line the child writes that is not a protocol marker, and
     // a chatty child turned one log line into a directory syscall as well.
@@ -78,19 +92,13 @@ pub(crate) fn diag_log(surface_tag: &str, message: &str) {
             let _ = fs::create_dir_all(parent);
         }
     });
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         // Best-effort timestamp using std::time. chrono is not a dep.
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let _ = writeln!(file, "{ts} pid={} {message}", std::process::id());
-    }
-    // Mirror to the error stream — visible when launched from a console. Once
-    // that stream has been pointed at this very file, echoing would only write
-    // the same line twice, so it stops.
-    if !crate::diag_stream::error_stream_is_captured() {
-        eprintln!("{message}");
     }
 }
 

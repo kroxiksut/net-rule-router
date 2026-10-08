@@ -79,6 +79,7 @@ fn planner_input<'a>(
         app_resolver: resolver,
         app_observations: obs,
         zone_priority_over_ip: false,
+        packet_blocks: true,
     }
 }
 
@@ -122,6 +123,7 @@ fn a_declined_shared_address_is_kept_off_the_tunnel() {
             app_observations: &obs,
             zone_priority_over_ip: false,
             secondary_ip_denylist: denylist,
+            packet_blocks: true,
         };
         plan_route_rules(
             &rule_book,
@@ -479,6 +481,7 @@ fn slices123_neutral_pipeline_matches_current_codegen() {
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
 
     let plan = EnforcementPlan {
@@ -728,6 +731,7 @@ fn slice8_derived_sets_match_current_codegen() {
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let flows = plan_route_rules(
         &rb,
@@ -855,6 +859,7 @@ fn slice9_plan_report_matches_current_codegen_diagnostics() {
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let (_, report) = plan_route_rules(
         &rb,
@@ -969,6 +974,7 @@ fn slice9_plan_report_names_both_caps() {
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let (_, report) = plan_route_rules(
         &rb,
@@ -1617,6 +1623,7 @@ fn slice5_fail_closed_default_block_matches_current_codegen() {
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
 
     let plan = EnforcementPlan {
@@ -1930,4 +1937,68 @@ fn an_app_and_address_rule_plans_nothing_and_is_reported() {
             vec![("s-combined".to_string(), reason)]
         );
     }
+}
+
+/// A network carved past the cap loses its narrower rules without a filter to
+/// show for it; both planners report it as the same conflict.
+#[test]
+fn a_network_carved_past_the_cap_is_a_conflict_in_both_planners() {
+    use crate::wfp_codegen::{generate_filters, CodegenInput};
+
+    let cache = MapCache::default();
+    let resolver = MapResolver::default();
+    let obs = MapObs::default();
+    let sid = "S-1-5-21-1-2-3-1001";
+    let inside: Vec<CanonicalRule> = (0..20u8)
+        .map(|i| exact_ip_rule(&format!("s-{i}"), Ipv4Addr::new(10, i, 0, 1)))
+        .collect();
+    let network = rule(
+        "p-net",
+        CanonicalAddressMatch::Subnet(
+            nrr_shared::ip_block::IpBlock::parse("10.0.0.0/8").expect("network"),
+        ),
+        RuleAction::Route,
+    );
+    let rb = book(vec![network], inside);
+    let denylist = std::collections::HashSet::new();
+    let current = generate_filters(CodegenInput {
+        sid,
+        rule_book: &rb,
+        behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
+        fqdn_cache: &cache,
+        app_observations: &obs,
+        app_resolver: &resolver,
+        secondary_ip_denylist: &denylist,
+        zone_priority_over_ip: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    });
+    let (_, report) = plan_route_rules(
+        &rb,
+        sid,
+        nrr_domain::RouteBehaviorMode::PreferPrimary,
+        &planner_input(&cache, &resolver, &obs),
+    );
+
+    let codegen = crate::rule_conflicts::over_cap_networks(
+        &current
+            .diagnostics
+            .iter()
+            .filter_map(crate::wfp_codegen::CodegenDiagnostic::rule_conflict)
+            .collect::<Vec<_>>(),
+    );
+    let planned = crate::rule_conflicts::over_cap_networks(&report.conflicts);
+    assert_eq!(planned, codegen);
+    assert_eq!(planned.len(), 1, "positive control: {planned:?}");
+    assert!(planned[0].starts_with("p-net ("), "{planned:?}");
+
+    let dtos = crate::rule_conflicts::rule_conflict_dtos(&report.conflicts, &rb);
+    let dto = dtos
+        .iter()
+        .find(|d| d.kind == nrr_shared::ipc_payloads::RuleConflictKind::NetworkCarvingOverCap)
+        .expect("the Overlaps screen hears of it");
+    assert_eq!(
+        (dto.rule_id.as_str(), dto.rule_value.as_str()),
+        ("p-net", "10.0.0.0/8")
+    );
 }

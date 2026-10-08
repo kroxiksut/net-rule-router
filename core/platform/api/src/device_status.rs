@@ -46,15 +46,6 @@ impl DeviceState {
             Self::Absent => "absent",
         }
     }
-
-    /// Does this state mean the device is on the machine but unusable?
-    ///
-    /// The distinction the caller acts on: an adapter that is here and broken
-    /// asks for repair, one that is absent asks the user to pick another.
-    #[must_use]
-    pub fn is_present_but_unusable(self) -> bool {
-        matches!(self, Self::FailedToStart | Self::Disabled)
-    }
 }
 
 /// Asks the OS about a network device the adapter enumeration did not return.
@@ -90,16 +81,6 @@ mod tests {
         assert_eq!(DeviceState::FailedToStart.as_str(), "failed-to-start");
         assert_eq!(DeviceState::Disabled.as_str(), "disabled");
         assert_eq!(DeviceState::Absent.as_str(), "absent");
-    }
-
-    /// The whole point of the port: two states mean "here but unusable" and
-    /// lead to a different sentence than the two that do not.
-    #[test]
-    fn only_a_present_device_asks_the_user_to_repair_rather_than_choose() {
-        assert!(DeviceState::FailedToStart.is_present_but_unusable());
-        assert!(DeviceState::Disabled.is_present_but_unusable());
-        assert!(!DeviceState::Absent.is_present_but_unusable());
-        assert!(!DeviceState::Started.is_present_but_unusable());
     }
 
     /// An unwired platform must not be mistaken for "no such device": the two

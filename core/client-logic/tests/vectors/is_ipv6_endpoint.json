@@ -1,0 +1,15 @@
+{
+  "description": "pure.js isIpv6Endpoint: a bracketed literal or a bare address with several colons",
+  "cases": [
+    { "name": "bracketed with port", "input": { "endpoint": "[2001:db8::1]:443" }, "expected": true },
+    { "name": "bare v6", "input": { "endpoint": "2001:db8::5" }, "expected": true },
+    { "name": "v4 with port", "input": { "endpoint": "192.0.2.10:443" }, "expected": false },
+    { "name": "bare v4", "input": { "endpoint": "198.51.100.7" }, "expected": false },
+    { "name": "empty", "input": { "endpoint": "" }, "expected": false },
+    { "name": "spaces only", "input": { "endpoint": "   " }, "expected": false },
+    { "name": "masked", "input": { "endpoint": "<public-ipv4>" }, "expected": false },
+    { "name": "padded bracket", "input": { "endpoint": "  [::1]:53 " }, "expected": true },
+    { "name": "masked marker with port", "input": { "endpoint": "<public-ipv6>:443" }, "expected": false },
+    { "name": "two colons", "input": { "endpoint": "a:b:c" }, "expected": true }
+  ]
+}

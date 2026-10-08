@@ -50,10 +50,11 @@ pub(crate) fn nameservers(text: &str) -> Vec<Ipv4Addr> {
     servers
 }
 
-/// `servers` without loopback ones. A loopback server is our own listener or
-/// a local cache (dnsmasq, unbound, resolved's stub) that forwards to whatever
-/// `resolv.conf` names — us, once redirected — so forwarding to it loops until
-/// the budget runs out on every query.
+/// `servers` without the ones on this machine. A loopback server is our own
+/// listener or a local cache (dnsmasq, unbound, resolved's stub) that forwards
+/// to whatever `resolv.conf` names — us, once redirected — so forwarding to it
+/// loops until the budget runs out on every query. `0.0.0.0` is the same
+/// machine: the kernel delivers a packet sent there locally.
 pub(crate) fn forwardable(servers: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let (kept, dropped) = without_loopback(servers);
@@ -61,17 +62,21 @@ pub(crate) fn forwardable(servers: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
         tracing::warn!(
             target: "nrr::dns-resolver",
             dropped,
-            "the machine's DNS names a local resolver on loopback; it forwards to this service \
-             once redirected, so it is not used as an upstream",
+            "the machine's DNS names a resolver on this machine (loopback or 0.0.0.0); it \
+             forwards to this service once redirected, so it is not used as an upstream",
         );
     }
     kept
 }
 
-/// The non-loopback servers and how many were dropped — the warning's trigger.
+/// The servers off this machine (neither loopback nor `0.0.0.0`) and how many
+/// were dropped — the warning's trigger.
 pub(crate) fn without_loopback(servers: Vec<Ipv4Addr>) -> (Vec<Ipv4Addr>, usize) {
     let before = servers.len();
-    let kept: Vec<Ipv4Addr> = servers.into_iter().filter(|s| !s.is_loopback()).collect();
+    let kept: Vec<Ipv4Addr> = servers
+        .into_iter()
+        .filter(|s| !s.is_loopback() && !s.is_unspecified())
+        .collect();
     let dropped = before - kept.len();
     (kept, dropped)
 }

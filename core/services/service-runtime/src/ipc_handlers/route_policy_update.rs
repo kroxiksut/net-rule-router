@@ -52,12 +52,11 @@ impl IpcHandler for RoutePolicyUpdateHandler {
             });
         }
 
-        let req: RoutePolicyUpdateRequest = serde_json::from_value(request.payload.clone())
-            .map_err(|e| IpcError {
-                code: IpcErrorCode::MalformedRequest,
-                message: format!("route.policy.update payload invalid: {e}"),
-                diagnostics_id: None,
-            })?;
+        let payload = apply_only_over_stored(request.payload.clone(), || {
+            self.writer.stored_for_sid(ctx.caller_stored())
+        })?;
+        let req: RoutePolicyUpdateRequest =
+            serde_json::from_value(payload).map_err(|e| malformed(format!("{e}")))?;
 
         // The placeholder rows a GUI shows when no live enumeration arrived name
         // no adapter of this machine. Refused here rather than in the GUI: a
@@ -96,6 +95,54 @@ impl IpcHandler for RoutePolicyUpdateHandler {
             Err(e) => Err(map_write_error(e)),
         }
     }
+}
+
+fn malformed(detail: String) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::MalformedRequest,
+        message: format!("route.policy.update payload invalid: {detail}"),
+        diagnostics_id: None,
+    }
+}
+
+/// An `apply-only` request laid over the stored row: the named fields from the
+/// request, the rest as stored, provenance from the request. With nothing
+/// stored yet the request writes whole, as one without the list does.
+fn apply_only_over_stored(
+    payload: serde_json::Value,
+    stored: impl FnOnce() -> Option<nrr_shared::ipc_payloads::RoutePolicyDto>,
+) -> Result<serde_json::Value, IpcError> {
+    let only: Vec<String> = match payload.get("apply-only") {
+        None => return Ok(payload),
+        Some(list) => serde_json::from_value(list.clone())
+            .map_err(|e| malformed(format!("apply-only: {e}")))?,
+    };
+    if only.is_empty() {
+        return Ok(payload);
+    }
+    // A slot may be named while absent: that is how a request unbinds it.
+    if let Some(unknown) = only.iter().find(|name| {
+        payload.get(name.as_str()).is_none() && !matches!(name.as_str(), "primary" | "secondary")
+    }) {
+        return Err(malformed(format!(
+            "apply-only names `{unknown}`, which the request lacks"
+        )));
+    }
+    let Some(stored) = stored() else {
+        return Ok(payload);
+    };
+    let serde_json::Value::Object(mut base) =
+        serde_json::to_value(stored).map_err(|e| malformed(format!("stored policy: {e}")))?
+    else {
+        return Ok(payload);
+    };
+    for name in only.iter().map(String::as_str).chain(["binding-source"]) {
+        match payload.get(name) {
+            Some(value) => base.insert(name.to_owned(), value.clone()),
+            None => base.remove(name),
+        };
+    }
+    Ok(serde_json::Value::Object(base))
 }
 
 /// The first binding in `req` naming a placeholder adapter, if any.
@@ -254,6 +301,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
+            apply_only: Vec::new(),
         })
         .unwrap();
         let err = h.handle(&req(payload), &ctx("")).unwrap_err();
@@ -385,6 +433,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
+            apply_only: Vec::new(),
         })
         .unwrap();
         let err = h.handle(&req(payload), &ctx("S")).unwrap_err();
@@ -428,6 +477,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
+            apply_only: Vec::new(),
         })
         .unwrap();
         let err = h.handle(&req(payload), &ctx("S")).unwrap_err();
@@ -470,6 +520,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
+            apply_only: Vec::new(),
         })
         .unwrap();
         let err = h.handle(&req(payload), &ctx("S")).unwrap_err();
@@ -515,6 +566,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             binding_source: dto.binding_source,
+            apply_only: Vec::new(),
         })
         .unwrap();
         let value = h.handle(&req(payload), &ctx("S-1-5-21-A")).unwrap();
@@ -580,6 +632,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             binding_source: dto.binding_source,
+            apply_only: Vec::new(),
         })
         .unwrap();
         h.handle(&req(payload), &ctx("S-1-5-21-A")).unwrap();
@@ -632,6 +685,7 @@ mod tests {
             short_name_completion: false,
             short_name_suffix: String::new(),
             binding_source: BindingSourceDto::UserAssigned,
+            apply_only: Vec::new(),
         })
         .unwrap();
         let _ = h.handle(&req(payload), &ctx("S")).unwrap_err();
@@ -639,5 +693,48 @@ mod tests {
             trigger.fired_for.lock().unwrap().is_empty(),
             "a failed write must NOT fire the recompile hook"
         );
+    }
+
+    /// Two clients each writing the row they read lose each other's change;
+    /// a request naming its fields lands on the stored row instead.
+    #[test]
+    fn an_apply_only_request_changes_only_what_it_names() {
+        // What the window read before the tray turned the kill switch on.
+        let mut stale = serde_json::to_value(sample_dto()).expect("dto");
+        stale["auto-rules-mode"] = serde_json::json!("auto");
+        stale["apply-only"] = serde_json::json!(["auto-rules-mode"]);
+        stale["binding-source"] = serde_json::json!("user-assigned");
+        let mut stored = sample_dto();
+        stored.kill_switch_enabled = true;
+
+        let merged = apply_only_over_stored(stale, || Some(stored)).expect("merged");
+        let req: RoutePolicyUpdateRequest = serde_json::from_value(merged).expect("request");
+        assert_eq!(req.auto_rules_mode, "auto");
+        assert!(req.kill_switch_enabled, "the tray's change survives");
+        assert_eq!(req.binding_source, BindingSourceDto::UserAssigned);
+    }
+
+    #[test]
+    fn naming_an_absent_slot_unbinds_it_and_an_unknown_name_is_refused() {
+        let mut unbind = serde_json::to_value(sample_dto()).expect("dto");
+        unbind.as_object_mut().expect("object").remove("primary");
+        unbind["apply-only"] = serde_json::json!(["primary"]);
+        let merged = apply_only_over_stored(unbind, || Some(sample_dto())).expect("merged");
+        let req: RoutePolicyUpdateRequest = serde_json::from_value(merged).expect("request");
+        assert!(req.primary.is_none());
+
+        let mut typo = serde_json::to_value(sample_dto()).expect("dto");
+        typo["apply-only"] = serde_json::json!(["kill-switch-enable"]);
+        let err = apply_only_over_stored(typo, || Some(sample_dto())).expect_err("refused");
+        assert_eq!(err.code, IpcErrorCode::MalformedRequest);
+    }
+
+    #[test]
+    fn with_nothing_stored_an_apply_only_request_writes_whole() {
+        let mut first = serde_json::to_value(sample_dto()).expect("dto");
+        first["kill-switch-enabled"] = serde_json::json!(true);
+        first["apply-only"] = serde_json::json!(["kill-switch-enabled"]);
+        let merged = apply_only_over_stored(first.clone(), || None).expect("merged");
+        assert_eq!(merged, first);
     }
 }

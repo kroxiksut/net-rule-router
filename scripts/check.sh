@@ -215,7 +215,11 @@ cyan "[check] clippy: cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings
 
 cyan "[check] tests: cargo test --workspace"
-cargo test --workspace
+# Tests get a temp directory of their own, removed however the run ends, so
+# nothing a test fails to clean up stays in /tmp.
+test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/nrr-gate.XXXXXX")"
+trap 'rm -rf "$test_tmp"' EXIT
+TMPDIR="$test_tmp" cargo test --workspace
 
 if ! command -v cargo-deny >/dev/null 2>&1; then
   message='cargo-deny is not installed. Install it with `cargo install --locked cargo-deny` to enable dependency/license checks.'

@@ -88,6 +88,12 @@ Dialog {
             ? tr("dialog.drift.row-secondary", "Additional")
             : tr("dialog.drift.row-primary", "Primary")
     }
+    /// A verify rule sits in the secondary bucket but is not routed there yet.
+    function _itemRouteLabel(item) {
+        if (item && String(item.action) === "verify-primary")
+            return tr("label.verify-primary", "Primary first, additional if unreachable")
+        return _routeLabel(item ? item.route : "")
+    }
 
     function _textColor() {
         return ownerRoot ? ownerRoot.textColor : palette.text
@@ -104,7 +110,7 @@ Dialog {
     /// A concise one-line summary of one conflict side: route + off/block flags.
     function _sideSummary(side) {
         if (!side) return "—"
-        var parts = [ _routeLabel(side.route) ]
+        var parts = [ _itemRouteLabel(side) ]
         // Shared wording with the review diff — one "disabled" text app-wide.
         if (side.enabled === false) parts.push(tr("label.disabled", "disabled"))
         if (String(side.action) === "block")
@@ -317,7 +323,7 @@ Dialog {
                             elide: Text.ElideRight
                         }
                         Label {
-                            text: dialog._routeLabel(modelData.route)
+                            text: dialog._itemRouteLabel(modelData)
                             font.pixelSize: 11
                             color: dialog._mutedColor()
                         }
@@ -369,7 +375,7 @@ Dialog {
                             elide: Text.ElideRight
                         }
                         Label {
-                            text: dialog._routeLabel(modelData.route)
+                            text: dialog._itemRouteLabel(modelData)
                             font.pixelSize: 11
                             color: dialog._mutedColor()
                         }
@@ -478,28 +484,34 @@ Dialog {
         }
 
         // ── Buttons ──────────────────────────────────────────────
-        Flow {
+        Item {
             Layout.fillWidth: true
             Layout.topMargin: 8
-            spacing: 8
-            ThemedButton {
-                theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("action.cancel", "Cancel")
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                onClicked: { dialog.cancelled(); dialog.close() }
-            }
-            ThemedButton {
-                theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.merge.apply", "Merge and review")
-                highlighted: true
-                enabled: !dialog.loading && dialog.errorText === ""
-                    && !dialog._isNoop() && dialog._allResolved()
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                onClicked: {
-                    dialog.confirmed(dialog._buildResolutions(),
-                        dialog._buildKeepSecondary())
+            Layout.preferredHeight: buttonsFlow.height
+            Flow {
+                id: buttonsFlow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: 8
+                ThemedButton {
+                    theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                    text: dialog.tr("action.cancel", "Cancel")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    onClicked: { dialog.cancelled(); dialog.close() }
+                }
+                ThemedButton {
+                    theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                    text: dialog.tr("dialog.merge.apply", "Merge and review")
+                    highlighted: true
+                    enabled: !dialog.loading && dialog.errorText === ""
+                        && !dialog._isNoop() && dialog._allResolved()
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    onClicked: {
+                        dialog.confirmed(dialog._buildResolutions(),
+                            dialog._buildKeepSecondary())
+                    }
                 }
             }
         }

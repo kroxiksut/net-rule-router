@@ -84,6 +84,7 @@ fn plan(rule_book: &CanonicalRuleBook, ipv6: Ipv6Guard) -> Vec<FlowRule> {
             zone_priority_over_ip: false,
             secondary_ip_denylist: &denylist,
             ipv6,
+            packet_blocks: true,
         },
         NETWORKS,
     )
@@ -146,6 +147,7 @@ fn the_service_shape_gate_lets_networks_through() {
             zone_priority_over_ip: false,
             secondary_ip_denylist: &denylist,
             ipv6: Ipv6Guard::Off,
+            packet_blocks: true,
         },
     );
     assert!(report.unsupported_shapes().is_empty());
@@ -282,6 +284,7 @@ fn network_rules_lower_to_the_filters_the_codegen_emits() {
             secondary_ip_denylist: &denylist,
             zone_priority_over_ip: false,
             families: FamilyScope::Both,
+            packet_blocks: true,
         },
         NETWORKS,
     );
@@ -296,6 +299,7 @@ fn network_rules_lower_to_the_filters_the_codegen_emits() {
             zone_priority_over_ip: false,
             secondary_ip_denylist: &denylist,
             ipv6: Ipv6Guard::FiltersAndRoutes,
+            packet_blocks: true,
         },
         NETWORKS,
     )

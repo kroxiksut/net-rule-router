@@ -54,7 +54,8 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     deps.app_enforcement.clone(),
                     deps.shared_ip_exemptions.clone(),
                     deps.block_all_posture.clone(),
-                );
+                )
+                .with_route_enforcement_status(deps.route_enforcement.clone());
                 if let Some(probe) = deps.fake_ip_datapath_probe.as_ref() {
                     handler = handler.with_fake_ip_datapath_probe(Arc::clone(probe));
                 }

@@ -256,6 +256,9 @@ fn cross_set_key(rule: &CanonicalRule, coverage: SubdomainCoverage) -> String {
     match rule.action {
         RuleAction::Route => key,
         RuleAction::Block => format!("{key}\u{1}block"),
+        // "Primary until proven otherwise" is not a plain primary rule; neither
+        // copy is switched off for the other.
+        RuleAction::VerifyPrimary => format!("{key}\u{1}verify-primary"),
     }
 }
 

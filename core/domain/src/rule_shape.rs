@@ -160,7 +160,10 @@ pub const fn shape_verdict(
                 }
             }
         }
-        (RuleShape::SourceAndDestination | RuleShape::SourceAndNetwork, RuleAction::Route) => {
+        (
+            RuleShape::SourceAndDestination | RuleShape::SourceAndNetwork,
+            RuleAction::Route | RuleAction::VerifyPrimary,
+        ) => {
             if support.app_scoped_destination_route {
                 ShapeVerdict::Supported
             } else {
@@ -231,7 +234,11 @@ mod tests {
     };
     use crate::RuleId;
 
-    const ACTIONS: [RuleAction; 2] = [RuleAction::Route, RuleAction::Block];
+    const ACTIONS: [RuleAction; 3] = [
+        RuleAction::Route,
+        RuleAction::Block,
+        RuleAction::VerifyPrimary,
+    ];
 
     fn all_supports() -> Vec<RuleShapeSupport> {
         let mut out = Vec::new();
@@ -301,12 +308,16 @@ mod tests {
                             RuleAction::Block => ShapeVerdict::Unsupported {
                                 reason: UnsupportedShapeReason::AppScopedDestinationBlock,
                             },
-                            RuleAction::Route if support.app_scoped_destination_route => {
+                            RuleAction::Route | RuleAction::VerifyPrimary
+                                if support.app_scoped_destination_route =>
+                            {
                                 ShapeVerdict::Supported
                             }
-                            RuleAction::Route => ShapeVerdict::Unsupported {
-                                reason: UnsupportedShapeReason::AppScopedDestinationRoute,
-                            },
+                            RuleAction::Route | RuleAction::VerifyPrimary => {
+                                ShapeVerdict::Unsupported {
+                                    reason: UnsupportedShapeReason::AppScopedDestinationRoute,
+                                }
+                            }
                         }
                     };
                     assert_eq!(

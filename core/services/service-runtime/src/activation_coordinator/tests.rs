@@ -1759,10 +1759,11 @@ impl RulesApplyDispatcher for OverlayProbe {
 fn activate_with_probe(
     fail_apply: bool,
 ) -> (
+    // First, so the bindings that hold the database drop before it.
+    tempfile::TempDir,
     Arc<OverlayProbe>,
     Connection,
     ActivationOutcome,
-    tempfile::TempDir,
 ) {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("state.db");
@@ -1802,7 +1803,7 @@ fn activate_with_probe(
         .expect("issue token");
     let outcome = coordinator.activate(&id, &token, "c").expect("activate");
     let after = Connection::open(&path).expect("after");
-    (probe, after, outcome, dir)
+    (dir, probe, after, outcome)
 }
 
 /// Every rules read during phase 2 must see the revision being applied — the
@@ -1810,7 +1811,7 @@ fn activate_with_probe(
 /// once the activation is over.
 #[test]
 fn readers_see_the_applying_revision_during_phase_2_and_not_after() {
-    let (probe, after, outcome, _dir) = activate_with_probe(false);
+    let (_dir, probe, after, outcome) = activate_with_probe(false);
     assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
     let seen = probe.seen.lock().expect("seen").clone();
     assert_eq!(seen, vec![("apply", Some(r#"{"applying":1}"#.to_string()))]);
@@ -1824,7 +1825,7 @@ fn readers_see_the_applying_revision_during_phase_2_and_not_after() {
 /// handed the one that just failed.
 #[test]
 fn the_revert_after_a_failed_apply_reads_the_stored_revision() {
-    let (probe, _after, outcome, _dir) = activate_with_probe(true);
+    let (_dir, probe, _after, outcome) = activate_with_probe(true);
     assert!(matches!(
         outcome,
         ActivationOutcome::RolledBackOnFailure { .. }

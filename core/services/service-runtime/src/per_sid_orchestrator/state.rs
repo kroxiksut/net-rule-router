@@ -47,6 +47,15 @@ pub type KillSwitchResolver =
 pub type Ipv6GuardResolver =
     Arc<dyn Fn(&str, &MachineReading) -> crate::enforcement_planner::Ipv6Guard + Send + Sync>;
 
+/// Which link each of a SID's connections leaves through, so a flow sweep spares
+/// one riding a link that is neither of theirs. Defaults to knowing no link,
+/// which spares nothing; production resolves it through the route coordinator.
+pub type FlowLinksResolver = Arc<
+    dyn Fn(&str, &MachineReading) -> nrr_platform_api::fake_ip::stale_flows::FlowLinks
+        + Send
+        + Sync,
+>;
+
 /// resolves the fail-closed exemptions for a SID when the
 /// secondary is unresolvable but a fail-closed kill-switch must still arm.
 /// Returns the primary's local subnets + any cached VPN-server IPs so a
@@ -152,6 +161,7 @@ pub struct PerSidApplyOrchestrator {
     pub(super) machine_reader: MachineReader,
     pub(super) kill_switch_resolver: KillSwitchResolver,
     pub(super) ipv6_guard_resolver: Ipv6GuardResolver,
+    pub(super) flow_links_resolver: FlowLinksResolver,
     /// fail-closed exemptions resolver. Used when the
     /// secondary is unresolvable yet the user requested a kill-switch with
     /// the fail-closed posture: mode B then blocks *all* egress except these

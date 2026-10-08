@@ -186,14 +186,20 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
                         Arc::clone(cache_arc),
                         FreshnessThresholds::default_production(),
                     ));
-                    production_author = production_author.with_flow_refresh(Arc::new(
+                    let mut refresh =
                         nrr_service_runtime::routed_host_flow_refresh::RoutedHostFlowRefresh::new(
                             fqdn,
                             Arc::new(
                                 nrr_platform_windows::stale_flows::WindowsStaleFlowReset::new(),
                             ),
-                        ),
-                    ));
+                        );
+                    if let Some(rc) = route_coordinator.as_ref() {
+                        let rc = Arc::clone(rc);
+                        refresh = refresh.with_links(Arc::new(move |sid: &str| {
+                            rc.flow_links(sid, &rc.read_machine())
+                        }));
+                    }
+                    production_author = production_author.with_flow_refresh(Arc::new(refresh));
                 }
                 let author: Arc<dyn nrr_service_runtime::auto_rules::AutoRuleAuthor> =
                     Arc::new(production_author);

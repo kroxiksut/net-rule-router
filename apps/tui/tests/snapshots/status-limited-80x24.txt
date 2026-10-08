@@ -1,0 +1,24 @@
+Service: OK
+┌> Screens─────────────────┐┌Routing state─────────────────────────────────────┐
+│> 1 Status                ││Routing limited                                   │
+│  2 First run             ││Some rules are not being applied right now. The   │
+│  3 Interfaces and routes ││notices say why.                                  │
+│  4 Rules                 ││                                                  │
+│  5 Overlaps              │└──────────────────────────────────────────────────┘
+│  6 Suggested addresses   │┌Connections───────────────────────────────────────┐
+│  7 Connection trace      ││Main connection: Ethernet — Example Network       │
+│  8 Cache                 ││Adapter — Available — Rules applied               │
+│  9 Diagnostics and logs  ││Additional connection: Example Tunnel — Example   │
+│  0 Settings              ││Network Adapter — Available — Rules not applied   │
+│                          ││  The additional connection is not up             │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          │└──────────────────────────────────────────────────┘
+│                          │┌Notifications─────────────────────────────────────┐
+│                          ││Warning: The additional connection is not up      │
+│                          ││Everything your rules send there is being held    │
+│                          ││until it comes back — that is the protection doing│
+│                          ││its job, not a fault. Start the connection, or    │
+└──────────────────────────┘└──────────────────────────────────────────────────┘
+Warning: The additional connection is not up
+F1: help   q: quit

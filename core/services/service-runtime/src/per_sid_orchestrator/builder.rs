@@ -39,6 +39,7 @@ impl PerSidApplyOrchestrator {
             machine_reader: Arc::new(MachineReading::empty),
             kill_switch_resolver: Arc::new(|_, _| None),
             ipv6_guard_resolver: Arc::new(|_, _| crate::enforcement_planner::Ipv6Guard::Off),
+            flow_links_resolver: Arc::new(|_, _| Default::default()),
             // Default: no extra exemptions. Production overrides via
             // `with_fail_closed_exemptions_resolver`.
             fail_closed_exemptions_resolver: Arc::new(|_, _| FailClosedExemptions::default()),
@@ -433,6 +434,12 @@ impl PerSidApplyOrchestrator {
 
     pub fn with_kill_switch_resolver(mut self, resolver: KillSwitchResolver) -> Self {
         self.kill_switch_resolver = resolver;
+        self
+    }
+
+    #[must_use]
+    pub fn with_flow_links_resolver(mut self, resolver: FlowLinksResolver) -> Self {
+        self.flow_links_resolver = resolver;
         self
     }
 

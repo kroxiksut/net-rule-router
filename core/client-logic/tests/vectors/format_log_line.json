@@ -1,0 +1,21 @@
+{
+  "description": "pure.js formatLogLine: one pass, {name} from args, {N} from positional, any hole gives the source line",
+  "cases": [
+    { "name": "value is not re-scanned", "input": { "translated": "{a} and {a}, {b}", "source": "src", "args": { "a": "{b}", "b": "x" }, "positional": [] }, "expected": "{b} and {b}, x" },
+    { "name": "positional with replacement patterns", "input": { "translated": "corr {0} / {1} / {0}", "source": "src", "args": {}, "positional": ["$& $' $$", "k"] }, "expected": "corr $& $' $$ / k / $& $' $$" },
+    { "name": "missing gives source", "input": { "translated": "{missing} {2}", "source": "apply failed: {raw}", "args": null, "positional": ["only"] }, "expected": "apply failed: {raw}" },
+    { "name": "one hole among filled", "input": { "translated": "{host}: {gone}", "source": "probe failed", "args": { "host": "h.example" }, "positional": [] }, "expected": "probe failed" },
+    { "name": "plain text", "input": { "translated": "plain text", "source": "plain text", "args": {}, "positional": [] }, "expected": "plain text" },
+    { "name": "empty translation", "input": { "translated": "", "source": "src", "args": {}, "positional": [] }, "expected": "" },
+    { "name": "doubled braces", "input": { "translated": "{{a}}", "source": "src", "args": { "a": "x" }, "positional": [] }, "expected": "{x}" },
+    { "name": "spaces are not a name", "input": { "translated": "{ a }", "source": "src", "args": { "a": "x" }, "positional": [] }, "expected": "{ a }" },
+    { "name": "leading zero index", "input": { "translated": "{01}", "source": "src", "args": {}, "positional": ["zero", "one"] }, "expected": "one" },
+    { "name": "dash is not a name character", "input": { "translated": "{a-b}", "source": "src", "args": { "a-b": "x" }, "positional": [] }, "expected": "{a-b}" },
+    { "name": "named beats positional", "input": { "translated": "{0}", "source": "src", "args": { "0": "named" }, "positional": ["pos"] }, "expected": "named" },
+    { "name": "index past the end", "input": { "translated": "{999}", "source": "src", "args": {}, "positional": ["a"] }, "expected": "src" },
+    { "name": "cyrillic translation", "input": { "translated": "Правило {rule} отклонено", "source": "Rule {rule} refused", "args": { "rule": "R-0001" }, "positional": [] }, "expected": "Правило R-0001 отклонено" },
+    { "name": "non-ASCII name is not a name", "input": { "translated": "{héllo}", "source": "src", "args": { "héllo": "x" }, "positional": [] }, "expected": "{héllo}" },
+    { "name": "unclosed brace", "input": { "translated": "{a", "source": "src", "args": { "a": "x" }, "positional": null }, "expected": "{a" },
+    { "name": "args and positional absent", "input": { "translated": "{0}", "source": "fallback" }, "expected": "fallback" }
+  ]
+}

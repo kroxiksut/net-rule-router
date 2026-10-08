@@ -357,6 +357,9 @@ impl ActivationCoordinator {
         if !rules.is_empty() {
             return Err(PolicyError::InvalidRuleValue { rules });
         }
+        if let Some(network) = network_on_both_routes(&submission.rules_json, carried.as_deref()) {
+            return Err(PolicyError::NetworkOnBothRoutes { network });
+        }
         let conn = self.conn.lock().expect("connection mutex poisoned");
         let repo = self.revisions_repo(&conn);
         let principal = submission.principal.as_str();
@@ -897,6 +900,32 @@ pub(crate) fn unsupported_rule_shape(
         crate::wfp_codegen::current_rule_shape_support(),
     )
     .map(|(rule, reason)| (rule.id.as_str().to_string(), reason))
+}
+
+/// A network both routes name, unless the book in force already did: an old
+/// book saved before the refusal must stay editable, its tie included.
+pub(crate) fn network_on_both_routes(
+    rules_json: &str,
+    carried_rules_json: Option<&str>,
+) -> Option<String> {
+    let decode = |dto| {
+        nrr_domain::rules_json_codec::decode(dto, nrr_domain::rules_file::HostPlatform::compiled())
+            .ok()
+            .map(|content| content.rule_book)
+    };
+    let book = nrr_shared::rules_json::from_canonical_string(rules_json)
+        .ok()
+        .and_then(decode)?;
+    let held: Vec<String> = carried_rules_json
+        .and_then(|json| {
+            crate::production_rules_provider::read_stored_rules(json, "rules-in-force").ok()
+        })
+        .and_then(decode)
+        .map(|carried| nrr_domain::validation::networks_on_both_routes(&carried))
+        .unwrap_or_default();
+    nrr_domain::validation::networks_on_both_routes(&book)
+        .into_iter()
+        .find(|network| !held.contains(network))
 }
 
 /// The first rule whose text would break the rules file on export. `None` for

@@ -1,0 +1,24 @@
+Service: OK
+┌> Screens─────────────────┐┌Routing state─────────────────────────────────────┐
+│> 1 Status                ││Routing active                                    │
+│  2 First run             ││Rules apply on this user session.                 │
+│  3 Interfaces and routes │└──────────────────────────────────────────────────┘
+│  4 Rules                 │┌Connections───────────────────────────────────────┐
+│  5 Overlaps              ││Main connection: Ethernet — Example Network       │
+│  6 Suggested addresses   ││Adapter — Available — Rules applied               │
+│  7 Connection trace      ││Additional connection: Example Tunnel — Example   │
+│  8 Cache                 ││Network Adapter — Available — Rules applied       │
+│  9 Diagnostics and logs  ││                                                  │
+│  0 Settings              ││                                                  │
+│                          │└──────────────────────────────────────────────────┘
+│                          │┌Notifications─────────────────────────────────────┐
+│                          ││No notifications.                                 │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+└──────────────────────────┘└──────────────────────────────────────────────────┘
+F1: help   q: quit

@@ -1,0 +1,24 @@
+Service: OK
+┌> Screens─────────────────┐┌Overlaps──────────────────────────────────────────┐
+│  1 Status                ││When rules of the two routes cover the same sites │
+│  2 First run             ││or addresses, the narrower rule wins: an exact    │
+│  3 Interfaces and routes ││name beats a wildcard, a wildcard beats a zone, a │
+│  4 Rules                 ││longer name beats a shorter one; an exact address │
+│> 5 Overlaps              ││beats a subnet or range, a smaller network beats a│
+│  6 Suggested addresses   ││larger one. Check that each item below goes where │
+│  7 Connection trace      ││you want it to: confirm it, or send it over the   │
+│  8 Cache                 ││other route. Changes go to your rules list, where │
+│  9 Diagnostics and logs  ││you review and apply them.                        │
+│  0 Settings              ││4 overlap(s) not confirmed                        │
+│                          ││Show resolved: No                                 │
+│                          ││                                                  │
+│                          │└──────────────────────────────────────────────────┘
+│                          │┌Rules that cover the same sites───────────────────┐
+│                          ││1. ads.example.net (Domain) names the same sites  │
+│                          ││as ads.example.net (Domain) on Primary. They are  │
+│                          ││blocked: on a tie a block wins over a route.      │
+│                          ││   Why it wins: A block wins a tie                │
+│                          ││   Decision: Not confirmed                        │
+│                          ││   The other rule names the same sites and never  │
+└──────────────────────────┘└──────────────────────────────────────────────────┘
+F1: help   q: quit

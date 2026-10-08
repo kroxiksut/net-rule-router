@@ -60,6 +60,16 @@ impl DnsObservationConsumer {
             if obs.ipv4s.is_empty() {
                 continue;
             }
+            // Every source lands here, ETW strings included: a name with
+            // markup in it never reaches the cache or a screen that lists it.
+            if !obs
+                .hostname
+                .split('.')
+                .all(|label| nrr_shared::dns_name::is_learnable_label(label.as_bytes()))
+            {
+                summary.ignored += 1;
+                continue;
+            }
             // Drop non-routable IPs (loopback/unspecified) before anything
             // else touches this observation. An ad-blocking hosts file pins
             // ad/tracker domains to 127.0.0.1 / 0.0.0.0; such a mapping must
@@ -178,6 +188,9 @@ impl DnsObservationConsumer {
                 );
             }
             if in_primary || in_secondary {
+                if let Some(engine) = self.auto_rules.as_ref() {
+                    engine.note_verify_candidate(&sid, &obs.hostname, &routable);
+                }
                 self.upsert_counted(
                     &obs.hostname,
                     &routable,

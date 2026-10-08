@@ -127,6 +127,130 @@ struct DecodedRead {
 }
 
 impl ProductionRulesProvider {
+    /// `for_enforcement` widens the book (subdomain coverage) and uses the
+    /// decode cache; a writer gets the book exactly as stored.
+    fn read_rules(&self, principal: &str, for_enforcement: bool) -> Option<ActiveRulesSnapshot> {
+        let guard = match self.conn.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!(
+                    target: "nrr::rules-provider",
+                    msg_key = "prod-rules-state-db-mutex-poisoned",
+                    "state DB mutex poisoned; treating as no active rules",
+                );
+                return None;
+            }
+        };
+        let repo = RevisionsRepository::new(&guard);
+        let warn = |p: &str, e: &dyn std::fmt::Display| {
+            tracing::warn!(
+                target: "nrr::rules-provider",
+                msg_key = "prod-rules-get-active-failed",
+                error = %e,
+                principal = %p,
+                "revisions.get_active_for failed; treating as no active rules",
+            );
+        };
+        // A revision mid-activation wins over the stored pointer, which still
+        // names the previous one until phase 3a commits.
+        let resolve = |p: &str| -> Result<Option<Source>, ()> {
+            if let Some(rules_json) = applying_revision_overlay::applying_for(&guard, p) {
+                return Ok(Some(Source::Applying {
+                    principal: p.to_owned(),
+                    rules_json,
+                }));
+            }
+            match repo.active_identity_for(p) {
+                Ok(found) => Ok(found.map(|(revision_id, content_hash)| Source::Stored {
+                    principal: p.to_owned(),
+                    revision_id,
+                    content_hash,
+                })),
+                Err(e) => {
+                    warn(p, &e);
+                    Err(())
+                }
+            }
+        };
+        let source = match resolve(principal) {
+            Ok(Some(s)) => s,
+            // No own revision → read through to the baseline principal.
+            Ok(None) if principal != BASELINE_PRINCIPAL => match resolve(BASELINE_PRINCIPAL) {
+                Ok(Some(s)) => s,
+                _ => return None,
+            },
+            Ok(None) | Err(()) => return None,
+        };
+        // Subdomain coverage is read for the CALLING principal even when the
+        // rules read through to the baseline.
+        let key = ReadKey {
+            source,
+            include_subdomains: for_enforcement
+                && Self::reads_include_subdomains(&guard, principal),
+        };
+        let mut decoded = self.decoded.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = decoded
+            .get(principal)
+            .filter(|d| for_enforcement && d.key == key)
+        {
+            return hit.snapshot.clone();
+        }
+        self.decodes.fetch_add(1, Ordering::Relaxed);
+        let (key, bare) = match key.source {
+            Source::Applying { ref rules_json, .. } => {
+                let bare = decode_rules_snapshot(rules_json, "applying-revision");
+                (key, bare)
+            }
+            Source::Stored {
+                principal: ref p, ..
+            } => match repo.get_active_for(p) {
+                // Keyed by the row actually decoded: another connection may
+                // have switched the active revision since the identity read.
+                Ok(Some(record)) => (
+                    ReadKey {
+                        source: Source::Stored {
+                            principal: p.clone(),
+                            revision_id: record.revision_id.clone(),
+                            content_hash: record.content_hash.clone(),
+                        },
+                        include_subdomains: key.include_subdomains,
+                    },
+                    Self::snapshot_from_record(&record),
+                ),
+                Ok(None) => return None,
+                Err(e) => {
+                    warn(p, &e);
+                    return None;
+                }
+            },
+        };
+        // Subdomain coverage (ON by default) widens only this enforcement read,
+        // NEVER the stored/hashed rule book the drift detector hashes bare; a
+        // storage error reads as OFF (the narrow book, never a guess).
+        let snapshot = bare.map(|mut s| {
+            // `?host` rules route via the main link until verified; before the
+            // widening, so a twin lands in the same set as its rule.
+            if for_enforcement {
+                s.rule_book = s.rule_book.with_verify_primary_effective();
+            }
+            if key.include_subdomains {
+                s.rule_book = s.rule_book.with_subdomain_coverage();
+            }
+            s
+        });
+        if !for_enforcement {
+            return snapshot;
+        }
+        decoded.insert(
+            principal.to_owned(),
+            DecodedRead {
+                key,
+                snapshot: snapshot.clone(),
+            },
+        );
+        snapshot
+    }
+
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         Self {
             conn,
@@ -264,113 +388,48 @@ impl RulesProvider for ProductionRulesProvider {
     /// is the resolution to the "seed-on-first-use trigger" open
     /// question — there is no separate seed step.
     fn active_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
-        let guard = match self.conn.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::warn!(
-                    target: "nrr::rules-provider",
-                    msg_key = "prod-rules-state-db-mutex-poisoned",
-                    "state DB mutex poisoned; treating as no active rules",
-                );
+        self.read_rules(principal, true)
+    }
+
+    fn stored_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
+        self.read_rules(principal, false)
+    }
+
+    fn rules_are_baseline_for(&self, principal: &str) -> bool {
+        if principal == BASELINE_PRINCIPAL {
+            return true;
+        }
+        // Unreadable: the user's own scope is the smaller blast radius.
+        let Ok(guard) = self.conn.lock() else {
+            return false;
+        };
+        applying_revision_overlay::applying_for(&guard, principal).is_none()
+            && matches!(
+                RevisionsRepository::new(&guard).active_identity_for(principal),
+                Ok(None)
+            )
+    }
+
+    fn stored_revision_for(&self, principal: &str) -> Option<String> {
+        let guard = self.conn.lock().ok()?;
+        let repo = RevisionsRepository::new(&guard);
+        // Outer `None`: no stable name. A revision mid-activation is known by
+        // its published blob alone, and a failed read names nothing.
+        let name = |p: &str| -> Option<Option<String>> {
+            if applying_revision_overlay::applying_for(&guard, p).is_some() {
                 return None;
             }
+            let found = repo.active_identity_for(p).ok()?;
+            Some(
+                found
+                    .map(|(revision_id, content_hash)| format!("{p}:{revision_id}:{content_hash}")),
+            )
         };
-        let repo = RevisionsRepository::new(&guard);
-        let warn = |p: &str, e: &dyn std::fmt::Display| {
-            tracing::warn!(
-                target: "nrr::rules-provider",
-                msg_key = "prod-rules-get-active-failed",
-                error = %e,
-                principal = %p,
-                "revisions.get_active_for failed; treating as no active rules",
-            );
-        };
-        // A revision mid-activation wins over the stored pointer, which still
-        // names the previous one until phase 3a commits.
-        let resolve = |p: &str| -> Result<Option<Source>, ()> {
-            if let Some(rules_json) = applying_revision_overlay::applying_for(&guard, p) {
-                return Ok(Some(Source::Applying {
-                    principal: p.to_owned(),
-                    rules_json,
-                }));
-            }
-            match repo.active_identity_for(p) {
-                Ok(found) => Ok(found.map(|(revision_id, content_hash)| Source::Stored {
-                    principal: p.to_owned(),
-                    revision_id,
-                    content_hash,
-                })),
-                Err(e) => {
-                    warn(p, &e);
-                    Err(())
-                }
-            }
-        };
-        let source = match resolve(principal) {
-            Ok(Some(s)) => s,
-            // No own revision → read through to the baseline principal.
-            Ok(None) if principal != BASELINE_PRINCIPAL => match resolve(BASELINE_PRINCIPAL) {
-                Ok(Some(s)) => s,
-                _ => return None,
-            },
-            Ok(None) | Err(()) => return None,
-        };
-        // Subdomain coverage is read for the CALLING principal even when the
-        // rules read through to the baseline.
-        let key = ReadKey {
-            source,
-            include_subdomains: Self::reads_include_subdomains(&guard, principal),
-        };
-        let mut decoded = self.decoded.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(hit) = decoded.get(principal).filter(|d| d.key == key) {
-            return hit.snapshot.clone();
+        match name(principal)? {
+            Some(own) => Some(own),
+            None if principal != BASELINE_PRINCIPAL => name(BASELINE_PRINCIPAL)?,
+            None => None,
         }
-        self.decodes.fetch_add(1, Ordering::Relaxed);
-        let (key, bare) = match key.source {
-            Source::Applying { ref rules_json, .. } => {
-                let bare = decode_rules_snapshot(rules_json, "applying-revision");
-                (key, bare)
-            }
-            Source::Stored {
-                principal: ref p, ..
-            } => match repo.get_active_for(p) {
-                // Keyed by the row actually decoded: another connection may
-                // have switched the active revision since the identity read.
-                Ok(Some(record)) => (
-                    ReadKey {
-                        source: Source::Stored {
-                            principal: p.clone(),
-                            revision_id: record.revision_id.clone(),
-                            content_hash: record.content_hash.clone(),
-                        },
-                        include_subdomains: key.include_subdomains,
-                    },
-                    Self::snapshot_from_record(&record),
-                ),
-                Ok(None) => return None,
-                Err(e) => {
-                    warn(p, &e);
-                    return None;
-                }
-            },
-        };
-        // Subdomain coverage (ON by default) widens only this enforcement read,
-        // NEVER the stored/hashed rule book the drift detector hashes bare; a
-        // storage error reads as OFF (the narrow book, never a guess).
-        let snapshot = bare.map(|mut s| {
-            if key.include_subdomains {
-                s.rule_book = s.rule_book.with_subdomain_coverage();
-            }
-            s
-        });
-        decoded.insert(
-            principal.to_owned(),
-            DecodedRead {
-                key,
-                snapshot: snapshot.clone(),
-            },
-        );
-        snapshot
     }
 }
 
@@ -765,6 +824,15 @@ mod tests {
             has_suffix_sibling(&default_on),
             "a SuffixDomain sibling for the domain must be present",
         );
+        // A writer reads what is stored: the sibling written back would become
+        // a rule the user never wrote.
+        let stored = provider.stored_rules_for(sid).expect("rules present");
+        assert_eq!(stored.rule_book.secondary.rules().len(), 1);
+        assert!(!has_suffix_sibling(&stored));
+        // ...and that read leaves the enforcement view's cache entry alone.
+        assert!(has_suffix_sibling(
+            &provider.active_rules_for(sid).expect("rules present")
+        ));
 
         // Seed the per-SID toggle explicitly OFF.
         {
@@ -803,6 +871,54 @@ mod tests {
         assert!(
             has_suffix_sibling(&on),
             "a SuffixDomain sibling for the domain must be present",
+        );
+    }
+
+    /// `?host` routes via the main link until verified: enforcement reads it as
+    /// a primary Route, a writer reads it as stored.
+    #[test]
+    fn a_verify_primary_rule_is_primary_for_enforcement_and_untouched_for_writers() {
+        use nrr_domain::RuleAction;
+        use nrr_shared::rules_json::{
+            AddressMatchDto, CanonicalRulesJsonV1, RuleDto, RULES_JSON_SCHEMA_VERSION,
+        };
+        let dto = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![],
+            secondary: vec![RuleDto {
+                id: "r-verify".into(),
+                enabled: true,
+                address_match: Some(AddressMatchDto::SuffixDomain {
+                    suffix: "proton.example".into(),
+                }),
+                app_match: None,
+                comment: String::new(),
+                action: nrr_shared::rules_json::RuleAction::VerifyPrimary,
+                origin: None,
+            }],
+        };
+        let json = rules_json::to_canonical_string(&dto).expect("serialise");
+        let sid = "S-1-5-21-verify";
+        let conn = make_state_conn();
+        insert_active_revision_for(&conn, sid, &json);
+        let provider = ProductionRulesProvider::new(Arc::clone(&conn));
+
+        let enforced = provider.active_rules_for(sid).expect("rules present");
+        assert!(enforced.rule_book.secondary.is_empty());
+        assert!(enforced
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .all(|r| r.action == RuleAction::Route));
+        assert!(!enforced.rule_book.primary.is_empty());
+
+        let stored = provider.stored_rules_for(sid).expect("rules present");
+        assert!(stored.rule_book.primary.is_empty());
+        assert_eq!(stored.rule_book.secondary.len(), 1);
+        assert_eq!(
+            stored.rule_book.secondary.rules()[0].action,
+            RuleAction::VerifyPrimary
         );
     }
 
@@ -860,6 +976,44 @@ mod tests {
             .active_rules_for("S-1-5-21-NEW-USER")
             .expect("read-through to baseline");
         assert_eq!(snap.rule_book.primary.rules().len(), 1);
+    }
+
+    #[test]
+    fn the_stored_revision_name_follows_the_book_a_writer_reads() {
+        let conn = make_state_conn();
+        let provider = ProductionRulesProvider::new(Arc::clone(&conn));
+        let user = "S-1-5-21-NAMED";
+        assert_eq!(provider.stored_revision_for(user), None, "no book at all");
+
+        insert_active_revision(&conn, &single_rule_json("203.0.113.5"));
+        let inherited = provider.stored_revision_for(user).expect("baseline named");
+        assert!(inherited.starts_with(nrr_storage::BASELINE_PRINCIPAL));
+
+        insert_active_revision_for(&conn, user, &single_rule_json("198.51.100.9"));
+        let own = provider.stored_revision_for(user).expect("own named");
+        assert_ne!(own, inherited, "diverging is a new book");
+        assert_eq!(provider.stored_revision_for(user), Some(own));
+        assert_eq!(provider.decode_count(), 0, "naming decodes nothing");
+    }
+
+    /// A user reading the baseline through carries the administrator's
+    /// machine-wide blocks; one with a book of their own does not.
+    #[test]
+    fn only_a_read_through_book_is_the_baseline() {
+        let conn = make_state_conn();
+        let provider = ProductionRulesProvider::new(Arc::clone(&conn));
+        let user = "S-1-5-21-OWNBOOK";
+        assert!(provider.rules_are_baseline_for(nrr_storage::BASELINE_PRINCIPAL));
+        insert_active_revision(&conn, &single_rule_json("203.0.113.5"));
+        assert!(
+            provider.rules_are_baseline_for(user),
+            "reads the baseline through"
+        );
+        insert_active_revision_for(&conn, user, &single_rule_json("198.51.100.9"));
+        assert!(
+            !provider.rules_are_baseline_for(user),
+            "a book of their own"
+        );
     }
 
     #[test]

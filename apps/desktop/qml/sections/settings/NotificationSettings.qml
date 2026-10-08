@@ -21,6 +21,8 @@ GroupBox {
     // the only place a mute gets a caller-chosen duration.
     property var _blockNoticeMutes: []
     property bool _blockNoticeMutesLoading: false
+    // A change heard while a load is in flight: that load may predate it.
+    property bool _blockNoticeMutesReloadPending: false
     // Blocked-connection notices are raised by the connection observer; where
     // there is none, nothing ever arrives and no mute has anything to silence.
     readonly property bool _blockNoticesSupported: root.blockNoticesSupported
@@ -74,12 +76,21 @@ GroupBox {
         && root.backendStatus.kind === "connected"
 
     function _loadBlockNoticeMutes() {
-        if (group._blockNoticeMutesLoading || !group._serviceReachable) return
+        if (!group._serviceReachable) return
+        if (group._blockNoticeMutesLoading) {
+            group._blockNoticeMutesReloadPending = true
+            return
+        }
         var corr = root.rpc.rpcBlockNoticeMutesList()
         if (!corr) return
         group._blockNoticeMutesLoading = true
+        group._blockNoticeMutesReloadPending = false
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             group._blockNoticeMutesLoading = false
+            if (group._blockNoticeMutesReloadPending) {
+                group._loadBlockNoticeMutes()
+                return
+            }
             if (!ok) {
                 // A connection that dropped mid-call is the banner's business,
                 // not ours; anything else is a real failure worth naming.
@@ -133,6 +144,10 @@ GroupBox {
         target: root
         function onBackendStatusChanged() {
             if (group._serviceReachable) group._loadBlockNoticeMutes()
+        }
+        // A mute set or lifted elsewhere, the tray included.
+        function onNoticeMutesRevisionChanged() {
+            group._loadBlockNoticeMutes()
         }
     }
 

@@ -207,3 +207,22 @@ fn run_node(program: &str) -> Option<String> {
     );
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
+
+/// The first-run status line reports the keys that reached the service, not
+/// the wizard's whole answer: Linux strips fake-IP, so "fake-IP is on" there
+/// would describe a write that never happened.
+#[test]
+fn the_first_run_answer_speaks_only_of_what_was_sent() {
+    let startup = repo_file("apps/desktop/qml/flows/StartupController.qml");
+    let body = startup
+        .split("function applyFirstRunStability(")
+        .nth(1)
+        .expect("StartupController applies the first-run stability answers");
+    let body = &body[..body.find("\n    }\n").expect("function end")];
+    assert!(
+        body.contains("root.stabilityPatchForPlatform(patch)"),
+        "{body}"
+    );
+    assert!(body.contains("_stabilityAppliedText(sent,"), "{body}");
+    assert!(!body.contains("_stabilityAppliedText(patch,"), "{body}");
+}

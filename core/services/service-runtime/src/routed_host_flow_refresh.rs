@@ -42,9 +42,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
+use nrr_platform_api::conn_observe::egress::EgressRole;
 use nrr_platform_api::fake_ip::stale_flows::{
-    EstablishedFlow, FlowTargets, StaleFlowReset, StaleFlowSweep,
+    EstablishedFlow, FlowLinks, FlowTargets, StaleFlowReset, StaleFlowSweep,
 };
+use nrr_shared::ip_block::IpBlock;
 
 use crate::flow_reset_log::{log_reset_flows, ResetCause};
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
@@ -93,17 +95,85 @@ pub struct FlowRefreshDecision {
     /// Owner unknown: tearing down a connection nobody can vouch for is how
     /// another user's session gets cut.
     pub kept_unknown_owner: usize,
+    /// Riding a link that is neither of the owner's — a tunnel they run beside
+    /// ours. No rule of ours moves it, so a reset only breaks it.
+    pub kept_other_link: usize,
+    /// Already on the link the plan assigns its destination.
+    pub kept_on_course: usize,
+}
+
+/// The link the plan sends a destination over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Course {
+    Primary,
+    Secondary,
+}
+
+/// The [`Course`] of each destination whose course is certain. A destination
+/// absent here — blocked, or steered both ways — has none, and its connections
+/// are reset wherever they run.
+#[derive(Debug, Clone, Default)]
+pub struct Courses {
+    hosts: HashMap<Ipv4Addr, Course>,
+    networks: Vec<(IpBlock, Course)>,
+}
+
+impl Courses {
+    pub fn insert_host(&mut self, host: Ipv4Addr, course: Course) {
+        self.hosts.insert(host, course);
+    }
+
+    pub fn insert_network(&mut self, network: IpBlock, course: Course) {
+        self.networks.push((network, course));
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty() && self.networks.is_empty()
+    }
+
+    /// The course of exactly `network`, as a rule names it.
+    #[must_use]
+    pub fn of_network(&self, network: IpBlock) -> Option<Course> {
+        self.networks
+            .iter()
+            .find(|(net, _)| *net == network)
+            .map(|(_, course)| *course)
+    }
+
+    /// A host's own course outranks a network's, and a longer prefix a shorter
+    /// one — the narrower rule wins, as in enforcement.
+    #[must_use]
+    pub fn of(&self, remote: Ipv4Addr) -> Option<Course> {
+        if let Some(course) = self.hosts.get(&remote) {
+            return Some(*course);
+        }
+        self.networks
+            .iter()
+            .filter(|(net, _)| net.contains(std::net::IpAddr::V4(remote)))
+            .max_by_key(|(net, _)| net.prefix_len())
+            .map(|(_, course)| *course)
+    }
+}
+
+/// Where the owner's connections run and where the plan wants them. The
+/// default knows neither, which spares nothing.
+#[derive(Debug, Clone, Default)]
+pub struct FlowPaths {
+    pub links: FlowLinks,
+    pub courses: Courses,
 }
 
 /// Which `candidates` a rule change by `rule_owner` may tear down: the owner's
 /// own connections, to addresses no direct host shares unless they are in
-/// `anchors`.
+/// `anchors`, that are off course on one of the owner's links.
 #[must_use]
 pub fn flows_to_reset(
     candidates: Vec<EstablishedFlow>,
     rule_owner: &str,
     shared_direct: &HashSet<Ipv4Addr>,
     anchors: &HashSet<Ipv4Addr>,
+    paths: &FlowPaths,
 ) -> FlowRefreshDecision {
     let mut decision = FlowRefreshDecision::default();
     for flow in candidates {
@@ -116,6 +186,24 @@ pub fn flows_to_reset(
             None => decision.kept_unknown_owner += 1,
             // SID strings compare case-insensitively.
             Some(owner) if owner.eq_ignore_ascii_case(rule_owner) => {
+                let on_course = match (
+                    paths.links.role_of(*flow.local.ip()),
+                    paths.courses.of(*flow.remote.ip()),
+                ) {
+                    (EgressRole::Other, _) => {
+                        decision.kept_other_link += 1;
+                        continue;
+                    }
+                    (EgressRole::Primary, Some(Course::Primary))
+                    | (EgressRole::Secondary, Some(Course::Secondary)) => true,
+                    _ => false,
+                };
+                // An anchor goes on course too: tearing it down is what makes
+                // the page ask for its resources again.
+                if on_course && !anchor {
+                    decision.kept_on_course += 1;
+                    continue;
+                }
                 decision.anchor_reset += usize::from(anchor);
                 decision.reset.push(flow);
             }
@@ -134,13 +222,14 @@ pub struct OwnerFlowReset {
 
 /// Tear down `owner`'s established connections to `targets` — hosts, or any
 /// address inside a network a rule names — under [`flows_to_reset`]'s rules,
-/// with no anchor. `None` when nothing was connected: the census is a query,
-/// read only when there is a connection to spare.
+/// with no anchor. `None` when nothing was connected: the census and `paths`
+/// are queries, read only when there is a connection to spare.
 pub fn reset_owner_flows(
     reset: &dyn StaleFlowReset,
     cache: &dyn FqdnCacheLookup,
     owner: &str,
     targets: &FlowTargets,
+    paths: impl FnOnce() -> FlowPaths,
 ) -> Option<OwnerFlowReset> {
     if targets.is_empty() {
         return None;
@@ -154,6 +243,7 @@ pub fn reset_owner_flows(
         owner,
         &cache.shared_direct_ips(),
         &HashSet::new(),
+        &paths(),
     );
     let torn_down = if decision.reset.is_empty() {
         0
@@ -174,16 +264,44 @@ struct RefreshTargets {
     hosts: HashMap<Ipv4Addr, String>,
 }
 
+/// A principal's links, read when a pass has connections to decide on.
+pub type FlowLinksSource = Arc<dyn Fn(&str) -> FlowLinks + Send + Sync>;
+
 /// Tears down established connections to hosts whose route just changed.
 pub struct RoutedHostFlowRefresh {
     cache: Arc<dyn FqdnCacheLookup>,
     reset: Arc<dyn StaleFlowReset>,
+    links: Option<FlowLinksSource>,
 }
 
 impl RoutedHostFlowRefresh {
     #[must_use]
     pub fn new(cache: Arc<dyn FqdnCacheLookup>, reset: Arc<dyn StaleFlowReset>) -> Self {
-        Self { cache, reset }
+        Self {
+            cache,
+            reset,
+            links: None,
+        }
+    }
+
+    /// Spare the connections riding a link that is neither of the principal's.
+    #[must_use]
+    pub fn with_links(mut self, links: FlowLinksSource) -> Self {
+        self.links = Some(links);
+        self
+    }
+
+    /// Where the owner's connections run. Which link a routed host belongs on
+    /// is the rule's, not known here, so no connection counts as on course.
+    fn paths(&self, principal: &str) -> FlowPaths {
+        FlowPaths {
+            links: self
+                .links
+                .as_ref()
+                .map(|links| links(principal))
+                .unwrap_or_default(),
+            courses: Courses::default(),
+        }
     }
 
     /// Tear down `principal`'s established connections aimed at an address
@@ -217,6 +335,7 @@ impl RoutedHostFlowRefresh {
             principal,
             &self.cache.shared_direct_ips(),
             &anchors,
+            &self.paths(principal),
         );
         let anchor_skipped = has_anchor && decision.anchor_reset == 0;
         if decision.kept_unknown_owner > 0 {
@@ -251,6 +370,7 @@ impl RoutedHostFlowRefresh {
                 anchor_skipped,
                 kept_shared = decision.kept_shared,
                 kept_other_owner = decision.kept_other_owner,
+                kept_other_link = decision.kept_other_link,
                 "tore down connections still running over the previous route — \
                  the application reconnects under the new rule",
             );
@@ -401,7 +521,13 @@ mod tests {
     #[test]
     fn the_rule_owners_connection_to_a_routed_only_address_is_reset() {
         let mine = flow("203.0.113.10", 50_000, Some(OWNER));
-        let decision = flows_to_reset(vec![mine.clone()], OWNER, &HashSet::new(), &HashSet::new());
+        let decision = flows_to_reset(
+            vec![mine.clone()],
+            OWNER,
+            &HashSet::new(),
+            &HashSet::new(),
+            &FlowPaths::default(),
+        );
         assert_eq!(decision.reset, vec![mine]);
     }
 
@@ -414,6 +540,7 @@ mod tests {
             OWNER,
             &HashSet::new(),
             &HashSet::new(),
+            &FlowPaths::default(),
         );
         assert_eq!(decision.reset, vec![mine]);
         assert_eq!(decision.kept_other_owner, 1);
@@ -429,6 +556,7 @@ mod tests {
             OWNER,
             &shared,
             &HashSet::new(),
+            &FlowPaths::default(),
         );
         assert_eq!(decision.reset, vec![to_routed]);
         assert_eq!(decision.kept_shared, 1);
@@ -441,6 +569,7 @@ mod tests {
             OWNER,
             &HashSet::new(),
             &HashSet::new(),
+            &FlowPaths::default(),
         );
         assert!(decision.reset.is_empty());
         assert_eq!(decision.kept_unknown_owner, 1);
@@ -450,11 +579,169 @@ mod tests {
     fn the_owner_matches_regardless_of_sid_letter_case() {
         let mine = flow("203.0.113.10", 50_000, Some("s-1-5-21-1-2-3-1001"));
         assert_eq!(
-            flows_to_reset(vec![mine], OWNER, &HashSet::new(), &HashSet::new())
-                .reset
-                .len(),
+            flows_to_reset(
+                vec![mine],
+                OWNER,
+                &HashSet::new(),
+                &HashSet::new(),
+                &FlowPaths::default()
+            )
+            .reset
+            .len(),
             1
         );
+    }
+
+    // ── the link a connection rides ───────────────────────────────────────
+
+    const PRIMARY_IF: u32 = 23;
+    const SECONDARY_IF: u32 = 28;
+    const CORPORATE_IF: u32 = 20;
+
+    fn on_primary() -> Ipv4Addr {
+        ip("192.0.2.1")
+    }
+    fn on_secondary() -> Ipv4Addr {
+        ip("198.51.100.41")
+    }
+    fn on_corporate() -> Ipv4Addr {
+        ip("172.16.0.150")
+    }
+
+    fn links() -> FlowLinks {
+        FlowLinks::new(
+            vec![
+                (IpAddr::V4(on_primary()), PRIMARY_IF),
+                (IpAddr::V4(on_secondary()), SECONDARY_IF),
+                (IpAddr::V4(on_corporate()), CORPORATE_IF),
+            ],
+            Some(PRIMARY_IF),
+            Some(SECONDARY_IF),
+        )
+    }
+
+    fn via(local: Ipv4Addr, remote: &str, local_port: u16) -> EstablishedFlow {
+        EstablishedFlow {
+            local: SocketAddrV4::new(local, local_port),
+            ..flow(remote, local_port, Some(OWNER))
+        }
+    }
+
+    fn paths(courses: &[(&str, Course)]) -> FlowPaths {
+        let mut known = Courses::default();
+        for (host, course) in courses {
+            known.insert_host(ip(host), *course);
+        }
+        FlowPaths {
+            links: links(),
+            courses: known,
+        }
+    }
+
+    fn decide(candidates: Vec<EstablishedFlow>, paths: &FlowPaths) -> FlowRefreshDecision {
+        flows_to_reset(candidates, OWNER, &HashSet::new(), &HashSet::new(), paths)
+    }
+
+    /// A corporate tunnel the user runs beside ours carries its own routes:
+    /// nothing we steer moves its connections, so a reset only cuts them.
+    #[test]
+    fn a_connection_riding_a_link_that_is_neither_of_the_owners_is_kept() {
+        let corporate = via(on_corporate(), "203.0.113.10", 50_000);
+        let decision = decide(
+            vec![corporate],
+            &paths(&[("203.0.113.10", Course::Primary)]),
+        );
+        assert!(decision.reset.is_empty());
+        assert_eq!(decision.kept_other_link, 1);
+
+        let unrouted = decide(
+            vec![via(on_corporate(), "203.0.113.11", 50_001)],
+            &paths(&[]),
+        );
+        assert_eq!(unrouted.kept_other_link, 1, "with no course known either");
+    }
+
+    #[test]
+    fn a_connection_already_on_its_course_is_kept_and_one_off_it_is_reset() {
+        let p = paths(&[
+            ("203.0.113.10", Course::Primary),
+            ("203.0.113.20", Course::Secondary),
+        ]);
+        let off_course = vec![
+            via(on_secondary(), "203.0.113.10", 50_001),
+            via(on_primary(), "203.0.113.20", 50_003),
+        ];
+        let mut candidates = vec![
+            via(on_primary(), "203.0.113.10", 50_000),
+            via(on_secondary(), "203.0.113.20", 50_002),
+        ];
+        candidates.extend(off_course.clone());
+
+        let decision = decide(candidates, &p);
+
+        assert_eq!(decision.reset, off_course);
+        assert_eq!(decision.kept_on_course, 2);
+    }
+
+    /// A destination with no certain course — blocked, say — is reset on any
+    /// of the owner's links, as is a connection whose link nobody could read.
+    #[test]
+    fn no_course_or_no_link_reading_leaves_the_reset_as_it_was() {
+        let blocked = via(on_primary(), "203.0.113.30", 50_000);
+        assert_eq!(
+            decide(vec![blocked.clone()], &paths(&[])).reset,
+            vec![blocked]
+        );
+
+        let unread = via(on_primary(), "203.0.113.10", 50_001);
+        let mut no_links = paths(&[("203.0.113.10", Course::Primary)]);
+        no_links.links = FlowLinks::default();
+        assert_eq!(decide(vec![unread.clone()], &no_links).reset, vec![unread]);
+    }
+
+    #[test]
+    fn an_anchor_on_course_is_still_reset() {
+        let anchor = via(on_primary(), "203.0.113.10", 50_000);
+        let decision = flows_to_reset(
+            vec![anchor.clone()],
+            OWNER,
+            &HashSet::new(),
+            &HashSet::from([ip("203.0.113.10")]),
+            &paths(&[("203.0.113.10", Course::Primary)]),
+        );
+        assert_eq!(decision.reset, vec![anchor]);
+    }
+
+    #[test]
+    fn a_hosts_own_course_outranks_its_networks_and_a_longer_prefix_a_shorter_one() {
+        let mut courses = Courses::default();
+        courses.insert_network(network("203.0.113.0/24"), Course::Secondary);
+        courses.insert_network(network("203.0.113.0/28"), Course::Primary);
+        courses.insert_host(ip("203.0.113.5"), Course::Secondary);
+        assert_eq!(courses.of(ip("203.0.113.5")), Some(Course::Secondary));
+        assert_eq!(courses.of(ip("203.0.113.6")), Some(Course::Primary));
+        assert_eq!(courses.of(ip("203.0.113.200")), Some(Course::Secondary));
+        assert_eq!(courses.of(ip("198.51.100.1")), None);
+    }
+
+    #[test]
+    fn a_routed_host_pass_spares_a_connection_on_another_link() {
+        let cache = cache_with(&[("cdn.example", "203.0.113.10")]);
+        let reset = Arc::new(MockStaleFlowReset::new());
+        let mine = via(on_primary(), "203.0.113.10", 50_000);
+        reset.set_flows(vec![
+            mine.clone(),
+            via(on_corporate(), "203.0.113.10", 50_001),
+        ]);
+        let refresher = RoutedHostFlowRefresh::new(
+            Arc::new(cache),
+            Arc::clone(&reset) as Arc<dyn StaleFlowReset>,
+        )
+        .with_links(Arc::new(|_: &str| links()));
+
+        refresher.refresh(OWNER, &[RoutedHost::Exact("cdn.example".into())]);
+
+        assert_eq!(reset.reset_flows(), vec![mine]);
     }
 
     // ── the pass ──────────────────────────────────────────────────────────
@@ -515,7 +802,13 @@ mod tests {
     fn the_owners_anchor_connection_on_a_shared_address_is_reset() {
         let shared = HashSet::from([ip("203.0.113.10")]);
         let anchor = flow("203.0.113.10", 50_000, Some(OWNER));
-        let decision = flows_to_reset(vec![anchor.clone()], OWNER, &shared, &shared);
+        let decision = flows_to_reset(
+            vec![anchor.clone()],
+            OWNER,
+            &shared,
+            &shared,
+            &FlowPaths::default(),
+        );
         assert_eq!(decision.reset, vec![anchor]);
         assert_eq!(decision.anchor_reset, 1);
         assert_eq!(decision.kept_shared, 0);
@@ -530,6 +823,7 @@ mod tests {
             OWNER,
             &shared,
             &anchors,
+            &FlowPaths::default(),
         );
         assert!(decision.reset.is_empty());
         assert_eq!(decision.kept_shared, 1);
@@ -546,6 +840,7 @@ mod tests {
             OWNER,
             &anchors,
             &anchors,
+            &FlowPaths::default(),
         );
         assert!(decision.reset.is_empty());
         assert_eq!(decision.anchor_reset, 0);
@@ -654,8 +949,14 @@ mod tests {
         ]);
         let targets = FlowTargets::new(Vec::new(), vec![network("198.51.100.0/24")]);
 
-        let outcome = reset_owner_flows(&reset, &FakeCache::default(), OWNER, &targets)
-            .expect("something was connected");
+        let outcome = reset_owner_flows(
+            &reset,
+            &FakeCache::default(),
+            OWNER,
+            &targets,
+            FlowPaths::default,
+        )
+        .expect("something was connected");
 
         assert_eq!(reset.reset_flows(), vec![mine_inside]);
         assert_eq!(outcome.torn_down, 1);
@@ -675,7 +976,8 @@ mod tests {
         cache.shared_direct.insert(ip("198.51.100.30"));
         let targets = FlowTargets::new(Vec::new(), vec![network("198.51.100.0/24")]);
 
-        let outcome = reset_owner_flows(&reset, &cache, OWNER, &targets).expect("connected");
+        let outcome = reset_owner_flows(&reset, &cache, OWNER, &targets, FlowPaths::default)
+            .expect("connected");
 
         assert_eq!(reset.reset_flows(), vec![routed]);
         assert_eq!(outcome.decision.kept_shared, 1);
@@ -688,12 +990,20 @@ mod tests {
             &reset,
             &FakeCache::default(),
             OWNER,
-            &FlowTargets::default()
+            &FlowTargets::default(),
+            FlowPaths::default
         )
         .is_none());
         assert!(reset.queried_networks().is_empty());
         let targets = FlowTargets::new(Vec::new(), vec![network("198.51.100.0/24")]);
-        assert!(reset_owner_flows(&reset, &FakeCache::default(), OWNER, &targets).is_none());
+        assert!(reset_owner_flows(
+            &reset,
+            &FakeCache::default(),
+            OWNER,
+            &targets,
+            FlowPaths::default
+        )
+        .is_none());
         assert!(reset.reset_flows().is_empty());
     }
 

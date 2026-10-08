@@ -15,6 +15,10 @@
 *.byteoversea.com  # TikTok: blocked nationwide since 2020
 *.ibyteimg.com  # TikTok: blocked nationwide since 2020
 *.musical.ly  # TikTok: blocked nationwide since 2020
+?*.proton.me
+?*.protonmail.com
+?*.protonmail.ch
+?*.protonvpn.com
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets

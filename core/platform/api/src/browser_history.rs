@@ -34,6 +34,10 @@ pub trait BrowserHistoryReadPort: Send + Sync {
     /// that consulted its process environment found nothing. The mechanism
     /// must resolve the principal's profile root instead.
     fn read_history_hostnames(&self, principal: &str) -> Result<Vec<String>, BrowserHistoryError>;
+
+    /// Delete history copies an earlier run left behind (a crash mid-read, or
+    /// a delete the OS refused). Called once at start, before any read.
+    fn discard_leftover_copies(&self) {}
 }
 
 /// Why a browser-history read yielded nothing.

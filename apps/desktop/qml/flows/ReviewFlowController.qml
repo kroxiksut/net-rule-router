@@ -304,7 +304,7 @@ QtObject {
                 // A `forbidden` here is the mutation gate (e.g. an
                 // unacknowledged security alert), not missing rights: rules
                 // commit as a non-elevated `user-scoped-mutation`.
-                _announceRulesActivationFailed(code)
+                _announceRulesActivationFailed(code, null)
                 // Clear the dirty flag even on failure: the user has
                 // completed the Save-and-review gesture and can't
                 // recover from non-retryable errors (forbidden, etc.)
@@ -321,7 +321,7 @@ QtObject {
             // The confirm only accepts the change; its verdict is on the
             // operation record.
             root.rpc.readMutationOutcome(p, root.rpc.settleByPreview("rules-update", payload),
-                function(failure) {
+                function(failure, failureArgs) {
                     if (failure === "") {
                         _completeRulesActivation(p)
                         return
@@ -329,17 +329,18 @@ QtObject {
                     console.log("review-flow: activation refused:", failure)
                     // Nothing was activated: the edits stay unsaved and the
                     // bound files keep what is in force.
-                    _announceRulesActivationFailed(failure)
+                    _announceRulesActivationFailed(failure, failureArgs)
                     _resolveGuardRulesApply(false)
                 })
         })
     }
 
-    function _announceRulesActivationFailed(code) {
+    // `args` are this refusal's own values; null words it by its code alone.
+    function _announceRulesActivationFailed(code, args) {
         root.statusLine = root.tr("status.rules-activate-failed",
             "Failed to activate rules: ") +
             ((typeof root.ipcErrorLabel === "function")
-                ? root.ipcErrorLabel(String(code || "unknown"), root.rpc.lastFailureArgs)
+                ? root.ipcErrorLabel(String(code || "unknown"), args || null)
                 : String(code || "unknown"))
     }
 

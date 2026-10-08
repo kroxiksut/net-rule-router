@@ -1,0 +1,21 @@
+{
+  "description": "pure.js stabilityCoerce",
+  "cases": [
+    { "name": "known slug", "input": { "key": "verbose-logging-mode", "raw": "timed" }, "expected": "timed" },
+    { "name": "unknown slug falls back", "input": { "key": "verbose-logging-mode", "raw": "bogus" }, "expected": "off" },
+    { "name": "absent reads as default", "input": { "key": "verbose-logging-mode" }, "expected": "off" },
+    { "name": "liveness below the floor", "input": { "key": "secondary-liveness-window-secs", "raw": 2 }, "expected": 5 },
+    { "name": "liveness zero is disabled", "input": { "key": "secondary-liveness-window-secs", "raw": 0 }, "expected": 0 },
+    { "name": "liveness above the cap", "input": { "key": "secondary-liveness-window-secs", "raw": 99999 }, "expected": 3600 },
+    { "name": "cache refresh negative", "input": { "key": "cache-refresh-interval-secs", "raw": -5 }, "expected": 300 },
+    { "name": "cache refresh from text", "input": { "key": "cache-refresh-interval-secs", "raw": "120" }, "expected": 120 },
+    { "name": "boolean text is not true", "input": { "key": "dns-fast-answers", "raw": "true" }, "expected": false },
+    { "name": "boolean null is default", "input": { "key": "dns-fast-answers", "raw": null }, "expected": true },
+    { "name": "boolean true", "input": { "key": "fake-ip-enabled", "raw": true }, "expected": true },
+    { "name": "unknown key passes", "input": { "key": "made-up", "raw": { "a": 1 } }, "expected": { "a": 1 } },
+    { "name": "empty text is default", "input": { "key": "routing-stop-policy", "raw": "" }, "expected": "teardown" },
+    { "name": "number where a slug belongs", "input": { "key": "enforcement-mode", "raw": 5 }, "expected": "resolver" },
+    { "name": "free text keeps a number as text", "input": { "key": "conn-trace-ndjson-forced-by", "raw": 42 }, "expected": "42" },
+    { "name": "fraction truncates", "input": { "key": "verbose-logging-until-ms", "raw": 1.9 }, "expected": 1 }
+  ]
+}

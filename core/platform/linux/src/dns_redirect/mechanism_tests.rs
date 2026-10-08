@@ -10,19 +10,23 @@ use super::*;
 const DHCP_SERVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const VPN_SERVER: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 1);
 
-fn scratch(test: &str) -> DnsFiles {
-    let root = std::env::temp_dir().join(format!("nrr-dns-mech-{test}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+fn scratch(test: &str) -> (tempfile::TempDir, DnsFiles) {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("nrr-dns-mech-{test}-"))
+        .tempdir()
+        .expect("tempdir");
+    let root = dir.path();
     std::fs::create_dir_all(root.join("etc")).expect("etc");
     std::fs::create_dir_all(root.join("data")).expect("data");
     std::fs::create_dir_all(root.join("records")).expect("records");
-    DnsFiles {
+    let files = DnsFiles {
         resolv_conf: root.join("etc").join("resolv.conf"),
         data_dir: root.join("data"),
         nm_conf_dir: root.join("run-nm").join("conf.d"),
         resolvconf_record_dirs: vec![root.join("records")],
         resolved_stub: root.join("run-resolved").join("stub-resolv.conf"),
-    }
+    };
+    (dir, files)
 }
 
 fn read(path: &Path) -> String {
@@ -317,28 +321,28 @@ fn upstreams(servers: &dyn SystemDnsServersPort) -> Vec<Ipv4Addr> {
 
 #[test]
 fn each_machine_gets_the_mechanism_that_writes_its_file() {
-    let files = scratch("choice-nm");
+    let (_dir, files) = scratch("choice-nm");
     let nm = FakeMachine::new(&files).with_network_manager();
     assert_eq!(
         detect_capture_method(&nm, &files),
         Some(DnsCaptureMethod::NetworkManager)
     );
 
-    let files = scratch("choice-resolvconf");
+    let (_dir, files) = scratch("choice-resolvconf");
     let rc = FakeMachine::new(&files).with_resolvconf(Resolvconf::Debian);
     assert_eq!(
         detect_capture_method(&rc, &files),
         Some(DnsCaptureMethod::Resolvconf)
     );
 
-    let files = scratch("choice-file");
+    let (_dir, files) = scratch("choice-file");
     plain_file(&files);
     assert_eq!(
         detect_capture_method(&FakeMachine::new(&files), &files),
         Some(DnsCaptureMethod::ResolvConfFile)
     );
 
-    let files = scratch("choice-none");
+    let (_dir, files) = scratch("choice-none");
     assert_eq!(
         detect_capture_method(&FakeMachine::new(&files), &files),
         None
@@ -347,7 +351,7 @@ fn each_machine_gets_the_mechanism_that_writes_its_file() {
 
 #[test]
 fn a_file_networkmanager_once_wrote_is_not_its_while_it_is_stopped() {
-    let files = scratch("choice-nm-stopped");
+    let (_dir, files) = scratch("choice-nm-stopped");
     let machine = FakeMachine::new(&files).with_network_manager();
     machine.state.lock().expect("lock").nm_running = false;
     assert_eq!(
@@ -360,7 +364,7 @@ fn a_file_networkmanager_once_wrote_is_not_its_while_it_is_stopped() {
 /// is resolved's machine, and taking the file over would forward to ourselves.
 #[test]
 fn a_file_naming_resolveds_stub_means_resolved_while_it_is_silent() {
-    let files = scratch("choice-stub-file");
+    let (_dir, files) = scratch("choice-stub-file");
     std::fs::write(&files.resolv_conf, "nameserver 127.0.0.53\noptions edns0\n").expect("stub");
     assert_eq!(
         detect_capture_method(&FakeMachine::new(&files), &files),
@@ -371,7 +375,7 @@ fn a_file_naming_resolveds_stub_means_resolved_while_it_is_silent() {
 #[cfg(unix)]
 #[test]
 fn a_link_to_resolveds_stub_means_resolved_while_it_is_silent() {
-    let files = scratch("choice-stub-link");
+    let (_dir, files) = scratch("choice-stub-link");
     let stub = &files.resolved_stub;
     std::fs::create_dir_all(stub.parent().expect("dir")).expect("dir");
     std::fs::write(stub, "nameserver 127.0.0.53\n").expect("stub");
@@ -384,7 +388,7 @@ fn a_link_to_resolveds_stub_means_resolved_while_it_is_silent() {
 
 #[test]
 fn a_rearm_picks_the_mechanism_the_machine_has_now() {
-    let files = scratch("choice-redetect");
+    let (_dir, files) = scratch("choice-redetect");
     plain_file(&files);
     let machine = FakeMachine::new(&files);
     let selector = DnsCaptureSelector::new(
@@ -433,7 +437,7 @@ fn every_mechanism_but_resolved_listens_on_loopback() {
 
 #[test]
 fn the_file_names_only_the_listener_and_keeps_the_search_list() {
-    let files = scratch("file-redirect");
+    let (_dir, files) = scratch("file-redirect");
     let original = plain_file(&files);
     let servers = ResolvConfFileServers {
         files: files.clone(),
@@ -465,7 +469,7 @@ fn the_file_names_only_the_listener_and_keeps_the_search_list() {
 /// us, once it is redirected. Forwarding to it would loop every query.
 #[test]
 fn a_local_cache_on_loopback_is_never_an_upstream() {
-    let files = scratch("file-loopback-cache");
+    let (_dir, files) = scratch("file-loopback-cache");
     std::fs::write(&files.resolv_conf, "nameserver 127.0.0.1\n").expect("resolv.conf");
     let servers = ResolvConfFileServers {
         files: files.clone(),
@@ -485,8 +489,15 @@ fn a_local_cache_on_loopback_is_never_an_upstream() {
         resolv_conf::without_loopback(vec![Ipv4Addr::LOCALHOST, DHCP_SERVER]),
         (vec![DHCP_SERVER], 1)
     );
+    // The kernel delivers `0.0.0.0` to this machine, so it loops the same way.
+    assert_eq!(
+        resolv_conf::without_loopback(resolv_conf::nameservers(
+            "nameserver 0.0.0.0\nnameserver 192.0.2.53\n"
+        )),
+        (vec![Ipv4Addr::new(192, 0, 2, 53)], 1)
+    );
 
-    let files = scratch("records-loopback-cache");
+    let (_dir, files) = scratch("records-loopback-cache");
     std::fs::write(
         files.resolvconf_record_dirs[0].join("lo.dnsmasq"),
         "nameserver 127.0.0.1\n",
@@ -498,7 +509,7 @@ fn a_local_cache_on_loopback_is_never_an_upstream() {
 #[cfg(unix)]
 #[test]
 fn a_symlinked_file_comes_back_as_the_same_symlink() {
-    let files = scratch("file-symlink");
+    let (_dir, files) = scratch("file-symlink");
     let target = files
         .data_dir
         .parent()
@@ -530,7 +541,7 @@ fn a_symlinked_file_comes_back_as_the_same_symlink() {
 
 #[test]
 fn a_dhcp_client_rewriting_the_file_is_noticed_and_its_version_becomes_the_copy() {
-    let files = scratch("file-rewrite");
+    let (_dir, files) = scratch("file-rewrite");
     plain_file(&files);
     let redirect = ResolvConfFileRedirect::new(files.clone());
     let handle = redirect
@@ -557,7 +568,7 @@ fn a_dhcp_client_rewriting_the_file_is_noticed_and_its_version_becomes_the_copy(
 
 #[test]
 fn a_crashed_runs_file_is_put_back_by_the_cleanup() {
-    let files = scratch("file-orphan");
+    let (_dir, files) = scratch("file-orphan");
     let original = plain_file(&files);
     ResolvConfFileRedirect::new(files.clone())
         .redirect_to(LOOPBACK_LISTENER_ADDR)
@@ -574,7 +585,7 @@ fn a_crashed_runs_file_is_put_back_by_the_cleanup() {
 fn a_write_failure_rolls_back_to_the_original_file() {
     use std::os::unix::fs::PermissionsExt;
 
-    let files = scratch("file-write-fails");
+    let (_dir, files) = scratch("file-write-fails");
     let original = plain_file(&files);
     let redirect = ResolvConfFileRedirect::new(files.clone());
     let etc_dir = files.resolv_conf.parent().expect("etc dir").to_path_buf();
@@ -592,7 +603,7 @@ fn a_write_failure_rolls_back_to_the_original_file() {
 
 #[test]
 fn a_listener_resolv_conf_cannot_name_is_refused_before_anything_changes() {
-    let files = scratch("file-refused");
+    let (_dir, files) = scratch("file-refused");
     let original = plain_file(&files);
     let redirect = ResolvConfFileRedirect::new(files.clone());
     assert!(redirect.redirect_to(LISTENER_ADDR).is_err());
@@ -606,7 +617,7 @@ fn a_listener_resolv_conf_cannot_name_is_refused_before_anything_changes() {
 
 #[test]
 fn networkmanager_writes_the_listener_and_the_devices_search_domains() {
-    let files = scratch("nm-redirect");
+    let (_dir, files) = scratch("nm-redirect");
     let machine = FakeMachine::new(&files).with_network_manager();
     // Positive control: before the redirect, the devices' servers are in the file.
     assert_eq!(
@@ -645,7 +656,7 @@ fn networkmanager_writes_the_listener_and_the_devices_search_domains() {
 /// place while the file names the devices' servers again.
 #[test]
 fn networkmanager_no_longer_writing_the_listener_is_noticed() {
-    let files = scratch("nm-bypassed");
+    let (_dir, files) = scratch("nm-bypassed");
     let machine = FakeMachine::new(&files).with_network_manager();
     let redirect = NetworkManagerDnsRedirect::new(machine.clone(), files.clone());
     let handle = redirect
@@ -685,7 +696,7 @@ fn networkmanager_no_longer_writing_the_listener_is_noticed() {
 /// so the redirect moves to the next mechanism once and stays there.
 #[test]
 fn networkmanager_ignoring_its_drop_in_hands_over_to_the_file() {
-    let files = scratch("nm-dns-none");
+    let (_dir, files) = scratch("nm-dns-none");
     let machine = FakeMachine::new(&files).with_network_manager();
     let parts = dns_capture_parts(
         DnsCaptureMethod::NetworkManager,
@@ -742,7 +753,7 @@ fn networkmanager_ignoring_its_drop_in_hands_over_to_the_file() {
 
 #[test]
 fn a_crashed_runs_networkmanager_drop_in_is_removed_by_the_cleanup() {
-    let files = scratch("nm-orphan");
+    let (_dir, files) = scratch("nm-orphan");
     let machine = FakeMachine::new(&files).with_network_manager();
     NetworkManagerDnsRedirect::new(machine.clone(), files.clone())
         .redirect_to(LOOPBACK_LISTENER_ADDR)
@@ -758,7 +769,7 @@ fn a_crashed_runs_networkmanager_drop_in_is_removed_by_the_cleanup() {
 
 #[test]
 fn a_reload_failure_removes_the_drop_in_and_restores_the_file() {
-    let files = scratch("nm-reload-fails");
+    let (_dir, files) = scratch("nm-reload-fails");
     let machine = FakeMachine::new(&files).with_network_manager();
     machine.fail_next_nm_reload();
 
@@ -777,7 +788,7 @@ fn a_reload_failure_removes_the_drop_in_and_restores_the_file() {
 
 #[test]
 fn a_device_domain_is_a_scope_with_its_devices_servers() {
-    let files = scratch("nm-scopes");
+    let (_dir, files) = scratch("nm-scopes");
     let machine = FakeMachine::new(&files).with_network_manager();
     let scopes = NetworkManagerDnsScopes(machine).dns_scopes();
     let corp = scopes
@@ -806,7 +817,7 @@ fn nmcli_terse_output_parses_per_device() {
 
 #[test]
 fn openresolv_takes_our_record_exclusively_and_gives_it_back() {
-    let files = scratch("openresolv");
+    let (_dir, files) = scratch("openresolv");
     let machine = FakeMachine::new(&files).with_resolvconf(Resolvconf::Openresolv);
     assert_eq!(
         servers_in(&files.resolv_conf),
@@ -832,7 +843,7 @@ fn openresolv_takes_our_record_exclusively_and_gives_it_back() {
 
 #[test]
 fn debian_resolvconf_lists_our_record_first_and_cuts_the_rest() {
-    let files = scratch("debian-resolvconf");
+    let (_dir, files) = scratch("debian-resolvconf");
     let machine = FakeMachine::new(&files).with_resolvconf(Resolvconf::Debian);
     let redirect = ResolvconfDnsRedirect::new(machine.clone(), files.clone());
     let handle = redirect
@@ -856,7 +867,7 @@ fn debian_resolvconf_lists_our_record_first_and_cuts_the_rest() {
 
 #[test]
 fn a_crashed_runs_resolvconf_record_is_deleted_by_the_cleanup() {
-    let files = scratch("resolvconf-orphan");
+    let (_dir, files) = scratch("resolvconf-orphan");
     let machine = FakeMachine::new(&files).with_resolvconf(Resolvconf::Debian);
     ResolvconfDnsRedirect::new(machine.clone(), files.clone())
         .redirect_to(LOOPBACK_LISTENER_ADDR)
@@ -875,7 +886,7 @@ fn a_crashed_runs_resolvconf_record_is_deleted_by_the_cleanup() {
 
 #[test]
 fn an_add_failure_leaves_no_record_behind() {
-    let files = scratch("resolvconf-add-fails");
+    let (_dir, files) = scratch("resolvconf-add-fails");
     let machine = FakeMachine::new(&files).with_resolvconf(Resolvconf::Debian);
     machine.fail_resolvconf_add();
 
@@ -894,7 +905,7 @@ fn an_add_failure_leaves_no_record_behind() {
 
 #[test]
 fn the_cleanup_on_a_clean_machine_touches_nothing() {
-    let files = scratch("clean");
+    let (_dir, files) = scratch("clean");
     let original = plain_file(&files);
     clear_every_redirect(FakeMachine::new(&files), &files).expect("clears");
     assert_eq!(read(&files.resolv_conf), original);

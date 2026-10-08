@@ -71,6 +71,10 @@ struct Settled {
 /// The inputs of one pass and the fingerprint it last applied.
 pub struct PassInputs {
     sources: Vec<(&'static str, InputGeneration)>,
+    /// Per source: whether the pass itself moves it (the route table it
+    /// writes). Re-read at [`Self::settle`] so the pass's own apply does not
+    /// come back as a change and cost an identical second pass.
+    own_writes: Vec<bool>,
     full_every: Duration,
     full_request: FullPassRequest,
     readings: Mutex<Readings>,
@@ -81,6 +85,7 @@ impl PassInputs {
     pub fn new() -> Self {
         Self {
             sources: Vec::new(),
+            own_writes: Vec::new(),
             full_every: FULL_PASS_EVERY,
             full_request: FullPassRequest::default(),
             readings: Mutex::new(Readings::default()),
@@ -98,6 +103,17 @@ impl PassInputs {
     #[must_use]
     pub fn with_source(mut self, name: &'static str, source: InputGeneration) -> Self {
         self.sources.push((name, source));
+        self.own_writes.push(false);
+        self
+    }
+
+    /// Add an input the pass itself writes. A change landing from elsewhere
+    /// while the pass applies is absorbed until the next full pass; the
+    /// alternative is every changing pass running twice.
+    #[must_use]
+    pub fn with_own_writes_source(mut self, name: &'static str, source: InputGeneration) -> Self {
+        self.sources.push((name, source));
+        self.own_writes.push(true);
         self
     }
 
@@ -114,17 +130,13 @@ impl PassInputs {
         let mut extra_hasher = DefaultHasher::new();
         extra.hash(&mut extra_hasher);
         let extra = extra_hasher.finish();
-
-        let mut hasher = DefaultHasher::new();
-        extra.hash(&mut hasher);
-        values.hash(&mut hasher);
-        let known = values.iter().all(Option::is_some);
+        let fingerprint = digest(extra, &values);
 
         let mut readings = self.lock();
         readings.seen = values;
         readings.seen_extra = extra;
         readings.forced = false;
-        known.then(|| hasher.finish())
+        fingerprint
     }
 
     /// Whether `fingerprint` is the one last applied, recently enough that a
@@ -140,14 +152,36 @@ impl PassInputs {
         })
     }
 
-    /// Record that the platform now holds what `fingerprint` describes.
+    /// Record that the platform now holds what `fingerprint` describes, with
+    /// the sources the pass writes itself read again after its apply.
     pub fn settle(&self, fingerprint: u64) {
+        let fresh: Vec<(usize, Option<u64>)> = self
+            .sources
+            .iter()
+            .zip(&self.own_writes)
+            .enumerate()
+            .filter(|(_, (_, own))| **own)
+            .map(|(i, ((_, read), _))| (i, read()))
+            .collect();
         let mut readings = self.lock();
-        readings.settled = Some(Settled {
+        let mut values = readings.seen.clone();
+        let mut settled_fp = Some(fingerprint);
+        // Only when `seen` is what `fingerprint` was taken from: a reading
+        // taken in between would otherwise be settled without being applied.
+        if !fresh.is_empty() && digest(readings.seen_extra, &values) == Some(fingerprint) {
+            for (i, value) in fresh {
+                if let Some(slot) = values.get_mut(i) {
+                    *slot = value;
+                }
+            }
+            settled_fp = digest(readings.seen_extra, &values);
+        }
+        let extra = readings.seen_extra;
+        readings.settled = settled_fp.map(|fingerprint| Settled {
             fingerprint,
             at: Instant::now(),
-            values: readings.seen.clone(),
-            extra: readings.seen_extra,
+            values,
+            extra,
         });
     }
 
@@ -188,6 +222,14 @@ impl PassInputs {
     fn lock(&self) -> std::sync::MutexGuard<'_, Readings> {
         self.readings.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// `None` when a source cannot tell.
+fn digest(extra: u64, values: &[Option<u64>]) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    extra.hash(&mut hasher);
+    values.hash(&mut hasher);
+    values.iter().all(Option::is_some).then(|| hasher.finish())
 }
 
 impl Default for PassInputs {
@@ -252,6 +294,12 @@ impl TableWriteDiff {
         *last = now;
         moved.join(",")
     }
+}
+
+/// The revision an activation is applying: served to every rules read
+/// before its pointer commits, and invisible to the table counts.
+pub fn applying_revision() -> InputGeneration {
+    Arc::new(|| Some(crate::applying_revision_overlay::changes()))
 }
 
 /// The hash of whatever `read` returns; `None` when it fails.
@@ -345,6 +393,36 @@ mod tests {
             inputs.is_settled(fp),
             "one request forced more than one pass"
         );
+    }
+
+    /// The pass's own route writes must not bring back an identical pass; a
+    /// move anywhere else during the pass still must.
+    #[test]
+    fn the_pass_own_writes_settle_with_it_and_nothing_else_does() {
+        let (routes, routes_source) = counter();
+        let (cache, cache_source) = counter();
+        let inputs = PassInputs::new()
+            .with_own_writes_source("routes", routes_source)
+            .with_source("cache", cache_source);
+
+        let fp = inputs.fingerprint(&()).expect("fingerprint");
+        routes.store(1, Ordering::Relaxed); // the apply wrote the table
+        inputs.settle(fp);
+        let after = inputs.fingerprint(&()).expect("fingerprint");
+        assert!(
+            inputs.is_settled(after),
+            "the pass's own apply came back as a change"
+        );
+
+        let fp = inputs.fingerprint(&()).expect("fingerprint");
+        routes.store(2, Ordering::Relaxed);
+        cache.store(1, Ordering::Relaxed); // learned while the pass applied
+        inputs.settle(fp);
+        assert!(
+            !inputs.is_settled(inputs.fingerprint(&()).expect("fingerprint")),
+            "a change that landed mid-pass was settled unplanned",
+        );
+        assert_eq!(inputs.moved(), "cache");
     }
 
     #[test]

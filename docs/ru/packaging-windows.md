@@ -34,7 +34,7 @@ NetRuleRouter\
   README.txt            заметки для пользователя (английский)
   README.ru.txt         те же заметки по-русски
   build-info.json       версия, ревизия, время сборки
-  <трей, служба, консоль, хост Qt, рантайм Qt, wintun.dll>
+  <трей, служба, консоль, терминальный интерфейс, хост Qt, рантайм Qt, wintun.dll>
   qml\                  модули самого Qt
   apps\desktop\qml\     интерфейс программы
   locales\  presets\  configs\  assets\  scripts\

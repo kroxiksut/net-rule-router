@@ -671,6 +671,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                     Arc::new(nrr_platform_api::browser_history::NoopBrowserHistoryRead)
                 }
             };
+            history.discard_leftover_copies();
             let rules: Arc<dyn RulesProvider> =
                 Arc::new(ProductionRulesProvider::new(Arc::clone(conn)));
             let active_sid: nrr_service_runtime::dns_observation_consumer::ActiveSidFn = {
@@ -763,6 +764,21 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             cache_store.as_ref(),
             settings_conn.as_ref(),
         ) {
+            // `?host` rules: the TLS check runs from the engine's own tick.
+            engine.attach_verify_primary(nrr_service_runtime::auto_rules::VerifyPrimaryWiring {
+                probe: Arc::new(nrr_service_runtime::path_probe::SystemPathProbe),
+                egress: Arc::clone(coord)
+                    as Arc<dyn nrr_service_runtime::production_auto_rule_probe::EgressSources>,
+                include_subdomains: {
+                    let conn = Arc::clone(conn_for_probe);
+                    Arc::new(move |sid: &str| {
+                        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                        nrr_service_runtime::production_rules_provider::include_subdomains_for(
+                            &guard, sid,
+                        )
+                    })
+                },
+            });
             let fqdn_for_probe: Arc<dyn FqdnCacheLookup> = Arc::new(SqliteFqdnCacheLookup::new(
                 Arc::clone(cache_arc),
                 FreshnessThresholds::default_production(),
@@ -886,6 +902,11 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         // address a host currently resolves to. Same Arc the resolver / relay
         // draw from, so the address shown matches what is served.
         deps = deps.with_fake_ip_bindings(fake_ip_assembly.binding_view());
+        // The coordinator pushes its enforcement reports on change only; the
+        // snapshot serves the standing ones to a client that connects later.
+        if let Some(coord) = route_coordinator.as_ref() {
+            deps = deps.with_route_enforcement_status(coord.enforcement_status());
+        }
         // Live fake-IP datapath probe for `service.health.get` /
         // `snapshot.initial.get`, so the GUI can show "fake-IP is ON but the
         // datapath is down" instead of staying silent through an outage.

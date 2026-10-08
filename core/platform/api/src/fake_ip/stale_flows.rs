@@ -27,6 +27,9 @@ use std::sync::Mutex;
 
 use nrr_shared::ip_block::IpBlock;
 
+use crate::adapters::AdapterInfo;
+use crate::conn_observe::egress::{resolve_egress, EgressRole};
+
 /// What one teardown pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StaleFlowSweep {
@@ -57,6 +60,54 @@ pub struct EstablishedFlow {
     pub pid: Option<u32>,
     /// File name of that process's image, resolved while it was still alive.
     pub image: Option<String>,
+}
+
+/// Which link a principal's connection leaves through, read off its local
+/// address with the classifier the connection observer uses. Empty — every
+/// address [`EgressRole::Unknown`] — when the caller could not read the links.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlowLinks {
+    unicast: Vec<(IpAddr, u32)>,
+    primary: Option<u32>,
+    secondary: Option<u32>,
+}
+
+impl FlowLinks {
+    /// `unicast` maps each local address to its interface; `primary` /
+    /// `secondary` are the interfaces the principal's bindings resolve to,
+    /// `None` while unbound or unresolvable.
+    #[must_use]
+    pub fn new(unicast: Vec<(IpAddr, u32)>, primary: Option<u32>, secondary: Option<u32>) -> Self {
+        Self {
+            unicast,
+            primary,
+            secondary,
+        }
+    }
+
+    #[must_use]
+    pub fn from_adapters(
+        adapters: &[AdapterInfo],
+        primary: Option<u32>,
+        secondary: Option<u32>,
+    ) -> Self {
+        let unicast = adapters
+            .iter()
+            .flat_map(|a| a.ipv4_addresses.iter().map(|ip| (IpAddr::V4(*ip), a.index)))
+            .collect();
+        Self::new(unicast, primary, secondary)
+    }
+
+    #[must_use]
+    pub fn role_of(&self, local: Ipv4Addr) -> EgressRole {
+        resolve_egress(
+            IpAddr::V4(local),
+            &self.unicast,
+            self.primary,
+            self.secondary,
+        )
+        .role
+    }
 }
 
 /// The remote addresses one listing asks about: single hosts and whole
@@ -370,6 +421,29 @@ mod tests {
 
         assert_eq!(listed, vec![to(inside)]);
         assert_eq!(mock.queried_networks(), vec![net]);
+    }
+
+    #[test]
+    fn a_local_address_names_the_link_its_connection_leaves_through() {
+        let v4 = |d: u8| Ipv4Addr::new(192, 0, 2, d);
+        let links = FlowLinks::new(
+            vec![
+                (IpAddr::V4(v4(1)), 23),
+                (IpAddr::V4(v4(2)), 28),
+                (IpAddr::V4(v4(3)), 20),
+            ],
+            Some(23),
+            Some(28),
+        );
+        assert_eq!(links.role_of(v4(1)), EgressRole::Primary);
+        assert_eq!(links.role_of(v4(2)), EgressRole::Secondary);
+        assert_eq!(links.role_of(v4(3)), EgressRole::Other);
+        assert_eq!(links.role_of(v4(9)), EgressRole::Unknown);
+        assert_eq!(
+            FlowLinks::default().role_of(v4(1)),
+            EgressRole::Unknown,
+            "a reading that failed knows no link"
+        );
     }
 
     #[test]

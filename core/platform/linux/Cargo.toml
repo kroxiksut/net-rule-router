@@ -42,8 +42,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # The browser-history reader opens a private COPY of a browser's History
 # database. Same version and bundling as the Windows reader and the stores, so
-# the graph keeps one SQLite.
-rusqlite = { version = "0.32", features = ["bundled"] }
+# the graph keeps one SQLite. `hooks` for the progress handler that bounds the
+# read of a user-supplied file.
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 # The main-link probe pins its socket to a link (`SO_BINDTODEVICE`); binding a
 # source address alone does not choose the egress interface on Linux. `all`
 # exposes `bind_device`; the crate is already in the graph via the service.

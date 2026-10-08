@@ -42,6 +42,8 @@ pub enum ContractNegotiateClientKind {
     /// The administrative console (`nrr-cli`). It reads and diagnoses; it never
     /// changes policy, and says so on connect.
     Console,
+    /// The terminal interface (`nrr-tui`).
+    Tui,
 }
 
 impl ContractNegotiateClientKind {
@@ -57,6 +59,7 @@ impl ContractNegotiateClientKind {
             Self::Gui => crate::ipc::IpcClientProfile::GuiInteractive,
             Self::Tray => crate::ipc::IpcClientProfile::TrayLightweight,
             Self::Console => crate::ipc::IpcClientProfile::AdminConsole,
+            Self::Tui => crate::ipc::IpcClientProfile::Tui,
         }
     }
 }
@@ -772,6 +775,13 @@ pub enum StatusUpdateEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         launched_by: Vec<String>,
     },
+    /// `sid`'s mutes changed — set, lifted or cleared from any surface. The
+    /// tray and the main window are separate clients; without this, an answer
+    /// given in one reached the other only after a restart.
+    BlockNoticeMutesChanged { sid: String },
+    /// A `?host` rule of `sid` moved to the additional route: the main link
+    /// was shown not to reach `host`.
+    VerifyPrimaryMoved { sid: String, host: String },
     /// Whether this SID's policy is actually being enforced, and what the user
     /// has to do when it is not.
     ///
@@ -779,7 +789,8 @@ pub enum StatusUpdateEvent {
     /// are different facts, and only the first one was ever visible: a binding
     /// the service cannot resolve, or a missing primary, left the product
     /// looking healthy while it routed nothing. Published on CHANGE only —
-    /// `status = "ok"` clears a standing notice.
+    /// `status = "ok"` clears a standing notice; the standing value per role
+    /// rides `SnapshotInitialResponse::enforcement_status`.
     EnforcementStatusChanged {
         sid: String,
         /// `"ok"` | `"adapter-choice-needed"` | `"adapter-gone"` |
@@ -823,6 +834,8 @@ impl StatusUpdateEvent {
             | Self::SecondaryExternalAddressObserved { sid, .. }
             | Self::UnassignedTunnelDetected { sid, .. }
             | Self::BlockNoticeRaised { sid, .. }
+            | Self::BlockNoticeMutesChanged { sid }
+            | Self::VerifyPrimaryMoved { sid, .. }
             | Self::EnforcementStatusChanged { sid, .. }
             | Self::AutostartStateChanged { sid, .. } => Some(sid.as_str()),
             // The baseline carries no SID and reaches everyone.
@@ -1001,6 +1014,23 @@ pub struct SnapshotInitialResponse {
     /// conflicts. Wire key: `rule-conflicts`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rule_conflicts: Vec<RuleConflictDto>,
+    /// The caller's standing `EnforcementStatusChanged` reports, one per role,
+    /// as last published. The push fires on change only, so a client that
+    /// connects later learns the current state from here. Empty when nothing
+    /// was reported yet. Wire key: `enforcement-status`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enforcement_status: Vec<EnforcementStatusDto>,
+}
+
+/// One role's standing enforcement report: the payload of the last
+/// [`StatusUpdateEvent::EnforcementStatusChanged`] for it, without the SID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct EnforcementStatusDto {
+    pub status: String,
+    pub role: String,
+    #[serde(default)]
+    pub candidates: Vec<String>,
 }
 
 /// One rule enforced differently from how it reads: because of another rule
@@ -1046,6 +1076,10 @@ pub enum RuleConflictKind {
     /// cannot scope to the application, so the rule is not enforced at all.
     /// `ip` is empty and `count` zero: no address was acted on.
     UnsupportedRuleShape,
+    /// A network rule holds more narrower rules than can be carved out of it,
+    /// so it covers its whole network and they lose to it. `ip` is empty and
+    /// `count` zero.
+    NetworkCarvingOverCap,
 }
 
 /// Compact summary of a revision row surfaced in

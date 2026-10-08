@@ -145,6 +145,35 @@ pub const RULES_LOCKED_CLIENT_SLUG: &str = "rules-locked";
 /// reach the window as one condition.
 pub const SECURITY_ALERT_UNACKNOWLEDGED_CLIENT_SLUG: &str = "security-alert-unacknowledged";
 
+/// A terminal client was refused a privileged operation and nobody could be
+/// asked for the rights (no authentication agent, no authority). The
+/// `Forbidden` refusal's message begins with this slug, so the terminal knows
+/// the refusal is the elevation gate's — the one it may try to lift by asking —
+/// without parsing prose.
+pub const TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG: &str = "terminal-needs-elevation";
+
+/// The user was asked for administrator rights and did not grant them, or the
+/// authority said no. A terminal's `Forbidden` refusal begins with it; the
+/// window's launcher reports a dismissed UAC prompt under the same slug.
+pub const ELEVATION_DECLINED_CLIENT_SLUG: &str = "uac-declined";
+
+/// Locale key wording [`TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG`] for this host:
+/// the remedy is `sudo` on Unix and an administrator terminal on Windows.
+pub const fn terminal_needs_elevation_locale_key() -> &'static str {
+    if cfg!(windows) {
+        "errors.terminal-needs-elevation-windows"
+    } else {
+        "errors.terminal-needs-elevation-unix"
+    }
+}
+
+/// The client error code of [`TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG`] on this
+/// host: its locale key under `errors.`, so `errors.<code>` names the remedy.
+pub fn terminal_needs_elevation_client_code() -> &'static str {
+    let key = terminal_needs_elevation_locale_key();
+    key.strip_prefix("errors.").unwrap_or(key)
+}
+
 /// Maximum size of a single wire-format frame (request or response),
 /// in bytes. Both client (`nrr-ipc-client`) and server
 /// (`nrr-windows-service`) enforce this limit. Frames larger than this

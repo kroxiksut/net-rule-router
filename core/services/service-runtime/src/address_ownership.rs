@@ -359,12 +359,18 @@ impl AddressOwnership {
     /// Here both claims are address rules, and the specificity contest between
     /// them was already settled per host in [`Self::resolve`] — what is left is
     /// genuinely one address wanted in two directions.
+    ///
+    /// Symmetric, and the same answer as [`Self::owner_of`]: a main-link zone
+    /// host inside an additional-link network, or under an additional literal,
+    /// is the narrower rule's, so a mode that pins main-link hosts must not pin
+    /// it back. Every mode then sends it where the carving does.
     #[must_use]
     pub fn address_rule_may_steer(&self, ip: IpAddr, for_link: Link) -> bool {
-        match for_link {
-            Link::Main => true,
-            Link::Additional => self.owner_of(ip) != Some(Link::Main),
-        }
+        let other = match for_link {
+            Link::Main => Link::Additional,
+            Link::Additional => Link::Main,
+        };
+        self.owner_of(ip) != Some(other)
     }
 
     /// Whether enforcement may install a BLOCK for this address. See rule 2.
@@ -1640,6 +1646,11 @@ mod tests {
                 Some(Link::Main)
             );
             assert!(!resolve(&zone_additional, &cache).address_rule_may_steer(at, Link::Additional));
+            // The main zone may not steer what the additional network won.
+            assert!(!resolve(&zone_main, &cache).address_rule_may_steer(at, Link::Main));
+            assert!(resolve(&zone_main, &cache).address_rule_may_steer(at, Link::Additional));
+            assert!(resolve_in(&zone_main, &cache, ZoneVsIpOrder::ZoneFirst)
+                .address_rule_may_steer(at, Link::Main));
             assert_eq!(
                 resolve_in(&zone_additional, &cache, ZoneVsIpOrder::ZoneFirst).owner_of(at),
                 Some(Link::Additional)

@@ -1,0 +1,15 @@
+{
+  "description": "pure.js mergeStabilityWrite",
+  "cases": [
+    { "name": "live only", "input": { "live": { "dns-via-secondary": true } }, "expected": { "dns-via-secondary": true } },
+    { "name": "partial overrides live", "input": { "live": { "fake-ip-enabled": false }, "partial": { "fake-ip-enabled": true } }, "expected": { "fake-ip-enabled": true } },
+    { "name": "intent carried", "input": { "live": { "dns-via-secondary": false }, "intent": { "dns-via-secondary": true } }, "expected": { "dns-via-secondary": true } },
+    { "name": "rules lock never carried", "input": { "live": { "allow-user-rule-edits": true }, "intent": { "allow-user-rule-edits": false } }, "expected": { "allow-user-rule-edits": true } },
+    { "name": "unknown intent key dropped", "input": { "live": {}, "intent": { "made-up": 1 } }, "expected": {} },
+    { "name": "parked key left to its flow", "input": { "live": { "enforcement-mode": "resolver" }, "intent": { "enforcement-mode": "reactive" }, "parked": { "enforcement-mode": "reactive" } }, "expected": { "enforcement-mode": "resolver" } },
+    { "name": "partial beats intent", "input": { "live": {}, "intent": { "dns-fast-answers": false }, "partial": { "dns-fast-answers": true } }, "expected": { "dns-fast-answers": true } },
+    { "name": "structured intent carried", "input": { "live": {}, "intent": { "ipc-accept-policy": { "kind": "critical" } } }, "expected": { "ipc-accept-policy": { "kind": "critical" } } },
+    { "name": "unknown live field rides back", "input": { "live": { "from-the-future": 7 }, "partial": { "verbose-logging-change": "one-hour" } }, "expected": { "from-the-future": 7, "verbose-logging-change": "one-hour" } },
+    { "name": "everything absent", "input": {}, "expected": {} }
+  ]
+}

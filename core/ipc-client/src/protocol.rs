@@ -403,6 +403,7 @@ mod tests {
             ContractNegotiateClientKind::Gui,
             ContractNegotiateClientKind::Tray,
             ContractNegotiateClientKind::Console,
+            ContractNegotiateClientKind::Tui,
         ] {
             let json = build_contract_negotiate_as(CLIENT_PROTOCOL_VERSION, kind);
             let env: nrr_service_runtime::IpcRequestEnvelope =

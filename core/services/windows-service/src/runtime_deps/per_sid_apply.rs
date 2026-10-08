@@ -765,6 +765,14 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             coord.fail_closed_exemptions(sid, machine)
                         })
                     };
+                // Which link each connection rides, so a flow sweep spares one
+                // on a tunnel the user runs beside ours.
+                let flow_links_resolver: nrr_service_runtime::per_sid_orchestrator::FlowLinksResolver = {
+                        let coord = Arc::clone(&route_coord);
+                        Arc::new(move |sid: &str, machine: &nrr_service_runtime::machine_reading::MachineReading| {
+                            coord.flow_links(sid, machine)
+                        })
+                    };
                 // The one reading of the machine each compute hands the three
                 // resolvers above, so a pass enumerates it once.
                 let machine_reader: nrr_service_runtime::per_sid_orchestrator::MachineReader = {
@@ -823,6 +831,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         .with_machine_reader(machine_reader)
                         .with_kill_switch_resolver(kill_switch_resolver)
                         .with_ipv6_guard_resolver(ipv6_guard_resolver)
+                        .with_flow_links_resolver(flow_links_resolver)
                         .with_fail_closed_exemptions_resolver(fail_closed_exemptions_resolver)
                         // App-routing via observation: read the
                         // process-wide observed app→IP store the conn-observe

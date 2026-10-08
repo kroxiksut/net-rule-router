@@ -1299,6 +1299,8 @@ ScrollView {
                                             - connRemoteCell.rightPadding)
                                     : ""
                                 color: root.textColor
+                                // Names come from DNS answers and may hold `<`.
+                                textFormat: Text.PlainText
                                 elide: Text.ElideMiddle
                                 FontMetrics { id: connRemoteMetrics; font: connRemoteCell.font }
                                 Accessible.name: connRowItem._vRemoteTip !== ""
@@ -1307,6 +1309,9 @@ ScrollView {
                                 HoverHandler { id: connRemoteHover }
                                 ToolTip.visible: connRemoteHover.hovered
                                     && connRowItem._vRemoteTip !== ""
+                                // Shown as plain: the shared tooltip reads AutoText as rich only
+                                // from a tag on its first line, which is always our own
+                                // heading; the names follow on lines of their own.
                                 ToolTip.text: connRowItem._vRemoteTip
                             }
                             Label {

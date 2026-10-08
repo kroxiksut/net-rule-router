@@ -1,0 +1,40 @@
+Service: OK
+> Screens                  Cache
+  1 Status                 Entries on the service: 12.
+  2 First run              c: Clear app cache   o: Clear OS DNS cache
+  3 Interfaces and routes  Cache entries
+  4 Rules                  > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
+  5 Overlaps                 2. host1.example.com → 192.0.2.21 · Additional (VPN) · Fresh
+  6 Suggested addresses      3. host2.example.com → 192.0.2.22 · Additional (VPN) · Fresh
+  7 Connection trace         4. host3.example.com → 192.0.2.23 · — · Fresh
+> 8 Cache                    5. host4.example.com → 192.0.2.24 · — · Fresh
+  9 Diagnostics and logs     6. host5.example.com → 192.0.2.25 · — · Fresh
+  0 Settings                 7. host6.example.com → 192.0.2.26 · — · Fresh
+                             8. host7.example.com → 192.0.2.27 · — · Fresh
+                             9. host8.example.com → 192.0.2.28 · — · Fresh
+                             10. host9.example.com → 192.0.2.29 · — · Fresh
+                           Rows 1–10 of 12.
+                           Selected entry
+                           Host: host0.example.com
+                           IP: 192.0.2.20
+                           Route: Additional (VPN)
+                           Freshness: Fresh
+                           Source: DNS
+                           resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+F1: help   q: quit

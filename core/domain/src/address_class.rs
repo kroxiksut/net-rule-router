@@ -263,18 +263,9 @@ fn port_purpose(port: u16) -> Option<&'static str> {
     }
 }
 
-/// The canonical form of an address: an IPv4-mapped IPv6 address
-/// (`::ffff:a.b.c.d`) is its IPv4 address, anything else is itself.
-///
-/// One address written two ways would otherwise be two rule keys and two
-/// matches; every place that compares addresses asks this.
-#[must_use]
-pub fn canonical_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    }
-}
+// One definition with the contracts crate, whose comparison fold must spell an
+// address the way the service stores it.
+pub use nrr_shared::ip_block::canonical_ip;
 
 #[cfg(test)]
 mod tests {

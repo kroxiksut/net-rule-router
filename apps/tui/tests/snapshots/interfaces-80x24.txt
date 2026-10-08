@@ -1,0 +1,24 @@
+Service: OK
+┌> Screens─────────────────┐┌Connections───────────────────────────────────────┐
+│  1 Status                ││The primary route uses the default interface; the │
+│  2 First run             ││additional route carries the traffic your rules   │
+│> 3 Interfaces and routes ││send to it.                                       │
+│  4 Rules                 ││Main connection: Ethernet — Example Network       │
+│  5 Overlaps              ││Adapter — Available                               │
+│  6 Suggested addresses   ││Additional connection: Example Tunnel — Example   │
+│  7 Connection trace      │└──────────────────────────────────────────────────┘
+│  8 Cache                 │┌Adapters──────────────────────────────────────────┐
+│  9 Diagnostics and logs  ││  1. Ethernet — Example Network Adapter — Wired   │
+│  0 Settings              ││(Ethernet) — Available — Main connection          │
+│                          ││  2. Example Tunnel — Example Network Adapter —   │
+│                          ││Wired (Ethernet) — Available — Additional         │
+│                          ││connection                                        │
+│                          │└──────────────────────────────────────────────────┘
+│                          │┌Chosen adapter: Wi-Fi─────────────────────────────┐
+│                          ││Wi-Fi · looks like the main connection            │
+│                          ││Type: Wi-Fi | IP: 192.0.2.10 | Gateway: 192.0.2.1 │
+│                          ││DNS: 192.0.2.53 | Default route: Yes              │
+│                          ││internet • unknown • Regular interface 90%        │
+│                          ││Recommended as primary                            │
+└──────────────────────────┘└──────────────────────────────────────────────────┘
+F1: help   q: quit

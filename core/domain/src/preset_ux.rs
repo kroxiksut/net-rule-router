@@ -400,6 +400,7 @@ mod tests {
                     enabled: true,
                     inline_comment: None,
                     blocked: false,
+                    verify_primary: false,
                     origin: None,
                 },
                 crate::rules_file::RulesFileEntry {
@@ -407,6 +408,7 @@ mod tests {
                     enabled: false,
                     inline_comment: None,
                     blocked: false,
+                    verify_primary: false,
                     origin: None,
                 },
             ],

@@ -19,6 +19,10 @@
 *.t.me  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
 *.telegram.me  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
 *.telesco.pe  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
+?*.proton.me
+?*.protonmail.com
+?*.protonmail.ch
+?*.protonvpn.com
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets

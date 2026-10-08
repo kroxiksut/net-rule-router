@@ -925,3 +925,98 @@ fn the_neutral_plan_lowers_to_the_windows_routes() {
         }
     }
 }
+
+/// Narrower wins in every mode: a host the main link holds only through a
+/// zone, inside an additional-link network, goes to the tunnel whether the
+/// mode pins main-link hosts or not, on both route paths.
+#[test]
+fn a_main_zone_host_inside_a_tunnel_network_takes_the_tunnel_in_every_mode() {
+    use crate::enforcement_planner::{plan_routes_with, FamilyScope};
+    use nrr_platform_api::enforcement::{EnforcementPlan, UserPrincipal};
+    use nrr_platform_api::route_lowering::{lower_routes, RouteTarget};
+
+    let cache = MockFqdnCacheLookup::new();
+    cache.set_ips("a.example", vec![Ipv4Addr::new(198, 51, 100, 7)]);
+    cache.set_ips("b.example", vec![Ipv4Addr::new(192, 0, 2, 9)]);
+    let b = book(
+        vec![rule("m", CanonicalAddressMatch::Zone("example".into()))],
+        vec![subnet("a", "198.51.100.0/24")],
+    );
+    let apps = MockAppObservationLookup::new();
+    let lowered = |t: &SecondaryRouteTarget| RouteTarget {
+        gateway: t.gateway,
+        gateway_v6: t.gateway_v6.unwrap_or(std::net::Ipv6Addr::UNSPECIFIED),
+        interface_index: t.interface_index,
+    };
+    // The interface the longest matching route sends `ip` out of.
+    let egress = |table: &[RouteEntry], ip: IpAddr| {
+        table
+            .iter()
+            .filter(|r| {
+                IpBlock::new(r.destination, r.prefix_length).is_some_and(|n| n.contains(ip))
+            })
+            .max_by_key(|r| r.prefix_length)
+            .map(|r| r.interface_index)
+    };
+    for mode in [
+        RouteBehaviorMode::PreferPrimary,
+        RouteBehaviorMode::PreferSecondaryWhenAvailable,
+        RouteBehaviorMode::StrictSecondaryFailClosed,
+    ] {
+        let windows = generate_routes_with(
+            mode,
+            &b,
+            Some(&main_target()),
+            &tunnel_target(),
+            &cache,
+            &apps,
+            &HashSet::new(),
+            ZoneVsIpOrder::default(),
+            &[],
+            &NetworkRouteFacts::default(),
+            NETWORKS,
+        )
+        .routes;
+        let plan = EnforcementPlan {
+            principal: UserPrincipal::from_linux_uid(1000),
+            flows: Vec::new(),
+            routes: plan_routes_with(
+                mode,
+                &b,
+                true,
+                &cache,
+                &apps,
+                &HashSet::new(),
+                FamilyScope::V4Only,
+                ZoneVsIpOrder::default(),
+                &[],
+                &NetworkRouteFacts::default(),
+                NETWORKS,
+            ),
+            policy_rules: Vec::new(),
+        };
+        let neutral = lower_routes(
+            &plan,
+            lowered(&tunnel_target()),
+            Some(lowered(&main_target())),
+        );
+        for (path, table) in [("windows", &windows), ("neutral", &neutral)] {
+            assert_eq!(
+                egress(table, addr("198.51.100.7")),
+                Some(tunnel_target().interface_index),
+                "{path}, {mode:?}: the main zone took its host back out of the tunnel network\n{table:#?}",
+            );
+        }
+        // Positive control: a zone host outside every network keeps its
+        // main-link pin in the modes that pin.
+        if mode != RouteBehaviorMode::PreferPrimary {
+            for (path, table) in [("windows", &windows), ("neutral", &neutral)] {
+                assert_eq!(
+                    egress(table, addr("192.0.2.9")),
+                    Some(main_target().interface_index),
+                    "{path}, {mode:?}",
+                );
+            }
+        }
+    }
+}

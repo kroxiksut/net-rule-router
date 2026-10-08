@@ -202,118 +202,124 @@ Dialog {
         // When the dialog is narrow enough that all three buttons do
         // not fit on one row, Flow wraps the leftmost buttons to a
         // second row instead of clipping.
-        Flow {
+        Item {
             Layout.fillWidth: true
             Layout.topMargin: 6
-            spacing: 8
-            layoutDirection: Qt.RightToLeft
-            ThemedButton {
-                id: saveContinueButton
-                theme: guard.ownerRoot ? guard.ownerRoot.uiTheme : null
-                text: guard.tr("unsaved-changes.action.save-continue",
-                    "Save and continue")
-                highlighted: true
-                Accessible.role: Accessible.Button
-                Accessible.name: guard.tr(
-                    "unsaved-changes.accessible.save-continue",
-                    "Save unsaved changes and continue")
-                visible: {
-                    if (!guard.ownerRoot) return false
-                    var rev = guard.ownerRoot.uiRevision
-                    if (typeof guard.ownerRoot.firstDirtySectionId !== "function") return false
-                    var sectionId = guard.ownerRoot.firstDirtySectionId()
-                    if (!sectionId) return false
-                    if (typeof guard.ownerRoot.saveCallbackForSection !== "function") return false
-                    return guard.ownerRoot.saveCallbackForSection(sectionId) !== null
-                }
-                enabled: !guard._saving
-                // "Save and continue" means ALL of it. Saving only the first
-                // dirty section left the rest dirty, so the guard re-opened on
-                // the very next step of the same navigation and the user was
-                // asked the same question again with no sign of progress.
-                onClicked: {
-                    if (!guard.ownerRoot
-                            || typeof guard.ownerRoot.dirtySectionIds !== "function"
-                            || typeof guard.ownerRoot.saveCallbackForSection !== "function") return
-                    var ids = guard.ownerRoot.dirtySectionIds()
-                    var savers = []
-                    for (var i = 0; i < ids.length; i += 1) {
-                        var cb = guard.ownerRoot.saveCallbackForSection(ids[i])
-                        if (cb !== null) savers.push(cb)
+            Layout.preferredHeight: buttonsFlow.height
+            Flow {
+                id: buttonsFlow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: 8
+                layoutDirection: Qt.RightToLeft
+                ThemedButton {
+                    id: saveContinueButton
+                    theme: guard.ownerRoot ? guard.ownerRoot.uiTheme : null
+                    text: guard.tr("unsaved-changes.action.save-continue",
+                        "Save and continue")
+                    highlighted: true
+                    Accessible.role: Accessible.Button
+                    Accessible.name: guard.tr(
+                        "unsaved-changes.accessible.save-continue",
+                        "Save unsaved changes and continue")
+                    visible: {
+                        if (!guard.ownerRoot) return false
+                        var rev = guard.ownerRoot.uiRevision
+                        if (typeof guard.ownerRoot.firstDirtySectionId !== "function") return false
+                        var sectionId = guard.ownerRoot.firstDirtySectionId()
+                        if (!sectionId) return false
+                        if (typeof guard.ownerRoot.saveCallbackForSection !== "function") return false
+                        return guard.ownerRoot.saveCallbackForSection(sectionId) !== null
                     }
-                    if (savers.length === 0) return
-                    guard._saving = true
-                    guard._savingWatchdog.restart()
-                    var remaining = savers.length
-                    var allOk = true
-                    var settle = function(ok) {
-                        if (!ok) allOk = false
-                        remaining -= 1
-                        if (remaining > 0) return
-                        guard._savingWatchdog.stop()
-                        guard._saving = false
-                        if (!allOk) return
-                        if (typeof guard.ownerRoot.clearAllUnsavedChanges === "function") {
-                            guard.ownerRoot.clearAllUnsavedChanges()
+                    enabled: !guard._saving
+                    // "Save and continue" means ALL of it. Saving only the first
+                    // dirty section left the rest dirty, so the guard re-opened on
+                    // the very next step of the same navigation and the user was
+                    // asked the same question again with no sign of progress.
+                    onClicked: {
+                        if (!guard.ownerRoot
+                                || typeof guard.ownerRoot.dirtySectionIds !== "function"
+                                || typeof guard.ownerRoot.saveCallbackForSection !== "function") return
+                        var ids = guard.ownerRoot.dirtySectionIds()
+                        var savers = []
+                        for (var i = 0; i < ids.length; i += 1) {
+                            var cb = guard.ownerRoot.saveCallbackForSection(ids[i])
+                            if (cb !== null) savers.push(cb)
                         }
+                        if (savers.length === 0) return
+                        guard._saving = true
+                        guard._savingWatchdog.restart()
+                        var remaining = savers.length
+                        var allOk = true
+                        var settle = function(ok) {
+                            if (!ok) allOk = false
+                            remaining -= 1
+                            if (remaining > 0) return
+                            guard._savingWatchdog.stop()
+                            guard._saving = false
+                            if (!allOk) return
+                            if (typeof guard.ownerRoot.clearAllUnsavedChanges === "function") {
+                                guard.ownerRoot.clearAllUnsavedChanges()
+                            }
+                            var intent = guard._pendingIntent
+                            guard._pendingIntent = null
+                            guard.close()
+                            if (typeof intent === "function") intent()
+                        }
+                        for (var j = 0; j < savers.length; j += 1) savers[j](settle)
+                    }
+                }
+                ThemedButton {
+                    theme: guard.ownerRoot ? guard.ownerRoot.uiTheme : null
+                    text: guard.tr("unsaved-changes.action.discard", "Discard changes")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: guard.tr(
+                        "unsaved-changes.accessible.discard",
+                        "Discard unsaved changes and continue")
+                    onClicked: {
                         var intent = guard._pendingIntent
                         guard._pendingIntent = null
                         guard.close()
+                        // Walk the dirty registry, fire each section's
+                        // revert callback (if registered) so its QML
+                        // draft state matches the persisted source again,
+                        // THEN clear the registry so the next intent does
+                        // not re-trigger the dialog. Without this clear,
+                        // the dirty flag stays true and the guard re-opens
+                        // on the very next navigation — observed bug.
+                        if (guard.ownerRoot) {
+                            var registry = guard.ownerRoot.unsavedChangesRegistry || {}
+                            for (var sectionId in registry) {
+                                if (!registry[sectionId]) continue
+                                if (typeof guard.ownerRoot.revertCallbackForSection !== "function") continue
+                                var revert = guard.ownerRoot.revertCallbackForSection(sectionId)
+                                if (revert) revert()
+                            }
+                            if (typeof guard.ownerRoot.clearAllUnsavedChanges === "function") {
+                                guard.ownerRoot.clearAllUnsavedChanges()
+                            }
+                        }
+                        // Fire the user's intent AFTER reverting + clearing
+                        // so the caller's state machine starts from a clean
+                        // registry — section navigation, window close, etc.
                         if (typeof intent === "function") intent()
+                        guard.userDiscarded(intent)
                     }
-                    for (var j = 0; j < savers.length; j += 1) savers[j](settle)
                 }
-            }
-            ThemedButton {
-                theme: guard.ownerRoot ? guard.ownerRoot.uiTheme : null
-                text: guard.tr("unsaved-changes.action.discard", "Discard changes")
-                Accessible.role: Accessible.Button
-                Accessible.name: guard.tr(
-                    "unsaved-changes.accessible.discard",
-                    "Discard unsaved changes and continue")
-                onClicked: {
-                    var intent = guard._pendingIntent
-                    guard._pendingIntent = null
-                    guard.close()
-                    // Walk the dirty registry, fire each section's
-                    // revert callback (if registered) so its QML
-                    // draft state matches the persisted source again,
-                    // THEN clear the registry so the next intent does
-                    // not re-trigger the dialog. Without this clear,
-                    // the dirty flag stays true and the guard re-opens
-                    // on the very next navigation — observed bug.
-                    if (guard.ownerRoot) {
-                        var registry = guard.ownerRoot.unsavedChangesRegistry || {}
-                        for (var sectionId in registry) {
-                            if (!registry[sectionId]) continue
-                            if (typeof guard.ownerRoot.revertCallbackForSection !== "function") continue
-                            var revert = guard.ownerRoot.revertCallbackForSection(sectionId)
-                            if (revert) revert()
-                        }
-                        if (typeof guard.ownerRoot.clearAllUnsavedChanges === "function") {
-                            guard.ownerRoot.clearAllUnsavedChanges()
-                        }
+                ThemedButton {
+                    id: cancelButton
+                    theme: guard.ownerRoot ? guard.ownerRoot.uiTheme : null
+                    text: guard.tr("action.cancel", "Cancel")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: guard.tr(
+                        "unsaved-changes.accessible.cancel",
+                        "Cancel and stay on the current view")
+                    onClicked: {
+                        var intent = guard._pendingIntent
+                        guard._pendingIntent = null
+                        guard.close()
+                        guard.cancelled(intent)
                     }
-                    // Fire the user's intent AFTER reverting + clearing
-                    // so the caller's state machine starts from a clean
-                    // registry — section navigation, window close, etc.
-                    if (typeof intent === "function") intent()
-                    guard.userDiscarded(intent)
-                }
-            }
-            ThemedButton {
-                id: cancelButton
-                theme: guard.ownerRoot ? guard.ownerRoot.uiTheme : null
-                text: guard.tr("action.cancel", "Cancel")
-                Accessible.role: Accessible.Button
-                Accessible.name: guard.tr(
-                    "unsaved-changes.accessible.cancel",
-                    "Cancel and stay on the current view")
-                onClicked: {
-                    var intent = guard._pendingIntent
-                    guard._pendingIntent = null
-                    guard.close()
-                    guard.cancelled(intent)
                 }
             }
         }

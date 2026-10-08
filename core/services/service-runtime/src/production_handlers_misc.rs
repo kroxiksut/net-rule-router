@@ -207,14 +207,23 @@ impl ProductionRulesSnapshotProvider {
             route_filter,
             RulesRouteFilter::Secondary | RulesRouteFilter::All
         );
+        // A rule this build cannot read is kept for a newer one, not shown:
+        // a client would send it back rewritten as a rule it understands.
+        let readable = |d: &&nrr_shared::rules_json::RuleDto| !d.is_unrecognized();
         let mut rows: Vec<RuleRowEntry> = Vec::new();
         if want_primary {
-            rows.extend(dto.primary.iter().map(|d| rule_dto_to_row(d, "primary")));
+            rows.extend(
+                dto.primary
+                    .iter()
+                    .filter(readable)
+                    .map(|d| rule_dto_to_row(d, "primary")),
+            );
         }
         if want_secondary {
             rows.extend(
                 dto.secondary
                     .iter()
+                    .filter(readable)
                     .map(|d| rule_dto_to_row(d, "secondary")),
             );
         }
@@ -298,12 +307,15 @@ fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRo
     let message_key = validation.message_key();
     // A Block-action rule displays as the "block" route regardless of which
     // bucket it physically lives in — set membership is enforcement-irrelevant
-    // for a blocked rule (the WFP codegen drops it). The QML list maps the
-    // "block" slug back to «Блокировать».
-    let target_route = if dto.action.is_route() {
-        route.to_string()
-    } else {
-        "block".to_string()
+    // for a blocked rule (the WFP codegen drops it). A `?host` rule displays as
+    // "verify". The QML list maps both slugs back to their labels.
+    let target_route = match &dto.action {
+        nrr_shared::rules_json::RuleAction::Route => route.to_string(),
+        nrr_shared::rules_json::RuleAction::Block => "block".to_string(),
+        nrr_shared::rules_json::RuleAction::VerifyPrimary => "verify".to_string(),
+        // `project` leaves such a rule out; the slug says what it is if one
+        // ever gets here.
+        nrr_shared::rules_json::RuleAction::Unrecognized(slug) => slug.clone(),
     };
     RuleRowEntry {
         id: dto.id.clone(),
@@ -617,21 +629,26 @@ impl ProductionRoutePolicyProvider {
 
 impl RoutePolicyProvider for ProductionRoutePolicyProvider {
     fn get_for_sid(&self, sid: &str) -> Option<RoutePolicyDto> {
-        let conn = self.conn.lock().ok()?;
-        let repo = RouteBindingsRepository::new(&conn);
-        // A policy with no adapter bound yet is still the user's: hiding it made
-        // every client rebuild the next full write from defaults, so binding an
-        // adapter after choosing the protections switched them off again.
-        if !repo.has_policy_for_sid(sid).ok()? {
-            return None;
-        }
-        let record = repo.load_for_sid(sid).ok()?;
-        // Best-effort — a provider-set read failure must not hide the policy.
-        let providers = repo
-            .load_link_provider_apps(sid, "secondary")
-            .unwrap_or_default();
-        Some(record_to_dto(record, providers))
+        stored_policy(&self.conn, sid)
     }
+}
+
+/// The caller's stored policy as the wire carries it.
+fn stored_policy(conn: &Mutex<Connection>, sid: &str) -> Option<RoutePolicyDto> {
+    let conn = conn.lock().ok()?;
+    let repo = RouteBindingsRepository::new(&conn);
+    // A policy with no adapter bound yet is still the user's: hiding it made
+    // every client rebuild the next full write from defaults, so binding an
+    // adapter after choosing the protections switched them off again.
+    if !repo.has_policy_for_sid(sid).ok()? {
+        return None;
+    }
+    let record = repo.load_for_sid(sid).ok()?;
+    // Best-effort — a provider-set read failure must not hide the policy.
+    let providers = repo
+        .load_link_provider_apps(sid, "secondary")
+        .unwrap_or_default();
+    Some(record_to_dto(record, providers))
 }
 
 pub struct ProductionRoutePolicyWriter {
@@ -645,6 +662,10 @@ impl ProductionRoutePolicyWriter {
 }
 
 impl RoutePolicyWriter for ProductionRoutePolicyWriter {
+    fn stored_for_sid(&self, sid: &str) -> Option<RoutePolicyDto> {
+        stored_policy(&self.conn, sid)
+    }
+
     fn update_for_sid(
         &self,
         sid: &str,
@@ -1571,5 +1592,39 @@ mod doh_resolver_ip_tests {
         for ip in [cached_v4, cached_v6, literal_v6] {
             assert!(ips.contains(&ip), "{ip} missing from {ips:?}");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod rules_list_projection_tests {
+    use super::*;
+    use nrr_domain::rules_revision::{RevisionStatus, RulesRevisionSource};
+
+    fn record(rules_json: &str) -> nrr_storage::revisions::RevisionRecord {
+        nrr_storage::revisions::RevisionRecord {
+            revision_id: "rev-1".into(),
+            content_hash: String::new(),
+            rules_json: rules_json.into(),
+            status: RevisionStatus::Active,
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: String::new(),
+            created_at: 0,
+            activated_at: None,
+            superseded_at: None,
+            superseded_by: None,
+            rejected_reason: None,
+            review_summary_json: None,
+            risk_level: None,
+        }
+    }
+
+    /// A client would send such a rule back rewritten as one it understands.
+    #[test]
+    fn rules_this_build_cannot_read_are_not_listed() {
+        let json = r#"{"primary":[{"address-match":{"kind":"exact-fqdn","value":"a.test"},"enabled":true,"id":"r-1"},{"address-match":{"from":1,"kind":"port-range"},"enabled":true,"id":"r-2"}],"schema-version":9,"secondary":[{"action":"throttle","address-match":{"kind":"zone","name":"test"},"enabled":true,"id":"r-3"}]}"#;
+        let listed = ProductionRulesSnapshotProvider::project(record(json), RulesRouteFilter::All);
+        let ids: Vec<&str> = listed.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["r-1"]);
     }
 }

@@ -21,6 +21,17 @@ NRR_SERVICE_ALIAS_NAME="nrr-service"
 # The Windows scripts register the build output in place; nothing hides it there.
 NRR_SERVICE_INSTALL_DIR="/usr/libexec/$NRR_PRODUCT_NAME_UNIX"
 NRR_STAGED_SERVICE_BINARY="$NRR_SERVICE_INSTALL_DIR/$NRR_SERVICE_EXE_NAME"
+# Where earlier builds staged the daemon (its SELinux label kept it from running
+# nft/ip); uninstall and purge still clear it on machines installed then.
+NRR_LEGACY_SERVICE_INSTALL_DIR="/usr/lib/$NRR_PRODUCT_NAME_UNIX"
+
+# The two terminal programs (BinaryRole::Console and BinaryRole::Tui). Staged
+# beside the daemon and linked from /usr/bin: a link keeps the real path in
+# /proc/<pid>/exe, so the interface finds the locales staged next to it, and
+# `nrr-cli reinstall` the daemon next to it.
+NRR_CONSOLE_EXE_NAMES=("nrr-cli" "nrr-tui")
+NRR_COMMAND_LINK_DIR="/usr/bin"
+NRR_STAGED_LOCALES_DIR="$NRR_SERVICE_INSTALL_DIR/locales"
 
 # The rest of the machine-wide footprint. Mirrors, in order, the install plan in
 # platform/linux (systemd unit, logrotate drop-in, polkit actions), the systemd
@@ -145,4 +156,49 @@ nrr_stage_service_binary() {
   local src="$1" tmp="$NRR_STAGED_SERVICE_BINARY.new"
   nrr_run_privileged install -D -m 0755 -T "$src" "$tmp"
   nrr_run_privileged mv -f "$tmp" "$NRR_STAGED_SERVICE_BINARY"
+}
+
+# Stage each terminal program built in $1 and link it into PATH; the locale
+# files go beside them. A program not built is reported, not fatal: the daemon
+# runs without either.
+nrr_stage_console_binaries() {
+  local build_dir="$1" repo_root="$2" name src dest link
+  for name in "${NRR_CONSOLE_EXE_NAMES[@]}"; do
+    src="$build_dir/$name"
+    dest="$NRR_SERVICE_INSTALL_DIR/$name"
+    if [ ! -x "$src" ]; then
+      nrr_yellow "    $name not built in $build_dir — not installed"
+      continue
+    fi
+    nrr_run_privileged install -D -m 0755 -T "$src" "$dest.new"
+    nrr_run_privileged mv -f "$dest.new" "$dest"
+    link="$NRR_COMMAND_LINK_DIR/$name"
+    # Anything else of that name is somebody else's install; never replace it.
+    if { [ -e "$link" ] || [ -L "$link" ]; } && [ "$(readlink "$link" 2>/dev/null)" != "$dest" ]; then
+      nrr_yellow "    $link is not ours — left alone; run $dest"
+      continue
+    fi
+    nrr_run_privileged ln -sfn "$dest" "$link"
+    nrr_gray "    $link -> $dest"
+  done
+  if [ -d "$repo_root/locales" ]; then
+    nrr_run_privileged rm -rf -- "$NRR_STAGED_LOCALES_DIR.new"
+    nrr_run_privileged cp -R "$repo_root/locales" "$NRR_STAGED_LOCALES_DIR.new"
+    nrr_run_privileged rm -rf -- "$NRR_STAGED_LOCALES_DIR"
+    nrr_run_privileged mv -f "$NRR_STAGED_LOCALES_DIR.new" "$NRR_STAGED_LOCALES_DIR"
+  fi
+}
+
+# Undo nrr_stage_console_binaries. A link is removed only while it still points
+# into the install directory: a program of the same name from elsewhere stays.
+nrr_remove_console_binaries() {
+  local name link
+  for name in "${NRR_CONSOLE_EXE_NAMES[@]}"; do
+    link="$NRR_COMMAND_LINK_DIR/$name"
+    if [ -L "$link" ] && [ "$(readlink "$link")" = "$NRR_SERVICE_INSTALL_DIR/$name" ]; then
+      nrr_run_privileged rm -f -- "$link"
+    fi
+    nrr_run_privileged rm -f -- "$NRR_SERVICE_INSTALL_DIR/$name"
+  done
+  nrr_run_privileged rm -rf -- "$NRR_STAGED_LOCALES_DIR"
 }

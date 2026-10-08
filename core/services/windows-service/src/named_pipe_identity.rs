@@ -14,6 +14,7 @@
 //! | `NetRuleRouter.exe` | `IpcClientProfile::GuiInteractive` |
 //! | `NetRuleRouterTray.exe` | `IpcClientProfile::TrayLightweight` |
 //! | `nrr-cli.exe` | `IpcClientProfile::AdminConsole` (read/diagnose only) |
+//! | `nrr-tui.exe` | `IpcClientProfile::Tui` |
 //! | anything else | rejected (`UnknownProcess`) |
 //!
 //! `nrr-service.exe` is also rejected — the service must not talk to
@@ -119,6 +120,8 @@ fn classify_exe_basename(basename: &str) -> Option<IpcClientProfile> {
         // through the same code path the application uses; the profile is what
         // keeps it to reading — it cannot invoke a policy change even by bug.
         Some(IpcClientProfile::AdminConsole)
+    } else if matches(BinaryRole::Tui) {
+        Some(IpcClientProfile::Tui)
     } else {
         // Includes `BinaryRole::Service` — explicitly rejected.
         None
@@ -462,6 +465,21 @@ mod tests {
     }
 
     #[test]
+    fn whitelist_accepts_tui_exe() {
+        assert_eq!(
+            classify_exe_basename("nrr-tui.exe"),
+            Some(IpcClientProfile::Tui)
+        );
+        assert_eq!(
+            classify_exe_basename("NRR-TUI.EXE"),
+            Some(IpcClientProfile::Tui)
+        );
+        // The name, not a prefix: a lookalike is still an unknown process.
+        assert_eq!(classify_exe_basename("nrr-tui-helper.exe"), None);
+        assert_eq!(classify_exe_basename("nrr-tui"), None);
+    }
+
+    #[test]
     fn whitelist_rejects_service_exe() {
         assert_eq!(classify_exe_basename("nrr-service.exe"), None);
         assert_eq!(classify_exe_basename("NRR-Service.exe"), None);
@@ -478,6 +496,7 @@ mod tests {
                 BinaryRole::Gui => Some(IpcClientProfile::GuiInteractive),
                 BinaryRole::Tray => Some(IpcClientProfile::TrayLightweight),
                 BinaryRole::Console => Some(IpcClientProfile::AdminConsole),
+                BinaryRole::Tui => Some(IpcClientProfile::Tui),
                 BinaryRole::Service => None,
             };
             assert_eq!(

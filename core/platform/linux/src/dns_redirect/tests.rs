@@ -182,23 +182,27 @@ impl DnsCommands for FakeResolved {
     }
 }
 
-fn taken_file(test: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "nrr-dns-redirect-{test}-{}.txt",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&path);
-    path
+fn taken_file(test: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("nrr-dns-redirect-{test}-"))
+        .tempdir()
+        .expect("tempdir");
+    let path = dir.path().join("taken.txt");
+    (dir, path)
 }
 
-fn redirect(fake: &FakeResolved, test: &str) -> ResolvedDnsRedirect<FakeResolved> {
-    ResolvedDnsRedirect::new(fake.clone(), taken_file(test))
+fn redirect(
+    fake: &FakeResolved,
+    test: &str,
+) -> (tempfile::TempDir, ResolvedDnsRedirect<FakeResolved>) {
+    let (dir, path) = taken_file(test);
+    (dir, ResolvedDnsRedirect::new(fake.clone(), path))
 }
 
 #[test]
 fn the_redirect_takes_every_name_and_leaves_narrow_domains_where_they_are() {
     let fake = FakeResolved::machine();
-    let redirect = redirect(&fake, "takes");
+    let (_dir, redirect) = redirect(&fake, "takes");
     let handle = redirect.redirect_to(LISTENER_ADDR).expect("redirects");
 
     assert_eq!(fake.domains(REDIRECT_LINK), Some(vec!["~.".to_string()]));
@@ -213,7 +217,7 @@ fn the_redirect_takes_every_name_and_leaves_narrow_domains_where_they_are() {
 #[test]
 fn restore_gives_the_catch_all_back_and_removes_the_link() {
     let fake = FakeResolved::machine();
-    let redirect = redirect(&fake, "restore");
+    let (_dir, redirect) = redirect(&fake, "restore");
     let handle = redirect.redirect_to(LISTENER_ADDR).expect("redirects");
     redirect.restore(&handle).expect("restores");
 
@@ -228,7 +232,7 @@ fn restore_gives_the_catch_all_back_and_removes_the_link() {
 #[test]
 fn a_vpn_that_reclaims_every_name_is_noticed_and_redirected_again() {
     let fake = FakeResolved::machine();
-    let redirect = redirect(&fake, "reclaim");
+    let (_dir, redirect) = redirect(&fake, "reclaim");
     let handle = redirect.redirect_to(LISTENER_ADDR).expect("redirects");
     fake.links
         .lock()
@@ -254,7 +258,7 @@ fn a_vpn_that_reclaims_every_name_is_noticed_and_redirected_again() {
 #[test]
 fn what_a_crashed_run_left_behind_is_undone_at_the_next_start() {
     let fake = FakeResolved::machine();
-    let file = taken_file("orphan");
+    let (_dir, file) = taken_file("orphan");
     ResolvedDnsRedirect::new(fake.clone(), file.clone())
         .redirect_to(LISTENER_ADDR)
         .expect("redirects");
@@ -272,7 +276,7 @@ fn what_a_crashed_run_left_behind_is_undone_at_the_next_start() {
 #[test]
 fn a_connection_gone_by_restore_is_skipped() {
     let fake = FakeResolved::machine();
-    let redirect = redirect(&fake, "gone");
+    let (_dir, redirect) = redirect(&fake, "gone");
     let handle = redirect.redirect_to(LISTENER_ADDR).expect("redirects");
     fake.links.lock().expect("lock").remove("wg0");
     redirect.restore(&handle).expect("restores");
@@ -282,7 +286,7 @@ fn a_connection_gone_by_restore_is_skipped() {
 #[test]
 fn a_listener_off_the_link_is_refused_before_anything_changes() {
     let fake = FakeResolved::machine();
-    let redirect = redirect(&fake, "refused");
+    let (_dir, redirect) = redirect(&fake, "refused");
     let loopback: SocketAddr = "127.0.0.1:53".parse().expect("addr");
     assert!(redirect.redirect_to(loopback).is_err());
     assert_eq!(fake.domains(REDIRECT_LINK), None);
@@ -298,7 +302,7 @@ fn a_failure_claiming_the_link_removes_the_link_it_just_created() {
     // rollback must undo only the link creation, leaving every domain as it was.
     let fake = FakeResolved::machine();
     fake.fail_dns_claim();
-    let redirect = redirect(&fake, "early-failure");
+    let (_dir, redirect) = redirect(&fake, "early-failure");
     assert!(redirect.redirect_to(LISTENER_ADDR).is_err());
     assert!(fake
         .links
@@ -321,7 +325,7 @@ fn a_late_step_failure_rolls_back_the_whole_redirect() {
     // claiming `~.` for a listener about to be torn down) is worse than none.
     let fake = FakeResolved::machine();
     fake.fail_domain_for("wg0");
-    let redirect = redirect(&fake, "late-failure");
+    let (_dir, redirect) = redirect(&fake, "late-failure");
     assert!(redirect.redirect_to(LISTENER_ADDR).is_err());
     assert!(fake
         .links
@@ -339,9 +343,8 @@ fn a_late_step_failure_rolls_back_the_whole_redirect() {
 #[test]
 fn upstream_servers_come_from_the_links_never_from_our_own() {
     let fake = FakeResolved::machine();
-    redirect(&fake, "servers")
-        .redirect_to(LISTENER_ADDR)
-        .expect("redirects");
+    let (_dir, redirect) = redirect(&fake, "servers");
+    redirect.redirect_to(LISTENER_ADDR).expect("redirects");
     let servers: Vec<(Option<u32>, Ipv4Addr)> = ResolvedDnsServers(fake)
         .upstream_candidates_v4()
         .into_iter()

@@ -97,9 +97,22 @@ void centerWindowOnScreen(QWindow *window) {
         return;
     }
 
+    // Position and size are the client area's; the title bar sits above it.
+    // Counting the frame keeps the title bar on screen when the window is
+    // taller than the work area (a small or scaled display). The margins are
+    // known only once the native window exists.
+    window->create();
+    const QMargins frame = window->frameMargins();
     const QRect available = screen->availableGeometry();
-    const int x = available.x() + qMax(0, (available.width() - window->width()) / 2);
-    const int y = available.y() + qMax(0, (available.height() - window->height()) / 2);
+    const int roomWidth = available.width() - frame.left() - frame.right();
+    const int roomHeight = available.height() - frame.top() - frame.bottom();
+    const int width = qMax(window->minimumWidth(), qMin(window->width(), roomWidth));
+    const int height = qMax(window->minimumHeight(), qMin(window->height(), roomHeight));
+    if (width != window->width() || height != window->height()) {
+        window->resize(width, height);
+    }
+    const int x = available.x() + frame.left() + qMax(0, (roomWidth - width) / 2);
+    const int y = available.y() + frame.top() + qMax(0, (roomHeight - height) / 2);
     window->setPosition(x, y);
 }
 

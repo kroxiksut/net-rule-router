@@ -618,13 +618,16 @@ mod tests {
     fn write_then_read_round_trips_payload() {
         let (_dir, cache) = fresh_cache();
         let payload = json!({"hello": "world", "n": 42});
+        let started = std::time::Instant::now();
         cache
             .write(CacheKey::SnapshotDiagnostics, payload.clone())
             .expect("write");
         let cached = cache.read(CacheKey::SnapshotDiagnostics).expect("hit");
         assert_eq!(cached.payload, payload);
         assert!(!cached.expired);
-        assert!(cached.age_secs <= 1);
+        // Whole epoch seconds: one more for the rounding, however long a loaded
+        // machine took between the write and the read.
+        assert!(cached.age_secs <= started.elapsed().as_secs() + 1);
     }
 
     #[test]

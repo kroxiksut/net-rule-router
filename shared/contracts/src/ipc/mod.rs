@@ -68,13 +68,17 @@ pub enum IpcClientProfile {
     TrayLightweight,
     /// The administrative console: reads and diagnoses, never changes policy.
     AdminConsole,
+    /// The terminal interface: the window's policy surface without the desktop
+    /// shell. Asks for elevation on demand, in its own terminal.
+    Tui,
 }
 
 impl IpcClientProfile {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::GuiInteractive,
         Self::TrayLightweight,
         Self::AdminConsole,
+        Self::Tui,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -82,6 +86,7 @@ impl IpcClientProfile {
             Self::GuiInteractive => "gui-interactive",
             Self::TrayLightweight => "tray-lightweight",
             Self::AdminConsole => "admin-console",
+            Self::Tui => "tui",
         }
     }
 
@@ -94,7 +99,7 @@ impl IpcClientProfile {
     pub const fn permits(self, class: crate::ipc_transport::IpcOperationClass) -> bool {
         use crate::ipc_transport::IpcOperationClass as C;
         match self {
-            Self::GuiInteractive | Self::TrayLightweight => true,
+            Self::GuiInteractive | Self::TrayLightweight | Self::Tui => true,
             Self::AdminConsole => matches!(
                 class,
                 C::ReadSnapshot | C::DiagnosticQuery | C::DiagnosticAction
@@ -102,37 +107,45 @@ impl IpcClientProfile {
         }
     }
 
+    /// Whether this caller may be shown an authentication prompt for a
+    /// privileged operation. The window and the terminal have a person in front
+    /// of them; the tray and the console do not ask. A terminal with no agent to
+    /// answer (SSH without one) is refused by the authority itself.
+    pub const fn may_prompt_for_elevation(self) -> bool {
+        matches!(self, Self::GuiInteractive | Self::Tui)
+    }
+
     /// The narrower of two profiles: what the OS proved, and what the caller
     /// declared. Declaration never widens.
+    ///
+    /// When neither contains the other (the tray and the terminal each hold
+    /// operations the other lacks), the answer is the console, the only
+    /// profile inside both.
     pub fn narrowed_by(self, declared: Self) -> Self {
-        if self.capability_rank() <= declared.capability_rank() {
+        if self.is_within(declared) {
             self
-        } else {
+        } else if declared.is_within(self) {
             declared
+        } else {
+            Self::AdminConsole
         }
     }
 
-    /// How much a profile may do, as a total order.
-    ///
-    /// The console is narrowest by class ([`Self::permits`]). Tray sits below
-    /// GUI because of `allowed_clients`: every operation open to the tray is
-    /// also open to the GUI, and some are GUI-only. That containment is what
-    /// makes the order real rather than invented, so it is held by
-    /// `no_operation_is_open_to_the_tray_but_closed_to_the_gui` — add a
-    /// tray-only operation and the order stops being true, which is the moment
-    /// this function has to change too.
-    ///
-    /// Why it matters that the order is total: a proven GUI that DECLARES
-    /// itself the tray used to keep GUI capabilities, because anything other
-    /// than the console fell through to "whatever the OS proved". A caller
-    /// asking to be treated more narrowly should be taken at its word — that is
-    /// the whole point of reading a declaration that can never widen.
-    const fn capability_rank(self) -> u8 {
-        match self {
-            Self::AdminConsole => 0,
-            Self::TrayLightweight => 1,
-            Self::GuiInteractive => 2,
-        }
+    /// Whether everything `self` may do, `other` may do too. The console is
+    /// narrowest by class; tray and terminal sit inside the window by
+    /// `allowed_clients`, as a contract test holds — a tray-only or
+    /// terminal-only operation must change this too.
+    const fn is_within(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::AdminConsole, _)
+                | (Self::GuiInteractive, Self::GuiInteractive)
+                | (
+                    Self::TrayLightweight,
+                    Self::TrayLightweight | Self::GuiInteractive
+                )
+                | (Self::Tui, Self::Tui | Self::GuiInteractive)
+        )
     }
 }
 
@@ -154,6 +167,7 @@ impl FromStr for IpcClientProfile {
             // writes, so a profile round-trip through text silently failed for
             // the one profile whose whole purpose is to be RESTRICTED.
             "console" | "admin-console" => Ok(Self::AdminConsole),
+            "tui" => Ok(Self::Tui),
             _ => Err("unknown ipc client profile"),
         }
     }

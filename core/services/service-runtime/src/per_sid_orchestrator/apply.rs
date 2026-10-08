@@ -348,7 +348,13 @@ impl PerSidApplyOrchestrator {
         // previous install BEFORE the state is replaced.
         let (destinations, secondary_resolved) = Self::coverage_of(&filters);
         let networks = Self::rule_networks_of(sid, &filters);
-        self.tear_down_flows_to_new_destinations(sid, &destinations, &networks, secondary_resolved);
+        self.tear_down_flows_to_new_destinations(
+            sid,
+            &filters,
+            &destinations,
+            &networks,
+            secondary_resolved,
+        );
         Self::publish_enforced_addresses(sid, &filters);
         self.upsert_state_with_destinations(
             sid,
@@ -599,7 +605,13 @@ impl PerSidApplyOrchestrator {
         // sweep of every pinned destination.
         let (destinations, secondary_resolved) = Self::coverage_of(&desired);
         let networks = Self::rule_networks_of(sid, &desired);
-        self.tear_down_flows_to_new_destinations(sid, &destinations, &networks, secondary_resolved);
+        self.tear_down_flows_to_new_destinations(
+            sid,
+            &desired,
+            &destinations,
+            &networks,
+            secondary_resolved,
+        );
         Self::publish_enforced_addresses(sid, &desired);
         let live_total = {
             let removed_ids: std::collections::HashSet<u64> =
@@ -1141,6 +1153,73 @@ impl PerSidApplyOrchestrator {
         out
     }
 
+    /// The course of each destination `filters` name, read the way the engine
+    /// arbitrates them: an egress-conditional permit for the additional link
+    /// outranks every rule band, so its destination is the tunnel's; a block
+    /// with no such permit leaves it no course; plain permits alone put it on
+    /// the main link. Networks count only when the rule book names them.
+    pub(super) fn courses_of(
+        filters: &[WfpFilterSpec],
+        rule_networks: &[nrr_shared::ip_block::IpBlock],
+    ) -> crate::routed_host_flow_refresh::Courses {
+        use crate::routed_host_flow_refresh::{Course, Courses};
+        #[derive(Default, Clone, Copy)]
+        struct Seen {
+            via_secondary: bool,
+            blocked: bool,
+        }
+        impl Seen {
+            fn mark(&mut self, spec: &WfpFilterSpec) {
+                match spec.action {
+                    WfpAction::Permit if spec.local_interface_luid.is_some() => {
+                        self.via_secondary = true;
+                    }
+                    WfpAction::Permit => {}
+                    WfpAction::Block => self.blocked = true,
+                }
+            }
+            fn course(self) -> Option<Course> {
+                if self.via_secondary {
+                    Some(Course::Secondary)
+                } else if self.blocked {
+                    None
+                } else {
+                    Some(Course::Primary)
+                }
+            }
+        }
+        let mut hosts: std::collections::HashMap<std::net::Ipv4Addr, Seen> =
+            std::collections::HashMap::new();
+        let mut networks: std::collections::HashMap<nrr_shared::ip_block::IpBlock, Seen> =
+            std::collections::HashMap::new();
+        for spec in filters {
+            for ip in spec.remote_ip.iter().chain(&spec.remote_ip_set) {
+                hosts.entry(*ip).or_default().mark(spec);
+            }
+            let named = spec
+                .remote_subnet
+                .and_then(|(net, prefix)| {
+                    nrr_shared::ip_block::IpBlock::new(std::net::IpAddr::V4(net), prefix)
+                })
+                .filter(|block| rule_networks.contains(block));
+            if let Some(block) = named {
+                networks.entry(block).or_default().mark(spec);
+            }
+        }
+        let mut courses = Courses::default();
+        for (host, seen) in hosts {
+            if let Some(course) = seen.course() {
+                courses.insert_host(host, course);
+            }
+        }
+        for (network, seen) in networks {
+            if let Some(course) = seen.course() {
+                courses.insert_network(network, course);
+            }
+        }
+        courses
+    }
+
     /// Tear down live connections to destinations this install just started
     /// enforcing, and report which ones those were.
     ///
@@ -1148,28 +1227,28 @@ impl PerSidApplyOrchestrator {
     /// keeps the interface it was bound to for life. On a newly pinned
     /// destination the connect-time filters never see it again, so the
     /// half-loaded page the user just added a rule for goes on using the wrong
-    /// link until something breaks it. The connection observer repairs this when
-    /// it SEES drops, which is seconds later and only if drops happen; doing it
-    /// on the activation edge is the same repair at the moment the user acted.
+    /// link until something breaks it.
     ///
     /// Only additions count — re-listing a destination that was already
     /// enforced would tear down the very connections the previous teardown
     /// established — with one exception: when the additional adapter just
-    /// became resolvable, EVERY pinned destination is swept. Its addresses did
-    /// not change while the tunnel was down, so the "new destinations" rule
-    /// finds nothing, and the sockets the browser opened over the main link (or
-    /// against a fail-closed block) would ride it until they died on their own.
+    /// became resolvable, every destination steered onto it is swept. Its
+    /// addresses did not change while the tunnel was down, so the "new
+    /// destinations" rule finds nothing, and the sockets the browser opened
+    /// over the main link would ride it until they died on their own.
     ///
-    /// These filters are `sid`'s alone, so only `sid`'s connections are torn
-    /// down, and none to an address a direct host shares — the same cut
-    /// [`crate::routed_host_flow_refresh::flows_to_reset`] makes.
+    /// Only `sid`'s own connections go, none to an address a direct host
+    /// shares, none riding a link that is neither of `sid`'s, and none already
+    /// on the link the plan assigns: [`crate::routed_host_flow_refresh::flows_to_reset`].
     pub(super) fn tear_down_flows_to_new_destinations(
         &self,
         sid: &str,
+        filters: &[WfpFilterSpec],
         destinations: &[std::net::Ipv4Addr],
         networks: &[nrr_shared::ip_block::IpBlock],
         secondary_resolved: bool,
     ) {
+        use crate::routed_host_flow_refresh::Course;
         let Some(reset) = self.stale_flow_reset.as_ref() else {
             return;
         };
@@ -1189,26 +1268,48 @@ impl PerSidApplyOrchestrator {
             }
         };
         let tunnel_came_up = secondary_resolved && !was_resolved;
-        // One table read for the whole set: "the tunnel came up" hands this
-        // every pinned destination at once, on the edge that must not stall.
-        let hosts: Vec<std::net::Ipv4Addr> = destinations
-            .iter()
-            .copied()
-            .filter(|ip| tunnel_came_up || !previous.contains(ip))
-            .collect();
-        let nets: Vec<nrr_shared::ip_block::IpBlock> = networks
-            .iter()
-            .copied()
-            .filter(|net| tunnel_came_up || !previous_networks.contains(net))
-            .collect();
+        // Walked only on the edge or once something is connected: this runs on
+        // every reconcile, and the courses read every filter.
+        let mut courses = tunnel_came_up.then(|| Self::courses_of(filters, networks));
+        let (hosts, nets): (Vec<std::net::Ipv4Addr>, Vec<nrr_shared::ip_block::IpBlock>) =
+            match courses.as_ref() {
+                Some(courses) => (
+                    destinations
+                        .iter()
+                        .copied()
+                        .filter(|ip| courses.of(*ip) == Some(Course::Secondary))
+                        .collect(),
+                    networks
+                        .iter()
+                        .copied()
+                        .filter(|net| courses.of_network(*net) == Some(Course::Secondary))
+                        .collect(),
+                ),
+                None => (
+                    destinations
+                        .iter()
+                        .copied()
+                        .filter(|ip| !previous.contains(ip))
+                        .collect(),
+                    networks
+                        .iter()
+                        .copied()
+                        .filter(|net| !previous_networks.contains(net))
+                        .collect(),
+                ),
+            };
         let fresh = hosts.len() + nets.len();
-        // Read only when something is connected: the census is a query. No
-        // anchor here: an apply routes addresses, it offers nothing.
         let Some(outcome) = crate::routed_host_flow_refresh::reset_owner_flows(
             reset.as_ref(),
             self.fqdn_cache.as_ref(),
             sid,
             &nrr_platform_api::fake_ip::stale_flows::FlowTargets::new(hosts, nets),
+            || crate::routed_host_flow_refresh::FlowPaths {
+                links: (self.flow_links_resolver)(sid, &(self.machine_reader)()),
+                courses: courses
+                    .take()
+                    .unwrap_or_else(|| Self::courses_of(filters, networks)),
+            },
         ) else {
             return;
         };
@@ -1236,6 +1337,8 @@ impl PerSidApplyOrchestrator {
                 kept_shared = decision.kept_shared,
                 kept_other_owner = decision.kept_other_owner,
                 kept_unknown_owner = decision.kept_unknown_owner,
+                kept_other_link = decision.kept_other_link,
+                kept_on_course = decision.kept_on_course,
                 "{reason}",
             );
         }

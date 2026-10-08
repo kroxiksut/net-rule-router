@@ -124,6 +124,7 @@ fn route_policy_update_request_sample(auto_rules_mode: &str) -> RoutePolicyUpdat
         short_name_completion: false,
         short_name_suffix: String::new(),
         binding_source: BindingSourceDto::UserAssigned,
+        apply_only: Vec::new(),
     }
 }
 
@@ -233,6 +234,13 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             reason: "not-covered-by-rules".into(),
             attempts: 1,
             launched_by: vec!["launcher.exe".into()],
+        },
+        StatusUpdateEvent::BlockNoticeMutesChanged {
+            sid: "S-1-5-21".into(),
+        },
+        StatusUpdateEvent::VerifyPrimaryMoved {
+            sid: "S-1-5-21".into(),
+            host: "accounts.example".into(),
         },
     ]
 }

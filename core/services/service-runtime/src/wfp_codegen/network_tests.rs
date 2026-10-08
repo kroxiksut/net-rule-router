@@ -84,6 +84,7 @@ fn generate_in(
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
             families,
+            packet_blocks: true,
         },
         shapes,
     )
@@ -175,6 +176,7 @@ fn the_shape_gate_lets_networks_into_the_service() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(out
         .filters
@@ -458,4 +460,71 @@ fn filter_ids_are_stable_and_distinct_per_piece() {
     assert_eq!(first.filters, second.filters);
     let ids: std::collections::HashSet<u64> = first.filters.iter().map(|f| f.id.raw).collect();
     assert_eq!(ids.len(), first.filters.len());
+}
+
+/// A user's own Block holds for that user only: the connect layer carries
+/// their SID, and nothing lands on the packet layer, which has no user
+/// condition and would cut every other account. The baseline's Block keeps
+/// its packet-layer mirror.
+#[test]
+fn only_the_baseline_block_reaches_the_packet_layer() {
+    let mut rb = book(
+        Vec::new(),
+        vec![
+            subnet("b-net", "10.1.0.0/16", RuleAction::Block),
+            exact("b-ip", "192.0.2.9"),
+        ],
+    );
+    let blocked: Vec<CanonicalRule> = rb
+        .secondary
+        .rules()
+        .iter()
+        .cloned()
+        .map(|mut r| {
+            r.action = RuleAction::Block;
+            r
+        })
+        .collect();
+    rb.secondary = CanonicalRuleSet::from_rules(blocked);
+    let generate_for = |packet_blocks: bool| {
+        generate_filters_with_shapes(
+            CodegenInput {
+                sid: SID,
+                rule_book: &rb,
+                behavior_mode: RouteBehaviorMode::PreferPrimary,
+                fqdn_cache: &MockFqdnCacheLookup::new(),
+                app_observations: &MockAppObservationLookup::new(),
+                app_resolver: &NoopAppPathResolver,
+                secondary_ip_denylist: &std::collections::HashSet::new(),
+                zone_priority_over_ip: false,
+                families: FamilyScope::V4Only,
+                packet_blocks,
+            },
+            NETWORKS,
+        )
+    };
+    let packet = |out: &CodegenOutput| {
+        out.filters
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.layer,
+                    WfpLayerKey::OutboundIpPacketV4 | WfpLayerKey::OutboundIpPacketV6
+                )
+            })
+            .count()
+    };
+
+    let own = generate_for(false);
+    assert_eq!(packet(&own), 0, "{:?}", own.filters);
+    let connect: Vec<&WfpFilterSpec> = own
+        .filters
+        .iter()
+        .filter(|f| f.action == WfpAction::Block)
+        .collect();
+    assert!(connect.len() >= 2, "{connect:?}");
+    assert!(connect.iter().all(|f| f.user_sid.as_deref() == Some(SID)));
+
+    let baseline = generate_for(true);
+    assert!(packet(&baseline) >= 2, "{:?}", baseline.filters);
 }

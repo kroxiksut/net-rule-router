@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
-use crate::protocol::{build_broker_argv, derive_pipe_name, BrokerRequest, BROKER_SHUTDOWN};
-use crate::protocol::{client_answer_timeout, BrokerResponse, BROKER_PING};
+use crate::protocol::{build_broker_argv, derive_pipe_name, BrokerRequest};
+use crate::protocol::{client_answer_timeout, BrokerResponse, BROKER_PING, BROKER_SHUTDOWN};
 #[cfg(target_os = "windows")]
 use crate::windows_sys::NoFlush;
 
@@ -42,6 +42,7 @@ pub fn new_handle() -> BrokerHandle {
         relay: Mutex::new(()),
         unanswered: Mutex::new(None),
         awaiting_consent: AtomicBool::new(false),
+        revoke_requested: AtomicBool::new(false),
     })
 }
 
@@ -68,6 +69,9 @@ pub struct Broker {
     /// A spawn is waiting on the UAC prompt, which stays up as long as the
     /// user leaves it.
     awaiting_consent: AtomicBool,
+    /// Revoke was asked for while the prompt was up: the session that prompt
+    /// yields is retired on arrival. Read and written under `state`.
+    revoke_requested: AtomicBool,
 }
 
 /// Outcome of a broker-relayed call.
@@ -155,7 +159,14 @@ impl Broker {
     /// `true` if a session was live and has now been retired.
     pub fn shutdown_if_active(&self) -> bool {
         *lock(&self.last_used) = None;
-        let Some(session) = lock(&self.state).take() else {
+        let taken = {
+            let mut state = lock(&self.state);
+            if self.awaiting_consent.load(Ordering::Acquire) {
+                self.revoke_requested.store(true, Ordering::Release);
+            }
+            state.take()
+        };
+        let Some(session) = taken else {
             return false;
         };
         *lock(&self.unanswered) = None;
@@ -306,12 +317,29 @@ impl Broker {
         if let Some(session) = lock(&self.state).clone() {
             return Ok(session);
         }
+        self.revoke_requested.store(false, Ordering::Release);
         self.awaiting_consent.store(true, Ordering::Release);
         let spawned = transport.spawn();
+        // Under the state lock, so a revoke lands either before (and is seen
+        // here) or after (and finds the session stored).
+        let mut state = lock(&self.state);
         self.awaiting_consent.store(false, Ordering::Release);
+        let revoked = self.revoke_requested.swap(false, Ordering::AcqRel);
         let session = spawned?;
-        *lock(&self.state) = Some(session.clone());
-        Ok(session)
+        if !revoked {
+            *state = Some(session.clone());
+            return Ok(session);
+        }
+        drop(state);
+        // Best-effort, as in `shutdown_if_active`.
+        let _ = transport.exchange(
+            &session,
+            BROKER_SHUTDOWN,
+            &serde_json::json!({}),
+            Duration::ZERO,
+            client_answer_timeout(BROKER_SHUTDOWN, Duration::ZERO),
+        );
+        Err(BrokerCallError::Declined)
     }
 
     fn respawn<T: Transport>(
@@ -709,7 +737,8 @@ mod tests {
     }
 
     /// The status poll and revoke answer at once while the prompt is up, and
-    /// the poll can tell the user is being asked.
+    /// the poll can tell the user is being asked. The revoke is not lost: the
+    /// session the prompt then yields is retired, and the call reads declined.
     #[test]
     fn the_status_poll_answers_while_the_uac_prompt_is_up() {
         use std::sync::mpsc;
@@ -724,14 +753,15 @@ mod tests {
                 entered: entered_tx,
                 release: Mutex::new(release_rx),
             };
-            relaying
-                .relay(
+            matches!(
+                relaying.relay(
                     &transport,
                     BROKER_PING,
                     &serde_json::json!({}),
                     Duration::ZERO,
-                )
-                .is_ok()
+                ),
+                Err(BrokerCallError::Declined)
+            )
         });
         entered_rx
             .recv_timeout(Duration::from_secs(5))
@@ -752,9 +782,32 @@ mod tests {
             answer.expect("the poll waited for the prompt"),
             (true, false, false)
         );
-        assert!(relay.join().expect("relay thread"));
+        assert!(
+            relay.join().expect("relay thread"),
+            "the call reads declined"
+        );
         assert!(!broker.is_awaiting_consent());
+        assert!(
+            !broker.is_session_active(),
+            "revoked during the prompt, yet a session is live"
+        );
+    }
+
+    #[test]
+    fn a_prompt_nobody_revoked_keeps_its_session() {
+        let fake = FakeTransport::new(vec![Reply::After(Duration::ZERO)]);
+        let broker = new_handle();
+        assert!(!broker.shutdown_if_active(), "nothing to revoke yet");
+        broker
+            .relay(
+                &fake,
+                BROKER_PING,
+                &serde_json::json!({}),
+                Duration::from_secs(1),
+            )
+            .expect("relayed");
         assert!(broker.is_session_active());
+        assert_eq!(fake.sent_ops(), [BROKER_PING]);
     }
 
     #[test]

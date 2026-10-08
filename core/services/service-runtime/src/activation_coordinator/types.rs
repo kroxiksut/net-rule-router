@@ -249,6 +249,8 @@ pub enum PolicyError {
         revision_id: RevisionId,
         reason: RevisionRejectReason,
     },
+    /// The same network on both routes, both routing it: a tie.
+    NetworkOnBothRoutes { network: String },
     /// A submitted revision holds a rule whose shape enforcement cannot carry
     /// out (see `nrr_domain::rule_shape`). Refused at submission so it never
     /// becomes a stored candidate.
@@ -344,6 +346,10 @@ impl std::fmt::Display for PolicyError {
                 revision_id,
                 reason,
             } => write!(f, "revision {revision_id} is not trusted: {reason}"),
+            Self::NetworkOnBothRoutes { network } => write!(
+                f,
+                "the network {network} is on both routes; give it one route"
+            ),
             Self::UnsupportedRuleShape { rule_id, reason } => write!(
                 f,
                 "rule {rule_id} has a shape enforcement cannot carry out ({reason})"

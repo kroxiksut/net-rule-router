@@ -40,6 +40,9 @@ impl AutoRulesEngine {
             primary_behavior_of: None,
             evidence_store: None,
             evidence_saved_at: Mutex::new(HashMap::new()),
+            twin_cleanup: Mutex::new(HashMap::new()),
+            verify: Mutex::new(HashMap::new()),
+            verify_wiring: OnceLock::new(),
         }
     }
 

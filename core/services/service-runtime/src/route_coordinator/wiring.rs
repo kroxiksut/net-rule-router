@@ -25,9 +25,11 @@ impl SecondaryRouteCoordinator {
             local_subnet_cache: Mutex::new(HashMap::new()),
             heal_logged: Mutex::new(HashMap::new()),
             not_found_logged: Mutex::new(HashMap::new()),
+            gone_since: Mutex::new(HashMap::new()),
+            gone_grace: super::notice_latches::GONE_GRACE,
             not_usable_logged: Mutex::new(HashMap::new()),
             anchor_persisted: Mutex::new(std::collections::HashSet::new()),
-            enforcement_status: Mutex::new(HashMap::new()),
+            enforcement_status: crate::app_enforcement_status::RouteEnforcementStatus::new(),
             unassigned_tunnel_notified: Mutex::new(HashMap::new()),
             no_next_hop_logged: Mutex::new(std::collections::HashSet::new()),
             no_policy_logged: Mutex::new(std::collections::HashSet::new()),
@@ -119,6 +121,13 @@ impl SecondaryRouteCoordinator {
     pub fn with_event_bus(mut self, events: Arc<crate::ipc_handlers::event_bus::EventBus>) -> Self {
         self.events = Some(events);
         self
+    }
+
+    /// The standing enforcement reports this coordinator pushes on change, for
+    /// the connect-time snapshot. Shares state with the coordinator.
+    #[must_use]
+    pub fn enforcement_status(&self) -> crate::app_enforcement_status::RouteEnforcementStatus {
+        self.enforcement_status.clone()
     }
 
     /// attach the VPN-server-IP persistence seam: a

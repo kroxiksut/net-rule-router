@@ -47,8 +47,10 @@ const HELD_RESOLUTION_BACKSTOP_SECS: i64 = 30 * 86_400;
 
 /// A restamp of an address last confirmed longer ago than this counts as news:
 /// it may have aged out of what enforcement reads, and bringing it back changes
-/// a plan. Shorter than any enforcement window, so the error is an extra pass,
-/// never a missed one.
+/// a plan. Shorter than any enforcement window, so the error is an extra pass.
+/// The one miss: a zone fan-out past its cap ranks hosts by recency, so a
+/// restamp within the hour can reorder it — that needs more distinct hosts
+/// under one zone within the hour than the cap, and waits for the full pass.
 const RESTAMP_IS_NEWS_AFTER_MS: i64 = 60 * 60 * 1_000;
 
 pub struct SqliteCacheStore {

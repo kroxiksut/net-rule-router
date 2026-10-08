@@ -171,6 +171,35 @@ impl fmt::Display for IpRange {
     }
 }
 
+/// The canonical form of an address: an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`) is its IPv4 address, anything else is itself.
+///
+/// One address written two ways would otherwise be two rule keys and two
+/// matches; every place that compares addresses asks this.
+#[must_use]
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+/// An IPv4-mapped IPv6 network (`::ffff:10.0.0.0/104`) is its IPv4 network.
+#[must_use]
+pub fn canonical_block(block: IpBlock) -> IpBlock {
+    match block.network() {
+        IpAddr::V6(_) if block.prefix_len() >= 96 => {
+            let mapped = canonical_ip(block.network());
+            if mapped.is_ipv4() {
+                IpBlock::new(mapped, block.prefix_len() - 96).unwrap_or(block)
+            } else {
+                block
+            }
+        }
+        _ => block,
+    }
+}
+
 fn decompose(first: IpAddr, last: IpAddr) -> Vec<IpBlock> {
     let bits = family_bits(first);
     let (mut cur, end) = (to_bits(first), to_bits(last));

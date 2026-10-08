@@ -130,6 +130,28 @@ fn the_chooser_answers_become_the_requests_the_service_accepts() {
     );
 }
 
+/// A card that checks its kind's mute on arrival must also carry the kind as
+/// `noticeMuteKind`, or a mute set later in the tray or Settings never takes it
+/// off the window's notification centre.
+#[test]
+fn every_mutable_card_names_its_kind_for_withdrawal() {
+    let main = repo_file("apps/desktop/qml/Main.qml");
+    let marker = "_addPushNoticeUnlessMuted(\"";
+    let kinds: Vec<&str> = main
+        .match_indices(marker)
+        .filter_map(|(at, _)| main[at + marker.len()..].split('"').next())
+        .collect();
+    assert!(kinds.len() >= 4, "the scan found {kinds:?}");
+    for kind in kinds {
+        assert!(
+            main.lines()
+                .any(|line| line.contains("\"noticeMuteKind\"")
+                    && line.contains(&format!("\"{kind}\""))),
+            "a `{kind}` card is admitted by its mute but never withdrawn by it"
+        );
+    }
+}
+
 /// Feed a program to `node` on stdin. `None` when node is not installed.
 fn run_node(program: &str) -> Option<String> {
     let mut child = Command::new("node")
@@ -154,4 +176,29 @@ fn run_node(program: &str) -> Option<String> {
         String::from_utf8_lossy(&out.stderr)
     );
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A mute set in the tray while Settings is still loading the list: the load
+/// in flight may predate it, so one more load follows.
+#[test]
+fn a_mute_change_heard_mid_load_loads_again() {
+    let settings = repo_file("apps/desktop/qml/sections/settings/NotificationSettings.qml");
+    let load = settings
+        .split("function _loadBlockNoticeMutes()")
+        .nth(1)
+        .expect("the settings page loads the mute list");
+    let load = &load[..load.find("\n    function ").unwrap_or(load.len())];
+    assert!(
+        load.contains("_blockNoticeMutesReloadPending = true"),
+        "{load}"
+    );
+    let callback = load
+        .split("registerRpcCallback")
+        .nth(1)
+        .expect("the load answers in a callback");
+    assert!(
+        callback.contains("if (group._blockNoticeMutesReloadPending)")
+            && callback.contains("group._loadBlockNoticeMutes()"),
+        "{callback}"
+    );
 }

@@ -1,0 +1,15 @@
+{
+  "description": "rules.js routeBucket: the file a target rides in; pseudo-routes ride in the secondary one",
+  "cases": [
+    { "name": "primary", "input": { "route": "primary" }, "expected": "primary" },
+    { "name": "secondary", "input": { "route": "secondary" }, "expected": "secondary" },
+    { "name": "block", "input": { "route": "block" }, "expected": "secondary" },
+    { "name": "verify", "input": { "route": "verify" }, "expected": "secondary" },
+    { "name": "empty", "input": { "route": "" }, "expected": "" },
+    { "name": "null", "input": { "route": null }, "expected": "" },
+    { "name": "absent", "input": {}, "expected": "" },
+    { "name": "case-sensitive pseudo-route", "input": { "route": "Block" }, "expected": "Block" },
+    { "name": "unknown slug", "input": { "route": "tertiary" }, "expected": "tertiary" },
+    { "name": "case-sensitive route", "input": { "route": "PRIMARY" }, "expected": "PRIMARY" }
+  ]
+}

@@ -52,8 +52,26 @@ impl LinuxBrowserHistoryRead {
     }
 }
 
-const CHROMIUM_QUERY: &str = "SELECT url FROM urls";
-const FIREFOX_QUERY: &str = "SELECT url FROM moz_places WHERE url IS NOT NULL";
+/// What is read from one kind of History database. The file is the user's, so
+/// `table` must be a real table: a view of that name could run anything.
+#[derive(Clone, Copy, Debug)]
+struct HistoryQuery {
+    table: &'static str,
+    sql: &'static str,
+}
+
+const CHROMIUM_QUERY: HistoryQuery = HistoryQuery {
+    table: "urls",
+    sql: "SELECT url FROM urls",
+};
+const FIREFOX_QUERY: HistoryQuery = HistoryQuery {
+    table: "moz_places",
+    sql: "SELECT url FROM moz_places WHERE url IS NOT NULL",
+};
+
+/// Longest one database may keep the daemon's thread busy; past it the read
+/// stops with what it has.
+const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Chromium `User Data` homes, relative to the home directory; profiles are
 /// `Default` and `Profile N` inside.
@@ -213,6 +231,40 @@ impl BrowserHistoryReadPort for LinuxBrowserHistoryRead {
         hosts.dedup();
         Ok(hosts)
     }
+
+    fn discard_leftover_copies(&self) {
+        let removed = discard_copies_in(&self.copy_dir);
+        if removed > 0 {
+            tracing::info!(
+                target: "nrr::browser-history",
+                removed,
+                "left-over browser-history copies removed",
+            );
+        }
+    }
+}
+
+/// Removes every file in `dir` named the way [`TempCopy`] names a copy or its
+/// side files; returns how many went. The directory is the daemon's own.
+fn discard_copies_in(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let is_file = entry.file_type().is_ok_and(|t| !t.is_dir());
+        let is_copy = entry.file_name().to_str().is_some_and(|name| {
+            let rest = ALL_SIDE_FILES
+                .iter()
+                .find_map(|suffix| name.strip_suffix(suffix))
+                .unwrap_or(name);
+            rest.starts_with("nrr-bh-") && rest.ends_with(".sqlite")
+        });
+        if is_file && is_copy && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// The home directory the account database records for `uid`.
@@ -377,7 +429,7 @@ fn check_owner(owner: u32, uid: u32) -> Result<(), String> {
 struct HistorySource {
     dir: Dir,
     file: &'static str,
-    query: &'static str,
+    query: HistoryQuery,
     label: &'static str,
 }
 
@@ -608,7 +660,7 @@ impl Drop for TempCopy {
 }
 
 /// Open `db` read-only as it stands; only checkpointed history is seen.
-fn read_hostnames_from_db(db: &Path, query: &str) -> Result<Vec<String>, String> {
+fn read_hostnames_from_db(db: &Path, query: HistoryQuery) -> Result<Vec<String>, String> {
     use rusqlite::OpenFlags;
     let conn = rusqlite::Connection::open_with_flags(
         db_uri(db, "?mode=ro&immutable=1"),
@@ -620,7 +672,10 @@ fn read_hostnames_from_db(db: &Path, query: &str) -> Result<Vec<String>, String>
 
 /// SQLite replays the WAL and rolls back a hot journal first, which writes,
 /// so `copy` must be a private copy and never a browser's live file.
-fn read_hostnames_replaying_journals(copy: &Path, query: &str) -> Result<Vec<String>, String> {
+fn read_hostnames_replaying_journals(
+    copy: &Path,
+    query: HistoryQuery,
+) -> Result<Vec<String>, String> {
     use rusqlite::config::DbConfig;
     use rusqlite::OpenFlags;
     let conn = rusqlite::Connection::open_with_flags(
@@ -645,14 +700,30 @@ fn db_uri(db: &Path, params: &str) -> String {
     )
 }
 
-/// The file is user-supplied: defensive mode on, schema untrusted.
-fn hostnames_from(conn: &rusqlite::Connection, query: &str) -> Result<Vec<String>, String> {
+/// The file is user-supplied: defensive mode on, schema untrusted, the source
+/// a real table, and the whole read under [`READ_BUDGET`].
+fn hostnames_from(conn: &rusqlite::Connection, query: HistoryQuery) -> Result<Vec<String>, String> {
+    hostnames_within(conn, query, READ_BUDGET)
+}
+
+fn hostnames_within(
+    conn: &rusqlite::Connection,
+    query: HistoryQuery,
+    budget: std::time::Duration,
+) -> Result<Vec<String>, String> {
     use rusqlite::config::DbConfig;
+    use std::time::Instant;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
         .map_err(|e| format!("harden: {e}"))?;
     conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;")
         .map_err(|e| format!("harden: {e}"))?;
-    let mut stmt = conn.prepare(query).map_err(|e| format!("prepare: {e}"))?;
+    // Interrupts any statement past the deadline, the schema parse included.
+    let deadline = Instant::now() + budget;
+    conn.progress_handler(10_000, Some(move || Instant::now() >= deadline));
+    require_plain_table(conn, query.table)?;
+    let mut stmt = conn
+        .prepare(query.sql)
+        .map_err(|e| format!("prepare: {e}"))?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| format!("query: {e}"))?;
@@ -661,9 +732,43 @@ fn hostnames_from(conn: &rusqlite::Connection, query: &str) -> Result<Vec<String
         .flatten()
         .filter_map(|url| hostname_from_history_url(&url))
         .collect();
+    if Instant::now() >= deadline {
+        tracing::info!(
+            target: "nrr::browser-history",
+            hosts = hosts.len(),
+            "browser-history read stopped at its time budget; keeping what was read",
+        );
+    }
     hosts.sort_unstable();
     hosts.dedup();
     Ok(hosts)
+}
+
+/// `name` must be an ordinary table whose `url` is a stored column: a view,
+/// a virtual table or a generated column would run the file's own SQL.
+fn require_plain_table(conn: &rusqlite::Connection, name: &str) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT type, rootpage FROM main.sqlite_master WHERE name = ?1 COLLATE NOCASE")
+        .map_err(|e| format!("schema: {e}"))?;
+    let entries: Vec<(String, i64)> = stmt
+        .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| format!("schema: {e}"))?;
+    if !matches!(entries.as_slice(), [(kind, root)] if kind == "table" && *root > 0) {
+        return Err(format!("`{name}` is not a plain table"));
+    }
+    let stored: bool = conn
+        .query_row(
+            "SELECT count(*) = 1 FROM pragma_table_xinfo(?1) \
+             WHERE name = 'url' COLLATE NOCASE AND hidden = 0",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("schema: {e}"))?;
+    if !stored {
+        return Err(format!("`{name}.url` is not a stored column"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -673,6 +778,38 @@ mod tests {
     fn own_uid() -> u32 {
         // SAFETY: `getuid` has no preconditions and cannot fail.
         unsafe { libc::getuid() }
+    }
+
+    #[test]
+    fn only_history_copies_are_discarded_at_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kept = ["History", "nrr-bh-notes.txt", "places.sqlite"];
+        for name in kept {
+            std::fs::write(dir.path().join(name), b"x").expect("write");
+        }
+        std::fs::create_dir(dir.path().join("nrr-bh-dir.sqlite")).expect("dir");
+        // The names a real copy gets.
+        let copy = TempCopy::create_in(dir.path(), "chrome").expect("copy");
+        drop(copy.create("-wal").expect("wal"));
+        let names = [copy.path().to_path_buf(), copy.side("-wal")];
+
+        assert_eq!(discard_copies_in(dir.path()), 2);
+        assert!(names.iter().all(|p| !p.exists()));
+        drop(copy);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().into_string().expect("utf-8"))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "History",
+                "nrr-bh-dir.sqlite",
+                "nrr-bh-notes.txt",
+                "places.sqlite"
+            ]
+        );
     }
 
     fn make_db(path: &Path, schema: &str, insert: &str, urls: &[&str]) {
@@ -914,5 +1051,69 @@ mod tests {
     #[test]
     fn the_running_account_has_a_home() {
         assert!(home_dir_of(own_uid()).is_some_and(|home| home.is_absolute()));
+    }
+
+    /// A user-planted view named like the table would spin the daemon forever;
+    /// it is refused before it runs. Same for a generated `url`.
+    #[test]
+    fn a_view_or_generated_column_in_place_of_the_table_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let view = dir.path().join("view.sqlite");
+        make_db(
+            &view,
+            "CREATE VIEW URLS AS WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) \
+             SELECT 'http://a.example/' AS url FROM c WHERE x < 0;",
+            "",
+            &[],
+        );
+        let started = std::time::Instant::now();
+        assert!(read_hostnames_replaying_journals(&view, CHROMIUM_QUERY).is_err());
+        assert!(read_hostnames_from_db(&view, CHROMIUM_QUERY).is_err());
+        assert!(started.elapsed() < READ_BUDGET);
+
+        let generated = dir.path().join("generated.sqlite");
+        make_db(
+            &generated,
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, raw TEXT, \
+             url TEXT GENERATED ALWAYS AS ('http://' || raw || '/'))",
+            "INSERT INTO urls (raw) VALUES (?1)",
+            &["gen.example"],
+        );
+        assert!(read_hostnames_from_db(&generated, CHROMIUM_QUERY).is_err());
+
+        // Positive control: the plain table is read.
+        let plain = dir.path().join("plain.sqlite");
+        chromium_db(&plain, &["https://plain.example/"]);
+        assert_eq!(
+            read_hostnames_from_db(&plain, CHROMIUM_QUERY).expect("plain"),
+            ["plain.example"]
+        );
+    }
+
+    /// The read stops at its budget instead of running as long as the file
+    /// makes it.
+    #[test]
+    fn a_read_stops_at_its_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("big.sqlite");
+        let conn = rusqlite::Connection::open(&db).expect("create");
+        conn.execute_batch(
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT);
+             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 50000)
+             INSERT INTO urls (url) SELECT 'https://h' || x || '.example/' FROM c;",
+        )
+        .expect("fill");
+        drop(conn);
+        let open = || rusqlite::Connection::open(&db).expect("open");
+
+        let all = hostnames_within(&open(), CHROMIUM_QUERY, std::time::Duration::from_secs(60))
+            .expect("unbounded read");
+        assert_eq!(all.len(), 50_000, "positive control: the whole table");
+
+        let cut = hostnames_within(&open(), CHROMIUM_QUERY, std::time::Duration::ZERO);
+        assert!(
+            !matches!(&cut, Ok(hosts) if hosts.len() == 50_000),
+            "a spent budget did not stop the read"
+        );
     }
 }

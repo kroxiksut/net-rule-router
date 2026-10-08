@@ -509,7 +509,30 @@ impl NftCliEnforcement {
     /// rule the user expects to be enforced.
     #[cfg(target_os = "linux")]
     pub fn probe(&self) -> Result<(), NftApplyError> {
-        self.run(&["-j", "list", "tables"], None).map_err(classify)
+        self.run(&["-j", "list", "tables"], None)
+            .map(drop)
+            .map_err(classify)
+    }
+
+    /// How many rules `chain` of `table` holds in the kernel now; `None` when
+    /// the table or chain is gone (another program flushed the ruleset). Terse,
+    /// so named sets are not listed: this is the cheap check that lets an
+    /// unchanged ruleset skip a full apply.
+    #[cfg(target_os = "linux")]
+    pub fn installed_rule_count(
+        &self,
+        table: &str,
+        chain: &str,
+    ) -> Result<Option<usize>, NftApplyError> {
+        match self.run(&["-j", "-t", "list", "chain", "inet", table, chain], None) {
+            Ok(stdout) => count_listed_rules(&String::from_utf8_lossy(&stdout))
+                .map(Some)
+                .ok_or_else(|| NftApplyError::Rejected {
+                    detail: "nft listed the chain in a form that could not be read".to_owned(),
+                }),
+            Err(failure) if is_absent_table(&failure) => Ok(None),
+            Err(failure) => Err(classify(failure)),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -520,14 +543,14 @@ impl NftCliEnforcement {
         })?;
         let mut args = extra.to_vec();
         args.extend(["-j", "-f", "-"]);
-        self.run(&args, Some(&payload))
+        self.run(&args, Some(&payload)).map(drop)
     }
 
     /// One `nft` run under a deadline, in the C locale, with both pipes
     /// drained — so a wedged `nft` cannot stall the enforcement pass and its
-    /// words can be classified whatever the system language.
+    /// words can be classified whatever the system language. Returns stdout.
     #[cfg(target_os = "linux")]
-    fn run(&self, args: &[&str], input: Option<&str>) -> Result<(), NftRunFailure> {
+    fn run(&self, args: &[&str], input: Option<&str>) -> Result<Vec<u8>, NftRunFailure> {
         let program = self.program.unwrap_or("nft");
         let mut full: Vec<&str> = self.leading_args.to_vec();
         full.extend_from_slice(args);
@@ -542,7 +565,7 @@ impl NftCliEnforcement {
             Err(e) => Err(NftRunFailure::Spawn(format!(
                 "unable to execute {program}: {e}"
             ))),
-            Ok(out) if out.status.success() => Ok(()),
+            Ok(out) if out.status.success() => Ok(out.stdout),
             Ok(out) => Err(NftRunFailure::Exited {
                 code: out.status.code(),
                 stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -570,6 +593,15 @@ impl NftCliEnforcement {
 
     #[cfg(not(target_os = "linux"))]
     pub fn probe(&self) -> Result<(), NftApplyError> {
+        Err(Self::not_linux())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn installed_rule_count(
+        &self,
+        _table: &str,
+        _chain: &str,
+    ) -> Result<Option<usize>, NftApplyError> {
         Err(Self::not_linux())
     }
 
@@ -772,6 +804,14 @@ fn is_absent_object(detail: &str) -> bool {
     lower.contains("no such file or directory")
         || lower.contains("does not exist")
         || lower.contains("no such table")
+}
+
+/// The rules in an `nft -j list chain` answer; `None` when it is not one.
+#[cfg(any(target_os = "linux", test))]
+fn count_listed_rules(json: &str) -> Option<usize> {
+    let listing: serde_json::Value = serde_json::from_str(json).ok()?;
+    let objects = listing.get("nftables")?.as_array()?;
+    Some(objects.iter().filter(|o| o.get("rule").is_some()).count())
 }
 
 /// Does this `nft` failure describe the environment rather than our ruleset?
@@ -980,6 +1020,19 @@ mod tests {
                 "delete table nrr_probe",
             ]
         );
+    }
+
+    #[test]
+    fn a_chain_listing_counts_its_rules_only() {
+        let listing = r#"{"nftables":[{"metainfo":{"json_schema_version":1}},
+            {"chain":{"family":"inet","table":"nrr","name":"output"}},
+            {"rule":{"handle":4}},{"rule":{"handle":5}}]}"#;
+        assert_eq!(count_listed_rules(listing), Some(2));
+        assert_eq!(
+            count_listed_rules(r#"{"nftables":[{"chain":{}}]}"#),
+            Some(0)
+        );
+        assert_eq!(count_listed_rules("Error: something"), None);
     }
 
     /// Once the bare probe table was accepted, even an errno `classify` reads

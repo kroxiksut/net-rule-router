@@ -211,6 +211,7 @@ impl PerSidApplyOrchestrator {
             secondary_ip_denylist: &secondary_ip_denylist,
             zone_priority_over_ip: false,
             families: ipv6.families(),
+            packet_blocks: self.rules_provider.rules_are_baseline_for(sid),
         });
         // Shadow-compare the neutral pipeline against the live one, BEFORE the
         // fake-IP augmentation is folded in — not because the planner cannot
@@ -259,6 +260,7 @@ impl PerSidApplyOrchestrator {
         // reason.
         let mut claimed_by_main: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
         let mut unsupported_shapes: Vec<String> = Vec::new();
+        let mut networks_over_cap: Vec<crate::rule_conflicts::RuleConflict> = Vec::new();
         for diag in &codegen_out.diagnostics {
             match diag {
                 crate::wfp_codegen::CodegenDiagnostic::AppUnresolved { app, .. } => {
@@ -297,6 +299,9 @@ impl PerSidApplyOrchestrator {
                 }
                 crate::wfp_codegen::CodegenDiagnostic::UnsupportedRuleShape { rule_id, reason } => {
                     unsupported_shapes.push(format!("{rule_id} ({reason})"));
+                }
+                crate::wfp_codegen::CodegenDiagnostic::NetworkCarvingOverCap { .. } => {
+                    networks_over_cap.extend(diag.rule_conflict());
                 }
                 _ => {}
             }
@@ -378,6 +383,10 @@ impl PerSidApplyOrchestrator {
                     rules = %unsupported_shapes.join(", "),
                     "rules not enforced: they limit an address to one application, which enforcement cannot scope yet, so they were skipped rather than applied to every application",
                 );
+            }
+            {
+                let over_cap = crate::rule_conflicts::over_cap_networks(&networks_over_cap);
+                crate::production_principal_plan::log_networks_over_cap(sid, &over_cap);
             }
             for (rule_id, suffix, cap) in &truncated_suffixes {
                 tracing::warn!(

@@ -74,6 +74,7 @@ struct RecordingAuthor {
     calls: Mutex<Vec<(AutoRuleReason, Vec<AuthoredRule>)>>,
     fail_with: Mutex<Option<AuthorError>>,
     anchor_skipped: std::sync::atomic::AtomicBool,
+    rewrites: std::sync::atomic::AtomicUsize,
 }
 
 impl RecordingAuthor {
@@ -83,6 +84,7 @@ impl RecordingAuthor {
             calls: Mutex::new(Vec::new()),
             fail_with: Mutex::new(None),
             anchor_skipped: std::sync::atomic::AtomicBool::new(false),
+            rewrites: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -171,6 +173,32 @@ impl AutoRuleAuthor for RecordingAuthor {
                 .anchor_skipped
                 .load(std::sync::atomic::Ordering::SeqCst),
         })
+    }
+
+    fn rewrite(
+        &self,
+        _principal: &str,
+        edit: &dyn Fn(&CanonicalRuleBook) -> Option<CanonicalRuleBook>,
+        _correlation_id: &str,
+    ) -> Result<bool, AuthorError> {
+        self.rewrites
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(e) = self
+            .fail_with
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return Err(e);
+        }
+        let mut book = self.rules.book.lock().unwrap_or_else(|p| p.into_inner());
+        match edit(&book) {
+            Some(new) => {
+                *book = new;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }
 
@@ -397,3 +425,4 @@ mod durability;
 mod main_link_works;
 mod offer_signals;
 mod proposal;
+mod verify_primary;

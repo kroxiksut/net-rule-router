@@ -51,7 +51,7 @@ pub(super) fn exchange<S: Read + Write>(
             return Ok(parse_response(&frame, op));
         }
         // Mismatched request_id on a single-in-flight socket — log and skip.
-        eprintln!(
+        client_trace!(
             "nrr-ipc-client(unix): discarding frame with unexpected request_id={frame_request_id}"
         );
     }
@@ -123,7 +123,7 @@ pub(super) fn replay_subscription<S: Read + Write>(
     let remembered = match inner.last_subscribe.lock() {
         Ok(g) => g.clone(),
         Err(_) => {
-            eprintln!("nrr-ipc-client(unix): resubscribe skipped — subscription lock poisoned");
+            client_trace!("nrr-ipc-client(unix): resubscribe skipped — subscription lock poisoned");
             return true;
         }
     };
@@ -139,7 +139,7 @@ pub(super) fn replay_subscription<S: Read + Write>(
             obj.insert("request-id".into(), Value::String(request_id.clone()));
         }
         None => {
-            eprintln!(
+            client_trace!(
                 "nrr-ipc-client(unix): resubscribe skipped — remembered envelope not an object"
             );
             return true;
@@ -154,15 +154,17 @@ pub(super) fn replay_subscription<S: Read + Write>(
             // The service allocated a NEW subscription for this connection;
             // the id from the caller's original subscribe is dead.
             remember_subscription_id(inner, &serde_json::json!({ "payload": payload }));
-            eprintln!("nrr-ipc-client(unix): resubscribed after reconnect (id={request_id})");
+            client_trace!("nrr-ipc-client(unix): resubscribed after reconnect (id={request_id})");
             true
         }
         Ok(RequestResponse::ServerError { code, message, .. }) => {
-            eprintln!("nrr-ipc-client(unix): resubscribe rejected by server: {code:?} {message}");
+            client_trace!(
+                "nrr-ipc-client(unix): resubscribe rejected by server: {code:?} {message}"
+            );
             true
         }
         Ok(RequestResponse::BadResponse(reason)) => {
-            eprintln!("nrr-ipc-client(unix): resubscribe got a malformed reply: {reason}");
+            client_trace!("nrr-ipc-client(unix): resubscribe got a malformed reply: {reason}");
             true
         }
         Ok(RequestResponse::Disconnected) => false,
@@ -170,7 +172,7 @@ pub(super) fn replay_subscription<S: Read + Write>(
             inner.set_status(ConnectionStatus::Disconnected {
                 last_error: format!("resubscribe failed: {e}"),
             });
-            eprintln!("nrr-ipc-client(unix): resubscribe transport failure: {e}");
+            client_trace!("nrr-ipc-client(unix): resubscribe transport failure: {e}");
             false
         }
     }
@@ -181,7 +183,7 @@ pub(super) fn replay_subscription<S: Read + Write>(
 /// and that ambiguity costs whole test runs to diagnose.
 pub(super) fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: &str) {
     let Some(payload) = frame.get("payload").cloned() else {
-        eprintln!("nrr-ipc-client(unix): push frame without payload (source={source})");
+        client_trace!("nrr-ipc-client(unix): push frame without payload (source={source})");
         return;
     };
     let event_type = payload
@@ -191,11 +193,11 @@ pub(super) fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: 
         .unwrap_or("unknown")
         .to_string();
     let Ok(guard) = inner.push_tx.lock() else {
-        eprintln!("nrr-ipc-client(unix): push {event_type} lost — subscriber lock poisoned");
+        client_trace!("nrr-ipc-client(unix): push {event_type} lost — subscriber lock poisoned");
         return;
     };
     let Some(tx) = guard.as_ref() else {
-        eprintln!("nrr-ipc-client(unix): push {event_type} discarded — nobody subscribed");
+        client_trace!("nrr-ipc-client(unix): push {event_type} discarded — nobody subscribed");
         return;
     };
     // A dropped frame is a hole in the event stream, and the subscriber has no
@@ -209,9 +211,11 @@ pub(super) fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: 
         }
     }
     match tx.try_send(payload) {
-        Ok(()) => eprintln!("nrr-ipc-client(unix): push {event_type} delivered (source={source})"),
+        Ok(()) => {
+            client_trace!("nrr-ipc-client(unix): push {event_type} delivered (source={source})")
+        }
         Err(e) => {
-            eprintln!("nrr-ipc-client(unix): push {event_type} dropped — channel full ({e})");
+            client_trace!("nrr-ipc-client(unix): push {event_type} dropped — channel full ({e})");
             inner.push_gap.store(true, Ordering::SeqCst);
         }
     }

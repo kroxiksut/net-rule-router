@@ -1,0 +1,38 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Welcome to NetRuleRouter
+Service: OK
+Step 1 of 5: Language:
+  The language of this terminal session. To start in it every time, run the program with --lang.
+Your answer:
+  > 1. English (current)
+    2. Русский
+    3. Next
+    4. Close the setup
+Commands on this screen:
+  A number: take that answer. To leave the setup, take the answer that closes it.
+Type the number of your answer and press Enter.
+
+Screen: Welcome to NetRuleRouter
+Service: OK
+Step 2 of 5: Main connection:
+  The connection everything travels by default. Until you name it, your rules are not applied.
+Your answer:
+  > 1. Ethernet — Example Network Adapter · Wired (Ethernet) · Connected · looks like the main connection
+    2. Example Tunnel — Example Network Adapter · Wired (Ethernet) · Connected · looks like the main connection
+    3. Next
+    4. Back
+    5. Close the setup
+Commands on this screen:
+  A number: take that answer. To leave the setup, take the answer that closes it.
+Type the number of your answer and press Enter.

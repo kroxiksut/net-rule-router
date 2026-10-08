@@ -1,0 +1,14 @@
+{
+  "description": "pure.js operationOutcome: \"\" for completed, the code for failed, null while the record does not say",
+  "cases": [
+    { "name": "completed", "input": { "ok": true, "status": { "state": "completed" } }, "expected": "" },
+    { "name": "failed with a code", "input": { "ok": true, "status": { "state": "failed", "error": { "code": "rule-cap-exceeded", "message": "m" } } }, "expected": "rule-cap-exceeded" },
+    { "name": "failed with an empty code", "input": { "ok": true, "status": { "state": "failed", "error": { "code": "", "message": "m" } } }, "expected": "unknown" },
+    { "name": "failed without an error", "input": { "ok": true, "status": { "state": "failed" } }, "expected": "unknown" },
+    { "name": "running", "input": { "ok": true, "status": { "state": "running" } }, "expected": null },
+    { "name": "queued", "input": { "ok": true, "status": { "state": "queued" } }, "expected": null },
+    { "name": "call failed", "input": { "ok": false, "status": { "state": "completed" } }, "expected": null },
+    { "name": "no status", "input": { "ok": true, "status": null }, "expected": null },
+    { "name": "unknown state", "input": { "ok": true, "status": { "state": "later" } }, "expected": null }
+  ]
+}

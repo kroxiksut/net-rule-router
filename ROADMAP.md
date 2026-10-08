@@ -44,6 +44,13 @@ addresses that fail over the main connection. A program with no rule of its
 own will get the same offer: move it to the additional connection. It waits for
 usage data because a suggestion that fires too often is worse than none.
 
+**A connection check.** When a site or a remote desktop session works directly
+but stalls through a VPN, one button tells you whether the VPN connection
+itself drops large packets, and what to change in the VPN client's settings if
+it does. If it does not, you know the cause is elsewhere. It only reports:
+NetRuleRouter changes nothing in the VPN's settings. It comes as people ask
+for it.
+
 ## Later
 
 **macOS**, after Linux.

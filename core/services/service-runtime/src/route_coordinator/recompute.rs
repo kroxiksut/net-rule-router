@@ -82,8 +82,9 @@ impl SecondaryRouteCoordinator {
 
     /// the SID whose policy is actually enforced for
     /// `active_sids`: the first connected-tray SID (M-1), or — under
-    /// service-driven scope with no tray — the OS active console-session user
-    /// (so a managed policy enforces even with no app running, from boot).
+    /// service-driven scope with no tray — the signed-in user the OS reports
+    /// (console session, else the sole remote one), so rules hold with no app
+    /// running, from boot.
     /// `None` means "nothing to enforce" (app-driven with no tray, or no
     /// console session). SHARED by `recompute_active`, the FQDN seeder, the
     /// DNS-observation consumer, and the policy-change trigger so all four
@@ -95,7 +96,7 @@ impl SecondaryRouteCoordinator {
             return Some(s.clone());
         }
         if (self.rule_scope_service_driven)() {
-            return self.api.active_console_user_sid();
+            return self.api.interactive_user_sid();
         }
         None
     }

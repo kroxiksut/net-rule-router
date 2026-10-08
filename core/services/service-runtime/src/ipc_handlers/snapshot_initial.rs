@@ -51,6 +51,9 @@ pub struct SnapshotInitialHandler {
     /// the bundled health sub-payload stays byte-identical with what
     /// `service.health.get` returns. `None` omits the wire field.
     fake_ip_datapath: Option<FakeIpDatapathProbe>,
+    /// Standing per-role enforcement reports the route coordinator pushes on
+    /// change. Empty when no coordinator is wired.
+    route_enforcement: crate::app_enforcement_status::RouteEnforcementStatus,
 }
 
 impl SnapshotInitialHandler {
@@ -83,7 +86,18 @@ impl SnapshotInitialHandler {
             shared_ip_exemptions,
             block_all_posture,
             fake_ip_datapath: None,
+            route_enforcement: crate::app_enforcement_status::RouteEnforcementStatus::new(),
         }
+    }
+
+    /// Share the route coordinator's standing enforcement reports.
+    #[must_use]
+    pub fn with_route_enforcement_status(
+        mut self,
+        status: crate::app_enforcement_status::RouteEnforcementStatus,
+    ) -> Self {
+        self.route_enforcement = status;
+        self
     }
 
     /// Attach the live fake-IP datapath probe (same instance the
@@ -166,6 +180,12 @@ impl IpcHandler for SnapshotInitialHandler {
         let kill_switch_block_all_armed = self.block_all_posture.armed();
         // The caller's own conflicts only: they name its rules and addresses.
         let rule_conflicts = self.app_enforcement.rule_conflicts(ctx.caller_stored());
+        // The caller's own reports only: candidates name that user's adapters.
+        let enforcement_status = if ctx.caller_stored().is_empty() {
+            Vec::new()
+        } else {
+            self.route_enforcement.for_principal(ctx.caller_stored())
+        };
 
         let resp = SnapshotInitialResponse {
             health,
@@ -185,6 +205,7 @@ impl IpcHandler for SnapshotInitialHandler {
             kill_switch_shared_ip_exemption_addresses,
             kill_switch_block_all_armed,
             rule_conflicts,
+            enforcement_status,
         };
         serde_json::to_value(resp).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
@@ -409,5 +430,68 @@ mod tests {
         assert!(resp["rule-conflicts"][0].get("app").is_none());
         let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
         assert_eq!(parsed.rule_conflicts, vec![conflict, unsupported]);
+    }
+
+    /// A client that connects after the push reads the standing report here —
+    /// its own, never another user's, whose candidates name that user's adapters.
+    #[test]
+    fn surfaces_only_the_callers_standing_enforcement_status() {
+        use nrr_domain::user_principal::UserPrincipal;
+        use nrr_shared::ipc_payloads::EnforcementStatusDto;
+        let caller = UserPrincipal::from_linux_uid(1000);
+        let report = |status: &str, role: &str, candidates: &[&str]| EnforcementStatusDto {
+            status: status.into(),
+            role: role.into(),
+            candidates: candidates.iter().map(|c| (*c).to_string()).collect(),
+        };
+        let board = crate::app_enforcement_status::RouteEnforcementStatus::new();
+        board.record(
+            caller.as_stored(),
+            &report("secondary-down", "secondary", &[]),
+        );
+        board.record(caller.as_stored(), &report("ok", "primary", &[]));
+        board.record(
+            UserPrincipal::from_linux_uid(1001).as_stored(),
+            &report("adapter-gone", "secondary", &["Other Tunnel"]),
+        );
+        let h = SnapshotInitialHandler::new(
+            Arc::new(FakeHealth {
+                state: ServiceRuntimeState::Running,
+                severity: ServiceHealthSeverity::Ok,
+            }),
+            Arc::new(FakePolicy { revision: None }),
+            Arc::new(FakeAdapters::empty()),
+            Arc::new(FakeDiagnostics::healthy()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutePolicy::default()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeApplyFailurePolicy),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutingPause),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeAutostart),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRetention),
+            AppEnforcementStatus::new(),
+            crate::app_enforcement_status::SharedIpExemptionStatus::new(),
+            crate::app_enforcement_status::BlockAllPostureStatus::new(),
+        )
+        .with_route_enforcement_status(board);
+
+        let own = IpcRequestContext {
+            caller_principal: Some(caller),
+            ..ctx()
+        };
+        let resp = h.handle(&req(), &own).unwrap();
+        assert_eq!(resp["enforcement-status"][1]["status"], "secondary-down");
+        let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
+        assert_eq!(
+            parsed.enforcement_status,
+            vec![
+                report("ok", "primary", &[]),
+                report("secondary-down", "secondary", &[]),
+            ]
+        );
+
+        let anonymous = h.handle(&req(), &ctx()).unwrap();
+        assert!(
+            anonymous.get("enforcement-status").is_none(),
+            "a caller with no principal is shown nobody's"
+        );
     }
 }

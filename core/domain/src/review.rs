@@ -217,6 +217,9 @@ pub struct RuleSummaryEntry {
     /// it changes nothing about routing, so the review UI has to say so rather
     /// than list it next to rules that actually take effect.
     pub enabled: bool,
+    /// What the rule does: a block or a `?host` rule is labelled by that, not
+    /// by the set it is stored in.
+    pub action: crate::canonical::RuleAction,
 }
 
 impl RuleSummaryEntry {
@@ -226,6 +229,7 @@ impl RuleSummaryEntry {
             display: rule_display(rule),
             route,
             enabled: rule.enabled,
+            action: rule.action,
         }
     }
 
@@ -236,6 +240,7 @@ impl RuleSummaryEntry {
             display: format!("{base} ({} → {})", route_label(from), route_label(to)),
             route: to,
             enabled: rule.enabled,
+            action: rule.action,
         }
     }
 }

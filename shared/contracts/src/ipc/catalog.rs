@@ -27,16 +27,30 @@ pub struct IpcOperationSpec {
     pub requires_service_mutation_privilege: bool,
 }
 
-const CLIENTS_GUI_ONLY: [IpcClientProfile; 1] = [IpcClientProfile::GuiInteractive];
+/// The window and the terminal: the two surfaces that edit policy. The
+/// terminal is the window without the desktop shell, so it shares every
+/// window-only operation.
+const CLIENTS_GUI_AND_TUI: [IpcClientProfile; 2] =
+    [IpcClientProfile::GuiInteractive, IpcClientProfile::Tui];
 /// Operations every surface may invoke, the console included. Kept as
 /// `IpcClientProfile::ALL` rather than a hand-written list so a new profile is
 /// admitted to the handshake by construction — a client that cannot negotiate
 /// cannot do anything at all, and finding that out at runtime is the worst
 /// place to find it out.
 const CLIENTS_ALL: [IpcClientProfile; IpcClientProfile::ALL.len()] = IpcClientProfile::ALL;
+/// The desktop shell only. The terminal is left out of what exists for the
+/// desktop session itself: autostart of the tray at logon, and the migration
+/// of the window's own local preferences, which a terminal has none of and
+/// must never mark as done for it.
 const CLIENTS_GUI_AND_TRAY: [IpcClientProfile; 2] = [
     IpcClientProfile::GuiInteractive,
     IpcClientProfile::TrayLightweight,
+];
+/// Every surface but the console.
+const CLIENTS_POLICY_SURFACES: [IpcClientProfile; 3] = [
+    IpcClientProfile::GuiInteractive,
+    IpcClientProfile::TrayLightweight,
+    IpcClientProfile::Tui,
 ];
 
 const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
@@ -51,35 +65,35 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::ServiceHealthGet,
         class: IpcInteractionClass::HealthCheck,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::SnapshotInitialGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::SnapshotInterfacesGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::SnapshotDiagnosticsGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::StatusUpdatesPoll,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     // The tray lives on push events — it is how it shows service state
@@ -89,35 +103,35 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::StatusUpdatesSubscribe,
         class: IpcInteractionClass::EventUpdate,
         execution: IpcExecutionModel::AsyncAccepted,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::MutationSubmit,
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::AsyncWithOperationHandle,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
         name: IpcOperationName::OperationStatusGet,
         class: IpcInteractionClass::LongRunningOperation,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::InterfacesRefreshRequest,
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::AsyncWithOperationHandle,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::RollbackRequest,
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::AsyncWithOperationHandle,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         // By default the caller's own rules; the baseline form is class-gated.
         requires_service_mutation_privilege: false,
     },
@@ -125,7 +139,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::ProductImpactDisableTemporary,
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::AsyncWithOperationHandle,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
@@ -141,21 +155,21 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::AuditList,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::SecurityAlertsList,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::RulesList,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -165,7 +179,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // per-SID user configuration, not service-global policy.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -173,7 +187,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // User-scoped per-SID write — same pattern as RoutePolicyUpdate.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -181,7 +195,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // Read the shared resolver baseline — a plain query.
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -190,7 +204,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // per-SID route-policy writes.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
@@ -199,7 +213,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // history and resolves their rule hosts — no elevation, runs async.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -221,7 +235,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::RetentionSettingsGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -230,7 +244,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // identity check on the named-pipe transport.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: true,
     },
     // Operational-log + audit NDJSON retention config.
@@ -238,7 +252,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::LogRetentionConfigGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -248,35 +262,35 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // whether it may change this.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
         name: IpcOperationName::ApplyFailurePolicyGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::ApplyFailurePolicySet,
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
         name: IpcOperationName::StorageUsageGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::RoutingPauseGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -284,7 +298,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // User-scoped per-SID write — same pattern as RoutePolicyUpdate.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -306,7 +320,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::ExplainGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -324,7 +338,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::ServiceStabilityConfigGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -333,85 +347,85 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // pattern as `ApplyFailurePolicySet`.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
         name: IpcOperationName::LogsClear,
         // Maintenance command — deletes rotated operational log files.
-        // Audit trail is never affected. GUI-only by design (tray has
+        // Audit trail is never affected. Not the tray (tray has
         // no UX for it).
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::CacheClear,
         // Maintenance command — clears the FQDN/IP resolution cache
         // (rebuildable DB). Audit / service-state DBs are never affected.
-        // GUI-only by design.
+        // Not the tray.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::CacheEntriesList,
         // Read-only paginated view of the FQDN/IP cache. Pure query — no
-        // mutation queue, no elevation. GUI-only (tray has no UX for it).
+        // mutation queue, no elevation. Not the tray (tray has no UX for it).
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::PresetExportGet,
         // Read-only export of the active revision's rules for one route
-        // as canonical rules-file txt bytes (base64-wrapped). GUI-only:
+        // as canonical rules-file txt bytes (base64-wrapped). Not the tray:
         // tray has no file-picker UX. Pure read, no mutation queue.
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::SettingsExportFull,
         // Read-only export of adapter bindings + rules paths + behavior
-        // mode as YAML (docs/en/rules-file-format.md Settings Export Format). GUI-only, pure read.
+        // mode as YAML (docs/en/rules-file-format.md Settings Export Format). Not the tray, pure read.
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::RulesMergePreview,
         // Read-only two-way merge preview (file text vs the caller's active
-        // revision). Pure query — no mutation queue, no elevation. GUI-only
+        // revision). Pure query — no mutation queue, no elevation. Not the tray
         // (tray has no merge UX).
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::ConnTraceEntriesList,
         // Read-only paginated view of recently-observed outbound connections
         // (in-memory ring). Pure query — no mutation queue, no elevation.
-        // GUI-only (tray has no UX for it).
+        // Not the tray (tray has no UX for it).
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::ThirdPartyComponentsList,
         // Attribution + live integrity of the shipped third-party binaries.
         // Pure read — hashes a file and checks its signature, changes nothing.
-        // GUI-only (the tray has no About surface).
+        // Not the tray (the tray has no About surface).
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     // ── Traffic counter ────────────────────────────────────────
@@ -419,7 +433,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::TrafficStatsGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -429,7 +443,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // history is not a per-user preference.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
@@ -438,7 +452,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // the caller is elevated; saving the row back untouched always passes.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
@@ -447,16 +461,16 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // caller outright — there is no unchanged-save case for a wipe.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
         name: IpcOperationName::AutoRuleCandidatesProbe,
         // The caller's own suggestions, examined on their own machine — no
-        // elevation, GUI only (the tray offers no probing surface).
+        // elevation, not the tray (the tray offers no probing surface).
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -464,7 +478,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // The caller's own observation about their own site.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     // ── Local networks under the kill-switch ───────────────────
@@ -473,7 +487,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::LocalNetworksGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -482,7 +496,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // a non-elevated user may change for themselves.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     // ── Companion-domain suggestions ────────────────────────
@@ -492,7 +506,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // prompt surface, so tray access is what makes the feature exist.
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -502,7 +516,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // their own routing must never meet a UAC prompt.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -510,7 +524,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // Persists a per-SID refusal — same user-scoped, non-elevated shape.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -519,7 +533,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // reachability rationale as AutoRuleCandidatesList.
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -528,7 +542,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // stance as AutoRuleCandidatesDismiss.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -537,7 +551,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // outside their SID moves, so no elevation.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     // ── Block-notice mutes + notice-driven routing ──────────────────
@@ -547,7 +561,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // surface comes up first is the one that shows them.
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -556,7 +570,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // their surface, no elevation.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -565,7 +579,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // surface the notice (and its mute action) appear on.
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -574,7 +588,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // exactly like `autorules.candidates.accept`.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -583,7 +597,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // non-elevated shape.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -591,7 +605,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // Undoes every one of the caller's own mutes — same shape.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -601,23 +615,23 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // `autorules.candidates.accept`.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::PrincipalDataPurge,
-        // Caller's own state, no elevation. GUI-only: the tray never
+        // Caller's own state, no elevation. Not the tray: the tray never
         // triggers full reset.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
         name: IpcOperationName::PrincipalDataCount,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
 ];

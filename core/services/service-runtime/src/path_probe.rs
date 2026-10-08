@@ -49,6 +49,85 @@ pub trait PathProbe: Send + Sync {
         source: Option<Ipv4Addr>,
         timeout: Duration,
     ) -> PathVerdict;
+
+    /// A connection to `target:443`, then a ClientHello naming `server_name`.
+    /// `Answered` only when a TLS record comes back: a path that lets TCP
+    /// through and silences or resets the hello by name is `Silent` — exactly
+    /// what [`Self::probe`] reports as reachable. A mechanism without it cannot
+    /// tell.
+    fn probe_tls(
+        &self,
+        _target: Ipv4Addr,
+        _server_name: &str,
+        _source: Option<Ipv4Addr>,
+        _timeout: Duration,
+    ) -> PathVerdict {
+        PathVerdict::Indeterminate
+    }
+}
+
+/// The ClientHello exchange over an already connected `stream`, each read and
+/// write bounded by `timeout`.
+pub fn tls_exchange(
+    stream: &mut std::net::TcpStream,
+    server_name: &str,
+    timeout: Duration,
+) -> PathVerdict {
+    use std::io::{Read, Write};
+
+    let mut fresh = [[0u8; 32]; 3];
+    if fresh.iter_mut().any(|b| getrandom::fill(b).is_err()) {
+        return PathVerdict::Indeterminate;
+    }
+    let Some(hello) = crate::tls_hello::client_hello(server_name, &fresh[0], &fresh[1], &fresh[2])
+    else {
+        return PathVerdict::Indeterminate;
+    };
+    if timeout.is_zero()
+        || stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        return PathVerdict::Indeterminate;
+    }
+    if let Err(e) = stream.write_all(&hello) {
+        return verdict_of_io_error(e.kind());
+    }
+    let mut header = [0u8; 5];
+    let mut got = 0;
+    loop {
+        match stream.read(&mut header[got..]) {
+            // Closed after the hello: the reset-by-name case, seen as EOF.
+            Ok(0) => return PathVerdict::Silent,
+            Ok(n) => {
+                got += n;
+                if let Some(answer) = crate::tls_hello::classify_first_record(&header[..got]) {
+                    return match answer {
+                        crate::tls_hello::TlsAnswer::Handshake
+                        | crate::tls_hello::TlsAnswer::Alert => PathVerdict::Answered,
+                        // Something on the path answered in the server's place.
+                        crate::tls_hello::TlsAnswer::NotTls => PathVerdict::Silent,
+                    };
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return verdict_of_io_error(e.kind()),
+        }
+    }
+}
+
+/// Only a refusal, a reset or a timeout is evidence the host did not answer;
+/// anything else means nothing was measured.
+fn verdict_of_io_error(kind: std::io::ErrorKind) -> PathVerdict {
+    match kind {
+        std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::UnexpectedEof => PathVerdict::Silent,
+        _ => PathVerdict::Indeterminate,
+    }
 }
 
 /// Production probe. A refused connection counts as `Silent`: for this question
@@ -56,6 +135,43 @@ pub trait PathProbe: Send + Sync {
 /// same answer, and both mean the user's site will not load that way.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemPathProbe;
+
+impl SystemPathProbe {
+    /// A connected socket from `source` (when given), or the verdict that ends
+    /// the probe here.
+    fn connect(
+        target: Ipv4Addr,
+        port: u16,
+        source: Option<Ipv4Addr>,
+        timeout: Duration,
+    ) -> Result<socket2::Socket, PathVerdict> {
+        let address = std::net::SocketAddr::from((target, port));
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .map_err(|_| PathVerdict::Indeterminate)?;
+        if let Some(source) = source {
+            // Binding is what decides the link. Without it the OS would pick by
+            // route — and the pinned destination's route points at the tunnel,
+            // which is the opposite of the question being asked.
+            socket
+                .bind(&std::net::SocketAddr::from((source, 0)).into())
+                .map_err(|_| PathVerdict::Indeterminate)?;
+        }
+        // A zero budget cannot measure anything, and the platform reports the
+        // attempt as a timeout — indistinguishable from a host that stayed
+        // silent, which is evidence the block-detector acts on.
+        if timeout.is_zero() {
+            return Err(PathVerdict::Indeterminate);
+        }
+        socket
+            .connect_timeout(&address.into(), timeout)
+            .map_err(|e| verdict_of_io_error(e.kind()))?;
+        Ok(socket)
+    }
+}
 
 impl PathProbe for SystemPathProbe {
     fn probe(
@@ -65,46 +181,22 @@ impl PathProbe for SystemPathProbe {
         source: Option<Ipv4Addr>,
         timeout: Duration,
     ) -> PathVerdict {
-        let address = std::net::SocketAddr::from((target, port));
-        let Ok(socket) = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        ) else {
-            return PathVerdict::Indeterminate;
-        };
-        if let Some(source) = source {
-            // Binding is what decides the link. Without it the OS would pick by
-            // route — and the pinned destination's route points at the tunnel,
-            // which is the opposite of the question being asked.
-            if socket
-                .bind(&std::net::SocketAddr::from((source, 0)).into())
-                .is_err()
-            {
-                return PathVerdict::Indeterminate;
-            }
+        match Self::connect(target, port, source, timeout) {
+            Ok(_) => PathVerdict::Answered,
+            Err(verdict) => verdict,
         }
-        // A zero budget cannot measure anything, and the platform reports the
-        // attempt as a timeout — indistinguishable from a host that stayed
-        // silent, which is evidence the block-detector acts on.
-        if timeout.is_zero() {
-            return PathVerdict::Indeterminate;
-        }
-        match socket.connect_timeout(&address.into(), timeout) {
-            Ok(()) => PathVerdict::Answered,
-            // Only a refusal or a timeout is evidence that the host did not
-            // answer. Everything else — a zero timeout, an unreachable network,
-            // a socket the OS would not let us use — means the probe never ran,
-            // and calling that "silent" hands the block-detector evidence
-            // nothing measured.
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted => PathVerdict::Silent,
-                _ => PathVerdict::Indeterminate,
-            },
+    }
+
+    fn probe_tls(
+        &self,
+        target: Ipv4Addr,
+        server_name: &str,
+        source: Option<Ipv4Addr>,
+        timeout: Duration,
+    ) -> PathVerdict {
+        match Self::connect(target, 443, source, timeout) {
+            Ok(socket) => tls_exchange(&mut socket.into(), server_name, timeout),
+            Err(verdict) => verdict,
         }
     }
 }
@@ -145,6 +237,16 @@ impl PathProbe for MockPathProbe {
             .unwrap_or_else(|p| p.into_inner())
             .push((target, port, source));
         self.verdict
+    }
+
+    fn probe_tls(
+        &self,
+        target: Ipv4Addr,
+        _server_name: &str,
+        source: Option<Ipv4Addr>,
+        timeout: Duration,
+    ) -> PathVerdict {
+        self.probe(target, 443, source, timeout)
     }
 }
 
@@ -308,6 +410,88 @@ impl PathProber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local server that reads the hello and then does `respond`.
+    fn exchange_with(respond: fn(&mut std::net::TcpStream)) -> PathVerdict {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accept");
+            let mut header = [0u8; 5];
+            peer.read_exact(&mut header).expect("hello header");
+            assert_eq!(header[0], 0x16, "a TLS handshake record arrives");
+            // The whole hello, as a real server reads it: closing with unread
+            // bytes makes the OS reset the connection, which can overtake the
+            // answer and turn this test into a race.
+            let mut body = vec![0u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+            peer.read_exact(&mut body).expect("hello body");
+            respond(&mut peer);
+            // Hold the connection until the client has read and closed it.
+            let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = peer.read(&mut [0u8; 1]);
+        });
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let verdict = tls_exchange(&mut stream, "site.example", Duration::from_millis(400));
+        drop(stream);
+        server.join().expect("server");
+        verdict
+    }
+
+    /// Real servers take the hand-built hello. Needs the internet:
+    /// `cargo test -p nrr-service-runtime -- --ignored live_tls`.
+    #[test]
+    #[ignore = "needs the internet"]
+    fn live_tls_probe_gets_a_server_hello_from_real_fronts() {
+        use std::net::ToSocketAddrs;
+        for name in ["www.wikipedia.org", "www.cloudflare.com", "www.google.com"] {
+            let target = (name, 443)
+                .to_socket_addrs()
+                .expect("resolve")
+                .find_map(|a| match a {
+                    std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+                    std::net::SocketAddr::V6(_) => None,
+                })
+                .expect("an IPv4 address");
+            assert_eq!(
+                SystemPathProbe.probe_tls(target, name, None, Duration::from_secs(5)),
+                PathVerdict::Answered,
+                "{name}"
+            );
+        }
+    }
+
+    /// TCP gets through in every case below; only a TLS answer counts.
+    #[test]
+    fn only_a_tls_record_back_means_the_name_gets_through() {
+        use std::io::Write;
+        assert_eq!(
+            exchange_with(|p| p.write_all(&[0x16, 0x03, 0x03, 0x00, 0x5a]).expect("write")),
+            PathVerdict::Answered
+        );
+        assert_eq!(
+            exchange_with(|p| p.write_all(&[0x15, 0x03, 0x03, 0x00, 0x02]).expect("write")),
+            PathVerdict::Answered,
+            "an alert is still a TLS peer answering"
+        );
+        assert_eq!(
+            exchange_with(|p| {
+                let _ = p.shutdown(std::net::Shutdown::Both);
+            }),
+            PathVerdict::Silent,
+            "closed after the hello"
+        );
+        assert_eq!(
+            exchange_with(|p| p.write_all(b"HTTP/1.1 403 Forbidden\r\n").expect("write")),
+            PathVerdict::Silent,
+            "something else answered in the server's place"
+        );
+        assert_eq!(
+            exchange_with(|_| std::thread::sleep(Duration::from_millis(700))),
+            PathVerdict::Silent,
+            "the hello went unanswered"
+        );
+    }
 
     /// A probe that could not run is not a host that stayed silent: the
     /// block-detector treats silence as evidence, and a zero timeout measured

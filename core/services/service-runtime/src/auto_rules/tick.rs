@@ -28,6 +28,56 @@ impl AutoRulesEngine {
         }
     }
 
+    /// An earlier author saved the enforcement view, so the user's stored rules
+    /// may hold `<id>+sub` twins they never wrote. Removed once per principal
+    /// per run, whatever the mode; a refusal (rules lock, security alert) is
+    /// retried after [`REFUSED_REWRITE_RETRY`], not on every tick.
+    fn drop_stored_subdomain_twins(&self, sid: &str, now: SystemTime) {
+        let resting = match self
+            .twin_cleanup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+        {
+            Some(None) => true,
+            Some(Some(refused_at)) => still_waiting(*refused_at, REFUSED_REWRITE_RETRY, now),
+            None => false,
+        };
+        if resting {
+            return;
+        }
+        let Some(author) = self.author.get() else {
+            return;
+        };
+        let correlation = format!("auto-rules-cleanup-{}", unix_ms(now));
+        let outcome = author.rewrite(sid, &|book| book.without_subdomain_twins(), &correlation);
+        let refused_at = match outcome {
+            Ok(rewrote) => {
+                if rewrote {
+                    tracing::info!(
+                        target: "nrr::auto-rules",
+                        sid = %sid,
+                        "stored subdomain twins removed from the user's rules",
+                    );
+                }
+                None
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "nrr::auto-rules",
+                    sid = %sid,
+                    code = %e.code,
+                    "stored subdomain twins not removed yet",
+                );
+                Some(now)
+            }
+        };
+        self.twin_cleanup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(sid.to_owned(), refused_at);
+    }
+
     // ── Proposal tick ────────────────────────────────────────────────────────
 
     /// Recomputes `sid`'s suggestions and acts on them per the principal's mode.
@@ -36,6 +86,9 @@ impl AutoRulesEngine {
     /// answer is stable over a browsing session, so the extra work would produce
     /// the identical list.
     pub fn tick(&self, sid: &str, now: SystemTime) -> TickSummary {
+        self.drop_stored_subdomain_twins(sid, now);
+        // Whatever the suggestion mode: `?` rules are the user's own.
+        self.verify_primary_step(sid, now);
         let mut summary = TickSummary::default();
         let mode = self.mode(sid);
         if mode == AutoRulesMode::Off {

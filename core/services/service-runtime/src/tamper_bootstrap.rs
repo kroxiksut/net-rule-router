@@ -555,15 +555,12 @@ mod tests {
         vec![0x11u8; 32]
     }
 
-    fn open_state() -> Arc<Mutex<Connection>> {
+    fn open_state() -> (tempfile::TempDir, Arc<Mutex<Connection>>) {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Leak the dir so the file outlives the test body (we only need
-        // the connection; the temp file is cleaned by the OS later).
-        let path = dir.keep().join("state.db");
-        let conn = open_connection(&path).expect("open");
+        let conn = open_connection(&dir.path().join("state.db")).expect("open");
         let runner = SqliteMigrationRunner::for_state_db(conn);
         runner.run_pending_migrations().expect("migrate");
-        Arc::new(Mutex::new(runner.into_connection()))
+        (dir, Arc::new(Mutex::new(runner.into_connection())))
     }
 
     fn record(id: &str, hash: &str) -> RevisionRecord {
@@ -591,7 +588,7 @@ mod tests {
     // ── Scenario 3: fresh install (key absent, revisions empty) ───────────────
     #[test]
     fn fresh_install_generates_key_no_alert() {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         let ks = InMemKeyStore::new();
         let repo = alerts();
         let out = run_tamper_bootstrap(&conn, &ks, &repo, NOW).expect("bootstrap");
@@ -608,7 +605,7 @@ mod tests {
     // ── Scenario 2: key deleted + revisions non-empty ─────────────────────────
     #[test]
     fn key_reset_with_existing_data_blocks_mutations() {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         // Seed a signed row, then "delete" the key by using an empty store.
         {
             let guard = conn.lock().unwrap();
@@ -639,7 +636,7 @@ mod tests {
     /// must take the same route as a missing key, alert included.
     #[test]
     fn a_truncated_signing_key_is_treated_as_missing_not_used() {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         {
             let guard = conn.lock().unwrap();
             let signed = RevisionsRepository::with_signing_key(&guard, key());
@@ -669,7 +666,7 @@ mod tests {
     // ── Scenario 1: tampered row detected ─────────────────────────────────────
     #[test]
     fn external_tamper_raises_alert_but_keeps_key() {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         {
             let guard = conn.lock().unwrap();
             let signed = RevisionsRepository::with_signing_key(&guard, key());
@@ -710,7 +707,7 @@ mod tests {
 
     #[test]
     fn legacy_unsigned_rows_are_backfilled_silently() {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         {
             let guard = conn.lock().unwrap();
             // Insert WITHOUT a key → empty-blob (Unsigned) rows, exactly
@@ -740,7 +737,7 @@ mod tests {
 
     #[test]
     fn tamper_alert_is_deduped_across_restarts() {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         {
             let guard = conn.lock().unwrap();
             let signed = RevisionsRepository::with_signing_key(&guard, key());
@@ -773,7 +770,7 @@ mod tests {
     /// The alert names the row as it stands after the sweep, not as found.
     #[test]
     fn the_alert_follows_the_content_the_sweep_left() {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         {
             let guard = conn.lock().unwrap();
             RevisionsRepository::with_signing_key(&guard, key())
@@ -818,7 +815,7 @@ mod tests {
 
     #[test]
     fn a_marker_not_bound_to_the_current_key_holds_nothing() {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         let ks = InMemKeyStore::with_key(key());
         ks.save_resign_marker(&resign_marker_for(&[0x22u8; 32]))
             .expect("marker of an earlier key");
@@ -864,7 +861,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_marker_keeps_the_rules() {
-        let conn = open_state();
+        let (_dir, conn) = open_state();
         let ks = UnreadableMarker(InMemKeyStore::with_key(key()));
         let out = run_tamper_bootstrap(&conn, &ks, &alerts(), NOW).expect("bootstrap");
         assert!(out.key_reset_unacknowledged);

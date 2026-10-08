@@ -101,6 +101,11 @@ manage the firewall and routes there without a policy change. Only the staging
 copy and the registration step use `sudo` — the build stays unprivileged, so
 nothing in `target/` ends up owned by root.
 
+The same script installs the two terminal programs, the `nrr-cli` console and
+the [`nrr-tui` terminal interface](tui.md), and makes both available by name
+from any shell; `uninstall-service.sh` removes them again. A program of the
+same name that some other package already put there is left alone.
+
 Desktop integration (the application menu entry and the icon) is per-user
 session data and installs separately:
 

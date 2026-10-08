@@ -1,0 +1,25 @@
+{
+  "description": "pure.js isNonInternetAddress: loopback, link-local and private ranges of either family; an unreadable value is never classified",
+  "cases": [
+    { "name": "private 10 with port", "input": { "remote": "10.0.0.5:443" }, "expected": true },
+    { "name": "loopback", "input": { "remote": "127.0.0.1:8080" }, "expected": true },
+    { "name": "link-local v4", "input": { "remote": "169.254.10.1" }, "expected": true },
+    { "name": "172.16 low edge", "input": { "remote": "172.16.0.1:53" }, "expected": true },
+    { "name": "172.31 high edge", "input": { "remote": "172.31.255.255" }, "expected": true },
+    { "name": "172.32 outside", "input": { "remote": "172.32.0.1" }, "expected": false },
+    { "name": "192.168", "input": { "remote": "192.168.1.20:443" }, "expected": true },
+    { "name": "documentation v4", "input": { "remote": "203.0.113.9:443" }, "expected": false },
+    { "name": "v6 loopback bracketed", "input": { "remote": "[::1]:443" }, "expected": true },
+    { "name": "v6 link-local with zone", "input": { "remote": "[fe80::1%4]:53" }, "expected": true },
+    { "name": "v6 link-local upper case", "input": { "remote": "FEB0::2" }, "expected": true },
+    { "name": "v6 unique-local", "input": { "remote": "fd00::7" }, "expected": true },
+    { "name": "v6 documentation", "input": { "remote": "[2001:db8::1]:443" }, "expected": false },
+    { "name": "masked", "input": { "remote": "<private-ipv4>:443" }, "expected": false },
+    { "name": "octet too big", "input": { "remote": "10.0.0.256" }, "expected": false },
+    { "name": "four-digit octet", "input": { "remote": "10.0.0.0010" }, "expected": false },
+    { "name": "three parts", "input": { "remote": "10.0.1" }, "expected": false },
+    { "name": "empty", "input": { "remote": "" }, "expected": false },
+    { "name": "unclosed bracket", "input": { "remote": "[fd00::1" }, "expected": true },
+    { "name": "leading colon", "input": { "remote": ":443" }, "expected": false }
+  ]
+}

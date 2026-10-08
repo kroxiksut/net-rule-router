@@ -1,0 +1,17 @@
+{
+  "description": "rules.js fileRowFromServiceWire / driftRowFromServiceWire over one `rules.list` entry. The harness IDN decoder strips an `ace:` prefix.",
+  "cases": [
+    { "name": "plain domain", "input": { "entry": { "id": "R-0001", "rule-type": "domain", "match-value": "site.example", "target-route": "secondary", "enabled": true, "validation-status": "ok" } } },
+    { "name": "ACE host decoded", "input": { "entry": { "id": "R-0002", "rule-type": "domain", "match-value": "ace:пример.рф", "target-route": "primary", "enabled": true, "validation-status": "ok" } } },
+    { "name": "zone decoded", "input": { "entry": { "id": "R-0003", "rule-type": "zone", "match-value": "ace:рф", "target-route": "primary", "enabled": false, "validation-status": "ok" } } },
+    { "name": "non-host value not decoded", "input": { "entry": { "id": "R-0004", "rule-type": "application", "match-value": "ace:tool.exe", "target-route": "secondary", "enabled": true, "validation-status": "ok" } } },
+    { "name": "empty route reads as primary", "input": { "entry": { "id": "R-0005", "rule-type": "exact-ip", "match-value": "192.0.2.7", "target-route": "", "enabled": true, "validation-status": "ok" } } },
+    { "name": "comment carried", "input": { "entry": { "id": "R-0006", "rule-type": "subnet", "match-value": "198.51.100.0/24", "target-route": "secondary", "enabled": true, "validation-status": "warning", "comment": "office" } } },
+    { "name": "block row", "input": { "entry": { "id": "R-0007", "rule-type": "domain", "match-value": "*.ads.example", "target-route": "block", "enabled": true, "validation-status": "ok" } } },
+    { "name": "verify row", "input": { "entry": { "id": "R-0008", "rule-type": "domain", "match-value": "shop.example", "target-route": "verify", "enabled": true, "validation-status": "ok" } } },
+    { "name": "auto origin carried", "input": { "entry": { "id": "auto-1", "rule-type": "domain", "match-value": "img.site.example", "target-route": "secondary", "enabled": true, "validation-status": "ok", "comment": "free text", "origin": { "kind": "auto", "reason": "site-companion", "anchor": "site.example", "added": "2026-01-01" } } } },
+    { "name": "unknown reason carried verbatim", "input": { "entry": { "id": "auto-2", "rule-type": "domain", "match-value": "a.example", "target-route": "secondary", "enabled": true, "validation-status": "ok", "origin": { "kind": "auto", "reason": "future-reason", "anchor": "", "added": "" } } } },
+    { "name": "range", "input": { "entry": { "id": "R-0009", "rule-type": "ip-range", "match-value": "192.0.2.10-192.0.2.20", "target-route": "primary", "enabled": true, "validation-status": "ok" } } },
+    { "name": "unknown type and route kept", "input": { "entry": { "id": "R-0010", "rule-type": "linux-application", "match-value": "ace:tool", "target-route": "tertiary", "enabled": false, "validation-status": "error" } } }
+  ]
+}

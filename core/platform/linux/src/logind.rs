@@ -33,6 +33,8 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 /// A user with a live login, as logind sees them.
@@ -56,7 +58,7 @@ struct LoginctlUser {
     #[serde(default)]
     linger: bool,
     /// Absent before systemd 254: that `list-users` names a user without a
-    /// state, which [`user_state`] then asks for one by one.
+    /// state, which [`user_states`] then asks for in one call.
     #[serde(default)]
     state: Option<String>,
 }
@@ -109,23 +111,41 @@ fn live_users_via(args: &[&str]) -> Result<Vec<LiveUser>, LogindError> {
             stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         });
     }
-    parse_live_users(&String::from_utf8_lossy(&out.stdout), user_state)
+    parse_live_users(&String::from_utf8_lossy(&out.stdout), user_states)
 }
 
-/// One user's state, for a `list-users` that did not print it. `None` when the
-/// lookup fails: the list has just answered, so a failure here is a user who
-/// left between the two calls, not a logind that cannot be asked.
-fn user_state(uid: u32) -> Option<String> {
-    let uid = uid.to_string();
-    let out = crate::command::output_with_timeout(
-        "loginctl",
-        &["show-user", &uid, "--property=State", "--value"],
-        crate::command::DEFAULT_COMMAND_TIMEOUT,
-    )
-    .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+/// The states of users a `list-users` named without one, in one call: this runs
+/// every enforcement tick, and a process per user woke an idle machine N times.
+/// A user missing from the answer left between the two calls; `loginctl` then
+/// fails for them but still prints the others, so its status is not read.
+fn user_states(uids: &[u32]) -> HashMap<u32, String> {
+    let uids: Vec<String> = uids.iter().map(u32::to_string).collect();
+    let mut args = vec!["show-user"];
+    args.extend(uids.iter().map(String::as_str));
+    args.extend(["--property=UID", "--property=State"]);
+    crate::command::output_with_timeout("loginctl", &args, crate::command::DEFAULT_COMMAND_TIMEOUT)
+        .map(|out| parse_show_user_states(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_default()
+}
+
+/// `UID=…`/`State=…` blocks, one per user, as `show-user` prints them.
+fn parse_show_user_states(stdout: &str) -> HashMap<u32, String> {
+    let mut states = HashMap::new();
+    for block in stdout.split("\n\n") {
+        let mut uid = None;
+        let mut state = None;
+        for line in block.lines() {
+            match line.split_once('=') {
+                Some(("UID", value)) => uid = value.trim().parse::<u32>().ok(),
+                Some(("State", value)) => state = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+        if let (Some(uid), Some(state)) = (uid, state) {
+            states.insert(uid, state);
+        }
+    }
+    states
 }
 
 /// Everything that can go wrong asking the question.
@@ -168,7 +188,7 @@ impl std::error::Error for LogindError {}
 /// tested on every OS.
 fn parse_live_users(
     stdout: &str,
-    state_of: impl Fn(u32) -> Option<String>,
+    states_of: impl FnOnce(&[u32]) -> HashMap<u32, String>,
 ) -> Result<Vec<LiveUser>, LogindError> {
     let text = stdout.trim();
     if text.is_empty() {
@@ -176,12 +196,22 @@ fn parse_live_users(
     }
     let rows: Vec<LoginctlUser> =
         serde_json::from_str(text).map_err(|e| LogindError::Unreadable(e.to_string()))?;
+    let missing: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.state.is_none())
+        .map(|row| row.uid)
+        .collect();
+    let mut asked = if missing.is_empty() {
+        HashMap::new()
+    } else {
+        states_of(&missing)
+    };
     Ok(rows
         .into_iter()
         .filter_map(|mut row| {
             let state = match row.state.take() {
                 Some(state) => state,
-                None => state_of(row.uid)?,
+                None => asked.remove(&row.uid)?,
             };
             to_live_user(row, &state)
         })
@@ -238,7 +268,9 @@ mod tests {
 
     /// A current systemd: every row carries its state, nothing is looked up.
     fn listed(stdout: &str) -> Result<Vec<LiveUser>, LogindError> {
-        parse_live_users(stdout, |uid| unreachable!("uid {uid} came with its state"))
+        parse_live_users(stdout, |uids| {
+            unreachable!("{uids:?} came with their states")
+        })
     }
 
     #[test]
@@ -247,14 +279,27 @@ mod tests {
         let text = r#"[{"uid":1000,"user":"a","linger":false},
                        {"uid":1001,"user":"b","linger":false},
                        {"uid":1002,"user":"c","linger":false}]"#;
-        let users = parse_live_users(text, |uid| match uid {
-            1000 => Some("active".to_string()),
-            1001 => Some("closing".to_string()),
-            _ => None,
+        let users = parse_live_users(text, |uids| {
+            assert_eq!(uids, [1000, 1001, 1002], "one call for all of them");
+            HashMap::from([(1000, "active".to_string()), (1001, "closing".to_string())])
         })
         .expect("parses");
         assert_eq!(users.len(), 1, "closing and vanished users are not live");
         assert_eq!(users[0].uid, 1000);
+    }
+
+    #[test]
+    fn show_user_prints_a_block_per_user() {
+        let states =
+            parse_show_user_states("UID=1000\nState=active\n\nUID=1001\nState=lingering\n");
+        assert_eq!(
+            states,
+            HashMap::from([
+                (1000, "active".to_string()),
+                (1001, "lingering".to_string())
+            ])
+        );
+        assert!(parse_show_user_states("").is_empty());
     }
 
     #[test]

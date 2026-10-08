@@ -48,6 +48,7 @@
 //! - `value` — active rule
 //! - `value  # text` — active rule with inline comment (label in GUI)
 //! - `# value` — disabled rule (GUI toggle-off maps to commenting the line)
+//! - `?host` — in `--- Domains`: try the primary route first (secondary file)
 //! - lines with only `#` text and no rule token — free comments, ignored by parser
 //! - empty lines — ignored
 //!

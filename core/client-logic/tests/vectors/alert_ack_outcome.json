@@ -1,0 +1,42 @@
+{
+  "description": "pure.js alertAckOutcome: settled once the alert is no longer active; an unreadable answer proves nothing",
+  "cases": [
+    {
+      "name": "gone",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": true }, "active_alerts": [] }, "alertId": "alt-1", "code": "" },
+      "expected": ""
+    },
+    {
+      "name": "still active",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": true }, "active_alerts": [{ "alert_id": "alt-1", "state": "active" }] }, "alertId": "alt-1", "code": "" },
+      "expected": "unknown"
+    },
+    {
+      "name": "acknowledged now",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": true }, "active_alerts": [{ "alert_id": "alt-1", "state": "acknowledged" }] }, "alertId": "alt-1", "code": "" },
+      "expected": ""
+    },
+    {
+      "name": "another alert active",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": true }, "active_alerts": [{ "alert_id": "alt-2", "state": "active" }] }, "alertId": "alt-1", "code": "" },
+      "expected": ""
+    },
+    { "name": "no answer, no code", "input": { "alertId": "alt-1", "code": "" }, "expected": "unknown" },
+    { "name": "no answer, a code", "input": { "alertId": "alt-1", "code": "timeout" }, "expected": "timeout" },
+    {
+      "name": "unreadable with a code",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": false }, "active_alerts": [] }, "alertId": "alt-1", "code": "internal" },
+      "expected": "internal"
+    },
+    {
+      "name": "stale",
+      "input": { "status": { "stale": true, "security_status": { "alerts_readable": true }, "active_alerts": [] }, "alertId": "alt-1", "code": "" },
+      "expected": "unknown"
+    },
+    {
+      "name": "numeric id",
+      "input": { "status": { "stale": false, "security_status": { "alerts_readable": true }, "active_alerts": [{ "alert_id": 5, "state": "active" }] }, "alertId": "5", "code": "" },
+      "expected": "unknown"
+    }
+  ]
+}

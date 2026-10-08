@@ -1,0 +1,17 @@
+{
+  "description": "pure.js registrableDomain: the group key of the suggestions list.",
+  "cases": [
+    { "name": "subdomain of a plain name", "input": { "host": "www.example.com" }, "expected": "example.com" },
+    { "name": "case and one trailing dot", "input": { "host": "Static.Example.COM." }, "expected": "example.com" },
+    { "name": "only one trailing dot is dropped", "input": { "host": "example.com.." }, "expected": "com." },
+    { "name": "two-label public suffix", "input": { "host": "a.b.example.co.uk" }, "expected": "example.co.uk" },
+    { "name": "regional suffix of the shipped presets", "input": { "host": "cdn.shop.example.msk.ru" }, "expected": "example.msk.ru" },
+    { "name": "the suffix alone is its own group", "input": { "host": "co.uk" }, "expected": "co.uk" },
+    { "name": "one label under a suffix", "input": { "host": "x.co.uk" }, "expected": "x.co.uk" },
+    { "name": "unknown two-label ending stays naive", "input": { "host": "deep.sub.example.ru" }, "expected": "example.ru" },
+    { "name": "IPv4 address", "input": { "host": "192.0.2.10" }, "expected": "192.0.2.10" },
+    { "name": "address-like name with a fifth label", "input": { "host": "1.192.0.2.10" }, "expected": "2.10" },
+    { "name": "single label", "input": { "host": "localhost" }, "expected": "localhost" },
+    { "name": "empty", "input": { "host": "" }, "expected": "" }
+  ]
+}

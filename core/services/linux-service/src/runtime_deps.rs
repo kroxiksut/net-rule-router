@@ -216,6 +216,15 @@ pub(crate) fn build_runtime_deps(
         ),
         _ => None,
     };
+    // No logind session stream yet: the enforcement pass already asks logind
+    // who is present every few seconds, so a resolver waiting for a sign-in
+    // (and one whose serve thread died) is looked after from there.
+    if let (Some(cycle), Some(controller)) =
+        (enforcement.as_ref(), dns_resolver_controller.as_ref())
+    {
+        let controller = Arc::clone(controller);
+        cycle.set_presence_listener(Arc::new(move || controller.try_tick()));
+    }
     // What the operator saved through the settings page; the IPC surface
     // stores it, and without this read the daemon ran on the factory values.
     let boot = nrr_service_runtime::boot_settings::read_boot_settings(state_conn.as_ref());
@@ -1031,11 +1040,12 @@ pub(crate) fn build_policy_stack(
     let pass_inputs = {
         use nrr_platform_api::route_table::RouteTablePort;
         use nrr_service_runtime::pass_inputs::{
-            hashed, table_writes, PassInputs, PLAN_BLIND_STATE_TABLES,
+            applying_revision, hashed, table_writes, PassInputs, PLAN_BLIND_STATE_TABLES,
         };
         let cache = Arc::clone(&cache_store);
         let observations = Arc::clone(&app_observations);
         PassInputs::new()
+            .with_source("applying", applying_revision())
             .with_source(
                 "state",
                 table_writes(
@@ -1052,7 +1062,7 @@ pub(crate) fn build_policy_stack(
                 "adapters",
                 hashed(move || adapter_port_for_inputs.enumerate_all()),
             )
-            .with_source(
+            .with_own_writes_source(
                 "routes",
                 hashed(|| nrr_platform_linux::LinuxApi.get_ip_forward_table()),
             )

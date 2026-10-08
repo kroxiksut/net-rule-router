@@ -1,0 +1,13 @@
+{
+  "description": "pure.js noticeMuteRequest",
+  "cases": [
+    { "name": "a day", "input": { "kind": "secondary-down", "choice": "1d", "now": 1000 }, "expected": { "scope": { "kind": "notice", "notice": "secondary-down" }, "until-unix-ms": 86401000 } },
+    { "name": "forever", "input": { "kind": "secondary-down", "choice": "forever", "now": 1000 }, "expected": { "scope": { "kind": "notice", "notice": "secondary-down" } } },
+    { "name": "unknown kind", "input": { "kind": "made-up", "choice": "1d", "now": 1000 }, "expected": null },
+    { "name": "unknown choice", "input": { "kind": "rules-drift", "choice": "2d", "now": 1000 }, "expected": null },
+    { "name": "a week", "input": { "kind": "external-address", "choice": "7d", "now": 0 }, "expected": { "scope": { "kind": "notice", "notice": "external-address" }, "until-unix-ms": 604800000 } },
+    { "name": "a month", "input": { "kind": "local-networks", "choice": "30d", "now": 5 }, "expected": { "scope": { "kind": "notice", "notice": "local-networks" }, "until-unix-ms": 2592000005 } },
+    { "name": "rules drift forever", "input": { "kind": "rules-drift", "choice": "forever", "now": 9 }, "expected": { "scope": { "kind": "notice", "notice": "rules-drift" } } },
+    { "name": "show is not a mute", "input": { "kind": "rules-drift", "choice": "show", "now": 9 }, "expected": null }
+  ]
+}

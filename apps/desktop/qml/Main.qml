@@ -26,7 +26,7 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
     // Unknown feature or missing profile → true (show it), which is why the
@@ -86,6 +86,8 @@ ApplicationWindow {
     property int wizardStep: 0
     property int autoCloseMs: 0
     property int uiRevision: 0
+    // Bumped when the service says this user's notice mutes changed.
+    property int noticeMutesRevision: 0
     // Dedicated revision token for the theme tokens (`uiTheme`). Bumped ONLY
     // when a theme-affecting pref changes (themeMode / effectiveThemeMode /
     // high-contrast / font scale / system font) — kept separate from
@@ -102,6 +104,8 @@ ApplicationWindow {
     // QML value-equality means a same-language reassignment is a no-op.
     property string currentLanguage: ""
     property bool quittingToTray: false
+    // Set by File → Exit for the one close it starts.
+    property bool exitRequested: false
     property var localeCatalog: ({})
     // Per-file locale load report from the launcher: { acceptedWithWarnings,
     // rejected, reports: [{ id, fileName, source, status, warnings, errors }] }.
@@ -873,20 +877,22 @@ ApplicationWindow {
     function defaultRouteLabel(role) {
         if (role === "primary") return tr("label.primary", "Primary")
         if (role === "block") return tr("label.block", "Block")
+        if (role === "verify") return tr("label.verify-primary", "Primary first, additional if unreachable")
         return tr("label.secondary", "Additional")
     }
     function routeLabel(role) {
         if (role === "primary") return prefs.routePrimaryLabel || defaultRouteLabel("primary")
-        // "block" is a fixed semantic (drop), NOT a renamable adapter label —
-        // it must never fall through to prefs.routeSecondaryLabel.
-        if (role === "block") return tr("label.block", "Block")
+        // "block" and "verify" are fixed semantics, NOT renamable adapter
+        // labels — they must never fall through to prefs.routeSecondaryLabel.
+        if (role === "block" || role === "verify") return defaultRouteLabel(role)
         return prefs.routeSecondaryLabel || defaultRouteLabel("secondary")
     }
-    function routeRoleOptions(includeBlock) {
+    function routeRoleOptions(includeBlock, includeVerify) {
         var opts = [
             { id: "primary", label: routeLabel("primary") },
             { id: "secondary", label: routeLabel("secondary") }
         ]
+        if (includeVerify) opts.push({ id: "verify", label: routeLabel("verify") })
         if (includeBlock) opts.push({ id: "block", label: routeLabel("block") })
         return opts
     }
@@ -1349,6 +1355,17 @@ ApplicationWindow {
         // still self-describing (e.g. a brand-new server error code
         // we haven't added a key for yet).
         return slug
+    }
+
+    /// A failed service-control action: the refusal's own wording when its code
+    /// has one, else the launcher's detail, which names what went wrong.
+    function serviceOperationErrorText(code, message) {
+        var slug = String(code || "")
+        if (slug !== "") {
+            var localised = tr("errors." + slug, "")
+            if (localised && localised !== "errors." + slug) return localised
+        }
+        return String(message || "")
     }
 
     /// The words for a `Pure.previewRefusal`: the refused values when the
@@ -2366,6 +2383,11 @@ ApplicationWindow {
             }
             updateRoutingState(patch)
             _resyncLinkProvidersFromPrefs(p)
+            // The push fires on change only; a window that connected later
+            // learns the standing state here. Nothing may record these
+            // statuses before this call: it skips a report equal to the one
+            // already held, so a premature write hid the notice and the chip.
+            _applyStandingEnforcementStatus(p["enforcement-status"])
         })
     }
     // Heal the service-side link-provider SSOT after a
@@ -3400,7 +3422,7 @@ ApplicationWindow {
                 // prefix is stamped by the service's auto-rule authoring.
                 if (mpPhase === "completed"
                         && mpCorr.indexOf("auto-rules-") === 0) {
-                    boundFilesController.handleAutoRulesAuthored()
+                    boundFilesController.handleAutoRulesAuthored(mpCorr)
                 }
                 break
             case "auto-rule-candidates-changed":
@@ -3505,10 +3527,16 @@ ApplicationWindow {
                 })
                 break
             case "secondary-external-address-observed":
-                _onSecondaryExternalAddress(event, eventId)
+                _onSecondaryExternalAddress(event)
                 break
             case "block-notice-raised":
                 _onBlockNoticeRaised(event, eventId)
+                break
+            case "block-notice-mutes-changed":
+                notificationsController.onNoticeMutesChanged()
+                break
+            case "verify-primary-moved":
+                _onVerifyPrimaryMoved(event)
                 break
             case "enforcement-status-changed":
                 _onEnforcementStatusChanged(event)
@@ -3558,7 +3586,24 @@ ApplicationWindow {
     /// surfaces never double up on one event while every (re)connect still
     /// announces itself. Keying on the address alone silenced the notice
     /// forever after the first dismissal.
-    function _onSecondaryExternalAddress(event, eventId) {
+    /// A `?` rule moved to the additional route: the main link was shown not
+    /// to reach the site.
+    function _onVerifyPrimaryMoved(event) {
+        var host = String(event.host || "")
+        if (host === "") return
+        notificationsController._addPushNotice({
+            "id": "verify-moved:" + host,
+            "severity": "info",
+            "dismissible": true,
+            "title": tr("tray.verify-moved.title", "Site moved to the additional route"),
+            "body": Pure.fillPlaceholders(tr("tray.verify-moved.body",
+                    "{host} does not open over the primary route, so its rule now uses the additional route."),
+                { host: "<b>" + Pure.escapeMarkup(host) + "</b>" }),
+            "bodyRichText": true
+        })
+    }
+
+    function _onSecondaryExternalAddress(event) {
         var address = String(event["external-address"] || "")
         if (address === "") return
         var adapter = String(event["adapter-name"] || "")
@@ -3567,16 +3612,25 @@ ApplicationWindow {
         // plain prose. Same trick as the tray's own notice for this event.
         var body = tr("tray.external-address.body",
                 "External address of the additional route: {address}")
-            .replace("{address}", "<b>" + address + "</b>")
+            .replace("{address}", "<b>" + Pure.escapeMarkup(address) + "</b>")
         if (adapter !== "") {
-            body = body + " " + tr("tray.external-address.adapter", "Adapter: {name}")
-                .replace("{name}", adapter)
+            body = body + " " + Pure.fillPlaceholders(
+                tr("tray.external-address.adapter", "Adapter: {name}"),
+                { name: Pure.escapeMarkup(adapter) })
         }
+        // One card per address: a reconnect that lands on the same one is not
+        // news, and a card for an address the route no longer has is stale.
+        var prefix = "secondary-external-address:"
+        var id = prefix + adapter + ":" + address
+        var stale = notificationsController._pushNotices.filter(function(n) {
+            return String(n.id).indexOf(prefix) === 0 && n.id !== id
+        })
+        for (var i = 0; i < stale.length; i += 1) notificationsController._dropPushNotice(stale[i].id)
         notificationsController._addPushNoticeUnlessMuted("external-address", {
-            "id": "secondary-external-address:" + String(eventId || "") + ":" + address,
+            "id": id,
             "severity": "info",
             "dismissible": true,
-            // The id restarts with the service; only a recent answer suppresses.
+            // An answer silences this address for a while; a reconnect later is news.
             "refractoryMs": 600000,
             "noticeMuteKind": "external-address",
             "title": tr("tray.external-address.title", "Additional route connected"),
@@ -3589,6 +3643,32 @@ ApplicationWindow {
     /// notice itself: the user may have dismissed the warning, and coming back
     /// out of this set is still news worth telling them.
     property var _enforcementDownRoles: []
+
+    /// role -> the service's last enforcement status slug for it, so a screen
+    /// can tell a switched-off adapter (`secondary-down`) from a removed one.
+    property var enforcementStatusByRole: ({})
+    function _setEnforcementStatus(role, status) {
+        var next = Object.assign({}, enforcementStatusByRole)
+        if (status === "" || status === "ok") delete next[role]
+        else next[role] = status
+        enforcementStatusByRole = next
+    }
+
+    /// The snapshot's standing reports, handled as the pushes they stand for.
+    /// The push fires on change only, so a window opened (or reconnected)
+    /// after it would otherwise show the rules as applied. A report equal to
+    /// the last one heard is skipped: the snapshot is re-read on every rules
+    /// refresh, and repeating it would bring back a dismissed warning.
+    function _applyStandingEnforcementStatus(reports) {
+        if (!(reports instanceof Array)) return
+        for (var i = 0; i < reports.length; i += 1) {
+            var report = reports[i] || {}
+            var role = String(report.role || "")
+            var status = String(report.status || "") || "ok"
+            if ((enforcementStatusByRole[role] || "ok") === status) continue
+            _onEnforcementStatusChanged(report)
+        }
+    }
 
     /// The channel is carrying the rules again. Worth one self-retiring line,
     /// because the browser will not say so on its own: a page that was refused
@@ -3611,6 +3691,49 @@ ApplicationWindow {
         })
     }
 
+    /// The headline for a role the service reports as not enforced: the
+    /// title of its notice, and what the routing chip says "limited" means.
+    function enforcementStatusTitle(role, status) {
+        if (status === "adapter-choice-needed")
+            return tr("notifications.enforcement.adapter-choice.title",
+                "Choose which adapter to use")
+        if (status === "adapter-gone")
+            return tr("notifications.enforcement.adapter-gone.title",
+                "The saved connection is gone")
+        if (status === "adapter-failed")
+            return tr("notifications.enforcement.adapter-failed.title",
+                "The saved connection is broken")
+        if (status === "no-primary-route")
+            return tr("notifications.enforcement.no-primary.title",
+                "Main connection is not set")
+        if (status === "primary-no-way-out")
+            return tr("notifications.enforcement.primary-no-way-out.title",
+                "The main connection has no way to the internet")
+        if (status === "no-policy")
+            return tr("notifications.enforcement.no-policy.title",
+                "Connections are not chosen yet")
+        if (status === "secondary-down")
+            return role === "primary"
+                ? tr("notifications.enforcement.primary-down.title",
+                    "The main connection is not up")
+                : tr("notifications.enforcement.secondary-down.title",
+                    "The additional connection is not up")
+        if (status === "adapters-unreadable")
+            return tr("notifications.enforcement.adapters-unreadable.title",
+                "Cannot read the list of connections")
+        return tr("notifications.enforcement.unknown.title",
+            "Your rules are not being applied")
+    }
+
+    /// One line per role not enforced, for the routing chip. Read from the
+    /// statuses, not stored text, so a language switch rewords it.
+    function enforcementDownDetail() {
+        var lines = []
+        for (var role in enforcementStatusByRole)
+            lines.push(enforcementStatusTitle(role, enforcementStatusByRole[role]))
+        return lines.join("\n")
+    }
+
     /// The service reported whether this user's policy is actually in force.
     /// A standing notice, not a flash: "your rules are not applied" is a state
     /// the user has to end by acting, so it carries no auto-dismiss and its id
@@ -3620,12 +3743,16 @@ ApplicationWindow {
         var role = String(event.role || "")
         var status = String(event.status || "")
         var noticeId = "enforcement-status:" + role
+        _setEnforcementStatus(role, status)
         notificationsController._dropPushNotice(noticeId)
         var wasDown = _enforcementDownRoles.indexOf(role) >= 0
         if (status === "" || status === "ok") {
             // Coming back may mean the service re-matched a reinstalled adapter.
-            if (status === "ok" && bridgeAvailable)
+            if (status === "ok" && bridgeAvailable) {
                 Qt.callLater(routePolicyController.followServiceBindingHeal)
+                // Ends the leak-protection state the interfaces page reports.
+                Qt.callLater(interfacesRolesController.refreshInterfacesFromService)
+            }
             if (wasDown) {
                 _enforcementDownRoles = _enforcementDownRoles.filter(
                     function(r) { return r !== role })
@@ -3636,11 +3763,9 @@ ApplicationWindow {
         if (!wasDown) _enforcementDownRoles = _enforcementDownRoles.concat([role])
 
         var candidates = event.candidates || []
-        var title = ""
+        var title = enforcementStatusTitle(role, status)
         var body = ""
         if (status === "adapter-choice-needed") {
-            title = tr("notifications.enforcement.adapter-choice.title",
-                "Choose which adapter to use")
             body = tr("notifications.enforcement.adapter-choice.body",
                     "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}")
                 .replace("{list}", candidates.join(", "))
@@ -3649,8 +3774,6 @@ ApplicationWindow {
             // longer starts, a connection removed by hand. The cause differs,
             // the answer does not: nothing here answers to the saved name, so
             // the choice goes back to the user.
-            title = tr("notifications.enforcement.adapter-gone.title",
-                "The saved connection is gone")
             body = candidates.length > 0
                 ? tr("notifications.enforcement.adapter-gone.body",
                         "The connection your rules were set to use is no longer on this computer, so the rules are not being applied. Pick another one: {list}")
@@ -3662,8 +3785,6 @@ ApplicationWindow {
             // start — usually a second VPN client that installed an older copy
             // of the same driver. Picking another connection works around it;
             // repairing the driver fixes it, and only the user can decide.
-            title = tr("notifications.enforcement.adapter-failed.title",
-                "The saved connection is broken")
             body = candidates.length > 0
                 ? tr("notifications.enforcement.adapter-failed.body",
                         "The connection your rules use is still installed, but its driver will not start, so the rules are not being applied. Reinstall it, or pick another one: {list}")
@@ -3671,43 +3792,29 @@ ApplicationWindow {
                 : tr("notifications.enforcement.adapter-failed.body-empty",
                     "The connection your rules use is still installed, but its driver will not start, and there is nothing to replace it with right now. Reinstalling it usually helps.")
         } else if (status === "no-primary-route") {
-            title = tr("notifications.enforcement.no-primary.title",
-                "Main connection is not set")
             body = tr("notifications.enforcement.no-primary.body",
                 "Without a main connection there is nowhere to send traffic your rules do not route, so the rules are not being applied.")
         } else if (status === "primary-no-way-out") {
-            title = tr("notifications.enforcement.primary-no-way-out.title",
-                "The main connection has no way to the internet")
             body = tr("notifications.enforcement.primary-no-way-out.body",
                 "The connection chosen as main has no gateway, so traffic your rules do not route is going out the way the system sends it instead. Choose the connection that actually reaches the internet as main.")
         } else if (status === "no-policy") {
-            title = tr("notifications.enforcement.no-policy.title",
-                "Connections are not chosen yet")
             body = tr("notifications.enforcement.no-policy.body",
                 "The service has no routing settings for you yet, so nothing is being routed. Choose the main and additional connections.")
         } else if (status === "secondary-down") {
             // The service reports which role went down; before this the primary
             // going down was announced as "the additional connection is not up".
             if (role === "primary") {
-                title = tr("notifications.enforcement.primary-down.title",
-                    "The main connection is not up")
                 body = tr("notifications.enforcement.primary-down.body",
                     "Traffic that is not routed to the additional connection has nowhere to go until it comes back. Check the cable, the Wi-Fi, or pick another main connection.")
             } else {
-                title = tr("notifications.enforcement.secondary-down.title",
-                    "The additional connection is not up")
                 body = tr("notifications.enforcement.secondary-down.body",
                     "Everything your rules send there is being held until it comes back — that is the protection doing its job, not a fault. Start the connection, or move those rules to the main one.")
             }
         } else if (status === "adapters-unreadable") {
-            title = tr("notifications.enforcement.adapters-unreadable.title",
-                "Cannot read the list of connections")
             body = tr("notifications.enforcement.adapters-unreadable.body",
                 "The service cannot enumerate network adapters right now, so your rules are not being applied. This usually clears itself; if it does not, restart the service.")
         } else {
             // An unknown status still says the one thing that matters.
-            title = tr("notifications.enforcement.unknown.title",
-                "Your rules are not being applied")
             body = tr("notifications.enforcement.unknown.body",
                 "The service reported a state this version does not recognise. Open interfaces and routes to check the setup.")
         }
@@ -3828,6 +3935,7 @@ ApplicationWindow {
             "dismissible": true,
             "kind": "block-notice",
             "muteKind": "block-notice",
+            "noticeMuteKind": "block-notice-backlog",
             "title": tr("notifications.block-notice.backlog.title",
                 "Blocked while the app was closed"),
             "body": body
@@ -3984,6 +4092,9 @@ ApplicationWindow {
         var bk = (backendStatus || {}).kind || ""
         if (bk !== "connected") return "disconnected"
         if (!rulesModel || rulesModel.count === 0) return "no-rules"
+        // A role the service reports as not enforced: its rules are blocked,
+        // which "active" would contradict.
+        if (_enforcementDownRoles.length > 0) return "limited"
         return "active"
     }
 
@@ -4009,6 +4120,8 @@ ApplicationWindow {
         // "block" ships only as an SVG (a drop has no adapter PNG set); render
         // it as SVG in both normal and high-contrast modes.
         if (routeId === "block") return Qt.resolvedUrl("../../../assets/icons/status" + (highContrastIcons ? "-hc" : "") + "/route-block.svg")
+        // "verify" takes the primary icon: that is where its traffic goes until
+        // the service moves the rule.
         if (highContrastIcons) return Qt.resolvedUrl("../../../assets/icons/status-hc/" + (routeId === "secondary" ? "route-secondary" : "route-primary") + ".svg")
         return Qt.resolvedUrl("../../../assets/icons/status/" + (routeId === "secondary" ? "route-secondary-20.png" : "route-primary-20.png"))
     }
@@ -5250,7 +5363,7 @@ ApplicationWindow {
             ruleTypeTitle: ruleTypeLabel(ruleDialog.localRuleType),
             matchValue: ruleDialog.localValue,
             aceMatchValue: _aceLowerForSearch(ruleDialog.localValue),
-            targetRoute: ruleDialog.localRoute,
+            targetRoute: Rules.routeForRuleType(ruleDialog.localRoute, ruleDialog.localRuleType),
             comment: finalComment,
             // Editing an app-authored rule makes it the user's own: the badge
             // said "we added this for you", and once they have gone in and
@@ -5334,7 +5447,7 @@ ApplicationWindow {
                 ruleTypeTitle: ruleTypeLabel(ruleType),
                 matchValue: value,
                 aceMatchValue: _aceLowerForSearch(value),
-                targetRoute: ruleDialog.localRoute,
+                targetRoute: Rules.routeForRuleType(ruleDialog.localRoute, ruleType),
                 comment: ruleDialog.localComment,
                 originReason: "",
                 originAnchor: "",
@@ -5423,7 +5536,8 @@ ApplicationWindow {
     // NOT uninstall the service; that stays on the app uninstaller / the
     // "Service management" button). Steps: clear service operational logs
     // (audit trail untouched) + sidecar + GUI logs (local/fast), reset all
-    Action { id: exitAction; text: tr("action.exit-application", "Exit"); shortcut: StandardKey.Quit; icon.source: uiIconSource("exit"); onTriggered: window.close() }
+    // Exit closes the window for real; the close button is what goes to the tray.
+    Action { id: exitAction; text: tr("action.exit-application", "Exit"); shortcut: StandardKey.Quit; icon.source: uiIconSource("exit"); onTriggered: { window.exitRequested = true; window.close() } }
     Action { id: aboutAction; text: tr("action.open-about-window", "About"); shortcut: "F1"; icon.source: uiIconSource("about"); onTriggered: openChildWindow(aboutWindow) }
     Action { id: licenseAction; text: tr("action.open-license-window", "License"); shortcut: "Ctrl+Shift+L"; icon.source: uiIconSource("about"); onTriggered: openChildWindow(licenseWindow) }
     // Disabled when the service's log directory is not readable by this user:
@@ -6103,9 +6217,13 @@ ApplicationWindow {
     // "Open NetRuleRouter" click reaches the running primary via the
     // `gui-activation.json` handover (polled every 350 ms) and shows the
     // window in milliseconds — vs. ~3–5 s for a cold launcher+QML boot.
-    // Full exit only happens via tray "Exit" (shutdown flag) or autoclose.
+    // Full exit: tray "Exit" (shutdown flag), File → Exit, or autoclose.
     onClosing: function(close) {
         emitPrefs()
+        // Read once: a prompt the user cancels must leave the close button
+        // going to the tray as before.
+        var exiting = exitRequested
+        exitRequested = false
         // Only the close-paths that actually
         // destroy unsaved editor state need the prompt. The
         // close-to-tray path preserves all in-memory editor state,
@@ -6115,7 +6233,7 @@ ApplicationWindow {
         var isDestructive =
             !quittingToTray
             && autoCloseMs === 0
-            && !prefs.minimizeToTrayInsteadOfClose
+            && (exiting || !prefs.minimizeToTrayInsteadOfClose)
         if (isDestructive && hasAnyUnsavedChanges()) {
             close.accepted = false
             unsavedChangesGuard.requestAction(
@@ -6143,7 +6261,7 @@ ApplicationWindow {
             boundFilesController._showSaveBeforeCloseDialog()
             return
         }
-        if (quittingToTray || autoCloseMs > 0 || !prefs.minimizeToTrayInsteadOfClose) {
+        if (quittingToTray || exiting || autoCloseMs > 0 || !prefs.minimizeToTrayInsteadOfClose) {
             close.accepted = true
             // quitOnLastWindowClosed is off so close-to-tray can hide the
             // window; a real close must therefore end the process itself, or it
@@ -7413,9 +7531,9 @@ ApplicationWindow {
             var secondary = []
             for (var i = 0; i < rulesModel.count; i += 1) {
                 var entry = rulesModel.get(i)
-                // A "block" rule nominally lives in the secondary bucket; its
-                // `action:"block"` field (set by the serializer) overrides routing.
-                var bucket = (entry.targetRoute === "secondary" || entry.targetRoute === "block")
+                // Pseudo-routes live in the secondary bucket; their `action`
+                // field (set by the serializer) overrides routing.
+                var bucket = (Rules.routeBucket(entry.targetRoute) === "secondary")
                     ? secondary : primary
                 bucket.push(Rules.ruleRowToWireDto(entry, _aceEncodeHost))
             }
@@ -7571,22 +7689,23 @@ ApplicationWindow {
                     String(operation) + "…"),
                 "progress")
         }
-        function onOperationCompleted(operation, success, errorMessage) {
+        function onOperationCompleted(operation, success, errorMessage, errorCode) {
             if (success) {
                 window.logProgress(
                     window.tr("progress.service-" + String(operation) + "-ok",
                         String(operation)),
                     "success")
             } else {
+                var reason = window.serviceOperationErrorText(errorCode, errorMessage)
                 window.logProgress(
                     window.tr("progress.service-failed", "Service operation failed")
-                        + " (" + String(operation) + "): " + String(errorMessage || ""),
+                        + " (" + String(operation) + "): " + reason,
                     "error")
                 // The pill alone loses the failure: it sits in the footer, it is
                 // easy to miss, and it scrolls away. A refused stop pressed five
                 // times read as "nothing happens". The notice centre keeps it
                 // until the user answers it, and names the reason.
-                notificationsController._noteServiceOperationFailed(operation, errorMessage)
+                notificationsController._noteServiceOperationFailed(operation, reason)
             }
         }
         function onUacDeclined(operation) {

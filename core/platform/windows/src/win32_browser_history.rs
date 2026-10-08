@@ -73,11 +73,31 @@ struct HistorySource {
     db_path: PathBuf,
     /// Root the DB must stay under once every link is resolved.
     anchor: PathBuf,
-    /// `SELECT <url-col> FROM <table>` for this browser family.
-    query: &'static str,
+    query: HistoryQuery,
     /// Short label for the temp-copy filename + diagnostics.
     label: &'static str,
 }
+
+/// What is read from one browser family's database. The file is the user's,
+/// so `table` must be a real table: a view of that name could run anything.
+#[derive(Clone, Copy, Debug)]
+struct HistoryQuery {
+    table: &'static str,
+    sql: &'static str,
+}
+
+const CHROMIUM_QUERY: HistoryQuery = HistoryQuery {
+    table: "urls",
+    sql: "SELECT url FROM urls",
+};
+const FIREFOX_QUERY: HistoryQuery = HistoryQuery {
+    table: "moz_places",
+    sql: "SELECT url FROM moz_places WHERE url IS NOT NULL",
+};
+
+/// Longest one database may keep the service's thread busy; past it the read
+/// stops with what it has.
+const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl BrowserHistoryReadPort for WindowsBrowserHistoryRead {
     fn read_history_hostnames(&self, principal: &str) -> Result<Vec<String>, BrowserHistoryError> {
@@ -140,6 +160,55 @@ impl BrowserHistoryReadPort for WindowsBrowserHistoryRead {
         hosts.dedup();
         Ok(hosts)
     }
+
+    fn discard_leftover_copies(&self) {
+        let removed = discard_copies_in(&copy_dirs());
+        if removed > 0 {
+            tracing::info!(
+                target: "nrr::browser-history",
+                removed,
+                "left-over browser-history copies removed",
+            );
+        }
+    }
+}
+
+/// Removes every file in `dirs` named the way [`TempCopy`] names a copy or
+/// its side files; returns how many went.
+fn discard_copies_in(dirs: &[PathBuf]) -> usize {
+    let mut removed = 0;
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let is_file = entry.file_type().is_ok_and(|t| !t.is_dir());
+            if is_file
+                && entry.file_name().to_str().is_some_and(is_copy_name)
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// `nrr-bh-<label>-<32 hex>.sqlite`, optionally with a side-file suffix.
+fn is_copy_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("nrr-bh-") else {
+        return false;
+    };
+    let rest = SIDE_FILES
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))
+        .unwrap_or(rest);
+    let Some(stem) = rest.strip_suffix(".sqlite") else {
+        return false;
+    };
+    stem.rsplit_once('-').is_some_and(|(label, nonce)| {
+        !label.is_empty() && nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+    })
 }
 
 /// Account-server hostnames from every Thunderbird profile under the
@@ -228,9 +297,6 @@ fn profile_roots_for(principal: &str) -> AppDataRoots {
 /// `Profile 1`, …) under `<LocalAppData>\<Vendor>\<Product>\User Data`; Firefox
 /// keeps `places.sqlite` per profile under `<AppData>\Mozilla\Firefox\Profiles`.
 fn discover_history_sources(roots: &AppDataRoots) -> Vec<HistorySource> {
-    const CHROMIUM_QUERY: &str = "SELECT url FROM urls";
-    const FIREFOX_QUERY: &str = "SELECT url FROM moz_places WHERE url IS NOT NULL";
-
     let mut out = Vec::new();
     if let Some(local) = roots.local.as_ref() {
         for (vendor_product, label) in [
@@ -578,12 +644,23 @@ impl TempCopy {
 }
 
 impl Drop for TempCopy {
+    /// A file is a copy of the user's history, so a refused delete is retried:
+    /// an antivirus scan opens a file the moment its writer closes it. What
+    /// still stands goes at the next start.
     fn drop(&mut self) {
         self.close_all();
-        for (side, _) in &self.sides {
-            let _ = std::fs::remove_file(side);
+        let mut left: Vec<&Path> = self.sides.iter().map(|(side, _)| side.as_path()).collect();
+        left.push(&self.path);
+        for pause_ms in [0, 50, 100, 200, 400] {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+            left.retain(|path| match std::fs::remove_file(path) {
+                Ok(()) => false,
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            });
+            if left.is_empty() {
+                return;
+            }
         }
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -888,7 +965,7 @@ mod os {
 /// Open `db` READ-ONLY as it stands and project `query`'s single URL column
 /// into distinct hostnames. `immutable=1` ignores the side files, so only
 /// checkpointed history is seen.
-pub fn read_hostnames_from_db(db: &Path, query: &str) -> Result<Vec<String>, String> {
+fn read_hostnames_from_db(db: &Path, query: HistoryQuery) -> Result<Vec<String>, String> {
     use rusqlite::OpenFlags;
     let conn = rusqlite::Connection::open_with_flags(
         db_uri(db, "?mode=ro&immutable=1"),
@@ -901,7 +978,10 @@ pub fn read_hostnames_from_db(db: &Path, query: &str) -> Result<Vec<String>, Str
 /// As [`read_hostnames_from_db`], but SQLite first replays the WAL and rolls
 /// back a hot journal found beside `copy`. Both write, so the connection is
 /// read-write: `copy` must be a private copy, never a browser's live file.
-fn read_hostnames_replaying_journals(copy: &Path, query: &str) -> Result<Vec<String>, String> {
+fn read_hostnames_replaying_journals(
+    copy: &Path,
+    query: HistoryQuery,
+) -> Result<Vec<String>, String> {
     use rusqlite::config::DbConfig;
     use rusqlite::OpenFlags;
     let conn = rusqlite::Connection::open_with_flags(
@@ -921,15 +1001,30 @@ fn db_uri(db: &Path, params: &str) -> String {
     format!("file:{}{params}", db.to_string_lossy().replace('?', "%3f"))
 }
 
-/// The file is user-supplied, so SQLite's defensive mode is on and the
-/// schema untrusted.
-fn hostnames_from(conn: &rusqlite::Connection, query: &str) -> Result<Vec<String>, String> {
+/// The file is user-supplied: defensive mode on, schema untrusted, the source
+/// a real table, and the whole read under [`READ_BUDGET`].
+fn hostnames_from(conn: &rusqlite::Connection, query: HistoryQuery) -> Result<Vec<String>, String> {
+    hostnames_within(conn, query, READ_BUDGET)
+}
+
+fn hostnames_within(
+    conn: &rusqlite::Connection,
+    query: HistoryQuery,
+    budget: std::time::Duration,
+) -> Result<Vec<String>, String> {
     use rusqlite::config::DbConfig;
+    use std::time::Instant;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
         .map_err(|e| format!("harden: {e}"))?;
     conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;")
         .map_err(|e| format!("harden: {e}"))?;
-    let mut stmt = conn.prepare(query).map_err(|e| format!("prepare: {e}"))?;
+    // Interrupts any statement past the deadline, the schema parse included.
+    let deadline = Instant::now() + budget;
+    conn.progress_handler(10_000, Some(move || Instant::now() >= deadline));
+    require_plain_table(conn, query.table)?;
+    let mut stmt = conn
+        .prepare(query.sql)
+        .map_err(|e| format!("prepare: {e}"))?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| format!("query: {e}"))?;
@@ -939,9 +1034,43 @@ fn hostnames_from(conn: &rusqlite::Connection, query: &str) -> Result<Vec<String
             hosts.push(host);
         }
     }
+    if Instant::now() >= deadline {
+        tracing::info!(
+            target: "nrr::browser-history",
+            hosts = hosts.len(),
+            "browser-history read stopped at its time budget; keeping what was read",
+        );
+    }
     hosts.sort_unstable();
     hosts.dedup();
     Ok(hosts)
+}
+
+/// `name` must be an ordinary table whose `url` is a stored column: a view,
+/// a virtual table or a generated column would run the file's own SQL.
+fn require_plain_table(conn: &rusqlite::Connection, name: &str) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT type, rootpage FROM main.sqlite_master WHERE name = ?1 COLLATE NOCASE")
+        .map_err(|e| format!("schema: {e}"))?;
+    let entries: Vec<(String, i64)> = stmt
+        .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| format!("schema: {e}"))?;
+    if !matches!(entries.as_slice(), [(kind, root)] if kind == "table" && *root > 0) {
+        return Err(format!("`{name}` is not a plain table"));
+    }
+    let stored: bool = conn
+        .query_row(
+            "SELECT count(*) = 1 FROM pragma_table_xinfo(?1) \
+             WHERE name = 'url' COLLATE NOCASE AND hidden = 0",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("schema: {e}"))?;
+    if !stored {
+        return Err(format!("`{name}.url` is not a stored column"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1152,7 +1281,7 @@ user_pref("network.dns.disableIPv6", true);
         let src = HistorySource {
             db_path: db.clone(),
             anchor: profile.clone(),
-            query: "SELECT url FROM urls",
+            query: CHROMIUM_QUERY,
             label: "chrome",
         };
         let copy_dirs = [copies.clone()];
@@ -1172,7 +1301,7 @@ user_pref("network.dns.disableIPv6", true);
         HistorySource {
             db_path: db.to_path_buf(),
             anchor: profile.to_path_buf(),
-            query: "SELECT url FROM urls",
+            query: CHROMIUM_QUERY,
             label: "firefox",
         }
     }
@@ -1214,7 +1343,7 @@ user_pref("network.dns.disableIPv6", true);
         );
         // Positive control: the main file alone holds only the checkpointed row.
         assert_eq!(
-            read_hostnames_from_db(&db, "SELECT url FROM urls").unwrap(),
+            read_hostnames_from_db(&db, CHROMIUM_QUERY).unwrap(),
             ["checkpointed.example"]
         );
         assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
@@ -1254,7 +1383,7 @@ user_pref("network.dns.disableIPv6", true);
         // Positive control: the main file alone does not read as committed.
         let main_only = dir.path().join("main-only.sqlite");
         std::fs::copy(&db, &main_only).unwrap();
-        let main_only = read_hostnames_from_db(&main_only, "SELECT url FROM urls");
+        let main_only = read_hostnames_from_db(&main_only, CHROMIUM_QUERY);
         assert!(
             main_only
                 .as_ref()
@@ -1295,6 +1424,74 @@ user_pref("network.dns.disableIPv6", true);
         let hosts = read_source_hostnames(&src, &me, std::slice::from_ref(&copies)).unwrap();
         assert_eq!(hosts, ["checkpointed.example"]);
         assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_a_scanner_still_holds_is_removed_once_it_lets_go() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut copy = TempCopy::create_in(&[dir.path().to_path_buf()], "chrome").unwrap();
+        copy.close_all();
+        let path = copy.path().to_path_buf();
+        // Read sharing only, as a scanner opens a file.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&path)
+            .unwrap();
+        // Positive control: a single delete is refused while the file is held.
+        assert!(std::fs::remove_file(&path).is_err());
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(held);
+        });
+
+        drop(copy);
+        releaser.join().unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn only_history_copies_are_discarded_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let kept = [
+            "History".to_string(),
+            "nrr-bh-notes.txt".to_string(),
+            format!("nrr-bh-chrome-{nonce}.sqlite.bak"),
+            format!("nrr-bh--{nonce}.sqlite"),
+            "nrr-bh-chrome-0123.sqlite".to_string(),
+        ];
+        for name in &kept {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join(format!("nrr-bh-dir-{nonce}.sqlite"))).unwrap();
+        std::fs::write(
+            dir.path()
+                .join(format!("nrr-bh-opera-gx-{nonce}.sqlite-wal")),
+            b"x",
+        )
+        .unwrap();
+        // The names a real copy gets, side files included.
+        let mut copy = TempCopy::create_in(&dirs, "firefox").unwrap();
+        copy.close_all();
+
+        assert_eq!(discard_copies_in(&dirs), 2 + SIDE_FILES.len());
+        drop(copy);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected: Vec<String> = kept.to_vec();
+        expected.push(format!("nrr-bh-dir-{nonce}.sqlite"));
+        expected.sort();
+        assert_eq!(left, expected);
     }
 
     #[test]
@@ -1384,7 +1581,7 @@ user_pref("network.dns.disableIPv6", true);
                 "chrome://settings", // pseudo-scheme, dropped
             ],
         );
-        let hosts = read_hostnames_from_db(&db, "SELECT url FROM urls").unwrap();
+        let hosts = read_hostnames_from_db(&db, CHROMIUM_QUERY).unwrap();
         assert_eq!(
             hosts,
             vec!["feed.example".to_string(), "search.example".to_string()]
@@ -1395,7 +1592,75 @@ user_pref("network.dns.disableIPv6", true);
     fn missing_db_is_an_error_not_a_panic() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.sqlite");
-        assert!(read_hostnames_from_db(&missing, "SELECT url FROM urls").is_err());
+        assert!(read_hostnames_from_db(&missing, CHROMIUM_QUERY).is_err());
+    }
+
+    /// A user-planted view named like the table would spin the service
+    /// forever; it is refused before it runs. Same for a generated `url`.
+    #[test]
+    fn a_view_or_generated_column_in_place_of_the_table_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = dir.path().join("view.sqlite");
+        make_db(
+            &view,
+            "CREATE VIEW URLS AS WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) \
+             SELECT 'http://a.example/' AS url FROM c WHERE x < 0;",
+            &[],
+        );
+        let started = std::time::Instant::now();
+        assert!(read_hostnames_replaying_journals(&view, CHROMIUM_QUERY).is_err());
+        assert!(read_hostnames_from_db(&view, CHROMIUM_QUERY).is_err());
+        assert!(started.elapsed() < READ_BUDGET);
+
+        let generated = dir.path().join("generated.sqlite");
+        let conn = rusqlite::Connection::open(&generated).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, raw TEXT, \
+             url TEXT GENERATED ALWAYS AS ('http://' || raw || '/'));
+             INSERT INTO urls (raw) VALUES ('gen.example');",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(read_hostnames_from_db(&generated, CHROMIUM_QUERY).is_err());
+
+        // Positive control: the plain table is read.
+        let plain = dir.path().join("plain.sqlite");
+        make_db(
+            &plain,
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT)",
+            &["https://plain.example/"],
+        );
+        assert_eq!(
+            read_hostnames_from_db(&plain, CHROMIUM_QUERY).unwrap(),
+            ["plain.example"]
+        );
+    }
+
+    /// The read stops at its budget instead of running as long as the file
+    /// makes it.
+    #[test]
+    fn a_read_stops_at_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("big.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT);
+             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 50000)
+             INSERT INTO urls (url) SELECT 'https://h' || x || '.example/' FROM c;",
+        )
+        .unwrap();
+        drop(conn);
+        let open = || rusqlite::Connection::open(&db).unwrap();
+
+        let all =
+            hostnames_within(&open(), CHROMIUM_QUERY, std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(all.len(), 50_000, "positive control: the whole table");
+
+        let cut = hostnames_within(&open(), CHROMIUM_QUERY, std::time::Duration::ZERO);
+        assert!(
+            !matches!(&cut, Ok(hosts) if hosts.len() == 50_000),
+            "a spent budget did not stop the read"
+        );
     }
 
     fn touch(path: &Path) {

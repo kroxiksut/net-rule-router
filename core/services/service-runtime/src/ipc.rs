@@ -464,6 +464,19 @@ impl IpcRouter {
     /// different things done about it.
     fn authorize(&self, class: IpcOperationClass, ctx: &IpcRequestContext) -> AuthorizationOutcome {
         use nrr_platform_api::authorization::{AuthorizationDecision, AuthorizationSubject};
+        use nrr_shared::ipc_transport::TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG;
+        use nrr_shared::product_identity::BinaryRole;
+
+        // A terminal may be an SSH session with no agent to answer a prompt, so
+        // it is never asked: started elevated, or told how to be.
+        if ctx.client_profile == IpcClientProfile::Tui {
+            return AuthorizationOutcome::Refused(format!(
+                "{TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG}: {} needs an administrator; start {} \
+                 elevated (sudo, or an administrator terminal)",
+                class.slug(),
+                BinaryRole::Tui.unix_file_name(),
+            ));
+        }
 
         let Some(authority) = self.authority.as_ref() else {
             return AuthorizationOutcome::Refused("operation requires an elevated client".into());
@@ -489,7 +502,7 @@ impl IpcRouter {
         // An interactive client can be prompted; a background or console caller
         // cannot, and popping a password dialog at one would be a prompt nobody
         // is sitting in front of.
-        let interactive = matches!(ctx.client_profile, IpcClientProfile::GuiInteractive);
+        let interactive = ctx.client_profile.may_prompt_for_elevation();
         match authority.authorize(subject, action, interactive) {
             AuthorizationDecision::Allowed => AuthorizationOutcome::Granted,
             AuthorizationDecision::Denied => AuthorizationOutcome::Refused(format!(
@@ -1194,6 +1207,44 @@ mod tests {
                 error.message.contains("netrulerouter."),
                 "{denied:?}: the refusal must name the action: {}",
                 error.message,
+            );
+        }
+    }
+
+    /// The terminal is never put in front of the authority: unelevated, it is
+    /// refused with the slug that names the remedy, even where the authority
+    /// would have said yes; elevated (`sudo nrr-tui`), it passes.
+    #[test]
+    fn a_terminal_needs_to_be_started_elevated_and_is_never_prompted() {
+        use nrr_platform_api::authorization::{AuthorizationDecision, FixedAuthority};
+        use nrr_shared::ipc_transport::TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG;
+
+        let tui = |elevated: bool| {
+            let uid = if elevated { 0 } else { 1000 };
+            IpcRequestContext {
+                client_profile: IpcClientProfile::Tui,
+                caller_is_elevated: elevated,
+                caller_principal: Some(UserPrincipal::from_linux_uid(uid)),
+                caller_pid: Some(4321),
+            }
+        };
+        let allowing = Arc::new(FixedAuthority(AuthorizationDecision::Allowed));
+        for router in [make_router().with_authority(allowing), make_router()] {
+            let refused = router.dispatch(baseline_rollback_request(), tui(false));
+            let error = refused.error.expect("an unelevated terminal is refused");
+            assert_eq!(error.code, IpcErrorCode::Forbidden);
+            assert!(
+                error
+                    .message
+                    .starts_with(TERMINAL_NEEDS_ELEVATION_CLIENT_SLUG),
+                "{}",
+                error.message
+            );
+
+            let root = router.dispatch(baseline_rollback_request(), tui(true));
+            assert!(
+                root.error.is_none_or(|e| e.code != IpcErrorCode::Forbidden),
+                "an elevated terminal passes the elevation gate"
             );
         }
     }

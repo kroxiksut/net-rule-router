@@ -1,0 +1,183 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Status
+Service: OK
+Routing state:
+  Routing active
+  Rules apply on this user session.
+Connections:
+  Main connection: Ethernet — Example Network Adapter — Available — Rules applied
+  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+Notifications:
+  No notifications.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Overlaps
+Service: OK
+Overlaps:
+  When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
+  Show resolved: No
+  Reading your rules from the service...
+Rules that cover the same sites:
+Commands on this screen:
+  c and an item number, for example c 2: confirm that item is correct; c all: confirm every item
+  u and an item number: ask about that item again
+  o and an item number: send that item's sites over the other route instead
+  s: show or hide confirmed items
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Overlaps
+Service: OK
+Overlaps:
+  When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
+  4 overlap(s) not confirmed
+  Show resolved: No
+Rules that cover the same sites:
+  1. ads.example.net (Domain) names the same sites as ads.example.net (Domain) on Primary. They are blocked: on a tie a block wins over a route.
+     Why it wins: A block wins a tie
+     Decision: Not confirmed
+     The other rule names the same sites and never applies.
+     A block rule is part of this pair; change it in the rules list.
+  2. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+     Why it wins: Narrower rule
+     Decision: Not confirmed
+     A rule that tries the primary route first is part of this pair; change it in the rules list.
+  3. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
+     Why it wins: Same rule on both routes
+     Decision: Not confirmed
+  4. video.example.com (Domain) goes over Additional: it is narrower than *.example.com (Domain) on Primary.
+     Why it wins: Narrower rule
+     Decision: Not confirmed
+Commands on this screen:
+  c and an item number, for example c 2: confirm that item is correct; c all: confirm every item
+  u and an item number: ask about that item again
+  o and an item number: send that item's sites over the other route instead
+  s: show or hide confirmed items
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Overlaps
+Service: OK
+Overlaps:
+  When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
+  3 overlap(s) not confirmed
+  Show resolved: No
+Rules that cover the same sites:
+  1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+     Why it wins: Narrower rule
+     Decision: Not confirmed
+     A rule that tries the primary route first is part of this pair; change it in the rules list.
+  2. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
+     Why it wins: Same rule on both routes
+     Decision: Not confirmed
+  3. video.example.com (Domain) goes over Additional: it is narrower than *.example.com (Domain) on Primary.
+     Why it wins: Narrower rule
+     Decision: Not confirmed
+Commands on this screen:
+  c and an item number, for example c 2: confirm that item is correct; c all: confirm every item
+  u and an item number: ask about that item again
+  o and an item number: send that item's sites over the other route instead
+  s: show or hide confirmed items
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Overlaps
+Service: OK
+Overlaps:
+  When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
+  3 overlap(s) not confirmed
+  Show resolved: No
+  There is no item 9 in the list. Use the number shown before an item.
+Rules that cover the same sites:
+  1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+     Why it wins: Narrower rule
+     Decision: Not confirmed
+     A rule that tries the primary route first is part of this pair; change it in the rules list.
+  2. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
+     Why it wins: Same rule on both routes
+     Decision: Not confirmed
+  3. video.example.com (Domain) goes over Additional: it is narrower than *.example.com (Domain) on Primary.
+     Why it wins: Narrower rule
+     Decision: Not confirmed
+Commands on this screen:
+  c and an item number, for example c 2: confirm that item is correct; c all: confirm every item
+  u and an item number: ask about that item again
+  o and an item number: send that item's sites over the other route instead
+  s: show or hide confirmed items
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Overlaps
+Service: OK
+Overlaps:
+  When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
+  2 overlap(s) not confirmed
+  Show resolved: No
+  Rule changes take effect only after you review and apply them.
+  Review and apply the change on screen 4, Rules.
+Rules that cover the same sites:
+  1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+     Why it wins: Narrower rule
+     Decision: Not confirmed
+     A rule that tries the primary route first is part of this pair; change it in the rules list.
+  2. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
+     Why it wins: Same rule on both routes
+     Decision: Not confirmed
+Commands on this screen:
+  c and an item number, for example c 2: confirm that item is correct; c all: confirm every item
+  u and an item number: ask about that item again
+  o and an item number: send that item's sites over the other route instead
+  s: show or hide confirmed items
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Overlaps
+Service: OK
+Overlaps:
+  When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
+  0 overlap(s) not confirmed
+  Show resolved: No
+  Rule changes take effect only after you review and apply them.
+  Review and apply the change on screen 4, Rules.
+Rules that cover the same sites:
+  Every overlap is resolved.
+Commands on this screen:
+  c and an item number, for example c 2: confirm that item is correct; c all: confirm every item
+  u and an item number: ask about that item again
+  o and an item number: send that item's sites over the other route instead
+  s: show or hide confirmed items
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Overlaps
+Service: OK
+Overlaps:
+  When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.
+  0 overlap(s) not confirmed
+  Show resolved: Yes
+  Rule changes take effect only after you review and apply them.
+  Review and apply the change on screen 4, Rules.
+Rules that cover the same sites:
+  1. ads.example.net (Domain) names the same sites as ads.example.net (Domain) on Primary. They are blocked: on a tie a block wins over a route.
+     Why it wins: A block wins a tie
+     Decision: Confirmed
+     The other rule names the same sites and never applies.
+     A block rule is part of this pair; change it in the rules list.
+  2. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+     Why it wins: Narrower rule
+     Decision: Confirmed
+     A rule that tries the primary route first is part of this pair; change it in the rules list.
+  3. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
+     Why it wins: Same rule on both routes
+     Decision: Confirmed
+Commands on this screen:
+  c and an item number, for example c 2: confirm that item is correct; c all: confirm every item
+  u and an item number: ask about that item again
+  o and an item number: send that item's sites over the other route instead
+  s: show or hide confirmed items
+Type a screen number, h for help or q to quit, then press Enter.

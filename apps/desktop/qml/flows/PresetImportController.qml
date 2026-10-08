@@ -395,9 +395,9 @@ QtObject {
                 ruleType: ruleType,
                 ruleTypeTitle: root.ruleTypeLabel(ruleType),
                 matchValue: displayValue,
-                // A parsed `+block` rule shows as the "block" route regardless
-                // of which file (primary/secondary) the import targeted.
-                targetRoute: (r.blocked === true) ? "block" : String(targetRoute),
+                // A parsed `+block` rule shows as "block" whichever file it
+                // came from; a `?` rule shows as "verify" in the secondary one.
+                targetRoute: Rules.parsedRuleTargetRoute(r, targetRoute),
                 comment: String(r.comment || ""),
                 // Provenance the parser lifted out of the `--- Auto` section's
                 // inline comment. Kept as three scalar roles (matching the
@@ -683,8 +683,10 @@ QtObject {
         if (target === "both") {
             Pure.clearModel(root.rulesModel)
         } else {
+            // Block and verify rules came from the secondary file, so they
+            // go with it.
             for (var k = root.rulesModel.count - 1; k >= 0; k -= 1) {
-                if (String(root.rulesModel.get(k).targetRoute || "") === target) {
+                if (Rules.routeBucket(root.rulesModel.get(k).targetRoute) === target) {
                     root.rulesModel.remove(k)
                 }
             }
@@ -1081,13 +1083,13 @@ QtObject {
             }
             if (!ok) {
                 console.log("preset-import: activate failed:", code, msg)
-                _announcePresetImportFailed(code)
+                _announcePresetImportFailed(code, null)
                 return
             }
             // The confirm only accepts the import; its verdict is on the
             // operation record.
             root.rpc.readMutationOutcome(p, root.rpc.settleByPreview("preset-import", payload),
-                function(failure) {
+                function(failure, failureArgs) {
                     if (failure === "") {
                         _completePresetImportActivation(st)
                         return
@@ -1095,7 +1097,7 @@ QtObject {
                     console.log("preset-import: import refused:", failure)
                     // Nothing was imported: the edits flag and the file
                     // bindings keep describing what is in force.
-                    _announcePresetImportFailed(failure)
+                    _announcePresetImportFailed(failure, failureArgs)
                 })
         })
     }
@@ -1103,11 +1105,11 @@ QtObject {
     // Preset import is per-principal (user-scoped, non-elevated), so a
     // `forbidden` is the mutation gate (e.g. an unacknowledged security
     // alert), not missing rights.
-    function _announcePresetImportFailed(code) {
+    function _announcePresetImportFailed(code, args) {
         root.statusLine = root.tr("status.preset-import-failed",
             "Failed to import preset: ") +
             ((typeof root.ipcErrorLabel === "function")
-                ? root.ipcErrorLabel(String(code || "unknown"), root.rpc.lastFailureArgs)
+                ? root.ipcErrorLabel(String(code || "unknown"), args || null)
                 : String(code || "unknown"))
     }
 

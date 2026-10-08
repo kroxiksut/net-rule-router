@@ -168,6 +168,27 @@ QtObject {
         if (kept.length !== _pushNotices.length) _pushNotices = kept
     }
 
+    /// The service says the user's mutes changed, possibly from the tray: cards
+    /// of a kind now muted go, and Settings re-reads its list.
+    function onNoticeMutesChanged() {
+        root.noticeMutesRevision += 1
+        if (!root.bridgeAvailable || !root.rpc
+                || typeof root.rpc.rpcBlockNoticeMutesList !== "function") return
+        var corr = root.rpc.rpcBlockNoticeMutesList()
+        if (!corr) return
+        root.rpc.registerRpcCallback(corr, function(ok, p) {
+            if (!ok || !p) return
+            var mutes = p.mutes || []
+            var now = Date.now()
+            var muted = []
+            for (var i = 0; i < _pushNotices.length; i += 1) {
+                var kind = String(_pushNotices[i].noticeMuteKind || "")
+                if (kind !== "" && Pure.noticeKindMuted(mutes, kind, now)) muted.push(_pushNotices[i].id)
+            }
+            for (var j = 0; j < muted.length; j += 1) _dropPushNotice(muted[j])
+        })
+    }
+
     /// Take a notice down without recording an answer — used when the OTHER
     /// surface already recorded one.
     function _dropPushNotice(noticeId) {

@@ -761,97 +761,103 @@ ScrollView {
                     font.bold: true
                 }
                 // RightToLeft: buttons are declared in reverse reading order.
-                Flow {
+                Item {
                     Layout.fillWidth: true
-                    spacing: root.uiTheme.spacingSm
-                    layoutDirection: Qt.RightToLeft
-                    // Seed the FQDN/IP cache from the local browser history.
-                    // Runs on demand by explicit user consent — the service
-                    // resolves ONLY hosts that match the user's rules (privacy
-                    // boundary), filling the gap for sites visited before the
-                    // service ran.
-                    ThemedButton {
-                        theme: root.uiTheme
-                        text: root.tr("diag.cache.seed-browser-history.button",
-                            "Seed cache from browser history")
-                        onClicked: {
-                            if (!root.bridgeReadyOrWarn())
-                                return
-                            var corr = nrrNativeBridge.rpcSeedFromBrowserHistory()
-                            root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-                                if (!ok) {
-                                    root.statusLine = root.tr("diag.cache.seed-browser-history.unavailable",
-                                        "This feature is unavailable.") + " "
-                                        + ((typeof root.ipcErrorLabel === "function")
-                                            ? root.ipcErrorLabel(String(errorCode || "unknown"))
-                                            : String(errorCode || "unknown"))
+                    Layout.preferredHeight: cacheActionsFlow.height
+                    Flow {
+                        id: cacheActionsFlow
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        spacing: root.uiTheme.spacingSm
+                        layoutDirection: Qt.RightToLeft
+                        // Seed the FQDN/IP cache from the local browser history.
+                        // Runs on demand by explicit user consent — the service
+                        // resolves ONLY hosts that match the user's rules (privacy
+                        // boundary), filling the gap for sites visited before the
+                        // service ran.
+                        ThemedButton {
+                            theme: root.uiTheme
+                            text: root.tr("diag.cache.seed-browser-history.button",
+                                "Seed cache from browser history")
+                            onClicked: {
+                                if (!root.bridgeReadyOrWarn())
                                     return
-                                }
-                                root.statusLine = (payload && payload["started"] === true)
-                                    ? root.tr("diag.cache.seed-browser-history.started",
-                                        "Import started — hosts matching your rules will appear in the cache.")
-                                    : (payload && payload["already-running"] === true)
-                                        ? root.tr("diag.cache.seed-browser-history.already-running",
-                                            "Your previous import is still running — hosts matching your rules will appear in the cache when it finishes.")
-                                        : root.tr("diag.cache.seed-browser-history.unavailable",
-                                            "This feature is unavailable.")
-                                // Newly-seeded entries show up as "Browser history".
-                                section._loadCacheEntries(true)
-                            })
+                                var corr = nrrNativeBridge.rpcSeedFromBrowserHistory()
+                                root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+                                    if (!ok) {
+                                        root.statusLine = root.tr("diag.cache.seed-browser-history.unavailable",
+                                            "This feature is unavailable.") + " "
+                                            + ((typeof root.ipcErrorLabel === "function")
+                                                ? root.ipcErrorLabel(String(errorCode || "unknown"))
+                                                : String(errorCode || "unknown"))
+                                        return
+                                    }
+                                    root.statusLine = (payload && payload["started"] === true)
+                                        ? root.tr("diag.cache.seed-browser-history.started",
+                                            "Import started — hosts matching your rules will appear in the cache.")
+                                        : (payload && payload["already-running"] === true)
+                                            ? root.tr("diag.cache.seed-browser-history.already-running",
+                                                "Your previous import is still running — hosts matching your rules will appear in the cache when it finishes.")
+                                            : root.tr("diag.cache.seed-browser-history.unavailable",
+                                                "This feature is unavailable.")
+                                    // Newly-seeded entries show up as "Browser history".
+                                    section._loadCacheEntries(true)
+                                })
+                            }
                         }
-                    }
-                    ThemedButton {
-                        theme: root.uiTheme
-                        text: root.tr("diag.cache.clear-os-dns-button", "Clear OS DNS cache")
-                        onClicked: {
-                            // Flushes the OS DNS resolver cache only; the app's
-                            // FQDN/IP cache is left untouched.
-                            if (!root.bridgeReadyOrWarn())
-                                return
-                            var corr = nrrNativeBridge.rpcCacheClear({ "clear-app-cache": false, "flush-os-cache": true })
-                            root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-                                if (!ok) {
-                                    root.statusLine = root.tr("status.cache-cleared-failed",
-                                        "Failed to clear cache: ") + ((typeof root.ipcErrorLabel === "function")
-                                            ? root.ipcErrorLabel(String(errorCode || "unknown"))
-                                            : String(errorCode || "unknown"))
+                        ThemedButton {
+                            theme: root.uiTheme
+                            text: root.tr("diag.cache.clear-os-dns-button", "Clear OS DNS cache")
+                            onClicked: {
+                                // Flushes the OS DNS resolver cache only; the app's
+                                // FQDN/IP cache is left untouched.
+                                if (!root.bridgeReadyOrWarn())
                                     return
-                                }
-                                // `os-cache-flushed` is true/false/null — true only
-                                // when the OS flush actually ran and succeeded.
-                                root.statusLine = (payload && payload["os-cache-flushed"] === true)
-                                    ? root.tr("diag.cache.os-flush-ok", "OS DNS cache flushed.")
-                                    : root.tr("diag.cache.os-flush-failed", "Could not flush the OS DNS cache.")
-                            })
+                                var corr = nrrNativeBridge.rpcCacheClear({ "clear-app-cache": false, "flush-os-cache": true })
+                                root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+                                    if (!ok) {
+                                        root.statusLine = root.tr("status.cache-cleared-failed",
+                                            "Failed to clear cache: ") + ((typeof root.ipcErrorLabel === "function")
+                                                ? root.ipcErrorLabel(String(errorCode || "unknown"))
+                                                : String(errorCode || "unknown"))
+                                        return
+                                    }
+                                    // `os-cache-flushed` is true/false/null — true only
+                                    // when the OS flush actually ran and succeeded.
+                                    root.statusLine = (payload && payload["os-cache-flushed"] === true)
+                                        ? root.tr("diag.cache.os-flush-ok", "OS DNS cache flushed.")
+                                        : root.tr("diag.cache.os-flush-failed", "Could not flush the OS DNS cache.")
+                                })
+                            }
                         }
-                    }
-                    // Cache clearing split into two independent
-                    // actions: the app's rebuildable FQDN/IP cache, and the OS
-                    // DNS resolver cache. Each drives the same cache.clear RPC
-                    // with a different flag set.
-                    ThemedButton {
-                        theme: root.uiTheme
-                        text: root.tr("diag.cache.clear-app-button", "Clear app cache")
-                        onClicked: {
-                            // Clears the rebuildable FQDN/IP cache; audit/state
-                            // DBs untouched. OS DNS cache left alone.
-                            if (!root.bridgeReadyOrWarn())
-                                return
-                            var corr = nrrNativeBridge.rpcCacheClear({ "clear-app-cache": true, "flush-os-cache": false })
-                            root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-                                if (!ok) {
-                                    root.statusLine = root.tr("status.cache-cleared-failed",
-                                        "Failed to clear cache: ") + ((typeof root.ipcErrorLabel === "function")
-                                            ? root.ipcErrorLabel(String(errorCode || "unknown"))
-                                            : String(errorCode || "unknown"))
+                        // Cache clearing split into two independent
+                        // actions: the app's rebuildable FQDN/IP cache, and the OS
+                        // DNS resolver cache. Each drives the same cache.clear RPC
+                        // with a different flag set.
+                        ThemedButton {
+                            theme: root.uiTheme
+                            text: root.tr("diag.cache.clear-app-button", "Clear app cache")
+                            onClicked: {
+                                // Clears the rebuildable FQDN/IP cache; audit/state
+                                // DBs untouched. OS DNS cache left alone.
+                                if (!root.bridgeReadyOrWarn())
                                     return
-                                }
-                                var removed = Number((payload && payload["resolutions-removed"]) || 0)
-                                root.statusLine = root.tr("status.cache-cleared",
-                                    "Cache cleared: {count} resolution(s) removed.")
-                                    .replace("{count}", String(removed))
-                                section._loadCacheEntries(true)
-                            })
+                                var corr = nrrNativeBridge.rpcCacheClear({ "clear-app-cache": true, "flush-os-cache": false })
+                                root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+                                    if (!ok) {
+                                        root.statusLine = root.tr("status.cache-cleared-failed",
+                                            "Failed to clear cache: ") + ((typeof root.ipcErrorLabel === "function")
+                                                ? root.ipcErrorLabel(String(errorCode || "unknown"))
+                                                : String(errorCode || "unknown"))
+                                        return
+                                    }
+                                    var removed = Number((payload && payload["resolutions-removed"]) || 0)
+                                    root.statusLine = root.tr("status.cache-cleared",
+                                        "Cache cleared: {count} resolution(s) removed.")
+                                        .replace("{count}", String(removed))
+                                    section._loadCacheEntries(true)
+                                })
+                            }
                         }
                     }
                 }

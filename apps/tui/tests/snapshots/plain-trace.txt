@@ -1,0 +1,226 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Status
+Service: OK
+Routing state:
+  Routing active
+  Rules apply on this user session.
+Connections:
+  Main connection: Ethernet — Example Network Adapter — Available — Rules applied
+  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+Notifications:
+  No notifications.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Connection trace
+Service: OK
+Connection trace:
+  Loading connections...
+  Show blocked: No · Show local connections: No · IPv6 only: No
+Connections:
+Selected connection:
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that connection, for example d 3
+  e and a row number: why that connection took its route, for example e 3
+  / and text: search all fields, for example /example; / on its own clears the search
+  b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Connection trace: Shown: 12 of 14.
+Connections: > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
+Connections: 2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) · Allowed
+Connections: 3. browser.exe → 203.0.113.3:443 · site.example — Primary · Allowed
+Connections: 4. browser.exe → 203.0.113.4:443 · site.example — Additional (VPN) · Allowed
+Connections: 5. browser.exe → 203.0.113.5:443 · site.example — Primary · Allowed
+Connections: 6. browser.exe → 203.0.113.6:443 · site.example — Additional (VPN) · Allowed
+Connections: 7. browser.exe → 203.0.113.7:443 · site.example — Primary · Allowed
+Connections: 8. browser.exe → 203.0.113.8:443 · site.example — Additional (VPN) · Allowed
+Connections: 9. browser.exe → 203.0.113.9:443 · site.example — Primary · Allowed
+Connections: 10. browser.exe → 203.0.113.10:443 · site.example — Additional (VPN) · Allowed
+Connections: Rows 1–10 of 12.
+Selected connection: Process: browser.exe
+Selected connection: Remote: 203.0.113.1:443 · site.example
+Selected connection: Names this address was answered for (1): site.example
+Selected connection: Egress: Primary
+Selected connection: Verdict: Allowed
+Selected connection: TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
+Selected connection: Enter / e: Why this route?
+
+Screen: Connection trace
+Service: OK
+Connection trace:
+  Shown: 12 of 14.
+  Show blocked: No · Show local connections: No · IPv6 only: No
+Connections:
+  > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
+    2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) · Allowed
+    3. browser.exe → 203.0.113.3:443 · site.example — Primary · Allowed
+    4. browser.exe → 203.0.113.4:443 · site.example — Additional (VPN) · Allowed
+    5. browser.exe → 203.0.113.5:443 · site.example — Primary · Allowed
+    6. browser.exe → 203.0.113.6:443 · site.example — Additional (VPN) · Allowed
+    7. browser.exe → 203.0.113.7:443 · site.example — Primary · Allowed
+    8. browser.exe → 203.0.113.8:443 · site.example — Additional (VPN) · Allowed
+    9. browser.exe → 203.0.113.9:443 · site.example — Primary · Allowed
+    10. browser.exe → 203.0.113.10:443 · site.example — Additional (VPN) · Allowed
+  Rows 1–10 of 12.
+Selected connection:
+  Process: browser.exe
+  Remote: 203.0.113.1:443 · site.example
+  Names this address was answered for (1): site.example
+  Egress: Primary
+  Verdict: Allowed
+  TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
+  Enter / e: Why this route?
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that connection, for example d 3
+  e and a row number: why that connection took its route, for example e 3
+  / and text: search all fields, for example /example; / on its own clears the search
+  b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Connection trace
+Service: OK
+Connection trace:
+  Shown: 12 of 14.
+  Show blocked: No · Show local connections: No · IPv6 only: No
+Connections:
+  > 11. browser.exe → 203.0.113.11:443 · site.example — Primary · Allowed
+    12. browser.exe → 203.0.113.12:443 · site.example — Additional (VPN) · Allowed
+  Rows 11–12 of 12.
+Selected connection:
+  Process: browser.exe
+  Remote: 203.0.113.11:443 · site.example
+  Names this address was answered for (1): site.example
+  Egress: Primary
+  Verdict: Allowed
+  TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
+  Enter / e: Why this route?
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that connection, for example d 3
+  e and a row number: why that connection took its route, for example e 3
+  / and text: search all fields, for example /example; / on its own clears the search
+  b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Connection trace
+Service: OK
+Connection trace:
+  Shown: 12 of 14.
+  Show blocked: No · Show local connections: No · IPv6 only: No
+Connections:
+  > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
+    2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) · Allowed
+    3. browser.exe → 203.0.113.3:443 · site.example — Primary · Allowed
+    4. browser.exe → 203.0.113.4:443 · site.example — Additional (VPN) · Allowed
+    5. browser.exe → 203.0.113.5:443 · site.example — Primary · Allowed
+    6. browser.exe → 203.0.113.6:443 · site.example — Additional (VPN) · Allowed
+    7. browser.exe → 203.0.113.7:443 · site.example — Primary · Allowed
+    8. browser.exe → 203.0.113.8:443 · site.example — Additional (VPN) · Allowed
+    9. browser.exe → 203.0.113.9:443 · site.example — Primary · Allowed
+    10. browser.exe → 203.0.113.10:443 · site.example — Additional (VPN) · Allowed
+  Rows 1–10 of 12.
+Selected connection:
+  Process: browser.exe
+  Remote: 203.0.113.1:443 · site.example
+  Names this address was answered for (1): site.example
+  Egress: Primary
+  Verdict: Allowed
+  TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
+  Enter / e: Why this route?
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that connection, for example d 3
+  e and a row number: why that connection took its route, for example e 3
+  / and text: search all fields, for example /example; / on its own clears the search
+  b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Connection trace
+Service: OK
+Connection trace:
+  Shown: 12 of 14.
+  Show blocked: No · Show local connections: No · IPv6 only: No
+Connections:
+    1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
+  > 2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) · Allowed
+    3. browser.exe → 203.0.113.3:443 · site.example — Primary · Allowed
+    4. browser.exe → 203.0.113.4:443 · site.example — Additional (VPN) · Allowed
+    5. browser.exe → 203.0.113.5:443 · site.example — Primary · Allowed
+    6. browser.exe → 203.0.113.6:443 · site.example — Additional (VPN) · Allowed
+    7. browser.exe → 203.0.113.7:443 · site.example — Primary · Allowed
+    8. browser.exe → 203.0.113.8:443 · site.example — Additional (VPN) · Allowed
+    9. browser.exe → 203.0.113.9:443 · site.example — Primary · Allowed
+    10. browser.exe → 203.0.113.10:443 · site.example — Additional (VPN) · Allowed
+  Rows 1–10 of 12.
+Selected connection:
+  Process: browser.exe
+  Remote: 203.0.113.2:443 · site.example
+  Names this address was answered for (1): site.example
+  Egress: Additional (VPN)
+  Verdict: Allowed
+  TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
+  Enter / e: Why this route?
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that connection, for example d 3
+  e and a row number: why that connection took its route, for example e 3
+  / and text: search all fields, for example /example; / on its own clears the search
+  b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Diagnostics and logs
+Service: OK
+Service:
+  Service unavailable
+  Loading...
+  l: switch between diagnostics and the log
+Audit trail:
+  No data from the service yet
+  No data from the service yet
+Explain sample:
+  hostname or IP: site.example
+  Probing...
+  e: Enter a hostname or IP to simulate the routing decision against the active rule set.
+Diagnostic archive export:
+  The archive is saved in the service archives directory (per-user).
+  Ready
+  x: Diagnostic archive export
+Commands on this screen:
+  l: switch between diagnostics and the log
+  a and an alert number: acknowledge it, for example a 1
+  e and a host or address: which rule decides it, for example e example.com
+  x: export a diagnostic archive
+  In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
+  n: next page (more)   p: previous page (back)
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Service: Service running
+Service: Active revision: rev-7
+Service: The service started 2.4 s before this boot reached the sign-in screen.
+Service: Cache healthy · Entries: 42
+Service: 3 log file(s)
+Audit trail: Audit chain intact
+Audit trail: Security alerts requiring attention: 1
+Audit trail: > 1. Active security alert: Database tampering detected · integrity.revision_signature
+Audit trail: Rows 1–1 of 1.
+Audit trail: audit-2026-10-06.ndjson
+Audit trail: a: Acknowledge
+Explain sample: site.example  →  Additional — Allowed
+Explain sample: Blocked by an address rule: this name resolves to a blocked address (203.0.113.2)

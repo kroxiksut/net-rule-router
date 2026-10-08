@@ -1,0 +1,21 @@
+{
+  "description": "rules.js normalizeHostInput: a URL reduced to its host, for host types with URL punctuation only",
+  "cases": [
+    { "name": "full url", "input": { "type": "domain", "raw": "https://www.Site.example/page?q=1" }, "expected": "site.example" },
+    { "name": "no scheme", "input": { "type": "domain", "raw": "www.site.example/" }, "expected": "site.example" },
+    { "name": "userinfo and port", "input": { "type": "suffix-domain", "raw": "user:pw@site.example:8443/x" }, "expected": "site.example" },
+    { "name": "exact keeps www", "input": { "type": "exact-fqdn", "raw": "https://www.site.example/" }, "expected": "www.site.example" },
+    { "name": "zone with fragment", "input": { "type": "zone", "raw": "http://site.example#top" }, "expected": "site.example" },
+    { "name": "plain host untouched", "input": { "type": "domain", "raw": "Site.Example" }, "expected": "Site.Example" },
+    { "name": "www without punctuation", "input": { "type": "domain", "raw": "www.site.example" }, "expected": "www.site.example" },
+    { "name": "subnet untouched", "input": { "type": "subnet", "raw": "192.0.2.0/24" }, "expected": "192.0.2.0/24" },
+    { "name": "ipv6 untouched", "input": { "type": "exact-ip", "raw": "2001:db8::1" }, "expected": "2001:db8::1" },
+    { "name": "application untouched", "input": { "type": "application", "raw": "C:/Apps/app.exe" }, "expected": "C:/Apps/app.exe" },
+    { "name": "unicode scheme and host", "input": { "type": "domain", "raw": "http://Пример.РФ/путь" }, "expected": "пример.рф" },
+    { "name": "only the trailing port", "input": { "type": "domain", "raw": "host:1:23" }, "expected": "host:1" },
+    { "name": "path cut stops at a line break", "input": { "type": "domain", "raw": "a.example/x\ny/z" }, "expected": "a.example/x\ny" },
+    { "name": "at after a slash is a path", "input": { "type": "domain", "raw": "a.example/x@y" }, "expected": "a.example" },
+    { "name": "bare slash", "input": { "type": "domain", "raw": "/" }, "expected": "" },
+    { "name": "unknown type untouched", "input": { "type": "Domain", "raw": "https://x.example/" }, "expected": "https://x.example/" }
+  ]
+}

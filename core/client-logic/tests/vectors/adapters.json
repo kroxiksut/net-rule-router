@@ -1,0 +1,91 @@
+{
+  "description": "pure.js adapter helpers over one live interface row: own tunnel, way out, display name, role hint, one role per adapter. Each case is `base-row` with `patch` laid over it.",
+  "base-row": {
+    "persistent-id": "{00000000-0000-0000-0000-000000000001}",
+    "adapter-name": "{00000000-0000-0000-0000-000000000001}",
+    "name": "Ethernet",
+    "interface-description": "Example Gigabit Network Connection",
+    "interface-type": "ethernet",
+    "kind": "ethernet",
+    "is-bluetooth-like": false,
+    "local-ip": "192.0.2.10",
+    "gateway": "192.0.2.1",
+    "dns-servers": "192.0.2.53",
+    "has-default-route": true,
+    "has-forwarding-path": true,
+    "availability": "available",
+    "route-state": "not-selected",
+    "observed-facts": {
+      "connectivity-state": "internet",
+      "external-ip-status": "unknown",
+      "external-ip": null,
+      "external-probe-attempted": false,
+      "external-probe-note": ""
+    },
+    "derived-assessment": {
+      "vpn-tunnel-likelihood": "unlikely",
+      "virtual-interface-likelihood": "unlikely",
+      "service-interface-likelihood": "unlikely",
+      "classification": "regular-interface",
+      "confidence-percent": 90,
+      "heuristic-only": true,
+      "signals": []
+    },
+    "recommendation": {
+      "class": "preferred-primary",
+      "confidence": "high",
+      "advisory-only": true,
+      "key-signals": [],
+      "excluded-alternatives": []
+    }
+  },
+  "cases": [
+    { "name": "plain uplink", "input": { "patch": {} } },
+    { "name": "own fake-IP tunnel", "input": { "patch": {
+        "name": "NetRuleRouter", "interface-description": "Wintun Userspace Tunnel", "kind": "tunnel",
+        "gateway": "-", "recommendation": { "class": "" } } } },
+    { "name": "own tunnel name differs in case", "input": { "patch": { "name": "netrulerouter" } } },
+    { "name": "host-only virtual adapter", "input": { "patch": {
+        "kind": "virtual", "gateway": "-", "has-forwarding-path": false,
+        "derived-assessment": { "virtual-interface-likelihood": "likely" },
+        "recommendation": { "class": "not-recommended" } } } },
+    { "name": "virtual by classification at 70", "input": { "patch": {
+        "gateway": "0.0.0.0",
+        "derived-assessment": { "classification": "virtual-interface-likely", "confidence-percent": 70 },
+        "recommendation": { "class": "" } } } },
+    { "name": "virtual classification below 70 without a way out", "input": { "patch": {
+        "gateway": "", "has-forwarding-path": false,
+        "derived-assessment": { "classification": "virtual-interface-likely", "confidence-percent": 69 },
+        "recommendation": { "class": "" } } } },
+    { "name": "gateway-less tunnel not evaluated", "input": { "patch": {
+        "kind": "tunnel", "gateway": "-", "has-forwarding-path": null,
+        "derived-assessment": { "vpn-tunnel-likelihood": "likely" },
+        "recommendation": { "class": "preferred-secondary" } } } },
+    { "name": "down adapter is never flagged", "input": { "patch": {
+        "kind": "wifi", "availability": "unavailable", "gateway": "-", "has-forwarding-path": false,
+        "derived-assessment": { "virtual-interface-likelihood": "likely", "vpn-tunnel-likelihood": "likely" },
+        "recommendation": { "class": "" } } } },
+    { "name": "possible VPN recommended secondary", "input": { "patch": {
+        "derived-assessment": { "vpn-tunnel-likelihood": "possible" },
+        "recommendation": { "class": "preferred-secondary" } } } },
+    { "name": "possible VPN without recommendation", "input": { "patch": {
+        "derived-assessment": { "vpn-tunnel-likelihood": "possible" },
+        "recommendation": { "class": "" } } } },
+    { "name": "tunnel without a way out still looks primary", "input": { "patch": {
+        "kind": "tunnel", "gateway": "-", "has-forwarding-path": false } } },
+    { "name": "virtual kind gets no VPN word", "input": { "patch": {
+        "kind": "virtual", "derived-assessment": { "vpn-tunnel-likelihood": "likely" },
+        "recommendation": { "class": "" } } } },
+    { "name": "holds secondary", "input": { "patch": { "selected-role": "secondary" } } },
+    { "name": "holds primary", "input": { "patch": { "selected-role": "primary" } } },
+    { "name": "empty role", "input": { "patch": { "selected-role": "" } } },
+    { "name": "unknown role", "input": { "patch": { "selected-role": "other-role" } } },
+    { "name": "no name", "input": { "patch": { "name": "", "interface-description": "Example Adapter" } } },
+    { "name": "name equals description after trim", "input": { "patch": { "name": "  Wi-Fi  ", "interface-description": "Wi-Fi" } } },
+    { "name": "no description", "input": { "patch": { "name": "Wi-Fi 2", "interface-description": "   " } } },
+    { "name": "IPv6 all-zero gateway with a forwarding path", "input": { "patch": { "gateway": "::" } } },
+    { "name": "IPv6 all-zero long form without a forwarding path", "input": { "patch": { "gateway": "::0", "has-forwarding-path": false } } },
+    { "name": "padded gateway", "input": { "patch": { "gateway": " 192.0.2.1 ", "has-forwarding-path": false } } },
+    { "name": "cyrillic connection name", "input": { "patch": { "name": "Домашняя сеть", "interface-description": "Example Wireless Adapter" } } }
+  ]
+}

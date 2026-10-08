@@ -41,6 +41,7 @@ impl ConnectionObservationConsumer {
             placeholder_confirmed: None,
             companion_reported: Mutex::new(HashSet::new()),
             primary_stall_evidence: Mutex::new(stall_evidence::ConnectionStallTracker::default()),
+            unanswered: Mutex::new(unanswered::UnansweredTracker::default()),
             app_main_link: None,
             app_additional_link: None,
             connection_programs: Mutex::new(std::collections::HashMap::new()),

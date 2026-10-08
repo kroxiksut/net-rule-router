@@ -1,0 +1,24 @@
+Service: OK
+┌> Screens─────────────────┐┌Step 1 of 5: Language─────────────────────────────┐
+│  1 Status                ││The language of this terminal session. To start in│
+│> 2 First run             ││it every time, run the program with --lang.       │
+│  3 Interfaces and routes ││                                                  │
+│  4 Rules                 │└──────────────────────────────────────────────────┘
+│  5 Overlaps              │┌Your answer───────────────────────────────────────┐
+│  6 Suggested addresses   ││> 1. English (current)                            │
+│  7 Connection trace      ││  2. Русский                                      │
+│  8 Cache                 ││  3. Next                                         │
+│  9 Diagnostics and logs  ││  4. Close the setup                              │
+│  0 Settings              │└──────────────────────────────────────────────────┘
+│                          │
+│                          │
+│                          │
+│                          │
+│                          │
+│                          │
+│                          │
+│                          │
+│                          │
+│                          │
+└──────────────────────────┘
+F1: help   q: quit

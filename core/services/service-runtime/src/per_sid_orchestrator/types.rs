@@ -161,6 +161,13 @@ pub struct ActiveRulesSnapshot {
 pub trait RulesProvider: Send + Sync {
     fn active_rules(&self) -> Option<ActiveRulesSnapshot>;
 
+    /// Whether `principal` reads the administrator's baseline, whose Block may
+    /// act for every account at the packet layer, rather than a book of their
+    /// own, whose Block stays theirs. Fixtures default to the baseline.
+    fn rules_are_baseline_for(&self, _principal: &str) -> bool {
+        true
+    }
+
     /// the active rules for one `principal` (Windows SID).
     /// The default implementation ignores the principal and returns the
     /// global/baseline rules via [`Self::active_rules`], which keeps
@@ -169,6 +176,20 @@ pub trait RulesProvider: Send + Sync {
     /// with read-through to the baseline (lazy divergence).
     fn active_rules_for(&self, _principal: &str) -> Option<ActiveRulesSnapshot> {
         self.active_rules()
+    }
+
+    /// The principal's rules exactly as stored, for a caller that writes them
+    /// back. [`Self::active_rules_for`] may widen the book for enforcement, and
+    /// writing that back would store rules the user never wrote.
+    fn stored_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
+        self.active_rules_for(principal)
+    }
+
+    /// A name for the book [`Self::stored_rules_for`] returns, read without
+    /// decoding it: an unchanged name is an unchanged book. `None` when the
+    /// provider cannot name it; the caller then re-reads on its own clock.
+    fn stored_revision_for(&self, _principal: &str) -> Option<String> {
+        None
     }
 }
 

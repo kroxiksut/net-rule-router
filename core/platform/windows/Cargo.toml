@@ -28,8 +28,8 @@ nrr-shared  = { path = "../../../shared/contracts" }
 nrr-storage = { path = "../../storage" }
 # Read the browsers' History SQLite (Chrome/Edge `urls`,
 # Firefox `moz_places`) for the opt-in browser-history seed. Bundled SQLite, same
-# version as nrr-storage.
-rusqlite    = { version = "0.32", features = ["bundled"] }
+# version as nrr-storage. `hooks` for the progress handler that bounds the read.
+rusqlite    = { version = "0.32", features = ["bundled", "hooks"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 sha2        = "0.10"

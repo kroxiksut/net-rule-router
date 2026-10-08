@@ -1,0 +1,13 @@
+{
+  "description": "pure.js stabilityPatchForPlatform / stabilityAnyKeyApplies",
+  "cases": [
+    { "name": "no capability map", "input": { "partial": { "fake-ip-enabled": true } }, "expected": { "patch": { "fake-ip-enabled": true }, "any": true } },
+    { "name": "whole row supported", "input": { "partial": { "fake-ip-enabled": true }, "supports": { "serviceStabilityConfig": true } }, "expected": { "patch": { "fake-ip-enabled": true }, "any": true } },
+    { "name": "verbose logging only", "input": { "partial": { "verbose-logging-change": "one-hour", "fake-ip-enabled": true }, "supports": { "serviceStabilityConfig": false, "verboseLogging": true, "connTraceLog": false } }, "expected": { "patch": { "verbose-logging-change": "one-hour" }, "any": true } },
+    { "name": "trace only", "input": { "partial": { "conn-trace-gui": false, "verbose-logging-change": "off" }, "supports": { "serviceStabilityConfig": false, "verboseLogging": false, "connTraceLog": true } }, "expected": { "patch": { "conn-trace-gui": false }, "any": true } },
+    { "name": "absent flags read as supported", "input": { "partial": { "verbose-logging-change": "off", "enforcement-mode": "reactive" }, "supports": { "serviceStabilityConfig": false } }, "expected": { "patch": { "verbose-logging-change": "off" }, "any": true } },
+    { "name": "empty patch", "input": { "partial": {}, "supports": { "serviceStabilityConfig": false } }, "expected": { "patch": {}, "any": true } },
+    { "name": "nothing applies", "input": { "partial": { "verbose-logging-change": "off" }, "supports": { "serviceStabilityConfig": false, "verboseLogging": false, "connTraceLog": false } }, "expected": { "patch": {}, "any": false } },
+    { "name": "only false switches off", "input": { "partial": { "dns-via-secondary": true }, "supports": { "serviceStabilityConfig": "no" } }, "expected": { "patch": { "dns-via-secondary": true }, "any": true } }
+  ]
+}

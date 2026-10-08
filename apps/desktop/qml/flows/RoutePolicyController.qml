@@ -158,6 +158,12 @@ QtObject {
                 return
             }
             if (!req) { finish(true, "", "unchanged"); return }
+            // Only what this write changes: a whole row restating the rest would
+            // revert whatever the tray wrote since the read.
+            var changed = Pure.routePolicyChangedKeys(
+                Pure.buildFullRoutePolicyReq((p["route-policy"] || p.routePolicy) || {}, ""), req)
+            if (changed.length === 0) { finish(true, "", "unchanged"); return }
+            req["apply-only"] = changed
             var wCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
             if (!wCorr) { finish(false, "bridge-unavailable", "write"); return }
             root.rpc.registerRpcCallback(wCorr, function(ok2, p2, code2, msg2) {

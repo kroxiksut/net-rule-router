@@ -3,12 +3,13 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Dialogs
 import "../lib/pure.js" as Pure
+import "../lib/rules.js" as Rules
 
 // Add / Edit rule dialog (extracted from Main.qml).
 //
 // The dialog keeps its `ruleDialog` id so Main.qml's wiring — the
 // `property alias ruleDialog`, the overlays array, and the RulesSection calls
-// through `root.ruleDialog.{resetForEdit,open,normalizeHostInput}` — is
+// through `root.ruleDialog.{resetForEdit,open}` — is
 // unchanged. All shared state (models, theme, window helpers such as
 // `saveRule`, `ruleTypeLabel`, `routeRoleOptions`, `comboPopupWidth`,
 // `_punycodeFor`, `platformProfile`) comes in through `root` (the
@@ -106,6 +107,27 @@ Dialog {
     // silently downgrade it to `primary`. Latched in resetForEdit(), so the
     // combo model stays stable for the whole dialog session.
     property bool allowBlockRoute: false
+    // "Primary first" is offered only for name rules; the combo model follows
+    // the type, and a type that cannot carry it moves the route to secondary.
+    readonly property bool verifyRouteOffered: Rules.ruleTypeAllowsVerify(localRuleType)
+    // The one handler for this signal: QML refuses a second one and the whole
+    // dialog — and with it the main window — then fails to load.
+    onLocalRuleTypeChanged: {
+        var fitted = Rules.routeForRuleType(localRoute, localRuleType)
+        if (fitted !== localRoute) localRoute = fitted
+        _requestVerdict()
+    }
+    onLocalRouteChanged: _syncRouteCombo()
+    // User input severs the combo's index binding, so it is kept in step by hand.
+    function _syncRouteCombo() {
+        if (!routeTargetCombo || !root) return
+        var roleOpts = root.routeRoleOptions(allowBlockRoute, verifyRouteOffered)
+        var rIdx = 0
+        for (var i = 0; i < roleOpts.length; i += 1) {
+            if (roleOpts[i].id === localRoute) { rIdx = i; break }
+        }
+        routeTargetCombo.currentIndex = rIdx
+    }
     // First rule type that can actually be added today. `application`
     // is excluded (per-process routing not implemented yet) so a fresh
     // Add form never defaults to a non-functional type.
@@ -187,14 +209,7 @@ Dialog {
             }
             ruleTypeCombo.currentIndex = tIdx
         }
-        if (routeTargetCombo) {
-            var roleOpts = root.routeRoleOptions(allowBlockRoute)
-            var rIdx = 0
-            for (var i = 0; i < roleOpts.length; i += 1) {
-                if (roleOpts[i].id === localRoute) { rIdx = i; break }
-            }
-            routeTargetCombo.currentIndex = rIdx
-        }
+        _syncRouteCombo()
     }
     // Copy of `nrr_domain::preset_validation::MAX_INLINE_COMMENT_CHARS`, which
     // rejects a longer comment on import. QML cannot read Rust constants, so
@@ -302,7 +317,6 @@ Dialog {
         })
     }
     onLocalValueChanged: _requestVerdict()
-    onLocalRuleTypeChanged: _requestVerdict()
     function _verdictFor(ruleType, raw) {
         return _verdict.key === _verdictKey(ruleType, raw) ? _verdict : null
     }
@@ -405,30 +419,6 @@ Dialog {
                 .replace("{count}", String(listRows.length))
         }
         return text
-    }
-    // Paste convenience: when the user pastes a full URL copied from a
-    // browser, reduce it to the bare host so the value passes validation.
-    // Hostname-shaped types only, and only when the text looks like a URL, so
-    // ordinary typing of a plain hostname is never disturbed.
-    function normalizeHostInput(ruleType, raw) {
-        if (ruleType !== "zone" && ruleType !== "domain"
-                && ruleType !== "suffix-domain" && ruleType !== "exact-fqdn") {
-            return raw
-        }
-        var s = String(raw || "")
-        if (!/[:\/@?#]/.test(s)) return raw
-        s = s.replace(/^[A-Za-z][A-Za-z0-9\u0080-\uFFFF-]*:\/\//, "") // scheme://
-        s = s.replace(/^[^@\/]*@/, "")                        // user:pass@
-        s = s.replace(/[\/?#].*$/, "")                        // path/query/fragment
-        s = s.replace(/:\d+$/, "")                            // :port
-        s = s.toLowerCase()
-        // Drop a leading `www.` for broad-match types so a pasted
-        // `www.site.com` becomes `site.com` (apex + subdomains). `exact-fqdn`
-        // keeps `www.` — there the exact host is the whole point.
-        if (ruleType === "domain" || ruleType === "suffix-domain") {
-            s = s.replace(/^www\./, "")
-        }
-        return s
     }
 
     onAccepted: {
@@ -616,7 +606,7 @@ Dialog {
             onTextChanged: {
                 // Reduce a pasted browser URL to its bare host (a no-op for
                 // plain hostnames, IPs and application names).
-                var norm = ruleDialog.normalizeHostInput(ruleDialog.localRuleType, text)
+                var norm = Rules.normalizeHostInput(ruleDialog.localRuleType, text)
                 if (norm !== text) {
                     text = norm    // re-enters onTextChanged; norm has no URL
                     return          // punctuation, so the next pass settles.
@@ -780,11 +770,27 @@ Dialog {
             id: routeTargetCombo
             theme: root.uiTheme
             Layout.fillWidth: true
-            model: root.routeRoleOptions(ruleDialog.allowBlockRoute)
+            model: root.routeRoleOptions(ruleDialog.allowBlockRoute, ruleDialog.verifyRouteOffered)
             textRole: "label"
             valueRole: "id"
             popup.width: root.comboPopupWidth(routeTargetCombo, model, "label", null)
             onActivated: ruleDialog.localRoute = model[currentIndex].id
+            // A new model (the type changed) resets the index; put it back.
+            onModelChanged: Qt.callLater(ruleDialog._syncRouteCombo)
+        }
+        Label {
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            wrapMode: Text.WordWrap
+            color: root.mutedTextColor
+            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+            visible: ruleDialog.localRoute === "verify"
+            text: root.uiRevision >= 0
+                ? root.tr("dialog.rule.route-verify-hint",
+                    "Opens through the primary route first. Once NetRuleRouter confirms the primary route cannot reach the site, the rule moves to the additional route by itself.")
+                : ""
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
         }
         RowLayout {
             Layout.fillWidth: true

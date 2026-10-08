@@ -40,6 +40,7 @@ fn rule(
         match_value: value.to_string(),
         comment: comment.to_string(),
         blocked: false,
+        verify_primary: false,
         line_number: line,
         origin: None,
     }
@@ -93,6 +94,34 @@ browser.exe
         .map(|r| (r.match_value.as_str(), r.enabled))
         .collect();
     assert_eq!(values, vec![("My Tool.EXE", false), ("browser.exe", true)]);
+}
+
+/// An enabled network line may be spaced out; unticking it must keep the rule.
+#[test]
+fn a_disabled_spaced_network_is_a_rule_not_prose() {
+    let result = parse_canonical_rules(
+        "--- Ranges
+10.0.0.5 - 10.0.0.40
+# 10.0.1.5 - 10.0.1.40
+# 10.0.2.1 - old box
+--- CIDR
+# 10.9.0.0 / 16
+# 10.8.0.0 is the lab
+",
+    );
+    let values: Vec<(&str, bool)> = result
+        .rules
+        .iter()
+        .map(|r| (r.match_value.as_str(), r.enabled))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            ("10.0.0.5 - 10.0.0.40", true),
+            ("10.0.1.5 - 10.0.1.40", false),
+            ("10.9.0.0 / 16", false),
+        ]
+    );
 }
 
 #[test]
@@ -190,6 +219,93 @@ fn no_block_flag_leaves_rule_unblocked() {
     let result = parse_canonical_rules("--- Domains\nexample.com\n");
     assert_eq!(result.rules.len(), 1);
     assert!(!result.rules[0].blocked);
+}
+
+#[test]
+fn verify_prefix_is_read_on_domain_lines_enabled_or_not() {
+    let result = parse_canonical_rules(
+        "--- Domains
+?accounts.example.com  # sign-in
+?*.mail.example
+# ?off.example.com
+plain.example.com
+",
+    );
+    let read: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| (r.match_value.as_str(), r.enabled, r.verify_primary))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("accounts.example.com", true, true),
+            ("*.mail.example", true, true),
+            ("off.example.com", false, true),
+            ("plain.example.com", true, false),
+        ]
+    );
+    assert_eq!(result.rules[0].comment, "sign-in");
+}
+
+#[test]
+fn verify_prefix_with_block_flag_is_no_rule() {
+    let result = parse_canonical_rules(
+        "--- Domains
+?both.example.com +block
+# ?off.example.com +block
+kept.example.com
+",
+    );
+    let values: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| r.match_value.as_str())
+        .collect();
+    assert_eq!(values, ["kept.example.com"]);
+}
+
+#[test]
+fn verify_prefix_outside_domain_sections_stays_in_the_value() {
+    let result = parse_canonical_rules(
+        "--- IP
+?192.0.2.10
+--- Zones
+?example
+",
+    );
+    assert_eq!(result.rules.len(), 2);
+    for r in &result.rules {
+        assert!(!r.verify_primary, "{r:?}");
+        assert!(r.match_value.starts_with('?'), "{r:?}");
+    }
+}
+
+#[test]
+fn verify_prefix_travels_as_a_kebab_case_field() {
+    let result = parse_canonical_rules(
+        "--- Domains
+?accounts.example.com
+",
+    );
+    let json = serde_json::to_value(&result.rules[0]).expect("serialize");
+    assert_eq!(json["verify-primary"], serde_json::Value::Bool(true));
+    // An older peer that sends no such field reads as "not marked".
+    let mut legacy = json;
+    legacy
+        .as_object_mut()
+        .expect("object")
+        .remove("verify-primary");
+    let back: ParsedRule = serde_json::from_value(legacy).expect("deserialize");
+    assert!(!back.verify_primary);
+}
+
+#[test]
+fn split_verify_primary_needs_an_attached_value() {
+    assert_eq!(split_verify_primary("?a.example"), ("a.example", true));
+    assert_eq!(split_verify_primary("a.example"), ("a.example", false));
+    assert_eq!(split_verify_primary("?"), ("?", false));
+    assert_eq!(split_verify_primary("? a.example"), ("? a.example", false));
 }
 
 #[test]

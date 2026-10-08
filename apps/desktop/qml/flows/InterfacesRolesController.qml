@@ -58,6 +58,11 @@ QtObject {
     /// disable itself and the section can say what is happening.
     property bool externalIpProbeBusy: false
 
+    /// The additional route's posture from the latest live snapshot,
+    /// `{ failClosedActive }`, or null when the service does not report it.
+    /// Kept here so every refresh, push-driven ones included, updates it.
+    property var secondaryRouteState: null
+
     /// User-initiated: re-enumerate adapters AND ask each one what its external
     /// address looks like from outside. Deliberately NOT part of
     /// `refreshInterfacesFromService` — that one also runs automatically (on
@@ -132,7 +137,15 @@ QtObject {
         }
         var corr = nrrNativeBridge.rpcSnapshotInterfacesGet()
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-            if (!ok || !payload) return
+            if (!ok || !payload) {
+                interfacesRolesController.secondaryRouteState = null
+                return
+            }
+            var secondary = payload.secondary || null
+            interfacesRolesController.secondaryRouteState = secondary === null ? null : {
+                failClosedActive: !!(secondary["fail-closed-active"]
+                    || secondary.fail_closed_active)
+            }
             // A live adapter refresh (VPN up/down) can change the VPN-split
             // banner trigger; `_applyInterfaceRows` already bumps uiRevision,
             // which is what repaints the (JS-sourced) adapter name in the

@@ -106,6 +106,9 @@ ColumnLayout {
         var text = kind === "literal-block-overrides-route"
             ? root.tr("rules.overlaps.conflicts.literal-block",
                 "{rule}: {host} resolves to {ip}, and a block of that address wins over any name rule, so the address is blocked.")
+            : kind === "network-carving-over-cap"
+            ? root.tr("rules.overlaps.conflicts.carving-over-cap",
+                "{rule} holds more narrower rules than can be carved out of it, so it applies to its whole network and the narrower rules inside it do not take effect. Split it into smaller networks.")
             : kind === "unsupported-rule-shape"
             ? root.tr("rules.overlaps.conflicts.unsupported-shape",
                 "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application.")
@@ -418,8 +421,11 @@ ColumnLayout {
                                 width: actions.width
                                 wrapMode: Text.Wrap
                                 color: root.mutedTextColor
-                                text: root.tr("rules.overlaps.block-note",
-                                    "A block rule is part of this pair; change it in the rules list.")
+                                text: section.controller.hasBlockSide(row.overlap)
+                                    ? root.tr("rules.overlaps.block-note",
+                                        "A block rule is part of this pair; change it in the rules list.")
+                                    : root.tr("rules.overlaps.verify-note",
+                                        "A rule that tries the primary route first is part of this pair; change it in the rules list.")
                                 Accessible.role: Accessible.StaticText
                                 Accessible.name: text
                             }

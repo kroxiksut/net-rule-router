@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
+import "../lib/pure.js" as Pure
 
 // Generic prompt window for the tray surface.
 //
@@ -563,7 +564,7 @@ Window {
             // Screen readers get plain text — strip the styling tags used for visual emphasis.
             Accessible.name: promptWindow.bodyAccessibleText !== ""
                 ? promptWindow.bodyAccessibleText
-                : (promptWindow.bodyRichText ? text.replace(/<\/?[a-z]+>/gi, "") : text)
+                : (promptWindow.bodyRichText ? Pure.markupToPlain(text) : text)
         }
 
         // Compact detail list. Height follows the content up to the cap, past
@@ -722,71 +723,77 @@ Window {
         // renders last on screen (Windows convention). A Flow, not a RowLayout:
         // five buttons with translated labels do not fit one row at this width,
         // and the row clipped the last of them — the one being asked for.
-        Flow {
+        Item {
             Layout.fillWidth: true
             Layout.topMargin: promptWindow._gapSm
-            spacing: promptWindow._gapSm
-            layoutDirection: Qt.RightToLeft
+            Layout.preferredHeight: actionsFlow.height
+            Flow {
+                id: actionsFlow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                spacing: promptWindow._gapSm
+                layoutDirection: Qt.RightToLeft
 
-            ThemedButton {
-                visible: promptWindow.primaryAction !== null
-                theme: promptWindow.theme
-                highlighted: promptWindow.primaryAction
-                    ? promptWindow.primaryAction.accent !== false : false
-                text: promptWindow.primaryAction
-                    ? String(promptWindow.primaryAction.label || "") : ""
-                onClicked: promptWindow._trigger(promptWindow.primaryAction)
-                Accessible.name: text
-            }
-            ThemedButton {
-                visible: promptWindow.secondaryAction !== null
-                theme: promptWindow.theme
-                highlighted: promptWindow.secondaryAction
-                    ? promptWindow.secondaryAction.accent === true : false
-                text: promptWindow.secondaryAction
-                    ? String(promptWindow.secondaryAction.label || "") : ""
-                onClicked: promptWindow._trigger(promptWindow.secondaryAction)
-                Accessible.name: text
-            }
-            ThemedButton {
-                visible: promptWindow.tertiaryAction !== null
-                theme: promptWindow.theme
-                highlighted: promptWindow.tertiaryAction
-                    ? promptWindow.tertiaryAction.accent === true : false
-                text: promptWindow.tertiaryAction
-                    ? String(promptWindow.tertiaryAction.label || "") : ""
-                onClicked: promptWindow._trigger(promptWindow.tertiaryAction)
-                Accessible.name: text
-            }
-            Repeater {
-                model: promptWindow.extraActions
-                delegate: ThemedButton {
-                    required property var modelData
+                ThemedButton {
+                    visible: promptWindow.primaryAction !== null
                     theme: promptWindow.theme
-                    highlighted: modelData.accent === true
-                    text: String(modelData.label || "")
-                    onClicked: promptWindow._trigger(modelData)
+                    highlighted: promptWindow.primaryAction
+                        ? promptWindow.primaryAction.accent !== false : false
+                    text: promptWindow.primaryAction
+                        ? String(promptWindow.primaryAction.label || "") : ""
+                    onClicked: promptWindow._trigger(promptWindow.primaryAction)
                     Accessible.name: text
                 }
-            }
-            // Copying must not count as answering: this is the one footer
-            // button that leaves the notice standing.
-            ThemedButton {
-                visible: promptWindow.copyPayload !== "" || promptWindow.items.length > 0
-                theme: promptWindow.theme
-                text: promptWindow._copyAcknowledged
-                    ? promptWindow.copiedLabel : promptWindow.copyLabel
-                onClicked: promptWindow._copy()
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-            }
-            ThemedButton {
-                visible: promptWindow.dismissAction !== null
-                theme: promptWindow.theme
-                text: promptWindow.dismissAction
-                    ? String(promptWindow.dismissAction.label || "") : ""
-                onClicked: promptWindow._trigger(promptWindow.dismissAction)
-                Accessible.name: text
+                ThemedButton {
+                    visible: promptWindow.secondaryAction !== null
+                    theme: promptWindow.theme
+                    highlighted: promptWindow.secondaryAction
+                        ? promptWindow.secondaryAction.accent === true : false
+                    text: promptWindow.secondaryAction
+                        ? String(promptWindow.secondaryAction.label || "") : ""
+                    onClicked: promptWindow._trigger(promptWindow.secondaryAction)
+                    Accessible.name: text
+                }
+                ThemedButton {
+                    visible: promptWindow.tertiaryAction !== null
+                    theme: promptWindow.theme
+                    highlighted: promptWindow.tertiaryAction
+                        ? promptWindow.tertiaryAction.accent === true : false
+                    text: promptWindow.tertiaryAction
+                        ? String(promptWindow.tertiaryAction.label || "") : ""
+                    onClicked: promptWindow._trigger(promptWindow.tertiaryAction)
+                    Accessible.name: text
+                }
+                Repeater {
+                    model: promptWindow.extraActions
+                    delegate: ThemedButton {
+                        required property var modelData
+                        theme: promptWindow.theme
+                        highlighted: modelData.accent === true
+                        text: String(modelData.label || "")
+                        onClicked: promptWindow._trigger(modelData)
+                        Accessible.name: text
+                    }
+                }
+                // Copying must not count as answering: this is the one footer
+                // button that leaves the notice standing.
+                ThemedButton {
+                    visible: promptWindow.copyPayload !== "" || promptWindow.items.length > 0
+                    theme: promptWindow.theme
+                    text: promptWindow._copyAcknowledged
+                        ? promptWindow.copiedLabel : promptWindow.copyLabel
+                    onClicked: promptWindow._copy()
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                }
+                ThemedButton {
+                    visible: promptWindow.dismissAction !== null
+                    theme: promptWindow.theme
+                    text: promptWindow.dismissAction
+                        ? String(promptWindow.dismissAction.label || "") : ""
+                    onClicked: promptWindow._trigger(promptWindow.dismissAction)
+                    Accessible.name: text
+                }
             }
         }
     }

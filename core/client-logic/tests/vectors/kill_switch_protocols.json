@@ -1,0 +1,18 @@
+{
+  "description": "pure.js killSwitchProtocolLocked / killSwitchProtocolsAtLastOne",
+  "cases": [
+    { "name": "only bit 1", "input": { "mask": 1, "bit": 1 }, "expected": { "locked": true, "atLastOne": true } },
+    { "name": "two bits", "input": { "mask": 3, "bit": 1 }, "expected": { "locked": false, "atLastOne": false } },
+    { "name": "other bit blocks nothing", "input": { "mask": 65, "bit": 1 }, "expected": { "locked": true, "atLastOne": true } },
+    { "name": "only other bit reads as default", "input": { "mask": 64, "bit": 64 }, "expected": { "locked": false, "atLastOne": false } },
+    { "name": "default mask", "input": { "mask": 127, "bit": 4 }, "expected": { "locked": false, "atLastOne": false } },
+    { "name": "single bit 4", "input": { "mask": 4, "bit": 4 }, "expected": { "locked": true, "atLastOne": true } },
+    { "name": "box not ticked", "input": { "mask": 4, "bit": 1 }, "expected": { "locked": false, "atLastOne": true } },
+    { "name": "zero reads as default", "input": { "mask": 0, "bit": 1 }, "expected": { "locked": false, "atLastOne": false } },
+    { "name": "mask from text", "input": { "mask": "2", "bit": 2 }, "expected": { "locked": true, "atLastOne": true } },
+    { "name": "null mask", "input": { "mask": null, "bit": 1 }, "expected": { "locked": false, "atLastOne": false } },
+    { "name": "absent mask", "input": { "bit": 32 }, "expected": { "locked": false, "atLastOne": false } },
+    { "name": "outside the mask", "input": { "mask": 160, "bit": 32 }, "expected": { "locked": false, "atLastOne": false } },
+    { "name": "highest enforced bit", "input": { "mask": 32, "bit": 32 }, "expected": { "locked": true, "atLastOne": true } }
+  ]
+}

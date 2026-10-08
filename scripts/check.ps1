@@ -360,7 +360,28 @@ if ($null -eq $cargoFmt) {
 }
 Invoke-ToolStep 'format' $cargoFmt.Source @('--all', '--', '--check')
 Invoke-CargoStep 'clippy' @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings')
-Invoke-CargoStep 'tests' @('test', '--workspace')
+
+# Tests get a temp directory of their own, removed after the run: a file an
+# antivirus scan still holds when a test's TempDir drops is left behind, and in
+# the user's %TEMP% nothing would ever collect it.
+$testTemp = Join-Path ([System.IO.Path]::GetTempPath()) "nrr-gate-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $testTemp | Out-Null
+$previousTmp, $previousTemp = $env:TMP, $env:TEMP
+$env:TMP, $env:TEMP = $testTemp, $testTemp
+try {
+    Invoke-CargoStep 'tests' @('test', '--workspace')
+} finally {
+    $env:TMP, $env:TEMP = $previousTmp, $previousTemp
+    foreach ($attempt in 1..5) {
+        try {
+            Remove-Item -LiteralPath $testTemp -Recurse -Force -ErrorAction Stop
+            break
+        } catch {
+            if ($attempt -eq 5) { Write-Warning "test temp directory not removed: $testTemp" }
+            else { Start-Sleep -Seconds 1 }
+        }
+    }
+}
 
 $cargoDeny = Get-Command 'cargo-deny' -ErrorAction SilentlyContinue
 if ($null -eq $cargoDeny) {

@@ -112,6 +112,19 @@ pub trait AutoRuleAuthor: Send + Sync {
                 anchor_skipped: false,
             })
     }
+
+    /// Rewrite `principal`'s stored rules: `edit` returns the new book, or
+    /// `None` when there is nothing to change (nothing is submitted then).
+    /// `Ok(true)` once the new book is active. An author that cannot rewrite
+    /// changes nothing.
+    fn rewrite(
+        &self,
+        _principal: &str,
+        _edit: &dyn Fn(&CanonicalRuleBook) -> Option<CanonicalRuleBook>,
+        _correlation_id: &str,
+    ) -> Result<bool, AuthorError> {
+        Ok(false)
+    }
 }
 
 /// Production author: read-modify-write through the mutation executor.
@@ -168,7 +181,9 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
         // is exactly what we want: their first accepted suggestion is also the
         // moment their own rule set comes into existence, seeded from the
         // baseline rather than from nothing.
-        let snapshot = self.rules.active_rules_for(principal).ok_or_else(|| {
+        // The stored book: the enforcement read adds subdomain twins that
+        // would be written back as rules the user never wrote.
+        let snapshot = self.rules.stored_rules_for(principal).ok_or_else(|| {
             AuthorError::new(
                 "no-active-revision",
                 "there is no active rule set to add these addresses to yet",
@@ -194,6 +209,52 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
         }
         evict_over_budget(&mut book, budget, principal);
 
+        self.submit(principal, book, correlation_id)?;
+        // Strictly after the executor returns: it applies the policy
+        // synchronously, so tearing down any earlier would have the
+        // application reconnect over the route still in force.
+        let hosts = hosts_to_refresh(&landed);
+        let has_anchor = hosts.iter().any(|h| matches!(h, RoutedHost::Anchor(_)));
+        let anchor_skipped = match self.flow_refresh.as_ref() {
+            Some(refresh) => refresh.refresh(principal, &hosts).anchor_skipped,
+            None => has_anchor,
+        };
+        Ok(AuthoredOutcome {
+            authored,
+            anchor_skipped,
+        })
+    }
+
+    fn rewrite(
+        &self,
+        principal: &str,
+        edit: &dyn Fn(&CanonicalRuleBook) -> Option<CanonicalRuleBook>,
+        correlation_id: &str,
+    ) -> Result<bool, AuthorError> {
+        // A rewrite is the service's own background work: refused at the gate,
+        // it must not reach `execute`, whose refusal logs and toasts the user.
+        if let Some(e) = self.executor.closed_gate(MutationKind::RulesUpdate, false) {
+            return Err(AuthorError::new(&e.code, e.message));
+        }
+        let Some(snapshot) = self.rules.stored_rules_for(principal) else {
+            return Ok(false);
+        };
+        let Some(book) = edit(&snapshot.rule_book) else {
+            return Ok(false);
+        };
+        self.submit(principal, book, correlation_id)?;
+        Ok(true)
+    }
+}
+
+impl ProductionAutoRuleAuthor {
+    /// Encode, hash and hand `book` to the executor as `principal`'s new rules.
+    fn submit(
+        &self,
+        principal: &str,
+        book: CanonicalRuleBook,
+        correlation_id: &str,
+    ) -> Result<(), AuthorError> {
         let content = RulesRevisionContent::new(book);
         let rules_json = rules_json::to_canonical_string(&rules_json_codec::encode(&content))
             .map_err(|e| {
@@ -219,21 +280,7 @@ impl AutoRuleAuthor for ProductionAutoRuleAuthor {
             caller_is_elevated: false,
         };
         match self.executor.execute(stored, principal) {
-            MutationOutcome::Completed(_) => {
-                // Strictly after the executor returns: it applies the policy
-                // synchronously, so tearing down any earlier would have the
-                // application reconnect over the route still in force.
-                let hosts = hosts_to_refresh(&landed);
-                let has_anchor = hosts.iter().any(|h| matches!(h, RoutedHost::Anchor(_)));
-                let anchor_skipped = match self.flow_refresh.as_ref() {
-                    Some(refresh) => refresh.refresh(principal, &hosts).anchor_skipped,
-                    None => has_anchor,
-                };
-                Ok(AuthoredOutcome {
-                    authored,
-                    anchor_skipped,
-                })
-            }
+            MutationOutcome::Completed(_) => Ok(()),
             // The executor already reports the Free rule cap, the tamper gate's
             // refusal while a security alert is unacknowledged, and every policy
             // error with a stable code. Pass it through verbatim rather than
@@ -774,5 +821,89 @@ mod tests {
         assert_eq!(added_date(SystemTime::UNIX_EPOCH), "1970-01-01");
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_785_456_000);
         assert_eq!(added_date(t), "2026-07-31");
+    }
+
+    /// The fake executor behind a gate that is open or closed.
+    struct Gated {
+        inner: crate::ipc_handlers::test_fakes::FakeMutationExecutor,
+        closed: bool,
+    }
+
+    impl MutationExecutor for Gated {
+        fn preview(
+            &self,
+            kind: MutationKind,
+            payload: &serde_json::Value,
+            principal: &str,
+        ) -> crate::ipc_handlers::payloads::ReviewSummaryResponse {
+            self.inner.preview(kind, payload, principal)
+        }
+        fn execute(&self, payload: StoredMutation, principal: &str) -> MutationOutcome {
+            self.inner.execute(payload, principal)
+        }
+        fn closed_gate(
+            &self,
+            _kind: MutationKind,
+            _caller_is_elevated: bool,
+        ) -> Option<crate::ipc_handlers::operation_status_store::OperationError> {
+            self.closed.then(
+                || crate::ipc_handlers::operation_status_store::OperationError {
+                    args: Default::default(),
+                    code: "rules-locked".into(),
+                    message: "locked".into(),
+                },
+            )
+        }
+        fn rollback(&self, principal: &str, target: Option<&str>) -> MutationOutcome {
+            self.inner.rollback(principal, target)
+        }
+        fn rollback_target(
+            &self,
+            principal: &str,
+            target: Option<&str>,
+        ) -> Result<
+            Option<nrr_shared::ipc_payloads::RollbackTargetDto>,
+            crate::ipc_handlers::operation_status_store::OperationError,
+        > {
+            self.inner.rollback_target(principal, target)
+        }
+        fn safe_disable(&self, reason: &str) -> MutationOutcome {
+            self.inner.safe_disable(reason)
+        }
+    }
+
+    #[test]
+    fn a_rewrite_behind_a_closed_gate_is_never_submitted() {
+        let mut book = authored_book(1);
+        book.secondary = CanonicalRuleSet::from_rules(
+            book.secondary
+                .rules()
+                .iter()
+                .cloned()
+                .chain([CanonicalRule {
+                    id: RuleId("old-0+sub".into()),
+                    address_match: Some(CanonicalAddressMatch::SuffixDomain("h0.example".into())),
+                    origin: None,
+                    ..book.secondary.rules()[0].clone()
+                }])
+                .collect(),
+        );
+        let rewrite = |closed: bool| {
+            let exec = Arc::new(Gated {
+                inner: crate::ipc_handlers::test_fakes::FakeMutationExecutor::default(),
+                closed,
+            });
+            let author = ProductionAutoRuleAuthor::new(
+                Arc::new(FixedBook(book.clone())),
+                Arc::clone(&exec) as Arc<dyn MutationExecutor>,
+            );
+            let result = author.rewrite("S-1-5-21-1-1", &|b| b.without_subdomain_twins(), "c-1");
+            (result, exec.inner.executed_count())
+        };
+        // Positive control: an open gate submits the rewrite.
+        assert_eq!(rewrite(false), (Ok(true), 1));
+        let (result, executed) = rewrite(true);
+        assert_eq!(result.map_err(|e| e.code), Err("rules-locked".to_owned()));
+        assert_eq!(executed, 0, "no execute, so no progress push and no toast");
     }
 }

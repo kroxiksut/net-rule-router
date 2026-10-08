@@ -282,6 +282,7 @@ fn wire_action(action: nrr_domain::canonical::RuleAction) -> rules_json::RuleAct
     match action {
         nrr_domain::canonical::RuleAction::Route => rules_json::RuleAction::Route,
         nrr_domain::canonical::RuleAction::Block => rules_json::RuleAction::Block,
+        nrr_domain::canonical::RuleAction::VerifyPrimary => rules_json::RuleAction::VerifyPrimary,
     }
 }
 

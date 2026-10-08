@@ -214,6 +214,8 @@ impl PerSidApplyOrchestrator {
             // can carry IPv6. Naming the family here would compare two different
             // questions.
             ipv6: crate::enforcement_planner::Ipv6Guard::Off,
+            // The live pass asked the same question.
+            packet_blocks: self.rules_provider.rules_are_baseline_for(sid),
         };
         let plan = EnforcementPlan {
             principal,

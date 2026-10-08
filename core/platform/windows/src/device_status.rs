@@ -194,7 +194,6 @@ mod tests {
     fn an_unrecognised_problem_still_means_present_but_unusable() {
         let state = classify(DN_HAS_PROBLEM, CM_PROB(0x0000_002B));
         assert_eq!(state, DeviceState::FailedToStart);
-        assert!(state.is_present_but_unusable());
     }
 
     /// An adapter GUID nothing on this machine answers to. Runs against the

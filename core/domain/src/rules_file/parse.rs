@@ -204,6 +204,8 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
             Some(s) => s,
             None => continue,
         };
+        let domain_values =
+            matches!(slot, Slot::Known(idx) if known[*idx].section.takes_domain_values());
 
         let mut entry = if let Some(rest) = trimmed.strip_prefix('#') {
             // Possibly a disabled rule — `nrr_shared` owns the one predicate
@@ -219,6 +221,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
             // disabled blocked rule (`# example.com +block`) is not mistaken
             // for a prose comment.
             let (value, blocked) = extract_rule_flags(value);
+            let (value, verify_primary) = take_verify_prefix(value, domain_values);
             let rule_type = match &current {
                 Some(Slot::Known(idx)) => {
                     nrr_shared::preset_parser::classify_section_lenient(known[*idx].section.name())
@@ -238,6 +241,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                 inline_comment: comment,
                 enabled: false,
                 blocked,
+                verify_primary,
                 origin: None,
             }
         } else {
@@ -247,6 +251,7 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                 continue;
             }
             let (value, blocked) = extract_rule_flags(value);
+            let (value, verify_primary) = take_verify_prefix(value, domain_values);
             if value.is_empty() {
                 continue;
             }
@@ -255,9 +260,19 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                 inline_comment: comment,
                 enabled: true,
                 blocked,
+                verify_primary,
                 origin: None,
             }
         };
+
+        // "Try the primary route first" and "drop it" contradict each other;
+        // the line is refused rather than one of them guessed.
+        if entry.verify_primary && entry.blocked {
+            warnings.push(ParseWarning::VerifyPrimaryWithBlock {
+                match_value: entry.match_value,
+            });
+            continue;
+        }
 
         match slot {
             Slot::Known(idx) => {
@@ -383,6 +398,20 @@ fn extract_rule_flags(value: &str) -> (String, bool) {
         }
     }
     (kept.join(" "), blocked)
+}
+
+/// Lifts the `?` prefix off `value` in a host-name section; anywhere else it
+/// stays part of the value, which that section's validation then refuses.
+fn take_verify_prefix(value: String, domain_values: bool) -> (String, bool) {
+    if !domain_values {
+        return (value, false);
+    }
+    let (rest, verify) = nrr_shared::preset_parser::split_verify_primary(&value);
+    if verify {
+        (rest.to_string(), true)
+    } else {
+        (value, false)
+    }
 }
 
 // ── File-to-RuleSet conversion ────────────────────────────────────────────────

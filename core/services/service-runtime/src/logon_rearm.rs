@@ -112,17 +112,52 @@ impl SignInGate {
         }
     }
 
+    /// [`Self::fire`] if a user is signed in now: for the moment the sign-in
+    /// event source starts listening, after a sign-in it could not report.
+    pub fn fire_if_signed_in(&self) {
+        if (self.signed_in)() {
+            self.fire();
+        }
+    }
+
     /// How many actions are still waiting.
     pub fn pending(&self) -> usize {
         self.pending.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
+
+    /// No sign-in event will come (no source, or it failed to subscribe): ask
+    /// every `every` instead, and stop once the held steps have run — nothing
+    /// polls a machine that is already past sign-in.
+    pub fn poll_until_fired(gate: Arc<Self>, stop: crate::lifecycle::StopToken, every: Duration) {
+        let spawned = std::thread::Builder::new()
+            .name("nrr-sign-in-poll".into())
+            .spawn(move || {
+                while gate.pending() > 0 {
+                    gate.fire_if_signed_in();
+                    if gate.pending() == 0 || stop.wait_for(every) {
+                        break;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                target: "nrr::logon",
+                error = %e,
+                "could not start the sign-in poll; held steps wait for the next sign-in event",
+            );
+        }
+    }
 }
+
+/// How often the gate asks for a sign-in when no event will tell it.
+pub const SIGN_IN_POLL_EVERY: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod gate_tests {
     use super::SignInGate;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn counting(runs: &Arc<AtomicUsize>) -> Arc<dyn Fn() + Send + Sync> {
         let runs = Arc::clone(runs);
@@ -152,6 +187,51 @@ mod gate_tests {
             "a second sign-in must not repeat it"
         );
         assert_eq!(gate.pending(), 0);
+    }
+
+    /// A sign-in the event source started too late to see still releases
+    /// what was held, and only once a user is really there.
+    #[test]
+    fn a_sign_in_before_the_source_listened_releases_the_held_steps() {
+        let signed_in = Arc::new(AtomicBool::new(false));
+        let gate = SignInGate::new({
+            let s = Arc::clone(&signed_in);
+            Arc::new(move || s.load(Ordering::SeqCst))
+        });
+        let runs = Arc::new(AtomicUsize::new(0));
+        gate.defer("tun", counting(&runs));
+        gate.fire_if_signed_in();
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "nobody is signed in");
+
+        signed_in.store(true, Ordering::SeqCst);
+        gate.fire_if_signed_in();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// With no sign-in event to wait for, the poll releases the held step once
+    /// a user is there, and then stops.
+    #[test]
+    fn without_a_sign_in_event_the_poll_releases_the_held_steps() {
+        let signed_in = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(SignInGate::new({
+            let s = Arc::clone(&signed_in);
+            Arc::new(move || s.load(Ordering::SeqCst))
+        }));
+        let runs = Arc::new(AtomicUsize::new(0));
+        gate.defer("tun", counting(&runs));
+        let stop = crate::lifecycle::StopToken::new();
+        SignInGate::poll_until_fired(Arc::clone(&gate), stop.clone(), Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "nobody is signed in");
+
+        signed_in.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while runs.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.pending(), 0);
+        stop.request_stop();
     }
 
     #[test]

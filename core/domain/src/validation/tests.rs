@@ -1019,6 +1019,45 @@ fn a_copy_the_user_already_disabled_is_not_asked_about_again() {
     assert!(enabled_duplicates_across_sets(&book).is_empty());
 }
 
+#[test]
+fn one_network_written_as_a_subnet_and_as_a_range_on_two_routes_is_reported() {
+    let network = |id: &str, address: CanonicalAddressMatch| CanonicalRule {
+        address_match: Some(address),
+        ..rule_with(id, "unused.example", true)
+    };
+    let subnet = |text: &str| {
+        CanonicalAddressMatch::Subnet(nrr_shared::ip_block::IpBlock::parse(text).expect("subnet"))
+    };
+    let range = |text: &str| {
+        CanonicalAddressMatch::ip_range(nrr_shared::ip_block::IpRange::parse(text).expect("range"))
+    };
+    let book = |secondary: CanonicalAddressMatch| CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![network("R-0001", subnet("10.0.0.0/24"))]),
+        secondary: CanonicalRuleSet::from_rules(vec![network("R-0002", secondary)]),
+    };
+
+    let found = enabled_duplicates_across_sets(&book(range("10.0.0.0-10.0.0.255")));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].match_summary, "10.0.0.0/24 = 10.0.0.0-10.0.0.255");
+    assert_eq!(
+        enabled_duplicates_across_sets(&book(subnet("10.0.0.0/24"))).len(),
+        1,
+        "the same subnet on both routes"
+    );
+    // Positive control: a range one address short is a different network.
+    assert!(enabled_duplicates_across_sets(&book(range("10.0.0.0-10.0.0.254"))).is_empty());
+
+    let warned = |book: CanonicalRuleBook| {
+        let mut warnings = Vec::new();
+        detect_cross_set_duplicates(book.primary.rules(), book.secondary.rules(), &mut warnings);
+        warnings
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::DuplicateRuleAcrossSets { .. }))
+    };
+    assert!(warned(book(range("10.0.0.0-10.0.0.255"))));
+    assert!(!warned(book(range("10.0.0.0-10.0.0.254"))));
+}
+
 /// One enabled/disabled domain rule. The route comes from the set the rule
 /// is placed in, so it is not part of the rule itself.
 fn rule_with(id: &str, host: &str, enabled: bool) -> CanonicalRule {
@@ -1165,5 +1204,60 @@ fn the_app_allowance_is_the_budget_or_what_the_book_already_holds() {
             count: 2_001,
             limit: MAX_AUTO_RULES
         })
+    );
+}
+
+#[test]
+fn one_network_routed_on_both_routes_is_a_tie_and_a_block_is_not() {
+    let network =
+        |id: &str, address: CanonicalAddressMatch, action: crate::canonical::RuleAction| {
+            CanonicalRule {
+                address_match: Some(address),
+                action,
+                ..rule_with(id, "unused.example", true)
+            }
+        };
+    let subnet = |text: &str| {
+        CanonicalAddressMatch::Subnet(nrr_shared::ip_block::IpBlock::parse(text).expect("subnet"))
+    };
+    let range = |text: &str| {
+        CanonicalAddressMatch::ip_range(nrr_shared::ip_block::IpRange::parse(text).expect("range"))
+    };
+    let route = crate::canonical::RuleAction::Route;
+    let book = |secondary: CanonicalRule| CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![network(
+            "R-0001",
+            subnet("10.0.0.0/24"),
+            route,
+        )]),
+        secondary: CanonicalRuleSet::from_rules(vec![secondary]),
+    };
+
+    assert_eq!(
+        networks_on_both_routes(&book(network(
+            "R-0002",
+            range("10.0.0.0-10.0.0.255"),
+            route
+        ))),
+        ["10.0.0.0-10.0.0.255"]
+    );
+    assert_eq!(
+        networks_on_both_routes(&book(network("R-0002", subnet("10.0.0.0/24"), route))),
+        ["10.0.0.0/24"]
+    );
+    let block = network(
+        "R-0002",
+        subnet("10.0.0.0/24"),
+        crate::canonical::RuleAction::Block,
+    );
+    assert!(
+        networks_on_both_routes(&book(block)).is_empty(),
+        "a block is not a route"
+    );
+    let mut off = network("R-0002", subnet("10.0.0.0/24"), route);
+    off.enabled = false;
+    assert!(networks_on_both_routes(&book(off)).is_empty());
+    assert!(
+        networks_on_both_routes(&book(network("R-0002", subnet("10.0.0.0/25"), route))).is_empty()
     );
 }

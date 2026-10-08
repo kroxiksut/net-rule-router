@@ -50,6 +50,9 @@ const ALLOWED_TOP_LEVEL_DOMAINS: &[&str] = &[
     // Block-notification reason slugs, resolved by name from the tray and the
     // per-reason mute settings.
     "block-reason",
+    // Texts only the terminal interface (`nrr-tui`) shows; shared concepts
+    // reuse the families above.
+    "tui",
 ];
 
 /// Rust files that resolve locale keys at runtime. QML is NOT listed here: the
@@ -60,6 +63,8 @@ const RUNTIME_KEY_SOURCE_FILES: &[&str] = &[
     "apps/desktop/gui/src/ui_surface.rs",
     // lib.rs because nrr-desktop-tray is a lib-only crate consumed by the launcher.
     "apps/desktop/tray/src/lib.rs",
+    // The terminal interface's one key table.
+    "apps/tui/src/keys.rs",
 ];
 
 /// Root of the QML tree, walked recursively for `tr()` keys.
@@ -171,6 +176,27 @@ fn runtime_uses_known_localization_keys() {
         "runtime contains deprecated localization key families: {}",
         deprecated.join(", ")
     );
+}
+
+/// The terminal words its elevation refusal through a key it picks per host,
+/// so both hosts' keys must exist in every baseline locale.
+#[test]
+fn the_terminal_elevation_refusal_is_worded_for_every_host() {
+    let keys = [
+        "errors.terminal-needs-elevation-unix",
+        "errors.terminal-needs-elevation-windows",
+    ];
+    let host_key = nrr_shared::ipc_transport::terminal_needs_elevation_locale_key();
+    assert!(keys.contains(&host_key));
+    for locale in BASELINE_LOCALES {
+        let map = raw_locale_map(locale);
+        for key in keys {
+            assert!(
+                map.get(key).is_some_and(|text| !text.is_empty()),
+                "locale '{locale}' lacks {key}"
+            );
+        }
+    }
 }
 
 /// A service line tagged `msg_key = "<id>"` is shown in the Logs view as

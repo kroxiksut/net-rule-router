@@ -1,0 +1,100 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Status
+Service: connecting… — Connecting to service…
+Routing state:
+  Service not connected
+  No data from the service yet
+Connections:
+  No data from the service yet
+Notifications:
+  No notifications.
+Type a screen number, h for help or q to quit, then press Enter.
+Service: OK
+Routing state: Routing active
+Routing state: Rules apply on this user session.
+Connections: Main connection: Ethernet — Example Network Adapter — Available — Rules applied
+Connections: Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+Warning: The additional connection is not up — Everything your rules send there is being held until it comes back — that is the protection doing its job, not a fault. Start the connection, or move those rules to the main one.
+Routing state: Routing limited
+Routing state: Some rules are not being applied right now. The notices say why.
+Connections: Additional connection: Example Tunnel — Example Network Adapter — Available — Rules not applied
+Connections: The additional connection is not up
+
+Screen: Rules
+Service: OK
+Rule list:
+  Reading the rules from the service…
+  Route: All routes
+Rules:
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  r: show the rules the service applies
+Type a screen number, h for help or q to quit, then press Enter.
+Help — Rules:
+  A number: open that screen
+  Enter on its own: show this screen again
+  h or ?: this help
+  q: quit
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  r: show the rules the service applies
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+Type a screen number, h for help or q to quit, then press Enter.
+Not understood: w
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Rules
+Service: OK
+Rule list:
+  Reading the rules from the service…
+  Route: All routes
+Rules:
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  r: show the rules the service applies
+Type a screen number, h for help or q to quit, then press Enter.

@@ -122,6 +122,18 @@ A line starting with `#` where the rest is not a valid rule value (e.g.
 `# this is a note`) is treated as a free comment — it is not shown as a
 disabled rule in the GUI.
 
+#### Verify the main route first
+
+```
+?accounts.example.com
+?*.mail.example.net
+# ?old.example.com
+```
+
+A `?` written immediately before a domain value, in the additional-route file,
+asks the app to try the main route first (§1.15). It goes after the `#` of a
+disabled rule, never before it.
+
 #### Free comment
 
 ```
@@ -139,7 +151,7 @@ Empty lines and lines containing only whitespace are ignored.
 ### 1.4 Complete example
 
 ```
-# NetRuleRouter rules file — version 5
+# NetRuleRouter rules file — version 6
 # Route: Primary (main network)
 
 --- Zones
@@ -174,6 +186,18 @@ browser.exe      # browser traffic
 
 --- Auto
 rr3.example-cdn.net  # auto:site-companion anchor:example.org added:2026-07-31
+```
+
+The additional-route file of the same pair, with a site that should use the
+main route for as long as the main route can reach it (§1.15):
+
+```
+# NetRuleRouter rules file — version 6
+# Route: Additional (VPN)
+
+--- Domains
+*.streaming.example.com    # always through the VPN
+?accounts.example.com      # main route first; moved here only if it cannot reach it
 ```
 
 ### 1.5 Rule evaluation priority
@@ -433,11 +457,16 @@ The header line `# NetRuleRouter rules file — version N` (and the preset heade
 | 3 | Per-rule `+block` flag (§1.12). |
 | 4 | App-authored rules section (§1.13, `--- Auto`). |
 | 5 | Subnet and range sections (§1.8, `--- CIDR`, `--- Ranges`). |
+| 6 | The `?` prefix on domain rules: verify the main route first (§1.15). |
 
 Version 2 was reserved for a nested `- destination` syntax under application
 rules. It was never implemented and no build reads or writes it; the number is
 left in place rather than reused, so a file from any build means the same thing
 in every build. Do not declare version 2 in a file.
+
+A file that uses the `?` prefix declares **version 6**. An older build does not
+know the prefix: it reads `?accounts.example.com` as a value that is not a host
+name and does not apply that rule. Open such a file in a current build.
 
 A file that contains a `--- CIDR` or `--- Ranges` section declares **version
 5**. An older build treats those sections as extended ones (§1.9): it keeps
@@ -589,6 +618,42 @@ VPN. Double encryption costs noticeable speed, and a corporate VPN client may
 refuse to connect at all once it detects it is running through another
 tunnel.
 
+### 1.15 Verify the main route first (`?`)
+
+Some sites work through the main route in one place and not in another, and
+you cannot always tell in advance which case you are in. Writing such a site
+in the additional-route file with a **`?`** in front of it says: use the main
+route while it reaches the site, and move the site to the additional route only
+once the main route has been shown not to reach it.
+
+```
+--- Domains
+?accounts.example.com      # sign-in page
+?*.mail.example.net
+```
+
+Key properties:
+
+- **The site starts on the main route.** Nothing goes through the additional
+  route until the app has confirmed that the main route cannot reach the site.
+- **The app finishes the edit for you.** Once it confirms the main route cannot
+  reach the site, it removes the `?`, and from then on the line is an ordinary
+  additional-route rule. While the main route keeps working, the line stays as
+  you wrote it.
+- **Domain rules only.** The prefix is read in `--- Domains` (and in
+  `--- Auto`, which shares its grammar, §1.13), on exact hosts and on `*.`
+  suffix rules alike. In any other section the `?` is part of the value, which
+  makes it invalid.
+- **Additional-route file only.** In the main-route file a site already uses
+  the main route, so the prefix adds nothing there: the line is read as an
+  ordinary rule of that file.
+- **Not together with `+block`.** "Try the main route" and "drop it" contradict
+  each other, so a line carrying both is not read as a rule.
+- **Disable it like any rule** — comment the line: `# ?accounts.example.com`.
+- **One rule per site in a file.** `?accounts.example.com` and
+  `accounts.example.com` in the same file are the same rule; the first one
+  listed is kept.
+
 ---
 
 ## 2. Settings Export Format (YAML)
@@ -693,14 +758,14 @@ Preset metadata is stored as header comments at the top of each file, before
 any section headers. All keys are optional.
 
 ```
-# NetRuleRouter preset — version 5
+# NetRuleRouter preset — version 6
 # name: Corporate VPN Rules
 # description: Routes corporate traffic via the additional (VPN) interface
 # author: Jane Doe
 # preset_version: 1
 ```
 
-The first line `# NetRuleRouter preset — version 5` identifies the file as a
+The first line `# NetRuleRouter preset — version 6` identifies the file as a
 preset and carries the format version. A file without this header is still
 valid as a rules file; the metadata lines are treated as free comments.
 

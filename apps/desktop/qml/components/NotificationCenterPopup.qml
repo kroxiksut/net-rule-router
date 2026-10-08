@@ -11,6 +11,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../lib/pure.js" as Pure
 
 Popup {
     id: root
@@ -171,7 +172,7 @@ Popup {
                             Accessible.role: Accessible.StaticText
                             // Screen readers get plain text — strip the styling tags used for visual emphasis.
                             Accessible.name: card.modelData.bodyRichText === true
-                                ? text.replace(/<\/?[a-z]+>/gi, "") : text
+                                ? Pure.markupToPlain(text) : text
                         }
                         RowLayout {
                             Layout.fillWidth: true
@@ -233,38 +234,46 @@ Popup {
                                 }
                             }
                         }
-                        Flow {
+                        // A bare Flow in a layout reports one row; the Item reads the
+                        // wrapped height so a second row does not draw over the next card.
+                        Item {
                             Layout.fillWidth: true
+                            Layout.preferredHeight: muteChoices.height
                             visible: card.choosingMute
-                            spacing: root._theme ? root._theme.spacingSm : 8
-                            layoutDirection: Qt.RightToLeft
-                            Repeater {
-                                model: [
-                                    { choice: "1d", key: "label.duration.for-a-day", fallback: "For a day" },
-                                    { choice: "7d", key: "label.duration.for-7-days", fallback: "For 7 days" },
-                                    { choice: "30d", key: "label.duration.for-30-days", fallback: "For 30 days" },
-                                    { choice: "forever", key: "label.duration.forever", fallback: "Forever" }
-                                ]
-                                delegate: ThemedButton {
-                                    required property var modelData
-                                    theme: root._theme
-                                    text: root.tr(modelData.key, modelData.fallback)
-                                    Accessible.name: text
-                                    onClicked: {
-                                        card.choosingMute = false
-                                        if (root.ownerRoot) {
-                                            root.ownerRoot.notificationsController.muteNoticeFor(
-                                                card.modelData.noticeMuteKind, modelData.choice,
-                                                card.modelData.id)
+                            Flow {
+                                id: muteChoices
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                spacing: root._theme ? root._theme.spacingSm : 8
+                                layoutDirection: Qt.RightToLeft
+                                Repeater {
+                                    model: [
+                                        { choice: "1d", key: "label.duration.for-a-day", fallback: "For a day" },
+                                        { choice: "7d", key: "label.duration.for-7-days", fallback: "For 7 days" },
+                                        { choice: "30d", key: "label.duration.for-30-days", fallback: "For 30 days" },
+                                        { choice: "forever", key: "label.duration.forever", fallback: "Forever" }
+                                    ]
+                                    delegate: ThemedButton {
+                                        required property var modelData
+                                        theme: root._theme
+                                        text: root.tr(modelData.key, modelData.fallback)
+                                        Accessible.name: text
+                                        onClicked: {
+                                            card.choosingMute = false
+                                            if (root.ownerRoot) {
+                                                root.ownerRoot.notificationsController.muteNoticeFor(
+                                                    card.modelData.noticeMuteKind, modelData.choice,
+                                                    card.modelData.id)
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            ThemedButton {
-                                theme: root._theme
-                                text: root.tr("action.cancel", "Cancel")
-                                Accessible.name: text
-                                onClicked: card.choosingMute = false
+                                ThemedButton {
+                                    theme: root._theme
+                                    text: root.tr("action.cancel", "Cancel")
+                                    Accessible.name: text
+                                    onClicked: card.choosingMute = false
+                                }
                             }
                         }
                     }

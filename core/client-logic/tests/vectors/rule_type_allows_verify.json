@@ -1,0 +1,17 @@
+{
+  "description": "rules.js ruleTypeAllowsVerify: only a name can be tried on the main link first",
+  "cases": [
+    { "name": "domain", "input": { "ruleType": "domain" }, "expected": true },
+    { "name": "suffix-domain", "input": { "ruleType": "suffix-domain" }, "expected": true },
+    { "name": "exact-fqdn", "input": { "ruleType": "exact-fqdn" }, "expected": true },
+    { "name": "zone", "input": { "ruleType": "zone" }, "expected": false },
+    { "name": "exact-ip", "input": { "ruleType": "exact-ip" }, "expected": false },
+    { "name": "exact-ipv6", "input": { "ruleType": "exact-ipv6" }, "expected": false },
+    { "name": "subnet", "input": { "ruleType": "subnet" }, "expected": false },
+    { "name": "ip-range", "input": { "ruleType": "ip-range" }, "expected": false },
+    { "name": "application", "input": { "ruleType": "application" }, "expected": false },
+    { "name": "empty", "input": { "ruleType": "" }, "expected": false },
+    { "name": "null", "input": { "ruleType": null }, "expected": false },
+    { "name": "case-sensitive", "input": { "ruleType": "Domain" }, "expected": false }
+  ]
+}

@@ -1,0 +1,65 @@
+[package]
+name = "nrr-tui"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# The terminal interface: what the GUI does, minus the GUI's own settings, for a
+# machine reached over SSH or a user who prefers the console. Interactive only —
+# reading and diagnostics from scripts belong to `nrr-cli`.
+#
+# No Qt and no desktop crate at any depth (`tests/dependency_boundary.rs`). Every
+# decision a screen makes goes through `nrr-client-logic`, the same functions the
+# GUI's JS is held to by parity vectors.
+[[bin]]
+name = "nrr-tui"
+path = "src/main.rs"
+
+[dependencies]
+nrr-client-logic = { path = "../../core/client-logic" }
+nrr-ipc-client = { path = "../../core/ipc-client" }
+nrr-shared = { path = "../../shared/contracts" }
+# The service-control and display-language ports; the per-OS implementations
+# below are picked in `platform.rs` and nowhere else.
+nrr-platform-api = { path = "../../core/platform/api" }
+# Full-screen rendering. MIT. Its crossterm backend is the one below, so the
+# event loop and the renderer agree on one terminal. Default features off: no
+# calendar widget (and its `time` dependency), no macros, no layout cache.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+# Raw mode, alternate screen and key events. MIT.
+crossterm = "0.29"
+serde_json = "1"
+# Typed requests and answers of the screens' calls; already linked through
+# nrr-shared.
+serde = "1"
+# The rule dialog's value verdict: the same pure validator the GUI's launcher
+# and the service judge a rule value with. Depends on nrr-shared and idna only.
+nrr-domain = { path = "../../core/domain" }
+# Host names cross the wire in ACE form and show in Unicode, as in the GUI.
+# Already linked through nrr-domain.
+idna = "1"
+# The rules apply's `content-hash`, the SHA-256 the GUI's bridge computes.
+sha2 = "0.10"
+# Rule-set bytes for the preset import, which the service takes base64-encoded.
+# The version the service already links.
+base64 = "0.22"
+# Log and trace times in the reader's local time, as the GUI shows them. The
+# same features the launcher and diagnostics already link: nothing new built.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.dependencies]
+# Service query (is it installed / stopped), display language, DLL search order.
+nrr-platform-windows = { path = "../../core/platform/windows" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# systemd query and the POSIX locale environment: the Unix IPC client cannot
+# tell "stopped" from "not installed" on its own.
+nrr-platform-linux = { path = "../../core/platform/linux" }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "2"
+
+[lints]
+workspace = true

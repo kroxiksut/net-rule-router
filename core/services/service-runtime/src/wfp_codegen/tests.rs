@@ -124,6 +124,7 @@ fn a_shared_address_gets_no_secondary_filter() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
 
     // The main link's own suffix rule still covers the shared address.
@@ -168,6 +169,7 @@ fn exact_ip_rule_emits_single_filter_with_remote_ip() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert_eq!(out.filters.len(), 1);
     let f = &out.filters[0];
@@ -203,6 +205,7 @@ fn exact_fqdn_rule_fans_out_over_cached_ips() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // Packed by slot, so the ADDRESSES are the contract and their order is
     // not: `pack_v4` groups by a hash of the address, deliberately
@@ -256,6 +259,7 @@ fn codegen_output_is_deterministic_and_behaviorally_self_equivalent() {
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     };
 
     let first = generate_filters(input());
@@ -287,6 +291,7 @@ fn codegen_output_is_deterministic_and_behaviorally_self_equivalent() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(
         !behaviorally_equivalent(&first.filters, &other.filters),
@@ -308,6 +313,7 @@ fn exact_fqdn_rule_with_cold_cache_emits_diagnostic_no_filter() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(out.filters.is_empty());
     assert_eq!(
@@ -343,6 +349,7 @@ fn suffix_domain_fans_out_over_cached_subdomains_and_their_ips() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // 1 (api) + 2 (www) = 3 filters
     assert_eq!(out.filters.len(), 3);
@@ -372,6 +379,7 @@ fn suffix_domain_fan_out_includes_the_apex() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let ips: Vec<_> = out.filters.iter().flat_map(destination_ips).collect();
     assert!(
@@ -399,6 +407,7 @@ fn zone_fan_out_still_excludes_the_bare_zone_label() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let ips: Vec<_> = out.filters.iter().flat_map(destination_ips).collect();
     assert_eq!(ips, vec![Ipv4Addr::new(198, 51, 100, 2)]);
@@ -419,6 +428,7 @@ fn suffix_domain_with_only_a_cached_apex_still_emits_a_filter() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert_eq!(out.filters.len(), 1);
     assert!(out.diagnostics.is_empty());
@@ -438,6 +448,7 @@ fn suffix_domain_with_no_cached_subdomains_emits_diagnostic() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(out.filters.is_empty());
     assert_eq!(
@@ -473,6 +484,7 @@ fn suffix_domain_over_many_hosts_keeps_every_address_inside_one_band() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // Packing is why this is now a coverage question rather than a count:
     // 300 hosts fold into a handful of chunk filters, and what must hold is
@@ -534,6 +546,7 @@ fn a_wide_rule_costs_filters_by_slot_not_by_address() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
 
     let covered: std::collections::HashSet<IpAddr> =
@@ -558,6 +571,7 @@ fn a_wide_rule_costs_filters_by_slot_not_by_address() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let ids = |o: &CodegenOutput| -> Vec<u64> {
         let mut v: Vec<u64> = o.filters.iter().map(|f| f.id.raw).collect();
@@ -592,6 +606,7 @@ fn suffix_domain_at_backstop_emits_truncated_diagnostic() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(
         out.diagnostics
@@ -623,6 +638,7 @@ fn zone_fans_out_over_cached_hosts_under_tld() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert_eq!(out.filters.len(), 2);
 }
@@ -641,6 +657,7 @@ fn zone_with_no_cached_hosts_emits_zone_empty_diagnostic() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(out.filters.is_empty());
     assert_eq!(
@@ -670,6 +687,7 @@ fn application_rule_emits_filter_with_app_pattern_and_no_remote_ip() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // The name resolves to one concrete path → one app-id filter carrying the
     // RESOLVED PATH (not the raw name) so `FwpmGetAppIdFromFileName0` can key
@@ -702,6 +720,7 @@ fn app_observed_ips_are_marked_only_for_a_resolved_secondary_route_rule() {
             secondary_ip_denylist: &denylist,
             zone_priority_over_ip: false,
             families: crate::enforcement_planner::FamilyScope::V4Only,
+            packet_blocks: true,
         })
     };
     let resolver =
@@ -746,6 +765,7 @@ fn builtin_vpn_globs_resolve_to_concrete_paths_never_leaving_a_glob() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // `openvpn*` matched the seeded `openvpn.exe` → its concrete path surfaces.
     assert_eq!(
@@ -778,6 +798,7 @@ fn builtin_vpn_globs_unresolved_yield_empty_exempt_set() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(
         out.vpn_default_exempt_paths.is_empty(),
@@ -812,6 +833,7 @@ fn builtin_vpn_exempt_paths_are_deduped_and_sorted() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // Deduped (openvpn.exe seen via two globs) and sorted ascending.
     assert_eq!(
@@ -839,6 +861,7 @@ fn app_rule_with_unresolved_exe_emits_diagnostic_and_no_app_id_filter() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // No ALE_APP_ID (app_pattern) filter — the WFP condition needs a real
     // path, which an unresolved name cannot supply.
@@ -886,6 +909,7 @@ fn glob_app_rule_fans_out_one_app_id_filter_per_resolved_path() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // One ALE_APP_ID filter per resolved path.
     let app_id_filters: Vec<_> = out
@@ -923,6 +947,7 @@ fn resolved_app_id_weight_sits_below_shifted_observation_mirrors() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let app_id = out
         .filters
@@ -957,6 +982,7 @@ fn strict_secondary_fail_closed_emits_block_catch_all() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert_eq!(out.filters.len(), 1);
     let f = &out.filters[0];
@@ -983,6 +1009,7 @@ fn prefer_primary_does_not_emit_default_block() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(out.filters.is_empty());
 }
@@ -1001,6 +1028,7 @@ fn prefer_secondary_when_available_does_not_emit_default_block() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(out.filters.is_empty());
 }
@@ -1024,6 +1052,7 @@ fn disabled_rule_is_skipped_with_diagnostic() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(out.filters.is_empty());
     assert_eq!(
@@ -1058,6 +1087,7 @@ fn repeated_generation_produces_identical_filter_ids() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let b = generate_filters(CodegenInput {
         sid: "S",
@@ -1069,6 +1099,7 @@ fn repeated_generation_produces_identical_filter_ids() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert_eq!(ids(&a), ids(&b));
 }
@@ -1110,6 +1141,7 @@ fn primary_filters_outrank_secondary_filters_by_weight() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let primary_weight = out
         .filters
@@ -1146,6 +1178,7 @@ fn per_sid_user_sid_stamped_on_every_filter() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     for f in &out.filters {
         assert_eq!(f.user_sid.as_deref(), Some("S-1-5-21-XYZ"));
@@ -1169,6 +1202,7 @@ fn different_sids_produce_different_filter_ids() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let b = generate_filters(CodegenInput {
         sid: "S-1-5-21-B",
@@ -1180,6 +1214,7 @@ fn different_sids_produce_different_filter_ids() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert_ne!(a.filters[0].id.raw, b.filters[0].id.raw);
 }
@@ -1203,6 +1238,7 @@ fn primary_and_secondary_rule_with_same_id_produce_different_filter_ids() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let ids: Vec<u64> = out.filters.iter().map(|f| f.id.raw).collect();
     assert_eq!(ids.len(), 2);
@@ -1231,6 +1267,7 @@ fn fanout_idx_keeps_filter_ids_unique_for_multi_ip_hostname() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     let ids: std::collections::HashSet<u64> = out.filters.iter().map(|f| f.id.raw).collect();
     assert_eq!(ids.len(), 3, "fan-out per IP must yield distinct ids");
@@ -1250,6 +1287,7 @@ fn no_rule_no_strict_mode_yields_empty_output() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(out.is_empty());
     assert!(out.diagnostics.is_empty());
@@ -1274,6 +1312,7 @@ fn secondary_dest_ips_collects_only_secondary_rule_ips() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert_eq!(
         out.secondary_dest_ips,
@@ -1305,6 +1344,7 @@ fn secondary_dest_ips_dedupes_across_rules_and_fanout() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert_eq!(
         out.secondary_dest_ips,
@@ -1343,6 +1383,7 @@ fn an_app_rule_does_not_take_over_an_address_a_main_route_rule_names() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
 
     assert!(
@@ -1394,6 +1435,7 @@ fn an_app_whose_every_address_was_claimed_is_not_reported_as_unobserved() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     assert!(
         out.diagnostics
@@ -1431,6 +1473,7 @@ fn an_app_rule_still_claims_addresses_nobody_else_named() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
 
     assert!(out.secondary_dest_ips.contains(&IpAddr::V4(only_app)));
@@ -1452,6 +1495,7 @@ fn secondary_dest_ips_skips_app_match_rules() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // The resolved app-id filter carries an `app_pattern` but no `remote_ip`,
     // so it contributes nothing to the kill-switch's protected dest set.
@@ -1486,6 +1530,7 @@ fn app_rule_routes_observed_ips_as_secondary_dest() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // The app's observed IPs become secondary /32 destinations the
     // kill-switch protects — same as a domain rule's resolved IPs.
@@ -1524,6 +1569,7 @@ fn secondary_app_patterns_collects_secondary_route_apps() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // The resolved path — not the raw name — is what the per-app kill-switch
     // pins, so `secondary_app_patterns` now carries it.
@@ -1566,6 +1612,7 @@ fn secondary_app_patterns_excludes_primary_and_block_apps() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // Only the secondary ROUTE app is protected: the primary app uses the
     // primary NIC (never killed), and the block app is being dropped, not
@@ -1600,6 +1647,7 @@ fn block_rule_emits_ale_and_packet_block_at_block_band() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // Exactly two filters: an ALE-layer block and a packet-layer mirror.
     assert_eq!(out.filters.len(), 2);
@@ -1651,6 +1699,7 @@ fn block_rule_ip_is_excluded_from_secondary_dest_ips() {
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
     });
     // Only the routed (Permit) destination is protected by the kill-switch;
     // a dropped destination must never be handed to it.
@@ -1676,6 +1725,7 @@ fn block_filter_ids_are_deterministic_across_reapply() {
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
             families: crate::enforcement_planner::FamilyScope::V4Only,
+            packet_blocks: true,
         })
     };
     let a = mk();
@@ -1761,6 +1811,7 @@ fn an_app_and_address_rule_is_skipped_whole_for_either_action() {
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
             families: crate::enforcement_planner::FamilyScope::V4Only,
+            packet_blocks: true,
         });
         assert!(
             out.filters.iter().all(|f| f.app_pattern.is_none()

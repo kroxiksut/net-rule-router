@@ -970,6 +970,10 @@ function refusalDetail(code, args) {
         return { key: "errors.network-covers-fake-ip-pool-named",
                  values: { network: network } }
     }
+    if (code === "network-on-both-routes") {
+        return { key: "errors.network-on-both-routes-named",
+                 values: { network: network } }
+    }
     return null
 }
 
@@ -980,6 +984,21 @@ function fillPlaceholders(text, values) {
         out = out.split("{" + name + "}").join(String(values[name]))
     }
     return out
+}
+
+// A value placed into StyledText. A name learned from DNS or the service may
+// carry `<` or `&`; escaped, it reads as itself instead of styling the text.
+function escapeMarkup(text) {
+    return String(text === undefined || text === null ? "" : text)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
+// What a screen reader gets from a StyledText body: the emphasis tags dropped
+// and the entities `escapeMarkup` wrote turned back into their characters.
+function markupToPlain(text) {
+    return String(text === undefined || text === null ? "" : text)
+        .replace(/<\/?[a-z]+>/gi, "")
+        .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
 }
 
 // ---- "Don't show…" for whole notice kinds ----
@@ -1406,6 +1425,24 @@ function buildFullRoutePolicyReq(cur, modeFallback) {
     // must never be echoed back from a snapshot.
     req["binding-source"] = "user-assigned"
     return req
+}
+
+// The fields `req` changes against the full request `base` built from the
+// same snapshot: what an `apply-only` write names, so a concurrent write from
+// the tray or the window is not reverted by one that merely restated it.
+// `binding-source` is the write's provenance, sent with every write.
+function routePolicyChangedKeys(base, req) {
+    var keys = {}
+    var key
+    for (key in base) keys[key] = true
+    for (key in req) keys[key] = true
+    var changed = []
+    for (key in keys) {
+        if (key === "binding-source" || key === "apply-only") continue
+        if (JSON.stringify(base[key]) !== JSON.stringify(req[key])) changed.push(key)
+    }
+    changed.sort()
+    return changed
 }
 
 // ---- adapter bindings: the service's view against the app's own ----

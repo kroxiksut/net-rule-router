@@ -1,0 +1,24 @@
+Service: OK
+┌> Screens─────────────────┐┌Addresses your sites need─────────────────────────┐
+│  1 Status                ││These addresses were pulled in by sites you route.│
+│  2 First run             ││Adding one sends it through the additional route  │
+│  3 Interfaces and routes ││together with the site that needs it. Anything you│
+│  4 Rules                 ││leave alone keeps going through the main route.   │
+│  5 Overlaps              ││Mode: Suggest only (default)                      │
+│> 6 Suggested addresses   ││Sort: What the main route can't reach first       │
+│  7 Connection trace      ││Show answered (1): No                             │
+│  8 Cache                 ││Show ones the main connection already handles (1):│
+│  9 Diagnostics and logs  ││No                                                │
+│  0 Settings              ││                                                  │
+│                          ││                                                  │
+│                          │└──────────────────────────────────────────────────┘
+│                          │┌Suggested addresses───────────────────────────────┐
+│                          ││1. example.org — Pending (1)                      │
+│                          ││   Needed by: news.example, shop.example          │
+│                          ││   *.video.example.org — Pending; connections to  │
+│                          ││it stall on the main route                        │
+│                          ││     keeps appearing together with the site · seen│
+│                          ││in 4 visits · belongs to this site 75% of the time│
+│                          ││     The rule covers every name under             │
+└──────────────────────────┘└──────────────────────────────────────────────────┘
+F1: help   q: quit

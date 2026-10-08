@@ -413,6 +413,7 @@ mod tests {
     use crate::block_notice_mute_store::InMemoryBlockNoticeMuteStore;
     use crate::ipc::{IpcOperationClass, IPC_PROTOCOL_VERSION};
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
     use std::sync::Mutex;
 
     fn ctx(sid: Option<&str>) -> IpcRequestContext {
@@ -529,6 +530,17 @@ mod tests {
                 host: "cdn.example".into()
             }
         );
+
+        // The other surface hears about the change.
+        let pending = bus.peek_pending_for(&sub.subscription_id, 10);
+        assert!(
+            matches!(
+                pending.as_slice(),
+                [e] if matches!(&e.event, StatusUpdateEvent::BlockNoticeMutesChanged { sid } if sid == "S-A")
+            ),
+            "{pending:?}"
+        );
+        bus.advance_cursor(&sub.subscription_id, pending[0].event_id);
 
         center.record("S-A", &notice("cdn.example"));
         assert!(

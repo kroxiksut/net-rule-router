@@ -45,7 +45,7 @@ use nrr_shared::RouteRole;
 /// A destination address match. Family-specific catch-alls are expressed as a
 /// `/0` subnet (`SubnetV4 { 0.0.0.0, 0 }` = all IPv4; `SubnetV6 { ::, 0 }` = all
 /// IPv6), distinct from the family-agnostic [`DstMatch::Any`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DstMatch {
     /// Any destination, any address family.
     Any,
@@ -61,7 +61,7 @@ pub enum DstMatch {
 
 /// An IP-layer transport protocol. `Other(n)` carries an IANA protocol number
 /// for anything not individually named (e.g. IPv6 ICMP variants, SCTP).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum L4Proto {
     Tcp,
     Udp,
@@ -76,7 +76,7 @@ pub enum L4Proto {
 
 /// A 5-tuple-style flow match. `dst_port` / `protocol` of `None` mean
 /// "unconstrained on that field".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FlowMatch {
     pub dst: DstMatch,
     pub dst_port: Option<u16>,
@@ -84,7 +84,7 @@ pub struct FlowMatch {
 }
 
 /// The action a [`FlowRule`] takes on a matching flow.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Verdict {
     Permit,
     Block,
@@ -105,7 +105,7 @@ pub enum Verdict {
 /// kill-switch blocks (`0x0030_0000`) > route rules > the catch-all block
 /// (`0x0018_0000`) > the default. A [`PrecedenceClass::HardBlock`] is the
 /// terminal veto (the `CLEAR_ACTION_RIGHT` analog).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PrecedenceClass {
     /// The base band: unmatched traffic follows the default route (allow).
     DefaultCatchAll,
@@ -186,7 +186,7 @@ pub const SLOTS_PER_RULE: u64 = 256;
 /// different slot ranges by construction.
 pub const APP_PATH_FANOUT_CAP: u64 = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Precedence {
     pub class: PrecedenceClass,
     pub ordinal: u32,
@@ -207,19 +207,19 @@ impl Precedence {
 }
 
 /// Which principal a rule applies to. `None` is system-wide (no per-user scope).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PrincipalScope(pub Option<UserPrincipal>);
 
 /// A neutral stable adapter identity. On Windows this resolves to a LUID, on
 /// Linux to an interface name — at lowering time, never in the plan. It is the
 /// persistent adapter identity (not an ephemeral ifindex).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AdapterId(pub String);
 
 /// Which application(s) a rule applies to. `exe_paths` is a Windows-only
 /// consumer (`ALE_APP_ID`); Linux ignores it (no per-exe nft match) and enforces
 /// app rules via observed destinations until the eBPF fwmark port ships.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AppScope {
     /// Any application.
     Any,
@@ -240,7 +240,7 @@ pub enum AppScope {
 
 /// A reference to an egress interface, resolved to a LUID (Windows) or ifname
 /// (Linux) at lowering time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EgressRef {
     Primary,
     Secondary,
@@ -250,7 +250,7 @@ pub enum EgressRef {
 /// The egress pin, carried AS AN ATTRIBUTE of a rule (not a separate mechanism).
 /// `OnlyVia` is the leak-proof pin: on Windows it lowers to the permit(luid) +
 /// block pair; on Linux to `oifname <dev> accept` followed by a scoped drop.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EgressConstraint {
     Any,
     OnlyVia(EgressRef),
@@ -260,7 +260,7 @@ pub enum EgressConstraint {
 /// hold at the packet layer (Windows adds an ALE + packet-layer mirror so
 /// ICMP/IGMP/GRE/ESP are covered); Linux collapses this — its single output
 /// hook already sees every protocol.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Coverage {
     ConnectOnly,
     AllPackets,
@@ -268,7 +268,7 @@ pub enum Coverage {
 
 /// One neutral enforcement rule. The ordered list of these (by [`Precedence`])
 /// is the arbitration surface both lowerings realise.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FlowRule {
     pub verdict: Verdict,
     pub precedence: Precedence,
@@ -301,7 +301,7 @@ pub enum RouteTableRef {
 }
 
 /// A single route intent: destination → egress, in a table, at a metric.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RouteIntent {
     pub dst: DstMatch,
     pub egress: EgressRef,
@@ -358,24 +358,29 @@ pub struct PlanDelta {
 /// arbitration surface where ordering matters); a routes/policy delta is a
 /// follow-up if a caller needs it.
 pub fn plan_delta(old: &EnforcementPlan, new: &EnforcementPlan) -> PlanDelta {
+    use std::collections::HashSet;
+    // Hashed: a plan holds thousands of flows, and it changes whenever a rule
+    // host gains an address.
+    let in_old: HashSet<&FlowRule> = old.flows.iter().collect();
+    let in_new: HashSet<&FlowRule> = new.flows.iter().collect();
     let added = new
         .flows
         .iter()
         .enumerate()
-        .filter(|(_, f)| !old.flows.contains(f))
+        .filter(|(_, f)| !in_old.contains(f))
         .map(|(i, _)| i)
         .collect();
     let removed = old
         .flows
         .iter()
         .enumerate()
-        .filter(|(_, f)| !new.flows.contains(f))
+        .filter(|(_, f)| !in_new.contains(f))
         .map(|(i, _)| i)
         .collect();
     // Among the flows present in BOTH plans, has their relative order changed?
-    let common_old: Vec<&FlowRule> = old.flows.iter().filter(|f| new.flows.contains(f)).collect();
-    let common_new: Vec<&FlowRule> = new.flows.iter().filter(|f| old.flows.contains(f)).collect();
-    let reordered = common_old != common_new;
+    let common_old = old.flows.iter().filter(|f| in_new.contains(f));
+    let common_new = new.flows.iter().filter(|f| in_old.contains(f));
+    let reordered = !common_old.eq(common_new);
     PlanDelta {
         added,
         removed,
@@ -546,8 +551,20 @@ pub trait PolicyEnforcer: Send + Sync {
     /// is why it is asked every pass rather than cached.
     fn channel_availability(&self, principal: &UserPrincipal) -> ChannelAvailability;
 
+    /// Which link each of the principal's connections leaves through, so a
+    /// sweep spares one riding a link that is neither of theirs. The default
+    /// knows no link, which spares nothing.
+    fn flow_links(&self, _principal: &UserPrincipal) -> crate::fake_ip::stale_flows::FlowLinks {
+        crate::fake_ip::stale_flows::FlowLinks::default()
+    }
+
     /// Remove everything this product installed, and nothing else.
     fn teardown(&self) -> Result<(), EnforcementFailure>;
+
+    /// The next [`Self::enforce`] must confirm with the platform that what it
+    /// installed is still there before trusting an unchanged plan — for an
+    /// explicit apply, which may follow somebody else flushing our rules.
+    fn distrust_installed(&self) {}
 }
 
 /// Why enforcement could not be carried out, and whether trying again can help.

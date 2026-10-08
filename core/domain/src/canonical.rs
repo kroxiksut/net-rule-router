@@ -74,6 +74,11 @@ pub enum RuleAction {
     Route,
     /// Drop matching traffic with a hard WFP block; install no route.
     Block,
+    /// Written in the secondary set as `?host`: routed via the PRIMARY route
+    /// until the service confirms the primary cannot reach the host, then
+    /// rewritten to [`Self::Route`]. Enforcement sees it only as a primary
+    /// `Route` (see `CanonicalRuleBook::with_verify_primary_effective`).
+    VerifyPrimary,
 }
 
 impl RuleAction {
@@ -287,6 +292,7 @@ impl CanonicalRule {
             match rule.action {
                 RuleAction::Route => 0,
                 RuleAction::Block => 1,
+                RuleAction::VerifyPrimary => 2,
             }
         }
         fn origin(rule: &CanonicalRule) -> Option<(&str, &str, &str)> {
@@ -400,6 +406,34 @@ impl CanonicalRuleSet {
         CanonicalRuleSet::from_rules(out)
     }
 
+    /// The inverse of [`Self::with_subdomain_coverage`]: drops the synthetic
+    /// `<id>+sub` twins of exact rules. `None` when there is none. A twin that
+    /// differs from what its apex derives was edited as a rule in the list, so
+    /// it is the user's and stays.
+    fn without_subdomain_twins(&self) -> Option<CanonicalRuleSet> {
+        let is_twin = |r: &CanonicalRule| {
+            let (Some(apex_id), Some(CanonicalAddressMatch::SuffixDomain(d))) =
+                (r.id.0.strip_suffix("+sub"), &r.address_match)
+            else {
+                return false;
+            };
+            self.rules.iter().any(|apex| {
+                apex.id.0 == apex_id
+                    && matches!(&apex.address_match, Some(CanonicalAddressMatch::ExactFqdn(a)) if a == d)
+                    && apex.app_match == r.app_match
+                    && apex.enabled == r.enabled
+                    && apex.action == r.action
+                    && apex.comment == r.comment
+                    && r.origin.is_none()
+            })
+        };
+        if !self.rules.iter().any(is_twin) {
+            return None;
+        }
+        let kept = self.rules.iter().filter(|r| !is_twin(r)).cloned().collect();
+        Some(CanonicalRuleSet::from_rules(kept))
+    }
+
     /// Number of currently enabled rules.
     pub fn enabled_count(&self) -> usize {
         self.rules.iter().filter(|r| r.enabled).count()
@@ -446,6 +480,65 @@ impl CanonicalRuleBook {
             primary: self.primary.with_subdomain_coverage(),
             secondary: self.secondary.with_subdomain_coverage(),
         }
+    }
+
+    /// The book as enforcement must see it: a `?host` rule is "primary until
+    /// proven otherwise", so every [`RuleAction::VerifyPrimary`] rule becomes a
+    /// primary `Route`. Enforcement-only, like [`Self::with_subdomain_coverage`]
+    /// and applied before it; never stored, hashed or written back.
+    pub fn with_verify_primary_effective(&self) -> CanonicalRuleBook {
+        let is_verify = |r: &CanonicalRule| r.action == RuleAction::VerifyPrimary;
+        if !self
+            .primary
+            .rules
+            .iter()
+            .chain(&self.secondary.rules)
+            .any(is_verify)
+        {
+            return self.clone();
+        }
+        let as_route = |r: &CanonicalRule| {
+            if is_verify(r) {
+                CanonicalRule {
+                    action: RuleAction::Route,
+                    ..r.clone()
+                }
+            } else {
+                r.clone()
+            }
+        };
+        let primary = self
+            .primary
+            .rules
+            .iter()
+            .chain(self.secondary.rules.iter().filter(|r| is_verify(r)))
+            .map(as_route)
+            .collect();
+        let secondary = self
+            .secondary
+            .rules
+            .iter()
+            .filter(|r| !is_verify(r))
+            .cloned()
+            .collect();
+        CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(primary),
+            secondary: CanonicalRuleSet::from_rules(secondary),
+        }
+    }
+
+    /// This book without the twins [`Self::with_subdomain_coverage`] adds, for
+    /// a stored book a writer once saved widened. `None` when it is clean.
+    pub fn without_subdomain_twins(&self) -> Option<CanonicalRuleBook> {
+        let primary = self.primary.without_subdomain_twins();
+        let secondary = self.secondary.without_subdomain_twins();
+        if primary.is_none() && secondary.is_none() {
+            return None;
+        }
+        Some(CanonicalRuleBook {
+            primary: primary.unwrap_or_else(|| self.primary.clone()),
+            secondary: secondary.unwrap_or_else(|| self.secondary.clone()),
+        })
     }
 }
 
@@ -763,6 +856,109 @@ mod tests {
     }
 
     // ── subdomain-coverage expansion ──────────────────────────────────────────
+
+    #[test]
+    fn a_verify_primary_rule_is_enforced_as_a_primary_route_and_nothing_else_moves() {
+        let verify = CanonicalRule {
+            action: RuleAction::VerifyPrimary,
+            ..suffix_rule("s-verify", "proton.example")
+        };
+        let block = CanonicalRule {
+            action: RuleAction::Block,
+            ..exact_fqdn_rule("p-block", "ads.example")
+        };
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![block.clone()]),
+            secondary: CanonicalRuleSet::from_rules(vec![
+                exact_fqdn_rule("s-route", "chat.example"),
+                verify.clone(),
+            ]),
+        };
+        let effective = book.with_verify_primary_effective();
+        assert_eq!(
+            effective.primary,
+            CanonicalRuleSet::from_rules(vec![
+                block,
+                CanonicalRule {
+                    action: RuleAction::Route,
+                    ..verify
+                },
+            ])
+        );
+        assert_eq!(
+            effective.secondary,
+            CanonicalRuleSet::from_rules(vec![exact_fqdn_rule("s-route", "chat.example")])
+        );
+        let plain = effective.clone();
+        assert_eq!(
+            plain.with_verify_primary_effective(),
+            effective,
+            "nothing left to move"
+        );
+    }
+
+    #[test]
+    fn a_widened_book_written_back_is_restored_and_user_suffix_rules_stay() {
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![exact_fqdn_rule("p1", "main.example")]),
+            secondary: CanonicalRuleSet::from_rules(vec![
+                exact_fqdn_rule("r1", "site.example"),
+                // The user's own suffix rule, even one whose id looks synthetic.
+                suffix_rule("r9+sub", "other.example"),
+            ]),
+        };
+        assert_eq!(
+            book.without_subdomain_twins(),
+            None,
+            "a clean book stays as is"
+        );
+        let widened = book.with_subdomain_coverage();
+        assert_eq!(widened.total_rule_count(), 5);
+        assert_eq!(widened.without_subdomain_twins(), Some(book));
+    }
+
+    #[test]
+    fn a_twin_edited_apart_from_its_apex_is_the_users_rule() {
+        let apex = exact_fqdn_rule("r1", "site.example");
+        let widened = CanonicalRuleBook {
+            primary: CanonicalRuleSet::default(),
+            secondary: CanonicalRuleSet::from_rules(vec![apex.clone()]),
+        }
+        .with_subdomain_coverage();
+        let twin = widened
+            .secondary
+            .rules()
+            .iter()
+            .find(|r| r.id.0 == "r1+sub")
+            .cloned()
+            .expect("twin");
+        // Positive control: the twin as derived is dropped.
+        assert!(widened.without_subdomain_twins().is_some());
+
+        // The apex switched off, the twin left on: the user kept subdomains.
+        let apex_off = CanonicalRule {
+            enabled: false,
+            ..apex.clone()
+        };
+        let kept = CanonicalRuleBook {
+            primary: CanonicalRuleSet::default(),
+            secondary: CanonicalRuleSet::from_rules(vec![apex_off, twin.clone()]),
+        };
+        assert_eq!(kept.without_subdomain_twins(), None);
+
+        // A twin with its own comment is no longer the derived one either.
+        let commented = CanonicalRuleBook {
+            primary: CanonicalRuleSet::default(),
+            secondary: CanonicalRuleSet::from_rules(vec![
+                apex,
+                CanonicalRule {
+                    comment: "kept on purpose".into(),
+                    ..twin
+                },
+            ]),
+        };
+        assert_eq!(commented.without_subdomain_twins(), None);
+    }
 
     #[test]
     fn subdomain_coverage_adds_suffix_and_keeps_apex() {

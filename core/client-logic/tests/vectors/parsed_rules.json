@@ -1,0 +1,17 @@
+{
+  "description": "rules.js parsedRuleTargetRoute / driftRowFromParsedRule over one `preset.parse` rule read from the file of `route`",
+  "cases": [
+    { "name": "primary file plain", "input": { "route": "primary", "rule": { "id-hint": 1, "enabled": true, "rule-type": "domain", "section-name": "Domains", "match-value": "site.example", "comment": "", "line-number": 7 } } },
+    { "name": "secondary file plain", "input": { "route": "secondary", "rule": { "id-hint": 2, "enabled": true, "rule-type": "zone", "section-name": "Zones", "match-value": "example", "comment": "", "line-number": 8 } } },
+    { "name": "block in primary file", "input": { "route": "primary", "rule": { "id-hint": 3, "enabled": true, "rule-type": "domain", "section-name": "Domains", "match-value": "ads.example", "comment": "", "blocked": true, "line-number": 9 } } },
+    { "name": "block in secondary file", "input": { "route": "secondary", "rule": { "id-hint": 4, "enabled": false, "rule-type": "exact-ip", "section-name": "IP", "match-value": "192.0.2.7", "comment": "", "blocked": true, "line-number": 10 } } },
+    { "name": "verify in secondary file", "input": { "route": "secondary", "rule": { "id-hint": 5, "enabled": true, "rule-type": "domain", "section-name": "Domains", "match-value": "shop.example", "comment": "", "verify-primary": true, "line-number": 11 } } },
+    { "name": "verify means nothing in primary file", "input": { "route": "primary", "rule": { "id-hint": 6, "enabled": true, "rule-type": "domain", "section-name": "Domains", "match-value": "shop.example", "comment": "", "verify-primary": true, "line-number": 12 } } },
+    { "name": "block wins over verify", "input": { "route": "secondary", "rule": { "id-hint": 7, "enabled": true, "rule-type": "domain", "section-name": "Domains", "match-value": "both.example", "comment": "", "blocked": true, "verify-primary": true, "line-number": 13 } } },
+    { "name": "explicit false flags", "input": { "route": "secondary", "rule": { "id-hint": 8, "enabled": true, "rule-type": "subnet", "section-name": "CIDR", "match-value": "198.51.100.0/24", "comment": "", "blocked": false, "verify-primary": false, "line-number": 14 } } },
+    { "name": "range in primary", "input": { "route": "primary", "rule": { "id-hint": 9, "enabled": true, "rule-type": "ip-range", "section-name": "Ranges", "match-value": "192.0.2.10-192.0.2.20", "comment": "x", "line-number": 15 } } },
+    { "name": "application disabled", "input": { "route": "secondary", "rule": { "id-hint": 10, "enabled": false, "rule-type": "application", "section-name": "Windows", "match-value": "client.exe", "comment": "", "line-number": 16 } } },
+    { "name": "auto rule keeps only routing", "input": { "route": "secondary", "rule": { "id-hint": 11, "enabled": true, "rule-type": "domain", "section-name": "Auto", "match-value": "img.site.example", "comment": "note", "origin": { "kind": "auto", "reason": "site-companion", "anchor": "site.example", "added": "2026-01-01" }, "line-number": 17 } } },
+    { "name": "unicode host", "input": { "route": "primary", "rule": { "id-hint": 12, "enabled": true, "rule-type": "domain", "section-name": "Domains", "match-value": "пример.рф", "comment": "", "line-number": 18 } } }
+  ]
+}

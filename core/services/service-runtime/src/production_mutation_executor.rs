@@ -261,11 +261,18 @@ impl ProductionMutationExecutor {
     fn parse_rules_payload(
         payload: &serde_json::Value,
     ) -> Result<RulesUpdatePayload, OperationError> {
-        serde_json::from_value::<RulesUpdatePayload>(payload.clone()).map_err(|e| OperationError {
-            args: Default::default(),
-            code: "malformed-payload".into(),
-            message: format!("RulesUpdate payload invalid: {e}"),
-        })
+        let parsed =
+            serde_json::from_value::<RulesUpdatePayload>(payload.clone()).map_err(|e| {
+                OperationError {
+                    args: Default::default(),
+                    code: "malformed-payload".into(),
+                    message: format!("RulesUpdate payload invalid: {e}"),
+                }
+            })?;
+        match unrecognized::unreadable_submitted_rule(&parsed.rules_json) {
+            Some(refusal) => Err(refusal),
+            None => Ok(parsed),
+        }
     }
 
     /// The gates `submit_candidate` enforces (rule shape, control characters,
@@ -299,7 +306,11 @@ impl ProductionMutationExecutor {
             rules_json,
             carried.as_deref(),
         );
-        (!refused.is_empty()).then(|| invalid_rule_value_summary(&refused))
+        if !refused.is_empty() {
+            return Some(invalid_rule_value_summary(&refused));
+        }
+        crate::activation_coordinator::network_on_both_routes(rules_json, carried.as_deref())
+            .map(|network| refused_summary(&network_on_both_routes_error(&network)))
     }
 
     /// Defense-in-depth rule caps on every write: the user's own rules up to
@@ -518,9 +529,8 @@ impl ProductionMutationExecutor {
     /// a typed wire code; the rule author reaches this executor without any
     /// handler, so this is the gate that holds for it.
     fn gate_refusal(&self, stored: &StoredMutation, principal: &str) -> Option<OperationError> {
-        if stored.kind.changes_rules()
-            && !rule_edits_allowed_for(self.stability.as_ref(), stored.caller_is_elevated)
-        {
+        let error = self.refusal_at_gate(stored.kind, stored.caller_is_elevated)?;
+        if error.code == RULES_LOCKED_ERROR_CODE {
             tracing::warn!(
                 target: "nrr::mutation::execute",
                 msg_key = "prod-mutation-locked",
@@ -528,6 +538,27 @@ impl ProductionMutationExecutor {
                 principal = %principal,
                 "mutation refused — rule changes are locked by the administrator",
             );
+        } else {
+            tracing::warn!(
+                target: "nrr::mutation::execute",
+                msg_key = "prod-mutation-security-alert-active",
+                kind = ?stored.kind,
+                principal = %principal,
+                "mutation refused — a security alert must be acknowledged first",
+            );
+        }
+        Some(error)
+    }
+
+    /// [`Self::gate_refusal`] without its log line: the answer alone.
+    fn refusal_at_gate(
+        &self,
+        kind: MutationKind,
+        caller_is_elevated: bool,
+    ) -> Option<OperationError> {
+        if kind.changes_rules()
+            && !rule_edits_allowed_for(self.stability.as_ref(), caller_is_elevated)
+        {
             return Some(OperationError {
                 args: Default::default(),
                 code: RULES_LOCKED_ERROR_CODE.into(),
@@ -535,17 +566,7 @@ impl ProductionMutationExecutor {
             });
         }
         let repo = self.alerts_repo.as_ref()?;
-        if !mutation_refused_by_alert(stored.kind, repo.as_ref()) {
-            return None;
-        }
-        tracing::warn!(
-            target: "nrr::mutation::execute",
-            msg_key = "prod-mutation-security-alert-active",
-            kind = ?stored.kind,
-            principal = %principal,
-            "mutation refused — a security alert must be acknowledged first",
-        );
-        Some(OperationError {
+        mutation_refused_by_alert(kind, repo.as_ref()).then(|| OperationError {
             args: Default::default(),
             code: SECURITY_ALERT_GATE_CODE.into(),
             message: SECURITY_ALERT_GATE_MESSAGE.into(),
@@ -667,6 +688,10 @@ impl MutationExecutor for ProductionMutationExecutor {
             MutationKind::AuditChainRestart => self.audit_chain_restart_preview(),
             _ => None,
         }
+    }
+
+    fn closed_gate(&self, kind: MutationKind, caller_is_elevated: bool) -> Option<OperationError> {
+        self.refusal_at_gate(kind, caller_is_elevated)
     }
 
     fn execute(&self, stored: StoredMutation, principal: &str) -> MutationOutcome {
@@ -1285,9 +1310,13 @@ struct ScoredCandidate {
 fn map_rule_entry(
     entry: &nrr_domain::review::RuleSummaryEntry,
 ) -> nrr_shared::ipc_payloads::RuleSummaryEntryDto {
-    let route_slug = match entry.route {
-        nrr_domain::RouteRole::Primary => "primary",
-        nrr_domain::RouteRole::Secondary => "secondary",
+    // The same slugs the rules list uses, so the review labels a block and a
+    // `?host` rule the way the table does.
+    let route_slug = match (entry.action, entry.route) {
+        (nrr_domain::RuleAction::Block, _) => "block",
+        (nrr_domain::RuleAction::VerifyPrimary, _) => "verify",
+        (nrr_domain::RuleAction::Route, nrr_domain::RouteRole::Primary) => "primary",
+        (nrr_domain::RuleAction::Route, nrr_domain::RouteRole::Secondary) => "secondary",
     };
     nrr_shared::ipc_payloads::RuleSummaryEntryDto {
         id: entry.id.clone(),
@@ -1596,6 +1625,17 @@ fn control_character_error(rule_id: &str, field: &str) -> OperationError {
 /// Rows whose value the rules table marks as an error, named by id. The values
 /// reach the GUI only through the preview: a mutation's outcome code is
 /// announced to every session.
+/// The GUI's `errors.<code>` for one network written on both routes.
+const NETWORK_ON_BOTH_ROUTES_CODE: &str = "network-on-both-routes";
+
+fn network_on_both_routes_error(network: &str) -> OperationError {
+    OperationError {
+        args: std::collections::BTreeMap::from([("network".to_owned(), network.to_owned())]),
+        code: NETWORK_ON_BOTH_ROUTES_CODE.into(),
+        message: format!("the network {network} is on both routes; give it one route"),
+    }
+}
+
 fn invalid_rule_value_error(rules: &[RefusedRuleValue]) -> OperationError {
     let ids: Vec<&str> = rules.iter().map(|r| r.rule_id.as_str()).collect();
     OperationError {
@@ -1709,6 +1749,9 @@ fn policy_error(err: &PolicyError) -> OperationError {
         }
         PolicyError::InvalidRuleValue { rules } => {
             return invalid_rule_value_error(rules);
+        }
+        PolicyError::NetworkOnBothRoutes { network } => {
+            return network_on_both_routes_error(network);
         }
     };
     OperationError {
