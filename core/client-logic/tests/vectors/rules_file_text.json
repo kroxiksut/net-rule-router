@@ -23,14 +23,22 @@
         { "enabled": true, "ruleType": "domain", "matchValue": "one.example", "targetRoute": "primary" },
         { "enabled": true, "ruleType": "domain", "matchValue": "two.example", "targetRoute": "secondary" },
         { "enabled": true, "ruleType": "domain", "matchValue": "three.example", "targetRoute": "block" },
-        { "enabled": true, "ruleType": "domain", "matchValue": "four.example", "targetRoute": "verify" },
+        { "enabled": true, "ruleType": "domain", "matchValue": "four.example", "targetRoute": "secondary", "verify": true },
         { "enabled": true, "ruleType": "domain", "matchValue": "five.example", "targetRoute": "" }
       ] } },
-    { "name": "pseudo-routes in the secondary file", "input": { "route": "secondary", "rows": [
+    { "name": "block and verify in the secondary file", "input": { "route": "secondary", "rows": [
         { "enabled": true, "ruleType": "domain", "matchValue": "ads.example", "targetRoute": "block" },
-        { "enabled": false, "ruleType": "domain", "matchValue": "shop.example", "targetRoute": "verify", "comment": "try main first" },
+        { "enabled": false, "ruleType": "domain", "matchValue": "shop.example", "targetRoute": "secondary", "verify": true, "comment": "check where it works" },
         { "enabled": false, "ruleType": "exact-ip", "matchValue": "192.0.2.9", "targetRoute": "block" },
-        { "enabled": true, "ruleType": "subnet", "matchValue": "198.51.100.0/24", "targetRoute": "verify" }
+        { "enabled": true, "ruleType": "domain", "matchValue": "blocked.example", "targetRoute": "block", "verify": true },
+        { "enabled": true, "ruleType": "subnet", "matchValue": "198.51.100.0/24", "targetRoute": "secondary", "verify": true },
+        { "enabled": true, "ruleType": "exact-ipv6", "matchValue": "2001:db8::9", "targetRoute": "secondary", "verify": true }
+      ] } },
+    { "name": "verify in the primary file", "input": { "route": "primary", "rows": [
+        { "enabled": true, "ruleType": "suffix-domain", "matchValue": "*.mail.example", "targetRoute": "primary", "verify": true },
+        { "enabled": false, "ruleType": "exact-ip", "matchValue": "192.0.2.7", "targetRoute": "primary", "verify": true },
+        { "enabled": true, "ruleType": "zone", "matchValue": "example", "targetRoute": "primary", "verify": true },
+        { "enabled": true, "ruleType": "domain", "matchValue": "auto.example", "targetRoute": "primary", "verify": true, "originReason": "site-companion", "originAnchor": "site.example" }
       ] } },
     { "name": "comments kept and stripped", "input": { "route": "primary", "includeComments": false, "rows": [
         { "enabled": true, "ruleType": "zone", "matchValue": "example", "targetRoute": "primary", "comment": "dropped" },

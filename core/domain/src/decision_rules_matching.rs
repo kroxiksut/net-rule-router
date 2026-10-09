@@ -415,7 +415,7 @@ fn action_rank(action: RuleAction) -> u8 {
     match action {
         RuleAction::Block => 0,
         // Enforced as a primary Route; a projected book never holds it.
-        RuleAction::Route | RuleAction::VerifyPrimary => 1,
+        RuleAction::Route | RuleAction::Verify => 1,
     }
 }
 

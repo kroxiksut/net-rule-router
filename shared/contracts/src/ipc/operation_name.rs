@@ -160,6 +160,13 @@ pub enum IpcOperationName {
     /// [`crate::ipc_payloads::ConnTraceEntriesListRequest`] →
     /// [`crate::ipc_payloads::ConnTraceEntriesListResponse`].
     ConnTraceEntriesList,
+    /// What leak protection blocked during the caller's last outage of the
+    /// additional route, folded by program and destination. Always the
+    /// caller's own; in memory only. Query op (no mutation queue, no
+    /// elevation). Payload schema:
+    /// [`crate::ipc_payloads::ConnTraceOutageBlocksRequest`] →
+    /// [`crate::ipc_payloads::ConnTraceOutageBlocksResponse`].
+    ConnTraceOutageBlocksList,
     /// Read the operational-log + audit NDJSON retention
     /// config (singleton row in `log_retention_config`). Query op.
     LogRetentionConfigGet,
@@ -293,10 +300,27 @@ pub enum IpcOperationName {
     /// identity: full reset has to ask "yours or everyone's?", and it cannot
     /// ask that without knowing whether anyone else is there.
     PrincipalDataCount,
+    /// Read the caller's check verdicts: `?` rules that do not open on the
+    /// link they are written for while the other one answers. In-memory,
+    /// per-SID; GUI, tray and TUI all show the notice.
+    /// [`crate::ipc_payloads::VerifyVerdictsListRequest`] →
+    /// [`crate::ipc_payloads::VerifyVerdictsListResponse`].
+    VerifyVerdictsList,
+    /// Move the given `?` rules into the other set for good, in the CALLER'S
+    /// OWN rules. User-scoped, not elevated, same stance as
+    /// [`Self::AutoRuleCandidatesAccept`].
+    /// [`crate::ipc_payloads::VerifyVerdictsAcceptRequest`] →
+    /// [`crate::ipc_payloads::VerifyVerdictsAcceptResponse`].
+    VerifyVerdictsAccept,
+    /// "Not now" for the given verdicts: the move stays in force until the
+    /// service restarts, the notice goes away. User-scoped, not elevated.
+    /// [`crate::ipc_payloads::VerifyVerdictsDismissRequest`] →
+    /// [`crate::ipc_payloads::VerifyVerdictsDismissResponse`].
+    VerifyVerdictsDismiss,
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 69] = [
+    pub const ALL: [Self; 73] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -340,6 +364,7 @@ impl IpcOperationName {
         Self::SettingsExportFull,
         Self::RulesMergePreview,
         Self::ConnTraceEntriesList,
+        Self::ConnTraceOutageBlocksList,
         Self::LogRetentionConfigGet,
         Self::LogRetentionConfigSet,
         Self::ThirdPartyComponentsList,
@@ -366,6 +391,9 @@ impl IpcOperationName {
         Self::BlockNoticeRouteToSecondary,
         Self::PrincipalDataPurge,
         Self::PrincipalDataCount,
+        Self::VerifyVerdictsList,
+        Self::VerifyVerdictsAccept,
+        Self::VerifyVerdictsDismiss,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -413,6 +441,7 @@ impl IpcOperationName {
             Self::SettingsExportFull => "settings.export.full",
             Self::RulesMergePreview => "rules.merge-preview",
             Self::ConnTraceEntriesList => "conn-trace.entries.list",
+            Self::ConnTraceOutageBlocksList => "conn-trace.outage-blocks.list",
             Self::LogRetentionConfigGet => "settings.log-retention.get",
             Self::LogRetentionConfigSet => "settings.log-retention.set",
             Self::ThirdPartyComponentsList => "third-party.components.list",
@@ -439,6 +468,9 @@ impl IpcOperationName {
             Self::BlockNoticeRouteToSecondary => "block-notices.route-to-secondary",
             Self::PrincipalDataPurge => "principal-data.purge",
             Self::PrincipalDataCount => "principal-data.count",
+            Self::VerifyVerdictsList => "rules.verify.verdicts.list",
+            Self::VerifyVerdictsAccept => "rules.verify.verdicts.accept",
+            Self::VerifyVerdictsDismiss => "rules.verify.verdicts.dismiss",
         }
     }
 

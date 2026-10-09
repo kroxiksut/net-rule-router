@@ -102,7 +102,7 @@ impl<'a> AddressRuleWalk<'a> {
                 }
                 !ownership.block_yields(ip, self.addr_match)
             }
-            RuleAction::Route | RuleAction::VerifyPrimary => {
+            RuleAction::Route | RuleAction::Verify => {
                 let steers = ownership.address_rule_may_steer(ip, self.link);
                 if steers {
                     if let Some(block) = ownership.literal_block_of(ip) {

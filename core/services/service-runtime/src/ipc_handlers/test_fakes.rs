@@ -527,7 +527,7 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         // the Unimplemented stub here.
         traffic_stats: None,
         traffic_stats_writer: None,
-        // No conn-trace ring in test deps; ConnTraceEntriesList resolves
+        // No conn-trace ring in test deps; both conn-trace reads resolve
         // to the Unimplemented stub here.
         conn_trace_ring: None,
         third_party_integrity: None,

@@ -1,0 +1,15 @@
+{
+  "description": "rules.js rowIsVerify: the `?` a row actually carries: a route rule of a type that takes it",
+  "cases": [
+    { "name": "domain on primary", "input": { "row": { "ruleType": "domain", "targetRoute": "primary", "verify": true } }, "expected": true },
+    { "name": "suffix on secondary", "input": { "row": { "ruleType": "suffix-domain", "targetRoute": "secondary", "verify": true } }, "expected": true },
+    { "name": "address v6", "input": { "row": { "ruleType": "exact-ipv6", "targetRoute": "secondary", "verify": true } }, "expected": true },
+    { "name": "flag off", "input": { "row": { "ruleType": "domain", "targetRoute": "primary", "verify": false } }, "expected": false },
+    { "name": "flag absent", "input": { "row": { "ruleType": "domain", "targetRoute": "primary" } }, "expected": false },
+    { "name": "block", "input": { "row": { "ruleType": "domain", "targetRoute": "block", "verify": true } }, "expected": false },
+    { "name": "zone", "input": { "row": { "ruleType": "zone", "targetRoute": "primary", "verify": true } }, "expected": false },
+    { "name": "subnet", "input": { "row": { "ruleType": "subnet", "targetRoute": "secondary", "verify": true } }, "expected": false },
+    { "name": "application", "input": { "row": { "ruleType": "application", "targetRoute": "secondary", "verify": true } }, "expected": false },
+    { "name": "unknown route", "input": { "row": { "ruleType": "domain", "targetRoute": "verify", "verify": true } }, "expected": false }
+  ]
+}

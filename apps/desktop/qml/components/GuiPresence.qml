@@ -39,8 +39,8 @@ QtObject {
     /// Set by the window. The tray leaves it false and only reads.
     property bool publishing: false
 
-    /// `function() -> { active, rulesPathPrimary, rulesPathSecondary }`,
-    /// supplied by the window. Called on every publish.
+    /// `function() -> { active, rulesPathPrimary, rulesPathSecondary,
+    /// rulesFolder }`, supplied by the window. Called on every publish.
     property var snapshotProvider: null
 
     property string _path: ""
@@ -68,20 +68,21 @@ QtObject {
             "at": Date.now(),
             "active": snap.active === true,
             "rules-path-primary": String(snap.rulesPathPrimary || ""),
-            "rules-path-secondary": String(snap.rulesPathSecondary || "")
+            "rules-path-secondary": String(snap.rulesPathSecondary || ""),
+            "rules-folder": String(snap.rulesFolder || "")
         }
         nrrNativeBridge.writeTextFile(path, JSON.stringify(payload))
     }
 
     /// Read the published snapshot.
     /// Returns `{ known, windowRunning, windowActive, rulesPathPrimary,
-    /// rulesPathSecondary }`. `known` is false when no window has ever
+    /// rulesPathSecondary, rulesFolder }`. `known` is false when no window has ever
     /// published on this machine — the caller then has no rules paths and
     /// cannot compare anything.
     function read() {
         var blank = {
             known: false, windowRunning: false, windowActive: false,
-            rulesPathPrimary: "", rulesPathSecondary: ""
+            rulesPathPrimary: "", rulesPathSecondary: "", rulesFolder: ""
         }
         var path = _resolvePath()
         if (path === "") return blank
@@ -110,7 +111,9 @@ QtObject {
             // window that may no longer exist.
             windowActive: running && parsed.active === true,
             rulesPathPrimary: String(parsed["rules-path-primary"] || ""),
-            rulesPathSecondary: String(parsed["rules-path-secondary"] || "")
+            rulesPathSecondary: String(parsed["rules-path-secondary"] || ""),
+            // The user's rule-set folder, as the window last knew it.
+            rulesFolder: String(parsed["rules-folder"] || "")
         }
     }
 

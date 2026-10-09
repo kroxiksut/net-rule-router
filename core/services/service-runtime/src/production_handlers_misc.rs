@@ -307,12 +307,13 @@ fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRo
     let message_key = validation.message_key();
     // A Block-action rule displays as the "block" route regardless of which
     // bucket it physically lives in — set membership is enforcement-irrelevant
-    // for a blocked rule (the WFP codegen drops it). A `?host` rule displays as
-    // "verify". The QML list maps both slugs back to their labels.
+    // for a blocked rule (the WFP codegen drops it). A `?` rule shows its own
+    // set and the `verify` flag.
+    let verify = dto.action == nrr_shared::rules_json::RuleAction::VerifyPrimary;
     let target_route = match &dto.action {
-        nrr_shared::rules_json::RuleAction::Route => route.to_string(),
+        nrr_shared::rules_json::RuleAction::Route
+        | nrr_shared::rules_json::RuleAction::VerifyPrimary => route.to_string(),
         nrr_shared::rules_json::RuleAction::Block => "block".to_string(),
-        nrr_shared::rules_json::RuleAction::VerifyPrimary => "verify".to_string(),
         // `project` leaves such a rule out; the slug says what it is if one
         // ever gets here.
         nrr_shared::rules_json::RuleAction::Unrecognized(slug) => slug.clone(),
@@ -322,6 +323,7 @@ fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRo
         rule_type,
         match_value,
         target_route,
+        verify,
         comment: if dto.comment.is_empty() {
             None
         } else {

@@ -5,10 +5,13 @@ use nrr_client_logic::adapters::display_name;
 use nrr_client_logic::Route;
 use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
 
+use crossterm::event::{KeyCode, KeyEvent};
+
 use super::Screen;
 use crate::i18n::{Key, Texts};
 use crate::keys;
 use crate::link::{admin_command, Link};
+use crate::restore;
 use crate::state::{enforcement_text, AppState, NoticeLevel, RoutingState};
 use crate::view::{Panel, ScreenView, Segment, StateTone, ViewLine};
 
@@ -39,7 +42,19 @@ impl Screen for StatusScreen {
     }
 
     fn help(&self) -> &'static [Key] {
-        &[keys::HELP_STATUS_FEED]
+        &[keys::HELP_STATUS_FEED, restore::HELP]
+    }
+
+    fn plain_help(&self) -> &'static [Key] {
+        &[restore::PLAIN_HELP]
+    }
+
+    fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
+        key.code == KeyCode::Char('r') && restore::restore(app)
+    }
+
+    fn on_line(&self, app: &mut AppState, line: &str) -> bool {
+        line == "r" && restore::restore(app)
     }
 }
 
@@ -181,6 +196,9 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         lines.push(ViewLine::text(
             texts.fill(keys::FETCH_FAILED, &[("error", error)]),
         ));
+    }
+    if app.restore.offer.is_some() {
+        lines.push(ViewLine::text(texts.get(restore::OFFER_LINE)));
     }
     lines
 }

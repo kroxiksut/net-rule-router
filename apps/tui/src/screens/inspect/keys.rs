@@ -128,6 +128,49 @@ pub const TRACE_PLAIN_SEARCH: Key = key(
     "tui.trace.plain-search",
     "/ and text: search all fields, for example /example; / on its own clears the search",
 );
+pub const TRACE_HELP_OUTAGE: Key = key(
+    "tui.trace.help-outage",
+    "o: what was blocked while the additional route was down",
+);
+
+// ── Blocked while the route was down ─────────────────────────────────────────
+
+pub const OUTAGE_INTRO: Key = key(
+    "diag.outage-blocks.intro",
+    "What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.",
+);
+pub const OUTAGE_ACTIVE: Key = key(
+    "diag.outage-blocks.episode-active",
+    "The additional route has been down since {since}.",
+);
+pub const OUTAGE_ENDED: Key = key(
+    "diag.outage-blocks.episode-ended",
+    "The last outage lasted from {since} to {until}.",
+);
+pub const OUTAGE_NONE: Key = key(
+    "diag.outage-blocks.no-episode",
+    "The additional route has not been down since the service started.",
+);
+pub const OUTAGE_EMPTY: Key = key(
+    "diag.outage-blocks.empty",
+    "Nothing was blocked during this outage.",
+);
+pub const OUTAGE_OMITTED: Key = key(
+    "diag.outage-blocks.omitted",
+    "{count} older entries did not fit in the list.",
+);
+pub const OUTAGE_OBSERVER_OFF: Key = key(
+    "diag.outage-blocks.observer-off",
+    "On this system NetRuleRouter cannot tell which connections an outage blocked, so this list stays empty.",
+);
+pub const OUTAGE_FAILED: Key = key("diag.outage-blocks.failed", "Could not load the list: ");
+pub const OUTAGE_OPEN_ROUTES: Key = key(
+    "diag.outage-blocks.open-routes",
+    "Open interfaces and routes",
+);
+pub const COL_ATTEMPTS: Key = key("diag.outage-blocks.col-attempts", "Attempts");
+pub const COL_FIRST: Key = key("diag.outage-blocks.col-first", "First");
+pub const COL_LAST: Key = key("diag.outage-blocks.col-last", "Last");
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 
@@ -423,6 +466,19 @@ pub const ALL: &[Key] = &[
     TRACE_PLAIN_DETAILS,
     TRACE_PLAIN_EXPLAIN,
     TRACE_PLAIN_SEARCH,
+    TRACE_HELP_OUTAGE,
+    OUTAGE_INTRO,
+    OUTAGE_ACTIVE,
+    OUTAGE_ENDED,
+    OUTAGE_NONE,
+    OUTAGE_EMPTY,
+    OUTAGE_OMITTED,
+    OUTAGE_OBSERVER_OFF,
+    OUTAGE_FAILED,
+    OUTAGE_OPEN_ROUTES,
+    COL_ATTEMPTS,
+    COL_FIRST,
+    COL_LAST,
     CACHE_LIST,
     CACHE_DETAIL,
     CACHE_TOTAL,

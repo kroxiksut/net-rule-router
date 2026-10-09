@@ -53,7 +53,7 @@ const CLIENTS_POLICY_SURFACES: [IpcClientProfile; 3] = [
     IpcClientProfile::Tui,
 ];
 
-const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
+const IPC_OPERATION_CATALOG: [IpcOperationSpec; 73] = [
     IpcOperationSpec {
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
@@ -419,6 +419,15 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
+        name: IpcOperationName::ConnTraceOutageBlocksList,
+        // The caller's own outage list, read from memory. The tray's notice
+        // opens it in the window, so the tray itself never asks.
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
         name: IpcOperationName::ThirdPartyComponentsList,
         // Attribution + live integrity of the shipped third-party binaries.
         // Pure read — hashes a file and checks its signature, changes nothing.
@@ -632,6 +641,32 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_AND_TUI,
+        requires_service_mutation_privilege: false,
+    },
+    // ── Check verdicts of `?` rules ─────────────────────────────
+    IpcOperationSpec {
+        name: IpcOperationName::VerifyVerdictsList,
+        // In-memory per-SID read. The tray shows the notice too.
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::VerifyVerdictsAccept,
+        // Rewrites the caller's OWN rules — no elevation, like
+        // `autorules.candidates.accept`.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::VerifyVerdictsDismiss,
+        // Marks the caller's own in-memory verdicts.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_POLICY_SURFACES,
         requires_service_mutation_privilege: false,
     },
 ];

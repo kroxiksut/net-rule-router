@@ -9,6 +9,7 @@ fn row(rule_type: &str, match_value: &str) -> RuleRowEntry {
         rule_type: rule_type.into(),
         match_value: match_value.into(),
         target_route: "primary".into(),
+        verify: false,
         comment: None,
         enabled: true,
         validation_status: "ok".into(),

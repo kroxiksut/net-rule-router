@@ -154,7 +154,7 @@ pub fn write_rules_file_with_passthrough(
 ///
 /// - Active rule: `value` or `value  # comment`.
 /// - Disabled rule: `# value` or `# value  # comment`.
-/// - "Try the primary route first": `?value`, or `# ?value` when disabled.
+/// - "Check where it works": `?value`, or `# ?value` when disabled.
 ///
 /// The two-space separator before the inline `#` mirrors the canonical form
 /// shown in docs/en/rules-file-format.md Complete example examples.

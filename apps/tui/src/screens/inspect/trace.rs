@@ -326,6 +326,7 @@ impl Screen for TraceScreen {
             keys::TRACE_HELP_FILTERS,
             keys::HELP_PAGES,
             keys::HELP_REFRESH,
+            keys::TRACE_HELP_OUTAGE,
             keys::TRACE_SUBTITLE,
             keys::TRACE_VERDICT_NOTE,
         ]
@@ -339,6 +340,7 @@ impl Screen for TraceScreen {
             keys::TRACE_PLAIN_SEARCH,
             keys::TRACE_HELP_FILTERS,
             keys::HELP_REFRESH,
+            keys::TRACE_HELP_OUTAGE,
         ]
     }
 
@@ -373,6 +375,7 @@ impl Screen for TraceScreen {
         match key.code {
             KeyCode::Char('/') => state.typing = Some(state.query.clone()),
             KeyCode::Char('r') => load(app),
+            KeyCode::Char('o') => app.open(ScreenId::OutageBlocks),
             KeyCode::Char(c @ ('b' | 'l' | 'v')) => state.toggle(c),
             KeyCode::Enter => explain_selected(app),
             code => {
@@ -392,6 +395,7 @@ impl Screen for TraceScreen {
             }
             ("p", "") => state.pager.previous_page(),
             ("r", "") => load(app),
+            ("o", "") => app.open(ScreenId::OutageBlocks),
             ("/", text) => state.set_query(text.to_owned()),
             ("b", "") => state.toggle('b'),
             ("l", "") => state.toggle('l'),

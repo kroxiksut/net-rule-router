@@ -8,10 +8,7 @@ use crate::i18n::{key, Key};
 pub const ROUTE_PRIMARY: Key = key("label.primary", "Primary");
 pub const ROUTE_SECONDARY: Key = key("label.secondary", "Additional");
 pub const ROUTE_BLOCK: Key = key("label.block", "Block");
-pub const ROUTE_VERIFY: Key = key(
-    "label.verify-primary",
-    "Primary first, additional if unreachable",
-);
+pub const ROUTE_UNSURE: Key = key("rules.filter.route.unsure", "Unsure (?)");
 pub const ROUTE_ALL: Key = key("rules.filter.route.all", "All routes");
 pub const ROUTE_FILTER: Key = key("rules.filter.route.label", "Route");
 pub const SEARCH: Key = key("action.search", "Search");
@@ -40,15 +37,42 @@ pub const ENABLED_OFF: Key = key(
     "dialog.rule.enabled-off",
     "Rule is disabled (kept in the file, not applied)",
 );
+pub const VERIFY: Key = key("dialog.rule.verify", "Unsure — check where it works");
 pub const VERIFY_HINT: Key = key(
-    "dialog.rule.route-verify-hint",
-    "Opens through the primary route first. Once NetRuleRouter confirms the primary route cannot reach the site, the rule moves to the additional route by itself.",
+    "dialog.rule.verify-hint",
+    "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.",
+);
+pub const VERDICTS_TITLE: Key = key(
+    "notifications.verify-verdicts.title",
+    "Addresses that do not open where they are written: {count}",
+);
+pub const VERDICTS_BODY: Key = key(
+    "notifications.verify-verdicts.body",
+    "They do get through over the other route and use it until the next restart. “Move” writes them there for good; “Not now” keeps them as written and checks again after the restart.",
+);
+pub const VERDICTS_ITEM: Key = key("notifications.verify-verdicts.item", "{value} → {route}");
+pub const VERDICTS_WHERE: Key = key(
+    "tui.suggestions.notice-open",
+    "To answer, open screen {key}, {screen}.",
+);
+pub const VERDICTS_MOVED: Key = key(
+    "status.verify-verdicts.moved",
+    "Rules moved to the route where they work.",
+);
+pub const VERDICTS_FAILED: Key = key(
+    "status.verify-verdicts.failed",
+    "The service did not take the answer: ",
 );
 pub const DUPLICATE: Key = key(
     "dialog.rule.duplicate-body",
     "A rule with the same type, value, and target route already exists ({id}). Open the existing rule to change it, or cancel to keep editing the new one.",
 );
 pub const OPEN_EXISTING: Key = key("dialog.rule.duplicate-open-existing", "Open existing");
+pub const OVERLAPS_HEADING: Key = key("rules.overlaps.nav-label", "Overlaps");
+pub const OVERLAPS_MORE: Key = key(
+    "notifications.block-notice.backlog.more",
+    "and {count} more",
+);
 
 pub const RULE_ADDED: Key = key("status.rule-added", "Rule added");
 pub const RULE_ADDED_DISABLED: Key = key(
@@ -244,6 +268,49 @@ pub const NO_PRESETS: Key = key(
     "tui.rules.no-presets",
     "No rule sets were found beside the program.",
 );
+pub const SETS_FOLDER: Key = key("tui.rules.sets-folder", "Rule sets in {path}");
+pub const SETS_FOLDER_EMPTY: Key = key(
+    "tui.rules.sets-folder-empty",
+    "Your rule-set folder {path} holds no sets; the shipped ones are listed.",
+);
+pub const SETTINGS_UNREADABLE: Key = key(
+    "tui.rules.settings-unreadable",
+    "Your settings file could not be read: {error}",
+);
+pub const FOLDER_QUESTION: Key = key(
+    "tui.rules.folder-question",
+    "Folder with your rule sets; - goes back to the sets shipped with the program:",
+);
+pub const FOLDER_SET: Key = key(
+    "tui.rules.folder-set",
+    "Rule sets are now listed from {path}.",
+);
+pub const FOLDER_CLEARED: Key = key(
+    "tui.rules.folder-cleared",
+    "Rule sets are listed from the ones shipped with the program again.",
+);
+pub const FOLDER_MISSING: Key = key("tui.rules.folder-missing", "There is no folder {path}.");
+pub const FOLDER_UNAVAILABLE: Key = key(
+    "tui.rules.folder-unavailable",
+    "This session edits the administrator's baseline, so it has no rule-set folder of its own.",
+);
+pub const SET_NAMES_TAKEN: Key = key(
+    "tui.rules.set-names-taken",
+    "Nothing was saved: every name from {name} to {name} (99) is taken in {path}.",
+);
+pub const FOLDER_SET_SAVED: Key = key(
+    "status.rules-folder-set-saved",
+    "The rules on screen are saved in your folder as a set: {dir}",
+);
+pub const OLD_FILES_KEPT: Key = key(
+    "status.rules-folder-old-files-kept",
+    "The files they were linked to before stay where they were: {dir}",
+);
+pub const MY_RULES: Key = key("rules.sets.my-rules", "My rules");
+pub const SETTINGS_NOT_WRITTEN: Key = key(
+    "tui.rules.settings-not-written",
+    "Your settings file was not updated: {error}",
+);
 pub const MODE_QUESTION: Key = key(
     "tui.rules.mode-question",
     "What to do with the rules on screen?",
@@ -278,6 +345,10 @@ pub const IMPORT_NOTHING: Key = key(
 );
 pub const READ_FAILED: Key = key("tui.rules.read-failed", "Could not read {path}: {error}");
 pub const EXPORTED: Key = key("tui.rules.exported", "The rules were written to {path}.");
+pub const EXPORTED_UNBOUND: Key = key(
+    "tui.rules.exported-unbound",
+    "The rules were written to {path}, but your settings file was not updated: {error}",
+);
 pub const WRITE_FAILED: Key = key("tui.rules.write-failed", "Could not write {path}: {error}");
 pub const PLAIN_PROMPT: Key = key(
     "tui.rules.plain-prompt",
@@ -290,6 +361,11 @@ pub const PLAIN_CHOICE_PROMPT: Key = key(
 pub const PLAIN_REVIEW_PROMPT: Key = key(
     "tui.rules.plain-review-prompt",
     "Type y and press Enter to apply these changes, or n to go back to editing; > and < scroll the list.",
+);
+pub const VERDICTS_KEYS: Key = key("tui.rules.verdicts.keys", "m: Move. n: Not now.");
+pub const VERDICTS_FOLDER_QUESTION: Key = key(
+    "tui.rules.verdicts.folder-question",
+    "Folder for your rule sets: the rules on screen are saved there, then the rules move. Nothing typed is Not now:",
 );
 pub const PLAIN_REVIEW_CRITICAL_PROMPT: Key = key(
     "tui.rules.plain-review-critical-prompt",
@@ -322,6 +398,10 @@ pub const HELP_APPLY: Key = key(
     "tui.rules.help.apply",
     "Ctrl+S or s: apply. The changes are shown first; Enter applies them, Esc returns",
 );
+pub const HELP_FOLDER: Key = key(
+    "tui.rules.help.folder",
+    "o: choose the folder with your rule sets; the rules on screen are saved there as a set",
+);
 pub const HELP_FILES: Key = key(
     "tui.rules.help.files",
     "i: import the two rules files. x: export them. p: load a country rule set",
@@ -329,6 +409,10 @@ pub const HELP_FILES: Key = key(
 pub const HELP_RELOAD: Key = key(
     "tui.rules.help.reload",
     "r: show the rules the service applies, dropping the changes on screen",
+);
+pub const HELP_VERDICTS: Key = key(
+    "tui.rules.help.verdicts",
+    "m: move the rules that work only on the other route there for good. n: not now",
 );
 pub const HELP_FORM: Key = key(
     "tui.rules.help.form",
@@ -358,9 +442,17 @@ pub const PLAIN_APPLY: Key = key(
     "tui.rules.plain.apply",
     "s: apply the changes; they are shown first",
 );
+pub const PLAIN_FOLDER: Key = key(
+    "tui.rules.plain.folder",
+    "o: choose the folder with your rule sets",
+);
 pub const PLAIN_FILES: Key = key(
     "tui.rules.plain.files",
     "i: import files. x: export files. p: load a country rule set",
+);
+pub const PLAIN_VERDICTS: Key = key(
+    "tui.rules.plain.verdicts",
+    "m: move the rules that work only on the other route. n: not now",
 );
 pub const PLAIN_RELOAD: Key = key(
     "tui.rules.plain.reload",
@@ -384,7 +476,7 @@ pub const ALL: &[Key] = &[
     ROUTE_PRIMARY,
     ROUTE_SECONDARY,
     ROUTE_BLOCK,
-    ROUTE_VERIFY,
+    ROUTE_UNSURE,
     ROUTE_ALL,
     ROUTE_FILTER,
     SEARCH,
@@ -403,9 +495,20 @@ pub const ALL: &[Key] = &[
     FIELD_COMMENT,
     ENABLED_ON,
     ENABLED_OFF,
+    VERIFY,
     VERIFY_HINT,
+    VERDICTS_TITLE,
+    VERDICTS_BODY,
+    VERDICTS_ITEM,
+    VERDICTS_WHERE,
+    VERDICTS_MOVED,
+    VERDICTS_FAILED,
+    VERDICTS_KEYS,
+    VERDICTS_FOLDER_QUESTION,
     DUPLICATE,
     OPEN_EXISTING,
+    OVERLAPS_HEADING,
+    OVERLAPS_MORE,
     RULE_ADDED,
     RULE_ADDED_DISABLED,
     RULE_UPDATED,
@@ -477,6 +580,19 @@ pub const ALL: &[Key] = &[
     EXPORT_QUESTION,
     PRESET_QUESTION,
     NO_PRESETS,
+    SETS_FOLDER,
+    SETS_FOLDER_EMPTY,
+    SETTINGS_UNREADABLE,
+    SETTINGS_NOT_WRITTEN,
+    FOLDER_QUESTION,
+    FOLDER_SET,
+    FOLDER_CLEARED,
+    FOLDER_MISSING,
+    FOLDER_UNAVAILABLE,
+    SET_NAMES_TAKEN,
+    FOLDER_SET_SAVED,
+    OLD_FILES_KEPT,
+    MY_RULES,
     MODE_QUESTION,
     MODE_REPLACE,
     MODE_ADD,
@@ -490,6 +606,7 @@ pub const ALL: &[Key] = &[
     IMPORT_NOTHING,
     READ_FAILED,
     EXPORTED,
+    EXPORTED_UNBOUND,
     WRITE_FAILED,
     PLAIN_PROMPT,
     PLAIN_CHOICE_PROMPT,
@@ -502,7 +619,9 @@ pub const ALL: &[Key] = &[
     HELP_FILTER,
     HELP_APPLY,
     HELP_FILES,
+    HELP_FOLDER,
     HELP_RELOAD,
+    HELP_VERDICTS,
     HELP_FORM,
     PLAIN_ADD,
     PLAIN_EDIT,
@@ -513,5 +632,7 @@ pub const ALL: &[Key] = &[
     PLAIN_PAGES,
     PLAIN_APPLY,
     PLAIN_FILES,
+    PLAIN_FOLDER,
     PLAIN_RELOAD,
+    PLAIN_VERDICTS,
 ];

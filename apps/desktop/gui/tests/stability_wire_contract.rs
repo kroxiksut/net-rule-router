@@ -469,7 +469,7 @@ fn the_divergence_line_applies_by_click_or_forgets_the_intent() {
     let keep = &controller[keep_at..];
     let keep = &keep[..keep.find("\n    }").unwrap_or(keep.len())];
     assert!(keep.contains("Pure.stabilityIntentWithout(_readServiceIntent(), key)"));
-    assert!(keep.contains("root.prefs.serviceIntentJson ="));
+    assert!(keep.contains("_writeStabilityIntent(next)"));
     assert!(keep.contains("_dropDivergence("));
 
     let note = repo_file("apps/desktop/qml/components/ServiceIntentDivergenceNote.qml");

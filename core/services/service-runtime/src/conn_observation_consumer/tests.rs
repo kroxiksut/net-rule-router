@@ -1577,3 +1577,72 @@ fn a_program_never_offered_is_not_reported_as_split() {
     );
     assert!(split.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
 }
+
+// ── Outage list ─────────────────────────────────────────────────────────
+
+fn owned_block(sid: &str, spec_id: u64, port: u16, at_ms: u64) -> ConnectionObservation {
+    let mut o = block_obs(Some(true), Some(spec_id));
+    o.user_sid = Some(sid.to_string());
+    o.remote.set_port(port);
+    o.observed_unix_ms = Some(at_ms);
+    o
+}
+
+/// A drop the outage caused joins its owner's list, folded with its retries;
+/// a rule block, a foreign drop and an owner-less drop do not.
+#[test]
+fn an_outage_drop_joins_its_owners_outage_list() {
+    let (consumer, _notices) = block_notice_consumer(Some(Arc::new(|id| id == 777)));
+    let ring = Arc::new(ConnectionTraceRing::new(16));
+    let consumer = consumer.with_trace_ring(Arc::clone(&ring));
+    assert!(
+        ring.outage_blocks().is_fed(),
+        "this consumer attributes drops"
+    );
+    let mut foreign = owned_block("S-1-5-21-A", 9, 443, 5_500);
+    foreign.blocked_by_nrr = Some(false);
+    let mut orphan = owned_block("S-1-5-21-A", 777, 443, 5_600);
+    orphan.user_sid = None;
+    consumer.consume(
+        &[
+            owned_block("S-1-5-21-A", 777, 443, 5_000),
+            owned_block("S-1-5-21-A", 42, 443, 5_100),
+            foreign,
+            orphan,
+            owned_block("S-1-5-21-A", 777, 8443, 6_000),
+        ],
+        SystemTime::now(),
+    );
+    let snap = ring.outage_blocks().snapshot("S-1-5-21-A");
+    assert_eq!(snap.episode.map(|e| e.since_ms), Some(5_000));
+    assert_eq!(snap.entries.len(), 1, "{:?}", snap.entries);
+    let entry = &snap.entries[0];
+    assert_eq!(entry.attempts, 2, "the rule block is not the outage's");
+    assert_eq!(entry.remote.port(), 8443, "the latest attempt's port");
+    assert_eq!(entry.first_seen_ms, 5_000);
+    assert_eq!(entry.last_seen_ms, 6_000);
+    assert_eq!(ring.len(), 5, "every row still reaches the trace");
+}
+
+/// First contact of an app pinned to a live tunnel drops by design and heals
+/// itself; it is no outage and must not reach the list. A live secondary also
+/// ends whatever outage its user had open.
+#[test]
+fn a_first_contact_drop_on_a_live_secondary_never_joins_the_outage_list() {
+    let ring = Arc::new(ConnectionTraceRing::new(16));
+    let consumer = test_consumer_with_live_secondary().with_trace_ring(Arc::clone(&ring));
+    ring.outage_blocks().outage_began("S-1-5-21-TEST", 1);
+    let mut first_contact = vpn_drop_obs(Some(80122));
+    first_contact.user_sid = Some("S-1-5-21-TEST".to_string());
+    let summary = consumer.consume(&[first_contact], SystemTime::now());
+    assert_eq!(
+        summary.killswitch_drops_live_secondary, 1,
+        "positive control: the drop was seen as pinned on a live link"
+    );
+    let snap = ring.outage_blocks().snapshot("S-1-5-21-TEST");
+    assert!(snap.entries.is_empty(), "{:?}", snap.entries);
+    assert!(
+        snap.episode.is_some_and(|e| e.until_ms.is_some()),
+        "the usable secondary closed the open outage"
+    );
+}

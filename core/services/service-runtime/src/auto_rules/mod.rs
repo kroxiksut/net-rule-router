@@ -543,10 +543,13 @@ pub struct AutoRulesEngine {
     /// [`Self::drop_stored_subdomain_twins`]): `None` once done, `Some(at)`
     /// when the rewrite was last refused at `at`.
     twin_cleanup: Mutex<HashMap<String, Option<SystemTime>>>,
-    /// `?host` rules and the state of their checks, per principal.
+    /// `?` rules, their checks and verdicts, per principal.
     verify: Mutex<HashMap<String, verify_primary::VerifyState>>,
-    /// Set once at the composition root; without it `?` rules stay on the
-    /// main link and are never checked.
+    /// Whether any principal has a `?` rule on an IPv4 address: the one load
+    /// a connection pays when nobody does.
+    verify_watches_ips: std::sync::atomic::AtomicBool,
+    /// Set once at the composition root; without it `?` rules stay where they
+    /// are written and are never checked.
     verify_wiring: OnceLock<VerifyPrimaryWiring>,
 }
 

@@ -1,0 +1,24 @@
+Service: OK
+┌> Screens─────────────────┐┌Settings sections─────────────────────────────────┐
+│  1 Status                ││> c1. Notifications                               │
+│  2 First run             ││  c2. Routing behavior                            │
+│  3 Interfaces and routes ││  c3. Apply failure policy                        │
+│  4 Rules                 ││  c4. Service management                          │
+│  5 Overlaps              ││  c5. Presets and settings                        │
+│  6 Suggested addresses   ││  c6. Logs and diagnostics                        │
+│  7 Connection trace      ││  c7. Traffic statistics                          │
+│  8 Cache                 ││  c8. Check for updates                           │
+│  9 Diagnostics and logs  ││  c9. Terminal                                    │
+│> 0 Settings              ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+└──────────────────────────┘└──────────────────────────────────────────────────┘
+F1: help   q: quit

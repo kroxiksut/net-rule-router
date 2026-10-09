@@ -52,6 +52,7 @@ Item {
     property alias factoryPresetSaveDialog: factoryPresetSaveDialog
     property alias saveRuleSetDialog: saveRuleSetDialog
     property alias rulesSaveFolderDialog: rulesSaveFolderDialog
+    property alias verifyVerdictsFolderDialog: verifyVerdictsFolderDialog
     property alias safeDisableConfirmDialog: safeDisableConfirmDialog
     property alias safeRollbackConfirmDialog: safeRollbackConfirmDialog
 
@@ -513,6 +514,17 @@ Item {
                 Pure.localPathFromFileUrl(selectedFolder))
         }
         onRejected: ownerRoot.boundFilesController.cancelFactoryPathRebind()
+    }
+
+    // "Move" on the `?` verdict card with no rule-set folder yet: the folder
+    // comes first, then the move. Cancelling is "Not now".
+    FolderDialog {
+        id: verifyVerdictsFolderDialog
+        title: ownerRoot.tr("settings.presets.user-folder.dialog-title",
+            "Choose the folder with your rule sets")
+        onAccepted: ownerRoot.adoptFolderAndMoveVerifyVerdicts(
+            Pure.localPathFromFileUrl(selectedFolder))
+        onRejected: ownerRoot.dismissVerifyVerdicts()
     }
 
     SafeDisableConfirmDialog {

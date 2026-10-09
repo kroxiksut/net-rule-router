@@ -28,6 +28,10 @@ pub fn product_dir_leaf() -> &'static str {
 /// This is the READ answer. A caller about to write walks
 /// [`nrr_shared::user_paths::user_app_roots`] instead, which offers the next
 /// candidate when one cannot be created.
+///
+/// Holds `user-settings.json` ([`nrr_shared::user_settings`]), the settings
+/// every client reads without the service, and `managed/` with the GUI's own
+/// preferences.
 pub fn user_config_root() -> Option<PathBuf> {
     nrr_shared::user_paths::user_config_root()
 }

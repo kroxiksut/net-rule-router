@@ -396,8 +396,9 @@ QtObject {
                 ruleTypeTitle: root.ruleTypeLabel(ruleType),
                 matchValue: displayValue,
                 // A parsed `+block` rule shows as "block" whichever file it
-                // came from; a `?` rule shows as "verify" in the secondary one.
+                // came from; a `?` rule keeps its file's route and its mark.
                 targetRoute: Rules.parsedRuleTargetRoute(r, targetRoute),
+                verify: Rules.parsedRuleVerify(r),
                 comment: String(r.comment || ""),
                 // Provenance the parser lifted out of the `--- Auto` section's
                 // inline comment. Kept as three scalar roles (matching the
@@ -683,8 +684,7 @@ QtObject {
         if (target === "both") {
             Pure.clearModel(root.rulesModel)
         } else {
-            // Block and verify rules came from the secondary file, so they
-            // go with it.
+            // Block rules came from the secondary file, so they go with it.
             for (var k = root.rulesModel.count - 1; k >= 0; k -= 1) {
                 if (Rules.routeBucket(root.rulesModel.get(k).targetRoute) === target) {
                     root.rulesModel.remove(k)
@@ -718,12 +718,13 @@ QtObject {
     }
 
     function _applyImportMerge(parsedRowsByRoute) {
-        // Build a Set of existing (ruleType, matchValue, targetRoute)
-        // triples so we skip duplicates in O(n+m).
+        // Existing (ruleType, matchValue, targetRoute) triples, so duplicates
+        // are skipped in O(n+m). `?x` and `x` on one route are one rule and
+        // the plain one wins, as in the service's own dedup.
         var seen = {}
         for (var k = 0; k < root.rulesModel.count; k += 1) {
             var r = root.rulesModel.get(k)
-            seen[Rules.mergeKey(r)] = true
+            seen[Rules.mergeKey(r)] = { index: k, row: null }
         }
         var nextId = root._maxRuleNumericId() + 1
         var routes = ["primary", "secondary"]
@@ -733,7 +734,15 @@ QtObject {
             for (var j = 0; j < rows.length; j += 1) {
                 var row = rows[j]
                 var key = Rules.mergeKey(row)
-                if (seen[key]) continue
+                var prior = seen[key]
+                if (prior) {
+                    if (!Rules.rowIsVerify(row)) {
+                        if (prior.row) prior.row.verify = false
+                        else if (Rules.rowIsVerify(root.rulesModel.get(prior.index)))
+                            root.rulesModel.setProperty(prior.index, "verify", false)
+                    }
+                    continue
+                }
                 row.id = "R-" + ("0000" + String(nextId)).slice(-4)
                 row.aceMatchValue = root._aceLowerForSearch(row.matchValue)
                 batch.push(row)
@@ -744,7 +753,7 @@ QtObject {
                 if (String(row.comment || "") !== "") {
                     root._sidecarWriteCommentForRow(row)
                 }
-                seen[key] = true
+                seen[key] = { index: -1, row: row }
                 nextId += 1
             }
             // One append for the whole route — see `_appendRowsChunked`.

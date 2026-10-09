@@ -779,9 +779,15 @@ pub enum StatusUpdateEvent {
     /// tray and the main window are separate clients; without this, an answer
     /// given in one reached the other only after a restart.
     BlockNoticeMutesChanged { sid: String },
-    /// A `?host` rule of `sid` moved to the additional route: the main link
-    /// was shown not to reach `host`.
-    VerifyPrimaryMoved { sid: String, host: String },
+    /// The set of `sid`'s check verdicts changed: a `?` rule was found not to
+    /// open on the link it is written for while the other one answers, or a
+    /// verdict was accepted, dismissed or dropped. Clients re-read
+    /// `rules.verify.verdicts.list`; the notice goes away at zero.
+    VerifyVerdictsChanged {
+        sid: String,
+        /// Verdicts the user has not dismissed yet.
+        pending_count: u64,
+    },
     /// Whether this SID's policy is actually being enforced, and what the user
     /// has to do when it is not.
     ///
@@ -809,6 +815,10 @@ pub enum StatusUpdateEvent {
         /// is still installed but its driver will not start).
         #[serde(default)]
         candidates: Vec<String>,
+        /// When this status began (wall clock, UTC ms). Unchanged while only
+        /// `candidates` change; absent from a service that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_unix_ms: Option<i64>,
     },
 }
 
@@ -835,7 +845,7 @@ impl StatusUpdateEvent {
             | Self::UnassignedTunnelDetected { sid, .. }
             | Self::BlockNoticeRaised { sid, .. }
             | Self::BlockNoticeMutesChanged { sid }
-            | Self::VerifyPrimaryMoved { sid, .. }
+            | Self::VerifyVerdictsChanged { sid, .. }
             | Self::EnforcementStatusChanged { sid, .. }
             | Self::AutostartStateChanged { sid, .. } => Some(sid.as_str()),
             // The baseline carries no SID and reaches everyone.
@@ -1031,6 +1041,9 @@ pub struct EnforcementStatusDto {
     pub role: String,
     #[serde(default)]
     pub candidates: Vec<String>,
+    /// When this status began (wall clock, UTC ms); see the push's field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_unix_ms: Option<i64>,
 }
 
 /// One rule enforced differently from how it reads: because of another rule

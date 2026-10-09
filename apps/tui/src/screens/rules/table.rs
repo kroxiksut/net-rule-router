@@ -1,11 +1,12 @@
 //! The rules on screen: rows, what the service holds, the route filter, the
 //! search and the chosen row.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use nrr_client_logic::rules_table::{
     file_row_from_service_wire, row_matches_search, RowOrigin, RuleRow, RuleType, TargetRoute,
 };
+use nrr_client_logic::Route;
 use nrr_domain::rule_value_validation::validate_rule_value;
 use nrr_shared::ipc_payloads::RuleRowEntry;
 use nrr_shared::rules_json::FREE_MAX_RULES;
@@ -86,8 +87,9 @@ pub enum RouteFilter {
     All,
     Primary,
     Secondary,
-    Verify,
     Block,
+    /// The `?` rules, on either route.
+    Unsure,
 }
 
 impl RouteFilter {
@@ -95,8 +97,8 @@ impl RouteFilter {
         Self::All,
         Self::Primary,
         Self::Secondary,
-        Self::Verify,
         Self::Block,
+        Self::Unsure,
     ];
 
     pub fn label(self) -> Key {
@@ -104,18 +106,19 @@ impl RouteFilter {
             Self::All => text::ROUTE_ALL,
             Self::Primary => text::ROUTE_PRIMARY,
             Self::Secondary => text::ROUTE_SECONDARY,
-            Self::Verify => text::ROUTE_VERIFY,
             Self::Block => text::ROUTE_BLOCK,
+            Self::Unsure => text::ROUTE_UNSURE,
         }
     }
 
-    fn passes(self, route: &TargetRoute) -> bool {
+    fn passes(self, rule: &RuleRow) -> bool {
+        let route = &rule.target_route;
         match self {
             Self::All => true,
             Self::Primary => *route == TargetRoute::Primary,
             Self::Secondary => *route == TargetRoute::Secondary,
-            Self::Verify => *route == TargetRoute::Verify,
             Self::Block => *route == TargetRoute::Block,
+            Self::Unsure => rule.is_verify(),
         }
     }
 }
@@ -125,7 +128,6 @@ pub fn route_label(route: &TargetRoute) -> Option<Key> {
     match route {
         TargetRoute::Primary => Some(text::ROUTE_PRIMARY),
         TargetRoute::Secondary => Some(text::ROUTE_SECONDARY),
-        TargetRoute::Verify => Some(text::ROUTE_VERIFY),
         TargetRoute::Block => Some(text::ROUTE_BLOCK),
         TargetRoute::Other(_) => None,
     }
@@ -160,7 +162,7 @@ impl Table {
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                self.filter.passes(&row.rule.target_route)
+                self.filter.passes(&row.rule)
                     && row_matches_search(&row.rule, &row.ace_lower, &self.search)
             })
             .map(|(i, _)| i)
@@ -270,18 +272,28 @@ impl Table {
     }
 
     /// Rows read from files: `replace` drops every row first; otherwise only
-    /// rows not already present are added. Returns how many were added.
+    /// rows not already present are added. `?x` and `x` on one route are one
+    /// rule, and the plain one wins. Returns how many were added.
     pub fn import(&mut self, parsed: Vec<RuleRow>, replace: bool) -> usize {
         if replace {
             self.rows.clear();
         }
-        let mut seen: HashSet<String> = self.rows.iter().map(|r| r.rule.merge_key()).collect();
+        let mut seen: HashMap<String, usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.rule.merge_key(), i))
+            .collect();
         let mut added = 0;
         for mut rule in parsed {
-            if !seen.insert(rule.merge_key()) {
+            if let Some(&at) = seen.get(&rule.merge_key()) {
+                if !rule.is_verify() {
+                    self.rows[at].rule.verify = false;
+                }
                 continue;
             }
             rule.id = self.next_free_id();
+            seen.insert(rule.merge_key(), self.rows.len());
             self.rows.push(Row::new(rule));
             added += 1;
         }
@@ -290,51 +302,36 @@ impl Table {
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "the Overlaps screen edits the working copy through these"
-)]
+/// The working copy as other screens read and edit it.
 impl Table {
-    /// The rules in list order, ids unique across both routes: the form other
-    /// screens read the working copy in.
+    /// The rules in list order, ids unique across both routes.
     pub fn rules(&self) -> impl Iterator<Item = &RuleRow> {
         self.rows.iter().map(|r| &r.rule)
     }
 
     /// The row with list id `id` riding in `bucket`.
-    pub fn find(&self, bucket: nrr_client_logic::Route, id: &str) -> Option<usize> {
+    pub fn find(&self, bucket: Route, id: &str) -> Option<usize> {
         self.rows.iter().position(|r| {
-            r.rule.id == id
-                && r.rule
-                    .target_route
-                    .bucket()
-                    .unwrap_or(nrr_client_logic::Route::Primary)
-                    == bucket
+            r.rule.id == id && r.rule.target_route.bucket().unwrap_or(Route::Primary) == bucket
         })
     }
 
     /// Move the rule to another route; `false` when it is not in the list.
-    pub fn set_route(
-        &mut self,
-        bucket: nrr_client_logic::Route,
-        id: &str,
-        to: TargetRoute,
-    ) -> bool {
+    pub fn set_route(&mut self, bucket: Route, id: &str, to: TargetRoute) -> bool {
         let Some(at) = self.find(bucket, id) else {
             return false;
         };
         let rule = &mut self.rows[at].rule;
-        rule.target_route = to.for_rule_type(&rule.rule_type);
+        // A block takes no `?`; it must not come back on a later move.
+        if to == TargetRoute::Block {
+            rule.verify = false;
+        }
+        rule.target_route = to;
         true
     }
 
     /// Switch the rule on or off; `false` when it is not in the list.
-    pub fn set_enabled(
-        &mut self,
-        bucket: nrr_client_logic::Route,
-        id: &str,
-        enabled: bool,
-    ) -> bool {
+    pub fn set_enabled(&mut self, bucket: Route, id: &str, enabled: bool) -> bool {
         let Some(at) = self.find(bucket, id) else {
             return false;
         };
@@ -348,10 +345,7 @@ pub fn rule_id(n: usize) -> String {
 }
 
 /// A row from a parsed rules file, as the GUI's import builds it.
-pub fn row_from_parsed(
-    rule: &nrr_shared::preset_parser::ParsedRule,
-    file: nrr_client_logic::Route,
-) -> RuleRow {
+pub fn row_from_parsed(rule: &nrr_shared::preset_parser::ParsedRule, file: Route) -> RuleRow {
     let rule_type = RuleType::from_slug(rule.rule_type.slug());
     let match_value = if rule_type.is_hostlike() {
         ace::decode(&rule.match_value)
@@ -362,6 +356,7 @@ pub fn row_from_parsed(
         id: String::new(),
         enabled: rule.enabled,
         target_route: nrr_client_logic::rules_table::parsed_rule_target_route(rule, file),
+        verify: nrr_client_logic::rules_table::parsed_rule_verify(rule),
         rule_type,
         match_value,
         comment: rule.comment.clone(),

@@ -58,6 +58,7 @@ fn event_loop(
     while !app.quit {
         if let Some(language) = app.language_change.take() {
             current = Texts::load(Some(&language), &[]);
+            crate::screens::rules::on_texts(app, &current);
         }
         let texts = &current;
         let now = Instant::now();
@@ -190,14 +191,20 @@ pub fn header_lines(app: &AppState, texts: &Texts, options: RenderOptions) -> Ve
 }
 
 /// The menu: the current screen carries `>`; while the menu has the focus its
-/// row is also inverted, so focus never depends on colour.
+/// row is also inverted, so focus never depends on colour. A sub-screen shows,
+/// indented under its parent, only while it is open.
 pub fn menu_lines(app: &AppState, texts: &Texts) -> Vec<Line<'static>> {
     ScreenId::ALL
         .iter()
+        .filter(|&&id| id.hotkey().is_some() || id == app.screen)
         .map(|&id| {
             let current = id == app.screen;
             let marker = if current { '>' } else { ' ' };
-            let text = format!("{marker} {} {}", id.hotkey(), texts.get(id.title()));
+            let title = texts.get(id.title());
+            let text = match id.hotkey() {
+                Some(key) => format!("{marker} {key} {title}"),
+                None => format!("{marker}     {title}"),
+            };
             if current && app.focus == Focus::Menu {
                 Line::styled(text, Style::default().add_modifier(Modifier::REVERSED))
             } else {

@@ -1,0 +1,95 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Settings
+Service: OK
+Settings sections:
+  > c1. Notifications
+    c2. Routing behavior
+    c3. Apply failure policy
+    c4. Service management
+    c5. Presets and settings
+    c6. Logs and diagnostics
+    c7. Traffic statistics
+    c8. Check for updates
+    c9. Terminal
+Commands on this screen:
+  c and a number, for example c2: open that section
+  i and a number, for example i3: change that setting or run that action. With a value after it, for example i3 2 or i3 30, it is set at once.
+  b: back to the list of sections
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Settings
+Service: OK
+Settings sections:
+  > c1. Notifications
+    c2. Routing behavior
+    c3. Apply failure policy
+    c4. Service management
+    c5. Presets and settings
+    c6. Logs and diagnostics
+    c7. Traffic statistics
+    c8. Check for updates
+    c9. Terminal
+Commands on this screen:
+  c and a number, for example c2: open that section
+  i and a number, for example i3: change that setting or run that action. With a value after it, for example i3 2 or i3 30, it is set at once.
+  b: back to the list of sections
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Settings
+Service: OK
+Terminal:
+  > i1. Line mode for screen readers: Off
+    i2. No colours: Off
+    i3. Plain characters instead of frame lines: Off
+    These take effect the next time the program starts. The command-line options and the NO_COLOR and NRR_TUI_PLAIN variables still switch them on.
+Commands on this screen:
+  c and a number, for example c2: open that section
+  i and a number, for example i3: change that setting or run that action. With a value after it, for example i3 2 or i3 30, it is set at once.
+  b: back to the list of sections
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Settings
+Service: OK
+Result:
+  There is no i7 here.
+Terminal:
+  > i1. Line mode for screen readers: Off
+    i2. No colours: Off
+    i3. Plain characters instead of frame lines: Off
+    These take effect the next time the program starts. The command-line options and the NO_COLOR and NRR_TUI_PLAIN variables still switch them on.
+Commands on this screen:
+  c and a number, for example c2: open that section
+  i and a number, for example i3: change that setting or run that action. With a value after it, for example i3 2 or i3 30, it is set at once.
+  b: back to the list of sections
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Settings
+Service: OK
+Result:
+  There is no i7 here.
+Settings sections:
+    c1. Notifications
+    c2. Routing behavior
+    c3. Apply failure policy
+    c4. Service management
+    c5. Presets and settings
+    c6. Logs and diagnostics
+    c7. Traffic statistics
+    c8. Check for updates
+  > c9. Terminal
+Commands on this screen:
+  c and a number, for example c2: open that section
+  i and a number, for example i3: change that setting or run that action. With a value after it, for example i3 2 or i3 30, it is set at once.
+  b: back to the list of sections
+Type a screen number, h for help or q to quit, then press Enter.

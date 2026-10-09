@@ -48,7 +48,8 @@ QtObject {
             "Setup answers were supplied before launch; applying them."), "progress")
         if (root.routePolicyController) {
             root.routePolicyController.applyFirstRunProtections(
-                provisioning.killSwitch === true, provisioning.dohLockdown === true)
+                provisioning.killSwitch === true, provisioning.dohLockdown === true,
+                "provisioning")
         }
         applyFirstRunStability({ "fake-ip-enabled": provisioning.fakeIp === true }, "provisioning")
         _applyProvisionedConnections()
@@ -252,6 +253,7 @@ QtObject {
             // is already up at launch there is no disconnected→connected edge
             // to hang it on.
             Qt.callLater(root.serviceIntentController.replayServiceIntentToService)
+            Qt.callLater(root.settingsRestoreController.checkOnConnect)
             // Same edge problem for the drift compare: the file legs are only
             // measured by a recheck, and the cold-start capture does not do one.
             // Without this the window says nothing about a diverged rules file

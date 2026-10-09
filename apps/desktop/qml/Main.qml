@@ -321,7 +321,7 @@ ApplicationWindow {
         // Also the "keep mine" answer to a binding disagreement: the push
         // replaces what the service holds, so the question is settled.
         routeBindingDivergence = []
-        routePolicyController.pushRouteBindingToService()
+        routePolicyController.pushRouteBindingToService(undefined, undefined, "user:binding-resend")
         // Re-read once the push has had time to land so the notice clears on
         // the spot instead of waiting for the next watch tick. The push is
         // asynchronous (and may go through elevation), so a read issued right
@@ -434,7 +434,8 @@ ApplicationWindow {
     // notices live here instead of stacked top banners. `activeNotifications`
     // is the list rendered by NotificationCenterPopup and counted by the footer
     // bell chip. To add a notice: push { id, severity: "warning"|"info", title,
-    // body, actionKey?, actionText? }; `actionKey` is dispatched by
+    // body, actionKey?, actionText?, secondaryActionKey?, secondaryActionText? };
+    // an action key is dispatched by
     // `notificationsController.runNotificationAction`, dismissal routed through `notificationsController.dismissNotification`.
     readonly property var activeNotifications: {
         var out = []
@@ -520,12 +521,30 @@ ApplicationWindow {
                 "actionText": tr("action.open-settings", "Open settings")
             })
         }
+        // `?` rules that work only on the other route. The service holds the
+        // list, so the card leaves on both surfaces once either answers.
+        var verdictNotice = verifyVerdicts.notice
+        if (verdictNotice) {
+            out.push({
+                "id": "verify-verdicts",
+                "severity": "info",
+                "dismissible": false,
+                "title": tr("notifications.verify-verdicts.title",
+                    "Addresses that do not open where they are written: {count}")
+                    .replace("{count}", String(verdictNotice.ids.length)),
+                "body": verifyVerdictsBody(verdictNotice),
+                "actionKey": "verify-verdicts-move",
+                "actionText": tr("action.move", "Move"),
+                "secondaryActionKey": "verify-verdicts-later",
+                "secondaryActionText": tr("action.not-now", "Not now")
+            })
+        }
         // Notices the service pushed at us. Everything above is derived from
         // live state and clears itself; a push describes something that already
         // happened, so it is held until the user answers it (here or in the
         // tray). Appended last so a standing warning stays on top.
         for (var p = 0; p < notificationsController._pushNotices.length; p += 1) out.push(notificationsController._pushNotices[p])
-        return out
+        return Pure.noticesWarningsFirst(out)
     }
 
     property bool strictKillSwitchActive: false
@@ -877,22 +896,20 @@ ApplicationWindow {
     function defaultRouteLabel(role) {
         if (role === "primary") return tr("label.primary", "Primary")
         if (role === "block") return tr("label.block", "Block")
-        if (role === "verify") return tr("label.verify-primary", "Primary first, additional if unreachable")
         return tr("label.secondary", "Additional")
     }
     function routeLabel(role) {
         if (role === "primary") return prefs.routePrimaryLabel || defaultRouteLabel("primary")
-        // "block" and "verify" are fixed semantics, NOT renamable adapter
-        // labels — they must never fall through to prefs.routeSecondaryLabel.
-        if (role === "block" || role === "verify") return defaultRouteLabel(role)
+        // "block" is a fixed semantic, NOT a renamable adapter label — it
+        // must never fall through to prefs.routeSecondaryLabel.
+        if (role === "block") return defaultRouteLabel(role)
         return prefs.routeSecondaryLabel || defaultRouteLabel("secondary")
     }
-    function routeRoleOptions(includeBlock, includeVerify) {
+    function routeRoleOptions(includeBlock) {
         var opts = [
             { id: "primary", label: routeLabel("primary") },
             { id: "secondary", label: routeLabel("secondary") }
         ]
-        if (includeVerify) opts.push({ id: "verify", label: routeLabel("verify") })
         if (includeBlock) opts.push({ id: "block", label: routeLabel("block") })
         return opts
     }
@@ -994,6 +1011,7 @@ ApplicationWindow {
         if (id === "diagnostics") return tr("section.diagnostics", "Diagnostics")
         if (id === "conn-trace") return tr("diag.conn-trace.title", "Connection trace")
         if (id === "cache") return tr("diag.cache.title", "Cache")
+        if (id === "outage-blocks") return tr("diag.outage-blocks.title", "Blocked while the route was down")
         if (id === "logs") return tr("section.logs", "Logs")
         if (id === "settings") return tr("section.settings", "Settings")
         return id
@@ -1073,8 +1091,35 @@ ApplicationWindow {
         rpc.registerRpcCallback(corr, function(ok, payload) {
             _rulesOverlapInFlight = false
             rulesOverlapPairs = (ok && payload && payload.pairs) ? payload.pairs : []
-            ruleOverlapsController.update((ok && payload && payload["route-overlaps"]) || [])
+            ruleOverlapsController.update((ok && payload && payload["route-overlaps"]) || [],
+                ok && !_rulesOverlapStale)
             if (_rulesOverlapStale) Qt.callLater(refreshRulesOverlaps)
+        })
+    }
+
+    /// Pairs the rule still in the dialog would take part in, against the
+    /// rules on screen: the edited row replaced (`index` >= 0) or the new one
+    /// appended. `done(pairs, candidate)` gets nothing when the bridge is out.
+    function candidateRouteOverlaps(index, row, done) {
+        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcRulesOverlaps !== "function") {
+            return
+        }
+        var rulesJson = _buildRulesJsonFromModel({ index: index, row: row })
+        if (!rulesJson) return
+        var candidate = { id: String(row.id), route: String(row.targetRoute) }
+        var corr = nrrNativeBridge.rpcRulesOverlaps(rulesJson, prefs.routeIncludeSubdomains !== false)
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            var all = (ok && payload && payload["route-overlaps"]) || []
+            var mine = []
+            for (var i = 0; i < all.length; i += 1) {
+                var o = all[i]
+                if (String(o.winner["rule-id"]) === candidate.id
+                        || String(o.loser["rule-id"]) === candidate.id) {
+                    mine.push(o)
+                }
+            }
+            done(mine, candidate)
         })
     }
 
@@ -1428,6 +1473,8 @@ ApplicationWindow {
         "doh-lockdown": "routing",
         "leak-protection": "routing"
     })
+
+    function openOutageBlocks() { requestSectionChange("outage-blocks") }
 
     function focusSetting(focusId, context) {
         var id = String(focusId || "")
@@ -1889,6 +1936,7 @@ ApplicationWindow {
         setUserPresetsDir(folder)
         statusLine = tr("status.user-presets-folder-set",
             "The quick-load dropdown now lists the rule sets in your folder.")
+        boundFilesController.adoptRulesFolder(folder)
     }
     // Answered "no": never offer again. Persisted, because re-asking on the
     // next save is exactly the nagging this design avoids.
@@ -2483,7 +2531,8 @@ ApplicationWindow {
                 // from `window` itself, and the user is still looking at us.
                 active: window.active || Qt.application.state === Qt.ApplicationActive,
                 rulesPathPrimary: window._comparableRulesPathFor("primary"),
-                rulesPathSecondary: window._comparableRulesPathFor("secondary")
+                rulesPathSecondary: window._comparableRulesPathFor("secondary"),
+                rulesFolder: window.userPresetsDir
             }
         }
     }
@@ -2703,6 +2752,60 @@ ApplicationWindow {
         id: autoRuleSuggestionsController
         root: window
     }
+    // `?` rules the service found working only on the other route.
+    property alias verifyVerdicts: verifyVerdicts
+    VerifyVerdicts {
+        id: verifyVerdicts
+        rpc: rpcTransport
+    }
+    /// The verdict card's text: what happened, what each button does, then
+    /// the first few rules with the route they would move to.
+    function verifyVerdictsBody(notice) {
+        var lines = [tr("notifications.verify-verdicts.body",
+            "They do get through over the other route and use it until the next restart. “Move” writes them there for good; “Not now” keeps them as written and checks again after the restart.")]
+        for (var i = 0; i < notice.shown.length; i += 1) {
+            lines.push(tr("notifications.verify-verdicts.item", "{value} → {route}")
+                .replace("{value}", notice.shown[i].value)
+                .replace("{route}", routeLabel(notice.shown[i].to)))
+        }
+        if (notice.more > 0) {
+            lines.push(tr("notifications.block-notice.backlog.more", "and {count} more")
+                .replace("{count}", String(notice.more)))
+        }
+        return lines.join("\n")
+    }
+    /// "Move" on the verdict card. Without a rule-set folder the user first
+    /// picks one, the same picker Settings uses; the rules on screen move in
+    /// and the bound files then follow the move. Cancelling the picker is
+    /// "Not now".
+    function moveVerifyVerdicts() {
+        if (!verifyVerdicts.notice) return
+        if (hasRulesFolder) {
+            _acceptVerifyVerdicts()
+            return
+        }
+        dialogHost.verifyVerdictsFolderDialog.open()
+    }
+    function adoptFolderAndMoveVerifyVerdicts(folder) {
+        setUserPresetsDir(folder)
+        statusLine = tr("status.user-presets-folder-set",
+            "The quick-load dropdown now lists the rule sets in your folder.")
+        // Moved whatever the folder write did: the user asked for the move,
+        // and a failed write has already said so on the status line.
+        boundFilesController.adoptRulesFolder(folder, function() { _acceptVerifyVerdicts() })
+    }
+    function dismissVerifyVerdicts() {
+        verifyVerdicts.dismiss(function(ok, code) {
+            if (!ok) statusLine = tr("status.verify-verdicts.failed",
+                "The service did not take the answer: ") + ipcErrorLabel(code)
+        })
+    }
+    function _acceptVerifyVerdicts() {
+        verifyVerdicts.accept(function(ok, code) {
+            if (!ok) statusLine = tr("status.verify-verdicts.failed",
+                "The service did not take the answer: ") + ipcErrorLabel(code)
+        })
+    }
     // Rules of the two routes claiming the same hosts: Rules → Overlaps.
     property alias ruleOverlapsController: ruleOverlapsController
     RuleOverlapsController {
@@ -2725,6 +2828,13 @@ ApplicationWindow {
     }
     NotificationsController {
         id: notificationsController
+        root: window
+    }
+    // "Restore my settings": the user's route policy and mutes, recorded after
+    // each confirmed write of theirs and offered back to a service that lost them.
+    property alias settingsRestoreController: settingsRestoreController
+    SettingsRestoreController {
+        id: settingsRestoreController
         root: window
     }
     // Service intent: what the user decided about service-owned settings, and
@@ -2995,6 +3105,9 @@ ApplicationWindow {
                     // the panels adopt those defaults, write them into the
                     // display mirror, and the user's settings are gone.
                     Qt.callLater(serviceIntentController.replayServiceIntentToService)
+                    // After the parked delivery and the binding resync have run:
+                    // what the service still lacks is offered, never sent unasked.
+                    Qt.callLater(settingsRestoreController.checkOnConnect)
                     // Re-pull the unresolved-app set so the
                     // "app not enforced" banner reflects the live service state
                     // after a reconnect (state DB may have been wiped/re-applied).
@@ -3005,6 +3118,7 @@ ApplicationWindow {
                     Qt.callLater(function() {
                         autoRuleSuggestionsController.refreshAutoRuleCandidates()
                         autoRuleSuggestionsController.refreshAutoRuleDismissed()
+                        verifyVerdicts.refresh()
                     })
                     // Service came back online.
                     // Priority 1: if the user just clicked Start /
@@ -3535,8 +3649,8 @@ ApplicationWindow {
             case "block-notice-mutes-changed":
                 notificationsController.onNoticeMutesChanged()
                 break
-            case "verify-primary-moved":
-                _onVerifyPrimaryMoved(event)
+            case "verify-verdicts-changed":
+                verifyVerdicts.refresh()
                 break
             case "enforcement-status-changed":
                 _onEnforcementStatusChanged(event)
@@ -3586,23 +3700,6 @@ ApplicationWindow {
     /// surfaces never double up on one event while every (re)connect still
     /// announces itself. Keying on the address alone silenced the notice
     /// forever after the first dismissal.
-    /// A `?` rule moved to the additional route: the main link was shown not
-    /// to reach the site.
-    function _onVerifyPrimaryMoved(event) {
-        var host = String(event.host || "")
-        if (host === "") return
-        notificationsController._addPushNotice({
-            "id": "verify-moved:" + host,
-            "severity": "info",
-            "dismissible": true,
-            "title": tr("tray.verify-moved.title", "Site moved to the additional route"),
-            "body": Pure.fillPlaceholders(tr("tray.verify-moved.body",
-                    "{host} does not open over the primary route, so its rule now uses the additional route."),
-                { host: "<b>" + Pure.escapeMarkup(host) + "</b>" }),
-            "bodyRichText": true
-        })
-    }
-
     function _onSecondaryExternalAddress(event) {
         var address = String(event["external-address"] || "")
         if (address === "") return
@@ -3687,7 +3784,9 @@ ApplicationWindow {
             "title": tr("notifications.enforcement.restored.title",
                 "Routing is working again"),
             "body": tr("notifications.enforcement.restored.body",
-                "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs.")
+                "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs."),
+            "actionKey": "open-outage-blocks",
+            "actionText": tr("action.outage-blocks", "What was blocked")
         })
     }
 
@@ -4120,8 +4219,6 @@ ApplicationWindow {
         // "block" ships only as an SVG (a drop has no adapter PNG set); render
         // it as SVG in both normal and high-contrast modes.
         if (routeId === "block") return Qt.resolvedUrl("../../../assets/icons/status" + (highContrastIcons ? "-hc" : "") + "/route-block.svg")
-        // "verify" takes the primary icon: that is where its traffic goes until
-        // the service moves the rule.
         if (highContrastIcons) return Qt.resolvedUrl("../../../assets/icons/status-hc/" + (routeId === "secondary" ? "route-secondary" : "route-primary") + ".svg")
         return Qt.resolvedUrl("../../../assets/icons/status/" + (routeId === "secondary" ? "route-secondary-20.png" : "route-primary-20.png"))
     }
@@ -4876,8 +4973,7 @@ ApplicationWindow {
         // to trust each call site to remember. Non-user origins (read-back
         // re-seeds, the replay itself) never record, or they would launder
         // service defaults into "what the user wanted".
-        var userWrite = originText.indexOf("user:") === 0
-            || originText === "offline-pending-apply"
+        var userWrite = Pure.isUserWriteOrigin(originText)
         if (userWrite) {
             // A pending replay carries values recorded BEFORE this write, so
             // letting it run now would undo what the user just chose.
@@ -5363,7 +5459,9 @@ ApplicationWindow {
             ruleTypeTitle: ruleTypeLabel(ruleDialog.localRuleType),
             matchValue: ruleDialog.localValue,
             aceMatchValue: _aceLowerForSearch(ruleDialog.localValue),
-            targetRoute: Rules.routeForRuleType(ruleDialog.localRoute, ruleDialog.localRuleType),
+            targetRoute: ruleDialog.localRoute,
+            verify: Rules.rowIsVerify({ ruleType: ruleDialog.localRuleType,
+                targetRoute: ruleDialog.localRoute, verify: ruleDialog.localVerify }),
             comment: finalComment,
             // Editing an app-authored rule makes it the user's own: the badge
             // said "we added this for you", and once they have gone in and
@@ -5394,6 +5492,7 @@ ApplicationWindow {
             }
         }
         if (editingRule >= 0) rulesModel.set(editingRule, item); else rulesModel.append(item)
+        ruleOverlapsController.noteOwnEdit(item.id)
         // A `set()` edit does NOT change
         // rulesModel.count, so RulesSection's onCountChanged rebuild never
         // fires and the edited row (e.g. secondary→primary) stays stale until
@@ -5447,7 +5546,9 @@ ApplicationWindow {
                 ruleTypeTitle: ruleTypeLabel(ruleType),
                 matchValue: value,
                 aceMatchValue: _aceLowerForSearch(value),
-                targetRoute: Rules.routeForRuleType(ruleDialog.localRoute, ruleType),
+                targetRoute: ruleDialog.localRoute,
+                verify: Rules.rowIsVerify({ ruleType: ruleType,
+                    targetRoute: ruleDialog.localRoute, verify: ruleDialog.localVerify }),
                 comment: ruleDialog.localComment,
                 originReason: "",
                 originAnchor: "",
@@ -5964,6 +6065,7 @@ ApplicationWindow {
                 ? ruleTypeLabel(slug) : slug,
             matchValue: String(w["match-value"] || ""),
             targetRoute: route,
+            verify: w.verify === true,
             comment: (w.comment !== undefined && w.comment !== null)
                 ? String(w.comment) : "",
             validationStatus: String(w["validation-status"] || "valid"),
@@ -6119,6 +6221,7 @@ ApplicationWindow {
                 // Same reason: the offer the tray may have shown while this
                 // window was closed has to be countable the moment it opens.
                 autoRuleSuggestionsController.refreshAutoRuleCandidates()
+                verifyVerdicts.refresh()
                 // The Overlaps count shows on every screen, not only once the
                 // rules screen has been opened.
                 refreshRulesOverlaps()
@@ -6928,6 +7031,14 @@ ApplicationWindow {
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { SettingsSection { root: window } }
                 }
+                Loader {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    active: StackLayout.isCurrentItem
+                    asynchronous: window.sectionLoadsAsync
+                    visible: StackLayout.isCurrentItem
+                    sourceComponent: Component { OutageBlocksSection { root: window } }
+                }
             }
         }
     }
@@ -6982,6 +7093,7 @@ ApplicationWindow {
     property alias factoryPresetSaveDialog: dialogHost.factoryPresetSaveDialog
     property alias saveRuleSetDialog: dialogHost.saveRuleSetDialog
     property alias rulesSaveFolderDialog: dialogHost.rulesSaveFolderDialog
+    property alias verifyVerdictsFolderDialog: dialogHost.verifyVerdictsFolderDialog
     // Tray-initiated safe-disable confirmation, opened from
     // `applyGuiActivationRequest` when the secondary launcher writes
     // `action: "safe-disable"` into the gui-activation.json hand-off.
@@ -7525,18 +7637,23 @@ ApplicationWindow {
     /// the two payloads are byte-identical for identical rules; it lives here
     /// so non-section call sites can reuse it without crossing the section
     /// boundary.
-    function _buildRulesJsonFromModel() {
+    /// `candidate` ({index, row}) puts a row that is not in the table yet in
+    /// place of row `index`, or after the last one when `index` is negative.
+    function _buildRulesJsonFromModel(candidate) {
         try {
             var primary = []
             var secondary = []
-            for (var i = 0; i < rulesModel.count; i += 1) {
-                var entry = rulesModel.get(i)
-                // Pseudo-routes live in the secondary bucket; their `action`
+            var put = function(entry) {
+                // A block lives in the secondary bucket; its `action`
                 // field (set by the serializer) overrides routing.
                 var bucket = (Rules.routeBucket(entry.targetRoute) === "secondary")
                     ? secondary : primary
                 bucket.push(Rules.ruleRowToWireDto(entry, _aceEncodeHost))
             }
+            for (var i = 0; i < rulesModel.count; i += 1) {
+                put(candidate && candidate.index === i ? candidate.row : rulesModel.get(i))
+            }
+            if (candidate && candidate.index < 0) put(candidate.row)
             return JSON.stringify({
                 "schema-version": 1,
                 "primary": primary,

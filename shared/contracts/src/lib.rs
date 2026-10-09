@@ -68,6 +68,7 @@ pub mod rules_json;
 pub mod rules_overlap;
 pub mod system_info;
 pub mod user_paths;
+pub mod user_settings;
 // Descriptors + integrity status of the binaries we ship from third parties
 // (today: WireGuard LLC's Wintun, Windows only). The GUI renders these, so
 // the shapes belong to the wire contract; the port that fills them lives in

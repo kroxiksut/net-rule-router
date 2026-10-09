@@ -1,0 +1,159 @@
+{
+  "description": "pure.js routePolicyIntentAfterWrite",
+  "cases": [
+    {
+      "name": "the first key recorded",
+      "input": {
+        "intent": {},
+        "request": {
+          "mode": "prefer-secondary-when-available"
+        },
+        "keys": [
+          "mode"
+        ]
+      },
+      "expected": {
+        "mode": "prefer-secondary-when-available"
+      }
+    },
+    {
+      "name": "other recorded keys stay",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true
+        },
+        "request": {
+          "mode": "prefer-primary"
+        },
+        "keys": [
+          "mode"
+        ]
+      },
+      "expected": {
+        "kill-switch-enabled": true,
+        "mode": "prefer-primary"
+      }
+    },
+    {
+      "name": "a value is overwritten",
+      "input": {
+        "intent": {
+          "mode": "prefer-primary"
+        },
+        "request": {
+          "mode": "strict-secondary-fail-closed"
+        },
+        "keys": [
+          "mode"
+        ]
+      },
+      "expected": {
+        "mode": "strict-secondary-fail-closed"
+      }
+    },
+    {
+      "name": "an unbinding drops the recorded binding",
+      "input": {
+        "intent": {
+          "primary": {
+            "stable-id": "A",
+            "display-name": "Ethernet",
+            "user-confirmed": true
+          },
+          "mode": "prefer-primary"
+        },
+        "request": {
+          "mode": "prefer-primary"
+        },
+        "keys": [
+          "primary"
+        ]
+      },
+      "expected": {
+        "mode": "prefer-primary"
+      }
+    },
+    {
+      "name": "a null value drops its key",
+      "input": {
+        "intent": {
+          "short-name-suffix": "corp"
+        },
+        "request": {
+          "short-name-suffix": null
+        },
+        "keys": [
+          "short-name-suffix"
+        ]
+      },
+      "expected": {}
+    },
+    {
+      "name": "a binding is recorded whole",
+      "input": {
+        "intent": {},
+        "request": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          },
+          "mode": "prefer-primary"
+        },
+        "keys": [
+          "secondary"
+        ]
+      },
+      "expected": {
+        "secondary": {
+          "stable-id": "B",
+          "display-name": "Tunnel",
+          "user-confirmed": true
+        }
+      }
+    },
+    {
+      "name": "no named keys change nothing",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": false
+        },
+        "request": {
+          "kill-switch-enabled": true
+        },
+        "keys": []
+      },
+      "expected": {
+        "kill-switch-enabled": false
+      }
+    },
+    {
+      "name": "a key neither side has stays absent",
+      "input": {
+        "intent": {},
+        "request": {},
+        "keys": [
+          "doh-lockdown-enabled"
+        ]
+      },
+      "expected": {}
+    },
+    {
+      "name": "only the named keys of a full request",
+      "input": {
+        "intent": {},
+        "request": {
+          "mode": "prefer-primary",
+          "kill-switch-enabled": true,
+          "include-subdomains": true
+        },
+        "keys": [
+          "kill-switch-enabled"
+        ]
+      },
+      "expected": {
+        "kill-switch-enabled": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,364 @@
+{
+  "description": "pure.js verifyVerdictNotice: the one notice for ? rules that work only on the other route",
+  "cases": [
+    {
+      "name": "nothing",
+      "input": {
+        "verdicts": []
+      }
+    },
+    {
+      "name": "one domain",
+      "input": {
+        "verdicts": [
+          {
+            "rule-id": "R-0001",
+            "value": "accounts.example.com",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "accounts.example.com",
+            "since-unix-ms": 1767225600001,
+            "dismissed": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "one address the other way",
+      "input": {
+        "verdicts": [
+          {
+            "rule-id": "R-0002",
+            "value": "203.0.113.7",
+            "kind": "ip",
+            "from-route": "secondary",
+            "to-route": "primary",
+            "host": "203.0.113.7",
+            "since-unix-ms": 1767225600002,
+            "dismissed": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "suffix keeps its star",
+      "input": {
+        "verdicts": [
+          {
+            "rule-id": "R-0003",
+            "value": "*.mail.example.net",
+            "kind": "domain",
+            "from-route": "secondary",
+            "to-route": "primary",
+            "host": "imap.mail.example.net",
+            "since-unix-ms": 1767225600003,
+            "dismissed": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "set aside only",
+      "input": {
+        "verdicts": [
+          {
+            "rule-id": "R-0004",
+            "value": "a.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "a.example",
+            "since-unix-ms": 1767225600004,
+            "dismissed": true
+          },
+          {
+            "rule-id": "R-0005",
+            "value": "b.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "b.example",
+            "since-unix-ms": 1767225600005,
+            "dismissed": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "set aside ones skipped",
+      "input": {
+        "verdicts": [
+          {
+            "rule-id": "R-0006",
+            "value": "a.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "a.example",
+            "since-unix-ms": 1767225600006,
+            "dismissed": true
+          },
+          {
+            "rule-id": "R-0007",
+            "value": "192.0.2.7",
+            "kind": "ip",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "192.0.2.7",
+            "since-unix-ms": 1767225600007,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0008",
+            "value": "c.example",
+            "kind": "domain",
+            "from-route": "secondary",
+            "to-route": "primary",
+            "host": "c.example",
+            "since-unix-ms": 1767225600008,
+            "dismissed": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "exactly five",
+      "input": {
+        "verdicts": [
+          {
+            "rule-id": "R-0010",
+            "value": "h0.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h0.example",
+            "since-unix-ms": 1767225600010,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0011",
+            "value": "h1.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h1.example",
+            "since-unix-ms": 1767225600011,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0012",
+            "value": "h2.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h2.example",
+            "since-unix-ms": 1767225600012,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0013",
+            "value": "h3.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h3.example",
+            "since-unix-ms": 1767225600013,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0014",
+            "value": "h4.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h4.example",
+            "since-unix-ms": 1767225600014,
+            "dismissed": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "six names five",
+      "input": {
+        "verdicts": [
+          {
+            "rule-id": "R-0020",
+            "value": "h0.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h0.example",
+            "since-unix-ms": 1767225600020,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0021",
+            "value": "h1.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h1.example",
+            "since-unix-ms": 1767225600021,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0022",
+            "value": "h2.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h2.example",
+            "since-unix-ms": 1767225600022,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0023",
+            "value": "h3.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h3.example",
+            "since-unix-ms": 1767225600023,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0024",
+            "value": "h4.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h4.example",
+            "since-unix-ms": 1767225600024,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0025",
+            "value": "h5.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h5.example",
+            "since-unix-ms": 1767225600025,
+            "dismissed": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "set aside between many",
+      "input": {
+        "verdicts": [
+          {
+            "rule-id": "R-0030",
+            "value": "h0.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h0.example",
+            "since-unix-ms": 1767225600030,
+            "dismissed": true
+          },
+          {
+            "rule-id": "R-0031",
+            "value": "h1.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h1.example",
+            "since-unix-ms": 1767225600031,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0032",
+            "value": "h2.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h2.example",
+            "since-unix-ms": 1767225600032,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0033",
+            "value": "h3.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h3.example",
+            "since-unix-ms": 1767225600033,
+            "dismissed": true
+          },
+          {
+            "rule-id": "R-0034",
+            "value": "h4.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h4.example",
+            "since-unix-ms": 1767225600034,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0035",
+            "value": "h5.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h5.example",
+            "since-unix-ms": 1767225600035,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0036",
+            "value": "h6.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h6.example",
+            "since-unix-ms": 1767225600036,
+            "dismissed": true
+          },
+          {
+            "rule-id": "R-0037",
+            "value": "h7.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h7.example",
+            "since-unix-ms": 1767225600037,
+            "dismissed": false
+          },
+          {
+            "rule-id": "R-0038",
+            "value": "h8.example",
+            "kind": "domain",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "h8.example",
+            "since-unix-ms": 1767225600038,
+            "dismissed": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "ipv6 value",
+      "input": {
+        "verdicts": [
+          {
+            "rule-id": "R-0040",
+            "value": "2001:db8::7",
+            "kind": "ip",
+            "from-route": "primary",
+            "to-route": "secondary",
+            "host": "2001:db8::7",
+            "since-unix-ms": 1767225600040,
+            "dismissed": false
+          }
+        ]
+      }
+    }
+  ]
+}

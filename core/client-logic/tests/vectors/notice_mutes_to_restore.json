@@ -1,0 +1,278 @@
+{
+  "description": "pure.js noticeMutesToRestore",
+  "cases": [
+    {
+      "name": "nothing recorded",
+      "input": {
+        "intent": null,
+        "service": [],
+        "now": 100
+      },
+      "expected": []
+    },
+    {
+      "name": "a record that is not a list",
+      "input": {
+        "intent": {
+          "scope": {
+            "kind": "all"
+          }
+        },
+        "service": [],
+        "now": 100
+      },
+      "expected": []
+    },
+    {
+      "name": "every mute is held",
+      "input": {
+        "intent": [
+          {
+            "scope": {
+              "kind": "all"
+            }
+          },
+          {
+            "scope": {
+              "kind": "host",
+              "host": "a.example"
+            }
+          }
+        ],
+        "service": [
+          {
+            "scope": {
+              "kind": "host",
+              "host": "a.example"
+            }
+          },
+          {
+            "scope": {
+              "kind": "all"
+            }
+          }
+        ],
+        "now": 100
+      },
+      "expected": []
+    },
+    {
+      "name": "an indefinite mute the service lost",
+      "input": {
+        "intent": [
+          {
+            "scope": {
+              "kind": "all"
+            }
+          },
+          {
+            "scope": {
+              "kind": "notice",
+              "notice": "rules-drift"
+            }
+          }
+        ],
+        "service": [
+          {
+            "scope": {
+              "kind": "all"
+            }
+          }
+        ],
+        "now": 100
+      },
+      "expected": [
+        {
+          "scope": {
+            "kind": "notice",
+            "notice": "rules-drift"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an expired mute stays gone",
+      "input": {
+        "intent": [
+          {
+            "scope": {
+              "kind": "host",
+              "host": "a.example"
+            },
+            "until-unix-ms": 50
+          }
+        ],
+        "service": [],
+        "now": 100
+      },
+      "expected": []
+    },
+    {
+      "name": "a mute that still runs keeps its deadline",
+      "input": {
+        "intent": [
+          {
+            "scope": {
+              "kind": "app",
+              "app": "x.exe"
+            },
+            "until-unix-ms": 5000
+          }
+        ],
+        "service": [],
+        "now": 100
+      },
+      "expected": [
+        {
+          "scope": {
+            "kind": "app",
+            "app": "x.exe"
+          },
+          "until-unix-ms": 5000
+        }
+      ]
+    },
+    {
+      "name": "key order inside a scope does not matter",
+      "input": {
+        "intent": [
+          {
+            "scope": {
+              "host": "a.example",
+              "kind": "host"
+            }
+          }
+        ],
+        "service": [
+          {
+            "scope": {
+              "kind": "host",
+              "host": "a.example"
+            }
+          }
+        ],
+        "now": 100
+      },
+      "expected": []
+    },
+    {
+      "name": "an entry without a scope is skipped",
+      "input": {
+        "intent": [
+          {
+            "until-unix-ms": 5000
+          },
+          {
+            "scope": "all"
+          },
+          {
+            "scope": {
+              "kind": "app",
+              "app": "x.exe"
+            }
+          }
+        ],
+        "service": [],
+        "now": 100
+      },
+      "expected": [
+        {
+          "scope": {
+            "kind": "app",
+            "app": "x.exe"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a service answer that is not a list holds nothing",
+      "input": {
+        "intent": [
+          {
+            "scope": {
+              "kind": "all"
+            }
+          }
+        ],
+        "service": {
+          "mutes": []
+        },
+        "now": 100
+      },
+      "expected": [
+        {
+          "scope": {
+            "kind": "all"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a zero deadline is no deadline",
+      "input": {
+        "intent": [
+          {
+            "scope": {
+              "kind": "all"
+            },
+            "until-unix-ms": 0
+          }
+        ],
+        "service": [],
+        "now": 100
+      },
+      "expected": [
+        {
+          "scope": {
+            "kind": "all"
+          }
+        }
+      ]
+    },
+    {
+      "name": "the recorded order is kept",
+      "input": {
+        "intent": [
+          {
+            "scope": {
+              "kind": "notice",
+              "notice": "rules-drift"
+            }
+          },
+          {
+            "scope": {
+              "kind": "all"
+            }
+          },
+          {
+            "scope": {
+              "kind": "host",
+              "host": "a.example"
+            }
+          }
+        ],
+        "service": [],
+        "now": 100
+      },
+      "expected": [
+        {
+          "scope": {
+            "kind": "notice",
+            "notice": "rules-drift"
+          }
+        },
+        {
+          "scope": {
+            "kind": "all"
+          }
+        },
+        {
+          "scope": {
+            "kind": "host",
+            "host": "a.example"
+          }
+        }
+      ]
+    }
+  ]
+}

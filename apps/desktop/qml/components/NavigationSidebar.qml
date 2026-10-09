@@ -273,7 +273,8 @@ Pane {
                             }
                         }
 
-                        // Diagnostics submenu: the live connection trace and the cache.
+                        // Diagnostics submenu: the live connection trace, what the last
+                        // outage blocked, and the cache.
                         ColumnLayout {
                             visible: navEntry.isDiagnosticsEntry && navigationSidebar.diagnosticsNavExpanded
                                 && !root.sidebarCollapsed
@@ -289,6 +290,14 @@ Pane {
                                 iconName: "routing"
                                 text: root.sectionTitle("conn-trace")
                                 onClicked: root.requestSectionChange("conn-trace")
+                            }
+
+                            SidebarSubNavButton {
+                                shell: navigationSidebar.root
+                                sectionId: "outage-blocks"
+                                iconName: "routing"
+                                text: root.sectionTitle("outage-blocks")
+                                onClicked: root.requestSectionChange("outage-blocks")
                             }
 
                             SidebarSubNavButton {

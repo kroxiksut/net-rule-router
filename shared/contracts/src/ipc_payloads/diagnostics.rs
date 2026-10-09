@@ -455,6 +455,74 @@ pub struct ConnTraceEntriesListResponse {
     pub gui_stream_enabled: bool,
 }
 
+/// Wire request for `ConnTraceOutageBlocksList`. Empty: the answer is always
+/// the caller's own last outage, small enough to send whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ConnTraceOutageBlocksRequest {}
+
+/// One outage of the caller's additional route.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutageEpisodeDto {
+    /// When the route went down (UTC ms).
+    pub since_unix_ms: i64,
+    /// When it came back (UTC ms); absent while the outage lasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_unix_ms: Option<i64>,
+}
+
+/// One program's blocked attempts at one address during the outage, folded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutageBlockDto {
+    /// Executable name (e.g. `browser.exe`), or `?` when unknown.
+    pub process: String,
+    /// Full executable path, or empty when unknown.
+    #[serde(default)]
+    pub process_path: String,
+    pub remote_ip: String,
+    /// Port of the latest attempt.
+    pub remote_port: u16,
+    /// The name the service's DNS saw this address answered for, or empty.
+    #[serde(default)]
+    pub host: String,
+    /// The secondary-rule host that owns this address, or empty when the
+    /// service knows none.
+    #[serde(default)]
+    pub rule_host: String,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    pub attempts: u32,
+}
+
+/// Wire response for `ConnTraceOutageBlocksList`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ConnTraceOutageBlocksResponse {
+    /// The last outage, ongoing or over; absent when there was none since the
+    /// service started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<OutageEpisodeDto>,
+    /// Most recently attempted first.
+    #[serde(default)]
+    pub entries: Vec<OutageBlockDto>,
+    /// Folded entries dropped to keep the list bounded, oldest first. Nonzero
+    /// means the list is incomplete and the GUI must say so.
+    #[serde(default)]
+    pub omitted: u32,
+    /// `true` when the compact redaction tier is active (IPs masked).
+    pub redacted: bool,
+    /// `false` when nothing can see these drops on this machine, so an empty
+    /// list means "not watching" rather than "nothing was blocked".
+    #[serde(default = "default_true")]
+    pub observer_active: bool,
+    /// `false` when the user switched the GUI trace off; the list is then
+    /// empty by request.
+    #[serde(default = "default_true")]
+    pub gui_stream_enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DiagnosticsExportArchiveResponse {

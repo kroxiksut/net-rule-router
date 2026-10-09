@@ -20,7 +20,7 @@ use nrr_client_logic::review::{self, Outcome};
 use nrr_client_logic::route_policy;
 use nrr_client_logic::rules_table::{
     build_rules_file_text, drift_row_from_parsed_rule, drift_row_from_service_wire,
-    file_row_from_service_wire, normalize_host_input, parsed_rule_target_route,
+    file_row_from_service_wire, normalize_host_input, parsed_rule_target_route, parsed_rule_verify,
     rule_row_to_wire_dto, RowOrigin, RuleRow, RuleType, RulesFileOptions, TargetRoute,
     WireDtoOptions, PRESET_FORMAT_VERSION,
 };
@@ -335,6 +335,7 @@ fn row_from_js(value: &Value) -> RuleRow {
         rule_type: RuleType::from_slug(text(value, "ruleType")),
         match_value: text(value, "matchValue").to_owned(),
         target_route: TargetRoute::from_slug(text(value, "targetRoute")),
+        verify: value["verify"].as_bool().unwrap_or(false),
         comment: text(value, "comment").to_owned(),
         origin: has_origin.then(|| RowOrigin {
             reason: text(value, "originReason").to_owned(),
@@ -360,6 +361,7 @@ fn file_row_to_js(row: &RuleRow) -> Value {
         "ruleType": row.rule_type.as_str(),
         "matchValue": row.match_value,
         "targetRoute": row.target_route.as_str(),
+        "verify": row.verify,
         "comment": row.comment,
         "originReason": origin.reason,
         "originAnchor": origin.anchor,
@@ -373,6 +375,7 @@ fn drift_row_to_js(row: &RuleRow) -> Value {
         "ruleType": row.rule_type.as_str(),
         "matchValue": row.match_value,
         "targetRoute": row.target_route.as_str(),
+        "verify": row.verify,
     })
 }
 
@@ -412,25 +415,12 @@ fn rule_type_allows_verify_matches_js() {
 }
 
 #[test]
-fn route_for_rule_type_matches_js() {
+fn row_is_verify_matches_js() {
     check(
-        "route_for_rule_type",
+        "row_is_verify",
         &mut JsLib::rules(),
-        |input| {
-            format!(
-                "routeForRuleType({}, {})",
-                arg(input, "route"),
-                arg(input, "ruleType")
-            )
-        },
-        |input| {
-            let rule_type = RuleType::from_slug(text(input, "ruleType"));
-            Value::from(
-                TargetRoute::from_slug(text(input, "route"))
-                    .for_rule_type(&rule_type)
-                    .as_str(),
-            )
-        },
+        |input| format!("rowIsVerify({})", arg(input, "row")),
+        |input| Value::from(row_from_js(&input["row"]).is_verify()),
     );
 }
 
@@ -511,6 +501,7 @@ fn rows_from_parsed_rules_match_js() {
         |input| {
             format!(
                 "(function (r, route) {{ return {{ target: parsedRuleTargetRoute(r, route), \
+                 verify: parsedRuleVerify(r), \
                  drift: driftRowFromParsedRule(r, route) }} }})({}, {})",
                 arg(input, "rule"),
                 arg(input, "route")
@@ -522,6 +513,7 @@ fn rows_from_parsed_rules_match_js() {
             let file = route(input);
             json!({
                 "target": parsed_rule_target_route(&rule, file).as_str(),
+                "verify": parsed_rule_verify(&rule),
                 "drift": drift_row_to_js(&drift_row_from_parsed_rule(&rule, file)),
             })
         },

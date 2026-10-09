@@ -14,7 +14,7 @@
       "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },
     { "name": "one rule removed", "input": { "patch": { "rules-removed": [{ "id": "R-0002", "display": "192.0.2.1", "route": "block" }] } },
       "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },
-    { "name": "modified only", "input": { "patch": { "rules-modified": [{ "id": "R-0003", "display": "a.example", "route": "verify", "enabled": false }] } },
+    { "name": "modified only", "input": { "patch": { "rules-modified": [{ "id": "R-0003", "display": "a.example", "route": "secondary", "enabled": false }] } },
       "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },
     { "name": "retargeted only", "input": { "patch": { "rules-retargeted": [{ "id": "R-0004", "display": "b.example (primary → secondary)", "route": "secondary" }] } },
       "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },

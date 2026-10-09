@@ -1,11 +1,12 @@
 //! Screen 5, overlaps: pairs of rules on the two routes that cover the same
 //! sites, which route the sites actually take, and the conflicts the service
-//! found in the applied rules. The pairs and winners come from
+//! found in the applied rules. The pairs come from
 //! `nrr_shared::rules_overlap::find_route_overlaps`, the function the GUI's
-//! launcher runs; nothing here decides a winner.
+//! launcher runs, over the Rules screen's working copy, so an edit shows here
+//! before it is applied; nothing here decides a winner.
 //!
-//! "Send over the other route" is an ordinary edit of the rules list: nothing
-//! reaches the service until the list is reviewed and applied.
+//! "Send over the other route" is an ordinary edit of that working copy:
+//! nothing reaches the service until the list is reviewed and applied.
 
 mod keys;
 #[cfg(test)]
@@ -14,21 +15,13 @@ mod tests;
 use std::collections::BTreeSet;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use nrr_client_logic::rules_table::{
-    file_row_from_service_wire, rule_row_to_wire_dto, RuleRow, TargetRoute, WireDtoOptions,
-};
+use nrr_client_logic::rules_overlaps::confirmed_by_own_edit;
+use nrr_client_logic::rules_table::TargetRoute;
 use nrr_client_logic::Route;
-use nrr_ipc_client::IpcClient;
-use nrr_shared::ipc::IpcOperationName;
-use nrr_shared::ipc_payloads::{
-    RuleConflictDto, RuleConflictKind, RulesListRequest, RulesListResponse,
-};
-use nrr_shared::rules_json::{CanonicalRulesJsonV1, RULES_JSON_SCHEMA_VERSION};
-use nrr_shared::rules_overlap::{find_route_overlaps, OverlapRule, RouteOverlap, RouteOverlapKind};
+use nrr_shared::ipc_payloads::{RuleConflictDto, RuleConflictKind};
+use nrr_shared::rules_overlap::{OverlapRule, RouteOverlap, RouteOverlapKind};
 
-use super::suggestions::{call, CallError};
-use super::{Screen, ScreenId};
-use crate::backend::Reply;
+use super::{rules, Screen, ScreenId};
 use crate::i18n::{Key, Texts};
 use crate::keys as common;
 use crate::state::{AppState, Focus};
@@ -36,23 +29,18 @@ use crate::view::{Panel, ScreenView, Segment, ViewLine};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Note {
-    Failed(CallError),
     NoItem(usize),
     CannotSend(usize),
     Gone(usize),
+    /// The rules list is being applied and cannot change meanwhile.
+    Locked,
 }
 
 #[derive(Debug, Default)]
 pub struct Overlaps {
-    /// The rules the pairs are found in, with the service's ids, and where
-    /// "send over" writes.
-    rows: Vec<RuleRow>,
-    /// Pairs over `rows`, recomputed whenever they change.
+    /// Pairs over the Rules screen's working copy as of its last change seen
+    /// here.
     pairs: Vec<RouteOverlap>,
-    loaded: bool,
-    loading: bool,
-    /// `rows` hold an edit the service has not applied.
-    edited: bool,
     /// Pair keys the user confirmed this session; a key names both rules and
     /// their routes, so editing either asks again.
     confirmed: BTreeSet<String>,
@@ -83,74 +71,62 @@ impl Overlaps {
         self.pairs.iter().filter(|p| !self.is_confirmed(p)).count()
     }
 
-    /// The row one side of a pair names; `None` when the list moved on.
-    fn row_of(&self, side: &OverlapRule) -> Option<usize> {
-        self.rows
-            .iter()
-            .position(|row| bucket_slug(&row.target_route) == side.route && row.id == side.rule_id)
-    }
-
-    /// The route as the rules list names it: a block rule rides in the
-    /// secondary bucket but is not a route.
-    fn route_of<'a>(&'a self, side: &'a OverlapRule) -> &'a str {
-        self.row_of(side).map_or(side.route.as_str(), |at| {
-            self.rows[at].target_route.as_str()
-        })
-    }
-
-    /// Only two routing rules can trade places; a block or "primary first"
-    /// rule is changed in the rules list.
-    fn can_reroute(&self, pair: &RouteOverlap) -> bool {
-        is_plain_route(self.route_of(&pair.winner)) && is_plain_route(self.route_of(&pair.loser))
-    }
-
-    fn has_block_side(&self, pair: &RouteOverlap) -> bool {
-        self.route_of(&pair.winner) == "block" || self.route_of(&pair.loser) == "block"
-    }
-
-    fn recompute(&mut self, include_subdomains: bool) {
-        self.pairs = find_route_overlaps(&rules_json(&self.rows), include_subdomains);
-        // A key of a pair that no longer exists can never be shown again.
+    /// Only keys of pairs that exist now are kept, as the GUI stores them, so
+    /// the set cannot outgrow the rules it describes. A pair that is gone for
+    /// a moment keeps its key until the next confirmation.
+    fn confirm(&mut self, keys: impl IntoIterator<Item = String>) {
+        self.confirmed.extend(keys);
         let live: BTreeSet<&str> = self.pairs.iter().map(|p| p.key.as_str()).collect();
         self.confirmed.retain(|k| live.contains(k.as_str()));
+        self.clamp();
+    }
+
+    fn clamp(&mut self) {
         let count = self.shown().len();
         self.selected = self.selected.min(count.saturating_sub(1));
     }
+}
+
+/// Find the pairs again; the working copy may have changed.
+pub fn refresh(app: &mut AppState) {
+    app.overlaps.pairs = rules::route_overlaps(app);
+    app.overlaps.clamp();
+}
+
+/// A rule saved from the rule form: an exception it makes inside a wider rule
+/// of the other route is what the user meant, so it is not asked about.
+pub fn confirm_own_edit(app: &mut AppState, rule_id: &str) {
+    refresh(app);
+    let settled = confirmed_by_own_edit(&app.overlaps.pairs, &[rule_id]);
+    if !settled.is_empty() {
+        app.overlaps.confirm(settled);
+    }
+}
+
+/// The route the working copy gives one side of a pair: a block rule rides in
+/// the secondary bucket but is not a route.
+fn route_of<'a>(app: &'a AppState, side: &'a OverlapRule) -> &'a str {
+    let table = &app.rules.table;
+    Route::from_slug(&side.route)
+        .and_then(|bucket| table.find(bucket, &side.rule_id))
+        .map_or(side.route.as_str(), |at| {
+            table.rows[at].rule.target_route.as_str()
+        })
+}
+
+/// Only two routing rules can trade places (a `?` rule is one); a block is
+/// changed in the rules list.
+fn can_reroute(app: &AppState, pair: &RouteOverlap) -> bool {
+    is_plain_route(route_of(app, &pair.winner)) && is_plain_route(route_of(app, &pair.loser))
 }
 
 fn is_plain_route(route: &str) -> bool {
     route == Route::Primary.as_str() || route == Route::Secondary.as_str()
 }
 
-/// The bucket a row rides in, as the wire names it; an unknown target rides
-/// with the primary rules, as the GUI's serializer puts it.
-fn bucket_slug(target: &TargetRoute) -> &'static str {
-    target.bucket().unwrap_or(Route::Primary).as_str()
-}
-
-/// The rules in the wire form the overlap finder reads.
-fn rules_json(rows: &[RuleRow]) -> CanonicalRulesJsonV1 {
-    let mut json = CanonicalRulesJsonV1 {
-        schema_version: RULES_JSON_SCHEMA_VERSION,
-        primary: Vec::new(),
-        secondary: Vec::new(),
-    };
-    for row in rows {
-        let dto = rule_row_to_wire_dto(row, None, WireDtoOptions::FULL);
-        match row.target_route.bucket() {
-            Some(Route::Secondary) => json.secondary.push(dto),
-            _ => json.primary.push(dto),
-        }
-    }
-    json
-}
-
-/// The reader's subdomain setting; absent means on, the product default.
-fn include_subdomains(app: &AppState) -> bool {
-    app.snapshot
-        .as_ref()
-        .and_then(|s| s.route_policy.as_ref())
-        .is_none_or(|p| p.include_subdomains)
+/// Whether there are rules to look at, read or written here.
+fn has_rules(app: &AppState) -> bool {
+    app.rules.table.is_loaded() || !app.rules.table.rows.is_empty()
 }
 
 pub struct OverlapsScreen;
@@ -197,15 +173,10 @@ impl Screen for OverlapsScreen {
         keys::PLAIN_KEYS
     }
 
-    /// Re-read on every visit, unless an edit made here is still waiting to
-    /// be applied: a re-read would throw it away.
+    /// The working copy may have changed on the Rules screen meanwhile.
     fn on_show(&self, app: &mut AppState) {
-        if app.overlaps.edited {
-            let subdomains = include_subdomains(app);
-            app.overlaps.recompute(subdomains);
-        } else if app.link.is_connected() {
-            load(app);
-        }
+        rules::load_if_needed(app);
+        refresh(app);
     }
 
     fn takes_focus(&self) -> bool {
@@ -258,12 +229,13 @@ impl Screen for OverlapsScreen {
 
 fn move_to(app: &mut AppState, index: usize, count: usize) {
     app.overlaps.selected = index.min(count.saturating_sub(1));
-    let state = &app.overlaps;
-    let rows: usize = state
+    let seen: &AppState = app;
+    let rows: usize = seen
+        .overlaps
         .shown()
         .iter()
-        .take(state.selected)
-        .map(|p| pair_line_count(state, p))
+        .take(seen.overlaps.selected)
+        .map(|p| pair_line_count(seen, p))
         .sum();
     app.scroll = u16::try_from(rows).unwrap_or(u16::MAX);
 }
@@ -283,16 +255,13 @@ fn command(app: &mut AppState, letter: char, index: usize) -> bool {
             };
             app.overlaps.note = None;
             match letter {
-                'c' => {
-                    app.overlaps.confirmed.insert(pair.key);
-                }
+                'c' => app.overlaps.confirm([pair.key]),
                 'u' => {
                     app.overlaps.confirmed.remove(&pair.key);
+                    app.overlaps.clamp();
                 }
                 _ => send_over(app, &pair, index),
             }
-            let count = app.overlaps.shown().len();
-            app.overlaps.selected = app.overlaps.selected.min(count.saturating_sub(1));
         }
         _ => return false,
     }
@@ -302,7 +271,7 @@ fn command(app: &mut AppState, letter: char, index: usize) -> bool {
 fn confirm_all(app: &mut AppState) {
     let state = &mut app.overlaps;
     let keys: Vec<String> = state.pairs.iter().map(|p| p.key.clone()).collect();
-    state.confirmed.extend(keys);
+    state.confirm(keys);
     state.selected = 0;
     state.note = None;
     app.scroll = 0;
@@ -311,64 +280,29 @@ fn confirm_all(app: &mut AppState) {
 /// The shared sites take the loser's route: a nested winner moves there; of a
 /// duplicate the winning copy is switched off, as the GUI's review does.
 fn send_over(app: &mut AppState, pair: &RouteOverlap, index: usize) {
-    let state = &mut app.overlaps;
-    if !state.can_reroute(pair) {
-        state.note = Some(Note::CannotSend(index + 1));
+    if !can_reroute(app, pair) {
+        app.overlaps.note = Some(Note::CannotSend(index + 1));
         return;
     }
-    let Some(at) = state.row_of(&pair.winner) else {
-        state.note = Some(Note::Gone(index + 1));
-        return;
-    };
-    let row = &mut state.rows[at];
-    if pair.kind == RouteOverlapKind::Duplicate {
-        row.enabled = false;
-    } else {
-        row.target_route = TargetRoute::from_slug(&pair.loser.route);
-    }
-    state.edited = true;
-    let subdomains = include_subdomains(app);
-    app.overlaps.recompute(subdomains);
-}
-
-fn load(app: &mut AppState) {
-    if app.overlaps.loading {
+    if rules::edits_locked(app) {
+        app.overlaps.note = Some(Note::Locked);
         return;
     }
-    app.overlaps.loading = true;
-    app.outbox.push(Box::new(|client: &dyn IpcClient| {
-        let answer: Result<RulesListResponse, _> = call(
-            client,
-            IpcOperationName::RulesList,
-            &RulesListRequest::default(),
-        );
-        Reply::new(move |app| loaded(app, answer))
-    }));
-}
-
-fn loaded(app: &mut AppState, answer: Result<RulesListResponse, CallError>) {
-    app.overlaps.loading = false;
-    // An edit made while the read was in flight is newer than the read.
-    if app.overlaps.edited {
-        return;
-    }
-    match answer {
-        Ok(list) => {
-            app.overlaps.rows = list
-                .rows
-                .iter()
-                .map(|entry| RuleRow {
-                    id: entry.id.clone(),
-                    ..file_row_from_service_wire(entry, str::to_owned)
-                })
-                .collect();
-            app.overlaps.loaded = true;
-            app.overlaps.note = None;
-            let subdomains = include_subdomains(app);
-            app.overlaps.recompute(subdomains);
+    let winner = &pair.winner;
+    let table = &mut app.rules.table;
+    let sent = Route::from_slug(&winner.route).is_some_and(|bucket| {
+        if pair.kind == RouteOverlapKind::Duplicate {
+            table.set_enabled(bucket, &winner.rule_id, false)
+        } else {
+            let to = TargetRoute::from_slug(&pair.loser.route);
+            table.set_route(bucket, &winner.rule_id, to)
         }
-        Err(error) => app.overlaps.note = Some(Note::Failed(error)),
+    });
+    if !sent {
+        app.overlaps.note = Some(Note::Gone(index + 1));
+        return;
     }
+    refresh(app);
 }
 
 fn conflicts(app: &AppState) -> &[RuleConflictDto] {
@@ -383,7 +317,7 @@ fn conflicts(app: &AppState) -> &[RuleConflictDto] {
 fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let state = &app.overlaps;
     let mut lines = vec![ViewLine::text(texts.get(keys::INTRO))];
-    if state.loaded {
+    if has_rules(app) {
         lines.push(ViewLine::new(vec![Segment::strong(texts.fill(
             keys::PENDING_COUNT,
             &[("n", state.pending_count().to_string())],
@@ -398,15 +332,20 @@ fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         })),
     ]));
     if !app.link.is_connected() {
-        lines.push(ViewLine::text(texts.get(if state.loaded {
+        lines.push(ViewLine::text(texts.get(if has_rules(app) {
             common::STALE
         } else {
             common::NO_DATA
         })));
-    } else if state.loading && !state.loaded {
-        lines.push(ViewLine::text(texts.get(keys::LOADING)));
+    } else if !has_rules(app) {
+        if rules::is_loading(app) {
+            lines.push(ViewLine::text(texts.get(keys::LOADING)));
+        } else if let Some(error) = rules::load_failure(app, texts) {
+            let failed = texts.fill(keys::FAILED, &[("error", error)]);
+            lines.push(ViewLine::new(vec![Segment::strong(failed)]));
+        }
     }
-    if state.edited {
+    if app.rules.table.is_dirty() {
         let screen = ScreenId::Rules;
         lines.push(ViewLine::new(vec![Segment::strong(
             texts.get(keys::PREVIEW_NOTICE),
@@ -414,7 +353,7 @@ fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         lines.push(ViewLine::text(texts.fill(
             keys::APPLY_ON_RULES,
             &[
-                ("key", screen.hotkey().to_string()),
+                ("key", screen.hotkey().map(String::from).unwrap_or_default()),
                 ("screen", texts.get(screen.title())),
             ],
         )));
@@ -422,10 +361,10 @@ fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if let Some(note) = &state.note {
         let item = |key: Key, n: usize| texts.fill(key, &[("n", n.to_string())]);
         let text = match note {
-            Note::Failed(error) => texts.fill(keys::FAILED, &[("error", error.text(texts))]),
             Note::NoItem(n) => item(keys::NO_ITEM, *n),
             Note::CannotSend(n) => item(keys::CANNOT_SEND, *n),
             Note::Gone(n) => item(keys::GONE, *n),
+            Note::Locked => texts.get(keys::LOCKED),
         };
         lines.push(ViewLine::new(vec![Segment::strong(text)]));
     }
@@ -433,10 +372,10 @@ fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
 }
 
 fn pair_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
-    let state = &app.overlaps;
-    if !state.loaded {
+    if !has_rules(app) {
         return Vec::new();
     }
+    let state = &app.overlaps;
     let shown = state.shown();
     if shown.is_empty() {
         let empty = if state.pairs.is_empty() {
@@ -450,36 +389,40 @@ fn pair_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     shown
         .iter()
         .enumerate()
-        .flat_map(|(i, pair)| {
-            pair_item_lines(state, pair, i, focused && i == state.selected, texts)
-        })
+        .flat_map(|(i, pair)| pair_item_lines(app, pair, i, focused && i == state.selected, texts))
         .collect()
 }
 
 /// Rows one pair takes; [`pair_item_lines`] must agree (a test holds them).
-fn pair_line_count(state: &Overlaps, pair: &RouteOverlap) -> usize {
-    let note = !state.can_reroute(pair) || pair.kind == RouteOverlapKind::Intersecting;
+fn pair_line_count(app: &AppState, pair: &RouteOverlap) -> usize {
+    let note = !can_reroute(app, pair) || pair.kind == RouteOverlapKind::Intersecting;
     3 + usize::from(pair.block_wins_tie) + usize::from(note)
 }
 
 fn pair_item_lines(
-    state: &Overlaps,
+    app: &AppState,
     pair: &RouteOverlap,
     index: usize,
     selected: bool,
     texts: &Texts,
 ) -> Vec<ViewLine> {
     let marker = if selected { "> " } else { "" };
+    let sentence = explain(
+        pair,
+        route_of(app, &pair.winner),
+        route_of(app, &pair.loser),
+        texts,
+    );
     let mut lines = vec![ViewLine::new(vec![
         Segment::plain(format!("{marker}{}. ", index + 1)),
-        Segment::strong(explain(state, pair, texts)),
+        Segment::strong(sentence),
     ])];
     lines.push(ViewLine::text(format!(
         "   {}: {}",
         texts.get(keys::REASON_LABEL),
         texts.get(reason(pair))
     )));
-    let decision = if state.is_confirmed(pair) {
+    let decision = if app.overlaps.is_confirmed(pair) {
         keys::CONFIRMED
     } else {
         keys::NOT_CONFIRMED
@@ -494,13 +437,11 @@ fn pair_item_lines(
             texts.get(keys::BLOCK_TIE_WARNING)
         )));
     }
-    if !state.can_reroute(pair) {
-        let note = if state.has_block_side(pair) {
-            keys::BLOCK_NOTE
-        } else {
-            keys::VERIFY_NOTE
-        };
-        lines.push(ViewLine::text(format!("   {}", texts.get(note))));
+    if !can_reroute(app, pair) {
+        lines.push(ViewLine::text(format!(
+            "   {}",
+            texts.get(keys::BLOCK_NOTE)
+        )));
     } else if pair.kind == RouteOverlapKind::Intersecting {
         let send = texts.fill(
             keys::SEND_OVER,
@@ -525,8 +466,15 @@ fn reason(pair: &RouteOverlap) -> Key {
     }
 }
 
-/// The whole pair as one sentence, as the GUI reads it to a screen reader.
-fn explain(state: &Overlaps, pair: &RouteOverlap, texts: &Texts) -> String {
+/// One pair as a sentence: the list reads it to a screen reader, the rule form
+/// shows it before the rule is saved. Each route is that side's as the rules
+/// list names it: `primary`, `secondary` or `block`.
+pub fn explain(
+    pair: &RouteOverlap,
+    winner_route: &str,
+    loser_route: &str,
+    texts: &Texts,
+) -> String {
     let template = if pair.block_wins_tie {
         keys::BLOCK_TIE
     } else {
@@ -541,14 +489,8 @@ fn explain(state: &Overlaps, pair: &RouteOverlap, texts: &Texts) -> String {
         &[
             ("winner", describe(&pair.winner, texts)),
             ("loser", describe(&pair.loser, texts)),
-            (
-                "winner-route",
-                route_label(state.route_of(&pair.winner), texts),
-            ),
-            (
-                "loser-route",
-                route_label(state.route_of(&pair.loser), texts),
-            ),
+            ("winner-route", route_label(winner_route, texts)),
+            ("loser-route", route_label(loser_route, texts)),
         ],
     );
     if pair.main_stays_when_additional_down {
@@ -580,7 +522,6 @@ fn route_label(route: &str, texts: &Texts) -> String {
     texts.get(match route {
         "primary" => keys::ROUTE_PRIMARY,
         "block" => keys::ROUTE_BLOCK,
-        "verify" => keys::ROUTE_VERIFY,
         _ => keys::ROUTE_SECONDARY,
     })
 }

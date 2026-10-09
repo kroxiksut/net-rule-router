@@ -332,9 +332,35 @@ QtObject {
             ? bridge.rpcAutoRuleDismissedRestore(payload)
             : ""
     }
+    function rpcVerifyVerdictsList() {
+        return (bridgeAvailable && typeof bridge.rpcVerifyVerdictsList === "function")
+            ? bridge.rpcVerifyVerdictsList()
+            : ""
+    }
+    function rpcVerifyVerdictsAccept(payload) {
+        return (bridgeAvailable && typeof bridge.rpcVerifyVerdictsAccept === "function")
+            ? bridge.rpcVerifyVerdictsAccept(payload)
+            : ""
+    }
+    function rpcVerifyVerdictsDismiss(payload) {
+        return (bridgeAvailable && typeof bridge.rpcVerifyVerdictsDismiss === "function")
+            ? bridge.rpcVerifyVerdictsDismiss(payload)
+            : ""
+    }
     function rpcRouteLinkProviderSet(payload) {
         return (bridgeAvailable && typeof bridge.rpcRouteLinkProviderSet === "function")
             ? bridge.rpcRouteLinkProviderSet(payload)
+            : ""
+    }
+    // The user's own record of the service's settings, in their settings file.
+    function rpcUserSettingsIntentGet() {
+        return (bridgeAvailable && typeof bridge.rpcUserSettingsIntentGet === "function")
+            ? bridge.rpcUserSettingsIntentGet()
+            : ""
+    }
+    function rpcUserSettingsIntentRecord(payload) {
+        return (bridgeAvailable && typeof bridge.rpcUserSettingsIntentRecord === "function")
+            ? bridge.rpcUserSettingsIntentRecord(payload)
             : ""
     }
     // Block-notice mutes and the "route this over the secondary" shortcut

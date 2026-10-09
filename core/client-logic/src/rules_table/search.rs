@@ -166,6 +166,7 @@ mod tests {
             rule_type: RuleType::Domain,
             match_value: "пример.рф".into(),
             target_route: super::super::TargetRoute::Secondary,
+            verify: false,
             comment: "Work Site".into(),
             origin: None,
         };

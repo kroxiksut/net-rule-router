@@ -141,7 +141,7 @@ pub struct RouteBinding {
 ///
 /// Used as the persistence key for a rule: stable across renames, reorders,
 /// and comment edits.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RuleId(pub String);
 
 impl RuleId {

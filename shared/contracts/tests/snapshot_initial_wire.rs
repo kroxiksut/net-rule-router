@@ -59,11 +59,13 @@ fn reports_round_trip_under_their_wire_key() {
                 status: "secondary-down".into(),
                 role: "secondary".into(),
                 candidates: Vec::new(),
+                since_unix_ms: None,
             },
             EnforcementStatusDto {
                 status: "adapter-gone".into(),
                 role: "primary".into(),
                 candidates: vec!["Ethernet".into()],
+                since_unix_ms: None,
             },
         ]
     );
@@ -80,6 +82,7 @@ fn a_report_has_the_push_events_shape() {
         status: "adapter-choice-needed".into(),
         role: "secondary".into(),
         candidates: vec!["Example Tunnel".into(), "Example Tunnel".into()],
+        since_unix_ms: Some(1_700_000_000_000),
     };
     let mut pushed = serde_json::to_value(&event).unwrap_or_else(|e| panic!("{e}"));
     let fields = pushed
@@ -91,9 +94,49 @@ fn a_report_has_the_push_events_shape() {
         status: "adapter-choice-needed".into(),
         role: "secondary".into(),
         candidates: vec!["Example Tunnel".into(), "Example Tunnel".into()],
+        since_unix_ms: Some(1_700_000_000_000),
     };
     assert_eq!(
         serde_json::to_value(&report).unwrap_or_else(|e| panic!("{e}")),
         pushed
     );
+}
+
+#[test]
+fn since_travels_under_its_kebab_key_and_is_left_off_when_unknown() {
+    let report = EnforcementStatusDto {
+        status: "secondary-down".into(),
+        role: "secondary".into(),
+        candidates: Vec::new(),
+        since_unix_ms: Some(1_700_000_000_000),
+    };
+    let wire = serde_json::to_value(&report).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(wire["since-unix-ms"], 1_700_000_000_000_i64);
+    let back: EnforcementStatusDto = serde_json::from_value(wire).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(back, report);
+
+    let unknown = EnforcementStatusDto {
+        since_unix_ms: None,
+        ..report
+    };
+    let wire = serde_json::to_value(&unknown).unwrap_or_else(|e| panic!("{e}"));
+    assert!(wire.get("since-unix-ms").is_none(), "{wire}");
+}
+
+/// A push from a service that predates the field still decodes.
+#[test]
+fn an_older_push_decodes_with_no_since() {
+    let event: StatusUpdateEvent = serde_json::from_value(json!({
+        "type": "enforcement-status-changed",
+        "sid": "S-1-5-21-0",
+        "status": "secondary-down",
+        "role": "secondary"
+    }))
+    .unwrap_or_else(|e| panic!("{e}"));
+    match event {
+        StatusUpdateEvent::EnforcementStatusChanged { since_unix_ms, .. } => {
+            assert_eq!(since_unix_ms, None);
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
 }

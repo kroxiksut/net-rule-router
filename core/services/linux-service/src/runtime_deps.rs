@@ -1040,12 +1040,14 @@ pub(crate) fn build_policy_stack(
     let pass_inputs = {
         use nrr_platform_api::route_table::RouteTablePort;
         use nrr_service_runtime::pass_inputs::{
-            applying_revision, hashed, table_writes, PassInputs, PLAN_BLIND_STATE_TABLES,
+            applying_revision, hashed, table_writes, verify_verdicts, PassInputs,
+            PLAN_BLIND_STATE_TABLES,
         };
         let cache = Arc::clone(&cache_store);
         let observations = Arc::clone(&app_observations);
         PassInputs::new()
             .with_source("applying", applying_revision())
+            .with_source("verdicts", verify_verdicts())
             .with_source(
                 "state",
                 table_writes(
@@ -1080,6 +1082,13 @@ pub(crate) fn build_policy_stack(
     trace_ring.attach_namer(Arc::new(
         nrr_service_runtime::conn_trace_names::ConnTraceNamer::production(Arc::clone(&cache_store)),
     ));
+    // `?` address rules are checked for the connections programs make.
+    trace_ring.attach_connection_watch({
+        let engine = Arc::clone(&auto_rules);
+        Arc::new(move |sid: &str, remote: std::net::SocketAddr| {
+            engine.note_verify_connection(sid, remote)
+        })
+    });
 
     Some(PolicyStack {
         app_enforcement,

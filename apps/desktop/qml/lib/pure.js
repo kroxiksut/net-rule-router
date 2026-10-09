@@ -39,6 +39,7 @@ function idxForSection(value) {
     if (value === "conn-trace") return 6
     if (value === "cache") return 7
     if (value === "logs") return 8
+    if (value === "outage-blocks") return 10
     return 9
 }
 
@@ -222,6 +223,66 @@ function rememberedRulesPathFor(prefs, route, userPresetsDir) {
         if (isPathUnderDir(autoOpen, ownFolder)) return autoOpen
     }
     return autoOpen || loaded || saved
+}
+
+// ---- the user's rule-set folder ----
+
+// A name a set folder can take: plain, never a path or drive syntax.
+function isUsableSetName(name) {
+    var n = String(name || "").trim()
+    if (n === "" || n === ".") return false
+    if (n.indexOf("/") >= 0 || n.indexOf("\\") >= 0) return false
+    if (n.indexOf(":") >= 0 || n.indexOf("..") >= 0) return false
+    return true
+}
+
+// The folder of a rules file, with "/" separators; "" when the path names none.
+function rulesFileFolder(path) {
+    var norm = String(path || "").replace(/\\/g, "/")
+    var slash = norm.lastIndexOf("/")
+    return slash > 0 ? norm.substring(0, slash) : ""
+}
+
+// The name the set on screen is saved under when it moves into the user's
+// folder: the folder of the files its rules came from, else the label of the
+// set picked from the list, else `fallback` (the localized "My rules").
+function adoptedSetName(prefs, fallback) {
+    var p = prefs || {}
+    var path = String(p.lastSavedPathPrimary || p.lastLoadedPathPrimary
+        || p.lastSavedPathSecondary || p.lastLoadedPathSecondary || "")
+    var candidate = ""
+    if (path !== "") {
+        var folder = rulesFileFolder(path)
+        candidate = folder.substring(folder.lastIndexOf("/") + 1)
+    }
+    if (!isUsableSetName(candidate)) {
+        var picked = String(p.selectedPresetSet || "")
+        candidate = picked.substring(picked.indexOf(":") + 1)
+    }
+    return isUsableSetName(candidate) ? candidate : String(fallback || "")
+}
+
+// Do the rules on screen already live in `folder`: is the remembered file of
+// either route inside it?
+function rulesLiveInFolder(prefs, folder) {
+    var dir = String(folder || "").replace(/\\/g, "/").replace(/\/+$/, "")
+    if (dir === "") return false
+    var routes = ["primary", "secondary"]
+    for (var r = 0; r < routes.length; r += 1) {
+        var home = rememberedRulesPathFor(prefs, routes[r], dir)
+        if (home !== "" && isPathUnderDir(home, dir)) return true
+    }
+    return false
+}
+
+// `base`, or the first of `base (2)` … `base (99)` for which `hasFiles(name)`
+// is false. Past 99 the last name is returned taken; the caller must not
+// write into it.
+function numberedSetName(base, hasFiles) {
+    var name = String(base || "")
+    for (var n = 2; n < 100 && hasFiles(name); n += 1)
+        name = String(base || "") + " (" + n + ")"
+    return name
 }
 
 // ---- file URLs ----
@@ -1027,6 +1088,54 @@ var NOTICE_MUTE_CHOICES_MS = {
     "forever": 0
 }
 
+// Keys of the route overlaps a rule saved from the rule dialog settles by
+// itself: the saved rule sits inside a wider rule of the other route and wins,
+// which is how an exception is written. A tie, an intersection or a new wide
+// rule swallowing an older narrow one still asks.
+function overlapsConfirmedByOwnEdit(overlaps, editedRuleIds) {
+    var ids = []
+    for (var i = 0; i < (editedRuleIds || []).length; i += 1) ids.push(String(editedRuleIds[i]))
+    var out = []
+    for (var k = 0; k < (overlaps || []).length; k += 1) {
+        var o = overlaps[k]
+        if (!o || o.kind !== "nested" || o["block-wins-tie"] === true) continue
+        if (ids.indexOf(String((o.winner || {})["rule-id"])) >= 0) out.push(String(o.key))
+    }
+    return out
+}
+
+// The one notice for `?` rules that work only on the other route, from the
+// service's verdict list in its order: every id still waiting (what "Move"
+// and "Not now" act on), the first five as value and target route, and how
+// many are not named. Null when nothing waits.
+function verifyVerdictNotice(verdicts) {
+    var shownMax = 5
+    var ids = []
+    var shown = []
+    for (var i = 0; i < (verdicts || []).length; i += 1) {
+        var v = verdicts[i]
+        if (!v || v.dismissed === true) continue
+        ids.push(String(v["rule-id"] || ""))
+        if (shown.length < shownMax)
+            shown.push({ value: String(v.value || ""), to: String(v["to-route"] || "") })
+    }
+    if (ids.length === 0) return null
+    return { ids: ids, shown: shown, more: ids.length - shown.length }
+}
+
+// Warnings ahead of everything else, each group in the order given: what
+// needs the user's hand must not sit under the news.
+function noticesWarningsFirst(notices) {
+    var warnings = []
+    var rest = []
+    for (var i = 0; i < (notices || []).length; i += 1) {
+        var n = notices[i]
+        if (n && n.severity === "warning") warnings.push(n)
+        else rest.push(n)
+    }
+    return warnings.concat(rest)
+}
+
 // Whether a `block-notices.mutes.list` answer silences notice `kind` at `nowMs`.
 function noticeKindMuted(mutes, kind, nowMs) {
     var list = mutes || []
@@ -1443,6 +1552,191 @@ function routePolicyChangedKeys(base, req) {
     }
     changed.sort()
     return changed
+}
+
+// ---- restoring the user's settings to a service that lost them ----
+
+// Whether a write's `origin` is the user's own decision, the only kind
+// recorded as their intent: a gesture ("user:<where>") or the changes they
+// made while the service was stopped, applied on their answer. A resync, a
+// heal, a re-seed or a replay restates what the app holds.
+function isUserWriteOrigin(origin) {
+    var text = String(origin || "")
+    return text.indexOf("user:") === 0 || text === "offline-pending-apply"
+}
+
+// The two adapter-binding slots of the route policy.
+var ROUTE_BINDING_KEYS = ["primary", "secondary"]
+
+// The recorded intent (`serviceIntentJson`) with namespace `ns` replaced by
+// `value`, every other namespace kept. `null` drops the namespace; a record
+// that does not parse starts empty.
+function intentWithNamespace(rawJson, ns, value) {
+    var whole = {}
+    try {
+        var parsed = JSON.parse(String(rawJson || "") || "{}")
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) whole = parsed
+    } catch (e) {
+        whole = {}
+    }
+    if (value === null || value === undefined) delete whole[ns]
+    else whole[ns] = value
+    return whole
+}
+
+// The route-policy record after a write the service confirmed: every key the
+// write named takes the request's value; a key the request leaves out or sets
+// to null (an unbinding) is dropped.
+function routePolicyIntentAfterWrite(intent, req, keys) {
+    var next = {}
+    var key
+    for (key in (intent || {})) next[key] = intent[key]
+    var list = keys || []
+    for (var i = 0; i < list.length; i += 1) {
+        var k = String(list[i])
+        var value = (req || {})[k]
+        if (value === undefined || value === null) delete next[k]
+        else next[k] = value
+    }
+    return next
+}
+
+function _bindingId(binding) {
+    if (!binding || typeof binding !== "object") return ""
+    var id = binding["stable-id"]
+    return typeof id === "string" ? id : ""
+}
+
+// Whether the service's slot holds adapter `id`, under its current id or one
+// it re-matched from.
+function _bindingHolds(slot, id) {
+    if (!slot || typeof slot !== "object" || Array.isArray(slot)) return false
+    if (_bindingId(slot) === id) return true
+    var known = slot["known-stable-ids"]
+    if (!Array.isArray(known)) return false
+    for (var i = 0; i < known.length; i += 1) {
+        if (known[i] === id) return true
+    }
+    return false
+}
+
+// The recorded route-policy keys the service holds otherwise, sorted. Values
+// compare as the wire reads them; a binding compares by adapter id; a key this
+// build has no field for is not compared.
+function routePolicyIntentDivergence(intent, service) {
+    var out = []
+    var cur = service || {}
+    for (var key in (intent || {})) {
+        var mine = intent[key]
+        if (ROUTE_BINDING_KEYS.indexOf(key) >= 0) {
+            var id = _bindingId(mine)
+            if (id !== "" && !_bindingHolds(cur[key], id)) out.push(key)
+            continue
+        }
+        if (ROUTE_POLICY_FIELD_DEFAULTS[key] === undefined) continue
+        if (routePolicyCoerce(key, mine) !== routePolicyEffective(cur, key)) out.push(key)
+    }
+    out.sort()
+    return out
+}
+
+// "Restore my settings": the diverging keys as one apply-only write over the
+// service's row, `{ request, keys, missing }`. A binding goes only when its
+// adapter is on the machine now (`presentIds`); otherwise it is listed in
+// `missing` as `{ role, name }` and left out. `request` is null when nothing
+// can be restored.
+function routePolicyRestorePlan(intent, service, presentIds) {
+    var request = buildFullRoutePolicyReq(service || {}, "")
+    var plan = { request: null, keys: [], missing: [] }
+    var present = presentIds || []
+    var diverging = routePolicyIntentDivergence(intent, service)
+    for (var i = 0; i < diverging.length; i += 1) {
+        var key = diverging[i]
+        var mine = intent[key]
+        if (ROUTE_BINDING_KEYS.indexOf(key) >= 0) {
+            var id = _bindingId(mine)
+            var name = (typeof mine["display-name"] === "string" && mine["display-name"] !== "")
+                ? mine["display-name"] : id
+            if (present.indexOf(id) < 0) {
+                plan.missing.push({ role: key, name: name })
+                continue
+            }
+            request[key] = {
+                "stable-id": id,
+                "display-name": name,
+                "user-confirmed": mine["user-confirmed"] === true
+            }
+        } else {
+            request[key] = routePolicyCoerce(key, mine)
+        }
+        plan.keys.push(key)
+    }
+    if (plan.keys.length > 0) {
+        request["apply-only"] = plan.keys.slice()
+        plan.request = request
+    }
+    return plan
+}
+
+// The stable ids of the adapters a `snapshot.initial.get` answer lists: the
+// adapter entries and the presented rows, each id once.
+function presentAdapterIds(snapshot) {
+    var adapters = (snapshot || {}).adapters || {}
+    var ids = []
+    var lists = [adapters.adapters, adapters.rows]
+    for (var l = 0; l < lists.length; l += 1) {
+        var list = Array.isArray(lists[l]) ? lists[l] : []
+        for (var i = 0; i < list.length; i += 1) {
+            var id = list[i] ? list[i]["persistent-id"] : undefined
+            if (typeof id === "string" && id !== "" && ids.indexOf(id) < 0) ids.push(id)
+        }
+    }
+    return ids
+}
+
+// JSON text with object keys sorted, so two equal values compare equal
+// whatever order their keys arrived in.
+function _canonicalJson(value) {
+    if (Array.isArray(value)) {
+        var items = []
+        for (var i = 0; i < value.length; i += 1) items.push(_canonicalJson(value[i]))
+        return "[" + items.join(",") + "]"
+    }
+    if (value && typeof value === "object") {
+        var keys = Object.keys(value).sort()
+        var parts = []
+        for (var k = 0; k < keys.length; k += 1)
+            parts.push(JSON.stringify(keys[k]) + ":" + _canonicalJson(value[keys[k]]))
+        return "{" + parts.join(",") + "}"
+    }
+    return JSON.stringify(value === undefined ? null : value)
+}
+
+// The `block-notices.mutes.set` requests that bring back recorded mutes the
+// service does not hold, in the recorded order. A mute whose deadline has
+// passed is not brought back.
+function noticeMutesToRestore(intentMutes, serviceMutes, nowMs) {
+    if (!Array.isArray(intentMutes)) return []
+    var held = []
+    var service = Array.isArray(serviceMutes) ? serviceMutes : []
+    for (var s = 0; s < service.length; s += 1) {
+        var m = service[s]
+        if (m && m.scope !== undefined) held.push(_canonicalJson(m.scope))
+    }
+    var out = []
+    for (var i = 0; i < intentMutes.length; i += 1) {
+        var mute = intentMutes[i]
+        var scope = mute ? mute.scope : undefined
+        if (!scope || typeof scope !== "object" || Array.isArray(scope)) continue
+        if (held.indexOf(_canonicalJson(scope)) >= 0) continue
+        var until = mute["until-unix-ms"]
+        var deadline = until ? Number(until) : 0
+        if (deadline > 0 && deadline <= nowMs) continue
+        var req = { "scope": scope }
+        if (until) req["until-unix-ms"] = until
+        out.push(req)
+    }
+    return out
 }
 
 // ---- adapter bindings: the service's view against the app's own ----

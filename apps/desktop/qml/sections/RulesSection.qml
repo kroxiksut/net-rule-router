@@ -455,6 +455,9 @@ ColumnLayout {
         var target = (route === "secondary" || route === "block") ? route : "primary"
         for (var i = 0; i < indices.length; i += 1) {
             root.rulesModel.setProperty(indices[i], "targetRoute", target)
+            // A block takes no `?`; it must not come back on a later move.
+            if (target === "block" && root.rulesModel.get(indices[i]).verify === true)
+                root.rulesModel.setProperty(indices[i], "verify", false)
         }
         section.scheduleRebuild()
         if (typeof root.setUnsavedChanges === "function") {
@@ -492,7 +495,11 @@ ColumnLayout {
             if (String(item.validationStatus || "valid") !== "error") return false
         }
         if (filterType !== "all" && Rules.canonicalRuleTypeSlug(item.ruleType) !== filterType) return false
-        if (filterRoute !== "all" && String(item.targetRoute || "") !== filterRoute) return false
+        if (filterRoute === "unsure") {
+            if (!Rules.rowIsVerify(item)) return false
+        } else if (filterRoute !== "all" && String(item.targetRoute || "") !== filterRoute) {
+            return false
+        }
         if (filterAutoAddedOnly && String(item.originReason || "") === "") return false
         if (searchText !== "") {
             // The needle is normalized like a rule value too, for URL-shaped
@@ -1633,7 +1640,7 @@ ColumnLayout {
         if (root.rulesModel) {
             for (var i = 0; i < root.rulesModel.count; i += 1) {
                 var entry = root.rulesModel.get(i)
-                // Pseudo-routes live in the secondary bucket; their `action`
+                // A block lives in the secondary bucket; its `action`
                 // field (set by the serializer) overrides routing.
                 var bucket = (Rules.routeBucket(entry.targetRoute) === "secondary")
                     ? secondary : primary
@@ -2023,9 +2030,10 @@ ColumnLayout {
             id: routeFilterCombo
             theme: root.uiTheme
             implicitWidth: 200
-            model: [ "all", "primary", "secondary", "verify", "block" ]
+            model: [ "all", "primary", "secondary", "block", "unsure" ]
             function routeLabelFor(id) {
                 if (id === "all") return root.tr("rules.filter.route.all", "All routes")
+                if (id === "unsure") return root.tr("rules.filter.route.unsure", "Unsure (?)")
                 return root.routeLabel(id)
             }
             labelResolver: function(item) { return routeFilterCombo.routeLabelFor(item) }
@@ -2559,21 +2567,25 @@ ColumnLayout {
                     Label {
                         Layout.preferredWidth: section.colRouteWidth
                         Layout.alignment: Qt.AlignVCenter
-                        // routeLabel resolves primary/secondary/verify/block; do
-                        // NOT use a binary ternary (a pseudo-route would
-                        // mislabel as Secondary via the fall-through).
-                        text: root.routeLabel(model.targetRoute)
+                        // routeLabel resolves primary/secondary/block; do NOT
+                        // use a binary ternary (a block would mislabel as
+                        // Secondary via the fall-through).
+                        readonly property bool unsure: Rules.rowIsVerify(model)
+                        text: root.routeLabel(model.targetRoute) + (unsure ? " ?" : "")
                         color: root.textColor
                         wrapMode: Text.WordWrap
                         opacity: model.enabled ? 1.0 : 0.5
-                        // The label names the order; how the switch happens
-                        // is worth a hover.
+                        Accessible.name: root.uiRevision >= 0 && unsure
+                            ? root.routeLabel(model.targetRoute) + ", "
+                                + root.tr("dialog.rule.verify", "Unsure — check where it works")
+                            : root.routeLabel(model.targetRoute)
+                        // The mark is one character; what it means is worth a hover.
                         HoverHandler { id: routeCellHover }
-                        ToolTip.visible: routeCellHover.hovered && model.targetRoute === "verify"
+                        ToolTip.visible: routeCellHover.hovered && unsure
                         ToolTip.delay: 400
-                        ToolTip.text: root.uiRevision >= 0 && model.targetRoute === "verify"
-                            ? root.tr("dialog.rule.route-verify-hint",
-                                "Opens through the primary route first. Once NetRuleRouter confirms the primary route cannot reach the site, the rule moves to the additional route by itself.")
+                        ToolTip.text: root.uiRevision >= 0 && unsure
+                            ? root.tr("dialog.rule.verify-hint",
+                                "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.")
                             : ""
                     }
                     // Compact per-row enable toggle. Was

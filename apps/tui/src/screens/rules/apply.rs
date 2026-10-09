@@ -11,7 +11,7 @@ use nrr_client_logic::review::{
     operation_outcome, preview_outcome, preview_refusal, refusal_detail, review_summary_is_empty,
     Outcome,
 };
-use nrr_client_logic::rules_table::{rule_row_to_wire_dto, WireDtoOptions};
+use nrr_client_logic::rules_table::{rule_row_to_wire_dto, RuleRow, WireDtoOptions};
 use nrr_client_logic::Route;
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient, IpcClientError};
 use nrr_shared::ipc::IpcOperationName;
@@ -95,24 +95,29 @@ pub struct Pending {
     pub admin_baseline: bool,
 }
 
-/// The rows as the canonical rules-json (`_buildRulesJsonFromModel`): a row
+/// Rules as the canonical rules-json (`_buildRulesJsonFromModel`): a rule
 /// rides in its route's bucket, a pseudo-route in the secondary one.
-pub fn pending_from(table: &Table, admin_baseline: bool) -> Option<Pending> {
+pub fn book_of<'a>(rules: impl IntoIterator<Item = &'a RuleRow>) -> CanonicalRulesJsonV1 {
     let encode: &dyn Fn(&str) -> String = &ace::encode;
     let mut book = CanonicalRulesJsonV1 {
         schema_version: RULES_JSON_SCHEMA_VERSION,
         primary: Vec::new(),
         secondary: Vec::new(),
     };
-    for row in &table.rows {
-        let dto = rule_row_to_wire_dto(&row.rule, Some(encode), WireDtoOptions::FULL);
-        if row.rule.target_route.bucket() == Some(Route::Secondary) {
+    for rule in rules {
+        let dto = rule_row_to_wire_dto(rule, Some(encode), WireDtoOptions::FULL);
+        if rule.target_route.bucket() == Some(Route::Secondary) {
             book.secondary.push(dto);
         } else {
             book.primary.push(dto);
         }
     }
-    let rules_json = to_canonical_string(&book).ok()?;
+    book
+}
+
+/// The rows on screen as one rules payload.
+pub fn pending_from(table: &Table, admin_baseline: bool) -> Option<Pending> {
+    let rules_json = to_canonical_string(&book_of(table.rules())).ok()?;
     let content_hash = format!("{:x}", Sha256::digest(rules_json.as_bytes()));
     Some(Pending {
         rules_json,

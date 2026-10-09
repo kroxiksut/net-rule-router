@@ -302,6 +302,11 @@ pub fn applying_revision() -> InputGeneration {
     Arc::new(|| Some(crate::applying_revision_overlay::changes()))
 }
 
+/// The `?` rules a check verdict moved to the other link, held in memory.
+pub fn verify_verdicts() -> InputGeneration {
+    Arc::new(|| Some(crate::verify_overlay::changes()))
+}
+
 /// The hash of whatever `read` returns; `None` when it fails.
 pub fn hashed<T: Hash, E>(
     read: impl Fn() -> Result<T, E> + Send + Sync + 'static,

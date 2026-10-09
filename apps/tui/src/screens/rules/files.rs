@@ -1,5 +1,6 @@
 //! The two rules files: read with the shared preset parser, written with the
-//! GUI's writer, and the country rule sets shipped beside the program.
+//! GUI's writer; the country rule sets shipped beside the program, and the
+//! sets in the user's own folder, found where the GUI finds them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,8 @@ pub struct RuleSet {
     /// Sections this build reads but does not apply, per route file.
     pub passthrough: [BTreeMap<String, String>; 2],
     pub files: usize,
+    /// The file each route was read from, when the set has one.
+    pub paths: [Option<PathBuf>; 2],
 }
 
 fn read_text(path: &Path) -> Result<Option<String>, ReadError> {
@@ -70,6 +73,7 @@ pub fn read_set(dir: &Path) -> Result<RuleSet, (PathBuf, ReadError)> {
             continue;
         };
         set.files += 1;
+        set.paths[route_index(route)] = Some(path);
         let parsed = parse_canonical_rules(&text);
         set.rows
             .extend(parsed.rules.iter().map(|rule| row_from_parsed(rule, route)));
@@ -90,32 +94,63 @@ pub fn set_exists(dir: &Path) -> bool {
 /// Both files from the rows on screen, as the GUI writes them.
 pub fn write_set(dir: &Path, table: &Table, exported_at: &str) -> Result<(), (PathBuf, String)> {
     std::fs::create_dir_all(dir).map_err(|e| (dir.to_path_buf(), e.to_string()))?;
-    let rows: Vec<RuleRow> = table.rows.iter().map(|r| r.rule.clone()).collect();
     for route in Route::ALL {
-        let options = RulesFileOptions {
-            include_comments: true,
-            exported_at,
-            passthrough: &table.passthrough[route_index(route)],
-            os: PlatformProfile::current().os,
-        };
-        let path = dir.join(file_name(route));
-        std::fs::write(&path, build_rules_file_text(&rows, route, &options))
-            .map_err(|e| (path.clone(), e.to_string()))?;
+        write_route(&dir.join(file_name(route)), route, table, exported_at)?;
     }
     Ok(())
 }
 
-/// A shipped rule set: `<country>/<pack>/` holding at least one rules file.
+/// The file of one route from the rows on screen, at `path`.
+pub fn write_route(
+    path: &Path,
+    route: Route,
+    table: &Table,
+    exported_at: &str,
+) -> Result<(), (PathBuf, String)> {
+    let rows: Vec<RuleRow> = table.rows.iter().map(|r| r.rule.clone()).collect();
+    let options = RulesFileOptions {
+        include_comments: true,
+        exported_at,
+        passthrough: &table.passthrough[route_index(route)],
+        os: PlatformProfile::current().os,
+    };
+    std::fs::write(path, build_rules_file_text(&rows, route, &options))
+        .map_err(|e| (path.to_path_buf(), e.to_string()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetSource {
+    /// The user's own rule-set folder.
+    User,
+    /// The sets shipped beside the program.
+    Bundled,
+}
+
+/// A rule set: a folder holding at least one rules file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preset {
-    /// `<country>_<pack>`, the GUI's label.
+    /// The GUI's label: `<country>_<pack>` for a shipped set, the folder name
+    /// for one of the user's own.
     pub label: String,
     pub dir: PathBuf,
+    pub source: SetSource,
+}
+
+impl Preset {
+    /// `<source>:<label>`, the GUI's form of the remembered choice: the two
+    /// sources can hold sets with the same label.
+    pub fn selection_key(&self) -> String {
+        let source = match self.source {
+            SetSource::User => "user",
+            SetSource::Bundled => "bundled",
+        };
+        format!("{source}:{}", self.label)
+    }
 }
 
 /// Beside the binary, then — in a development build only — the checkout;
 /// never a parent directory, where another user could plant a folder.
-fn presets_root() -> Option<PathBuf> {
+pub fn presets_root() -> Option<PathBuf> {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("presets")));
@@ -140,26 +175,63 @@ fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-pub fn presets() -> Vec<Preset> {
-    presets_root().map_or_else(Vec::new, |root| presets_in(&root))
+fn dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 pub fn presets_in(root: &Path) -> Vec<Preset> {
-    let name = |p: &Path| {
-        p.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    };
     let mut out = Vec::new();
     for country in sorted_dirs(root) {
         for pack in sorted_dirs(&country) {
             if set_exists(&pack) {
                 out.push(Preset {
-                    label: format!("{}_{}", name(&country), name(&pack)),
+                    label: format!("{}_{}", dir_name(&country), dir_name(&pack)),
                     dir: pack,
+                    source: SetSource::Bundled,
                 });
             }
         }
+    }
+    out
+}
+
+/// The sets in the user's folder, listed as the GUI lists them: each
+/// subfolder with rules files; one level deeper, so a copy of the shipped
+/// `<country>/<pack>/` tree lists too; and the folder itself when it holds the
+/// files and nothing below does.
+pub fn user_sets(root: &Path) -> Vec<Preset> {
+    let mut out = Vec::new();
+    for set in sorted_dirs(root) {
+        if set_exists(&set) {
+            out.push(Preset {
+                label: dir_name(&set),
+                dir: set,
+                source: SetSource::User,
+            });
+            continue;
+        }
+        for pack in sorted_dirs(&set) {
+            if set_exists(&pack) {
+                out.push(Preset {
+                    label: format!("{}_{}", dir_name(&set), dir_name(&pack)),
+                    dir: pack,
+                    source: SetSource::User,
+                });
+            }
+        }
+    }
+    if out.is_empty() && set_exists(root) {
+        let mut label = dir_name(root);
+        if label.is_empty() {
+            label = "rules".to_string();
+        }
+        out.push(Preset {
+            label,
+            dir: root.to_path_buf(),
+            source: SetSource::User,
+        });
     }
     out
 }

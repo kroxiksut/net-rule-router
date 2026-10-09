@@ -858,7 +858,7 @@ fn generate_for_rule(
     // A Block rule overrides the route: it drops its destination regardless of
     // which set (primary/secondary) it lives in, using the BASE_BLOCK band.
     let ctx = match rule.action {
-        RuleAction::Route | RuleAction::VerifyPrimary => EmitContext {
+        RuleAction::Route | RuleAction::Verify => EmitContext {
             action: WfpAction::Permit,
             base_weight,
             kind_prefix: "",

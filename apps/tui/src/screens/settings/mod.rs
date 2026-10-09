@@ -10,9 +10,9 @@ mod clock;
 mod items;
 mod jobs;
 pub mod prefs;
-mod text;
 #[cfg(test)]
 mod tests;
+mod text;
 
 use std::path::PathBuf;
 
@@ -22,9 +22,9 @@ use nrr_client_logic::route_policy;
 use nrr_ipc_client::IpcClientError;
 use nrr_platform_api::service_control::ServiceStatusReport;
 use nrr_shared::ipc_payloads::{
-    BlockNoticeMuteDto, BlockNoticeMuteScopeDto, LogRetentionConfigDto, LogRetentionConfigSetRequest,
-    RetentionSettingsDto, RetentionSettingsSetRequest, StorageUsageDto, TrafficStatsGetResponse,
-    TrafficStatsSettingsDto,
+    BlockNoticeMuteDto, BlockNoticeMuteScopeDto, LogRetentionConfigDto,
+    LogRetentionConfigSetRequest, RetentionSettingsDto, RetentionSettingsSetRequest,
+    StorageUsageDto, TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
 use nrr_shared::ipc_transport::IpcErrorCode;
 use nrr_shared::platform_profile::{PlatformProfile, PlatformSupports};
@@ -147,18 +147,13 @@ pub fn failure_text(failure: &Failure, texts: &Texts) -> String {
         .map_or_else(|| texts.get(text::ERROR_UNKNOWN), |(_, k)| texts.get(*k))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Loadable<T> {
+    #[default]
     NotLoaded,
     Loading,
     Ready(T),
     Failed(Failure),
-}
-
-impl<T> Default for Loadable<T> {
-    fn default() -> Self {
-        Self::NotLoaded
-    }
 }
 
 impl<T> Loadable<T> {
@@ -369,7 +364,10 @@ impl Screen for SettingsScreen {
         }
         let (title, lines) = match s.open {
             None => (texts.get(text::SECTIONS), section_lines(app, texts)),
-            Some(category) => (texts.get(category.title()), item_lines(app, category, texts)),
+            Some(category) => (
+                texts.get(category.title()),
+                item_lines(app, category, texts),
+            ),
         };
         panels.push(Panel {
             title,
@@ -595,7 +593,10 @@ fn back(app: &mut AppState) -> bool {
     let Some(category) = s.open.take() else {
         return false;
     };
-    s.cursor = Category::ALL.iter().position(|c| *c == category).unwrap_or(0);
+    s.cursor = Category::ALL
+        .iter()
+        .position(|c| *c == category)
+        .unwrap_or(0);
     s.mode = Mode::Browse;
     app.scroll = 0;
     true
@@ -747,7 +748,9 @@ fn is_yes(answer: &str) -> bool {
 /// `c2`, `i3`, `i3 30`: the code's letter, number and the rest.
 fn parse_code(line: &str, letter: char) -> Option<(usize, &str)> {
     let rest = line.strip_prefix(letter)?;
-    let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     let number = rest[..digits].parse::<usize>().ok()?.checked_sub(1)?;
     Some((number, rest[digits..].trim()))
 }
@@ -780,8 +783,10 @@ fn on_line(app: &mut AppState, line: &str) -> bool {
     }
     if let Some((index, _)) = parse_code(line, 'c') {
         if !open_section(app, index) {
-            app.settings
-                .refuse(Words::Fill(text::PLAIN_NO_ITEM, vec![("code", line.to_owned())]));
+            app.settings.refuse(Words::Fill(
+                text::PLAIN_NO_ITEM,
+                vec![("code", line.to_owned())],
+            ));
         }
         return true;
     }
@@ -794,8 +799,10 @@ fn on_line(app: &mut AppState, line: &str) -> bool {
         0
     };
     if index >= rows {
-        app.settings
-            .refuse(Words::Fill(text::PLAIN_NO_ITEM, vec![("code", line.to_owned())]));
+        app.settings.refuse(Words::Fill(
+            text::PLAIN_NO_ITEM,
+            vec![("code", line.to_owned())],
+        ));
         return true;
     }
     app.settings.cursor = index;
@@ -829,15 +836,15 @@ fn load(app: &mut AppState) {
     };
     if category == Category::Service {
         app.settings.data.service.start();
-        app.outbox.push(jobs::load_service(app.settings.service_probe));
+        app.outbox
+            .push(jobs::load_service(app.settings.service_probe));
         return;
     }
     if !app.link.is_connected() {
         return;
     }
     let s = &mut app.settings;
-    let stability_wanted =
-        nrr_client_logic::stability::any_key_applies(Some(&s.supports_map()));
+    let stability_wanted = nrr_client_logic::stability::any_key_applies(Some(&s.supports_map()));
     let day = s.clock.local_day();
     let mut queue = Vec::new();
     match category {
@@ -930,7 +937,12 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
             scope.map(|scope| jobs::remove_mutes(vec![scope]))
         }
         (ItemId::ClearMutes, Input::Run) => app.settings.data.mutes.ready().map(|m| {
-            jobs::remove_mutes(items::fine_mutes(m).into_iter().map(|m| m.scope.clone()).collect())
+            jobs::remove_mutes(
+                items::fine_mutes(m)
+                    .into_iter()
+                    .map(|m| m.scope.clone())
+                    .collect(),
+            )
         }),
         (ItemId::MuteAdd, Input::Run) => add_mute(app),
         (ItemId::Policy(key), input) => {
@@ -991,7 +1003,9 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
             "routing-stop-policy",
             Value::from(if toggled { "persist" } else { "teardown" }),
         ),
-        (ItemId::LogWindow(key), Input::Pick(change)) => stability_change(app, key, Value::from(change)),
+        (ItemId::LogWindow(key), Input::Pick(change)) => {
+            stability_change(app, key, Value::from(change))
+        }
         (ItemId::FailurePolicy, Input::Pick(slug)) => Some(jobs::set_failure_policy(slug)),
         (ItemId::ServiceStart, Input::Run) => Some(jobs::control_service(
             jobs::ServiceOp::Start,
@@ -1115,11 +1129,17 @@ fn protocol(app: &mut AppState, bit: i32) -> Option<crate::backend::Job> {
 }
 
 /// A stability change, cut to what this system's service applies.
-fn stability_change(app: &mut AppState, key: &'static str, value: Value) -> Option<crate::backend::Job> {
+fn stability_change(
+    app: &mut AppState,
+    key: &'static str,
+    value: Value,
+) -> Option<crate::backend::Job> {
     let mut partial = Map::new();
     partial.insert(key.to_owned(), value);
-    let partial =
-        nrr_client_logic::stability::patch_for_platform(&partial, Some(&app.settings.supports_map()));
+    let partial = nrr_client_logic::stability::patch_for_platform(
+        &partial,
+        Some(&app.settings.supports_map()),
+    );
     if partial.is_empty() {
         app.settings.refuse(Words::Key(text::UNSUPPORTED));
         return None;

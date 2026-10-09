@@ -432,10 +432,10 @@ pub enum ValidationWarning {
     /// as an address that is never a destination.
     AppPatternRefusedDropped { rule_id: RuleId, value: String },
 
-    /// A "try the primary route first" rule (`?host`) outside the one place it
-    /// means something — a host-name rule in the secondary set. It was kept as
+    /// A "check where it works" rule (`?value`) on a rule kind it means
+    /// nothing for — only domain and exact-IP rules are checked. It was kept as
     /// a plain route rule of its own set.
-    VerifyPrimaryIgnored { rule_id: RuleId, role: RouteRole },
+    VerifyIgnored { rule_id: RuleId, role: RouteRole },
 }
 
 impl fmt::Display for ValidationWarning {
@@ -566,10 +566,10 @@ impl fmt::Display for ValidationWarning {
                     "rule {rule_id}: application value '{value}' is refused; the rule was dropped"
                 )
             }
-            Self::VerifyPrimaryIgnored { rule_id, role } => {
+            Self::VerifyIgnored { rule_id, role } => {
                 write!(
                     f,
-                    "rule {rule_id}: '?' applies to a secondary domain rule only; kept as a plain {role:?} rule"
+                    "rule {rule_id}: '?' applies to a domain or exact-IP rule only; kept as a plain {role:?} rule"
                 )
             }
         }
@@ -817,8 +817,8 @@ fn normalize_rule_set(
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
         if let Some(mut canonical) = normalize_rule(rule, naming, errors, warnings) {
-            if settle_verify_primary(&mut canonical, role) {
-                warnings.push(ValidationWarning::VerifyPrimaryIgnored {
+            if settle_verify(&mut canonical) {
+                warnings.push(ValidationWarning::VerifyIgnored {
                     rule_id: canonical.id.clone(),
                     role,
                 });
@@ -832,22 +832,25 @@ fn normalize_rule_set(
 /// Turns a `?` that means nothing where it stands into a plain route rule of
 /// its own set; `true` when it did. The rules file and the wire both go
 /// through here, so one rule has one meaning whichever way it arrives.
-pub(crate) fn settle_verify_primary(rule: &mut CanonicalRule, role: RouteRole) -> bool {
-    if rule.action == RuleAction::VerifyPrimary && !verify_primary_applies(rule, role) {
+pub(crate) fn settle_verify(rule: &mut CanonicalRule) -> bool {
+    if rule.action == RuleAction::Verify && !verify_applies(rule) {
         rule.action = RuleAction::Route;
         return true;
     }
     false
 }
 
-/// "Try the primary route first" is a question about a host name the
-/// secondary set claims; in the primary set the answer is already "primary".
-fn verify_primary_applies(rule: &CanonicalRule, role: RouteRole) -> bool {
-    role == RouteRole::Secondary
-        && matches!(
-            rule.address_match,
-            Some(CanonicalAddressMatch::ExactFqdn(_) | CanonicalAddressMatch::SuffixDomain(_))
+/// "Does it open on this link" is asked of one destination a connection can
+/// name: a host name or one address, in either set.
+fn verify_applies(rule: &CanonicalRule) -> bool {
+    matches!(
+        rule.address_match,
+        Some(
+            CanonicalAddressMatch::ExactFqdn(_)
+                | CanonicalAddressMatch::SuffixDomain(_)
+                | CanonicalAddressMatch::ExactIp(_)
         )
+    )
 }
 
 /// Normalizes a single rule. Returns `None` when a blocking error was found and
@@ -1418,7 +1421,7 @@ impl MatchKey {
     /// apart.
     fn within_set(rule: &CanonicalRule) -> Self {
         let mut key = Self::from_rule(rule);
-        if key.action == RuleAction::VerifyPrimary {
+        if key.action == RuleAction::Verify {
             key.action = RuleAction::Route;
         }
         key
@@ -1460,13 +1463,12 @@ fn deduplicate_set(
         match seen.get(&key) {
             Some(&slot) => {
                 let kept = &mut out[slot];
-                let removed = if kept.action == RuleAction::VerifyPrimary
-                    && rule.action != RuleAction::VerifyPrimary
-                {
-                    std::mem::replace(kept, rule)
-                } else {
-                    rule
-                };
+                let removed =
+                    if kept.action == RuleAction::Verify && rule.action != RuleAction::Verify {
+                        std::mem::replace(kept, rule)
+                    } else {
+                        rule
+                    };
                 warnings.push(ValidationWarning::DuplicateRuleInSameSet {
                     kept_rule_id: out[slot].id.clone(),
                     removed_rule_id: removed.id,

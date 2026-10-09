@@ -443,16 +443,19 @@ mod tests {
             status: status.into(),
             role: role.into(),
             candidates: candidates.iter().map(|c| (*c).to_string()).collect(),
+            since_unix_ms: Some(1_000),
         };
         let board = crate::app_enforcement_status::RouteEnforcementStatus::new();
-        board.record(
+        board.record_at(
             caller.as_stored(),
             &report("secondary-down", "secondary", &[]),
+            1_000,
         );
-        board.record(caller.as_stored(), &report("ok", "primary", &[]));
-        board.record(
+        board.record_at(caller.as_stored(), &report("ok", "primary", &[]), 1_000);
+        board.record_at(
             UserPrincipal::from_linux_uid(1001).as_stored(),
             &report("adapter-gone", "secondary", &["Other Tunnel"]),
+            1_000,
         );
         let h = SnapshotInitialHandler::new(
             Arc::new(FakeHealth {
@@ -479,6 +482,7 @@ mod tests {
         };
         let resp = h.handle(&req(), &own).unwrap();
         assert_eq!(resp["enforcement-status"][1]["status"], "secondary-down");
+        assert_eq!(resp["enforcement-status"][1]["since-unix-ms"], 1_000);
         let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
         assert_eq!(
             parsed.enforcement_status,

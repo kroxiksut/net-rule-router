@@ -198,7 +198,15 @@ pub struct ConnectionTraceRing {
     /// Names each row's remote address on the way in; absent, rows carry the
     /// address only.
     namer: std::sync::OnceLock<Arc<crate::conn_trace_names::ConnTraceNamer>>,
+    /// What the user's route outages blocked: a second view of the same
+    /// stream, kept here so whatever feeds or reads the ring has it too.
+    outage_blocks: Arc<crate::outage_blocks::OutageBlocks>,
+    /// Told each connection's owner and remote end, on both platforms' feeds.
+    connection_watch: std::sync::OnceLock<ConnectionWatch>,
 }
+
+/// A cheap look at one connection: `(owner, remote)`.
+pub type ConnectionWatch = Arc<dyn Fn(&str, std::net::SocketAddr) + Send + Sync>;
 
 impl ConnectionTraceRing {
     /// Ring holding at most `cap` records (clamped to `>= 1`).
@@ -208,13 +216,26 @@ impl ConnectionTraceRing {
             cap: cap.max(1),
             observer_active: AtomicBool::new(false),
             namer: std::sync::OnceLock::new(),
+            outage_blocks: Arc::new(crate::outage_blocks::OutageBlocks::new()),
+            connection_watch: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The outage list fed alongside this ring.
+    pub fn outage_blocks(&self) -> &Arc<crate::outage_blocks::OutageBlocks> {
+        &self.outage_blocks
     }
 
     /// Name every row recorded from now on. The first namer stays; `false`
     /// says one was already attached.
     pub fn attach_namer(&self, namer: Arc<crate::conn_trace_names::ConnTraceNamer>) -> bool {
         self.namer.set(namer).is_ok()
+    }
+
+    /// Show every connection pushed from now on to `watch`. The first watch
+    /// stays; `false` says one was already attached.
+    pub fn attach_connection_watch(&self, watch: ConnectionWatch) -> bool {
+        self.connection_watch.set(watch).is_ok()
     }
 
     /// Record that the observation source is running and feeding this ring.
@@ -235,11 +256,40 @@ impl ConnectionTraceRing {
 
     /// Append the newest record, evicting the oldest when full. Named before
     /// the ring is locked, so a reader never waits on a name lookup.
-    pub fn push(&self, mut rec: ConnectionTraceRecord) {
+    pub fn push(&self, rec: ConnectionTraceRecord) {
+        self.push_noting_outage(rec, None);
+    }
+
+    /// [`Self::push`], also folding the row into its owner's outage list when
+    /// `outage_at_ms` says the outage caused this drop. Folded after naming, so
+    /// the list shows the name the row does.
+    pub fn push_noting_outage(&self, mut rec: ConnectionTraceRecord, outage_at_ms: Option<u64>) {
+        if let (Some(watch), Some(sid)) = (self.connection_watch.get(), rec.user_sid.as_deref()) {
+            watch(sid, rec.remote);
+        }
         if rec.remote_names.is_none() {
             if let Some(namer) = self.namer.get() {
                 rec.remote_names = namer.name(rec.remote.ip());
             }
+        }
+        if let (Some(at_ms), Some(sid)) = (outage_at_ms, rec.user_sid.as_deref()) {
+            let app = rec
+                .process_path
+                .as_deref()
+                .map(process_basename_lower)
+                .unwrap_or_default();
+            self.outage_blocks.record(crate::outage_blocks::OutageDrop {
+                sid,
+                app: &app,
+                process_path: rec.process_path.as_deref(),
+                remote: rec.remote,
+                host: rec
+                    .remote_names
+                    .as_ref()
+                    .and_then(|n| n.names.first())
+                    .map(String::as_str),
+                at_ms,
+            });
         }
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         while g.len() >= self.cap {
@@ -256,6 +306,24 @@ impl ConnectionTraceRing {
         let total = g.len();
         let page = g.iter().rev().skip(offset).take(limit).cloned().collect();
         (page, total)
+    }
+
+    /// Newest-first page over the records `keep` admits, so a reader that may
+    /// see only some rows still pages through full pages of them.
+    pub fn snapshot_where(
+        &self,
+        offset: usize,
+        limit: usize,
+        keep: impl Fn(&ConnectionTraceRecord) -> bool,
+    ) -> Vec<ConnectionTraceRecord> {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.iter()
+            .rev()
+            .filter(|rec| keep(rec))
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// Total records currently retained.

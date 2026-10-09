@@ -1,10 +1,10 @@
 {
-  "description": "rules.js routeBucket: the file a target rides in; pseudo-routes ride in the secondary one",
+  "description": "rules.js routeBucket: the file a target rides in; a block rides in the secondary one",
   "cases": [
     { "name": "primary", "input": { "route": "primary" }, "expected": "primary" },
     { "name": "secondary", "input": { "route": "secondary" }, "expected": "secondary" },
     { "name": "block", "input": { "route": "block" }, "expected": "secondary" },
-    { "name": "verify", "input": { "route": "verify" }, "expected": "secondary" },
+    { "name": "verify is no route", "input": { "route": "verify" }, "expected": "verify" },
     { "name": "empty", "input": { "route": "" }, "expected": "" },
     { "name": "null", "input": { "route": null }, "expected": "" },
     { "name": "absent", "input": {}, "expected": "" },

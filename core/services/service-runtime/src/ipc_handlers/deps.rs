@@ -175,9 +175,8 @@ pub struct IpcHandlerDeps {
     /// registered as `UnimplementedHandler` (degraded boot / no state DB).
     /// Wired via `with_merge_preview_source(...)`.
     pub merge_preview_source: Option<Arc<dyn crate::production_merge_preview::MergePreviewSource>>,
-    /// Connection-trace ring. `None` keeps
-    /// `ConnTraceEntriesList` registered as `UnimplementedHandler` (the
-    /// connection observer's GUI stream is off). Wired via
+    /// Connection-trace ring, with the outage list it carries. `None` keeps
+    /// both conn-trace reads registered as `UnimplementedHandler`. Wired via
     /// `with_conn_trace_ring(...)`.
     pub conn_trace_ring: Option<Arc<crate::conn_observation_consumer::ConnectionTraceRing>>,
     /// Inspector for the shipped third-party binaries.

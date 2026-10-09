@@ -60,11 +60,18 @@ QtObject {
     function _recordServiceIntentAfterWrite(partial, before) {
         var next = Pure.stabilityIntentAfterWrite(_readServiceIntent(), partial || {},
                                                   before || {}, _appElevated())
-        if (next !== null) {
-            root.prefs.serviceIntentJson = JSON.stringify({ "stability": next })
-            root.emitPrefs()
-        }
+        if (next !== null) _writeStabilityIntent(next)
         _dropDivergence(partial)
+    }
+
+    /// Replaces the stability part of the record. The other parts (the route
+    /// policy, the mutes) are recorded elsewhere and ride along untouched: a
+    /// record rebuilt from stability alone erased them.
+    function _writeStabilityIntent(next) {
+        var whole = Pure.intentWithNamespace(String(root.prefs.serviceIntentJson || ""),
+                                             "stability", next)
+        root.prefs.serviceIntentJson = JSON.stringify(whole)
+        root.emitPrefs()
     }
 
     /// The user just chose these keys themselves; what the service holds now is
@@ -104,10 +111,7 @@ QtObject {
     /// choice, so the line does not come back on the next connect.
     function keepServiceValue(key) {
         var next = Pure.stabilityIntentWithout(_readServiceIntent(), key)
-        if (next !== null) {
-            root.prefs.serviceIntentJson = JSON.stringify({ "stability": next })
-            root.emitPrefs()
-        }
+        if (next !== null) _writeStabilityIntent(next)
         var gone = {}
         gone[key] = true
         _dropDivergence(gone)

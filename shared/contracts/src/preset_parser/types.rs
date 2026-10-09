@@ -64,8 +64,8 @@ pub struct ParsedRule {
     #[serde(default)]
     pub blocked: bool,
     /// Whether the value carried the `?` prefix (docs/en/rules-file-format.md
-    /// Verify the main route first): try the primary route first. Read in the
-    /// host-name sections only; it means something only in the secondary file.
+    /// Check where it works). Read in the host-name and exact-IP sections of
+    /// either file.
     #[serde(default)]
     pub verify_primary: bool,
     /// Provenance of an app-authored rule — `Some` only for entries in the

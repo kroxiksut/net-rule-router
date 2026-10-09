@@ -1,7 +1,7 @@
 //! The Rules screen as panels of lines, for both renderers.
 
 use nrr_client_logic::placeholders::fill_placeholders;
-use nrr_client_logic::rules_table::{RuleType, TargetRoute};
+use nrr_client_logic::rules_table::{RuleRow, RuleType, TargetRoute};
 use nrr_shared::ipc_payloads::{ReviewRiskLevel, ReviewSummaryResponse, RuleSummaryEntryDto};
 use nrr_shared::platform_profile::PlatformProfile;
 use serde_json::Value;
@@ -12,9 +12,14 @@ use super::table::{route_label, RouteFilter, Row, Verdict, VerdictStatus, PAGE};
 
 /// Lines of the changes view's entry list one window shows.
 pub const REVIEW_PAGE: usize = 12;
-use super::{text, Busy, Choice, ChoicePurpose, Input, InputPurpose, Mode, Phase};
+/// Overlaps the form spells out before it counts the rest.
+const FORM_OVERLAPS: usize = 3;
+use super::{
+    text, verdicts, Busy, Choice, ChoicePurpose, Input, InputPurpose, Mode, Phase, SetList,
+};
 use crate::i18n::Texts;
 use crate::keys;
+use crate::screens::overlaps::explain;
 use crate::state::AppState;
 use crate::view::{Panel, ScreenView, Segment, StateTone, ViewLine};
 
@@ -128,9 +133,38 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         filter.push(Segment::plain(table.search.clone()));
     }
     lines.push(ViewLine::new(filter));
+    lines.extend(verdict_lines(app, texts));
     if let Some(note) = &rules.note {
         lines.push(ViewLine::text(note.text(texts)));
     }
+    lines
+}
+
+/// The one question for every `?` rule that works only on the other route.
+fn verdict_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
+    let Some(waiting) = verdicts::notice(app) else {
+        return Vec::new();
+    };
+    let mut lines = vec![
+        ViewLine::new(vec![Segment::state(
+            verdicts::title(&waiting, texts),
+            StateTone::Caution,
+        )]),
+        ViewLine::text(texts.get(text::VERDICTS_BODY)),
+    ];
+    for (value, to) in &waiting.shown {
+        let route = route_text(&TargetRoute::from_slug(to), texts);
+        let item = texts.fill(
+            text::VERDICTS_ITEM,
+            &[("value", value.clone()), ("route", route)],
+        );
+        lines.push(ViewLine::text(format!("     {item}")));
+    }
+    if waiting.more > 0 {
+        let rest = texts.fill(text::OVERLAPS_MORE, &[("count", waiting.more.to_string())]);
+        lines.push(ViewLine::text(format!("     {rest}")));
+    }
+    lines.push(ViewLine::text(texts.get(text::VERDICTS_KEYS)));
     lines
 }
 
@@ -141,6 +175,16 @@ fn type_label(rule_type: &RuleType, texts: &Texts) -> String {
 
 fn route_text(route: &TargetRoute, texts: &Texts) -> String {
     route_label(route).map_or_else(|| route.as_str().to_owned(), |k| texts.get(k))
+}
+
+/// A rule's route with its `?` mark.
+fn rule_route_text(rule: &RuleRow, texts: &Texts) -> String {
+    let route = route_text(&rule.target_route, texts);
+    if rule.is_verify() {
+        format!("{route} ?")
+    } else {
+        route
+    }
 }
 
 fn verdict_message(verdict: &Verdict, texts: &Texts) -> String {
@@ -180,7 +224,7 @@ fn row_lines(n: usize, row: &Row, chosen: bool, texts: &Texts) -> Vec<ViewLine> 
         rule.id,
         type_label(&rule.rule_type, texts),
         rule.match_value,
-        route_text(&rule.target_route, texts),
+        rule_route_text(rule, texts),
     );
     let mut first = vec![if chosen {
         Segment::strong(head)
@@ -198,6 +242,9 @@ fn row_lines(n: usize, row: &Row, chosen: bool, texts: &Texts) -> Vec<ViewLine> 
         let mut details = Vec::new();
         if row.verdict.status != VerdictStatus::Valid {
             details.push(verdict_message(&row.verdict, texts));
+        }
+        if rule.is_verify() {
+            details.push(texts.get(text::VERIFY_HINT));
         }
         if rule.auto_origin().is_some() {
             details.push(texts.get(text::AUTO_ORIGIN));
@@ -254,6 +301,8 @@ fn input_lines(input: &Input, texts: &Texts) -> Vec<ViewLine> {
         InputPurpose::Search => text::SEARCH_QUESTION,
         InputPurpose::Import => text::IMPORT_QUESTION,
         InputPurpose::Export => text::EXPORT_QUESTION,
+        InputPurpose::RulesFolder => text::FOLDER_QUESTION,
+        InputPurpose::VerdictFolder => text::VERDICTS_FOLDER_QUESTION,
     };
     vec![
         ViewLine::new(vec![Segment::strong(texts.get(question))]),
@@ -306,6 +355,31 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
             Field::Value => (text::FIELD_VALUE, form.value.clone()),
             Field::Route => (text::FIELD_ROUTE, route_text(&form.route, texts)),
             Field::Comment => (text::FIELD_COMMENT, form.comment.clone()),
+            Field::Verify => {
+                if !form.verify_offered() {
+                    continue;
+                }
+                let tick = texts.get(if form.verify {
+                    text::TICKED
+                } else {
+                    text::UNTICKED
+                });
+                lines.push(ViewLine::new(vec![
+                    Segment::plain(marker(current)),
+                    Segment::plain(format!("{tick} {}", texts.get(text::VERIFY))),
+                ]));
+                if form.verify {
+                    lines.push(ViewLine::text(format!(
+                        "     {}",
+                        texts.get(text::VERIFY_HINT)
+                    )));
+                }
+                if current {
+                    let labels = [texts.get(text::ON), texts.get(text::OFF)];
+                    lines.extend(options(&labels, Some(usize::from(!form.verify)), texts));
+                }
+                continue;
+            }
             Field::Enabled => {
                 let state = if form.enabled {
                     text::ENABLED_ON
@@ -359,21 +433,16 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
             }
             Field::Route => {
                 if current {
-                    let routes = route_options(&form.rule_type);
+                    let routes = route_options();
                     let labels: Vec<String> = routes.iter().map(|r| route_text(r, texts)).collect();
                     let chosen = routes.iter().position(|r| *r == form.route);
                     lines.extend(options(&labels, chosen, texts));
-                }
-                if form.route == TargetRoute::Verify {
-                    lines.push(ViewLine::text(format!(
-                        "     {}",
-                        texts.get(text::VERIFY_HINT)
-                    )));
                 }
             }
             _ => {}
         }
     }
+    lines.extend(overlap_lines(form, texts));
     if let Some(existing) = form.duplicate {
         let id = app
             .rules
@@ -392,12 +461,32 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
     lines
 }
 
+/// Which rules of the other route the rule in the form meets, and which one
+/// wins, before it is saved.
+fn overlap_lines(form: &Form, texts: &Texts) -> Vec<ViewLine> {
+    if form.overlaps.is_empty() {
+        return Vec::new();
+    }
+    let heading = format!("{}:", texts.get(text::OVERLAPS_HEADING));
+    let mut lines = vec![ViewLine::new(vec![Segment::strong(heading)])];
+    for found in form.overlaps.iter().take(FORM_OVERLAPS) {
+        let sentence = explain(&found.pair, &found.winner_route, &found.loser_route, texts);
+        lines.push(ViewLine::text(format!("     {sentence}")));
+    }
+    let more = form.overlaps.len().saturating_sub(FORM_OVERLAPS);
+    if more > 0 {
+        let rest = texts.fill(text::OVERLAPS_MORE, &[("count", more.to_string())]);
+        lines.push(ViewLine::text(format!("     {rest}")));
+    }
+    lines
+}
+
 /// How many options a question offers; line mode checks a typed number by it.
 pub fn choice_len(purpose: &ChoicePurpose) -> usize {
     match purpose {
         ChoicePurpose::Filter => RouteFilter::ALL.len(),
         ChoicePurpose::Quit | ChoicePurpose::ImportMode { .. } => 3,
-        ChoicePurpose::Preset(presets) => presets.len(),
+        ChoicePurpose::Preset(list) => list.sets.len(),
         ChoicePurpose::Delete(_) | ChoicePurpose::Reload | ChoicePurpose::Overwrite(_) => 2,
     }
 }
@@ -447,10 +536,10 @@ fn choice_lines(app: &AppState, choice: &Choice, texts: &Texts) -> Vec<ViewLine>
                 get(text::CANCEL),
             ],
         ),
-        ChoicePurpose::Preset(presets) => (
+        ChoicePurpose::Preset(list) => (
             get(text::PRESET_QUESTION),
-            Vec::new(),
-            presets.iter().map(|p| p.label.clone()).collect(),
+            set_list_details(list, texts),
+            list.sets.iter().map(|p| p.label.clone()).collect(),
         ),
         ChoicePurpose::Overwrite(path) => (
             get(text::OVERWRITE_QUESTION),
@@ -465,6 +554,23 @@ fn choice_lines(app: &AppState, choice: &Choice, texts: &Texts) -> Vec<ViewLine>
     }));
     lines.push(ViewLine::text(get(text::CHOICE_HINT)));
     lines
+}
+
+/// Where the offered sets come from, and why not from the user's folder.
+fn set_list_details(list: &SetList, texts: &Texts) -> Vec<String> {
+    let mut details = Vec::new();
+    if let Some(error) = &list.settings_error {
+        details.push(texts.fill(text::SETTINGS_UNREADABLE, &[("error", error)]));
+    }
+    if let Some(own) = &list.empty_own_folder {
+        let path = own.display().to_string();
+        details.push(texts.fill(text::SETS_FOLDER_EMPTY, &[("path", path)]));
+    }
+    if let Some(folder) = &list.folder {
+        let path = folder.display().to_string();
+        details.push(texts.fill(text::SETS_FOLDER, &[("path", path)]));
+    }
+    details
 }
 
 // ── The changes view ─────────────────────────────────────────────────────────
@@ -544,7 +650,8 @@ fn entry_lines(sign: &str, entries: &[&RuleSummaryEntryDto], texts: &Texts) -> V
             let mut line = format!("  {sign} {}", entry.display);
             if !entry.route.is_empty() {
                 let route = route_text(&TargetRoute::from_slug(&entry.route), texts);
-                line.push_str(&format!("  [{route}]"));
+                let mark = if entry.verify { " ?" } else { "" };
+                line.push_str(&format!("  [{route}{mark}]"));
             }
             if !entry.enabled {
                 line.push_str(&format!("  · {}", texts.get(text::DISABLED)));

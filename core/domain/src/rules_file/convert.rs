@@ -96,12 +96,12 @@ pub fn rules_file_to_route_rule_set(
                 address_match,
                 app_match,
                 comment: entry.inline_comment.clone().unwrap_or_default(),
-                // `?` is kept whichever file it came from: validation knows the
-                // route and turns it into a plain route on the primary one.
+                // `?` is kept whichever file it came from; validation turns it
+                // into a plain route on a kind it means nothing for.
                 action: if entry.blocked {
                     crate::RuleAction::Block
                 } else if entry.verify_primary {
-                    crate::RuleAction::VerifyPrimary
+                    crate::RuleAction::Verify
                 } else {
                     crate::RuleAction::Route
                 },
@@ -132,8 +132,9 @@ pub fn rules_file_to_route_rule_set(
 /// | `IpRange(range)`           | `Ranges`     | `first-last`          |
 /// | (app match, no address)    | `host_app_section` | `pattern.as_str()` |
 ///
-/// A [`crate::RuleAction::VerifyPrimary`] domain rule is written with its `?`
-/// prefix; on any other kind the action is dropped to a plain route line.
+/// A [`crate::RuleAction::Verify`] domain or exact-IP rule is written with
+/// its `?` prefix; on any other kind the action is dropped to a plain route
+/// line.
 ///
 /// A rule carrying an [`nrr_shared::auto_rule::RuleOrigin`] overrides the
 /// address-kind mapping for the two domain kinds and lands in `Auto` instead,
@@ -192,9 +193,10 @@ pub fn canonical_rule_set_to_rules_file_parsed(
                 CanonicalAddressMatch::ExactFqdn(_) | CanonicalAddressMatch::SuffixDomain(_)
             );
             let app_authored = rule.origin.is_some() && domain;
-            // The file reads `?` before host names only; on any other value
-            // it would come back as a broken rule.
-            let verify_primary = domain && rule.action == crate::RuleAction::VerifyPrimary;
+            // The file reads `?` before host names and single addresses only;
+            // on any other value it would come back as a broken rule.
+            let verify_primary = (domain || matches!(addr, CanonicalAddressMatch::ExactIp(_)))
+                && rule.action == crate::RuleAction::Verify;
             let (bucket, value) = match addr {
                 CanonicalAddressMatch::ExactFqdn(label) => (
                     if app_authored {

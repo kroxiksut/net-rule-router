@@ -1,34 +1,76 @@
-//! Recent connections, as the Diagnostics panel shows them.
+//! Recent connections, as the Diagnostics panel shows them, and what the
+//! caller's last route outage blocked.
 
 use super::*;
+
+use nrr_shared::ipc_payloads::{
+    ConnTraceOutageBlocksRequest, ConnTraceOutageBlocksResponse, OutageBlockDto, OutageEpisodeDto,
+};
+
+/// The local own-machine viewer shows real addresses and full exe paths, like
+/// the cache viewer: the user needs to see WHICH address an app reached, and
+/// masking it defeats the panel. Not gated on a diagnostic session for the
+/// same reason the cache viewer is not.
+const VIEWER_REDACTION: RedactionMode = RedactionMode::Diagnostics;
+
+/// What both trace views consult per request: the "show the trace in the GUI"
+/// switch and the inputs that name the rule behind an address.
+#[derive(Clone, Default)]
+struct TraceViewGates {
+    /// Machine settings, consulted per request so the switch acts at once
+    /// instead of at the next service start. It gates the ANSWER, never the
+    /// observer: app-routing, FCrDNS learning and the VPN learners read the
+    /// same observation stream and must keep running.
+    gui_stream: Option<Arc<dyn ServiceStabilityConfigProvider>>,
+    /// The active user's rule book + the FQDN cache yield the addresses a
+    /// secondary rule currently owns. All-or-nothing: absent deps simply leave
+    /// the rule fields empty.
+    expectation: Option<ConnTraceExpectation>,
+}
+
+impl TraceViewGates {
+    /// An absent provider means the deployment has no settings DB — answering
+    /// is then the useful default.
+    fn gui_stream_enabled(&self) -> bool {
+        self.gui_stream
+            .as_ref()
+            .map(|s| s.get().conn_trace_gui)
+            .unwrap_or(true)
+    }
+
+    /// What the active user's rules send over the secondary link, or `None`
+    /// when the deps are absent, nobody is routing-active, or `only_for` names
+    /// someone else — another user's rules say nothing about this user's rows.
+    /// Built once per request, never per row.
+    fn secondary_owners(&self, only_for: Option<&str>) -> Option<SecondaryAddressOwners> {
+        let (rules, fqdn, active_sid) = self.expectation.as_ref()?;
+        let sid = active_sid()?;
+        if only_for.is_some_and(|caller| !caller.eq_ignore_ascii_case(&sid)) {
+            return None;
+        }
+        let snapshot = rules.active_rules_for(&sid)?;
+        Some(SecondaryAddressOwners::build(
+            &snapshot.rule_book,
+            fqdn.as_ref(),
+        ))
+    }
+}
 
 // ── ConnTraceEntriesListHandler ───────────────────────────────────────────
 
 /// Read-only, paginated view of the connection-trace ring the
 /// connection-observer feeds. Mirrors [`CacheEntriesListHandler`]: same
-/// pagination cursor. The local own-machine viewer is never redacted (real
-/// remote/local IPs + full exe path), so it does not need the diagnostics
-/// facade for a redaction tier.
+/// pagination cursor. Rows are scoped to the caller's diagnostics audience.
 pub struct ConnTraceEntriesListHandler {
     ring: Arc<ConnectionTraceRing>,
-    /// Machine settings, consulted per request so the "show the trace in the
-    /// GUI" switch acts at once instead of at the next service start. It gates
-    /// the ANSWER, never the observer: app-routing, FCrDNS learning and the
-    /// VPN learners read the same observation stream and must keep running.
-    gui_stream: Option<Arc<dyn ServiceStabilityConfigProvider>>,
-    /// Optional inputs for the `expected_route` stamp: the active
-    /// user's rule book + the FQDN cache yield the addresses a secondary
-    /// rule currently owns, so each trace row can carry where policy EXPECTS
-    /// it to egress. All-or-nothing: absent deps simply leave the field empty.
-    expectation: Option<ConnTraceExpectation>,
+    gates: TraceViewGates,
 }
 
 impl ConnTraceEntriesListHandler {
     pub fn new(ring: Arc<ConnectionTraceRing>) -> Self {
         Self {
             ring,
-            gui_stream: None,
-            expectation: None,
+            gates: TraceViewGates::default(),
         }
     }
 
@@ -38,41 +80,19 @@ impl ConnTraceEntriesListHandler {
         mut self,
         settings: Arc<dyn ServiceStabilityConfigProvider>,
     ) -> Self {
-        self.gui_stream = Some(settings);
+        self.gates.gui_stream = Some(settings);
         self
     }
 
-    /// Whether the viewer may answer at all. An absent provider means the
-    /// deployment has no settings DB — answering is then the useful default.
-    fn gui_stream_enabled(&self) -> bool {
-        self.gui_stream
-            .as_ref()
-            .map(|s| s.get().conn_trace_gui)
-            .unwrap_or(true)
-    }
-
-    /// Enable the expected-route stamp (see the struct field doc).
+    /// Stamp each row with where policy EXPECTS it to egress.
     pub fn with_route_expectation(
         mut self,
         rules: Arc<dyn RulesProvider>,
         fqdn: Arc<dyn FqdnCacheLookup>,
         active_sid: ActiveSidFn,
     ) -> Self {
-        self.expectation = Some((rules, fqdn, active_sid));
+        self.gates.expectation = Some((rules, fqdn, active_sid));
         self
-    }
-
-    /// What the active user's rules send over the secondary link, or `None`
-    /// when the expectation deps are absent / no user is routing-active. Built
-    /// once per page request (bounded by the owners fan-out cap), never per row.
-    fn secondary_owners(&self) -> Option<SecondaryAddressOwners> {
-        let (rules, fqdn, active_sid) = self.expectation.as_ref()?;
-        let sid = active_sid()?;
-        let snapshot = rules.active_rules_for(&sid)?;
-        Some(SecondaryAddressOwners::build(
-            &snapshot.rule_book,
-            fqdn.as_ref(),
-        ))
     }
 }
 
@@ -98,8 +118,29 @@ fn exe_name(path: Option<&str>) -> String {
     }
 }
 
+/// An address as the viewers show it.
+fn shown_ip(ip: std::net::IpAddr) -> String {
+    redact_ipv4_str(&ip.to_string(), VIEWER_REDACTION).display_or_marker()
+}
+
+/// Whether `audience` may see a row owned by `owner`. Rows with no owner and
+/// the service's own connections belong to the machine, not to a person; the
+/// relay rows among the latter carry the caller's own traffic.
+fn row_visible_to(
+    audience: &DiagnosticsAudience,
+    rec: &crate::conn_observation_consumer::ConnectionTraceRecord,
+) -> bool {
+    let Some(caller) = audience.principal() else {
+        return true;
+    };
+    rec.user_sid
+        .as_deref()
+        .is_none_or(|owner| owner.is_empty() || owner.eq_ignore_ascii_case(caller))
+        || is_own_service(&exe_name(rec.process_path.as_deref()))
+}
+
 impl IpcHandler for ConnTraceEntriesListHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         const OP: &str = "conn-trace.entries.list";
         let req: ConnTraceEntriesListRequest = if request.payload.is_null() {
             ConnTraceEntriesListRequest::default()
@@ -109,7 +150,7 @@ impl IpcHandler for ConnTraceEntriesListHandler {
 
         // The switch is off: answer with an empty page and say why, rather
         // than with rows the user asked not to be shown.
-        if !self.gui_stream_enabled() {
+        if !self.gates.gui_stream_enabled() {
             return serialise(
                 OP,
                 &ConnTraceEntriesListResponse {
@@ -126,14 +167,6 @@ impl IpcHandler for ConnTraceEntriesListHandler {
             );
         }
 
-        // This is the user's own-machine connection viewer (per-SID,
-        // DACL-protected local pipe), so show real remote/local IPs and the
-        // full exe path, exactly like the cache viewer. The user needs to see
-        // WHICH IP an app reached; masking it to `<public-ipv4>` defeats the
-        // panel. Not gated on a diagnostic session for the same reason the
-        // cache viewer is not.
-        let mode = RedactionMode::Diagnostics;
-
         let limit = req.pagination.effective_page_size();
         let offset = req
             .pagination
@@ -143,19 +176,25 @@ impl IpcHandler for ConnTraceEntriesListHandler {
             .map(|(o, _)| o.max(0) as u32)
             .unwrap_or(0);
 
+        // Derived from the connection, never from the request: another user's
+        // rows name their programs and destinations.
+        let audience = ctx.diagnostics_audience();
         // Newest-first; fetch `limit + 1` so the extra row signals another page.
-        let (rows, _total) = self.ring.snapshot(offset as usize, limit as usize + 1);
+        let rows = self
+            .ring
+            .snapshot_where(offset as usize, limit as usize + 1, |rec| {
+                row_visible_to(&audience, rec)
+            });
         let has_more = rows.len() as u32 > limit;
 
         let fmt_addr = |sa: &std::net::SocketAddr| -> String {
-            let ip = redact_ipv4_str(&sa.ip().to_string(), mode).display_or_marker();
-            format!("{ip}:{}", sa.port())
+            format!("{}:{}", shown_ip(sa.ip()), sa.port())
         };
 
         // Built ONCE per page. A row whose remote it owns is EXPECTED to
         // egress the secondary link; the GUI flags expected=secondary +
         // egress=primary permits as leaks.
-        let secondary_owners = self.secondary_owners();
+        let secondary_owners = self.gates.secondary_owners(None);
         // The same owners answer both questions: whether policy expects this
         // remote on the secondary link, and — for a flow the service itself
         // opened — whose traffic it is carrying.
@@ -240,13 +279,123 @@ impl IpcHandler for ConnTraceEntriesListHandler {
                 total_count: None,
                 stale: false,
             },
-            // Never redacted: local own-machine viewer
-            // shows real addresses (see the mode note above). The GUI's
-            // "addresses masked" notice therefore stays hidden.
+            // Never redacted (see `VIEWER_REDACTION`), so the GUI's
+            // "addresses masked" notice stays hidden.
             redacted: false,
             observer_active: self.ring.observer_active(),
             gui_stream_enabled: true,
         };
         serialise(OP, &response)
+    }
+}
+
+// ── ConnTraceOutageBlocksListHandler ──────────────────────────────────────
+
+/// What leak protection blocked during the caller's last outage of the
+/// additional route. Always the caller's own: the request names nobody, and
+/// an elevated caller sees only their own list too — the list is the
+/// counterpart of their own block notice, not a machine log.
+pub struct ConnTraceOutageBlocksListHandler {
+    ring: Arc<ConnectionTraceRing>,
+    gates: TraceViewGates,
+}
+
+impl ConnTraceOutageBlocksListHandler {
+    pub fn new(ring: Arc<ConnectionTraceRing>) -> Self {
+        Self {
+            ring,
+            gates: TraceViewGates::default(),
+        }
+    }
+
+    /// Honour the "show connection trace in the GUI" switch, as the trace does.
+    pub fn with_gui_stream_gate(
+        mut self,
+        settings: Arc<dyn ServiceStabilityConfigProvider>,
+    ) -> Self {
+        self.gates.gui_stream = Some(settings);
+        self
+    }
+
+    /// Name the secondary rule behind each address, as the trace does.
+    pub fn with_route_expectation(
+        mut self,
+        rules: Arc<dyn RulesProvider>,
+        fqdn: Arc<dyn FqdnCacheLookup>,
+        active_sid: ActiveSidFn,
+    ) -> Self {
+        self.gates.expectation = Some((rules, fqdn, active_sid));
+        self
+    }
+}
+
+fn wire_ms(ms: u64) -> i64 {
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+
+impl IpcHandler for ConnTraceOutageBlocksListHandler {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        const OP: &str = "conn-trace.outage-blocks.list";
+        if !request.payload.is_null() {
+            let _: ConnTraceOutageBlocksRequest =
+                serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?;
+        }
+        let outages = self.ring.outage_blocks();
+        let observer_active = self.ring.observer_active() && outages.is_fed();
+        let empty = |gui_stream_enabled: bool| ConnTraceOutageBlocksResponse {
+            episode: None,
+            entries: Vec::new(),
+            omitted: 0,
+            redacted: false,
+            observer_active,
+            gui_stream_enabled,
+        };
+        if !self.gates.gui_stream_enabled() {
+            return serialise(OP, empty(false));
+        }
+        // An unattributed caller owns nothing; the empty principal is not a
+        // key anyone's drops are filed under.
+        let caller = ctx.caller_stored();
+        if caller.is_empty() {
+            return serialise(OP, empty(true));
+        }
+        let snapshot = outages.snapshot(caller);
+        let owners = self.gates.secondary_owners(Some(caller));
+        let entries = snapshot
+            .entries
+            .into_iter()
+            .map(|e| OutageBlockDto {
+                process: match e.process_path.as_deref() {
+                    Some(path) => exe_name(Some(path)),
+                    None => e.process,
+                },
+                process_path: e.process_path.unwrap_or_default(),
+                remote_ip: shown_ip(e.remote.ip()),
+                remote_port: e.remote.port(),
+                host: e.host.unwrap_or_default(),
+                rule_host: owners
+                    .as_ref()
+                    .and_then(|o| o.owner_of(e.remote.ip()))
+                    .map(std::borrow::Cow::into_owned)
+                    .unwrap_or_default(),
+                first_seen_ms: wire_ms(e.first_seen_ms),
+                last_seen_ms: wire_ms(e.last_seen_ms),
+                attempts: e.attempts,
+            })
+            .collect();
+        serialise(
+            OP,
+            &ConnTraceOutageBlocksResponse {
+                episode: snapshot.episode.map(|ep| OutageEpisodeDto {
+                    since_unix_ms: wire_ms(ep.since_ms),
+                    until_unix_ms: ep.until_ms.map(wire_ms),
+                }),
+                entries,
+                omitted: snapshot.omitted,
+                redacted: false,
+                observer_active,
+                gui_stream_enabled: true,
+            },
+        )
     }
 }

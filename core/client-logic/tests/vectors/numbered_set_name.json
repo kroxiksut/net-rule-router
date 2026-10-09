@@ -1,0 +1,103 @@
+{
+  "description": "pure.js numberedSetName",
+  "cases": [
+    {
+      "name": "a free name is kept",
+      "input": {
+        "base": "home",
+        "taken": [],
+        "all-taken": false
+      },
+      "expected": "home"
+    },
+    {
+      "name": "a taken name gets (2)",
+      "input": {
+        "base": "home",
+        "taken": [
+          "home"
+        ],
+        "all-taken": false
+      },
+      "expected": "home (2)"
+    },
+    {
+      "name": "the next free number",
+      "input": {
+        "base": "home",
+        "taken": [
+          "home",
+          "home (2)"
+        ],
+        "all-taken": false
+      },
+      "expected": "home (3)"
+    },
+    {
+      "name": "a gap is used",
+      "input": {
+        "base": "home",
+        "taken": [
+          "home",
+          "home (3)"
+        ],
+        "all-taken": false
+      },
+      "expected": "home (2)"
+    },
+    {
+      "name": "past 99 the last name comes back taken",
+      "input": {
+        "base": "full",
+        "taken": [],
+        "all-taken": true
+      },
+      "expected": "full (99)"
+    },
+    {
+      "name": "an empty base",
+      "input": {
+        "base": "",
+        "taken": [
+          ""
+        ],
+        "all-taken": false
+      },
+      "expected": " (2)"
+    },
+    {
+      "name": "a name with spaces",
+      "input": {
+        "base": "My rules",
+        "taken": [
+          "My rules"
+        ],
+        "all-taken": false
+      },
+      "expected": "My rules (2)"
+    },
+    {
+      "name": "letter case counts",
+      "input": {
+        "base": "home",
+        "taken": [
+          "Home",
+          "home"
+        ],
+        "all-taken": false
+      },
+      "expected": "home (2)"
+    },
+    {
+      "name": "only the base is asked about when free",
+      "input": {
+        "base": "work",
+        "taken": [
+          "work (2)"
+        ],
+        "all-taken": false
+      },
+      "expected": "work"
+    }
+  ]
+}

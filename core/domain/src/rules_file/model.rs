@@ -165,10 +165,10 @@ impl RulesFileSection {
         matches!(self, Self::Auto)
     }
 
-    /// `true` for the sections whose values are host names, the only ones a
-    /// `?` (try the primary route first) prefix is read in.
-    pub const fn takes_domain_values(self) -> bool {
-        matches!(self, Self::Domains | Self::Auto)
+    /// `true` for the sections whose values are host names or single
+    /// addresses, the only ones a `?` (check where it works) prefix is read in.
+    pub const fn takes_verify_prefix(self) -> bool {
+        matches!(self, Self::Domains | Self::Auto | Self::Ip)
     }
 }
 
@@ -235,9 +235,9 @@ pub struct RulesFileEntry {
     /// `true` when the line carried the `+block` flag: matching traffic is
     /// dropped (hard WFP block) regardless of which file the rule lives in.
     pub blocked: bool,
-    /// `true` when the value carried the `?` prefix (`?example.com`): try the
-    /// primary route first. Read in the domain-value sections only, and
-    /// meaningful only in the secondary file.
+    /// `true` when the value carried the `?` prefix (`?example.com`): check
+    /// that the route of this file works for it. Read in the domain and
+    /// exact-IP sections of either file.
     pub verify_primary: bool,
     /// Provenance of an app-authored entry, parsed from the structured
     /// `auto:… anchor:… added:…` prefix of the inline comment.

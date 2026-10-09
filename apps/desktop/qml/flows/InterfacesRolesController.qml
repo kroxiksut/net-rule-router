@@ -446,7 +446,8 @@ QtObject {
         root.emitPrefs()
         _reapplyInterfaceRolesFromPrefs()
         rebuildInterfacesModel()
-        root.routePolicyController.pushRouteBindingToService()
+        root.routePolicyController.pushRouteBindingToService(undefined, undefined,
+            "user:interfaces")
         root.statusLine = root.tr("status.secondary-rebound",
             "Additional adapter re-confirmed.")
     }
@@ -612,7 +613,8 @@ QtObject {
     /// connections at the one moment the wizard asks for them.
     function _deliverBinding(pushOpts) {
         if (root._routingBackendConnected()) {
-            root.routePolicyController.pushRouteBindingToService(pushOpts)
+            root.routePolicyController.pushRouteBindingToService(pushOpts, undefined,
+                "user:interfaces")
             return
         }
         root.recordOfflineBindingIntent(pushOpts)

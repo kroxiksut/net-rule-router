@@ -10,10 +10,6 @@
 --- Domains
 # Add the services that fail for you on the primary network, for example
 # a site your provider blocks or a service limited by region.
-?*.proton.me
-?*.protonmail.com
-?*.protonmail.ch
-?*.protonvpn.com
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets

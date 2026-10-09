@@ -1,0 +1,146 @@
+{
+  "description": "pure.js adoptedSetName",
+  "cases": [
+    {
+      "name": "the folder of the bound primary file",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/home/user/sets/home/rules_primary.txt"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "home"
+    },
+    {
+      "name": "a Windows path with backslashes",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "C:\\Users\\user\\Sets\\work\\rules_primary.txt"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "work"
+    },
+    {
+      "name": "only the secondary was read from a file",
+      "input": {
+        "prefs": {
+          "lastLoadedPathSecondary": "D:/Sets/travel/rules_secondary.txt"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "travel"
+    },
+    {
+      "name": "the primary read source wins over the secondary binding",
+      "input": {
+        "prefs": {
+          "lastLoadedPathPrimary": "/a/first/rules_primary.txt",
+          "lastSavedPathSecondary": "/b/second/rules_secondary.txt"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "first"
+    },
+    {
+      "name": "a path ending in a slash still names its folder",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/sets/home/"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "home"
+    },
+    {
+      "name": "no file: the shipped set picked from the list",
+      "input": {
+        "prefs": {
+          "selectedPresetSet": "bundled:ru_basic"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "ru_basic"
+    },
+    {
+      "name": "no file: the user's set picked from the list",
+      "input": {
+        "prefs": {
+          "selectedPresetSet": "user:home"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "home"
+    },
+    {
+      "name": "no file and no pick: the fallback",
+      "input": {
+        "prefs": {},
+        "fallback": "My rules"
+      },
+      "expected": "My rules"
+    },
+    {
+      "name": "a file at a drive root gives no usable folder name",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "C:/rules_primary.txt",
+          "selectedPresetSet": "user:office"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "office"
+    },
+    {
+      "name": "a bare file name has no folder",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "rules_primary.txt"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "My rules"
+    },
+    {
+      "name": "a pick whose label holds a colon is not a folder name",
+      "input": {
+        "prefs": {
+          "selectedPresetSet": "user:a:b"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "My rules"
+    },
+    {
+      "name": "a folder name with two dots is refused",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/sets/a..b/rules_primary.txt"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "My rules"
+    },
+    {
+      "name": "a pick without a source prefix is taken whole",
+      "input": {
+        "prefs": {
+          "selectedPresetSet": "plain"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "plain"
+    },
+    {
+      "name": "a blank folder name falls through to the pick",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/sets/ /rules_primary.txt",
+          "selectedPresetSet": "bundled:de_basic"
+        },
+        "fallback": "My rules"
+      },
+      "expected": "de_basic"
+    }
+  ]
+}

@@ -9,7 +9,7 @@
     { "name": "mixed-case unknown type", "input": { "row": { "ruleType": "Zone", "matchValue": "RU", "targetRoute": "secondary", "enabled": true } } },
     { "name": "route case kept in merge key only", "input": { "row": { "ruleType": "zone", "matchValue": "example", "targetRoute": "Secondary", "enabled": true } } },
     { "name": "block pseudo-route", "input": { "row": { "ruleType": "domain", "matchValue": "*.ads.example", "targetRoute": "block", "enabled": false } } },
-    { "name": "verify pseudo-route", "input": { "row": { "ruleType": "exact-fqdn", "matchValue": "video.example", "targetRoute": "verify", "enabled": true } } },
+    { "name": "verify is not identity", "input": { "row": { "ruleType": "exact-fqdn", "matchValue": "video.example", "targetRoute": "secondary", "verify": true, "enabled": true } } },
     { "name": "cyrillic value lower-cased", "input": { "row": { "ruleType": "domain", "matchValue": "Пример.РФ", "targetRoute": "secondary", "enabled": true } } },
     { "name": "application path", "input": { "row": { "ruleType": "application", "matchValue": "C:\\Program Files\\App\\App.EXE", "targetRoute": "secondary", "enabled": true } } },
     { "name": "empty row", "input": { "row": {} } }

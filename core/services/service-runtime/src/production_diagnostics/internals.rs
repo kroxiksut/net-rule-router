@@ -76,7 +76,7 @@ impl ProductionDiagnosticsFacade {
         // routes it `secondary`, and the "cover subdomains" toggle looks broken.
         // Read for the caller's own policy, mirroring the provider. Enforcement-
         // only: the stored/hashed rule book (drift, `rules.list`) is untouched.
-        rule_book = rule_book.with_verify_primary_effective();
+        rule_book = crate::verify_overlay::effective(&rule_book, caller_sid);
         if self.reads_include_subdomains(caller_sid) {
             rule_book = rule_book.with_subdomain_coverage();
         }

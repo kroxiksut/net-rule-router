@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use nrr_ui_support::ui_preferences::{UiPreferences, UiPreferencesStore};
 
 use crate::launcher::{diag_log, preferences_to_persist};
+use crate::user_settings_bridge::UserSettingsMirror;
 
 /// How long a burst of publications may coalesce before the newest snapshot is
 /// written.
@@ -51,6 +52,8 @@ pub(crate) struct DebouncedPreferenceWriter {
     coalesced: u32,
     /// Completed writes this session, reported in the diagnostic line.
     writes: u32,
+    /// The shared user settings, written after each preferences save.
+    user_settings: Option<UserSettingsMirror>,
 }
 
 impl DebouncedPreferenceWriter {
@@ -77,7 +80,14 @@ impl DebouncedPreferenceWriter {
             due_at: None,
             coalesced: 0,
             writes: 0,
+            user_settings: None,
         }
+    }
+
+    /// Also mirror the shared fields into `user-settings.json`.
+    pub(crate) fn with_user_settings(mut self, mirror: Option<UserSettingsMirror>) -> Self {
+        self.user_settings = mirror;
+        self
     }
 
     /// When the caller must wake up to write, or `None` while nothing is
@@ -131,6 +141,7 @@ impl DebouncedPreferenceWriter {
 
         match store.save(&updated) {
             Ok(()) => {
+                self.publish_user_settings(&updated);
                 self.base = updated;
                 self.writes = self.writes.saturating_add(1);
                 diag_log(
@@ -154,6 +165,23 @@ impl DebouncedPreferenceWriter {
                 );
             }
         }
+    }
+
+    /// Best effort: the preferences already landed, and a field that failed
+    /// here is retried with the next snapshot because it still differs.
+    fn publish_user_settings(&mut self, preferences: &UiPreferences) {
+        let Some(mirror) = self.user_settings.as_mut() else {
+            return;
+        };
+        let line = match mirror.publish(preferences) {
+            Ok(false) => return,
+            Ok(true) => format!(
+                "NRR_LAUNCHER[prefs] user settings written path={}",
+                mirror.path().display()
+            ),
+            Err(error) => format!("NRR_LAUNCHER[prefs] user settings not written: {error}"),
+        };
+        diag_log(self.surface_tag, &line);
     }
 }
 
@@ -348,6 +376,40 @@ mod tests {
         assert_eq!(writer.due_at(), Some(t0 + DEBOUNCE));
         writer.flush_if_due(t0 + DEBOUNCE);
         assert!(writer.due_at().is_none());
+    }
+
+    #[test]
+    fn a_saved_snapshot_merges_its_shared_field_into_user_settings() {
+        use crate::user_settings_bridge::open_session_in;
+        use nrr_shared::user_settings::UserSettingsStore;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shared = dir.path().join("user-settings.json");
+        let mut base = UiPreferences::default();
+        let mirror = open_session_in(UserSettingsStore::at(shared.clone()), &mut base, true);
+        assert!(mirror.is_some());
+        // The terminal binds a file while the window runs.
+        UserSettingsStore::at(shared.clone())
+            .update(|s| s.rules_files.primary = "/terminal/rules_primary.txt".to_string())
+            .expect("terminal write");
+
+        let mut writer = writer_over(
+            UiPreferencesStore::for_path(dir.path().join("ui-preferences.conf")),
+            base,
+        )
+        .with_user_settings(mirror);
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&payload_with_theme("dark")).expect("payload");
+        payload["userPresetsDir"] = "/window/sets".into();
+        writer.observe(&payload.to_string(), Instant::now());
+        writer.flush();
+
+        let on_disk = UserSettingsStore::at(shared)
+            .load()
+            .expect("load")
+            .expect("present");
+        assert_eq!(on_disk.rules_folder, "/window/sets");
+        assert_eq!(on_disk.rules_files.primary, "/terminal/rules_primary.txt");
     }
 
     #[test]

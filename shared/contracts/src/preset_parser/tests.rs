@@ -266,12 +266,36 @@ kept.example.com
 }
 
 #[test]
-fn verify_prefix_outside_domain_sections_stays_in_the_value() {
+fn verify_prefix_is_read_on_exact_ip_lines() {
     let result = parse_canonical_rules(
         "--- IP
-?192.0.2.10
---- Zones
+?192.0.2.10  # one host
+# ?2001:db8::7
+198.51.100.1
+",
+    );
+    let read: Vec<_> = result
+        .rules
+        .iter()
+        .map(|r| (r.match_value.as_str(), r.enabled, r.verify_primary))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("192.0.2.10", true, true),
+            ("2001:db8::7", false, true),
+            ("198.51.100.1", true, false),
+        ]
+    );
+}
+
+#[test]
+fn verify_prefix_outside_domain_and_ip_sections_stays_in_the_value() {
+    let result = parse_canonical_rules(
+        "--- Zones
 ?example
+--- CIDR
+?192.0.2.0/24
 ",
     );
     assert_eq!(result.rules.len(), 2);

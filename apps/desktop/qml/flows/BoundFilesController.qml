@@ -293,6 +293,63 @@ QtObject {
         _writeTargets(targets, false, onDone)
     }
 
+    /// The user just made `folder` the home of their rule sets, so the set on
+    /// screen moves in — unless it already lives there. A set of the same name
+    /// is never overwritten (a numbered name is taken instead) and the files
+    /// the rules were linked to before stay where they are. `onDone(ok)`, when
+    /// given, runs once the set is in place or nothing had to move.
+    function adoptRulesFolder(folder, onDone) {
+        var done = function(ok) { if (typeof onDone === "function") onDone(ok) }
+        var dir = String(folder || "").replace(/\\/g, "/").replace(/\/+$/, "")
+        if (dir === "" || (!_routeHasRules("primary") && !_routeHasRules("secondary"))) return done(true)
+        if (Pure.rulesLiveInFolder(root.prefs, dir)) return done(true)
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.createPresetSetDir !== "function") return done(false)
+        var name = Pure.numberedSetName(_adoptedSetName(), function(candidate) {
+            return _ruleSetDirHasFiles(dir + "/" + candidate)
+        })
+        var setDir = String(nrrNativeBridge.createPresetSetDir(dir, name) || "")
+        if (setDir === "") {
+            root.statusLine = root.tr("status.save-as-set-folder-failed",
+                "Could not create the set folder. Check that the folder above is writable.")
+            return done(false)
+        }
+        var previous = []
+        var bound = [String(root.prefs.lastSavedPathPrimary || ""),
+                     String(root.prefs.lastSavedPathSecondary || "")]
+        for (var b = 0; b < bound.length; b += 1) {
+            var old = bound[b] !== "" ? _routeFolder(bound[b]) : ""
+            if (old !== "" && previous.indexOf(old) < 0) previous.push(old)
+        }
+        exportRoutesToPaths(
+            [{ route: "primary",   path: setDir + "/rules_primary.txt" },
+             { route: "secondary", path: setDir + "/rules_secondary.txt" }],
+            function(ok) {
+                if (!ok) {
+                    root.statusLine = root.tr("status.save-as-set-failed",
+                        "Could not save the set. See logs for details.")
+                    return done(false)
+                }
+                var line = root.tr("status.rules-folder-set-saved",
+                    "The rules on screen are saved in your folder as a set: {dir}")
+                    .replace("{dir}", setDir)
+                if (previous.length > 0) {
+                    line += " " + root.tr("status.rules-folder-old-files-kept",
+                        "The files they were linked to before stay where they were: {dir}")
+                        .replace("{dir}", previous.join(", "))
+                }
+                root.statusLine = line
+                root.presetSetsChanged()
+                done(true)
+            })
+    }
+
+    /// The set the rules on screen came from — the folder of their files, else
+    /// the quick-load pick — or "My rules".
+    function _adoptedSetName() {
+        return Pure.adoptedSetName(root.prefs, root.tr("rules.sets.my-rules", "My rules"))
+    }
+
     /// Does `route` hold any rule at all? Drives which routes the export
     /// picker asks about — an empty route is not worth a file dialog.
     function _routeHasRules(route) {
@@ -396,11 +453,7 @@ QtObject {
     /// error reads as "bad name" rather than a generic write failure. Public:
     /// the naming dialog greys its confirm button on the same rule.
     function isUsableSetName(name) {
-        var n = String(name || "").trim()
-        if (n === "" || n === ".") return false
-        if (n.indexOf("/") >= 0 || n.indexOf("\\") >= 0) return false
-        if (n.indexOf(":") >= 0 || n.indexOf("..") >= 0) return false
-        return true
+        return Pure.isUsableSetName(name)
     }
 
     function _settleExportSet(ok) {
@@ -466,12 +519,12 @@ QtObject {
         // The service also removes rule twins it once stored by mistake; that
         // is not "addresses added".
         var tidied = String(correlationId || "").indexOf("auto-rules-cleanup-") === 0
-        // A `?` rule moving is told by its own notice; the line only says so.
+        // `?` rules the user agreed to move: the line only says so.
         var moved = String(correlationId || "").indexOf("auto-rules-verify-") === 0
         if (root.unsavedChangesRegistry && root.unsavedChangesRegistry["rules"]) {
             if (moved) {
-                root.statusLine = root.tr("tray.verify-moved.title",
-                    "Site moved to the additional route")
+                root.statusLine = root.tr("status.verify-verdicts.moved",
+                    "Rules moved to the route where they work.")
                 return
             }
             if (tidied) {
@@ -510,7 +563,7 @@ QtObject {
             return
         }
         root.statusLine = moved
-            ? root.tr("tray.verify-moved.title", "Site moved to the additional route")
+            ? root.tr("status.verify-verdicts.moved", "Rules moved to the route where they work.")
             : tidied
             ? root.tr("status.rules-tidied",
                 "Duplicate subdomain rules the app had added were removed from your rules.")

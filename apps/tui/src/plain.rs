@@ -116,8 +116,11 @@ impl<W: Write> PlainSession<W> {
 
     fn print_menu(&mut self, texts: &Texts) -> io::Result<()> {
         writeln!(self.out, "{}:", texts.get(keys::MENU_TITLE))?;
+        // A sub-screen opens from its parent's commands.
         for id in ScreenId::ALL {
-            writeln!(self.out, "  {}. {}", id.hotkey(), texts.get(id.title()))?;
+            if let Some(key) = id.hotkey() {
+                writeln!(self.out, "  {key}. {}", texts.get(id.title()))?;
+            }
         }
         Ok(())
     }
@@ -280,6 +283,7 @@ pub fn run(
                 backend.send_outbox(&mut app.outbox);
                 if let Some(language) = app.language_change.take() {
                     current = Texts::load(Some(&language), &[]);
+                    crate::screens::rules::on_texts(app, &current);
                     session.start(app, &current)?;
                 }
             }

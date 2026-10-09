@@ -57,6 +57,8 @@
   "action": {
     "open-folder": "Open folder",
     "ok": "OK",
+    "move": "Move",
+    "not-now": "Not now",
     "copy": "Copy",
     "copied": "Copied",
     "collapse-navigation": "Collapse navigation",
@@ -120,7 +122,8 @@
     "hide-details": "Hide details",
     "load-more": "Load more",
     "dismiss": "Dismiss",
-    "dont-show": "Don't show…"
+    "dont-show": "Don't show…",
+    "outage-blocks": "What was blocked"
   },
   "label": {
     "help": "Help",
@@ -128,7 +131,6 @@
     "primary": "Primary",
     "secondary": "Additional",
     "block": "Block",
-    "verify-primary": "Primary first, additional if unreachable",
     "service": "Service",
     "version": "Version",
     "license": "License",
@@ -1165,7 +1167,8 @@
       "coverage-with-subdomains": "Covers {host} and every subdomain of it.",
       "coverage-exact-only": "Covers {host} only. Type *.{host} to include its subdomains.",
       "include-subdomains": "Include subdomains",
-      "route-verify-hint": "Opens through the primary route first. Once NetRuleRouter confirms the primary route cannot reach the site, the rule moves to the additional route by itself."
+      "verify": "Unsure — check where it works",
+      "verify-hint": "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule."
     },
     "load-list": {
       "title": "Load rule list",
@@ -1347,7 +1350,6 @@
       "show-diff-description": "Open a read-only diff of the current app rules against the service.",
       "clear-all": "Clear everything",
       "clear-all-description": "Remove all rules from the app and the service. This cannot be undone.",
-      "not-now": "Not now",
       "not-now-description": "Dismiss the dialog. The banner stays until the drift is resolved.",
       "merge": "Merge…",
       "merge-description": "Your linked rules file and the service's active rules have diverged. Merge combines both instead of choosing one side."
@@ -1676,6 +1678,10 @@
   },
   "status": {
     "setting-not-applied": "The background service did not apply this change — the switch was reset to what the service actually holds.",
+    "verify-verdicts": {
+      "moved": "Rules moved to the route where they work.",
+      "failed": "The service did not take the answer: "
+    },
     "offline-change-recorded": "The background service is unavailable — your change was saved and will be offered to apply when it reconnects.",
     "offline-pending-applied": "Your saved changes were applied.",
     "offline-pending-auto-applied": "Applied the changes made while the service was stopped.",
@@ -2009,7 +2015,14 @@
     "primary-probe-limits-reset": "Check limits are back to their defaults.",
     "traffic-history-merge-failed": "Could not save the answer: ",
     "rules-list-added": "Rules added: {count}.",
-    "rules-list-already-present": "Already in the list: {count}."
+    "rules-list-already-present": "Already in the list: {count}.",
+    "rules-folder-set-saved": "The rules on screen are saved in your folder as a set: {dir}",
+    "rules-folder-old-files-kept": "The files they were linked to before stay where they were: {dir}",
+    "settings-restored": "Your settings were restored.",
+    "settings-restore-nothing": "The service already has your settings.",
+    "settings-restore-failed": "Could not restore your settings: ",
+    "settings-restore-read-failed": "Could not read your settings or the service's, so nothing was changed.",
+    "settings-restore-adapter-missing": "Not restored: the adapter {name} is not on this computer now."
   },
   "interfaces": {
     "type": {
@@ -2349,7 +2362,8 @@
       },
       "route": {
         "label": "Route",
-        "all": "All routes"
+        "all": "All routes",
+        "unsure": "Unsure (?)"
       },
       "auto-added": "Auto-added only"
     },
@@ -2583,7 +2597,6 @@
       "block-tie-warning": "The other rule names the same sites and never applies.",
       "main-stays": "Addresses of the main link inside this network stay on the main link even when the additional link is down. Leak protection does not block them.",
       "block-note": "A block rule is part of this pair; change it in the rules list.",
-      "verify-note": "A rule that tries the primary route first is part of this pair; change it in the rules list.",
       "confirm": "Correct",
       "confirm-all": "Confirm all",
       "confirmed": "Confirmed",
@@ -2623,6 +2636,9 @@
       "summary": "To add: {accepted}. Not added: {rejected}.",
       "truncated": "Only the first {count} lines were read.",
       "line-unrecognized": "Not an address, a subnet or a range."
+    },
+    "sets": {
+      "my-rules": "My rules"
     }
   },
   "connection": {
@@ -2751,10 +2767,6 @@
       "body": "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime in Settings → Routing, by switching back to “Suggest only”.",
       "confirm": "Turn on"
     },
-    "verify-moved": {
-      "title": "Site moved to the additional route",
-      "body": "{host} does not open over the primary route, so its rule now uses the additional route."
-    },
     "external-address": {
       "title": "Additional route connected",
       "body": "External address of the additional route: {address}",
@@ -2845,7 +2857,11 @@
     "notice-mute": {
       "title": "Stop showing this notification?",
       "body": "\"{name}\" will not appear for as long as you choose."
-    }
+    },
+    "settings-lost": {
+      "body": "This happens after the service was reinstalled or its data was reset. Settings missing: {count}."
+    },
+    "settings-restore-failed": "Your settings could not be restored. Open the app to try again."
   },
   "diag": {
     "copy-all-shown": "Copy all shown",
@@ -3212,7 +3228,8 @@
       }
     },
     "event": {
-      "auto-rules-verify-moved": "The main route does not reach {host}; its ? rule now uses the additional route.",
+      "auto-rules-verify-accepted": "Rules with ? moved to the route that works for them: {count}.",
+      "auto-rules-verify-verdict": "{host} does not open on the route its ? rule is written for but opens on the other one; the rule uses the other route until restart, and moving it is offered.",
       "conn-observation-tick": "Connections observed: {total} (Main {primary}, Additional {secondary}, blocked {blocked_nrr})",
       "dns-refresh-tick": "DNS refresh: {succeeded} of {attempted} names resolved",
       "system-routes-reconciled": "System routes updated: {added} added, {removed} removed",
@@ -3856,6 +3873,21 @@
       "storage-kill-switch-protocols-reset": "A stored leak protection protocol selection blocked nothing; every protocol is blocked instead.",
       "persid-plan-network-carving-over-cap": "{count} network rule(s) hold more narrower rules than can be carved out, so each applies to its whole network and the narrower rules inside it do not take effect ({rules}).",
       "linux-flow-reset-dump-capped": "The connection table holds more {family} sockets than one listing reads ({cap}); connections past that are not reset."
+    },
+    "outage-blocks": {
+      "title": "Blocked while the route was down",
+      "intro": "What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.",
+      "episode-active": "The additional route has been down since {since}.",
+      "episode-ended": "The last outage lasted from {since} to {until}.",
+      "no-episode": "The additional route has not been down since the service started.",
+      "empty": "Nothing was blocked during this outage.",
+      "omitted": "{count} older entries did not fit in the list.",
+      "observer-off": "On this system NetRuleRouter cannot tell which connections an outage blocked, so this list stays empty.",
+      "col-attempts": "Attempts",
+      "col-first": "First",
+      "col-last": "Last",
+      "open-routes": "Open interfaces and routes",
+      "failed": "Could not load the list: "
     }
   },
   "logs": {
@@ -4041,6 +4073,12 @@
   "notifications": {
     "title": "Notifications",
     "empty": "No notifications.",
+    "verify-verdicts": {
+      "title": "Addresses that do not open where they are written: {count}",
+      "body": "They do get through over the other route and use it until the next restart. “Move” writes them there for good; “Not now” keeps them as written and checks again after the restart.",
+      "item": "{value} → {route}",
+      "list": "Rules and the route they would move to"
+    },
     "chip-label": "Notifications",
     "chip-tooltip": "Show notifications",
     "dismiss-all": "Dismiss all",
@@ -4174,6 +4212,14 @@
     "host-unreachable": {
       "title": "A site does not answer on either link",
       "body": "{host} did not answer through the main link or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side."
+    },
+    "settings-lost": {
+      "title": "The service does not have your settings",
+      "body": "This happens after the service was reinstalled or its data was reset. Missing: {settings}.",
+      "action": "Restore my settings",
+      "more": "and {count} more",
+      "mutes": "hidden notifications",
+      "other-setting": "another routing setting"
     }
   },
   "route": {
@@ -4254,7 +4300,6 @@
     "menu": {
       "title": "Screens"
     },
-    "placeholder": "This screen will be in the next version.",
     "list": {
       "page": "Rows {from}–{to} of {total}.",
       "more-on-service": "The service has more: going past the last row asks for them.",
@@ -4275,7 +4320,11 @@
       "help-filters": "b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off",
       "plain-details": "d and a row number: show that connection, for example d 3",
       "plain-explain": "e and a row number: why that connection took its route, for example e 3",
-      "plain-search": "/ and text: search all fields, for example /example; / on its own clears the search"
+      "plain-search": "/ and text: search all fields, for example /example; / on its own clears the search",
+      "help-outage": "o: what was blocked while the additional route was down"
+    },
+    "outage-blocks": {
+      "where": "The list of what was blocked: {screen}"
     },
     "cache": {
       "detail-title": "Selected entry",
@@ -4336,7 +4385,8 @@
       "status-feed": "On this screen, Up and Down scroll the notifications when that panel has the focus.",
       "settings-focus": "Tab: give this screen the focus; then Up and Down move through the sections and the settings.",
       "settings-enter": "Enter: open a section, change the chosen setting, or run the chosen action.",
-      "settings-esc": "Esc: cancel a change, or go back to the list of sections."
+      "settings-esc": "Esc: cancel a change, or go back to the list of sections.",
+      "status-restore": "r: restore your settings to a service that lost them"
     },
     "footer": "F1: help   q: quit",
     "plain": {
@@ -4346,7 +4396,8 @@
       "help-enter": "Enter on its own: show this screen again",
       "help-help": "h or ?: this help",
       "unknown": "Not understood: {input}",
-      "commands": "Commands on this screen"
+      "commands": "Commands on this screen",
+      "status-restore": "r: restore your settings to a service that lost them"
     },
     "interfaces": {
       "adapters-title": "Adapters",
@@ -4379,6 +4430,10 @@
       "pending": "Not applied",
       "in-force": "Same as in the service",
       "not-loaded": "The rules in force are not known without the service.",
+      "verdicts": {
+        "keys": "m: Move. n: Not now.",
+        "folder-question": "Folder for your rule sets: the rules on screen are saved there, then the rules move. Nothing typed is Not now:"
+      },
       "loading": "Reading the rules from the service…",
       "load-failed": "Could not read the rules from the service: {error}",
       "previewing": "Comparing with the rules in force…",
@@ -4408,6 +4463,16 @@
       "export-question": "Folder to write rules_primary.txt and rules_secondary.txt to:",
       "preset-question": "Which rule set to load?",
       "no-presets": "No rule sets were found beside the program.",
+      "sets-folder": "Rule sets in {path}",
+      "sets-folder-empty": "Your rule-set folder {path} holds no sets; the shipped ones are listed.",
+      "settings-unreadable": "Your settings file could not be read: {error}",
+      "settings-not-written": "Your settings file was not updated: {error}",
+      "folder-question": "Folder with your rule sets; - goes back to the sets shipped with the program:",
+      "folder-set": "Rule sets are now listed from {path}.",
+      "folder-cleared": "Rule sets are listed from the ones shipped with the program again.",
+      "folder-missing": "There is no folder {path}.",
+      "folder-unavailable": "This session edits the administrator's baseline, so it has no rule-set folder of its own.",
+      "set-names-taken": "Nothing was saved: every name from {name} to {name} (99) is taken in {path}.",
       "mode-question": "What to do with the rules on screen?",
       "mode-replace": "Replace them with the rules from the files",
       "mode-add": "Keep them and add the rules from the files that are not there yet",
@@ -4421,6 +4486,7 @@
       "import-nothing": "Neither rules_primary.txt nor rules_secondary.txt is in {path}.",
       "read-failed": "Could not read {path}: {error}",
       "exported": "The rules were written to {path}.",
+      "exported-unbound": "The rules were written to {path}, but your settings file was not updated: {error}",
       "write-failed": "Could not write {path}: {error}",
       "plain-prompt": "Type the answer and press Enter. Enter alone keeps what is shown; ! cancels.",
       "plain-choice-prompt": "Type the number of your choice and press Enter; ! cancels.",
@@ -4434,7 +4500,9 @@
         "filter": "f: show the rules of one route. /: search; a pasted web address is reduced to its site",
         "apply": "Ctrl+S or s: apply. The changes are shown first; Enter applies them, Esc returns",
         "files": "i: import the two rules files. x: export them. p: load a country rule set",
+        "folder": "o: choose the folder with your rule sets; the rules on screen are saved there as a set",
         "reload": "r: show the rules the service applies, dropping the changes on screen",
+        "verdicts": "m: move the rules that work only on the other route there for good. n: not now",
         "form": "In the rule form: Up and Down move between fields, Left and Right change a choice, Space switches the rule on or off, Enter saves, Esc cancels"
       },
       "plain": {
@@ -4447,7 +4515,9 @@
         "pages": "> and <: next and previous page",
         "apply": "s: apply the changes; they are shown first",
         "files": "i: import files. x: export files. p: load a country rule set",
-        "reload": "r: show the rules the service applies"
+        "folder": "o: choose the folder with your rule sets",
+        "reload": "r: show the rules the service applies",
+        "verdicts": "m: move the rules that work only on the other route. n: not now"
       },
       "title-baseline": "Rules — baseline for every user",
       "baseline-note": "Running as root: these rules are the baseline every user without rules of their own follows, as Set as baseline does in the window."
@@ -4478,7 +4548,6 @@
       "edit-hint": "Enter saves, Esc cancels.",
       "pick-hint": "Up and Down choose, Enter saves, Esc cancels.",
       "confirm": "Press Enter again to confirm, or Esc to cancel.",
-      "confirm-word": "yes",
       "more-above": "{count} more lines above",
       "plain": {
         "sections": "c and a number, for example c2: open that section",
@@ -4546,6 +4615,11 @@
       "help-type": "While typing a path: Enter keeps it, Esc leaves it as it was",
       "plain-number": "A number: take that answer. To leave the setup, take the answer that closes it.",
       "plain-prompt": "Type the number of your answer and press Enter."
+    },
+    "restore": {
+      "body": "This happens after the service was reinstalled or its data was reset. Missing: {settings}. Press r on the Status screen to restore them.",
+      "line": "The service does not have your settings. r: restore them.",
+      "failed": "Your settings could not be restored: {error}"
     }
   }
 }

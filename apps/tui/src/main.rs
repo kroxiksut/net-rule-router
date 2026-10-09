@@ -14,6 +14,7 @@ mod keys;
 mod link;
 mod plain;
 mod platform;
+mod restore;
 mod screens;
 mod state;
 #[cfg(test)]
@@ -61,7 +62,7 @@ fn main() -> ExitCode {
     let texts = Texts::load(explicit_lang.as_deref(), &system);
     let tui = tui_command();
 
-    let options = match parsed {
+    let mut options = match parsed {
         Ok(Invocation::Run(options)) => options,
         Ok(Invocation::Help) => {
             println!("{}", texts.fill(keys::USAGE, &[("tui", tui)]));
@@ -99,7 +100,17 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_NOT_INTERACTIVE);
     }
 
-    match run(&options, &texts) {
+    // What the Settings screen saved adds to what the command line asked.
+    let prefs_path = screens::settings::prefs::default_path();
+    let saved = prefs_path
+        .as_deref()
+        .map(screens::settings::prefs::load)
+        .unwrap_or_default();
+    options.plain |= saved.plain;
+    options.no_color |= saved.no_color;
+    options.ascii |= saved.ascii;
+
+    match run(&options, &texts, saved, prefs_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!(
@@ -111,7 +122,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(options: &Options, texts: &Texts) -> std::io::Result<()> {
+fn run(
+    options: &Options,
+    texts: &Texts,
+    saved: screens::settings::TuiPrefs,
+    prefs_path: Option<std::path::PathBuf>,
+) -> std::io::Result<()> {
     // The client's stderr trace would land in the middle of the picture, or in
     // the middle of what a screen reader is reading.
     nrr_ipc_client::silence_diagnostics();
@@ -128,7 +144,17 @@ fn run(options: &Options, texts: &Texts) -> std::io::Result<()> {
         ScreenId::Status
     };
     let mut app = AppState::new(first, options.bell);
+    app.settings.prefs = saved;
+    app.settings.prefs_path = prefs_path;
     app.rules.baseline = platform::edits_baseline();
+    screens::rules::on_texts(&mut app, texts);
+    // The baseline's editor is not the user whose folder and files these are;
+    // a root-owned copy in their profile would also lock the GUI out of it.
+    if !app.rules.baseline {
+        app.rules.settings_file = nrr_shared::user_settings::UserSettingsStore::open()
+            .ok()
+            .map(|store| store.path().to_path_buf());
+    }
     // The setup offers the rule set of the region the system is set to.
     app.wizard.locale = platform::system_locale()
         .map(|port| port.ui_language_candidates())

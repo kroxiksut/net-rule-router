@@ -88,11 +88,10 @@ Dialog {
             ? tr("dialog.drift.row-secondary", "Additional")
             : tr("dialog.drift.row-primary", "Primary")
     }
-    /// A verify rule sits in the secondary bucket but is not routed there yet.
+    /// A `?` rule names its route with the mark after it.
     function _itemRouteLabel(item) {
-        if (item && String(item.action) === "verify-primary")
-            return tr("label.verify-primary", "Primary first, additional if unreachable")
-        return _routeLabel(item ? item.route : "")
+        var label = _routeLabel(item ? item.route : "")
+        return item && String(item.action) === "verify-primary" ? label + " ?" : label
     }
 
     function _textColor() {

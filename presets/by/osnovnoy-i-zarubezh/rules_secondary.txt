@@ -65,10 +65,6 @@ redd.it  # Discord and community platforms
 *.whatsapp.net  # Foreign messengers and communication tools
 *.signal.org  # Foreign messengers and communication tools
 *.signal.me  # Foreign messengers and communication tools
-?*.proton.me  # Foreign messengers and communication tools
-?*.protonmail.com  # Foreign messengers and communication tools
-?*.protonmail.ch  # Foreign messengers and communication tools
-?*.protonvpn.com  # Foreign messengers and communication tools
 *.viber.com  # Foreign messengers and communication tools
 *.viber.me  # Foreign messengers and communication tools
 *.line.me  # Foreign messengers and communication tools
@@ -110,11 +106,6 @@ ai.google.dev  # Google and Microsoft AI entry points
 notebooklm.google.com  # Google and Microsoft AI entry points
 aistudio.google.com  # Google and Microsoft AI entry points
 copilot.microsoft.com  # Google and Microsoft AI entry points
-
-?play.google.com  # Google Play store
-?play-lh.googleusercontent.com  # Google Play store
-?accounts.google.com  # Google sign-in
-?accounts.google.ru  # Google sign-in under the .ru zone
 
 *.jetbrains.com  # JetBrains ecosystem
 *.jb.gg  # JetBrains ecosystem

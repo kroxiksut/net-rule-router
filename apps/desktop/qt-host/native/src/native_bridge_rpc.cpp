@@ -64,6 +64,21 @@ QString NrrNativeBridge::rpcAutoRuleDismissedRestore(const QVariantMap &payload)
                           QJsonObject::fromVariantMap(payload));
 }
 
+QString NrrNativeBridge::rpcVerifyVerdictsList() {
+    return emitRpcRequest(QStringLiteral("rules.verify.verdicts.list"),
+                          QJsonObject());
+}
+
+QString NrrNativeBridge::rpcVerifyVerdictsAccept(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("rules.verify.verdicts.accept"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
+QString NrrNativeBridge::rpcVerifyVerdictsDismiss(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("rules.verify.verdicts.dismiss"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
 QString NrrNativeBridge::rpcBlockNoticeMutesList() {
     return emitRpcRequest(QStringLiteral("block-notices.mutes.list"),
                           QJsonObject());

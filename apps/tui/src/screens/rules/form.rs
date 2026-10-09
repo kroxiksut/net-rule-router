@@ -1,10 +1,13 @@
 //! The add and edit form (the GUI's `RuleEditDialog` and `saveRule`).
 
+use nrr_client_logic::rules_overlaps::overlaps_of_rule;
 use nrr_client_logic::rules_table::{normalize_host_input, RuleRow, RuleType, TargetRoute};
 use nrr_shared::platform_profile::PlatformProfile;
 use nrr_shared::rules_json::FREE_MAX_RULES;
+use nrr_shared::rules_overlap::{find_route_overlaps, OverlapRule, RouteOverlap};
 
 use super::ace;
+use super::apply::book_of;
 use super::table::{Row, Table, Verdict, VerdictStatus};
 
 /// The longest comment an import accepts (`MAX_INLINE_COMMENT_CHARS`).
@@ -27,14 +30,13 @@ pub fn offered_types() -> Vec<RuleType> {
     .collect()
 }
 
-/// Routes a rule of `rule_type` can take: "primary first" only for a name.
-pub fn route_options(rule_type: &RuleType) -> Vec<TargetRoute> {
-    let mut routes = vec![TargetRoute::Primary, TargetRoute::Secondary];
-    if rule_type.allows_verify() {
-        routes.push(TargetRoute::Verify);
-    }
-    routes.push(TargetRoute::Block);
-    routes
+/// The routes a rule can take.
+pub fn route_options() -> [TargetRoute; 3] {
+    [
+        TargetRoute::Primary,
+        TargetRoute::Secondary,
+        TargetRoute::Block,
+    ]
 }
 
 /// The length the GUI's field allows for a type (`matchValueMaxLength`).
@@ -64,15 +66,18 @@ pub enum Field {
     Type,
     Value,
     Route,
+    /// "Unsure — check where it works": the rule's `?`.
+    Verify,
     Comment,
     Enabled,
 }
 
 impl Field {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Type,
         Self::Value,
         Self::Route,
+        Self::Verify,
         Self::Comment,
         Self::Enabled,
     ];
@@ -83,6 +88,18 @@ impl Field {
         Self::ALL[next]
     }
 }
+
+/// A pair the rule in the form would take part in once saved, with each
+/// side's route as the list names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overlap {
+    pub pair: RouteOverlap,
+    pub winner_route: String,
+    pub loser_route: String,
+}
+
+/// What decides the form's overlaps: its type, value, route and switch.
+type OverlapInputs = (RuleType, String, TargetRoute, bool);
 
 /// What a save did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,11 +122,17 @@ pub struct Form {
     pub rule_type: RuleType,
     pub value: String,
     pub route: TargetRoute,
+    /// The `?` as ticked; [`Form::verify_offered`] says whether it applies.
+    pub verify: bool,
     pub comment: String,
     pub enabled: bool,
     pub field: Field,
     /// Set by a save that found the same rule elsewhere.
     pub duplicate: Option<usize>,
+    /// Rules of the other route the rule would overlap, and which one wins.
+    pub overlaps: Vec<Overlap>,
+    /// What `overlaps` was found for; found again only when it changes.
+    overlaps_for: Option<OverlapInputs>,
 }
 
 impl Form {
@@ -119,10 +142,13 @@ impl Form {
             rule_type: RuleType::Domain,
             value: String::new(),
             route: TargetRoute::Primary,
+            verify: false,
             comment: String::new(),
             enabled: true,
             field: Field::Value,
             duplicate: None,
+            overlaps: Vec::new(),
+            overlaps_for: None,
         }
     }
 
@@ -133,10 +159,13 @@ impl Form {
             rule_type: rule.rule_type.clone(),
             value: rule.match_value.clone(),
             route: rule.target_route.clone(),
+            verify: rule.verify,
             comment: rule.comment.clone(),
             enabled: rule.enabled,
             field: Field::Value,
             duplicate: None,
+            overlaps: Vec::new(),
+            overlaps_for: None,
         })
     }
 
@@ -144,8 +173,22 @@ impl Form {
         (!self.value.trim().is_empty()).then(|| Verdict::of(&self.rule_type, &self.value))
     }
 
+    /// "Unsure" fits a domain or one address on a route, never a block.
+    pub fn verify_offered(&self) -> bool {
+        self.rule_type.allows_verify() && self.route != TargetRoute::Block
+    }
+
+    /// The `?` a save writes.
+    fn saved_verify(&self) -> bool {
+        self.verify && self.verify_offered()
+    }
+
+    /// The next field; "Unsure" is passed over while it does not apply.
     pub fn move_field(&mut self, by: isize) {
         self.field = self.field.step(by);
+        if self.field == Field::Verify && !self.verify_offered() {
+            self.field = self.field.step(by.signum());
+        }
     }
 
     /// Left and Right on a choice; `by` is the direction.
@@ -163,7 +206,7 @@ impl Form {
                 }
             }
             Field::Route => {
-                let routes = route_options(&self.rule_type);
+                let routes = route_options();
                 let at = routes.iter().position(|r| *r == self.route);
                 let next = match at {
                     Some(i) => (i as isize + by).rem_euclid(routes.len() as isize) as usize,
@@ -173,16 +216,15 @@ impl Form {
                     self.route = r.clone();
                 }
             }
+            Field::Verify => self.verify = !self.verify,
             Field::Enabled => self.enabled = !self.enabled,
             Field::Value | Field::Comment => {}
         }
         self.duplicate = None;
     }
 
-    /// A type that cannot carry the route moves it to secondary
-    /// (`routeForRuleType`).
+    /// A type that cannot carry `?` keeps it ticked but writes none.
     pub fn set_type(&mut self, rule_type: RuleType) {
-        self.route = self.route.clone().for_rule_type(&rule_type);
         self.rule_type = rule_type;
     }
 
@@ -200,6 +242,7 @@ impl Form {
                     self.comment.push(c);
                 }
             }
+            Field::Verify if c == ' ' => self.verify = !self.verify,
             Field::Enabled if c == ' ' => self.enabled = !self.enabled,
             _ => {}
         }
@@ -241,11 +284,16 @@ impl Form {
                 self.value = line.chars().take(max_len(&self.rule_type)).collect();
             }
             Field::Route => {
-                let routes = route_options(&self.rule_type);
+                let routes = route_options();
                 if let Some(i) = pick(routes.len()) {
                     self.route = routes[i].clone();
                 }
             }
+            Field::Verify => match pick(2) {
+                Some(0) => self.verify = true,
+                Some(_) => self.verify = false,
+                None => {}
+            },
             Field::Comment if !line.is_empty() => {
                 self.comment = line.chars().take(COMMENT_MAX).collect();
             }
@@ -261,6 +309,53 @@ impl Form {
         }
         self.move_field(1);
         false
+    }
+
+    /// Find the pairs the rule would take part in against the rest of the
+    /// list; a keystroke that changes none of their inputs finds nothing new.
+    pub fn refresh_overlaps(&mut self, table: &Table, include_subdomains: bool) {
+        let inputs = (
+            self.rule_type.clone(),
+            self.value.clone(),
+            self.route.clone(),
+            self.enabled,
+        );
+        if self.overlaps_for.as_ref() == Some(&inputs) {
+            return;
+        }
+        self.overlaps_for = Some(inputs);
+        self.overlaps = match self.candidate(table) {
+            Some(candidate) => overlaps_with(table, self.editing, candidate, include_subdomains),
+            None => Vec::new(),
+        };
+    }
+
+    /// The rule a save would write, under the id it would get; `None` while
+    /// the value is refused.
+    fn candidate(&self, table: &Table) -> Option<RuleRow> {
+        let value = normalize_host_input(&self.rule_type, self.value.trim());
+        let refused = Verdict::of(&self.rule_type, &value).status == VerdictStatus::Error;
+        if value.is_empty() || refused {
+            return None;
+        }
+        Some(RuleRow {
+            id: self.saved_id(table),
+            enabled: self.enabled,
+            rule_type: self.rule_type.clone(),
+            match_value: value,
+            target_route: self.route.clone(),
+            verify: self.saved_verify(),
+            comment: String::new(),
+            origin: None,
+        })
+    }
+
+    /// An edited rule keeps its id; an added one takes the next free id.
+    fn saved_id(&self, table: &Table) -> String {
+        match self.editing.and_then(|i| table.rows.get(i)) {
+            Some(row) => row.rule.id.clone(),
+            None => table.next_free_id(),
+        }
     }
 
     /// Write the form into the table (`saveRule`). A URL typed or pasted into
@@ -286,17 +381,14 @@ impl Form {
                 comment = format!("Punycode: {ace}");
             }
         }
-        let id = match self.editing.and_then(|i| table.rows.get(i)) {
-            Some(row) => row.rule.id.clone(),
-            None => table.next_free_id(),
-        };
         // Editing an app-authored rule makes it the user's own.
         let rule = RuleRow {
-            id,
+            id: self.saved_id(table),
             enabled: self.enabled,
             rule_type: self.rule_type.clone(),
             match_value: self.value.clone(),
-            target_route: self.route.clone().for_rule_type(&self.rule_type),
+            target_route: self.route.clone(),
+            verify: self.saved_verify(),
             comment,
             origin: None,
         };
@@ -323,4 +415,36 @@ impl Form {
             }
         }
     }
+}
+
+/// The pairs `candidate` takes part in once it stands in the list: in place of
+/// the edited row, or after the last one.
+fn overlaps_with(
+    table: &Table,
+    editing: Option<usize>,
+    candidate: RuleRow,
+    include_subdomains: bool,
+) -> Vec<Overlap> {
+    let id = candidate.id.clone();
+    let mut rules: Vec<RuleRow> = table.rules().cloned().collect();
+    match editing.filter(|&i| i < rules.len()) {
+        Some(i) => rules[i] = candidate,
+        None => rules.push(candidate),
+    }
+    let pairs = find_route_overlaps(&book_of(&rules), include_subdomains);
+    // Ids are unique across both routes; a block rule rides in the secondary
+    // bucket but is not a route.
+    let route_of = |side: &OverlapRule| -> String {
+        match rules.iter().find(|r| r.id == side.rule_id) {
+            Some(rule) => rule.target_route.as_str().to_owned(),
+            None => side.route.clone(),
+        }
+    };
+    overlaps_of_rule(&pairs, &id)
+        .map(|pair| Overlap {
+            pair: pair.clone(),
+            winner_route: route_of(&pair.winner),
+            loser_route: route_of(&pair.loser),
+        })
+        .collect()
 }

@@ -302,7 +302,7 @@ QtObject {
             root._writePendingOffline(obj)
             root.statusLine = root.tr("status.binding-delivered-after-offline",
                 "The connections you chose are now applied by the background service.")
-        })
+        }, "offline-pending-apply")
     }
 
     /// Clear the two namespaces this controller owns, leaving the rest of the
@@ -379,7 +379,7 @@ QtObject {
                 return changed ? req : null
             }, function(ok) {
                 state.rpDone = true; state.rpOk = ok; settle()
-            })
+            }, "offline-pending-apply")
         }
         if (haveSt) {
             // applyServiceStabilityPatch does its own GET→merge→SET, so sending

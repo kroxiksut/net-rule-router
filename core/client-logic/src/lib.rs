@@ -10,6 +10,10 @@
 //! - [`rules_table`] — table rows, their wire form and the two rules files.
 //! - [`review`] — a rules change's preview, refusal and outcome.
 //! - [`route_policy`] — the full-replacement `route.policy.update` request.
+//! - [`rules_overlaps`] — overlaps the user made on purpose.
+//! - [`rule_sets`] — the user's rule-set folder and the set moving into it.
+//! - [`restore`] — the user's recorded settings brought back to a service
+//!   that lost them.
 //! - [`adapters`] — which adapter may take which route.
 //! - [`auto_rules`] — suggested addresses grouped, filtered and sorted.
 //! - [`conn_trace`] — the connection trace's view filters.
@@ -17,6 +21,8 @@
 //! - [`notice_mutes`] — hiding whole notice kinds for a while.
 //! - [`stability`] — the full-replacement `settings.service-stability.set` row.
 //! - [`units`] — byte counts as people read them.
+//! - [`verify_verdicts`] — the notice for `?` rules that work only on the
+//!   other route.
 
 pub mod adapters;
 pub mod auto_rules;
@@ -25,11 +31,15 @@ pub mod diagnostics;
 mod js;
 pub mod notice_mutes;
 pub mod placeholders;
+pub mod restore;
 pub mod review;
 pub mod route_policy;
+pub mod rule_sets;
+pub mod rules_overlaps;
 pub mod rules_table;
 pub mod stability;
 pub mod units;
+pub mod verify_verdicts;
 
 /// One of the two adapter routes. Also names the rules file that holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

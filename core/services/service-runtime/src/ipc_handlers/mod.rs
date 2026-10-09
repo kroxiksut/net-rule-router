@@ -74,6 +74,7 @@ pub mod snapshot_interfaces;
 pub mod status_updates_poll;
 pub mod status_updates_subscribe;
 pub mod third_party_handlers;
+pub mod verify_verdicts_handlers;
 
 #[cfg(test)]
 pub(crate) mod test_fakes;
@@ -154,6 +155,9 @@ pub use snapshot_interfaces::SnapshotInterfacesHandler;
 pub use status_updates_poll::{StatusUpdatesPollHandler, STATUS_UPDATES_POLL_DEPRECATION_MESSAGE};
 pub use status_updates_subscribe::StatusUpdatesSubscribeHandler;
 pub use stub::UnimplementedHandler;
+pub use verify_verdicts_handlers::{
+    VerifyVerdictsAcceptHandler, VerifyVerdictsDismissHandler, VerifyVerdictsListHandler,
+};
 
 mod deps;
 mod registration;

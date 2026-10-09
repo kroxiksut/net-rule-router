@@ -735,7 +735,7 @@ ColumnLayout {
                 root.statusLine = root.tr("status.policy-toggles-restored",
                     "Your saved routing preferences were restored.")
             }
-        })
+        }, "reseed")
     }
 
     // Read the persisted enforcement mode from the

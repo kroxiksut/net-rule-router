@@ -1311,17 +1311,17 @@ fn map_rule_entry(
     entry: &nrr_domain::review::RuleSummaryEntry,
 ) -> nrr_shared::ipc_payloads::RuleSummaryEntryDto {
     // The same slugs the rules list uses, so the review labels a block and a
-    // `?host` rule the way the table does.
+    // `?` rule the way the table does.
     let route_slug = match (entry.action, entry.route) {
         (nrr_domain::RuleAction::Block, _) => "block",
-        (nrr_domain::RuleAction::VerifyPrimary, _) => "verify",
-        (nrr_domain::RuleAction::Route, nrr_domain::RouteRole::Primary) => "primary",
-        (nrr_domain::RuleAction::Route, nrr_domain::RouteRole::Secondary) => "secondary",
+        (_, nrr_domain::RouteRole::Primary) => "primary",
+        (_, nrr_domain::RouteRole::Secondary) => "secondary",
     };
     nrr_shared::ipc_payloads::RuleSummaryEntryDto {
         id: entry.id.clone(),
         display: entry.display.clone(),
         route: route_slug.to_string(),
+        verify: entry.action == nrr_domain::RuleAction::Verify,
         enabled: entry.enabled,
     }
 }

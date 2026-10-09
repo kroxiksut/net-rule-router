@@ -1,11 +1,13 @@
 //! The read-mostly screens over the service's own records: the connection
-//! trace, the name cache, and diagnostics with the log. Their state lives
+//! trace and what an outage blocked, the name cache, and diagnostics with the
+//! log. Their state lives
 //! here, their IPC runs as backend jobs, and their long lists go a page at a
 //! time in both renderers.
 
 pub mod cache;
 pub mod diagnostics;
 mod keys;
+pub mod outage;
 #[cfg(test)]
 mod tests;
 pub mod trace;
@@ -22,11 +24,12 @@ use crate::i18n::Texts;
 use crate::state::AppState;
 use crate::view::{Segment, ViewLine};
 
-/// The three screens' state, kept while the user is elsewhere so coming back
-/// finds the list, the filters and the place in it.
+/// The screens' state, kept while the user is elsewhere so coming back finds
+/// the list, the filters and the place in it.
 #[derive(Debug, Default)]
 pub struct Inspect {
     pub trace: trace::TraceState,
+    pub outage: outage::OutageState,
     pub cache: cache::CacheState,
     pub diag: diagnostics::DiagState,
 }
@@ -95,15 +98,35 @@ fn wall_clock_seconds(ms: i64) -> String {
 }
 
 fn zoned(ms: i64, format: &str) -> String {
-    let Some(at) = chrono::DateTime::from_timestamp_millis(ms).filter(|_| ms > 0) else {
+    local_time(ms).map_or_else(|| "—".to_owned(), |at| at.format(format).to_string())
+}
+
+/// `HH:MM:SS` for a time today, with the date before it otherwise.
+fn clock_time(ms: i64) -> String {
+    clock_time_at(ms, chrono::Utc::now().timestamp_millis())
+}
+
+fn clock_time_at(ms: i64, now_ms: i64) -> String {
+    let Some(at) = local_time(ms) else {
         return "—".to_owned();
     };
+    let today = local_time(now_ms).map(|now| now.date_naive());
+    let format = if today == Some(at.date_naive()) {
+        "%H:%M:%S"
+    } else {
+        "%Y-%m-%d %H:%M:%S"
+    };
+    at.format(format).to_string()
+}
+
+fn local_time(ms: i64) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let at = chrono::DateTime::from_timestamp_millis(ms).filter(|_| ms > 0)?;
     // Snapshots must not depend on the zone of the machine running them.
     #[cfg(test)]
-    let at = at.with_timezone(&chrono::Utc);
+    let at = at.fixed_offset();
     #[cfg(not(test))]
-    let at = at.with_timezone(&chrono::Local);
-    at.format(format).to_string()
+    let at = at.with_timezone(&chrono::Local).fixed_offset();
+    Some(at)
 }
 
 /// Where the reader is in a list.

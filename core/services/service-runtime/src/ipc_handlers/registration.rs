@@ -429,6 +429,27 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, UnimplementedHandler::new(op));
                 }
             },
+            // The outage list rides the trace ring and its gates, so it is
+            // wired wherever the trace is.
+            IpcOperationName::ConnTraceOutageBlocksList => match deps.conn_trace_ring.clone() {
+                Some(ring) => {
+                    let handler = diagnostics_handlers::ConnTraceOutageBlocksListHandler::new(ring);
+                    let handler = match deps.service_stability_provider.clone() {
+                        Some(settings) => handler.with_gui_stream_gate(settings),
+                        None => handler,
+                    };
+                    let handler = match deps.conn_trace_expectation.clone() {
+                        Some((rules, fqdn, active_sid)) => {
+                            handler.with_route_expectation(rules, fqdn, active_sid)
+                        }
+                        None => handler,
+                    };
+                    registry.register(op, handler);
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
             // Attribution + integrity of shipped
             // third-party components. Always a real handler: without an
             // inspector it reports the attribution-only assets and no
@@ -587,6 +608,30 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::AutoRuleDismissedList => match deps.auto_rules.clone() {
                 Some(engine) => {
                     registry.register(op, AutoRuleDismissedListHandler::new(engine));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::VerifyVerdictsList => match deps.auto_rules.clone() {
+                Some(engine) => {
+                    registry.register(op, VerifyVerdictsListHandler::new(engine));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::VerifyVerdictsAccept => match deps.auto_rules.clone() {
+                Some(engine) => {
+                    registry.register(op, VerifyVerdictsAcceptHandler::new(engine));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::VerifyVerdictsDismiss => match deps.auto_rules.clone() {
+                Some(engine) => {
+                    registry.register(op, VerifyVerdictsDismissHandler::new(engine));
                 }
                 None => {
                     registry.register(op, UnimplementedHandler::new(op));

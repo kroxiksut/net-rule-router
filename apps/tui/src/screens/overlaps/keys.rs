@@ -73,10 +73,6 @@ pub const BLOCK_NOTE: Key = key(
     "rules.overlaps.block-note",
     "A block rule is part of this pair; change it in the rules list.",
 );
-pub const VERIFY_NOTE: Key = key(
-    "rules.overlaps.verify-note",
-    "A rule that tries the primary route first is part of this pair; change it in the rules list.",
-);
 
 pub const CONFLICTS_TITLE: Key = key(
     "rules.overlaps.conflicts.title",
@@ -110,10 +106,6 @@ pub const CONFLICT_MORE: Key = key(
 pub const ROUTE_PRIMARY: Key = key("label.primary", "Primary");
 pub const ROUTE_SECONDARY: Key = key("label.secondary", "Additional");
 pub const ROUTE_BLOCK: Key = key("label.block", "Block");
-pub const ROUTE_VERIFY: Key = key(
-    "label.verify-primary",
-    "Primary first, additional if unreachable",
-);
 pub const TYPE_DOMAIN: Key = key("rules.type.domain", "Domain");
 pub const TYPE_ZONE: Key = key("rules.type.zone", "Zone");
 pub const TYPE_EXACT_IP: Key = key("rules.type.exact-ip", "Exact IP");
@@ -144,6 +136,10 @@ pub const CANNOT_SEND: Key = key(
 pub const GONE: Key = key(
     "tui.overlaps.gone",
     "The rules of item {n} changed in the meantime; nothing was sent.",
+);
+pub const LOCKED: Key = key(
+    "tui.rules.busy",
+    "Wait until the rules are applied; the list cannot change meanwhile.",
 );
 
 pub const HELP_KEYS: &[Key] = &[
@@ -220,7 +216,6 @@ pub fn all() -> Vec<Key> {
         SEND_OVER,
         SEND_OVER_WHOLE,
         BLOCK_NOTE,
-        VERIFY_NOTE,
         CONFLICTS_TITLE,
         CONFLICTS_HINT,
         CONFLICT_LITERAL_BLOCK,
@@ -231,7 +226,6 @@ pub fn all() -> Vec<Key> {
         ROUTE_PRIMARY,
         ROUTE_SECONDARY,
         ROUTE_BLOCK,
-        ROUTE_VERIFY,
         TYPE_DOMAIN,
         TYPE_ZONE,
         TYPE_EXACT_IP,
@@ -244,6 +238,7 @@ pub fn all() -> Vec<Key> {
         NO_ITEM,
         CANNOT_SEND,
         GONE,
+        LOCKED,
     ];
     keys.extend_from_slice(HELP_KEYS);
     keys.extend_from_slice(PLAIN_KEYS);

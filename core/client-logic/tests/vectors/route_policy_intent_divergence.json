@@ -1,0 +1,205 @@
+{
+  "description": "pure.js routePolicyIntentDivergence",
+  "cases": [
+    {
+      "name": "nothing recorded",
+      "input": {
+        "intent": {},
+        "service": {
+          "kill-switch-enabled": true
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "a wiped service answers with its defaults",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true
+        },
+        "service": {}
+      },
+      "expected": [
+        "kill-switch-enabled"
+      ]
+    },
+    {
+      "name": "the same value",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true
+        },
+        "service": {
+          "kill-switch-enabled": true
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "a number recorded as text is the same number",
+      "input": {
+        "intent": {
+          "primary-probe-timeout-ms": "2000"
+        },
+        "service": {
+          "primary-probe-timeout-ms": 2000
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "a number the service lost",
+      "input": {
+        "intent": {
+          "primary-probe-timeout-ms": "2000"
+        },
+        "service": {}
+      },
+      "expected": [
+        "primary-probe-timeout-ms"
+      ]
+    },
+    {
+      "name": "a switch turned off against the default on",
+      "input": {
+        "intent": {
+          "include-subdomains": false
+        },
+        "service": {}
+      },
+      "expected": [
+        "include-subdomains"
+      ]
+    },
+    {
+      "name": "a binding the service does not hold",
+      "input": {
+        "intent": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "service": {}
+      },
+      "expected": [
+        "secondary"
+      ]
+    },
+    {
+      "name": "the same binding",
+      "input": {
+        "intent": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "service": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Other name",
+            "user-confirmed": false
+          }
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "a binding the service re-matched to a new id",
+      "input": {
+        "intent": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "service": {
+          "secondary": {
+            "stable-id": "B2",
+            "display-name": "Tunnel",
+            "user-confirmed": true,
+            "known-stable-ids": [
+              "B"
+            ]
+          }
+        }
+      },
+      "expected": []
+    },
+    {
+      "name": "another adapter bound",
+      "input": {
+        "intent": {
+          "primary": {
+            "stable-id": "A",
+            "display-name": "Ethernet",
+            "user-confirmed": true
+          }
+        },
+        "service": {
+          "primary": {
+            "stable-id": "C",
+            "display-name": "Wi-Fi",
+            "user-confirmed": true
+          }
+        }
+      },
+      "expected": [
+        "primary"
+      ]
+    },
+    {
+      "name": "a key this build has no field for",
+      "input": {
+        "intent": {
+          "future-field": true
+        },
+        "service": {}
+      },
+      "expected": []
+    },
+    {
+      "name": "a binding with no id",
+      "input": {
+        "intent": {
+          "primary": {
+            "stable-id": "",
+            "display-name": "x"
+          }
+        },
+        "service": {}
+      },
+      "expected": []
+    },
+    {
+      "name": "an empty mode is the default mode",
+      "input": {
+        "intent": {
+          "mode": ""
+        },
+        "service": {}
+      },
+      "expected": []
+    },
+    {
+      "name": "several keys come back sorted",
+      "input": {
+        "intent": {
+          "mode": "strict-secondary-fail-closed",
+          "doh-lockdown-enabled": true,
+          "auto-rules-mode": "off"
+        },
+        "service": {}
+      },
+      "expected": [
+        "auto-rules-mode",
+        "doh-lockdown-enabled",
+        "mode"
+      ]
+    }
+  ]
+}

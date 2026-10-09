@@ -20,6 +20,8 @@ Connections:
   Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
 Notifications:
   No notifications.
+Commands on this screen:
+  r: restore your settings to a service that lost them
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -36,6 +38,7 @@ Commands on this screen:
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+  o: what was blocked while the additional route was down
 Type a screen number, h for help or q to quit, then press Enter.
 Connection trace: Shown: 12 of 14.
 Connections: > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
@@ -89,6 +92,7 @@ Commands on this screen:
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+  o: what was blocked while the additional route was down
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -115,6 +119,7 @@ Commands on this screen:
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+  o: what was blocked while the additional route was down
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -149,6 +154,7 @@ Commands on this screen:
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+  o: what was blocked while the additional route was down
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -183,6 +189,7 @@ Commands on this screen:
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+  o: what was blocked while the additional route was down
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Diagnostics and logs

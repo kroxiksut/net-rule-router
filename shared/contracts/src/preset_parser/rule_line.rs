@@ -145,9 +145,11 @@ pub(super) fn parse_rule_line(
     // not misread as multi-word free text. Kept in lockstep with the domain
     // parser in `nrr_domain::rules_file::extract_rule_flags`.
     let (match_value, blocked) = extract_block_flag(match_value);
-    // `?` is read where values are host names; elsewhere it stays part of the
-    // value for validation to judge. Same reading as `nrr_domain::rules_file`.
-    let (match_value, verify_primary) = if rule_type == ParsedRuleType::Domain {
+    // `?` is read where values are host names or single addresses; elsewhere
+    // it stays part of the value for validation to judge. Same reading as
+    // `nrr_domain::rules_file`.
+    let reads_verify = matches!(rule_type, ParsedRuleType::Domain | ParsedRuleType::ExactIp);
+    let (match_value, verify_primary) = if reads_verify {
         let (rest, verify) = split_verify_primary(&match_value);
         if verify {
             (rest.to_string(), true)
@@ -171,8 +173,8 @@ pub(super) fn parse_rule_line(
         true
     };
 
-    // "Try the primary route first" and "drop it" contradict each other; the
-    // line is refused rather than one of them guessed.
+    // "Check where it works" and "drop it" contradict each other; the line is
+    // refused rather than one of them guessed.
     if verify_primary && blocked {
         return None;
     }
@@ -230,12 +232,12 @@ pub(super) fn extract_block_flag(value: &str) -> (String, bool) {
     (kept.join(" "), blocked)
 }
 
-/// Prefix that marks a domain rule "try the primary route first"
-/// (docs/en/rules-file-format.md Verify the main route first). It sits right
-/// before the value, after a `# ` disable prefix: `# ?example.com`.
+/// Prefix that marks a domain or exact-IP rule "check where it works"
+/// (docs/en/rules-file-format.md Check where it works). It sits right before
+/// the value, after a `# ` disable prefix: `# ?example.com`.
 pub const VERIFY_PRIMARY_PREFIX: char = '?';
 
-/// Splits the `?` prefix off a host-name value: `?example.com` reads as
+/// Splits the `?` prefix off a value: `?example.com` reads as
 /// `("example.com", true)`. A bare `?` or `? example.com` is not the prefix and
 /// stays in the value, for validation to refuse. One reading for both parsers.
 #[must_use]

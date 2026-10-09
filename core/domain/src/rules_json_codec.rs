@@ -56,7 +56,7 @@ use crate::rules_revision::{
 };
 use crate::validation::{
     canonical_app_pattern, canonical_host_name, canonical_ip_address, canonical_ip_range,
-    canonical_subnet, HostNameKind, ValidationError,
+    canonical_subnet, settle_verify, HostNameKind, ValidationError,
 };
 use crate::RuleId;
 use nrr_shared::app_identity::ExecutableNaming;
@@ -201,7 +201,7 @@ fn encode_action(action: crate::canonical::RuleAction) -> WireRuleAction {
     match action {
         crate::canonical::RuleAction::Route => WireRuleAction::Route,
         crate::canonical::RuleAction::Block => WireRuleAction::Block,
-        crate::canonical::RuleAction::VerifyPrimary => WireRuleAction::VerifyPrimary,
+        crate::canonical::RuleAction::Verify => WireRuleAction::VerifyPrimary,
     }
 }
 
@@ -211,7 +211,7 @@ fn decode_action(action: WireRuleAction) -> Option<crate::canonical::RuleAction>
     match action {
         WireRuleAction::Route => Some(crate::canonical::RuleAction::Route),
         WireRuleAction::Block => Some(crate::canonical::RuleAction::Block),
-        WireRuleAction::VerifyPrimary => Some(crate::canonical::RuleAction::VerifyPrimary),
+        WireRuleAction::VerifyPrimary => Some(crate::canonical::RuleAction::Verify),
         WireRuleAction::Unrecognized(_) => None,
     }
 }
@@ -290,7 +290,8 @@ pub fn decode(
 }
 
 /// The route's rules this build reads; the rest go to `kept`, sorted by id so
-/// the re-encoded bytes do not depend on arrival order.
+/// the re-encoded bytes do not depend on arrival order. A `?` that means
+/// nothing where it stands is settled as the rules file settles it.
 fn decode_route(
     rules: Vec<RuleDto>,
     naming: ExecutableNaming,
@@ -299,7 +300,9 @@ fn decode_route(
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
         if !rule.is_unrecognized() {
-            out.push(decode_rule(rule, naming)?);
+            let mut decoded = decode_rule(rule, naming)?;
+            settle_verify(&mut decoded);
+            out.push(decoded);
             continue;
         }
         if rule
@@ -1229,15 +1232,48 @@ mod tests {
     /// A build that predates `?` cannot read the action, so a book holding one
     /// says so; the same book without it keeps its older number.
     #[test]
-    fn a_verify_primary_rule_needs_schema_three() {
+    fn a_verify_rule_needs_schema_three() {
         let verify = CanonicalRule {
-            action: crate::canonical::RuleAction::VerifyPrimary,
+            action: crate::canonical::RuleAction::Verify,
             ..suffix("r-v", "mail.example")
         };
         let content = RulesRevisionContent::new(book(vec![], vec![verify]));
         assert_eq!(encode(&content).schema_version, 3);
         let plain = RulesRevisionContent::new(book(vec![], vec![suffix("r-v", "mail.example")]));
         assert_eq!(encode(&plain).schema_version, 1);
+    }
+
+    /// The wire and the rules file give `?` one meaning: on a domain or an
+    /// exact IP it holds in either set; on an application it is a plain route.
+    #[test]
+    fn a_question_mark_that_means_nothing_where_it_stands_decodes_as_a_route() {
+        let verify = |rule: CanonicalRule| CanonicalRule {
+            action: crate::canonical::RuleAction::Verify,
+            ..rule
+        };
+        let mut wire = encode(&RulesRevisionContent::new(book(
+            vec![verify(suffix("r-p", "mail.example"))],
+            vec![
+                verify(suffix("r-s", "mail.example")),
+                verify(ip("r-ip", Ipv4Addr::new(192, 0, 2, 7))),
+                verify(app_exact("r-app", "foo.exe", false)),
+            ],
+        )));
+        wire.schema_version = RULES_JSON_SCHEMA_VERSION;
+        let decoded = decode(wire, HostPlatform::Windows).expect("decodes");
+        let action_of = |set: &CanonicalRuleSet, id: &str| {
+            set.rules()
+                .iter()
+                .find(|r| r.id.0 == id)
+                .map(|r| r.action)
+                .expect("rule kept")
+        };
+        let book = &decoded.rule_book;
+        use crate::canonical::RuleAction::{Route, Verify};
+        assert_eq!(action_of(&book.primary, "r-p"), Verify);
+        assert_eq!(action_of(&book.secondary, "r-s"), Verify);
+        assert_eq!(action_of(&book.secondary, "r-ip"), Verify);
+        assert_eq!(action_of(&book.secondary, "r-app"), Route);
     }
 
     #[test]

@@ -265,6 +265,9 @@ impl ConnectionObservationConsumer {
     /// Wire the trace ring so resolved connections are
     /// retained for the Diagnostics panel. Without it the observer is log-only.
     pub fn with_trace_ring(mut self, ring: Arc<ConnectionTraceRing>) -> Self {
+        // This consumer attributes drops, so the outage list behind the ring
+        // can fill.
+        ring.outage_blocks().mark_fed();
         self.trace_ring = Some(ring);
         self
     }

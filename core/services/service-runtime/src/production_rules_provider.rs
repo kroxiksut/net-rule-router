@@ -25,8 +25,9 @@
 //!    default mode.
 //!
 //! Steps 2–4 run once per source: each read checks only the source's identity
-//! (overlay blob or active revision id + hash) and the subdomain flag, and
-//! serves the kept decode while they are unchanged.
+//! (overlay blob or active revision id + hash), the subdomain flag and the
+//! principal's check verdicts, and serves the kept decode while they are
+//! unchanged.
 //!
 //! ## Error handling
 //!
@@ -69,6 +70,8 @@ pub struct ProductionRulesProvider {
 struct ReadKey {
     source: Source,
     include_subdomains: bool,
+    /// Generation of the principal's check verdicts (`verify_overlay`).
+    verify_generation: u64,
 }
 
 #[derive(Clone)]
@@ -117,7 +120,9 @@ impl PartialEq for Source {
 
 impl PartialEq for ReadKey {
     fn eq(&self, other: &Self) -> bool {
-        self.source == other.source && self.include_subdomains == other.include_subdomains
+        self.source == other.source
+            && self.include_subdomains == other.include_subdomains
+            && self.verify_generation == other.verify_generation
     }
 }
 
@@ -181,12 +186,14 @@ impl ProductionRulesProvider {
             },
             Ok(None) | Err(()) => return None,
         };
-        // Subdomain coverage is read for the CALLING principal even when the
-        // rules read through to the baseline.
+        // Subdomain coverage and check verdicts are the CALLING principal's
+        // even when the rules read through to the baseline.
+        let verify = for_enforcement.then(|| crate::verify_overlay::moved_for(principal));
         let key = ReadKey {
             source,
             include_subdomains: for_enforcement
                 && Self::reads_include_subdomains(&guard, principal),
+            verify_generation: verify.as_ref().map_or(0, |(generation, _)| *generation),
         };
         let mut decoded = self.decoded.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(hit) = decoded
@@ -214,6 +221,7 @@ impl ProductionRulesProvider {
                             content_hash: record.content_hash.clone(),
                         },
                         include_subdomains: key.include_subdomains,
+                        verify_generation: key.verify_generation,
                     },
                     Self::snapshot_from_record(&record),
                 ),
@@ -228,10 +236,10 @@ impl ProductionRulesProvider {
         // NEVER the stored/hashed rule book the drift detector hashes bare; a
         // storage error reads as OFF (the narrow book, never a guess).
         let snapshot = bare.map(|mut s| {
-            // `?host` rules route via the main link until verified; before the
-            // widening, so a twin lands in the same set as its rule.
-            if for_enforcement {
-                s.rule_book = s.rule_book.with_verify_primary_effective();
+            // `?` rules are routes of their own set, or of the other one under
+            // a verdict; before the widening, so a twin lands with its rule.
+            if let Some((_, moved)) = verify.as_ref() {
+                s.rule_book = s.rule_book.with_verify_effective(moved);
             }
             if key.include_subdomains {
                 s.rule_book = s.rule_book.with_subdomain_coverage();
@@ -874,11 +882,11 @@ mod tests {
         );
     }
 
-    /// `?host` routes via the main link until verified: enforcement reads it as
-    /// a primary Route, a writer reads it as stored.
+    /// A `?` rule is a route of its own set; a live verdict moves it to the
+    /// other one for enforcement only, and a writer reads it as stored.
     #[test]
-    fn a_verify_primary_rule_is_primary_for_enforcement_and_untouched_for_writers() {
-        use nrr_domain::RuleAction;
+    fn a_verify_rule_follows_its_verdict_for_enforcement_and_is_untouched_for_writers() {
+        use nrr_domain::{RuleAction, RuleId};
         use nrr_shared::rules_json::{
             AddressMatchDto, CanonicalRulesJsonV1, RuleDto, RULES_JSON_SCHEMA_VERSION,
         };
@@ -898,28 +906,41 @@ mod tests {
             }],
         };
         let json = rules_json::to_canonical_string(&dto).expect("serialise");
-        let sid = "S-1-5-21-verify";
+        // Own principal: the verdict registry is process-wide.
+        let sid = "S-1-5-21-provider-verify";
         let conn = make_state_conn();
         insert_active_revision_for(&conn, sid, &json);
         let provider = ProductionRulesProvider::new(Arc::clone(&conn));
 
         let enforced = provider.active_rules_for(sid).expect("rules present");
-        assert!(enforced.rule_book.secondary.is_empty());
+        assert!(enforced.rule_book.primary.is_empty());
+        assert!(!enforced.rule_book.secondary.is_empty());
         assert!(enforced
             .rule_book
-            .primary
+            .secondary
             .rules()
             .iter()
             .all(|r| r.action == RuleAction::Route));
-        assert!(!enforced.rule_book.primary.is_empty());
+
+        // A verdict moves it; the cached decode does not hide the change.
+        crate::verify_overlay::set(sid, [RuleId("r-verify".into())].into_iter().collect());
+        let moved = provider.active_rules_for(sid).expect("rules present");
+        assert!(moved.rule_book.secondary.is_empty());
+        assert!(!moved.rule_book.primary.is_empty());
 
         let stored = provider.stored_rules_for(sid).expect("rules present");
         assert!(stored.rule_book.primary.is_empty());
         assert_eq!(stored.rule_book.secondary.len(), 1);
         assert_eq!(
             stored.rule_book.secondary.rules()[0].action,
-            RuleAction::VerifyPrimary
+            RuleAction::Verify
         );
+
+        // Dropped: back where it is written.
+        crate::verify_overlay::set(sid, std::collections::BTreeSet::new());
+        let back = provider.active_rules_for(sid).expect("rules present");
+        assert!(back.rule_book.primary.is_empty());
+        assert!(!back.rule_book.secondary.is_empty());
     }
 
     /// Insert an active revision under an arbitrary principal.

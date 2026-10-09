@@ -22,7 +22,7 @@ pub enum Words {
     Key(Key),
     Fill(Key, Vec<(&'static str, String)>),
     /// A key whose placeholders are themselves words.
-    FillWords(Key, Vec<(&'static str, Words)>),
+    Nested(Key, Vec<(&'static str, Words)>),
     /// A key named by a service slug, with the slug as its fallback.
     Dynamic(String),
     Raw(String),
@@ -36,7 +36,7 @@ impl Words {
         match self {
             Self::Key(key) => texts.get(*key),
             Self::Fill(key, values) => texts.fill(*key, values),
-            Self::FillWords(key, values) => {
+            Self::Nested(key, values) => {
                 let resolved: Vec<(&str, String)> = values
                     .iter()
                     .map(|(name, words)| (*name, words.resolve(texts)))
@@ -299,7 +299,10 @@ pub fn kind_scope(kind: &str) -> BlockNoticeMuteScopeDto {
 /// The table's row for block notices as a class.
 pub const BLOCK_NOTICES: &str = "block-notices";
 
-pub fn kind_mute<'a>(mutes: &'a [BlockNoticeMuteDto], kind: &str) -> Option<&'a BlockNoticeMuteDto> {
+pub fn kind_mute<'a>(
+    mutes: &'a [BlockNoticeMuteDto],
+    kind: &str,
+) -> Option<&'a BlockNoticeMuteDto> {
     let scope = kind_scope(kind);
     mutes.iter().find(|m| m.scope == scope)
 }
@@ -334,7 +337,7 @@ fn scope_words(scope: &BlockNoticeMuteScopeDto) -> Words {
             Words::Fill(t::MUTE_APP, vec![("name", app.clone())])
         }
         // The reason's own words are a key named after the slug.
-        BlockNoticeMuteScopeDto::Reason { reason } => Words::FillWords(
+        BlockNoticeMuteScopeDto::Reason { reason } => Words::Nested(
             t::MUTE_REASON,
             vec![("name", Words::Dynamic(format!("block-reason.{reason}")))],
         ),
@@ -347,7 +350,10 @@ fn scope_words(scope: &BlockNoticeMuteScopeDto) -> Words {
 fn notifications(app: &AppState) -> Vec<Item> {
     let s = &app.settings;
     let clock = s.clock;
-    let mut v = vec![heading(t::HIDDEN_HEADING), info(Words::Key(t::HIDDEN_DESCRIPTION))];
+    let mut v = vec![
+        heading(t::HIDDEN_HEADING),
+        info(Words::Key(t::HIDDEN_DESCRIPTION)),
+    ];
     let mutes = match &s.data.mutes {
         Loadable::Ready(mutes) => Some(mutes.as_slice()),
         other => {
@@ -360,24 +366,25 @@ fn notifications(app: &AppState) -> Vec<Item> {
             .supports
             .block_notices
             .then_some((BLOCK_NOTICES, Words::Key(t::MUTE_ALL)));
-        let kinds = block_row.into_iter().chain(MUTABLE_NOTICE_KINDS.iter().map(|k| {
-            (
-                k.slug,
-                Words::Key(Key {
-                    id: k.title_key,
-                    en: k.title_en,
-                }),
-            )
-        }));
+        let kinds = block_row
+            .into_iter()
+            .chain(MUTABLE_NOTICE_KINDS.iter().map(|k| {
+                (
+                    k.slug,
+                    Words::Key(Key {
+                        id: k.title_key,
+                        en: k.title_en,
+                    }),
+                )
+            }));
         for (kind, title) in kinds {
             let state = match kind_mute(mutes, kind) {
                 None => Words::Key(t::HIDDEN_SHOWN),
                 Some(mute) => match until_ms(mute) {
                     None => Words::Key(t::HIDDEN_FOREVER),
-                    Some(until) => Words::Fill(
-                        t::HIDDEN_UNTIL,
-                        vec![("timestamp", clock.format(until))],
-                    ),
+                    Some(until) => {
+                        Words::Fill(t::HIDDEN_UNTIL, vec![("timestamp", clock.format(until))])
+                    }
                 },
             };
             v.push(
@@ -558,7 +565,9 @@ fn routing(app: &AppState) -> Vec<Item> {
     if !s.supports.kill_switch {
         v.push(info(Words::Key(t::UNSUPPORTED)));
     } else {
-        v.push(policy_toggle(policy, "kill-switch-enabled", t::LEAK_ENABLE).note(t::LEAK_ENABLE_NOTE));
+        v.push(
+            policy_toggle(policy, "kill-switch-enabled", t::LEAK_ENABLE).note(t::LEAK_ENABLE_NOTE),
+        );
         let enabled = policy_bool(policy, "kill-switch-enabled");
         let fail_closed = policy_bool(policy, "kill-switch-fail-closed");
         if enabled {
@@ -566,8 +575,15 @@ fn routing(app: &AppState) -> Vec<Item> {
                 choice(
                     ItemId::Policy("kill-switch-fail-closed"),
                     t::FAILURE_MODE,
-                    vec![opt("fail-closed", t::FAIL_CLOSED), opt("fail-open", t::FAIL_OPEN)],
-                    if fail_closed { "fail-closed" } else { "fail-open" },
+                    vec![
+                        opt("fail-closed", t::FAIL_CLOSED),
+                        opt("fail-open", t::FAIL_OPEN),
+                    ],
+                    if fail_closed {
+                        "fail-closed"
+                    } else {
+                        "fail-open"
+                    },
                 )
                 .note(if fail_closed {
                     t::FAIL_CLOSED_NOTE
@@ -579,9 +595,16 @@ fn routing(app: &AppState) -> Vec<Item> {
                 v.push(heading(t::PROTOCOLS));
                 let mask = policy_int(policy, route_policy::KILL_SWITCH_PROTOCOLS_KEY).unwrap_or(0);
                 for (bit, label) in PROTOCOLS {
-                    v.push(toggle(ItemId::Protocol(bit), label, mask & i64::from(bit) != 0));
+                    v.push(toggle(
+                        ItemId::Protocol(bit),
+                        label,
+                        mask & i64::from(bit) != 0,
+                    ));
                 }
-                v.push(policy_toggle(policy, "kill-switch-block-all", t::BLOCK_ALL).note(t::BLOCK_ALL_NOTE));
+                v.push(
+                    policy_toggle(policy, "kill-switch-block-all", t::BLOCK_ALL)
+                        .note(t::BLOCK_ALL_NOTE),
+                );
                 if policy_bool(policy, "kill-switch-block-all") {
                     v.push(
                         policy_toggle(policy, "allow-dns-over-primary", t::ALLOW_DNS)
@@ -620,8 +643,16 @@ fn routing(app: &AppState) -> Vec<Item> {
                         if resolver {
                             v.push(stability_toggle(config, "fake-ip-enabled", t::FAKE_IP));
                         }
-                        v.push(stability_toggle(config, "fake-ip-udp-relay", t::FAKE_IP_UDP));
-                        v.push(stability_toggle(config, "fake-ip-instant-rst", t::FAKE_IP_RST));
+                        v.push(stability_toggle(
+                            config,
+                            "fake-ip-udp-relay",
+                            t::FAKE_IP_UDP,
+                        ));
+                        v.push(stability_toggle(
+                            config,
+                            "fake-ip-instant-rst",
+                            t::FAKE_IP_RST,
+                        ));
                         if fail_closed {
                             let key = "secondary-liveness-window-secs";
                             let secs = stability::effective(config, key).and_then(|v| v.as_i64());
@@ -635,10 +666,9 @@ fn routing(app: &AppState) -> Vec<Item> {
                             .note(t::LIVENESS_RANGE);
                             item.shown = Some(match secs {
                                 Some(0) | None => Words::Key(t::LIVENESS_DISABLED),
-                                Some(n) => Words::Join(vec![
-                                    raw(format!("{n} ")),
-                                    Words::Key(t::SECONDS),
-                                ]),
+                                Some(n) => {
+                                    Words::Join(vec![raw(format!("{n} ")), Words::Key(t::SECONDS)])
+                                }
                             });
                             v.push(item);
                         }
@@ -663,10 +693,18 @@ fn routing(app: &AppState) -> Vec<Item> {
         ));
     }
     v.push(heading(t::HOSTS_TITLE));
-    v.push(policy_toggle(policy, "resolve-hosts-bypass", t::HOSTS_BYPASS));
+    v.push(policy_toggle(
+        policy,
+        "resolve-hosts-bypass",
+        t::HOSTS_BYPASS,
+    ));
     if s.supports.local_network_exceptions {
         v.push(heading(t::LOCAL_TITLE));
-        v.push(policy_toggle(policy, "local-networks-auto-accept", t::LOCAL_AUTO));
+        v.push(policy_toggle(
+            policy,
+            "local-networks-auto-accept",
+            t::LOCAL_AUTO,
+        ));
     }
     v.push(heading(t::SHORT_TITLE));
     v.push(
@@ -706,14 +744,26 @@ fn routing(app: &AppState) -> Vec<Item> {
         &auto_mode,
     ));
     if auto_mode != "off" {
-        v.push(policy_toggle(policy, "auto-rules-eager-delivery-names", t::AUTO_EAGER));
+        v.push(policy_toggle(
+            policy,
+            "auto-rules-eager-delivery-names",
+            t::AUTO_EAGER,
+        ));
     }
     if s.supports.service_stability_config {
         v.push(heading(t::SYSTEM_TITLE));
         match stability_row {
             Ok(config) => {
-                v.push(toggle(ItemId::RuleLock, t::RULE_LOCK, rule_edits_allowed(config)));
-                v.push(stability_toggle(config, "rule-scope-service-driven", t::SERVICE_DRIVEN));
+                v.push(toggle(
+                    ItemId::RuleLock,
+                    t::RULE_LOCK,
+                    rule_edits_allowed(config),
+                ));
+                v.push(stability_toggle(
+                    config,
+                    "rule-scope-service-driven",
+                    t::SERVICE_DRIVEN,
+                ));
                 v.push(toggle(
                     ItemId::StopPersist,
                     t::STOP_PERSIST,
@@ -781,7 +831,11 @@ pub fn run_state_word(state: ServiceRunState) -> (Key, StateTone) {
 }
 
 fn state_line(word: Key, tone: StateTone) -> Item {
-    Item::new(ItemId::None, Words::Key(word), Kind::State(tone, t::SERVICE_STATE))
+    Item::new(
+        ItemId::None,
+        Words::Key(word),
+        Kind::State(tone, t::SERVICE_STATE),
+    )
 }
 
 fn service(app: &AppState) -> Vec<Item> {
@@ -803,13 +857,15 @@ fn service(app: &AppState) -> Vec<Item> {
                     ServiceStartMode::WithWindows => t::MODE_WITH_SYSTEM,
                     ServiceStartMode::OnAppLaunch => t::MODE_ON_LAUNCH,
                 };
-                v.push(info(Words::FillWords(
+                v.push(info(Words::Nested(
                     t::SERVICE_START_MODE,
                     vec![("mode", Words::Key(mode))],
                 )));
             }
             match report.run_state {
-                ServiceRunState::Stopped => v.push(action(ItemId::ServiceStart, t::SERVICE_START, false)),
+                ServiceRunState::Stopped => {
+                    v.push(action(ItemId::ServiceStart, t::SERVICE_START, false))
+                }
                 ServiceRunState::Running => {
                     v.push(action(ItemId::ServiceStop, t::SERVICE_STOP, true));
                     v.push(action(ItemId::ServiceRestart, t::SERVICE_RESTART, true));
@@ -883,8 +939,12 @@ fn logs(app: &AppState) -> Vec<Item> {
     let mut v = vec![heading(t::RETENTION_TITLE)];
     match &s.data.log_retention {
         Loadable::Ready(r) => {
-            let days = |label: Key| Words::Join(vec![Words::Key(label), raw(", "), Words::Key(t::DAYS_UNIT)]);
-            let mb = |label: Key| Words::Join(vec![Words::Key(label), raw(", "), Words::Key(t::MB_UNIT)]);
+            let days = |label: Key| {
+                Words::Join(vec![Words::Key(label), raw(", "), Words::Key(t::DAYS_UNIT)])
+            };
+            let mb = |label: Key| {
+                Words::Join(vec![Words::Key(label), raw(", "), Words::Key(t::MB_UNIT)])
+            };
             v.push(number(
                 ItemId::LogRetention(LogField::LogsAge),
                 days(t::LOGS_AGE),
@@ -998,11 +1058,41 @@ fn logs(app: &AppState) -> Vec<Item> {
     match &s.data.retention {
         Loadable::Ready(r) => {
             for (field, label, value, min, max) in [
-                (RevisionField::SupersededDays, t::SUPERSEDED_DAYS, r.superseded_days, 7, 365),
-                (RevisionField::SupersededCount, t::SUPERSEDED_COUNT, r.superseded_count_cap, 20, 1000),
-                (RevisionField::RejectedDays, t::REJECTED_DAYS, r.rejected_days, 1, 90),
-                (RevisionField::RolledbackDays, t::ROLLEDBACK_DAYS, r.rolledback_days, 1, 90),
-                (RevisionField::RolledbackCount, t::ROLLEDBACK_COUNT, r.rolledback_count_cap, 5, 100),
+                (
+                    RevisionField::SupersededDays,
+                    t::SUPERSEDED_DAYS,
+                    r.superseded_days,
+                    7,
+                    365,
+                ),
+                (
+                    RevisionField::SupersededCount,
+                    t::SUPERSEDED_COUNT,
+                    r.superseded_count_cap,
+                    20,
+                    1000,
+                ),
+                (
+                    RevisionField::RejectedDays,
+                    t::REJECTED_DAYS,
+                    r.rejected_days,
+                    1,
+                    90,
+                ),
+                (
+                    RevisionField::RolledbackDays,
+                    t::ROLLEDBACK_DAYS,
+                    r.rolledback_days,
+                    1,
+                    90,
+                ),
+                (
+                    RevisionField::RolledbackCount,
+                    t::ROLLEDBACK_COUNT,
+                    r.rolledback_count_cap,
+                    5,
+                    100,
+                ),
             ] {
                 v.push(number(
                     ItemId::Revisions(field),
@@ -1056,7 +1146,11 @@ fn traffic(app: &AppState) -> Vec<Item> {
         ])));
     }
     let settings = &stats.settings;
-    v.push(toggle(ItemId::Traffic(TrafficField::Enabled), t::TRAFFIC_ENABLED, settings.enabled));
+    v.push(toggle(
+        ItemId::Traffic(TrafficField::Enabled),
+        t::TRAFFIC_ENABLED,
+        settings.enabled,
+    ));
     v.push(toggle(
         ItemId::Traffic(TrafficField::Loopback),
         t::TRAFFIC_LOOPBACK,
@@ -1094,15 +1188,14 @@ fn terminal(app: &AppState) -> Vec<Item> {
     let prefs = app.settings.prefs;
     vec![
         toggle(ItemId::Pref(PrefField::Plain), t::PREF_PLAIN, prefs.plain),
-        toggle(ItemId::Pref(PrefField::NoColor), t::PREF_NO_COLOR, prefs.no_color),
+        toggle(
+            ItemId::Pref(PrefField::NoColor),
+            t::PREF_NO_COLOR,
+            prefs.no_color,
+        ),
         toggle(ItemId::Pref(PrefField::Ascii), t::PREF_ASCII, prefs.ascii),
         info(Words::Key(t::PREF_NOTE)),
     ]
-}
-
-/// Every row the cursor stops on, in order.
-pub fn selectable(items: &[Item]) -> Vec<&Item> {
-    items.iter().filter(|i| i.selectable()).collect()
 }
 
 #[cfg(test)]

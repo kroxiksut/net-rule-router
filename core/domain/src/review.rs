@@ -217,8 +217,8 @@ pub struct RuleSummaryEntry {
     /// it changes nothing about routing, so the review UI has to say so rather
     /// than list it next to rules that actually take effect.
     pub enabled: bool,
-    /// What the rule does: a block or a `?host` rule is labelled by that, not
-    /// by the set it is stored in.
+    /// What the rule does: a block is labelled by that, not by the set it is
+    /// stored in; a `?` rule keeps its set and is marked.
     pub action: crate::canonical::RuleAction,
 }
 

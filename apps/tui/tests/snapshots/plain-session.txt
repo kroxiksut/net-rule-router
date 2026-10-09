@@ -19,6 +19,8 @@ Connections:
   No data from the service yet
 Notifications:
   No notifications.
+Commands on this screen:
+  r: restore your settings to a service that lost them
 Type a screen number, h for help or q to quit, then press Enter.
 Service: OK
 Routing state: Routing active
@@ -47,7 +49,9 @@ Commands on this screen:
   > and <: next and previous page
   s: apply the changes; they are shown first
   i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
   r: show the rules the service applies
+  m: move the rules that work only on the other route. n: not now
 Type a screen number, h for help or q to quit, then press Enter.
 Help — Rules:
   A number: open that screen
@@ -64,7 +68,9 @@ Commands on this screen:
   > and <: next and previous page
   s: apply the changes; they are shown first
   i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
   r: show the rules the service applies
+  m: move the rules that work only on the other route. n: not now
 Screens:
   1. Status
   2. First run
@@ -96,5 +102,7 @@ Commands on this screen:
   > and <: next and previous page
   s: apply the changes; they are shown first
   i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
   r: show the rules the service applies
+  m: move the rules that work only on the other route. n: not now
 Type a screen number, h for help or q to quit, then press Enter.

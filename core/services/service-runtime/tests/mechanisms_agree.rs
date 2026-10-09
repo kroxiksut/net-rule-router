@@ -1187,7 +1187,7 @@ fn engine_outcome(rule_book: &CanonicalRuleBook, host: Option<&str>, ip: IpAddr)
     ) {
         RequestedRouteDecision::MatchedRoute { candidate } => match candidate.action {
             RuleAction::Block => Outcome::Block,
-            RuleAction::Route | RuleAction::VerifyPrimary => Outcome::Route(candidate.route_role),
+            RuleAction::Route | RuleAction::Verify => Outcome::Route(candidate.route_role),
         },
         RequestedRouteDecision::DefaultRoute { .. } => Outcome::Default,
     }

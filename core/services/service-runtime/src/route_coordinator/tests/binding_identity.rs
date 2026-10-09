@@ -527,10 +527,22 @@ fn a_late_subscriber_reads_the_standing_status_instead_of_waiting_for_a_change()
         status: status.into(),
         role: role.into(),
         candidates: Vec::new(),
+        since_unix_ms: None,
     };
     let board = coord.enforcement_status();
+    let standing = board.for_principal("S-LATE");
+    assert!(
+        standing.iter().all(|r| r.since_unix_ms.is_some()),
+        "a standing report says since when: {standing:?}"
+    );
     assert_eq!(
-        board.for_principal("S-LATE"),
+        standing
+            .into_iter()
+            .map(|r| EnforcementStatusDto {
+                since_unix_ms: None,
+                ..r
+            })
+            .collect::<Vec<_>>(),
         vec![
             report("no-primary-route", "primary"),
             report("ok", "secondary"),

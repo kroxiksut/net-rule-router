@@ -13,10 +13,10 @@ use super::*;
 ///
 /// Versions are cumulative: 1 (sections, comments, disabled rules), 3
 /// (`+block`), 4 (`--- Auto`), 5 (`--- CIDR`, `--- Ranges`), 6 (`?` before a
-/// domain value). Version 2 was a nested `- destination` syntax never
-/// implemented; the number stays retired so a file means the same thing in
-/// every build.
-pub const CURRENT_RULES_FILE_FORMAT_VERSION: u32 = 6;
+/// domain value), 7 (`?` before an exact IP and in the main-route file).
+/// Version 2 was a nested `- destination` syntax never implemented; the number
+/// stays retired so a file means the same thing in every build.
+pub const CURRENT_RULES_FILE_FORMAT_VERSION: u32 = 7;
 
 /// Optional metadata declared in a preset file's preamble comments.
 ///
@@ -92,7 +92,7 @@ pub enum ParseWarning {
         /// The reason slug that was present.
         reason_slug: String,
     },
-    /// A line carried both `?` (try the primary route first) and `+block`.
+    /// A line carried both `?` (check where it works) and `+block`.
     /// The two contradict each other, so the line was not read as a rule.
     VerifyPrimaryWithBlock {
         /// The match value of the refused line, without the `?`.

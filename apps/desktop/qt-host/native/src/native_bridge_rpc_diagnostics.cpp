@@ -80,6 +80,10 @@ QString NrrNativeBridge::rpcConnTraceEntriesList(const QString &cursor, int page
     return emitRpcRequest(QStringLiteral("conn-trace.entries.list"), obj);
 }
 
+QString NrrNativeBridge::rpcConnTraceOutageBlocksList() {
+    return emitRpcRequest(QStringLiteral("conn-trace.outage-blocks.list"), QJsonObject());
+}
+
 QString NrrNativeBridge::rpcSnapshotDiagnosticsGet() {
     return emitRpcRequest(QStringLiteral("snapshot.diagnostics.get"),
                           QJsonObject());

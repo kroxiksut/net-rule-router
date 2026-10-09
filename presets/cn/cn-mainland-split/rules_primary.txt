@@ -37,6 +37,12 @@ cn              # КНР / People's Republic of China (.cn)
 *.xiaomi.com  # Other major domestic platforms
 *.huawei.com  # Other major domestic platforms
 
+?*.proton.me  # Foreign messengers and communication tools
+?*.protonmail.com  # Foreign messengers and communication tools
+?*.protonmail.ch  # Foreign messengers and communication tools
+?*.protonvpn.com  # Foreign messengers and communication tools
+?accounts.google.ru  # Google (unreachable from the main link here) and Microsoft AI entry points
+
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 

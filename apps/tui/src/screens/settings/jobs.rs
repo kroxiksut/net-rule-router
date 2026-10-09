@@ -11,10 +11,10 @@ use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
 use nrr_platform_api::service_control::ServiceControlError;
 use nrr_shared::ipc::IpcOperationName as Op;
 use nrr_shared::ipc_payloads::{
-    ApplyFailurePolicyDto, BlockNoticeMuteDto, BlockNoticeMuteScopeDto, BlockNoticeMutesListResponse,
-    LogRetentionConfigDto, LogRetentionConfigSetRequest, LogsClearResponse, RetentionSettingsDto,
-    RetentionSettingsSetRequest, SettingsExportFullResponse, StorageUsageDto, TrafficStatsGetResponse,
-    TrafficStatsSettingsDto,
+    ApplyFailurePolicyDto, BlockNoticeMuteDto, BlockNoticeMuteScopeDto,
+    BlockNoticeMutesListResponse, LogRetentionConfigDto, LogRetentionConfigSetRequest,
+    LogsClearResponse, RetentionSettingsDto, RetentionSettingsSetRequest,
+    SettingsExportFullResponse, StorageUsageDto, TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
@@ -23,6 +23,7 @@ use super::items::Words;
 use super::{text, Failure, Loadable, ServiceInfo};
 use crate::backend::{Job, RegistrationProbe, Reply};
 use crate::state::AppState;
+use crate::view::StateTone;
 
 /// How long a start or a stop may take before the screen says so.
 const SERVICE_WAIT: Duration = Duration::from_secs(30);
@@ -83,7 +84,9 @@ fn written<T: Send + 'static>(
 /// The live `route-policy`, raw: a write echoes back every field it carries.
 fn policy_of(client: &dyn IpcClient) -> Result<Map<String, Value>, Failure> {
     let snapshot = call(client, Op::SnapshotInitialGet, json!({}))?;
-    Ok(object(snapshot.get("route-policy").cloned().unwrap_or(Value::Null)))
+    Ok(object(
+        snapshot.get("route-policy").cloned().unwrap_or(Value::Null),
+    ))
 }
 
 pub fn load_policy() -> Job {
@@ -144,7 +147,11 @@ pub fn load_log_retention() -> Job {
 
 pub fn load_storage() -> Job {
     job(|client| {
-        let result = loaded(read::<StorageUsageDto>(client, Op::StorageUsageGet, json!({})));
+        let result = loaded(read::<StorageUsageDto>(
+            client,
+            Op::StorageUsageGet,
+            json!({}),
+        ));
         Reply::new(move |app| app.settings.data.storage = result)
     })
 }
@@ -203,6 +210,7 @@ fn default_mode() -> &'static str {
 /// user's protections off.
 pub fn write_policy(changes: Map<String, Value>) -> Job {
     job(move |client| {
+        let mut sent = None;
         let result = (|| {
             let current = policy_of(client)?;
             let base = route_policy::build_full_update_request(&current, default_mode());
@@ -212,10 +220,14 @@ pub fn write_policy(changes: Map<String, Value>) -> Job {
             let Some(named) = route_policy::name_changes(&base, request.clone()) else {
                 return Ok(current);
             };
-            call(client, Op::RoutePolicyUpdate, Value::Object(named))?;
+            call(client, Op::RoutePolicyUpdate, Value::Object(named.clone()))?;
+            sent = Some(named);
             Ok(policy_of(client).unwrap_or(request))
         })();
-        written(result, Words::Key(text::SAVED), |app, policy| {
+        written(result, Words::Key(text::SAVED), move |app, policy| {
+            if let Some(sent) = &sent {
+                crate::restore::record_route_policy(app, sent);
+            }
             app.settings.data.policy = Loadable::Ready(policy);
         })
     })
@@ -247,8 +259,13 @@ pub fn set_mute(request: Value, from_form: bool) -> Job {
     job(move |client| {
         let result = read::<BlockNoticeMutesListResponse>(client, Op::BlockNoticeMutesSet, request)
             .map(|r| r.mutes);
-        let done = Words::Key(if from_form { text::MUTE_ADDED } else { text::SAVED });
+        let done = Words::Key(if from_form {
+            text::MUTE_ADDED
+        } else {
+            text::SAVED
+        });
         written(result, done, move |app, mutes| {
+            crate::restore::record_mutes(app, &mutes);
             app.settings.data.mutes = Loadable::Ready(mutes);
             if from_form {
                 app.settings.mute_form.target.clear();
@@ -264,14 +281,18 @@ pub fn remove_mutes(scopes: Vec<BlockNoticeMuteScopeDto>) -> Job {
         let result = (|| {
             let mut mutes: Option<Vec<BlockNoticeMuteDto>> = None;
             for scope in scopes {
-                let answer: BlockNoticeMutesListResponse =
-                    read(client, Op::BlockNoticeMutesRemove, json!({ "scope": scope }))?;
+                let answer: BlockNoticeMutesListResponse = read(
+                    client,
+                    Op::BlockNoticeMutesRemove,
+                    json!({ "scope": scope }),
+                )?;
                 mutes = Some(answer.mutes);
             }
             Ok(mutes)
         })();
         written(result, Words::Key(text::SAVED), |app, mutes| {
             if let Some(mutes) = mutes {
+                crate::restore::record_mutes(app, &mutes);
                 app.settings.data.mutes = Loadable::Ready(mutes);
             }
         })
@@ -296,7 +317,9 @@ pub fn set_retention(request: RetentionSettingsSetRequest) -> Job {
     job(move |client| {
         let result = serde_json::to_value(&request)
             .map_err(|e| Failure::detail(e.to_string()))
-            .and_then(|payload| read::<RetentionSettingsDto>(client, Op::RetentionSettingsSet, payload));
+            .and_then(|payload| {
+                read::<RetentionSettingsDto>(client, Op::RetentionSettingsSet, payload)
+            });
         written(result, Words::Key(text::SAVED), |app, settings| {
             app.settings.data.retention = Loadable::Ready(settings);
         })
@@ -324,7 +347,11 @@ pub fn clear_logs() -> Job {
             Op::LogsClear,
             json!({ "dry-run": false, "include-archives": false }),
         );
-        let storage = loaded(read::<StorageUsageDto>(client, Op::StorageUsageGet, json!({})));
+        let storage = loaded(read::<StorageUsageDto>(
+            client,
+            Op::StorageUsageGet,
+            json!({}),
+        ));
         Reply::new(move |app| match result {
             Ok(cleared) => {
                 app.settings.data.storage = storage;
@@ -358,9 +385,13 @@ pub fn clear_traffic(day: i64) -> Job {
     job(move |client| {
         let result =
             call(client, Op::TrafficStatsClear, json!({})).and_then(|_| traffic_of(client, day));
-        written(result, Words::Key(text::TRAFFIC_RESET_DONE), |app, stats| {
-            app.settings.data.traffic = Loadable::Ready(stats);
-        })
+        written(
+            result,
+            Words::Key(text::TRAFFIC_RESET_DONE),
+            |app, stats| {
+                app.settings.data.traffic = Loadable::Ready(stats);
+            },
+        )
     })
 }
 
@@ -394,7 +425,7 @@ pub fn control_service(op: ServiceOp, probe: RegistrationProbe) -> Job {
                         }
                         _ => text::RUN_UNKNOWN,
                     };
-                    app.settings.done(Words::FillWords(
+                    app.settings.done(Words::Nested(
                         text::SERVICE_DONE,
                         vec![("state", Words::Key(state))],
                     ));
@@ -456,9 +487,12 @@ pub fn export_settings(path: PathBuf) -> Job {
             Err(ExportError::Exists) => app
                 .settings
                 .refuse(Words::Fill(text::EXPORT_EXISTS, vec![("path", shown)])),
-            Err(ExportError::Write(error)) => app.settings.failed(
-                text::EXPORT_WRITE_FAILED,
-                Failure::detail(error),
+            Err(ExportError::Write(error)) => app.settings.say(
+                Words::Fill(
+                    text::EXPORT_WRITE_FAILED,
+                    vec![("path", shown), ("error", error)],
+                ),
+                Some(StateTone::Bad),
             ),
             Err(ExportError::Service(failure)) => app.settings.failed(text::NOT_SAVED, failure),
         })

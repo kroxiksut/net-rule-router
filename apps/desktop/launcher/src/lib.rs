@@ -23,6 +23,7 @@ pub mod rpc_dispatcher;
 pub mod service_control_linux;
 pub mod sidecar_handlers;
 pub mod update_check_fetch;
+pub(crate) mod user_settings_bridge;
 
 pub use launcher::{
     apply_qt_preferences_payload, default_activation_request_path, path_to_file_url,

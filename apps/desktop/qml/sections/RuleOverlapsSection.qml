@@ -41,29 +41,15 @@ ColumnLayout {
             root.refreshUnenforcedAppRules()
     }
 
-    function _describe(side) {
-        var type = String(side["rule-type"])
-        var value = String(side.value)
-        // Both name kinds are a "Domain" rule in the rules list.
-        var typeLabel = root.ruleTypeLabel(
-            type === "exact-fqdn" || type === "suffix-domain" ? "domain" : type)
-        return root.tr("rules.overlaps.rule", "{value} ({type})")
-            .replace("{value}", type === "suffix-domain" ? "*." + value : value)
-            .replace("{type}", typeLabel)
-    }
-    function _routeText(side) {
-        return root.routeLabel(section.controller.routeOf(side))
-    }
+    function _describe(side) { return section.controller.describe(side) }
+    function _routeText(side) { return section.controller.routeText(side) }
     function _blockWinsTie(overlap) {
         return !!overlap && overlap["block-wins-tie"] === true
     }
     function _mainStays(overlap) {
         return !!overlap && overlap["main-stays-when-additional-down"] === true
     }
-    function _mainStaysText() {
-        return root.tr("rules.overlaps.main-stays",
-            "Addresses of the main link inside this network stay on the main link even when the additional link is down. Leak protection does not block them.")
-    }
+    function _mainStaysText() { return section.controller.mainStaysText() }
     function _reason(overlap) {
         if (section._blockWinsTie(overlap))
             return root.tr("rules.overlaps.reason.block-tie", "A block wins a tie")
@@ -78,26 +64,7 @@ ColumnLayout {
         return !!overlap && String(overlap.kind) === "intersecting"
     }
     /// The whole row as one sentence, for a screen reader.
-    function _explain(overlap) {
-        var sentence = section._blockWinsTie(overlap)
-            ? root.tr("rules.overlaps.block-tie",
-                "{winner} names the same sites as {loser} on {loser-route}. They are blocked: on a tie a block wins over a route.")
-            : String(overlap.kind) === "duplicate"
-            ? root.tr("rules.overlaps.duplicate",
-                "{winner} is set on both routes. It goes over {winner-route}: on a tie the main route wins.")
-            : section._intersecting(overlap)
-            ? root.tr("rules.overlaps.intersecting",
-                "{winner} and {loser} on {loser-route} share some addresses. Each shared address takes the narrower rule; most of them go over {winner-route}.")
-            : root.tr("rules.overlaps.nested",
-                "{winner} goes over {winner-route}: it is narrower than {loser} on {loser-route}.")
-        sentence = sentence
-            .replace("{winner}", section._describe(overlap.winner))
-            .replace("{loser}", section._describe(overlap.loser))
-            .replace("{winner-route}", section._routeText(overlap.winner))
-            .replace("{loser-route}", section._routeText(overlap.loser))
-        return section._mainStays(overlap)
-            ? sentence + " " + section._mainStaysText() : sentence
-    }
+    function _explain(overlap) { return section.controller.explain(overlap) }
 
     /// One service-reported conflict as a sentence.
     function _conflictText(c) {
@@ -421,11 +388,8 @@ ColumnLayout {
                                 width: actions.width
                                 wrapMode: Text.Wrap
                                 color: root.mutedTextColor
-                                text: section.controller.hasBlockSide(row.overlap)
-                                    ? root.tr("rules.overlaps.block-note",
+                                text: root.tr("rules.overlaps.block-note",
                                         "A block rule is part of this pair; change it in the rules list.")
-                                    : root.tr("rules.overlaps.verify-note",
-                                        "A rule that tries the primary route first is part of this pair; change it in the rules list.")
                                 Accessible.role: Accessible.StaticText
                                 Accessible.name: text
                             }

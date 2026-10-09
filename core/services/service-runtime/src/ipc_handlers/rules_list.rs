@@ -87,6 +87,7 @@ mod tests {
             rule_type: "domain".into(),
             match_value: "example.com".into(),
             target_route: route.into(),
+            verify: false,
             comment: None,
             enabled: true,
             validation_status: "ok".into(),

@@ -267,6 +267,12 @@ public:
     Q_INVOKABLE QString rpcAutoRuleDismissedList();
     Q_INVOKABLE QString rpcAutoRuleDismissedRestore(const QVariantMap &payload);
 
+    /// Where the caller's `?` rules turned out to work: the list, then moving
+    /// or setting aside a set of them (`{"rule-ids": ["..."]}`).
+    Q_INVOKABLE QString rpcVerifyVerdictsList();
+    Q_INVOKABLE QString rpcVerifyVerdictsAccept(const QVariantMap &payload);
+    Q_INVOKABLE QString rpcVerifyVerdictsDismiss(const QVariantMap &payload);
+
     /// Block-notice mutes: silence future notices for one host, one app, or
     /// everything. `rpcBlockNoticeMutesSet`/`Remove` take `{"scope": {...}}`
     /// (kind: host/app/all); `Set` also takes an optional `until-unix-ms`
@@ -548,6 +554,13 @@ public:
     /// disconnect→connect transition.
     Q_INVOKABLE QString rpcServiceInfo();
 
+    /// Async wrappers over the launcher-local `local.user-settings.intent-get`
+    /// / `-record` RPCs: what the user decided about the service's settings,
+    /// kept in their own settings file so a service that lost it can be told
+    /// again. Record takes `{namespace, merge}` or `{namespace, value}`.
+    Q_INVOKABLE QString rpcUserSettingsIntentGet();
+    Q_INVOKABLE QString rpcUserSettingsIntentRecord(const QVariantMap &payload);
+
     /// Async wrapper over the launcher-local `local.update-check.run` RPC: the
     /// Help menu's "Check for updates". Answers `{status: "update-available",
     /// latestVersion, url}` or `{status: "up-to-date", currentVersion}`; a
@@ -759,6 +772,10 @@ public:
     // process/proto/local/remote/egress-role/egress-ifindex/verdict), `redacted`
     // and `observer-active` (false when the service is not watching at all).
     Q_INVOKABLE QString rpcConnTraceEntriesList(const QString &cursor, int pageSize);
+
+    // What leak protection blocked during the caller's last outage of the
+    // additional route, folded per program and address.
+    Q_INVOKABLE QString rpcConnTraceOutageBlocksList();
 
     // The live diagnostics status; the launch context holds only the copy
     // taken at start-up.

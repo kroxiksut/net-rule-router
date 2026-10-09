@@ -257,6 +257,41 @@ fn block_notice_ops_are_tray_reachable_and_never_elevated() {
 }
 
 #[test]
+#[allow(clippy::expect_used)]
+fn verify_verdict_ops_reach_every_policy_surface_and_never_elevate() {
+    // The notice is shown in the window, the tray and the terminal, and the
+    // answer rewrites the caller's own rules only.
+    let catalog = ipc_operation_catalog();
+    for name in [
+        IpcOperationName::VerifyVerdictsList,
+        IpcOperationName::VerifyVerdictsAccept,
+        IpcOperationName::VerifyVerdictsDismiss,
+    ] {
+        let spec = catalog
+            .iter()
+            .find(|item| item.name == name)
+            .expect("verdict op must be in the catalog");
+        for profile in [
+            IpcClientProfile::GuiInteractive,
+            IpcClientProfile::TrayLightweight,
+            IpcClientProfile::Tui,
+        ] {
+            assert!(
+                spec.allowed_clients.contains(&profile),
+                "{} must be callable from {profile:?}",
+                name.slug()
+            );
+        }
+        assert!(
+            !spec.requires_service_mutation_privilege,
+            "{} must not require elevation",
+            name.slug()
+        );
+        assert_eq!(IpcOperationName::from_slug(name.slug()), Some(name));
+    }
+}
+
+#[test]
 fn async_operations_return_operation_handle_when_required() {
     let catalog = ipc_operation_catalog();
     assert!(catalog.iter().any(|item| {

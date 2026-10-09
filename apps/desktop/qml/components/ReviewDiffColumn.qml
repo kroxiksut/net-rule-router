@@ -127,6 +127,8 @@ ColumnLayout {
                                 routeText = root.ownerRoot.tr(
                                     "label." + route, route)
                             }
+                            // A `?` rule names its route with the mark after it.
+                            if (modelData.verify === true) routeText += " ?"
                             return display + "  [" + routeText + "]" + suffix
                         }
                         return String(modelData)

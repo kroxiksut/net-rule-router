@@ -116,7 +116,7 @@ pub fn rule_row_to_wire_dto(
         } else {
             String::new()
         },
-        action: row.target_route.action(),
+        action: row.action(),
         origin,
     }
 }
@@ -172,6 +172,7 @@ pub fn file_row_from_service_wire(
         rule_type,
         match_value,
         target_route: wire_target_route(&entry.target_route),
+        verify: entry.verify,
         comment: entry.comment.clone().unwrap_or_default(),
         origin: entry.origin.as_ref().map(|origin| RowOrigin {
             reason: origin.reason().as_slug().to_owned(),
@@ -189,20 +190,24 @@ pub fn drift_row_from_service_wire(entry: &RuleRowEntry) -> RuleRow {
         RuleType::from_slug(&entry.rule_type),
         entry.match_value.clone(),
         wire_target_route(&entry.target_route),
+        entry.verify,
     )
 }
 
 /// The target a `preset.parse` rule takes when read from the rules file of
-/// `file` (`parsedRuleTargetRoute`). `+block` wins; `?` means something only in
-/// the secondary file, so the primary file keeps its own route for it.
+/// `file` (`parsedRuleTargetRoute`): `+block`, or the file's own route.
 pub fn parsed_rule_target_route(rule: &ParsedRule, file: Route) -> TargetRoute {
     if rule.blocked {
         TargetRoute::Block
-    } else if rule.verify_primary && file == Route::Secondary {
-        TargetRoute::Verify
     } else {
         file.into()
     }
+}
+
+/// The `?` of a `preset.parse` rule (`parsedRuleVerify`), in either file. A
+/// block takes none.
+pub fn parsed_rule_verify(rule: &ParsedRule) -> bool {
+    rule.verify_primary && !rule.blocked
 }
 
 /// The routing part of one `preset.parse` rule read from the rules file of
@@ -213,6 +218,7 @@ pub fn drift_row_from_parsed_rule(rule: &ParsedRule, file: Route) -> RuleRow {
         RuleType::from_slug(rule.rule_type.slug()),
         rule.match_value.clone(),
         parsed_rule_target_route(rule, file),
+        parsed_rule_verify(rule),
     )
 }
 
@@ -221,6 +227,7 @@ fn drift_row(
     rule_type: RuleType,
     match_value: String,
     target_route: TargetRoute,
+    verify: bool,
 ) -> RuleRow {
     RuleRow {
         id: String::new(),
@@ -228,6 +235,7 @@ fn drift_row(
         rule_type,
         match_value,
         target_route,
+        verify,
         comment: String::new(),
         origin: None,
     }

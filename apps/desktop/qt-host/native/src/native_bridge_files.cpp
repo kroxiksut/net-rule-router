@@ -132,6 +132,16 @@ QString NrrNativeBridge::rpcServiceInfo() {
                           QJsonObject());
 }
 
+QString NrrNativeBridge::rpcUserSettingsIntentGet() {
+    return emitRpcRequest(QStringLiteral("local.user-settings.intent-get"),
+                          QJsonObject());
+}
+
+QString NrrNativeBridge::rpcUserSettingsIntentRecord(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("local.user-settings.intent-record"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
 QString NrrNativeBridge::rpcUpdateCheckRun() {
     return emitRpcRequest(QStringLiteral("local.update-check.run"),
                           QJsonObject());

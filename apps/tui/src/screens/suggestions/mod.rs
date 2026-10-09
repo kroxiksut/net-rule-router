@@ -475,8 +475,17 @@ fn restore_job(ids: Vec<String>) -> Job {
 /// are accepted so the one answer covers both the future and the present.
 fn always_job(ids: Vec<String>) -> Job {
     Box::new(move |client: &dyn IpcClient| {
-        let outcome = switch_to_auto(client).and_then(|()| accept(client, ids));
+        let switched = switch_to_auto(client);
+        let did_switch = switched.is_ok();
+        let outcome = switched.and_then(|()| accept(client, ids));
         Reply::new(move |app| {
+            if did_switch {
+                let named =
+                    json!({ "auto-rules-mode": AUTO_MODE, "apply-only": ["auto-rules-mode"] });
+                if let Value::Object(named) = named {
+                    crate::restore::record_route_policy(app, &named);
+                }
+            }
             if let Ok(answer) = &outcome {
                 app.suggestions.pending_count = answer.pending;
                 app.suggestions.reload_hint = answer.anchor_skipped;
@@ -560,7 +569,7 @@ pub fn changed(
         texts.fill(
             keys::NOTICE_OPEN,
             &[
-                ("key", screen.hotkey().to_string()),
+                ("key", screen.hotkey().map(String::from).unwrap_or_default()),
                 ("screen", texts.get(screen.title())),
             ],
         )

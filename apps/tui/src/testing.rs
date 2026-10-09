@@ -295,6 +295,7 @@ pub fn enforcement(status: &str, role: &str) -> crate::backend::BackendEvent {
             status: status.into(),
             role: role.into(),
             candidates: Vec::new(),
+            since_unix_ms: None,
         },
     )))
 }
@@ -322,4 +323,27 @@ pub fn missing_from_locales(keys: &[crate::i18n::Key]) -> Vec<String> {
         }
     }
     missing
+}
+
+/// A directory of a test's own under the temp folder, removed when the test
+/// ends.
+pub struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    pub fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("nrr-tui-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        Self(dir)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

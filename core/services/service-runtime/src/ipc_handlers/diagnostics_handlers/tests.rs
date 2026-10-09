@@ -1227,3 +1227,218 @@ fn explain_samples_are_wired_from_recent_decision_ids_not_hardcoded_empty() {
     assert_eq!(samples.len(), 1, "the one decision id must be sampled");
     assert_eq!(samples[0]["query_kind"], "historical");
 }
+
+// ── Audience scoping and the outage list ─────────────────────────
+
+fn ctx_for(
+    principal: Option<nrr_domain::user_principal::UserPrincipal>,
+    elevated: bool,
+) -> IpcRequestContext {
+    IpcRequestContext {
+        client_profile: IpcClientProfile::GuiInteractive,
+        caller_is_elevated: elevated,
+        caller_principal: principal,
+        caller_pid: None,
+    }
+}
+
+fn call_as<H: IpcHandler>(
+    handler: &H,
+    operation: IpcOperationName,
+    ctx: &IpcRequestContext,
+) -> serde_json::Value {
+    let env = IpcRequestEnvelope {
+        protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+        request_id: "r".into(),
+        correlation_id: None,
+        operation,
+        operation_class: crate::ipc::IpcOperationClass::DiagnosticQuery,
+        confirmation_token: None,
+        payload: serde_json::Value::Null,
+    };
+    handler.handle(&env, ctx).expect("handler answers")
+}
+
+/// Another user's rows name their programs and destinations; an ordinary
+/// caller gets their own plus the machine's (no owner, or the service's own
+/// relay connections), an elevated one everything.
+#[test]
+fn conn_trace_shows_an_ordinary_caller_only_their_own_and_the_machines_rows() {
+    use nrr_domain::user_principal::UserPrincipal;
+    let me = UserPrincipal::from_linux_uid(1000);
+    let other = UserPrincipal::from_linux_uid(1001);
+    let service = nrr_shared::product_identity::BinaryRole::Service.windows_file_name();
+    let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+        16,
+    ));
+    let row = |owner: Option<&str>, process: String| {
+        let mut r = trace_row();
+        r.user_sid = owner.map(str::to_string);
+        r.process_path = Some(process);
+        r
+    };
+    ring.push(row(Some(me.as_stored()), r"\device\hd\mine.exe".into()));
+    ring.push(row(
+        Some(other.as_stored()),
+        r"\device\hd\theirs.exe".into(),
+    ));
+    ring.push(row(None, r"\device\hd\nobody.exe".into()));
+    ring.push(row(Some("S-1-5-18"), format!(r"\device\hd\{service}")));
+    let handler = ConnTraceEntriesListHandler::new(Arc::clone(&ring));
+    let processes = |ctx: IpcRequestContext| -> Vec<String> {
+        let resp: ConnTraceEntriesListResponse = serde_json::from_value(call_as(
+            &handler,
+            IpcOperationName::ConnTraceEntriesList,
+            &ctx,
+        ))
+        .expect("decode ConnTraceEntriesListResponse");
+        resp.page.items.into_iter().map(|i| i.process).collect()
+    };
+
+    assert_eq!(
+        processes(ctx_for(Some(me.clone()), false)),
+        vec![service, "nobody.exe", "mine.exe"]
+    );
+    assert_eq!(
+        processes(ctx_for(Some(me), true)),
+        vec![service, "nobody.exe", "theirs.exe", "mine.exe"],
+        "positive control: an elevated caller sees the machine"
+    );
+    assert_eq!(
+        processes(ctx_for(None, false)),
+        vec![service, "nobody.exe"],
+        "an unattributed caller owns nothing"
+    );
+}
+
+fn outage_list(
+    handler: &ConnTraceOutageBlocksListHandler,
+    ctx: &IpcRequestContext,
+) -> nrr_shared::ipc_payloads::ConnTraceOutageBlocksResponse {
+    serde_json::from_value(call_as(
+        handler,
+        IpcOperationName::ConnTraceOutageBlocksList,
+        ctx,
+    ))
+    .expect("decode ConnTraceOutageBlocksResponse")
+}
+
+fn note_outage_drop(
+    ring: &crate::conn_observation_consumer::ConnectionTraceRing,
+    sid: &str,
+    app: &str,
+    remote: &str,
+    at_ms: u64,
+) {
+    let path = format!(r"\device\hd\{app}");
+    ring.outage_blocks()
+        .record(crate::outage_blocks::OutageDrop {
+            sid,
+            app,
+            process_path: Some(&path),
+            remote: remote.parse().expect("remote"),
+            host: Some("site.example"),
+            at_ms,
+        });
+}
+
+/// The request names nobody, so the answer is always the caller's own — also
+/// for an elevated caller, whose list is the counterpart of their own notice.
+#[test]
+fn the_outage_list_is_only_ever_the_callers_own() {
+    use nrr_domain::user_principal::UserPrincipal;
+    use nrr_shared::ipc_payloads::OutageEpisodeDto;
+    let me = UserPrincipal::from_linux_uid(1000);
+    let other = UserPrincipal::from_linux_uid(1001);
+    let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+        4,
+    ));
+    ring.mark_observer_active();
+    ring.outage_blocks().mark_fed();
+    ring.outage_blocks().outage_began(me.as_stored(), 1_000);
+    note_outage_drop(&ring, me.as_stored(), "mine.exe", "198.51.100.1:443", 2_000);
+    note_outage_drop(
+        &ring,
+        other.as_stored(),
+        "theirs.exe",
+        "198.51.100.2:443",
+        2_500,
+    );
+    ring.outage_blocks().outage_ended(me.as_stored(), 3_000);
+    let handler = ConnTraceOutageBlocksListHandler::new(Arc::clone(&ring));
+
+    let mine = outage_list(&handler, &ctx_for(Some(me.clone()), false));
+    assert_eq!(
+        mine.episode,
+        Some(OutageEpisodeDto {
+            since_unix_ms: 1_000,
+            until_unix_ms: Some(3_000),
+        })
+    );
+    assert_eq!(mine.entries.len(), 1);
+    let entry = &mine.entries[0];
+    assert_eq!(entry.process, "mine.exe");
+    assert_eq!(entry.remote_ip, "198.51.100.1");
+    assert_eq!(entry.remote_port, 443);
+    assert_eq!(entry.host, "site.example");
+    assert_eq!((entry.first_seen_ms, entry.last_seen_ms), (2_000, 2_000));
+    assert_eq!(entry.attempts, 1);
+    assert_eq!(mine.omitted, 0);
+    assert!(mine.observer_active && mine.gui_stream_enabled);
+
+    let elevated = outage_list(&handler, &ctx_for(Some(me), true));
+    assert_eq!(
+        elevated.entries, mine.entries,
+        "elevation widens nothing here"
+    );
+
+    let theirs = outage_list(&handler, &ctx_for(Some(other), false));
+    assert_eq!(theirs.entries.len(), 1);
+    assert_eq!(theirs.entries[0].process, "theirs.exe");
+    assert_eq!(
+        theirs.episode.map(|e| (e.since_unix_ms, e.until_unix_ms)),
+        Some((2_500, None)),
+        "the drop itself opened their outage"
+    );
+
+    let anonymous = outage_list(&handler, &ctx_for(None, true));
+    assert!(anonymous.entries.is_empty());
+    assert_eq!(anonymous.episode, None);
+}
+
+/// The trace switch silences this view too, and a store nothing attributes
+/// drops into reads as "not watching", never as "nothing was blocked".
+#[test]
+fn the_outage_list_follows_the_trace_switch_and_says_when_nothing_watches() {
+    use nrr_domain::user_principal::UserPrincipal;
+    let me = UserPrincipal::from_linux_uid(1000);
+    let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+        4,
+    ));
+    ring.mark_observer_active();
+    note_outage_drop(&ring, me.as_stored(), "mine.exe", "198.51.100.1:443", 2_000);
+
+    let unfed = ConnTraceOutageBlocksListHandler::new(Arc::clone(&ring));
+    assert!(
+        !outage_list(&unfed, &ctx_for(Some(me.clone()), false)).observer_active,
+        "a ring fed without drop attribution cannot see an outage"
+    );
+
+    ring.outage_blocks().mark_fed();
+    let hidden = ConnTraceOutageBlocksListHandler::new(Arc::clone(&ring)).with_gui_stream_gate(
+        crate::ipc_handlers::test_fakes::FakeConnTraceGui::showing(false),
+    );
+    let resp = outage_list(&hidden, &ctx_for(Some(me.clone()), false));
+    assert!(resp.entries.is_empty() && resp.episode.is_none());
+    assert!(!resp.gui_stream_enabled);
+    assert!(resp.observer_active);
+
+    let shown = ConnTraceOutageBlocksListHandler::new(Arc::clone(&ring)).with_gui_stream_gate(
+        crate::ipc_handlers::test_fakes::FakeConnTraceGui::showing(true),
+    );
+    assert_eq!(
+        outage_list(&shown, &ctx_for(Some(me), false)).entries.len(),
+        1,
+        "positive control: switched on, the same entry is served"
+    );
+}

@@ -29,7 +29,8 @@ QtObject {
         one[key] = value
         _applyRoutePolicyKeys(one, {
             onApplied: function() { if (o.onApplied) o.onApplied(value) },
-            ok: o.ok, uac: o.uac, failPrefix: o.failPrefix, onFailed: o.onFailed
+            ok: o.ok, uac: o.uac, failPrefix: o.failPrefix, onFailed: o.onFailed,
+            origin: o.origin
         })
     }
 
@@ -101,7 +102,7 @@ QtObject {
                 root.statusLine = o.failPrefix + label
             }
             if (o.onFailed) o.onFailed(code)
-        })
+        }, o.origin || "user:routing-settings")
     }
 
     property var _policyWrites: []
@@ -119,8 +120,13 @@ QtObject {
     /// `build(cur)` returns the request, or null when there is nothing to
     /// write. `done(ok, code, stage)`: `stage` is "read" (nothing was sent),
     /// "unchanged" (build returned null, `ok` true) or "write".
-    function mutateRoutePolicy(build, done) {
-        _policyWrites.push({ build: build, done: done })
+    ///
+    /// `origin` says who asked. Only a user's write the service confirmed is
+    /// recorded as their intent (`Pure.isUserWriteOrigin`): a resync, a heal
+    /// or a re-seed restates what the app holds and must never pass for a
+    /// decision.
+    function mutateRoutePolicy(build, done, origin) {
+        _policyWrites.push({ build: build, done: done, origin: String(origin || "") })
         _drainPolicyWrites()
     }
 
@@ -167,6 +173,8 @@ QtObject {
             var wCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
             if (!wCorr) { finish(false, "bridge-unavailable", "write"); return }
             root.rpc.registerRpcCallback(wCorr, function(ok2, p2, code2, msg2) {
+                if (ok2 && Pure.isUserWriteOrigin(job.origin) && root.settingsRestoreController)
+                    root.settingsRestoreController.recordRoutePolicy(req, changed)
                 finish(ok2, code2, "write")
             })
         })
@@ -553,12 +561,16 @@ QtObject {
     /// The first-run protections (wizard or answer file) as ONE write, so the
     /// kill switch and the DoH lockdown cannot be sent as two snapshots of the
     /// same row.
-    function applyFirstRunProtections(killSwitch, dohLockdown) {
+    /// `origin` names who answered: the wizard is the user's own choice, an
+    /// answer sheet is the administrator's and is not recorded as theirs.
+    function applyFirstRunProtections(killSwitch, dohLockdown, origin) {
         var ks = _mirrorKillSwitch(killSwitch)
+        var o = _killSwitchMessages(ks)
+        o.origin = origin || "user:first-run"
         _applyRoutePolicyKeys({
             "kill-switch-enabled": ks,
             "doh-lockdown-enabled": dohLockdown === true
-        }, _killSwitchMessages(ks))
+        }, o)
     }
     /// MASTER kill-switch toggle (the explicit opt-in). When OFF (default) the
     /// whole leak-guard is disarmed regardless of sub-settings; when ON the gated
@@ -679,7 +691,7 @@ QtObject {
     /// first to preserve mode + failover (mirrors `applyRouteBehaviorMode`).
     /// A blank pref slot keeps the service's current binding; pass
     /// `opts.unbindPrimary` / `opts.unbindSecondary` to actually clear a slot.
-    function pushRouteBindingToService(opts, onDone) {
+    function pushRouteBindingToService(opts, onDone, origin) {
         var settle = function(ok, code) {
             if (typeof onDone === "function") onDone(ok === true, String(code || ""))
         }
@@ -699,7 +711,7 @@ QtObject {
             // a declined prompt from a transient failure.
             settle(ok, code)
             if (!ok && stage === "write") _reportBindingWriteFailure(code)
-        })
+        }, origin)
     }
     /// Attempts left in the current re-sync run, and the backoff between them.
     /// Both reasons this push fails are temporary: right after connect the
@@ -825,17 +837,32 @@ QtObject {
             _scheduleRouteBindingResyncRetry("bridge-unavailable")
             return
         }
+        // The user's own record survives a lost preferences file: a slot the
+        // preferences no longer name is taken from it. Read afresh, since the
+        // terminal client may have recorded a binding since.
+        var restore = root.settingsRestoreController
+        if (restore && typeof restore.refreshRecord === "function") {
+            restore.refreshRecord(function() { _resyncRouteBindingWith(restore.recordedBindings()) })
+        } else {
+            _resyncRouteBindingWith({})
+        }
+    }
+
+    function _resyncRouteBindingWith(recorded) {
         var prefsHasBinding =
             String(root.prefs.selectedPrimaryInterfaceId || root.prefs.selectedPrimaryInterfaceName || "") !== ""
             || String(root.prefs.selectedSecondaryInterfaceId || root.prefs.selectedSecondaryInterfaceName || "") !== ""
-        if (!prefsHasBinding) {
+        if (!prefsHasBinding && !recorded.primary && !recorded.secondary) {
             _routeBindingResyncSettled()
             return
         }
         mutateRoutePolicy(function(cur) {
             if (cur.primary || cur.secondary) return null // service already has a binding
             _bindingResyncOutstanding = true
-            return _routeBindingReqFromPrefs(cur)
+            var req = _routeBindingReqFromPrefs(cur)
+            if (!req.primary && recorded.primary) req.primary = recorded.primary
+            if (!req.secondary && recorded.secondary) req.secondary = recorded.secondary
+            return req
         }, function(ok, code, stage) {
             if (stage === "read") {
                 _scheduleRouteBindingResyncRetry("read-failed:" + code)
@@ -851,7 +878,7 @@ QtObject {
             }
             _reportBindingWriteFailure(code)
             _scheduleRouteBindingResyncRetry("write-failed:" + code)
-        })
+        }, "binding-resync")
     }
 
     function _routeBindingResyncSettled() {

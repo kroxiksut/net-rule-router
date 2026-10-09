@@ -1,0 +1,298 @@
+{
+  "description": "pure.js routePolicyRestorePlan",
+  "cases": [
+    {
+      "name": "nothing to restore",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true
+        },
+        "service": {
+          "kill-switch-enabled": true
+        },
+        "present": []
+      },
+      "expected": {
+        "keys": [],
+        "missing": [],
+        "values": null,
+        "applyOnly": null
+      }
+    },
+    {
+      "name": "one switch",
+      "input": {
+        "intent": {
+          "kill-switch-enabled": true
+        },
+        "service": {},
+        "present": []
+      },
+      "expected": {
+        "keys": [
+          "kill-switch-enabled"
+        ],
+        "missing": [],
+        "values": {
+          "kill-switch-enabled": true
+        },
+        "applyOnly": [
+          "kill-switch-enabled"
+        ]
+      }
+    },
+    {
+      "name": "a number recorded as text goes as a number",
+      "input": {
+        "intent": {
+          "primary-probe-timeout-ms": "2000"
+        },
+        "service": {},
+        "present": []
+      },
+      "expected": {
+        "keys": [
+          "primary-probe-timeout-ms"
+        ],
+        "missing": [],
+        "values": {
+          "primary-probe-timeout-ms": 2000
+        },
+        "applyOnly": [
+          "primary-probe-timeout-ms"
+        ]
+      }
+    },
+    {
+      "name": "a binding whose adapter is here",
+      "input": {
+        "intent": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "service": {},
+        "present": [
+          "A",
+          "B"
+        ]
+      },
+      "expected": {
+        "keys": [
+          "secondary"
+        ],
+        "missing": [],
+        "values": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "applyOnly": [
+          "secondary"
+        ]
+      }
+    },
+    {
+      "name": "a binding whose adapter is gone",
+      "input": {
+        "intent": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "service": {},
+        "present": [
+          "A"
+        ]
+      },
+      "expected": {
+        "keys": [],
+        "missing": [
+          {
+            "role": "secondary",
+            "name": "Tunnel"
+          }
+        ],
+        "values": null,
+        "applyOnly": null
+      }
+    },
+    {
+      "name": "a gone adapter with no name is named by its id",
+      "input": {
+        "intent": {
+          "primary": {
+            "stable-id": "A"
+          }
+        },
+        "service": {},
+        "present": []
+      },
+      "expected": {
+        "keys": [],
+        "missing": [
+          {
+            "role": "primary",
+            "name": "A"
+          }
+        ],
+        "values": null,
+        "applyOnly": null
+      }
+    },
+    {
+      "name": "the rest goes without the missing adapter",
+      "input": {
+        "intent": {
+          "mode": "prefer-secondary-when-available",
+          "primary": {
+            "stable-id": "A",
+            "display-name": "Ethernet",
+            "user-confirmed": true
+          }
+        },
+        "service": {},
+        "present": [
+          "B"
+        ]
+      },
+      "expected": {
+        "keys": [
+          "mode"
+        ],
+        "missing": [
+          {
+            "role": "primary",
+            "name": "Ethernet"
+          }
+        ],
+        "values": {
+          "mode": "prefer-secondary-when-available"
+        },
+        "applyOnly": [
+          "mode"
+        ]
+      }
+    },
+    {
+      "name": "an unconfirmed binding stays unconfirmed",
+      "input": {
+        "intent": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel"
+          }
+        },
+        "service": {},
+        "present": [
+          "B"
+        ]
+      },
+      "expected": {
+        "keys": [
+          "secondary"
+        ],
+        "missing": [],
+        "values": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": false
+          }
+        },
+        "applyOnly": [
+          "secondary"
+        ]
+      }
+    },
+    {
+      "name": "both bindings over others",
+      "input": {
+        "intent": {
+          "primary": {
+            "stable-id": "A",
+            "display-name": "Ethernet",
+            "user-confirmed": true
+          },
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "service": {
+          "primary": {
+            "stable-id": "C",
+            "display-name": "Wi-Fi",
+            "user-confirmed": true
+          }
+        },
+        "present": [
+          "A",
+          "B",
+          "C"
+        ]
+      },
+      "expected": {
+        "keys": [
+          "primary",
+          "secondary"
+        ],
+        "missing": [],
+        "values": {
+          "primary": {
+            "stable-id": "A",
+            "display-name": "Ethernet",
+            "user-confirmed": true
+          },
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "applyOnly": [
+          "primary",
+          "secondary"
+        ]
+      }
+    },
+    {
+      "name": "a re-matched binding needs nothing",
+      "input": {
+        "intent": {
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "service": {
+          "secondary": {
+            "stable-id": "B2",
+            "display-name": "Tunnel",
+            "user-confirmed": true,
+            "known-stable-ids": [
+              "B"
+            ]
+          }
+        },
+        "present": [
+          "B2"
+        ]
+      },
+      "expected": {
+        "keys": [],
+        "missing": [],
+        "values": null,
+        "applyOnly": null
+      }
+    }
+  ]
+}

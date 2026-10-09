@@ -21,6 +21,8 @@ use nrr_desktop_gui::ui_surface::apply_qt_preferences_payload as apply_qt_payloa
 use nrr_ui_support::tray::TrayStatusKind;
 use nrr_ui_support::ui_preferences::{SessionPreferences, UiPreferences, UiPreferencesStore};
 
+use crate::user_settings_bridge::UserSettingsMirror;
+
 mod child_process;
 mod context;
 mod diag_log;
@@ -112,7 +114,7 @@ pub fn run(config: LauncherConfig) -> ExitCode {
     install_system_locale_port();
     cleanup_temp_leftovers();
     let launch_request = parse_launch_request_arguments(cli_args);
-    let (store, preferences) = load_preferences_with_fallback();
+    let (store, preferences, user_settings) = load_preferences_with_fallback();
     // Main GUI only (the tray rides the same cache). Never blocks launch; the
     // result surfaces on the next start, since the context is built before
     // the fetch can finish.
@@ -127,6 +129,7 @@ pub fn run(config: LauncherConfig) -> ExitCode {
         Ok(Some(guard)) => run_primary(
             &config,
             store,
+            user_settings,
             preferences,
             launch_request,
             tray_status,
@@ -142,6 +145,7 @@ pub fn run(config: LauncherConfig) -> ExitCode {
                     Ok(guard) => run_primary(
                         &config,
                         store,
+                        user_settings,
                         preferences,
                         launch_request,
                         tray_status,
@@ -183,6 +187,7 @@ enum SecondaryOutcome {
 fn run_primary(
     config: &LauncherConfig,
     store: Option<UiPreferencesStore>,
+    user_settings: Option<UserSettingsMirror>,
     preferences: UiPreferences,
     request: LaunchRequest,
     tray_status: Option<TrayStatusKind>,
@@ -438,7 +443,8 @@ fn run_primary(
     // force-killed GUI loses at most the last fraction of a second of changes
     // instead of everything the user did.
     let mut prefs_writer =
-        crate::prefs_persistence::DebouncedPreferenceWriter::new(tag, store, preferences);
+        crate::prefs_persistence::DebouncedPreferenceWriter::new(tag, store, preferences)
+            .with_user_settings(user_settings);
 
     // Closed pipes are the usual end of a session, but a process the host
     // started (the tray) can inherit them and hold them open after the host is
@@ -849,7 +855,20 @@ pub fn write_activation_request_with_note(
 
 // ─── Preferences round-trip ──────────────────────────────────────────────
 
-fn load_preferences_with_fallback() -> (Option<UiPreferencesStore>, UiPreferences) {
+/// The preferences with the shared user settings laid over them, plus the
+/// handles that may write each. A read-only preferences session writes neither.
+fn load_preferences_with_fallback() -> (
+    Option<UiPreferencesStore>,
+    UiPreferences,
+    Option<UserSettingsMirror>,
+) {
+    let (store, mut preferences) = load_ui_preferences();
+    let user_settings =
+        crate::user_settings_bridge::open_session(&mut preferences, store.is_some());
+    (store, preferences, user_settings)
+}
+
+fn load_ui_preferences() -> (Option<UiPreferencesStore>, UiPreferences) {
     match UiPreferencesStore::managed_local() {
         Ok(store) => {
             let path = store.path().to_path_buf();

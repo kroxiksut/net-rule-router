@@ -14,7 +14,6 @@
 *.x.com
 *.twitter.com
 *.google.com
-?accounts.google.ru
 *.youtube.com
 *.googlevideo.com
 *.tiktok.com
@@ -25,10 +24,6 @@
 *.t.me
 *.whatsapp.com
 *.signal.org
-?*.proton.me
-?*.protonmail.com
-?*.protonmail.ch
-?*.protonvpn.com
 *.openai.com
 *.chatgpt.com
 *.anthropic.com

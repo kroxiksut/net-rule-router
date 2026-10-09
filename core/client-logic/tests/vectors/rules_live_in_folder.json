@@ -1,0 +1,116 @@
+{
+  "description": "pure.js rulesLiveInFolder",
+  "cases": [
+    {
+      "name": "the bound primary file is inside",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/home/user/sets/home/rules_primary.txt"
+        },
+        "folder": "/home/user/sets"
+      },
+      "expected": true
+    },
+    {
+      "name": "backslashes and letter case do not matter",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "C:\\Users\\User\\Sets\\work\\rules_primary.txt"
+        },
+        "folder": "c:/users/user/sets"
+      },
+      "expected": true
+    },
+    {
+      "name": "a trailing slash on the folder",
+      "input": {
+        "prefs": {
+          "lastSavedPathSecondary": "/sets/a/rules_secondary.txt"
+        },
+        "folder": "/sets/"
+      },
+      "expected": true
+    },
+    {
+      "name": "a trailing backslash on the folder",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "D:/Sets/a/rules_primary.txt"
+        },
+        "folder": "D:\\Sets\\"
+      },
+      "expected": true
+    },
+    {
+      "name": "a sibling folder with a longer name is outside",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "C:/rules-x/home/rules_primary.txt"
+        },
+        "folder": "C:/rules"
+      },
+      "expected": false
+    },
+    {
+      "name": "no folder",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/sets/a/rules_primary.txt"
+        },
+        "folder": ""
+      },
+      "expected": false
+    },
+    {
+      "name": "the filesystem root reads as no folder",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/sets/a/rules_primary.txt"
+        },
+        "folder": "/"
+      },
+      "expected": false
+    },
+    {
+      "name": "nothing bound",
+      "input": {
+        "prefs": {},
+        "folder": "/sets"
+      },
+      "expected": false
+    },
+    {
+      "name": "the secondary was read from inside",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/elsewhere/rules_primary.txt",
+          "lastLoadedPathSecondary": "/sets/b/rules_secondary.txt"
+        },
+        "folder": "/sets"
+      },
+      "expected": true
+    },
+    {
+      "name": "the launch opt-in is inside",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/elsewhere/rules_primary.txt",
+          "autoOpenOnLaunchPathPrimary": "/sets/c/rules_primary.txt"
+        },
+        "folder": "/sets"
+      },
+      "expected": true
+    },
+    {
+      "name": "bound elsewhere only",
+      "input": {
+        "prefs": {
+          "lastSavedPathPrimary": "/elsewhere/a/rules_primary.txt",
+          "lastSavedPathSecondary": "D:\\other\\rules_secondary.txt"
+        },
+        "folder": "/sets"
+      },
+      "expected": false
+    }
+  ]
+}

@@ -6,8 +6,8 @@ mod choice;
 pub mod inspect;
 pub mod interfaces;
 pub mod overlaps;
-mod placeholder;
 pub mod rules;
+pub mod settings;
 mod status;
 pub mod suggestions;
 pub mod wizard;
@@ -30,13 +30,32 @@ pub enum ScreenId {
     Overlaps,
     Suggestions,
     Trace,
+    /// What was blocked while the additional route was down; opens from the
+    /// trace.
+    OutageBlocks,
     Cache,
     Diagnostics,
     Settings,
 }
 
 impl ScreenId {
-    pub const ALL: [Self; 10] = [
+    /// Navigation order: the menu's, each sub-screen right after its parent.
+    pub const ALL: [Self; 11] = [
+        Self::Status,
+        Self::Wizard,
+        Self::Interfaces,
+        Self::Rules,
+        Self::Overlaps,
+        Self::Suggestions,
+        Self::Trace,
+        Self::OutageBlocks,
+        Self::Cache,
+        Self::Diagnostics,
+        Self::Settings,
+    ];
+
+    /// The screens with a digit key, in the menu's order.
+    const KEYED: [Self; 10] = [
         Self::Status,
         Self::Wizard,
         Self::Interfaces,
@@ -58,6 +77,7 @@ impl ScreenId {
             Self::Overlaps => keys::SCREEN_OVERLAPS,
             Self::Suggestions => keys::SCREEN_SUGGESTIONS,
             Self::Trace => keys::SCREEN_TRACE,
+            Self::OutageBlocks => keys::SCREEN_OUTAGE_BLOCKS,
             Self::Cache => keys::SCREEN_CACHE,
             Self::Diagnostics => keys::SCREEN_DIAGNOSTICS,
             Self::Settings => keys::SCREEN_SETTINGS,
@@ -68,14 +88,15 @@ impl ScreenId {
         Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
     }
 
-    /// The jump key shown beside the menu item: `1`–`9`, then `0`.
-    pub fn hotkey(self) -> char {
-        let n = (self.index() + 1) % 10;
-        char::from_digit(n as u32, 10).unwrap_or('0')
+    /// The jump key shown beside the menu item: `1`–`9`, then `0`. A
+    /// sub-screen has none: it opens from its parent.
+    pub fn hotkey(self) -> Option<char> {
+        let at = Self::KEYED.iter().position(|s| *s == self)?;
+        char::from_digit(((at + 1) % 10) as u32, 10)
     }
 
     pub fn from_hotkey(c: char) -> Option<Self> {
-        Self::ALL.into_iter().find(|s| s.hotkey() == c)
+        Self::KEYED.into_iter().find(|s| s.hotkey() == Some(c))
     }
 
     pub fn next(self) -> Self {
@@ -141,9 +162,10 @@ pub fn screen(id: ScreenId) -> &'static dyn Screen {
         ScreenId::Overlaps => &overlaps::OverlapsScreen,
         ScreenId::Suggestions => &suggestions::SuggestionsScreen,
         ScreenId::Trace => &inspect::trace::TraceScreen,
+        ScreenId::OutageBlocks => &inspect::outage::OutageScreen,
         ScreenId::Cache => &inspect::cache::CacheScreen,
         ScreenId::Diagnostics => &inspect::diagnostics::DiagnosticsScreen,
-        _ => &placeholder::Placeholder,
+        ScreenId::Settings => &settings::SettingsScreen,
     }
 }
 
@@ -164,11 +186,15 @@ mod tests {
 
     #[test]
     fn hotkeys_run_one_to_nine_then_zero_and_back() {
-        let keys: String = ScreenId::ALL.iter().map(|s| s.hotkey()).collect();
+        let keys: String = ScreenId::ALL.iter().filter_map(|s| s.hotkey()).collect();
         assert_eq!(keys, "1234567890");
         for s in ScreenId::ALL {
-            assert_eq!(ScreenId::from_hotkey(s.hotkey()), Some(s));
+            if let Some(key) = s.hotkey() {
+                assert_eq!(ScreenId::from_hotkey(key), Some(s));
+            }
             assert_eq!(s.next().previous(), s);
         }
+        assert_eq!(ScreenId::OutageBlocks.hotkey(), None);
+        assert_eq!(ScreenId::Trace.next(), ScreenId::OutageBlocks);
     }
 }

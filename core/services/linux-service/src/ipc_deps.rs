@@ -556,12 +556,17 @@ pub(crate) fn build_ipc_surface(
                         as Arc<dyn nrr_service_runtime::ipc_handlers::MutationExecutor>,
                 ),
             ));
+            // A `?` verdict takes effect now rather than at the next tick.
+            let verify_cycle = Arc::clone(&cycle);
             let runner = main_link_probe(
                 Arc::clone(&engine),
                 probe_cache,
                 Arc::clone(&stats_state_conn),
                 probe_route_table,
                 main_route_verdicts,
+                Arc::new(move |_sid: &str| {
+                    verify_cycle.tick_logged("verify");
+                }),
             );
             auto_probe = Some(nrr_service_runtime::service_tasks::AutoProbeWiring {
                 runner: Arc::clone(&runner),
@@ -695,6 +700,7 @@ fn main_link_probe(
     state_conn: Arc<Mutex<rusqlite::Connection>>,
     route_table: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
     verdicts: Arc<nrr_service_runtime::main_route_verdicts::MainRouteVerdicts>,
+    reapply: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Arc<dyn nrr_service_runtime::ipc_handlers::providers::AutoRuleProbeRunner> {
     use nrr_service_runtime::path_probe::{PathProber, ProbeLimits};
     use nrr_service_runtime::production_auto_rule_probe::{
@@ -710,7 +716,7 @@ fn main_link_probe(
             ),
             route_table,
         ));
-    // `?host` rules: the TLS check runs from the engine's own tick.
+    // `?` rules: the check runs from the engine's own tick.
     engine.attach_verify_primary(nrr_service_runtime::auto_rules::VerifyPrimaryWiring {
         probe: Arc::new(LinkBoundPathProbe),
         egress: Arc::clone(&egress),
@@ -721,6 +727,7 @@ fn main_link_probe(
                 nrr_service_runtime::production_rules_provider::include_subdomains_for(&guard, sid)
             })
         },
+        reapply: Some(reapply),
     });
     // The user's own bounds, clamped by `ProbeLimits::new`.
     let limits_for = Arc::new(move |sid: &str| {

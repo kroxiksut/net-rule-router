@@ -16,6 +16,7 @@ pub enum AppSection {
     VirtualMachines,
     Diagnostics,
     ConnectionTrace,
+    OutageBlocks,
     Cache,
     Logs,
     Settings,
@@ -31,7 +32,7 @@ impl AppSection {
         Self::Settings,
     ];
 
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::InterfacesAndRoutes,
         Self::Rules,
         Self::RuleSuggestions,
@@ -39,6 +40,7 @@ impl AppSection {
         Self::VirtualMachines,
         Self::Diagnostics,
         Self::ConnectionTrace,
+        Self::OutageBlocks,
         Self::Cache,
         Self::Logs,
         Self::Settings,
@@ -53,6 +55,7 @@ impl AppSection {
             Self::VirtualMachines => "rule-virtual-machines",
             Self::Diagnostics => "diagnostics",
             Self::ConnectionTrace => "conn-trace",
+            Self::OutageBlocks => "outage-blocks",
             Self::Cache => "cache",
             Self::Logs => "logs",
             Self::Settings => "settings",
@@ -68,6 +71,7 @@ impl AppSection {
             Self::VirtualMachines => "Virtual machines",
             Self::Diagnostics => "Diagnostics",
             Self::ConnectionTrace => "Connection trace",
+            Self::OutageBlocks => "Blocked while the route was down",
             Self::Cache => "Cache",
             Self::Logs => "Logs",
             Self::Settings => "Settings",
@@ -93,6 +97,7 @@ impl FromStr for AppSection {
             "rule-virtual-machines" => Ok(Self::VirtualMachines),
             "diagnostics" => Ok(Self::Diagnostics),
             "conn-trace" => Ok(Self::ConnectionTrace),
+            "outage-blocks" => Ok(Self::OutageBlocks),
             "cache" => Ok(Self::Cache),
             "logs" => Ok(Self::Logs),
             "settings" => Ok(Self::Settings),

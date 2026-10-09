@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crossterm::event::KeyCode;
 use nrr_ipc_client::ConnectionStatus;
+use nrr_shared::ipc::IpcOperationName;
 use serde_json::{json, Value};
 
 use super::*;
@@ -24,6 +25,12 @@ fn row(id: &str, rule_type: &str, value: &str, route: &str) -> Value {
     })
 }
 
+fn unsure(id: &str, rule_type: &str, value: &str, route: &str) -> Value {
+    let mut entry = row(id, rule_type, value, route);
+    entry["verify"] = Value::Bool(true);
+    entry
+}
+
 fn service() -> FakeService {
     let fake = FakeService::new(ConnectionStatus::Connected);
     fake.answer(
@@ -34,7 +41,7 @@ fn service() -> FakeService {
                 row("R-2", "exact-fqdn", "video.example.com", "secondary"),
                 row("R-3", "exact-fqdn", "dup.test", "primary"),
                 row("R-4", "exact-fqdn", "dup.test", "secondary"),
-                row("R-5", "suffix-domain", "chat.test", "verify"),
+                unsure("R-5", "suffix-domain", "chat.test", "secondary"),
                 row("R-6", "exact-fqdn", "api.chat.test", "primary"),
                 row("R-7", "exact-fqdn", "ads.example.net", "block"),
                 row("R-8", "exact-fqdn", "ads.example.net", "primary"),
@@ -101,8 +108,8 @@ fn pairs_say_which_route_the_sites_take() {
         "{wide}"
     );
     assert!(
-        wide.contains("A rule that tries the primary route first is part of this pair"),
-        "{wide}"
+        wide.contains("than *.chat.test (Domain) on Additional."),
+        "a ? rule is a rule of its route: {wide}"
     );
     assert!(wide.contains("Decision: Not confirmed"), "{wide}");
     assert_snapshot("overlaps-80x24", &render(&app, 80, 24));
@@ -115,8 +122,8 @@ fn the_rows_counted_for_scrolling_are_the_rows_drawn() {
     let texts = texts_en();
     for (i, pair) in app.overlaps.shown().iter().enumerate() {
         assert_eq!(
-            pair_line_count(&app.overlaps, pair),
-            pair_item_lines(&app.overlaps, pair, i, false, &texts).len(),
+            pair_line_count(&app, pair),
+            pair_item_lines(&app, pair, i, false, &texts).len(),
             "{}",
             pair.key
         );
@@ -154,12 +161,13 @@ fn sending_over_edits_the_rules_and_waits_for_apply() {
     press(&mut app, KeyCode::End);
     press(&mut app, KeyCode::Char('o'));
     let moved = app
-        .overlaps
-        .rows
-        .iter()
-        .find(|r| r.id == "R-2")
-        .expect("R-2");
+        .rules
+        .table
+        .rules()
+        .find(|r| r.match_value == "video.example.com")
+        .expect("video.example.com");
     assert_eq!(moved.target_route, TargetRoute::Primary);
+    assert!(rules::holds_unapplied(&app), "the Rules screen applies it");
     assert!(!winners(&app).contains(&"video.example.com".to_string()));
     let wide = render(&app, 200, 60);
     assert!(
@@ -174,16 +182,27 @@ fn sending_over_edits_the_rules_and_waits_for_apply() {
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Char('o'));
     let copy = app
-        .overlaps
-        .rows
-        .iter()
-        .find(|r| r.id == "R-3")
-        .expect("R-3");
+        .rules
+        .table
+        .rules()
+        .find(|r| r.id == "R-0003")
+        .expect("R-0003");
     assert!(!copy.enabled);
 
-    // A "primary first" side cannot trade places here.
+    // A `?` rule is a rule of its route: its pair trades places too.
     press(&mut app, KeyCode::Home);
     press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('o'));
+    let api = app
+        .rules
+        .table
+        .rules()
+        .find(|r| r.match_value == "api.chat.test")
+        .expect("api.chat.test");
+    assert_eq!(api.target_route, TargetRoute::Secondary);
+
+    // A block side cannot.
+    press(&mut app, KeyCode::Home);
     press(&mut app, KeyCode::Char('o'));
     assert!(render(&app, 200, 60).contains("cannot be sent over the other route here"));
 
@@ -191,6 +210,28 @@ fn sending_over_edits_the_rules_and_waits_for_apply() {
     app.open(ScreenId::Status);
     app.open(ScreenId::Overlaps);
     assert!(app.outbox.take().is_empty());
+    assert_eq!(fake.operations(), vec![IpcOperationName::RulesList]);
+}
+
+#[test]
+fn the_pairs_follow_an_edit_on_the_rules_screen() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    assert!(winners(&app).contains(&"video.example.com".to_string()));
+    assert!(!render(&app, 200, 60).contains("Rule changes take effect only after"));
+
+    // Rule 2 of the list is video.example.com; switching it off on the Rules
+    // screen ends its pair here, before anything is applied.
+    app.open(ScreenId::Rules);
+    assert!(crate::screens::screen(ScreenId::Rules).on_line(&mut app, "t 2"));
+    app.open(ScreenId::Overlaps);
+    assert!(!winners(&app).contains(&"video.example.com".to_string()));
+    assert_eq!(app.overlaps.pending_count(), 3);
+    let wide = render(&app, 200, 60);
+    assert!(
+        wide.contains("Rule changes take effect only after you review and apply them."),
+        "{wide}"
+    );
     assert_eq!(fake.operations(), vec![IpcOperationName::RulesList]);
 }
 

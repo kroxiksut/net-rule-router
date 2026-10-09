@@ -618,13 +618,15 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         // so a routing-active user's `route.policy.update` recompiles their
         // WFP filters mid-session. Only when the orchestrator exists (WFP available); otherwise the
         // update stays persist-only and applies on the next tray connect.
-        if let Some(orch) = per_sid_orchestrator.as_ref() {
-            let trigger = build_apply_trigger(
+        let policy_trigger = per_sid_orchestrator.as_ref().map(|orch| {
+            build_apply_trigger(
                 orch,
                 &sid_registry,
                 route_coordinator.as_ref(),
                 pause_coordinator.as_ref(),
-            );
+            )
+        });
+        if let Some(trigger) = policy_trigger.clone() {
             deps = deps.with_route_policy_apply_trigger(trigger);
         }
         // Wire the per-SID link-provider app writer so
@@ -764,7 +766,8 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             cache_store.as_ref(),
             settings_conn.as_ref(),
         ) {
-            // `?host` rules: the TLS check runs from the engine's own tick.
+            // `?` rules: the check runs from the engine's own tick; a verdict
+            // re-applies its owner's policy the way a policy edit does.
             engine.attach_verify_primary(nrr_service_runtime::auto_rules::VerifyPrimaryWiring {
                 probe: Arc::new(nrr_service_runtime::path_probe::SystemPathProbe),
                 egress: Arc::clone(coord)
@@ -778,6 +781,10 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                         )
                     })
                 },
+                reapply: policy_trigger.clone().map(|trigger| {
+                    Arc::new(move |sid: &str| trigger.on_policy_changed(sid))
+                        as Arc<dyn Fn(&str) + Send + Sync>
+                }),
             });
             let fqdn_for_probe: Arc<dyn FqdnCacheLookup> = Arc::new(SqliteFqdnCacheLookup::new(
                 Arc::clone(cache_arc),
@@ -906,6 +913,13 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         // snapshot serves the standing ones to a client that connects later.
         if let Some(coord) = route_coordinator.as_ref() {
             deps = deps.with_route_enforcement_status(coord.enforcement_status());
+            // The additional route's status opens and closes the outage list
+            // the trace ring keeps.
+            if let Some(ring) = conn_trace_ring.as_ref() {
+                coord
+                    .enforcement_status()
+                    .watch_outages(Arc::clone(ring.outage_blocks()));
+            }
         }
         // Live fake-IP datapath probe for `service.health.get` /
         // `snapshot.initial.get`, so the GUI can show "fake-IP is ON but the
@@ -921,6 +935,15 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         // dismiss act on exactly the suggestions the service parked.
         if let Some(engine) = auto_rules_engine.as_ref() {
             deps = deps.with_auto_rules(Arc::clone(engine));
+            // `?` address rules are checked for the connections programs make.
+            if let Some(ring) = conn_trace_ring.as_ref() {
+                let engine = Arc::clone(engine);
+                ring.attach_connection_watch(Arc::new(
+                    move |sid: &str, remote: std::net::SocketAddr| {
+                        engine.note_verify_connection(sid, remote)
+                    },
+                ));
+            }
         }
         // Block-notice mutes: the durable store plus the SAME
         // `block_notice_center` the connection observer feeds, so a mute set

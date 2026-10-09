@@ -112,6 +112,8 @@ GroupBox {
                     "Could not remove the mute: ") + root.ipcErrorLabel(code)
                 return
             }
+            if (root.settingsRestoreController)
+                root.settingsRestoreController.recordMutes((p && p.mutes) || [])
             group._blockNoticeMutes = group._normalizeBlockNoticeMutes((p && p.mutes) || [])
         })
     }
@@ -133,6 +135,8 @@ GroupBox {
                     "Could not add the mute: ") + root.ipcErrorLabel(code)
                 return
             }
+            if (root.settingsRestoreController)
+                root.settingsRestoreController.recordMutes((p && p.mutes) || [])
             group._blockNoticeMutes = group._normalizeBlockNoticeMutes((p && p.mutes) || [])
             root.statusLine = root.tr("settings.block-notices.add.saved", "Mute added.")
         })

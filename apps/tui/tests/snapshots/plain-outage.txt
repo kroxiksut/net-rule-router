@@ -1,0 +1,136 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Status
+Service: OK
+Routing state:
+  Routing active
+  Rules apply on this user session.
+Connections:
+  Main connection: Ethernet — Example Network Adapter — Available — Rules applied
+  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+Notifications:
+  No notifications.
+Commands on this screen:
+  r: restore your settings to a service that lost them
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Connection trace
+Service: OK
+Connection trace:
+  Loading connections...
+  Show blocked: No · Show local connections: No · IPv6 only: No
+Connections:
+Selected connection:
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that connection, for example d 3
+  e and a row number: why that connection took its route, for example e 3
+  / and text: search all fields, for example /example; / on its own clears the search
+  b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+  o: what was blocked while the additional route was down
+Type a screen number, h for help or q to quit, then press Enter.
+Connection trace: Shown: 12 of 14.
+Connections: > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
+Connections: 2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) · Allowed
+Connections: 3. browser.exe → 203.0.113.3:443 · site.example — Primary · Allowed
+Connections: 4. browser.exe → 203.0.113.4:443 · site.example — Additional (VPN) · Allowed
+Connections: 5. browser.exe → 203.0.113.5:443 · site.example — Primary · Allowed
+Connections: 6. browser.exe → 203.0.113.6:443 · site.example — Additional (VPN) · Allowed
+Connections: 7. browser.exe → 203.0.113.7:443 · site.example — Primary · Allowed
+Connections: 8. browser.exe → 203.0.113.8:443 · site.example — Additional (VPN) · Allowed
+Connections: 9. browser.exe → 203.0.113.9:443 · site.example — Primary · Allowed
+Connections: 10. browser.exe → 203.0.113.10:443 · site.example — Additional (VPN) · Allowed
+Connections: Rows 1–10 of 12.
+Selected connection: Process: browser.exe
+Selected connection: Remote: 203.0.113.1:443 · site.example
+Selected connection: Names this address was answered for (1): site.example
+Selected connection: Egress: Primary
+Selected connection: Verdict: Allowed
+Selected connection: TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
+Selected connection: Enter / e: Why this route?
+
+Screen: Blocked while the route was down
+Service: OK
+Blocked while the route was down:
+  What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
+  Loading...
+Connections:
+Selected connection:
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that connection, for example d 3
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+Blocked while the route was down: The additional route has been down since 2026-10-06 11:50:00.
+Blocked while the route was down: 3: Open interfaces and routes
+Connections: Process | Remote | Attempts | First | Last
+Connections: > 1. browser.exe | video.example.com · 203.0.113.5:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+Connections: 2. updater.exe | cdn.example.net · [2001:db8::7]:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+Connections: 3. ? | 198.51.100.9 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+Connections: Rows 1–3 of 3.
+Selected connection: Process: browser.exe
+Selected connection: Path: /opt/example/browser.exe
+Selected connection: Remote: video.example.com · 203.0.113.5:443
+Selected connection: Attempts: 12
+Selected connection: First: 2026-10-06 11:51:00
+Selected connection: Last: 2026-10-06 11:59:00
+
+Screen: Blocked while the route was down
+Service: OK
+Blocked while the route was down:
+  What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
+  The additional route has been down since 2026-10-06 11:50:00.
+  3: Open interfaces and routes
+Connections:
+  Process | Remote | Attempts | First | Last
+  > 1. browser.exe | video.example.com · 203.0.113.5:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+    2. updater.exe | cdn.example.net · [2001:db8::7]:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+    3. ? | 198.51.100.9 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+  Rows 1–3 of 3.
+Selected connection:
+  Process: browser.exe
+  Path: /opt/example/browser.exe
+  Remote: video.example.com · 203.0.113.5:443
+  Attempts: 12
+  First: 2026-10-06 11:51:00
+  Last: 2026-10-06 11:59:00
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that connection, for example d 3
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Blocked while the route was down
+Service: OK
+Blocked while the route was down:
+  What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
+  The additional route has been down since 2026-10-06 11:50:00.
+  3: Open interfaces and routes
+Connections:
+  Process | Remote | Attempts | First | Last
+    1. browser.exe | video.example.com · 203.0.113.5:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+  > 2. updater.exe | cdn.example.net · [2001:db8::7]:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+    3. ? | 198.51.100.9 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+  Rows 1–3 of 3.
+Selected connection:
+  Process: updater.exe
+  Remote: cdn.example.net · [2001:db8::7]:443
+  Attempts: 12
+  First: 2026-10-06 11:51:00
+  Last: 2026-10-06 11:59:00
+Commands on this screen:
+  n: next page (more)   p: previous page (back)
+  d and a row number: show that connection, for example d 3
+  r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
+Type a screen number, h for help or q to quit, then press Enter.

@@ -445,6 +445,7 @@ pub fn write_qt_context_file_at(
                             nrr_shared::RouteRole::Primary => "primary",
                             nrr_shared::RouteRole::Secondary => "secondary",
                         },
+                        "verify": false,
                         "comment": row.comment,
                         "validationStatus": validation.status_slug(),
                         "validationMessageKey": validation.message_key(),

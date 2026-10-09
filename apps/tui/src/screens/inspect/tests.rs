@@ -109,7 +109,37 @@ fn diagnostics_status() -> Value {
     })
 }
 
-/// A service with an answer for every operation the three screens use.
+fn outage_row(process: &str, ip: &str, port: u16, host: &str, rule_host: &str) -> Value {
+    json!({
+        "process": process,
+        "process-path": if process == "browser.exe" { "/opt/example/browser.exe" } else { "" },
+        "remote-ip": ip,
+        "remote-port": port,
+        "host": host,
+        "rule-host": rule_host,
+        "first-seen-ms": NOON - 540_000,
+        "last-seen-ms": NOON - 60_000,
+        "attempts": 12
+    })
+}
+
+/// An outage answer with three rows; `episode` null for none.
+fn outage(episode: Value, omitted: u32) -> Value {
+    json!({
+        "episode": episode,
+        "entries": [
+            outage_row("browser.exe", "203.0.113.5", 443, "video.example.com", "example.com"),
+            outage_row("updater.exe", "2001:db8::7", 443, "", "cdn.example.net"),
+            outage_row("?", "198.51.100.9", 0, "", ""),
+        ],
+        "omitted": omitted,
+        "redacted": false,
+        "observer-active": true,
+        "gui-stream-enabled": true
+    })
+}
+
+/// A service with an answer for every operation the screens use.
 fn service() -> FakeService {
     let fake = FakeService::new(ConnectionStatus::Connected);
     let mut trace: Vec<Value> = (0..12)
@@ -219,6 +249,10 @@ fn service() -> FakeService {
             }],
             "next_cursor": null, "total_count": 2, "stale": false
         }),
+    );
+    fake.answer(
+        IpcOperationName::ConnTraceOutageBlocksList,
+        outage(json!({ "since-unix-ms": NOON - 600_000 }), 0),
     );
     fake.answer(
         IpcOperationName::DiagnosticsExportArchive,
@@ -443,4 +477,183 @@ fn line_mode_acknowledges_explains_and_reads_the_log() {
     );
     assert!(text.contains("Level: Info"), "{text}");
     assert_snapshot("plain-diagnostics", &text);
+}
+
+/// A screen's words, panel by panel, without the wrapping of a terminal.
+fn view_text(app: &AppState, id: ScreenId) -> String {
+    let texts = texts_en();
+    let view = crate::screens::screen(id).view(app, &texts);
+    let mut out = String::new();
+    for panel in &view.panels {
+        out.push_str(&panel.title);
+        out.push('\n');
+        for line in &panel.lines {
+            out.push_str(&line.plain_text());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn outage_text(answer: Value) -> String {
+    let fake = service();
+    fake.answer(IpcOperationName::ConnTraceOutageBlocksList, answer);
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::OutageBlocks);
+    view_text(&app, ScreenId::OutageBlocks)
+}
+
+#[test]
+fn the_outage_list_names_what_was_blocked_while_the_route_is_down() {
+    let fake = service();
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::OutageBlocks);
+    let picture = render(&app, 140, 40);
+    assert!(
+        picture.contains("Blocked while the route was down"),
+        "the menu shows the screen while it is open:\n{picture}"
+    );
+    assert_snapshot("outage-140x40", &picture);
+
+    let text = view_text(&app, ScreenId::OutageBlocks);
+    assert!(
+        text.contains("The additional route has been down since 2026-10-06 11:50:00."),
+        "{text}"
+    );
+    assert!(
+        text.contains("Process | Remote | Attempts | First | Last"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "browser.exe | video.example.com · 203.0.113.5:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("updater.exe | cdn.example.net · [2001:db8::7]:443"),
+        "the rule's host stands in for a missing name:\n{text}"
+    );
+    assert!(text.contains("? | 198.51.100.9 | 12"), "{text}");
+    assert!(text.contains("3: Open interfaces and routes"), "{text}");
+    assert!(text.contains("Path: /opt/example/browser.exe"), "{text}");
+
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Down);
+    let text = view_text(&app, ScreenId::OutageBlocks);
+    assert!(text.contains("Remote: cdn.example.net"), "{text}");
+    assert!(!text.contains("Path:"), "{text}");
+}
+
+#[test]
+fn an_ended_outage_says_when_and_offers_no_fix() {
+    let text = outage_text(outage(
+        json!({ "since-unix-ms": NOON - 600_000, "until-unix-ms": NOON }),
+        0,
+    ));
+    assert!(
+        text.contains("The last outage lasted from 2026-10-06 11:50:00 to 2026-10-06 12:00:00."),
+        "{text}"
+    );
+    assert!(!text.contains("Open interfaces and routes"), "{text}");
+}
+
+#[test]
+fn without_an_outage_the_screen_says_so() {
+    let mut answer = outage(Value::Null, 0);
+    answer["entries"] = json!([]);
+    let text = outage_text(answer);
+    assert!(
+        text.contains("The additional route has not been down since the service started."),
+        "{text}"
+    );
+    assert!(!text.contains("Nothing was blocked"), "{text}");
+}
+
+#[test]
+fn an_outage_with_nothing_blocked_and_a_cut_list_are_said() {
+    let mut answer = outage(json!({ "since-unix-ms": NOON }), 0);
+    answer["entries"] = json!([]);
+    let text = outage_text(answer);
+    assert!(
+        text.contains("Nothing was blocked during this outage."),
+        "{text}"
+    );
+
+    let text = outage_text(outage(json!({ "since-unix-ms": NOON }), 2));
+    assert!(
+        text.contains("2 older entries did not fit in the list."),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_empty_list_that_cannot_be_filled_says_why() {
+    let mut answer = outage(json!({ "since-unix-ms": NOON }), 0);
+    answer["entries"] = json!([]);
+    answer["observer-active"] = json!(false);
+    let text = outage_text(answer.clone());
+    assert!(
+        text.contains("cannot tell which connections an outage blocked"),
+        "{text}"
+    );
+    assert!(!text.contains("Nothing was blocked"), "{text}");
+
+    answer["observer-active"] = json!(true);
+    answer["gui-stream-enabled"] = json!(false);
+    let text = outage_text(answer);
+    assert!(
+        text.contains("Showing the connection trace is switched off in Settings"),
+        "{text}"
+    );
+    assert!(!text.contains("Nothing was blocked"), "{text}");
+}
+
+#[test]
+fn o_on_the_trace_opens_the_outage_list_and_r_reads_it_again() {
+    let fake = service();
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Trace);
+    let picture = render(&app, 140, 40);
+    assert!(!picture.contains("Blocked while the route was down"));
+    key(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.screen, ScreenId::OutageBlocks);
+    settle(&mut app, &fake);
+    key(&mut app, KeyCode::Char('r'));
+    settle(&mut app, &fake);
+    let reads = fake
+        .operations()
+        .iter()
+        .filter(|op| **op == IpcOperationName::ConnTraceOutageBlocksList)
+        .count();
+    assert_eq!(reads, 2);
+}
+
+#[test]
+fn line_mode_reads_the_outage_list() {
+    let text = transcript(&["7", "o", "", "d 2"]);
+    assert!(
+        text.contains("o: what was blocked while the additional route was down"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Screen: Blocked while the route was down"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Remote: cdn.example.net · [2001:db8::7]:443"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{1b}'), "{text}");
+    assert_snapshot("plain-outage", &text);
+}
+
+#[test]
+fn a_time_today_is_a_clock_time_and_another_day_carries_its_date() {
+    assert_eq!(super::clock_time_at(NOON, NOON + 3_600_000), "12:00:00");
+    assert_eq!(
+        super::clock_time_at(NOON, NOON + 2 * 86_400_000),
+        "2026-10-06 12:00:00"
+    );
+    assert_eq!(super::clock_time_at(0, NOON), "—");
 }

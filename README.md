@@ -89,7 +89,7 @@ The full walkthrough, including what to do if you lose network access, is in
   stops a site you route.
 - **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
 - **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
-- **Rules that adapt to your provider** — put `?` before a site in the additional-route file and it goes over your main connection for as long as that works. Once your provider is shown to block it, the app moves the rule to the additional route by itself and tells you. The bundled presets use this for services some providers block and others do not, so one pack fits any provider.
+- **Rules that adapt to your provider** — put `?` before a site or an address (or tick "Unsure" when you add one) and it works over the route you wrote it for. If it does not open there but opens over the other route, the app sends it over the other route and offers to move the rule; until you agree, the move lasts until the computer restarts. The bundled presets use this for services some providers block and others do not, so one pack fits any provider.
 - **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a background service that applies policy at startup. The tray menu and its notices are still being shaped ahead of the first release; what they contain and how they look may change between builds.
 - **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme.
 - **RU / EN out of the box**, with drop-in community locales (no rebuild needed).
@@ -154,9 +154,9 @@ alibaba.com
 *.alibaba.com
 ```
 
-Lines marked with `?` (for example `?accounts.google.com`) are tried over the
-main route first and move to the additional route only where your provider
-blocks them. The full format is documented in
+Lines marked with `?` (for example `?accounts.google.com`) work over the route
+of their file; where your provider blocks them there and the other route opens
+them, the app offers to move them. The full format is documented in
 [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md).
 
 > The bundled country presets are AI-authored drafts meant as a convenient

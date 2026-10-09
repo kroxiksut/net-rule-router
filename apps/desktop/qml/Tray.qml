@@ -172,6 +172,7 @@ SystemTrayIcon {
         _autoRuleActiveIds = []
         _enforcementNoticeKind = ""
         _noticeMuteKind = ""
+        _verifyVerdictOnScreen = false
         // A block notice nobody answered is not quieted: unseen is not seen.
         _blockNoticeShown = []
         _blockNoticeRows = []
@@ -293,6 +294,7 @@ SystemTrayIcon {
             }
             tray._noticeMutes = (p && p.mutes) || []
             tray._noticeMutesReadAtMs = Date.now()
+            tray._recordIntent({ "namespace": "notice-mutes", "value": tray._noticeMutes })
         })
     }
 
@@ -377,8 +379,12 @@ SystemTrayIcon {
         refreshTooltip()
         // A service that just came up has an enforcement state we have not read
         // yet; one that went away invalidates what we read before.
-        if (serviceStatus === 4) _refreshEnforcementState()
-        else _enforcementKnown = false
+        if (serviceStatus === 4) {
+            _refreshEnforcementState()
+            verifyVerdicts.refresh()
+        } else {
+            _enforcementKnown = false
+        }
     }
 
     // Single demux point for every server-pushed status event the tray cares
@@ -405,8 +411,8 @@ SystemTrayIcon {
             case "secondary-external-address-observed":
                 _onSecondaryExternalAddress(event, eventId)
                 break
-            case "verify-primary-moved":
-                _onVerifyPrimaryMoved(event)
+            case "verify-verdicts-changed":
+                verifyVerdicts.refresh()
                 break
             case "block-notice-raised":
                 _onBlockNoticeRaised(event)
@@ -931,21 +937,99 @@ SystemTrayIcon {
         })
     }
 
-    /// A `?` rule moved to the additional route. Happens once per rule, so it
-    /// is told once and needs no "Don't show…".
-    function _onVerifyPrimaryMoved(event) {
+    // ── `?` rules that work only on the other route ──────────────────────────
+    //
+    // The service holds the list; the window shows the same question as a card.
+    // An answer on either surface empties the list, and the push that says so
+    // takes this notice down.
+    property var verifyVerdicts: VerifyVerdicts {
+        rpc: tray.rpc
+        onNoticeChanged: tray._onVerifyVerdictsChanged()
+    }
+    /// Ids the last notice carried: a refresh that brings nothing new does not
+    /// raise it again.
+    property var _verifyVerdictShownIds: []
+    property bool _verifyVerdictOnScreen: false
+
+    function _onVerifyVerdictsChanged() {
+        var notice = verifyVerdicts.notice
+        if (!notice) {
+            _verifyVerdictShownIds = []
+            if (_verifyVerdictOnScreen && promptWindow.visible) promptWindow.retire()
+            _verifyVerdictOnScreen = false
+            return
+        }
         if (!showNotifications) return
-        var host = String(event.host || "")
-        if (host === "") return
-        _presentOrQueue("verify-moved", function() {
-            promptWindow.present({
-                titleText: tr("tray.verify-moved.title", "Site moved to the additional route"),
-                bodyText: Pure.fillPlaceholders(tr("tray.verify-moved.body",
-                        "{host} does not open over the primary route, so its rule now uses the additional route."),
-                    { host: "<b>" + _escapeMarkup(host) + "</b>" }),
-                bodyRichText: true,
-                autoRetireMs: _infoNoticeMs
+        var fresh = false
+        for (var i = 0; i < notice.ids.length; i += 1) {
+            if (_verifyVerdictShownIds.indexOf(notice.ids[i]) < 0) { fresh = true; break }
+        }
+        if (!fresh) return
+        _verifyVerdictShownIds = notice.ids.slice()
+        _presentOrQueue("verify-verdicts", function() { tray._showVerifyVerdicts() })
+    }
+
+    function _showVerifyVerdicts() {
+        var notice = verifyVerdicts.notice
+        if (!notice) {
+            _scheduleDrain()
+            return
+        }
+        var items = []
+        for (var i = 0; i < notice.shown.length; i += 1) {
+            items.push({
+                primaryText: notice.shown[i].value,
+                secondaryText: notice.shown[i].to === "secondary"
+                    ? routeSecondaryLabel : routePrimaryLabel
             })
+        }
+        var body = tr("notifications.verify-verdicts.body",
+            "They do get through over the other route and use it until the next restart. “Move” writes them there for good; “Not now” keeps them as written and checks again after the restart.")
+        if (notice.more > 0) {
+            body += "\n" + tr("notifications.block-notice.backlog.more", "and {count} more")
+                .replace("{count}", String(notice.more))
+        }
+        _verifyVerdictOnScreen = true
+        promptWindow.present({
+            titleText: tr("notifications.verify-verdicts.title",
+                    "Addresses that do not open where they are written: {count}")
+                .replace("{count}", String(notice.ids.length)),
+            bodyText: body,
+            items: items,
+            listAccessibleName: tr("notifications.verify-verdicts.list",
+                "Rules and the route they would move to"),
+            primaryAction: {
+                label: tr("action.move", "Move"),
+                actionId: "verify-verdicts-move",
+                accent: true
+            },
+            secondaryAction: {
+                label: tr("action.not-now", "Not now"),
+                actionId: "verify-verdicts-later"
+            },
+            // Closing the window answers nothing: the card in the main window
+            // still asks.
+            dismissActionId: "verify-verdicts-close",
+            autoRetireMs: _promptAutoRetireMs
+        })
+    }
+
+    /// "Move" from the tray. With a rule-set folder the move is made here and
+    /// the bound files follow it; without one the folder has to be chosen
+    /// first, and that happens in the main window, where the same card waits.
+    function _moveVerifyVerdicts() {
+        var presence = guiPresence ? guiPresence.read() : { rulesFolder: "" }
+        if (String(presence.rulesFolder || "") === "") {
+            if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+                    && typeof nrrNativeBridge.openMainGuiFocused === "function") {
+                nrrNativeBridge.openMainGuiFocused("rules", "", "")
+            } else {
+                triggerAction("rules")
+            }
+            return
+        }
+        verifyVerdicts.accept(function(ok, code) {
+            if (!ok) console.log("tray verify-verdicts: accept failed:", code)
         })
     }
 
@@ -1595,7 +1679,7 @@ SystemTrayIcon {
                 accent: true
             }
             : _blockNoticeRouteAction()
-        return _blockNoticeSnoozeMuteActions({
+        var config = _blockNoticeSnoozeMuteActions({
             titleText: routeIsDown
                 ? tr("tray.block-notice.title-route-down", "Additional route is unavailable")
                 : tr("tray.block-notice.title", "Connection blocked"),
@@ -1604,6 +1688,25 @@ SystemTrayIcon {
             bodyAccessibleText: spoken,
             primaryAction: primary
         })
+        if (routeIsDown) config.dismissAction = _outageListAction()
+        return config
+    }
+
+    /// One notice stands for the whole outage; the list of everything it
+    /// blocked lives in the main window.
+    function _outageListAction() {
+        return {
+            label: tr("action.outage-blocks", "What was blocked"),
+            actionId: "block-notice-outage-list"
+        }
+    }
+    function _openOutageList() {
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.openMainGuiFocused !== "function") {
+            console.log("tray: cannot open the outage list — bridge unavailable")
+            return
+        }
+        nrrNativeBridge.openMainGuiFocused("outage-blocks", "", "")
     }
 
     /// Whether adding a rule could do anything about this block. A route that
@@ -1764,9 +1867,12 @@ SystemTrayIcon {
                 "Blocked connections"),
             primaryAction: primary
         }
-        // The addresses behind a folded row are one press away, and never
-        // offered while the user asked for addresses to stay hidden.
-        if (folded && !hideBlockNoticeAddresses) {
+        // An outage's rows lead to its full list, which the details could
+        // only show the start of. Otherwise the addresses behind a folded row
+        // are one press away, never while addresses are to stay hidden.
+        if (sharedReason === "route-unavailable") {
+            config.dismissAction = _outageListAction()
+        } else if (folded && !hideBlockNoticeAddresses) {
             config.dismissAction = {
                 label: detailsOpen
                     ? tr("action.hide-details", "Hide details")
@@ -1871,8 +1977,150 @@ SystemTrayIcon {
                     "Routing is working again"),
                 bodyText: tray.tr("notifications.enforcement.restored.body",
                     "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs."),
+                primaryAction: {
+                    label: tray.tr("action.outage-blocks", "What was blocked"),
+                    actionId: "enforcement-restored-outage-list"
+                },
                 secondaryAction: tray._noticeMuteAction("enforcement-restored"),
                 dismissActionId: "enforcement-restored-dismiss",
+                autoRetireMs: tray._infoNoticeMs
+            })
+        })
+    }
+
+    // ── "Restore my settings" while the window is closed ────────────────────
+
+    /// A write of the user's the service confirmed, kept in their own settings
+    /// file so a service that loses it can be offered it back.
+    function _recordIntent(payload) {
+        if (!rpc || typeof rpc.rpcUserSettingsIntentRecord !== "function") return
+        var corr = rpc.rpcUserSettingsIntentRecord(payload)
+        if (corr) rpc.registerRpcCallback(corr, function() {})
+    }
+
+    property var _settingsLostTimer: null
+
+    /// Compared once the connect has settled: the window, when open, resyncs
+    /// the binding and asks first.
+    function _scheduleSettingsLostCheck() {
+        if (_settingsLostTimer === null) {
+            _settingsLostTimer = Qt.createQmlObject(
+                "import QtQuick 2.15; Timer { interval: 6000; repeat: false }", tray,
+                "settingsLostTimer")
+            _settingsLostTimer.triggered.connect(function() { tray._checkSettingsLost() })
+        }
+        _settingsLostTimer.restart()
+    }
+
+    /// The record, the service's row with the adapters present, and its mutes;
+    /// `done(null)` when any read failed.
+    function _readSettingsState(done) {
+        if (!bridgeAvailable || !rpc || typeof rpc.rpcUserSettingsIntentGet !== "function"
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") {
+            done(null)
+            return
+        }
+        var intentCorr = rpc.rpcUserSettingsIntentGet()
+        if (!intentCorr) { done(null); return }
+        rpc.registerRpcCallback(intentCorr, function(ok, pi) {
+            if (!ok || !pi || !pi["service-intent"]) { done(null); return }
+            var intent = pi["service-intent"]
+            var snapCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+            if (!snapCorr) { done(null); return }
+            rpc.registerRpcCallback(snapCorr, function(okS, ps) {
+                if (!okS || !ps) { done(null); return }
+                var ids = Pure.presentAdapterIds(ps)
+                var policy = (ps["route-policy"] || ps.routePolicy) || {}
+                var mutesCorr = rpc.rpcBlockNoticeMutesList()
+                if (!mutesCorr) { done(null); return }
+                rpc.registerRpcCallback(mutesCorr, function(okM, pm) {
+                    if (!okM || !pm) { done(null); return }
+                    done({ intent: intent, policy: policy, adapters: ids, mutes: pm.mutes || [] })
+                })
+            })
+        })
+    }
+
+    function _checkSettingsLost() {
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) return
+        _readSettingsState(function(state) {
+            if (state === null) return
+            var keys = Pure.routePolicyIntentDivergence(state.intent["route-policy"] || {},
+                                                        state.policy)
+            var mutes = Pure.noticeMutesToRestore(state.intent["notice-mutes"], state.mutes,
+                                                  Date.now())
+            var count = keys.length + (mutes.length > 0 ? 1 : 0)
+            if (count === 0) return
+            tray._presentOrQueue("settings-lost", function() {
+                promptWindow.present({
+                    titleText: tray.tr("notifications.settings-lost.title",
+                        "The service does not have your settings"),
+                    bodyText: tray.tr("tray.settings-lost.body",
+                            "This happens after the service was reinstalled or its data was reset. Settings missing: {count}.")
+                        .replace("{count}", String(count)),
+                    primaryAction: {
+                        label: tray.tr("notifications.settings-lost.action", "Restore my settings"),
+                        actionId: "settings-lost-restore"
+                    },
+                    dismissActionId: "settings-lost-dismiss"
+                })
+            })
+        })
+    }
+
+    /// "Restore my settings" from the tray: the window's one write, sent from
+    /// here, then the mutes.
+    function _restoreSettings() {
+        _readSettingsState(function(state) {
+            if (state === null) { tray._noteSettingsRestored(false, []); return }
+            var plan = Pure.routePolicyRestorePlan(state.intent["route-policy"] || {},
+                                                   state.policy, state.adapters)
+            var mutes = Pure.noticeMutesToRestore(state.intent["notice-mutes"], state.mutes,
+                                                  Date.now())
+            var missing = []
+            for (var i = 0; i < plan.missing.length; i += 1) missing.push(String(plan.missing[i].name))
+            var restoreMutes = function(at) {
+                if (at >= mutes.length) { tray._noteSettingsRestored(true, missing); return }
+                var corr = rpc.rpcBlockNoticeMutesSet(mutes[at])
+                if (!corr) { tray._noteSettingsRestored(false, missing); return }
+                rpc.registerRpcCallback(corr, function(ok, p) {
+                    if (!ok) { tray._noteSettingsRestored(false, missing); return }
+                    if (at === mutes.length - 1)
+                        tray._recordIntent({ "namespace": "notice-mutes",
+                                             "value": (p && p.mutes) || [] })
+                    restoreMutes(at + 1)
+                })
+            }
+            if (plan.request === null) { restoreMutes(0); return }
+            var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(plan.request)
+            if (!writeCorr) { tray._noteSettingsRestored(false, missing); return }
+            rpc.registerRpcCallback(writeCorr, function(ok) {
+                if (!ok) { tray._noteSettingsRestored(false, missing); return }
+                var merge = {}
+                for (var k = 0; k < plan.keys.length; k += 1)
+                    merge[plan.keys[k]] = plan.request[plan.keys[k]]
+                tray._recordIntent({ "namespace": "route-policy", "merge": merge })
+                restoreMutes(0)
+            })
+        })
+    }
+
+    function _noteSettingsRestored(ok, missing) {
+        var body = ok
+            ? tray.tr("status.settings-restored", "Your settings were restored.")
+            : tray.tr("tray.settings-restore-failed",
+                "Your settings could not be restored. Open the app to try again.")
+        if (missing.length > 0) {
+            body += " " + tray.tr("status.settings-restore-adapter-missing",
+                    "Not restored: the adapter {name} is not on this computer now.")
+                .replace("{name}", missing.join(", "))
+        }
+        tray._presentOrQueue("settings-restored", function() {
+            promptWindow.present({
+                titleText: tray.tr("notifications.settings-lost.action", "Restore my settings"),
+                bodyText: body,
+                dismissActionId: "settings-restored-dismiss",
                 autoRetireMs: tray._infoNoticeMs
             })
         })
@@ -2347,7 +2595,12 @@ SystemTrayIcon {
         if (untilUnixMs !== undefined) req["until-unix-ms"] = untilUnixMs
         var corr = rpc.rpcBlockNoticeMutesSet(req)
         rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
-            if (!ok) console.warn("block-notice mute set failed:", code, msg)
+            if (!ok) {
+                console.warn("block-notice mute set failed:", code, msg)
+                return
+            }
+            tray._recordIntent({ "namespace": "notice-mutes",
+                                 "value": (payload && payload.mutes) || [] })
         })
     }
 
@@ -2379,6 +2632,19 @@ SystemTrayIcon {
         // are not rules yet, so the window landed on an unrelated table.
         if (action === "auto-rules-details") {
             promptWindow.detailsExpanded = !promptWindow.detailsExpanded
+            return
+        }
+        if (action === "verify-verdicts-move" || action === "verify-verdicts-later"
+                || action === "verify-verdicts-close") {
+            _verifyVerdictOnScreen = false
+            if (action === "verify-verdicts-move") {
+                _moveVerifyVerdicts()
+            } else if (action === "verify-verdicts-later") {
+                verifyVerdicts.dismiss(function(ok, code) {
+                    if (!ok) console.log("tray verify-verdicts: dismiss failed:", code)
+                })
+            }
+            _scheduleDrain()
             return
         }
         // "Don't show…" answers the notice on screen the way closing it would,
@@ -2432,6 +2698,17 @@ SystemTrayIcon {
             _scheduleDrain()
             return
         }
+        if (action === "block-notice-outage-list"
+                || action === "enforcement-restored-outage-list") {
+            _openOutageList()
+            if (action === "block-notice-outage-list" && _blockNoticeListIsCurrent()) {
+                _quietShownBlockNotices()
+                _blockNoticeAnswered()
+                return
+            }
+            _scheduleDrain()
+            return
+        }
         if (action === "block-notice-open-settings") {
             // The local-networks notice borrows this id; only the block list
             // has a switch to point at and blocks to quiet.
@@ -2455,6 +2732,15 @@ SystemTrayIcon {
             return
         }
         if (action === "enforcement-restored-dismiss") {
+            _scheduleDrain()
+            return
+        }
+        if (action === "settings-lost-restore") {
+            _restoreSettings()
+            _scheduleDrain()
+            return
+        }
+        if (action === "settings-lost-dismiss" || action === "settings-restored-dismiss") {
             _scheduleDrain()
             return
         }
@@ -2710,6 +2996,8 @@ SystemTrayIcon {
                     return
                 }
                 tray._autoRulesMode = String(mode)
+                tray._recordIntent({ "namespace": "route-policy",
+                                     "merge": { "auto-rules-mode": String(mode) } })
                 if (typeof onWritten === "function") onWritten()
             })
         })
@@ -2924,6 +3212,8 @@ SystemTrayIcon {
                     return
                 }
                 tray._killSwitchEnabled = (want === true)
+                tray._recordIntent({ "namespace": "route-policy",
+                                     "merge": { "kill-switch-enabled": want === true } })
             })
         })
     }
@@ -3427,6 +3717,7 @@ SystemTrayIcon {
                 // actually being enforced instead of guessing.
                 tray._refreshEnforcementState()
                 tray._refreshNoticeMutes(null)
+                tray._scheduleSettingsLostCheck()
                 // Both surfaces drain the same backlog, and the main window
                 // does it immediately. Waiting lets its acknowledgement land
                 // first, so a user who has both up is told once, not twice.

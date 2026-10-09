@@ -265,10 +265,11 @@ impl SecondaryRouteCoordinator {
             status: status.to_string(),
             role: role.to_string(),
             candidates,
+            since_unix_ms: None,
         };
-        if !self.enforcement_status.record(sid, &report) {
+        let Some(report) = self.enforcement_status.record(sid, &report) else {
             return;
-        }
+        };
         let Some(bus) = self.events.as_ref() else {
             return;
         };
@@ -279,6 +280,7 @@ impl SecondaryRouteCoordinator {
                 status: report.status,
                 role: report.role,
                 candidates: report.candidates,
+                since_unix_ms: report.since_unix_ms,
             },
         );
     }

@@ -266,7 +266,10 @@ pub fn policy_write(
     Box::new(move |client: &dyn IpcClient| {
         let result = write_policy(client, edit);
         Reply::new(move |app| {
-            let result = result.map(|stored| {
+            let result = result.map(|(stored, sent)| {
+                if let Some(sent) = &sent {
+                    crate::restore::record_route_policy(app, sent);
+                }
                 if let (Some(stored), Some(snapshot)) = (stored, app.snapshot.as_mut()) {
                     snapshot.route_policy = Some(stored);
                 }
@@ -276,12 +279,16 @@ pub fn policy_write(
     })
 }
 
-/// The answer is the policy now stored; an answer this build cannot read
-/// leaves the old one shown until the next snapshot.
+/// What a policy write left behind: the policy now stored, when the answer
+/// could be read, and the request sent, when one was.
+type Written = (Option<RoutePolicyDto>, Option<Map<String, Value>>);
+
+/// An answer this build cannot read leaves the old policy shown until the next
+/// snapshot.
 fn write_policy(
     client: &dyn IpcClient,
     edit: impl FnOnce(&mut Map<String, Value>),
-) -> Result<Option<RoutePolicyDto>, WriteFailure> {
+) -> Result<Written, WriteFailure> {
     let read = IpcOperationName::SnapshotInitialGet;
     let snapshot = client
         .call(read, Value::Object(Map::new()), ipc_operation_timeout(read))
@@ -298,13 +305,17 @@ fn write_policy(
     edit(&mut request);
     // Only what changed: a whole row would revert what the tray wrote since.
     let Some(request) = name_changes(&base, request) else {
-        return Ok(serde_json::from_value(Value::Object(stored)).ok());
+        return Ok((serde_json::from_value(Value::Object(stored)).ok(), None));
     };
     let write = IpcOperationName::RoutePolicyUpdate;
     let answer = client
-        .call(write, Value::Object(request), ipc_operation_timeout(write))
+        .call(
+            write,
+            Value::Object(request.clone()),
+            ipc_operation_timeout(write),
+        )
         .map_err(|e| WriteFailure::new(Stage::Write, &e))?;
-    Ok(serde_json::from_value(answer).ok())
+    Ok((serde_json::from_value(answer).ok(), Some(request)))
 }
 
 /// A role change as a policy write.

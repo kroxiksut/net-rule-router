@@ -10,6 +10,10 @@ su  # Историческая зона СССР (.su)
 рф  # Российская Федерация (.рф, Punycode xn--p1ai)
 
 --- Domains
+?accounts.google.com
+?accounts.google.ru
+?play-lh.googleusercontent.com
+?play.google.com
 *.2gis.com
 *.avito.com
 *.drweb.com
@@ -21,6 +25,10 @@ su  # Историческая зона СССР (.su)
 *.my.com
 *.ok.com
 *.ozon.com
+?*.proton.me
+?*.protonmail.ch
+?*.protonmail.com
+?*.protonvpn.com
 # *.qiwi.com    # лицензия отозвана, сервис не работает
 *.sberbank.com
 *.userapi.com

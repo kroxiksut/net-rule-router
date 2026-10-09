@@ -191,6 +191,20 @@ Popup {
                                     root.close()
                                 }
                             }
+                            // A notice that asks a question offers both answers.
+                            ThemedButton {
+                                theme: root._theme
+                                visible: !!card.modelData.secondaryActionText
+                                text: card.modelData.secondaryActionText || ""
+                                Accessible.role: Accessible.Button
+                                Accessible.name: text
+                                onClicked: {
+                                    if (root.ownerRoot) {
+                                        root.ownerRoot.notificationsController.runNotificationAction(card.modelData.secondaryActionKey,
+                                                            card.modelData.actionArg)
+                                    }
+                                }
+                            }
                             // "Stop showing these" for notices that carry a
                             // mutable kind. Offered on the notice itself so
                             // silencing a stripe never requires hunting for the

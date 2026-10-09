@@ -41,6 +41,16 @@ impl ConnectionObservationConsumer {
             Some(sid) => self.coordinator.resolve_egress_ifindexes(sid),
             None => (None, None),
         };
+        // The active user's additional route is usable again, so their outage
+        // is over — also when no status change said so (a tunnel the liveness
+        // probe had declared dead).
+        if let (Some(ring), Some(sid), Some(_)) = (
+            self.trace_ring.as_ref(),
+            active_sid_now.as_deref(),
+            secondary_ifindex,
+        ) {
+            ring.outage_blocks().outage_ended(sid, now_ms);
+        }
         // The "no rule covers this host" catch-all's id is deterministic
         // (same hash the codegen used to mint it) — computed once per batch,
         // only when a notice or the trace will read it, so an idle observer
@@ -136,12 +146,15 @@ impl ConnectionObservationConsumer {
                 .nrr_drop_spec_id
                 .zip(self.killswitch_app_scope_check.as_ref())
                 .is_some_and(|(spec_id, check)| check(spec_id));
+            let mut drop_reason = None;
             if rec.blocked_by_nrr == Some(true) {
-                rec.nrr_block_reason = Some(
-                    self.reason_for_drop(&rec, killswitch_verified, default_block_id)
-                        .slug(),
-                );
+                let reason = self.reason_for_drop(&rec, killswitch_verified, default_block_id);
+                rec.nrr_block_reason = Some(reason.slug());
+                drop_reason = Some(reason);
             }
+            // Joins its owner's outage list only on the terms the outage
+            // notice is raised on.
+            let mut outage_drop = false;
             // Surface every attributed drop in the NDJSON
             // (once per app/destination; see `log_drop_once`) and count it in
             // the tick summary so "N connections were being blocked right
@@ -161,6 +174,12 @@ impl ConnectionObservationConsumer {
                 // never ours to explain, so only OUR drops reach the sink.
                 if rec.blocked_by_nrr == Some(true) && !pinned_while_secondary_live {
                     self.note_block_attempt(&rec, killswitch_verified, default_block_id);
+                    outage_drop = drop_reason
+                        == Some(nrr_domain::block_notice::BlockReason::RouteUnavailable)
+                        && !nrr_domain::address_class::is_local_housekeeping_endpoint(
+                            rec.remote.ip(),
+                            rec.remote.port(),
+                        );
                 }
                 // Scope-bug detector: a kill-switch drop while
                 // the secondary is resolved and USABLE should be impossible
@@ -382,7 +401,8 @@ impl ConnectionObservationConsumer {
             }
             // Retain for the Diagnostics panel (last use of `rec`).
             if let Some(ring) = self.trace_ring.as_ref() {
-                ring.push(rec);
+                let outage_at_ms = outage_drop.then(|| rec.observed_unix_ms.unwrap_or(now_ms));
+                ring.push_noting_outage(rec, outage_at_ms);
             }
         }
         // The scope-bug indicator must be loud: this count is

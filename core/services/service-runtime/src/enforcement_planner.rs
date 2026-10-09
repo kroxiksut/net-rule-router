@@ -249,7 +249,7 @@ pub fn plan_route_rules_with_shapes(
                 continue;
             }
             let (verdict, class, coverage) = match rule.action {
-                RuleAction::Route | RuleAction::VerifyPrimary => (
+                RuleAction::Route | RuleAction::Verify => (
                     Verdict::Permit,
                     PrecedenceClass::RouteRule(role),
                     Coverage::ConnectOnly,

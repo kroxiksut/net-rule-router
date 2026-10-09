@@ -96,6 +96,11 @@ pub struct AppState {
     pub rules: crate::screens::rules::RulesState,
     /// A language the user picked; the loop reloads the texts in it.
     pub language_change: Option<String>,
+    /// "Restore my settings": what a service that lost them lacks.
+    pub restore: crate::restore::RestoreState,
+    /// The Settings screen's sections, what they read and the terminal's own
+    /// saved options.
+    pub settings: crate::screens::settings::SettingsState,
 }
 
 impl AppState {
@@ -122,6 +127,8 @@ impl AppState {
             wizard: crate::screens::wizard::WizardState::default(),
             rules: crate::screens::rules::RulesState::default(),
             language_change: None,
+            restore: crate::restore::RestoreState::default(),
+            settings: crate::screens::settings::SettingsState::default(),
         }
     }
 
@@ -171,19 +178,28 @@ impl AppState {
                 let reconnected = link.is_connected() && !self.link.is_connected();
                 self.link = link;
                 if reconnected {
+                    crate::restore::on_connected(self);
+                    crate::screens::rules::verdicts::load(self);
                     crate::screens::screen(self.screen).on_show(self);
                 }
                 Vec::new()
             }
             BackendEvent::Reply(reply) => {
                 (reply.0)(self);
-                Vec::new()
+                let mut effects = crate::restore::announce(self, texts, now);
+                for effect in crate::screens::rules::verdicts::announce(self, texts, now) {
+                    if !effects.contains(&effect) {
+                        effects.push(effect);
+                    }
+                }
+                effects
             }
             BackendEvent::Snapshot(snapshot) => {
                 let reports = snapshot.enforcement_status.clone();
                 self.snapshot = Some(*snapshot);
                 self.fetch_error = None;
                 crate::screens::wizard::snapshot_arrived(self);
+                crate::restore::on_snapshot(self);
                 self.apply_standing_enforcement(reports, texts, now)
             }
             BackendEvent::FetchFailed(error) => {
@@ -209,12 +225,10 @@ impl AppState {
                 }
                 Vec::new()
             }
-            StatusUpdateEvent::VerifyPrimaryMoved { host, .. } => self.notify(
-                NoticeLevel::Info,
-                texts.get(keys::VERIFY_MOVED_TITLE),
-                texts.fill(keys::VERIFY_MOVED_BODY, &[("host", &host)]),
-                now,
-            ),
+            StatusUpdateEvent::VerifyVerdictsChanged { .. } => {
+                crate::screens::rules::verdicts::load(self);
+                Vec::new()
+            }
             StatusUpdateEvent::HostUnreachableOnBothRoutes { host, .. } => self.notify(
                 NoticeLevel::Info,
                 texts.get(keys::HOST_UNREACHABLE_TITLE),
@@ -327,10 +341,18 @@ impl AppState {
     ) -> Vec<Effect> {
         if status.is_empty() || status == "ok" {
             if self.enforcement_down.remove(&role).is_some() {
+                let mut body = texts.get(keys::ENF_RESTORED_BODY);
+                // What leak protection held back meanwhile has a list of its own.
+                if role == "secondary" {
+                    let screen = texts.get(ScreenId::OutageBlocks.title());
+                    let pointer = texts.fill(keys::ENF_RESTORED_WHERE, &[("screen", screen)]);
+                    body.push(' ');
+                    body.push_str(&pointer);
+                }
                 return self.notify(
                     NoticeLevel::Info,
                     texts.get(keys::ENF_RESTORED_TITLE),
-                    texts.get(keys::ENF_RESTORED_BODY),
+                    body,
                     now,
                 );
             }
@@ -342,7 +364,7 @@ impl AppState {
         self.notify(NoticeLevel::Warning, title, body, now)
     }
 
-    fn notify(
+    pub(crate) fn notify(
         &mut self,
         level: NoticeLevel,
         title: String,
@@ -455,6 +477,7 @@ mod tests {
                 status: status.into(),
                 role: role.into(),
                 candidates: Vec::new(),
+                since_unix_ms: None,
             },
         )))
     }
@@ -477,6 +500,13 @@ mod tests {
         app.apply(enforcement("ok", "secondary"), &t, Instant::now());
         assert_eq!(app.routing_state(), RoutingState::Active);
         assert_eq!(app.notices.len(), 2, "the return is news too");
+        assert!(
+            app.notices[1]
+                .body
+                .ends_with("The list of what was blocked: Blocked while the route was down"),
+            "{:?}",
+            app.notices[1]
+        );
 
         let paused = Fixture {
             paused: true,
@@ -526,6 +556,7 @@ mod tests {
                 status: (*status).into(),
                 role: (*role).into(),
                 candidates: Vec::new(),
+                since_unix_ms: None,
             })
             .collect();
         BackendEvent::Snapshot(Box::new(snapshot))

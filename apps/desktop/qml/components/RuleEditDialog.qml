@@ -97,6 +97,9 @@ Dialog {
     property string localRuleType: ""
     property string localValue: ""
     property string localRoute: "primary"
+    // `?`: check where the rule works. Kept as ticked when the type cannot
+    // carry it; `Rules.rowIsVerify` decides what is saved.
+    property bool localVerify: false
     property string localComment: ""
     // Enabled toggle in Add/Edit dialog. Default
     // true on Add; carries existing state on Edit.
@@ -107,21 +110,21 @@ Dialog {
     // silently downgrade it to `primary`. Latched in resetForEdit(), so the
     // combo model stays stable for the whole dialog session.
     property bool allowBlockRoute: false
-    // "Primary first" is offered only for name rules; the combo model follows
-    // the type, and a type that cannot carry it moves the route to secondary.
-    readonly property bool verifyRouteOffered: Rules.ruleTypeAllowsVerify(localRuleType)
+    // "Unsure" fits a domain or one address on a route, never a block.
+    readonly property bool verifyOffered: Rules.ruleTypeAllowsVerify(localRuleType)
+        && localRoute !== "block"
     // The one handler for this signal: QML refuses a second one and the whole
     // dialog — and with it the main window — then fails to load.
     onLocalRuleTypeChanged: {
-        var fitted = Rules.routeForRuleType(localRoute, localRuleType)
-        if (fitted !== localRoute) localRoute = fitted
         _requestVerdict()
+        overlapTimer.restart()
     }
-    onLocalRouteChanged: _syncRouteCombo()
+    onLocalRouteChanged: { _syncRouteCombo(); overlapTimer.restart() }
+    onLocalEnabledChanged: overlapTimer.restart()
     // User input severs the combo's index binding, so it is kept in step by hand.
     function _syncRouteCombo() {
         if (!routeTargetCombo || !root) return
-        var roleOpts = root.routeRoleOptions(allowBlockRoute, verifyRouteOffered)
+        var roleOpts = root.routeRoleOptions(allowBlockRoute)
         var rIdx = 0
         for (var i = 0; i < roleOpts.length; i += 1) {
             if (roleOpts[i].id === localRoute) { rIdx = i; break }
@@ -176,6 +179,7 @@ Dialog {
             localRuleType = String(r.ruleType || (root.ruleTypesModel.count > 0 ? root.ruleTypesModel.get(0).id : "application"))
             localValue = String(r.matchValue || "")
             localRoute = String(r.targetRoute || "primary")
+            localVerify = r.verify === true
             localComment = String(r.comment || "")
             localEnabled = (r.enabled === undefined) ? true : !!r.enabled
             allowBlockRoute = (String(r.targetRoute || "") === "block")
@@ -183,6 +187,7 @@ Dialog {
             localRuleType = firstAddableRuleType()
             localValue = ""
             localRoute = "primary"
+            localVerify = false
             localComment = ""
             localEnabled = true
             allowBlockRoute = false
@@ -202,6 +207,7 @@ Dialog {
         // dialog session came back cleared on the next Add, and the rule was
         // saved disabled without the user ever choosing that.
         if (ruleEnabledCheck) ruleEnabledCheck.checked = localEnabled
+        if (ruleVerifyCheck) ruleVerifyCheck.checked = localVerify
         if (ruleTypeCombo) {
             var tIdx = 0
             for (var k = 0; k < root.ruleTypesModel.count; k += 1) {
@@ -316,7 +322,7 @@ Dialog {
             }
         })
     }
-    onLocalValueChanged: _requestVerdict()
+    onLocalValueChanged: { _requestVerdict(); overlapTimer.restart() }
     function _verdictFor(ruleType, raw) {
         return _verdict.key === _verdictKey(ruleType, raw) ? _verdict : null
     }
@@ -391,6 +397,53 @@ Dialog {
             }
         })
     }
+    // Which rules of the other route this one meets, said before it is saved:
+    // the overlaps table then asks only about pairs nobody made on purpose.
+    property var _overlapAnswer: ({ key: "", lines: [] })
+    readonly property int _overlapLinesShown: 3
+    function _overlapKey() {
+        return [root.editingRule, localRuleType, String(localValue || "").trim(),
+            localRoute, localEnabled].join("|")
+    }
+    function _requestOverlaps() {
+        var value = String(localValue || "").trim()
+        if (listMode || value === "" || typeof root.candidateRouteOverlaps !== "function") return
+        var editing = root.editingRule >= 0 && root.editingRule < root.rulesModel.count
+        var key = _overlapKey()
+        var row = {
+            id: editing ? root.rulesModel.get(root.editingRule).id : root.nextFreeRuleId(),
+            enabled: localEnabled,
+            ruleType: localRuleType,
+            matchValue: value,
+            targetRoute: localRoute,
+            verify: Rules.rowIsVerify({ ruleType: localRuleType, targetRoute: localRoute,
+                verify: localVerify }),
+            comment: ""
+        }
+        root.candidateRouteOverlaps(editing ? root.editingRule : -1, row, function(pairs, candidate) {
+            var lines = []
+            for (var i = 0; i < pairs.length; i += 1)
+                lines.push(root.ruleOverlapsController.explain(pairs[i], candidate))
+            ruleDialog._overlapAnswer = { key: key, lines: lines }
+        })
+    }
+    function overlapText() {
+        if (_overlapAnswer.key !== _overlapKey()) return ""
+        var lines = _overlapAnswer.lines
+        var shown = lines.slice(0, _overlapLinesShown)
+        if (lines.length > shown.length) {
+            shown.push(root.tr("notifications.block-notice.backlog.more", "and {count} more")
+                .replace("{count}", String(lines.length - shown.length)))
+        }
+        return shown.join("\n")
+    }
+    Timer {
+        id: overlapTimer
+        interval: 300
+        repeat: false
+        onTriggered: ruleDialog._requestOverlaps()
+    }
+
     // Typing a long list must not ask once per keystroke.
     Timer {
         id: listClassifyTimer
@@ -770,7 +823,7 @@ Dialog {
             id: routeTargetCombo
             theme: root.uiTheme
             Layout.fillWidth: true
-            model: root.routeRoleOptions(ruleDialog.allowBlockRoute, ruleDialog.verifyRouteOffered)
+            model: root.routeRoleOptions(ruleDialog.allowBlockRoute)
             textRole: "label"
             valueRole: "id"
             popup.width: root.comboPopupWidth(routeTargetCombo, model, "label", null)
@@ -778,17 +831,50 @@ Dialog {
             // A new model (the type changed) resets the index; put it back.
             onModelChanged: Qt.callLater(ruleDialog._syncRouteCombo)
         }
+        // Own width only, like the enable toggle: a row-wide hit area turns a
+        // missed click into a changed rule.
+        RowLayout {
+            Layout.fillWidth: true
+            CheckBox {
+                id: ruleVerifyCheck
+                enabled: ruleDialog.verifyOffered
+                checked: ruleDialog.localVerify
+                onToggled: ruleDialog.localVerify = checked
+                text: root.uiRevision >= 0
+                    ? root.tr("dialog.rule.verify", "Unsure — check where it works")
+                    : ""
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+                Accessible.description: verifyHint.text
+            }
+            Item { Layout.fillWidth: true }
+        }
         Label {
+            id: verifyHint
             Layout.fillWidth: true
             Layout.preferredWidth: 0
             wrapMode: Text.WordWrap
             color: root.mutedTextColor
             font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            visible: ruleDialog.localRoute === "verify"
+            visible: ruleDialog.verifyOffered && ruleDialog.localVerify
             text: root.uiRevision >= 0
-                ? root.tr("dialog.rule.route-verify-hint",
-                    "Opens through the primary route first. Once NetRuleRouter confirms the primary route cannot reach the site, the rule moves to the additional route by itself.")
+                ? root.tr("dialog.rule.verify-hint",
+                    "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.")
                 : ""
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+        // The other route's rules this one overlaps, and which of them wins.
+        Label {
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            color: root.mutedTextColor
+            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+            visible: !ruleDialog.listMode && text !== ""
+                && ruleDialog.isMatchValueValid(ruleDialog.localRuleType, ruleDialog.localValue)
+            text: root.uiRevision >= 0 ? ruleDialog.overlapText() : ""
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }

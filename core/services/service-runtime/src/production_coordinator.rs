@@ -730,7 +730,7 @@ impl ProductionRulesApplyDispatcher {
     ) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
         let mut snapshot =
             crate::production_rules_provider::decode_rules_snapshot(rules_json, origin)?;
-        snapshot.rule_book = snapshot.rule_book.with_verify_primary_effective();
+        snapshot.rule_book = crate::verify_overlay::effective(&snapshot.rule_book, sid);
         if let Some(conn) = self.settings_conn.as_ref() {
             let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
             if crate::production_rules_provider::include_subdomains_for(&guard, sid) {

@@ -1,0 +1,831 @@
+{
+  "description": "pure.js overlapsConfirmedByOwnEdit",
+  "cases": [
+    {
+      "name": "an exception added inside a wider rule settles itself",
+      "input": {
+        "overlaps": [
+          {
+            "key": "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0002",
+              "route": "primary",
+              "rule-type": "exact-ip",
+              "value": "192.0.2.7"
+            },
+            "loser": {
+              "rule-id": "R-0001",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "192.0.2.0/24"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:mail.example>primary:zone:example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0004",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "mail.example"
+            },
+            "loser": {
+              "rule-id": "R-0003",
+              "route": "primary",
+              "rule-type": "zone",
+              "value": "example"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:suffix-domain:example.org>secondary:suffix-domain:example.org",
+            "kind": "duplicate",
+            "winner": {
+              "rule-id": "R-0005",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "loser": {
+              "rule-id": "R-0006",
+              "route": "secondary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:ip-range:198.51.100.10-198.51.100.40>secondary:subnet:198.51.100.32/28",
+            "kind": "intersecting",
+            "winner": {
+              "rule-id": "R-0007",
+              "route": "primary",
+              "rule-type": "ip-range",
+              "value": "198.51.100.10-198.51.100.40"
+            },
+            "loser": {
+              "rule-id": "R-0008",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "198.51.100.32/28"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:ads.example>primary:suffix-domain:ads.example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0009",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "ads.example"
+            },
+            "loser": {
+              "rule-id": "R-0010",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "ads.example"
+            },
+            "block-wins-tie": true,
+            "main-stays-when-additional-down": false
+          }
+        ],
+        "ids": [
+          "R-0002"
+        ]
+      },
+      "expected": [
+        "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24"
+      ]
+    },
+    {
+      "name": "a wide rule swallowing an older narrow one still asks",
+      "input": {
+        "overlaps": [
+          {
+            "key": "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0002",
+              "route": "primary",
+              "rule-type": "exact-ip",
+              "value": "192.0.2.7"
+            },
+            "loser": {
+              "rule-id": "R-0001",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "192.0.2.0/24"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:mail.example>primary:zone:example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0004",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "mail.example"
+            },
+            "loser": {
+              "rule-id": "R-0003",
+              "route": "primary",
+              "rule-type": "zone",
+              "value": "example"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:suffix-domain:example.org>secondary:suffix-domain:example.org",
+            "kind": "duplicate",
+            "winner": {
+              "rule-id": "R-0005",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "loser": {
+              "rule-id": "R-0006",
+              "route": "secondary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:ip-range:198.51.100.10-198.51.100.40>secondary:subnet:198.51.100.32/28",
+            "kind": "intersecting",
+            "winner": {
+              "rule-id": "R-0007",
+              "route": "primary",
+              "rule-type": "ip-range",
+              "value": "198.51.100.10-198.51.100.40"
+            },
+            "loser": {
+              "rule-id": "R-0008",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "198.51.100.32/28"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:ads.example>primary:suffix-domain:ads.example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0009",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "ads.example"
+            },
+            "loser": {
+              "rule-id": "R-0010",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "ads.example"
+            },
+            "block-wins-tie": true,
+            "main-stays-when-additional-down": false
+          }
+        ],
+        "ids": [
+          "R-0001"
+        ]
+      },
+      "expected": []
+    },
+    {
+      "name": "a name exception inside a zone settles itself",
+      "input": {
+        "overlaps": [
+          {
+            "key": "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0002",
+              "route": "primary",
+              "rule-type": "exact-ip",
+              "value": "192.0.2.7"
+            },
+            "loser": {
+              "rule-id": "R-0001",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "192.0.2.0/24"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:mail.example>primary:zone:example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0004",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "mail.example"
+            },
+            "loser": {
+              "rule-id": "R-0003",
+              "route": "primary",
+              "rule-type": "zone",
+              "value": "example"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:suffix-domain:example.org>secondary:suffix-domain:example.org",
+            "kind": "duplicate",
+            "winner": {
+              "rule-id": "R-0005",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "loser": {
+              "rule-id": "R-0006",
+              "route": "secondary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:ip-range:198.51.100.10-198.51.100.40>secondary:subnet:198.51.100.32/28",
+            "kind": "intersecting",
+            "winner": {
+              "rule-id": "R-0007",
+              "route": "primary",
+              "rule-type": "ip-range",
+              "value": "198.51.100.10-198.51.100.40"
+            },
+            "loser": {
+              "rule-id": "R-0008",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "198.51.100.32/28"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:ads.example>primary:suffix-domain:ads.example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0009",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "ads.example"
+            },
+            "loser": {
+              "rule-id": "R-0010",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "ads.example"
+            },
+            "block-wins-tie": true,
+            "main-stays-when-additional-down": false
+          }
+        ],
+        "ids": [
+          "R-0004"
+        ]
+      },
+      "expected": [
+        "secondary:exact-fqdn:mail.example>primary:zone:example"
+      ]
+    },
+    {
+      "name": "the same rule on both routes still asks",
+      "input": {
+        "overlaps": [
+          {
+            "key": "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0002",
+              "route": "primary",
+              "rule-type": "exact-ip",
+              "value": "192.0.2.7"
+            },
+            "loser": {
+              "rule-id": "R-0001",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "192.0.2.0/24"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:mail.example>primary:zone:example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0004",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "mail.example"
+            },
+            "loser": {
+              "rule-id": "R-0003",
+              "route": "primary",
+              "rule-type": "zone",
+              "value": "example"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:suffix-domain:example.org>secondary:suffix-domain:example.org",
+            "kind": "duplicate",
+            "winner": {
+              "rule-id": "R-0005",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "loser": {
+              "rule-id": "R-0006",
+              "route": "secondary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:ip-range:198.51.100.10-198.51.100.40>secondary:subnet:198.51.100.32/28",
+            "kind": "intersecting",
+            "winner": {
+              "rule-id": "R-0007",
+              "route": "primary",
+              "rule-type": "ip-range",
+              "value": "198.51.100.10-198.51.100.40"
+            },
+            "loser": {
+              "rule-id": "R-0008",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "198.51.100.32/28"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:ads.example>primary:suffix-domain:ads.example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0009",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "ads.example"
+            },
+            "loser": {
+              "rule-id": "R-0010",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "ads.example"
+            },
+            "block-wins-tie": true,
+            "main-stays-when-additional-down": false
+          }
+        ],
+        "ids": [
+          "R-0005",
+          "R-0006"
+        ]
+      },
+      "expected": []
+    },
+    {
+      "name": "an intersection still asks",
+      "input": {
+        "overlaps": [
+          {
+            "key": "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0002",
+              "route": "primary",
+              "rule-type": "exact-ip",
+              "value": "192.0.2.7"
+            },
+            "loser": {
+              "rule-id": "R-0001",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "192.0.2.0/24"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:mail.example>primary:zone:example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0004",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "mail.example"
+            },
+            "loser": {
+              "rule-id": "R-0003",
+              "route": "primary",
+              "rule-type": "zone",
+              "value": "example"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:suffix-domain:example.org>secondary:suffix-domain:example.org",
+            "kind": "duplicate",
+            "winner": {
+              "rule-id": "R-0005",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "loser": {
+              "rule-id": "R-0006",
+              "route": "secondary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:ip-range:198.51.100.10-198.51.100.40>secondary:subnet:198.51.100.32/28",
+            "kind": "intersecting",
+            "winner": {
+              "rule-id": "R-0007",
+              "route": "primary",
+              "rule-type": "ip-range",
+              "value": "198.51.100.10-198.51.100.40"
+            },
+            "loser": {
+              "rule-id": "R-0008",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "198.51.100.32/28"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:ads.example>primary:suffix-domain:ads.example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0009",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "ads.example"
+            },
+            "loser": {
+              "rule-id": "R-0010",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "ads.example"
+            },
+            "block-wins-tie": true,
+            "main-stays-when-additional-down": false
+          }
+        ],
+        "ids": [
+          "R-0007",
+          "R-0008"
+        ]
+      },
+      "expected": []
+    },
+    {
+      "name": "a block winning a tie still asks",
+      "input": {
+        "overlaps": [
+          {
+            "key": "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0002",
+              "route": "primary",
+              "rule-type": "exact-ip",
+              "value": "192.0.2.7"
+            },
+            "loser": {
+              "rule-id": "R-0001",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "192.0.2.0/24"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:mail.example>primary:zone:example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0004",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "mail.example"
+            },
+            "loser": {
+              "rule-id": "R-0003",
+              "route": "primary",
+              "rule-type": "zone",
+              "value": "example"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:suffix-domain:example.org>secondary:suffix-domain:example.org",
+            "kind": "duplicate",
+            "winner": {
+              "rule-id": "R-0005",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "loser": {
+              "rule-id": "R-0006",
+              "route": "secondary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:ip-range:198.51.100.10-198.51.100.40>secondary:subnet:198.51.100.32/28",
+            "kind": "intersecting",
+            "winner": {
+              "rule-id": "R-0007",
+              "route": "primary",
+              "rule-type": "ip-range",
+              "value": "198.51.100.10-198.51.100.40"
+            },
+            "loser": {
+              "rule-id": "R-0008",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "198.51.100.32/28"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:ads.example>primary:suffix-domain:ads.example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0009",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "ads.example"
+            },
+            "loser": {
+              "rule-id": "R-0010",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "ads.example"
+            },
+            "block-wins-tie": true,
+            "main-stays-when-additional-down": false
+          }
+        ],
+        "ids": [
+          "R-0009"
+        ]
+      },
+      "expected": []
+    },
+    {
+      "name": "nothing edited settles nothing",
+      "input": {
+        "overlaps": [
+          {
+            "key": "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0002",
+              "route": "primary",
+              "rule-type": "exact-ip",
+              "value": "192.0.2.7"
+            },
+            "loser": {
+              "rule-id": "R-0001",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "192.0.2.0/24"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:mail.example>primary:zone:example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0004",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "mail.example"
+            },
+            "loser": {
+              "rule-id": "R-0003",
+              "route": "primary",
+              "rule-type": "zone",
+              "value": "example"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:suffix-domain:example.org>secondary:suffix-domain:example.org",
+            "kind": "duplicate",
+            "winner": {
+              "rule-id": "R-0005",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "loser": {
+              "rule-id": "R-0006",
+              "route": "secondary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:ip-range:198.51.100.10-198.51.100.40>secondary:subnet:198.51.100.32/28",
+            "kind": "intersecting",
+            "winner": {
+              "rule-id": "R-0007",
+              "route": "primary",
+              "rule-type": "ip-range",
+              "value": "198.51.100.10-198.51.100.40"
+            },
+            "loser": {
+              "rule-id": "R-0008",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "198.51.100.32/28"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:ads.example>primary:suffix-domain:ads.example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0009",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "ads.example"
+            },
+            "loser": {
+              "rule-id": "R-0010",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "ads.example"
+            },
+            "block-wins-tie": true,
+            "main-stays-when-additional-down": false
+          }
+        ],
+        "ids": []
+      },
+      "expected": []
+    },
+    {
+      "name": "several edits settle each own pair in detector order",
+      "input": {
+        "overlaps": [
+          {
+            "key": "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0002",
+              "route": "primary",
+              "rule-type": "exact-ip",
+              "value": "192.0.2.7"
+            },
+            "loser": {
+              "rule-id": "R-0001",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "192.0.2.0/24"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:mail.example>primary:zone:example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0004",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "mail.example"
+            },
+            "loser": {
+              "rule-id": "R-0003",
+              "route": "primary",
+              "rule-type": "zone",
+              "value": "example"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:suffix-domain:example.org>secondary:suffix-domain:example.org",
+            "kind": "duplicate",
+            "winner": {
+              "rule-id": "R-0005",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "loser": {
+              "rule-id": "R-0006",
+              "route": "secondary",
+              "rule-type": "suffix-domain",
+              "value": "example.org"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "primary:ip-range:198.51.100.10-198.51.100.40>secondary:subnet:198.51.100.32/28",
+            "kind": "intersecting",
+            "winner": {
+              "rule-id": "R-0007",
+              "route": "primary",
+              "rule-type": "ip-range",
+              "value": "198.51.100.10-198.51.100.40"
+            },
+            "loser": {
+              "rule-id": "R-0008",
+              "route": "secondary",
+              "rule-type": "subnet",
+              "value": "198.51.100.32/28"
+            },
+            "block-wins-tie": false,
+            "main-stays-when-additional-down": false
+          },
+          {
+            "key": "secondary:exact-fqdn:ads.example>primary:suffix-domain:ads.example",
+            "kind": "nested",
+            "winner": {
+              "rule-id": "R-0009",
+              "route": "secondary",
+              "rule-type": "exact-fqdn",
+              "value": "ads.example"
+            },
+            "loser": {
+              "rule-id": "R-0010",
+              "route": "primary",
+              "rule-type": "suffix-domain",
+              "value": "ads.example"
+            },
+            "block-wins-tie": true,
+            "main-stays-when-additional-down": false
+          }
+        ],
+        "ids": [
+          "R-0004",
+          "R-0002"
+        ]
+      },
+      "expected": [
+        "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+        "secondary:exact-fqdn:mail.example>primary:zone:example"
+      ]
+    },
+    {
+      "name": "no overlaps",
+      "input": {
+        "overlaps": [],
+        "ids": [
+          "R-0002"
+        ]
+      },
+      "expected": []
+    }
+  ]
+}

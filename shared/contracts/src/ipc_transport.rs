@@ -482,6 +482,8 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         | IpcOperationName::CacheEntriesList
         // Read-only paginated connection-trace viewer.
         | IpcOperationName::ConnTraceEntriesList
+        // The caller's own outage list, from memory.
+        | IpcOperationName::ConnTraceOutageBlocksList
         // Read-only attribution + integrity of shipped third-party binaries.
         | IpcOperationName::ThirdPartyComponentsList
         // Read-only two-way merge preview (no mutation queue).
@@ -495,7 +497,9 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // Read the caller's pending companion-domain suggestions.
         | IpcOperationName::AutoRuleCandidatesList
         // Read the caller's declined companion-domain suggestions.
-        | IpcOperationName::AutoRuleDismissedList => IpcOperationClass::ReadSnapshot,
+        | IpcOperationName::AutoRuleDismissedList
+        // Read the caller's check verdicts.
+        | IpcOperationName::VerifyVerdictsList => IpcOperationClass::ReadSnapshot,
         // StatusUpdatesSubscribe sets up a long-lived push channel —
         // classified as DiagnosticQuery (no mutation queue, no elevation).
         IpcOperationName::StatusUpdatesSubscribe => IpcOperationClass::DiagnosticQuery,
@@ -578,6 +582,11 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // queue but require no elevation.
         IpcOperationName::AutoRuleCandidatesAccept
         | IpcOperationName::AutoRuleCandidatesDismiss => IpcOperationClass::UserScopedConfiguration,
+        // Accepting a check verdict rewrites the caller's OWN rules; dismissing
+        // one marks their own in-memory verdict. Per-SID, no elevation.
+        IpcOperationName::VerifyVerdictsAccept | IpcOperationName::VerifyVerdictsDismiss => {
+            IpcOperationClass::UserScopedConfiguration
+        }
         // Restoring a declined suggestion writes the caller's own refusal
         // record (a delete), and erasing one drops their own pending/refusal
         // rows — same per-SID user-configuration class.

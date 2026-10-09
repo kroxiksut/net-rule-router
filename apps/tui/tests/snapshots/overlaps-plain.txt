@@ -20,6 +20,8 @@ Connections:
   Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
 Notifications:
   No notifications.
+Commands on this screen:
+  r: restore your settings to a service that lost them
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Overlaps
@@ -48,10 +50,9 @@ Rules that cover the same sites:
      Decision: Not confirmed
      The other rule names the same sites and never applies.
      A block rule is part of this pair; change it in the rules list.
-  2. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+  2. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Additional.
      Why it wins: Narrower rule
      Decision: Not confirmed
-     A rule that tries the primary route first is part of this pair; change it in the rules list.
   3. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
      Why it wins: Same rule on both routes
      Decision: Not confirmed
@@ -72,10 +73,9 @@ Overlaps:
   3 overlap(s) not confirmed
   Show resolved: No
 Rules that cover the same sites:
-  1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+  1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Additional.
      Why it wins: Narrower rule
      Decision: Not confirmed
-     A rule that tries the primary route first is part of this pair; change it in the rules list.
   2. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
      Why it wins: Same rule on both routes
      Decision: Not confirmed
@@ -97,10 +97,9 @@ Overlaps:
   Show resolved: No
   There is no item 9 in the list. Use the number shown before an item.
 Rules that cover the same sites:
-  1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+  1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Additional.
      Why it wins: Narrower rule
      Decision: Not confirmed
-     A rule that tries the primary route first is part of this pair; change it in the rules list.
   2. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
      Why it wins: Same rule on both routes
      Decision: Not confirmed
@@ -123,10 +122,9 @@ Overlaps:
   Rule changes take effect only after you review and apply them.
   Review and apply the change on screen 4, Rules.
 Rules that cover the same sites:
-  1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+  1. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Additional.
      Why it wins: Narrower rule
      Decision: Not confirmed
-     A rule that tries the primary route first is part of this pair; change it in the rules list.
   2. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
      Why it wins: Same rule on both routes
      Decision: Not confirmed
@@ -168,10 +166,9 @@ Rules that cover the same sites:
      Decision: Confirmed
      The other rule names the same sites and never applies.
      A block rule is part of this pair; change it in the rules list.
-  2. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Primary first, additional if unreachable.
+  2. api.chat.test (Domain) goes over Primary: it is narrower than *.chat.test (Domain) on Additional.
      Why it wins: Narrower rule
      Decision: Confirmed
-     A rule that tries the primary route first is part of this pair; change it in the rules list.
   3. dup.test (Domain) is set on both routes. It goes over Primary: on a tie the main route wins.
      Why it wins: Same rule on both routes
      Decision: Confirmed

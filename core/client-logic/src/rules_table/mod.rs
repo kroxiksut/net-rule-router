@@ -2,9 +2,10 @@
 //! files written from them.
 //!
 //! A row is the table's view of one rule. Besides the two adapter routes its
-//! target can be one of two pseudo-routes that ride in the secondary bucket:
-//! [`TargetRoute::Block`] (drop) and [`TargetRoute::Verify`] (`?host`: main
-//! link until the service confirms it cannot reach the host).
+//! target can be [`TargetRoute::Block`] (drop), a pseudo-route that rides in
+//! the secondary bucket. A route rule may also carry `?` ([`RuleRow::verify`]):
+//! it works where it is written, and the service offers to move it when only
+//! the other link reaches it.
 
 mod file_text;
 mod search;
@@ -20,7 +21,7 @@ pub use file_text::{build_rules_file_text, RulesFileOptions, PRESET_FORMAT_VERSI
 pub use search::{normalize_host_input, row_matches_search, search_box_text};
 pub use wire::{
     drift_row_from_parsed_rule, drift_row_from_service_wire, file_row_from_service_wire,
-    parsed_rule_target_route, rule_row_to_wire_dto, WireDtoOptions,
+    parsed_rule_target_route, parsed_rule_verify, rule_row_to_wire_dto, WireDtoOptions,
 };
 
 /// Where a row sends its traffic.
@@ -30,8 +31,6 @@ pub enum TargetRoute {
     Secondary,
     /// Drop the traffic; kept in the secondary file as `+block`.
     Block,
-    /// `?host` in the secondary file; wire action `verify-primary`.
-    Verify,
     /// A slug this build does not know, kept verbatim. It belongs to no file.
     Other(String),
 }
@@ -43,7 +42,6 @@ impl TargetRoute {
             "primary" => Self::Primary,
             "secondary" => Self::Secondary,
             "block" => Self::Block,
-            "verify" => Self::Verify,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -54,38 +52,17 @@ impl TargetRoute {
             Self::Primary => "primary",
             Self::Secondary => "secondary",
             Self::Block => "block",
-            Self::Verify => "verify",
             Self::Other(slug) => slug,
         }
     }
 
     /// The route bucket and rules file the row rides in (`routeBucket`): a
-    /// pseudo-route rides in the secondary one. `None` for an unknown slug.
+    /// block rides in the secondary one. `None` for an unknown slug.
     pub fn bucket(&self) -> Option<Route> {
         match self {
             Self::Primary => Some(Route::Primary),
-            Self::Secondary | Self::Block | Self::Verify => Some(Route::Secondary),
+            Self::Secondary | Self::Block => Some(Route::Secondary),
             Self::Other(_) => None,
-        }
-    }
-
-    /// This target as a rule of `rule_type` can carry it (`routeForRuleType`):
-    /// verify on a type that cannot take it becomes secondary, where it would
-    /// have ended up anyway.
-    pub fn for_rule_type(self, rule_type: &RuleType) -> Self {
-        if self == Self::Verify && !rule_type.allows_verify() {
-            Self::Secondary
-        } else {
-            self
-        }
-    }
-
-    /// The per-rule wire action.
-    pub fn action(&self) -> RuleAction {
-        match self {
-            Self::Block => RuleAction::Block,
-            Self::Verify => RuleAction::VerifyPrimary,
-            _ => RuleAction::Route,
         }
     }
 }
@@ -164,10 +141,18 @@ impl RuleType {
         )
     }
 
-    /// Only a name can be tried on the main link first
-    /// (`ruleTypeAllowsVerify`); the rules file reads `?` on host names only.
+    /// `?` fits a host name or one address (`ruleTypeAllowsVerify`): the
+    /// rules file reads it in those sections only.
     pub fn allows_verify(&self) -> bool {
-        matches!(self, Self::Domain | Self::SuffixDomain | Self::ExactFqdn)
+        matches!(
+            self,
+            Self::Domain
+                | Self::SuffixDomain
+                | Self::ExactFqdn
+                | Self::ExactIp
+                | Self::ExactIpv4
+                | Self::ExactIpv6
+        )
     }
 
     /// The one spelling of this type for identity (`canonicalRuleTypeSlug`):
@@ -211,6 +196,9 @@ pub struct RuleRow {
     /// Host values in Unicode form; the wire side ACE-encodes.
     pub match_value: String,
     pub target_route: TargetRoute,
+    /// `?`: check where the rule works. Kept as typed; [`RuleRow::is_verify`]
+    /// says whether it means anything for this row.
+    pub verify: bool,
     pub comment: String,
     pub origin: Option<RowOrigin>,
 }
@@ -223,8 +211,31 @@ impl RuleRow {
             .filter(|origin| !origin.reason.is_empty())
     }
 
+    /// The `?` this row actually carries (`rowIsVerify`): a route rule of a
+    /// type that takes it. A block or another type drops it.
+    pub fn is_verify(&self) -> bool {
+        self.verify
+            && matches!(
+                self.target_route,
+                TargetRoute::Primary | TargetRoute::Secondary
+            )
+            && self.rule_type.allows_verify()
+    }
+
+    /// The per-rule wire action.
+    pub fn action(&self) -> RuleAction {
+        if self.target_route == TargetRoute::Block {
+            RuleAction::Block
+        } else if self.is_verify() {
+            RuleAction::VerifyPrimary
+        } else {
+            RuleAction::Route
+        }
+    }
+
     /// Import-merge identity (`mergeKey`): folded type, lower-cased value,
-    /// target route as spelled.
+    /// target route as spelled. `?` is no part of it: `?x` and `x` on one
+    /// route are one rule.
     pub fn merge_key(&self) -> String {
         format!(
             "{}|{}|{}",

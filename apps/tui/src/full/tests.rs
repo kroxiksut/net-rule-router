@@ -300,10 +300,10 @@ fn keys_move_between_screens_focus_and_help() {
 }
 
 #[test]
-fn a_placeholder_screen_says_so_in_words() {
+fn zero_opens_the_settings_sections() {
     let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
     press(&mut app, KeyCode::Char('0'));
     let picture = render(&app, COLOUR, 80, 24, Instant::now());
     assert!(picture.contains("> 0 Settings"), "{picture}");
-    assert!(picture.contains("next version"), "{picture}");
+    assert!(picture.contains("Settings sections"), "{picture}");
 }

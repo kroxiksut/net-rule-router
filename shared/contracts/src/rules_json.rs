@@ -187,8 +187,9 @@ pub enum RuleAction {
     Route,
     /// Drop matching traffic (hard WFP block); install no route.
     Block,
-    /// `?host` in the secondary set: via the primary route until the service
-    /// confirms the primary cannot reach the host.
+    /// `?value` in either set: a route of its own set that the service checks.
+    /// The slug predates checking in both directions and stays for stored
+    /// revisions.
     VerifyPrimary,
     /// An action this build does not know, kept verbatim. A newer build may
     /// have written it; the rule is stored and re-sent unchanged, never applied.

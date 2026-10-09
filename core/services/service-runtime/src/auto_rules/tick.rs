@@ -88,7 +88,7 @@ impl AutoRulesEngine {
     pub fn tick(&self, sid: &str, now: SystemTime) -> TickSummary {
         self.drop_stored_subdomain_twins(sid, now);
         // Whatever the suggestion mode: `?` rules are the user's own.
-        self.verify_primary_step(sid, now);
+        self.verify_step(sid, now);
         let mut summary = TickSummary::default();
         let mode = self.mode(sid);
         if mode == AutoRulesMode::Off {

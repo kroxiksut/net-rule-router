@@ -66,6 +66,7 @@ fn rule_summary_entry_keeps_the_pre_field_bytes_when_enabled() {
         id: "r-001".to_string(),
         display: "example.com".to_string(),
         route: "secondary".to_string(),
+        verify: false,
         enabled: true,
     };
     let json = serde_json::to_value(&entry).expect("serialise");
@@ -238,9 +239,9 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
         StatusUpdateEvent::BlockNoticeMutesChanged {
             sid: "S-1-5-21".into(),
         },
-        StatusUpdateEvent::VerifyPrimaryMoved {
+        StatusUpdateEvent::VerifyVerdictsChanged {
             sid: "S-1-5-21".into(),
-            host: "accounts.example".into(),
+            pending_count: 3,
         },
     ]
 }
@@ -322,6 +323,14 @@ fn push_event_keys_the_ui_reads_are_stable() {
     assert_eq!(notice["attempts"], 1);
     assert_eq!(notice["launched-by"][0], "cmd.exe");
     assert_eq!(notice["launched-by"][1], "explorer.exe");
+
+    let verdicts = serde_json::to_value(StatusUpdateEvent::VerifyVerdictsChanged {
+        sid: "S-1-5-21".into(),
+        pending_count: 3,
+    })
+    .expect("serialise");
+    assert_eq!(verdicts["type"], "verify-verdicts-changed");
+    assert_eq!(verdicts["pending-count"], 3);
 
     let alerts = serde_json::to_value(StatusUpdateEvent::SecurityAlertsChanged).expect("serialise");
     assert_eq!(
@@ -1032,4 +1041,58 @@ fn only_a_mask_that_blocks_something_within_the_known_protocols_is_a_selection()
     for refused in [0, 0x40, 0x80, 0x85, u16::MAX] {
         assert!(!is_valid_kill_switch_protocols(refused), "{refused:#x}");
     }
+}
+
+#[test]
+fn verify_verdict_payloads_travel_as_kebab_case() {
+    let list = VerifyVerdictsListResponse {
+        verdicts: vec![VerifyVerdictDto {
+            rule_id: "r-1".into(),
+            value: "*.mail.example.net".into(),
+            kind: "domain".into(),
+            from_route: "primary".into(),
+            to_route: "secondary".into(),
+            host: "imap.mail.example.net".into(),
+            since_unix_ms: 1_700_000_000_000,
+            dismissed: false,
+        }],
+    };
+    let json = serde_json::to_value(&list).expect("serialise");
+    let v = &json["verdicts"][0];
+    assert_eq!(v["rule-id"], "r-1");
+    assert_eq!(v["from-route"], "primary");
+    assert_eq!(v["to-route"], "secondary");
+    assert_eq!(v["since-unix-ms"], 1_700_000_000_000_i64);
+    assert_eq!(v["dismissed"], false);
+
+    let accept: VerifyVerdictsAcceptRequest =
+        serde_json::from_value(serde_json::json!({ "rule-ids": ["r-1"] })).expect("decode");
+    assert_eq!(accept.rule_ids, ["r-1"]);
+    let dismiss: VerifyVerdictsDismissRequest =
+        serde_json::from_value(serde_json::json!({})).expect("decode empty");
+    assert!(dismiss.rule_ids.is_empty());
+    assert_eq!(
+        serde_json::to_value(VerifyVerdictsAcceptResponse { moved: 2 }).expect("serialise")
+            ["moved"],
+        2
+    );
+}
+
+#[test]
+fn a_verify_flag_is_elided_when_false() {
+    let entry = RuleSummaryEntryDto {
+        id: "r-001".to_string(),
+        display: "example.com".to_string(),
+        route: "primary".to_string(),
+        verify: false,
+        enabled: true,
+    };
+    let json = serde_json::to_value(&entry).expect("serialise");
+    assert!(json.get("verify").is_none());
+    let checked = RuleSummaryEntryDto {
+        verify: true,
+        ..entry
+    };
+    let json = serde_json::to_value(&checked).expect("serialise");
+    assert_eq!(json["verify"], true);
 }

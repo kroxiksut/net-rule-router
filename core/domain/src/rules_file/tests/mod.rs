@@ -61,8 +61,8 @@ example.com
     assert_eq!(shared.rules.len(), 1, "the GUI parser must see it too");
 }
 
-/// `?` (try the primary route first) is read the same way by both parsers:
-/// on host-name lines only, enabled or not, and a line also carrying
+/// `?` (check where it works) is read the same way by both parsers:
+/// on host-name and exact-IP lines only, enabled or not, and a line also carrying
 /// `+block` is no rule for either of them.
 #[test]
 fn both_parsers_agree_on_the_verify_prefix() {
@@ -96,7 +96,7 @@ plain.example.com
     assert_eq!(service, gui);
     // Positive control: the prefix was actually read somewhere.
     assert!(service.contains(&("accounts.example.com".to_string(), true, true)));
-    assert!(service.contains(&("?192.0.2.10".to_string(), true, false)));
+    assert!(service.contains(&("192.0.2.10".to_string(), true, true)));
     assert!(!service.iter().any(|(v, ..)| v.contains("both.example.com")));
 }
 use super::*;

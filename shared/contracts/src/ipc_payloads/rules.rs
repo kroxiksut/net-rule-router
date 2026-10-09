@@ -35,11 +35,13 @@ pub struct RuleRowEntry {
     pub id: String,
     pub rule_type: String,
     pub match_value: String,
-    /// Display route slug: `"primary"`, `"secondary"`, `"block"` or `"verify"`.
-    /// `"block"` is a `RuleAction::Block` rule in either bucket, `"verify"` a
-    /// `RuleAction::VerifyPrimary` (`?host`) rule; the GUI maps each back to its
-    /// label and to its own bucket-plus-`action` wire form on save.
+    /// Display route slug: `"primary"`, `"secondary"` or `"block"`. `"block"`
+    /// is a `RuleAction::Block` rule in either bucket; a `?` rule shows the
+    /// set it is written in and carries [`Self::verify`].
     pub target_route: String,
+    /// The rule is written with `?` (check where it works).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     pub enabled: bool,
@@ -629,10 +631,12 @@ pub struct RuleSummaryEntryDto {
     pub id: String,
     /// Human-readable display for the review UI.
     pub display: String,
-    /// `"primary"` or `"secondary"`, or `"block"` / `"verify"` for a rule
-    /// with that action, as in the rules list. For retargeted rules: the
-    /// destination route.
+    /// `"primary"` or `"secondary"`, or `"block"` for a blocking rule, as in
+    /// the rules list. For retargeted rules: the destination route.
     pub route: String,
+    /// The rule is written with `?` (check where it works).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify: bool,
     /// Whether the rule takes part in routing. A disabled rule is a
     /// real diff entry (it is stored and shipped to the service) but
     /// enforces nothing, so the review UI marks it instead of listing
@@ -760,4 +764,77 @@ pub struct MutationDryRunResponse {
 #[serde(rename_all = "kebab-case")]
 pub struct MutationConfirmResponse {
     pub operation_id: String,
+}
+
+// ── Check verdicts (`?` rules) ───────────────────────────────────────────────
+
+/// One `?` rule the service found not to open on the link it is written for
+/// while the other link answered. Lives until the service restarts, the rule
+/// changes, or the user accepts the move; until then the rule is enforced on
+/// `to_route`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerifyVerdictDto {
+    pub rule_id: String,
+    /// The value as the rule shows it: `accounts.example.com`,
+    /// `*.mail.example.net`, `203.0.113.7`.
+    pub value: String,
+    /// `"domain"` | `"ip"`.
+    pub kind: String,
+    /// `"primary"` | `"secondary"` — the set the rule is written in.
+    pub from_route: String,
+    /// The other set, where the move would put it.
+    pub to_route: String,
+    /// The host name or address that was checked.
+    pub host: String,
+    pub since_unix_ms: i64,
+    /// The user said "not now": still enforced on `to_route`, no longer
+    /// counted as pending.
+    #[serde(default)]
+    pub dismissed: bool,
+}
+
+/// `rules.verify.verdicts.list` request — no parameters; the caller's own SID
+/// scopes the read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerifyVerdictsListRequest {}
+
+/// `rules.verify.verdicts.list` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerifyVerdictsListResponse {
+    pub verdicts: Vec<VerifyVerdictDto>,
+}
+
+/// `rules.verify.verdicts.accept` request: move these `?` rules for good.
+/// Ids without a live verdict are ignored.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerifyVerdictsAcceptRequest {
+    #[serde(default)]
+    pub rule_ids: Vec<String>,
+}
+
+/// `rules.verify.verdicts.accept` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerifyVerdictsAcceptResponse {
+    /// Rules rewritten into the other set.
+    pub moved: u32,
+}
+
+/// `rules.verify.verdicts.dismiss` request: "not now" for these verdicts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerifyVerdictsDismissRequest {
+    #[serde(default)]
+    pub rule_ids: Vec<String>,
+}
+
+/// `rules.verify.verdicts.dismiss` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct VerifyVerdictsDismissResponse {
+    pub dismissed: u32,
 }

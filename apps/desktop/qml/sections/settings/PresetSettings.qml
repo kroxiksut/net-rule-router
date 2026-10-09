@@ -242,9 +242,11 @@ GroupBox {
         title: root.tr("settings.presets.user-folder.dialog-title",
             "Choose the folder with your rule sets")
         onAccepted: {
-            root.setUserPresetsDir(group._localPath(selectedFolder))
+            var folder = group._localPath(selectedFolder)
+            root.setUserPresetsDir(folder)
             root.statusLine = root.tr("status.user-presets-folder-set",
                 "The quick-load dropdown now lists the rule sets in your folder.")
+            root.boundFilesController.adoptRulesFolder(folder)
         }
     }
 

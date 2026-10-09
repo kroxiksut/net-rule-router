@@ -6,23 +6,28 @@
 mod ace;
 mod apply;
 mod files;
+mod folder;
 mod form;
+mod own_settings;
 mod render;
 mod table;
 mod text;
+pub mod verdicts;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nrr_client_logic::rules_table::search_box_text;
 use nrr_shared::ipc_payloads::RulesListResponse;
 use nrr_shared::rules_json::FREE_MAX_RULES;
+use nrr_shared::rules_overlap::{find_route_overlaps, RouteOverlap};
+use nrr_shared::user_settings::UserSettingsError;
 
 use self::apply::{Failure, Finished, Previewed, Review};
 use self::files::{Preset, RuleSet};
 use self::form::{Field, Form, Saved};
 use self::table::{RouteFilter, Table, PAGE};
-use super::{Screen, ScreenId};
+use super::{overlaps, Screen, ScreenId};
 use crate::i18n::{Key, Texts};
 use crate::state::AppState;
 use crate::view::ScreenView;
@@ -43,6 +48,9 @@ pub enum InputPurpose {
     Search,
     Import,
     Export,
+    RulesFolder,
+    /// The rule-set folder asked for before `?` rules move.
+    VerdictFolder,
 }
 
 #[derive(Debug)]
@@ -58,8 +66,23 @@ pub enum ChoicePurpose {
     Reload,
     Quit,
     ImportMode { set: Box<RuleSet>, path: String },
-    Preset(Vec<Preset>),
+    Preset(SetList),
     Overwrite(PathBuf),
+}
+
+/// The rule sets offered, and where they came from.
+#[derive(Debug, Default)]
+pub struct SetList {
+    pub sets: Vec<Preset>,
+    /// The folder the sets were found in.
+    pub folder: Option<PathBuf>,
+    /// The user's own folder, when it holds no set and the shipped ones are
+    /// offered instead.
+    pub empty_own_folder: Option<PathBuf>,
+    /// Why the settings file could not be read.
+    pub settings_error: Option<String>,
+    /// The remembered choice, `<source>:<label>`.
+    pub selected: String,
 }
 
 #[derive(Debug)]
@@ -93,6 +116,8 @@ pub struct Note {
     pub key: Key,
     pub args: Vec<(&'static str, String)>,
     pub failure: Option<Failure>,
+    /// A sentence said after this one.
+    pub then: Option<Box<Note>>,
 }
 
 impl Note {
@@ -101,6 +126,7 @@ impl Note {
             key,
             args: Vec::new(),
             failure: None,
+            then: None,
         }
     }
 
@@ -109,6 +135,7 @@ impl Note {
             key,
             args,
             failure: None,
+            then: None,
         }
     }
 
@@ -117,13 +144,23 @@ impl Note {
             key,
             args: Vec::new(),
             failure: Some(failure),
+            then: None,
         }
+    }
+
+    fn then(mut self, next: Note) -> Self {
+        self.then = Some(Box::new(next));
+        self
     }
 
     pub fn text(&self, texts: &Texts) -> String {
         let mut out = texts.fill(self.key, &self.args);
         if let Some(failure) = &self.failure {
             out.push_str(&failure.text(texts));
+        }
+        if let Some(next) = &self.then {
+            out.push(' ');
+            out.push_str(&next.text(texts));
         }
         out
     }
@@ -141,6 +178,31 @@ pub struct RulesState {
     pub baseline: bool,
     /// The quit question chose "apply, then quit".
     quit_after_apply: bool,
+    /// The settings file shared with the GUI; `None` when this session has no
+    /// file of the user's own (under `sudo` the rules are the baseline's).
+    pub settings_file: Option<PathBuf>,
+    /// The files the rules on screen were last read from or written to, per
+    /// route, as the settings file spells them; `""` is none.
+    pub loaded_files: [String; 2],
+    /// "My rules" in the reader's language: the name of a set with no other.
+    pub my_rules: String,
+    /// `?` rules that work only on the other route, waiting for an answer.
+    pub verdicts: verdicts::Verdicts,
+}
+
+impl RulesState {
+    fn my_rules_name(&self) -> &str {
+        if self.my_rules.is_empty() {
+            text::MY_RULES.en
+        } else {
+            &self.my_rules
+        }
+    }
+}
+
+/// The texts were loaded or changed language.
+pub fn on_texts(app: &mut AppState, texts: &Texts) {
+    app.rules.my_rules = texts.get(text::MY_RULES);
 }
 
 pub struct RulesScreen;
@@ -159,7 +221,9 @@ impl Screen for RulesScreen {
             text::HELP_FILTER,
             text::HELP_APPLY,
             text::HELP_FILES,
+            text::HELP_FOLDER,
             text::HELP_RELOAD,
+            text::HELP_VERDICTS,
             text::HELP_FORM,
         ]
     }
@@ -175,19 +239,15 @@ impl Screen for RulesScreen {
             text::PLAIN_PAGES,
             text::PLAIN_APPLY,
             text::PLAIN_FILES,
+            text::PLAIN_FOLDER,
             text::PLAIN_RELOAD,
+            text::PLAIN_VERDICTS,
         ]
     }
 
     fn on_show(&self, app: &mut AppState) {
-        let rules = &app.rules;
-        if app.link.is_connected()
-            && rules.busy.is_none()
-            && !rules.table.is_loaded()
-            && rules.table.rows.is_empty()
-        {
-            load(app);
-        }
+        load_if_needed(app);
+        verdicts::load(app);
     }
 
     fn takes_focus(&self) -> bool {
@@ -213,6 +273,9 @@ impl Screen for RulesScreen {
             Mode::List => list_line(app, line),
             Mode::Input(input) => {
                 if line == "!" {
+                    if input.purpose == InputPurpose::VerdictFolder {
+                        verdicts::not_now(app);
+                    }
                     return true;
                 }
                 let mut input = input;
@@ -229,6 +292,7 @@ impl Screen for RulesScreen {
                 if form.answer(line) {
                     save_form(app, form);
                 } else {
+                    refresh_form(app, &mut form);
                     app.rules.mode = Mode::Form(form);
                 }
                 true
@@ -289,6 +353,50 @@ impl Screen for RulesScreen {
 /// Whether quitting now would lose rules the service does not have.
 pub fn holds_unapplied(app: &AppState) -> bool {
     app.rules.table.is_dirty()
+}
+
+/// Read the rules once, when nothing is on screen yet.
+pub fn load_if_needed(app: &mut AppState) {
+    let rules = &app.rules;
+    if app.link.is_connected()
+        && rules.busy.is_none()
+        && !rules.table.is_loaded()
+        && rules.table.rows.is_empty()
+    {
+        load(app);
+    }
+}
+
+pub fn is_loading(app: &AppState) -> bool {
+    matches!(app.rules.busy, Some(Busy::Loading))
+}
+
+/// Why the last read of the rules failed, in words.
+pub fn load_failure(app: &AppState, texts: &Texts) -> Option<String> {
+    app.rules.load_error.as_ref().map(|f| f.text(texts))
+}
+
+/// The list cannot change while it is applied or its changes are reviewed:
+/// the apply marks what is on screen as applied.
+pub fn edits_locked(app: &AppState) -> bool {
+    app.rules.busy.is_some() || matches!(app.rules.mode, Mode::Review(_))
+}
+
+/// Rules of the two routes that cover the same sites, over the rules on
+/// screen rather than the applied ones.
+pub fn route_overlaps(app: &AppState) -> Vec<RouteOverlap> {
+    find_route_overlaps(
+        &apply::book_of(app.rules.table.rules()),
+        include_subdomains(app),
+    )
+}
+
+/// The reader's subdomain setting; absent means on, the product default.
+fn include_subdomains(app: &AppState) -> bool {
+    app.snapshot
+        .as_ref()
+        .and_then(|s| s.route_policy.as_ref())
+        .is_none_or(|p| p.include_subdomains)
 }
 
 /// Open the question "apply / discard / stay" on this screen.
@@ -357,8 +465,13 @@ fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
         Ok(list) => {
             rules.load_error = None;
             rules.table.load(&list.rows);
+            overlaps::refresh(app);
+            verdicts::write_bound_files(app);
         }
-        Err(failure) => rules.load_error = Some(failure),
+        Err(failure) => {
+            rules.load_error = Some(failure);
+            rules.verdicts.rewrite_files = false;
+        }
     }
 }
 
@@ -446,10 +559,16 @@ fn confirm(app: &mut AppState, review: Box<Review>) {
     app.outbox.push(apply::confirm_job(pending, token));
 }
 
-fn open_form(app: &mut AppState, form: Form) {
+fn open_form(app: &mut AppState, mut form: Form) {
     if !locked(app) {
+        refresh_form(app, &mut form);
         app.rules.mode = Mode::Form(Box::new(form));
     }
+}
+
+/// The form's overlap line follows the rule in it.
+fn refresh_form(app: &AppState, form: &mut Form) {
+    form.refresh_overlaps(&app.rules.table, include_subdomains(app));
 }
 
 fn edit_selected(app: &mut AppState, master: Option<usize>) {
@@ -472,6 +591,11 @@ fn ask(app: &mut AppState, purpose: ChoicePurpose) {
         ChoicePurpose::Filter => RouteFilter::ALL
             .iter()
             .position(|f| *f == app.rules.table.filter)
+            .unwrap_or(0),
+        ChoicePurpose::Preset(list) => list
+            .sets
+            .iter()
+            .position(|set| set.selection_key() == list.selected)
             .unwrap_or(0),
         _ => 0,
     };
@@ -503,12 +627,28 @@ fn reload(app: &mut AppState) {
 fn start_input(app: &mut AppState, purpose: InputPurpose) {
     let text = match purpose {
         InputPurpose::Search => app.rules.table.search.clone(),
-        InputPurpose::Import | InputPurpose::Export => std::env::current_dir()
-            .map(|d| d.display().to_string())
-            .unwrap_or_default(),
+        InputPurpose::Import | InputPurpose::Export => files_input_start(app),
+        InputPurpose::RulesFolder => folder::prompt_text(app),
+        InputPurpose::VerdictFolder => String::new(),
     };
     if purpose == InputPurpose::Search || !locked(app) {
         app.rules.mode = Mode::Input(Input { purpose, text });
+    }
+}
+
+/// The user's rule-set folder, ready for a set name; else where the terminal
+/// is.
+fn files_input_start(app: &AppState) -> String {
+    let own = app
+        .rules
+        .settings_file
+        .as_deref()
+        .and_then(own_settings::rules_folder);
+    match own {
+        Some(folder) => folder.join("").display().to_string(),
+        None => std::env::current_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -516,11 +656,58 @@ fn presets(app: &mut AppState) {
     if locked(app) {
         return;
     }
-    let found = files::presets();
-    if found.is_empty() {
+    let list = set_list(app.rules.settings_file.as_deref());
+    if list.sets.is_empty() {
         app.rules.note = Some(Note::new(text::NO_PRESETS));
     } else {
-        ask(app, ChoicePurpose::Preset(found));
+        ask(app, ChoicePurpose::Preset(list));
+    }
+}
+
+/// The GUI's choice of list: the sets in the user's folder, or — when there is
+/// no folder or nothing in it — the shipped ones.
+fn set_list(settings_file: Option<&Path>) -> SetList {
+    let (settings, settings_error) = match settings_file.map(own_settings::read) {
+        None => (Default::default(), None),
+        Some(Ok(settings)) => (settings, None),
+        Some(Err(error)) => (Default::default(), Some(error.to_string())),
+    };
+    let own = own_settings::own_folder(&settings);
+    if let Some(folder) = own.as_ref() {
+        let sets = files::user_sets(folder);
+        if !sets.is_empty() {
+            return SetList {
+                sets,
+                folder: own,
+                empty_own_folder: None,
+                settings_error,
+                selected: settings.selected_set,
+            };
+        }
+    }
+    let shipped = files::presets_root();
+    SetList {
+        sets: shipped
+            .as_deref()
+            .map(files::presets_in)
+            .unwrap_or_default(),
+        folder: shipped,
+        empty_own_folder: own,
+        settings_error,
+        selected: settings.selected_set,
+    }
+}
+
+/// Remembers a picked set in the shared settings; only a failure is said.
+fn remember_set(app: &mut AppState, set: &Preset) {
+    let Some(file) = app.rules.settings_file.as_deref() else {
+        return;
+    };
+    if let Err(error) = own_settings::remember_set(file, &set.selection_key()) {
+        app.rules.note = Some(Note::with(
+            text::SETTINGS_NOT_WRITTEN,
+            vec![("error", error.to_string())],
+        ));
     }
 }
 
@@ -531,6 +718,7 @@ fn save_form(app: &mut AppState, mut form: Box<Form>) {
         Saved::Added { enabled: false } => text::RULE_ADDED_DISABLED,
         Saved::Updated => text::RULE_UPDATED,
         Saved::Refused | Saved::Duplicate(_) => {
+            refresh_form(app, &mut form);
             app.rules.mode = Mode::Form(form);
             return;
         }
@@ -539,11 +727,20 @@ fn save_form(app: &mut AppState, mut form: Box<Form>) {
                 text::LIMIT_REACHED,
                 vec![("max", FREE_MAX_RULES.to_string())],
             ));
+            refresh_form(app, &mut form);
             app.rules.mode = Mode::Form(form);
             return;
         }
     };
     app.rules.note = Some(Note::new(note));
+    let table = &app.rules.table;
+    let row = match saved {
+        Saved::Added { .. } => table.rows.last(),
+        _ => form.editing.and_then(|i| table.rows.get(i)),
+    };
+    if let Some(id) = row.map(|r| r.rule.id.clone()) {
+        overlaps::confirm_own_edit(app, &id);
+    }
 }
 
 fn commit_input(app: &mut AppState, input: Input) {
@@ -572,6 +769,17 @@ fn commit_input(app: &mut AppState, input: Input) {
                 export(app, &path);
             }
         }
+        InputPurpose::RulesFolder => folder::choose(app, &input.text),
+        InputPurpose::VerdictFolder => verdicts::folder_answered(app, &input.text),
+    }
+}
+
+/// The folder prompt; a session with no settings of its own says why not.
+fn start_folder_input(app: &mut AppState) {
+    if app.rules.settings_file.is_none() {
+        app.rules.note = Some(Note::new(text::FOLDER_UNAVAILABLE));
+    } else {
+        start_input(app, InputPurpose::RulesFolder);
     }
 }
 
@@ -613,23 +821,63 @@ fn import(app: &mut AppState, set: RuleSet, path: String, replace: bool) {
     table.filter = RouteFilter::All;
     table.search.clear();
     table.cursor = 0;
-    app.rules.note = Some(Note::with(
+    let mut note = Note::with(
         text::IMPORTED,
         vec![("count", added.to_string()), ("path", path)],
-    ));
+    );
+    if let Err(error) = bind_imported(app, &set.paths) {
+        note = note.then(Note::with(
+            text::SETTINGS_NOT_WRITTEN,
+            vec![("error", error.to_string())],
+        ));
+    }
+    app.rules.note = Some(note);
 }
 
-fn export(app: &mut AppState, path: &std::path::Path) {
+/// The files read become where the rules come from and, outside the shipped
+/// tree, the user's rules files, as a load does in the GUI.
+fn bind_imported(
+    app: &mut AppState,
+    paths: &[Option<PathBuf>; 2],
+) -> Result<(), UserSettingsError> {
+    let read = own_settings::imported_texts(paths);
+    for (slot, path) in app.rules.loaded_files.iter_mut().zip(read) {
+        if let Some(path) = path {
+            *slot = path;
+        }
+    }
+    let Some(file) = app.rules.settings_file.as_deref() else {
+        return Ok(());
+    };
+    own_settings::bind_imported(file, paths, files::presets_root().as_deref())
+}
+
+/// Writes both files, then binds them as the user's rules files, as the GUI
+/// does after every write.
+fn export(app: &mut AppState, path: &Path) {
     let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    app.rules.note = Some(
-        match files::write_set(path, &app.rules.table, &exported_at) {
-            Ok(()) => Note::with(text::EXPORTED, vec![("path", path.display().to_string())]),
-            Err((file, error)) => Note::with(
-                text::WRITE_FAILED,
-                vec![("path", file.display().to_string()), ("error", error)],
-            ),
-        },
-    );
+    if let Err((file, error)) = files::write_set(path, &app.rules.table, &exported_at) {
+        let file = file.display().to_string();
+        let note = Note::with(text::WRITE_FAILED, vec![("path", file), ("error", error)]);
+        app.rules.note = Some(note);
+        return;
+    }
+    app.rules.loaded_files = folder::written_texts(path);
+    let shown = path.display().to_string();
+    app.rules.note = Some(match bind_written_set(app, path) {
+        Ok(()) => Note::with(text::EXPORTED, vec![("path", shown)]),
+        Err(error) => Note::with(
+            text::EXPORTED_UNBOUND,
+            vec![("path", shown), ("error", error.to_string())],
+        ),
+    });
+}
+
+fn bind_written_set(app: &AppState, dir: &Path) -> Result<(), UserSettingsError> {
+    let Some(file) = app.rules.settings_file.as_deref() else {
+        return Ok(());
+    };
+    own_settings::bind_written_set(file, dir, files::presets_root().as_deref())
 }
 
 fn cancel_choice(app: &mut AppState, choice: Choice) {
@@ -665,11 +913,14 @@ fn pick(app: &mut AppState, choice: Choice) {
             _ => {}
         },
         ChoicePurpose::ImportMode { set, path } if at < 2 => import(app, *set, path, at == 0),
-        ChoicePurpose::Preset(presets) => {
-            if let Some(preset) = presets.get(at) {
+        ChoicePurpose::Preset(list) => {
+            if let Some(preset) = list.sets.get(at) {
                 match files::read_set(&preset.dir) {
                     Err((file, error)) => app.rules.note = Some(read_failed(&file, error)),
-                    Ok(set) => offer_import(app, set, preset.label.clone()),
+                    Ok(set) => {
+                        offer_import(app, set, preset.label.clone());
+                        remember_set(app, preset);
+                    }
                 }
             }
         }
@@ -706,6 +957,9 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'i' => start_input(app, InputPurpose::Import),
             'x' => start_input(app, InputPurpose::Export),
             'p' => presets(app),
+            'o' => start_folder_input(app),
+            'm' => return verdicts::move_all(app),
+            'n' => return verdicts::not_now(app),
             _ => return false,
         },
         _ => return false,
@@ -731,7 +985,11 @@ fn edit_text(text: &mut String, key: KeyEvent) -> Option<bool> {
 
 fn input_key(app: &mut AppState, mut input: Input, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Esc => {}
+        KeyCode::Esc => {
+            if input.purpose == InputPurpose::VerdictFolder {
+                verdicts::not_now(app);
+            }
+        }
         KeyCode::Enter => commit_input(app, input),
         _ => {
             let used = edit_text(&mut input.text, key);
@@ -767,6 +1025,7 @@ fn form_key(app: &mut AppState, mut form: Box<Form>, key: KeyEvent) -> bool {
         }
         _ => {}
     }
+    refresh_form(app, &mut form);
     app.rules.mode = Mode::Form(form);
     true
 }
@@ -879,6 +1138,9 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         "i" => start_input(app, InputPurpose::Import),
         "x" => start_input(app, InputPurpose::Export),
         "p" => presets(app),
+        "o" => start_folder_input(app),
+        "m" => return verdicts::move_all(app),
+        "n" => return verdicts::not_now(app),
         _ => return false,
     }
     true

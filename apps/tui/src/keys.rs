@@ -13,15 +13,15 @@ pub const SCREEN_RULES: Key = key("section.rules", "Rules");
 pub const SCREEN_OVERLAPS: Key = key("rules.overlaps.nav-label", "Overlaps");
 pub const SCREEN_SUGGESTIONS: Key = key("rules.suggestions.inbox.nav-label", "Suggested addresses");
 pub const SCREEN_TRACE: Key = key("diag.conn-trace.title", "Connection trace");
+pub const SCREEN_OUTAGE_BLOCKS: Key = key(
+    "diag.outage-blocks.title",
+    "Blocked while the route was down",
+);
 pub const SCREEN_CACHE: Key = key("diag.cache.title", "Cache");
 pub const SCREEN_DIAGNOSTICS: Key = key("tui.screen.diagnostics-logs", "Diagnostics and logs");
 pub const SCREEN_SETTINGS: Key = key("section.settings", "Settings");
 
 pub const MENU_TITLE: Key = key("tui.menu.title", "Screens");
-pub const PLACEHOLDER: Key = key(
-    "tui.placeholder",
-    "This screen will be in the next version.",
-);
 
 // ── Start-up ─────────────────────────────────────────────────────────────────
 
@@ -240,6 +240,10 @@ pub const ENF_RESTORED_BODY: Key = key(
     "notifications.enforcement.restored.body",
     "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs.",
 );
+pub const ENF_RESTORED_WHERE: Key = key(
+    "tui.outage-blocks.where",
+    "The list of what was blocked: {screen}",
+);
 
 // ── Notices ──────────────────────────────────────────────────────────────────
 
@@ -247,14 +251,6 @@ pub const NOTICES_TITLE: Key = key("notifications.title", "Notifications");
 pub const NOTICES_EMPTY: Key = key("notifications.empty", "No notifications.");
 pub const LEVEL_WARNING: Key = key("settings.logs.level.option-warning", "Warning");
 pub const LEVEL_INFO: Key = key("settings.logs.level.option-info", "Info");
-pub const VERIFY_MOVED_TITLE: Key = key(
-    "tray.verify-moved.title",
-    "Site moved to the additional route",
-);
-pub const VERIFY_MOVED_BODY: Key = key(
-    "tray.verify-moved.body",
-    "{host} does not open over the primary route, so its rule now uses the additional route.",
-);
 pub const HOST_UNREACHABLE_TITLE: Key = key(
     "notifications.host-unreachable.title",
     "A site does not answer on either link",
@@ -313,11 +309,11 @@ pub const ALL: &[Key] = &[
     SCREEN_OVERLAPS,
     SCREEN_SUGGESTIONS,
     SCREEN_TRACE,
+    SCREEN_OUTAGE_BLOCKS,
     SCREEN_CACHE,
     SCREEN_DIAGNOSTICS,
     SCREEN_SETTINGS,
     MENU_TITLE,
-    PLACEHOLDER,
     NOT_INTERACTIVE,
     USAGE,
     UNKNOWN_OPTION,
@@ -388,12 +384,11 @@ pub const ALL: &[Key] = &[
     ENF_UNKNOWN_BODY,
     ENF_RESTORED_TITLE,
     ENF_RESTORED_BODY,
+    ENF_RESTORED_WHERE,
     NOTICES_TITLE,
     NOTICES_EMPTY,
     LEVEL_WARNING,
     LEVEL_INFO,
-    VERIFY_MOVED_TITLE,
-    VERIFY_MOVED_BODY,
     HOST_UNREACHABLE_TITLE,
     HOST_UNREACHABLE_BODY,
     EXTERNAL_ADDRESS_TITLE,

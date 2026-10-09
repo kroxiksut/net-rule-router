@@ -42,6 +42,7 @@ impl AutoRulesEngine {
             evidence_saved_at: Mutex::new(HashMap::new()),
             twin_cleanup: Mutex::new(HashMap::new()),
             verify: Mutex::new(HashMap::new()),
+            verify_watches_ips: std::sync::atomic::AtomicBool::new(false),
             verify_wiring: OnceLock::new(),
         }
     }

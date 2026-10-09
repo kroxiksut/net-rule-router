@@ -20,6 +20,8 @@ Connections:
   Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
 Notifications:
   No notifications.
+Commands on this screen:
+  r: restore your settings to a service that lost them
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Suggested addresses

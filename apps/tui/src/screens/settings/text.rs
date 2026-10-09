@@ -9,7 +9,10 @@ use crate::i18n::{key, Key};
 pub const SECTIONS: Key = key("tui.settings.sections", "Settings sections");
 pub const NOTIFICATIONS: Key = key("settings.category.notifications", "Notifications");
 pub const ROUTING: Key = key("settings.group.routing-behavior", "Routing behavior");
-pub const FAILURE_POLICY: Key = key("settings.routing.failure-policy.title", "Apply failure policy");
+pub const FAILURE_POLICY: Key = key(
+    "settings.routing.failure-policy.title",
+    "Apply failure policy",
+);
 pub const SERVICE: Key = key("settings.service.title", "Service management");
 pub const PRESETS: Key = key("settings.category.presets", "Presets and settings");
 pub const LOGS: Key = key("settings.group.logs-diagnostics", "Logs and diagnostics");
@@ -50,7 +53,6 @@ pub const CONFIRM: Key = key(
     "tui.settings.confirm",
     "Press Enter again to confirm, or Esc to cancel.",
 );
-pub const CONFIRM_WORD: Key = key("tui.settings.confirm-word", "yes");
 pub const MORE_ABOVE: Key = key("tui.settings.more-above", "{count} more lines above");
 
 // ── Keys and line mode ───────────────────────────────────────────────────────
@@ -88,32 +90,44 @@ pub const PLAIN_CONFIRM: Key = key(
     "tui.settings.plain.confirm-prompt",
     "Type yes to confirm; anything else cancels.",
 );
-pub const PLAIN_NO_ITEM: Key = key(
-    "tui.settings.plain.no-item",
-    "There is no {code} here.",
-);
+pub const PLAIN_NO_ITEM: Key = key("tui.settings.plain.no-item", "There is no {code} here.");
 
 // ── Notifications ────────────────────────────────────────────────────────────
 
-pub const HIDDEN_HEADING: Key = key("settings.notifications.hidden.heading", "Hidden notifications");
+pub const HIDDEN_HEADING: Key = key(
+    "settings.notifications.hidden.heading",
+    "Hidden notifications",
+);
 pub const HIDDEN_DESCRIPTION: Key = key(
     "settings.notifications.hidden.description",
     "Choose for how long each kind of notification stays hidden. The \"Don't show…\" button on a notification sets the same thing.",
 );
 pub const HIDDEN_SHOWN: Key = key("settings.notifications.hidden.shown", "Shown");
 pub const HIDDEN_FOREVER: Key = key("settings.notifications.hidden.forever", "Hidden for good");
-pub const HIDDEN_UNTIL: Key = key("settings.notifications.hidden.until", "Hidden until {timestamp}");
+pub const HIDDEN_UNTIL: Key = key(
+    "settings.notifications.hidden.until",
+    "Hidden until {timestamp}",
+);
 pub const HIDE_SHOW: Key = key("settings.notifications.hidden.show", "Show");
 pub const FOR_A_DAY: Key = key("label.duration.for-a-day", "For a day");
 pub const FOR_7_DAYS: Key = key("label.duration.for-7-days", "For 7 days");
 pub const FOR_30_DAYS: Key = key("label.duration.for-30-days", "For 30 days");
 pub const FOREVER: Key = key("label.duration.forever", "Forever");
 pub const BLOCK_GROUP: Key = key("settings.group.block-notices", "Blocked-connection notices");
-pub const MUTE_ALL: Key = key("settings.block-notices.mutes.row-all", "All blocked-connection notices");
+pub const MUTE_ALL: Key = key(
+    "settings.block-notices.mutes.row-all",
+    "All blocked-connection notices",
+);
 pub const MUTE_HOST: Key = key("settings.block-notices.mutes.row-host", "Host: {name}");
-pub const MUTE_APP: Key = key("settings.block-notices.mutes.row-app", "Application: {name}");
+pub const MUTE_APP: Key = key(
+    "settings.block-notices.mutes.row-app",
+    "Application: {name}",
+);
 pub const MUTE_REASON: Key = key("settings.block-notices.mutes.row-reason", "Reason: {name}");
-pub const MUTE_UNTIL: Key = key("settings.block-notices.mutes.until-timestamp", "Until {timestamp}");
+pub const MUTE_UNTIL: Key = key(
+    "settings.block-notices.mutes.until-timestamp",
+    "Until {timestamp}",
+);
 pub const MUTES_HEADING: Key = key("settings.block-notices.mutes.heading", "Active mutes");
 pub const MUTES_EMPTY: Key = key("settings.block-notices.mutes.empty", "No active mutes.");
 pub const ADD_HEADING: Key = key("settings.block-notices.add.heading", "Add a mute");
@@ -121,7 +135,10 @@ pub const ADD_DESCRIPTION: Key = key(
     "settings.block-notices.add.description",
     "The notification's quick-mute options only offer a few fixed lengths. Use this form for a duration of your own, or to mute indefinitely.",
 );
-pub const SCOPE_ALL: Key = key("settings.block-notices.add.scope-all", "Every blocked-connection notice");
+pub const SCOPE_ALL: Key = key(
+    "settings.block-notices.add.scope-all",
+    "Every blocked-connection notice",
+);
 pub const SCOPE_HOST: Key = key("settings.block-notices.add.scope-host", "One host");
 pub const SCOPE_APP: Key = key("settings.block-notices.add.scope-app", "One application");
 pub const SCOPE_LABEL: Key = key("settings.block-notices.add.scope-label", "What to mute");
@@ -135,7 +152,10 @@ pub const APP_FIELD: Key = key(
 );
 pub const DURATION: Key = key("settings.block-notices.add.duration-label", "For how long");
 pub const UNIT: Key = key("tui.settings.notifications.unit", "Unit");
-pub const MINUTES: Key = key("settings.block-notices.add.duration-unit-minutes", "Minutes");
+pub const MINUTES: Key = key(
+    "settings.block-notices.add.duration-unit-minutes",
+    "Minutes",
+);
 pub const HOURS: Key = key("settings.block-notices.add.duration-unit-hours", "Hours");
 pub const DAYS: Key = key("settings.block-notices.add.duration-unit-days", "Days");
 pub const MUTE_ADDED: Key = key("settings.block-notices.add.saved", "Mute added.");
@@ -196,8 +216,14 @@ pub const FAIL_OPEN: Key = key(
     "settings.routing.kill-switch.failure-mode.option-fail-open",
     "Allow traffic and warn me",
 );
-pub const FAIL_CLOSED_NOTE: Key = key("settings.routing.kill-switch.failure-mode.desc-fail-closed", "");
-pub const FAIL_OPEN_NOTE: Key = key("settings.routing.kill-switch.failure-mode.desc-fail-open", "");
+pub const FAIL_CLOSED_NOTE: Key = key(
+    "settings.routing.kill-switch.failure-mode.desc-fail-closed",
+    "",
+);
+pub const FAIL_OPEN_NOTE: Key = key(
+    "settings.routing.kill-switch.failure-mode.desc-fail-open",
+    "",
+);
 pub const PROTOCOLS: Key = key(
     "settings.routing.kill-switch.protocols.label",
     "Protocols leak protection cuts",
@@ -244,9 +270,15 @@ pub const SHARED_ANY: Key = key(
     "settings.routing-behavior.shared-ip.option-any-rule-domain",
     "Always route the whole shared IP (aggressive)",
 );
-pub const DNS_VIA_SECONDARY: Key = key("settings.routing.dns-via-secondary.label", "DNS through the tunnel");
+pub const DNS_VIA_SECONDARY: Key = key(
+    "settings.routing.dns-via-secondary.label",
+    "DNS through the tunnel",
+);
 pub const DNS_VIA_SECONDARY_NOTE: Key = key("settings.routing.dns-via-secondary.note", "");
-pub const DNS_FAST: Key = key("settings.routing.dns-fast-answers.label", "Fast DNS answers");
+pub const DNS_FAST: Key = key(
+    "settings.routing.dns-fast-answers.label",
+    "Fast DNS answers",
+);
 pub const FAKE_IP: Key = key(
     "settings.routing.fake-ip.label",
     "Route sites over virtual addresses (fake-IP)",
@@ -272,8 +304,14 @@ pub const LIVENESS_RANGE: Key = key(
     "Seconds from 5 to 3600, or 0 to turn it off.",
 );
 pub const SECONDS: Key = key("settings.routing.liveness-window.seconds-unit", "seconds");
-pub const DOH_TITLE: Key = key("settings.routing.doh-lockdown.title", "Block browser DoH/DoT");
-pub const DOH_ENABLE: Key = key("settings.routing.doh-lockdown.label", "Block browser DoH/DoT");
+pub const DOH_TITLE: Key = key(
+    "settings.routing.doh-lockdown.title",
+    "Block browser DoH/DoT",
+);
+pub const DOH_ENABLE: Key = key(
+    "settings.routing.doh-lockdown.label",
+    "Block browser DoH/DoT",
+);
 pub const DOH_SCOPE: Key = key("settings.routing.doh-lockdown.scope-label", "When to apply");
 pub const DOH_LEAK_ONLY: Key = key(
     "settings.routing.doh-lockdown.scope-leak-protection-only",
@@ -302,17 +340,32 @@ pub const PROBE_AUTO: Key = key(
     "settings.routing.primary-probe.auto",
     "Check the main route for new suggestions automatically",
 );
-pub const PROBE_TIMEOUT: Key = key("settings.routing.primary-probe.timeout", "Wait per address, ms");
-pub const PROBE_TARGETS: Key = key("settings.routing.primary-probe.max-targets", "Addresses per check");
+pub const PROBE_TIMEOUT: Key = key(
+    "settings.routing.primary-probe.timeout",
+    "Wait per address, ms",
+);
+pub const PROBE_TARGETS: Key = key(
+    "settings.routing.primary-probe.max-targets",
+    "Addresses per check",
+);
 pub const PROBE_REPEAT: Key = key(
     "settings.routing.primary-probe.repeat",
     "Do not re-check the same address for, s",
 );
 pub const PROBE_RESET: Key = key("settings.routing.primary-probe.reset", "Reset to defaults");
-pub const AUTO_MODE: Key = key("settings.routing.auto-rules.label", "Missing companion domains");
+pub const AUTO_MODE: Key = key(
+    "settings.routing.auto-rules.label",
+    "Missing companion domains",
+);
 pub const AUTO_OFF: Key = key("settings.routing.auto-rules.mode-off", "Off");
-pub const AUTO_SUGGEST: Key = key("settings.routing.auto-rules.mode-suggest", "Suggest only (default)");
-pub const AUTO_AUTO: Key = key("settings.routing.auto-rules.mode-auto", "Apply automatically");
+pub const AUTO_SUGGEST: Key = key(
+    "settings.routing.auto-rules.mode-suggest",
+    "Suggest only (default)",
+);
+pub const AUTO_AUTO: Key = key(
+    "settings.routing.auto-rules.mode-auto",
+    "Apply automatically",
+);
 pub const AUTO_EAGER: Key = key(
     "settings.routing.auto-rules.eager-label",
     "Offer content-delivery domains without waiting for analysis",
@@ -412,12 +465,18 @@ pub const EXPORT_DESCRIPTION: Key = key(
 );
 pub const EXPORT_PATH: Key = key("tui.settings.presets.export-path", "File to write");
 pub const EXPORT_RUN: Key = key("tui.settings.presets.export", "Export full settings");
-pub const EXPORT_NEED_PATH: Key = key("tui.settings.presets.need-path", "Type the file name first.");
+pub const EXPORT_NEED_PATH: Key = key(
+    "tui.settings.presets.need-path",
+    "Type the file name first.",
+);
 pub const EXPORT_EXISTS: Key = key(
     "tui.settings.presets.exists",
     "{path} already exists. Choose another name; nothing was overwritten.",
 );
-pub const EXPORT_DONE: Key = key("tui.settings.presets.written", "Full settings exported to {path}.");
+pub const EXPORT_DONE: Key = key(
+    "tui.settings.presets.written",
+    "Full settings exported to {path}.",
+);
 pub const EXPORT_WRITE_FAILED: Key = key(
     "tui.settings.presets.write-failed",
     "Could not write {path}: {error}",
@@ -433,14 +492,20 @@ pub const RETENTION_TITLE: Key = key("diag.retention.section-title", "Retention 
 pub const LOGS_AGE: Key = key("diag.retention.logs-max-age-label", "Keep logs for");
 pub const LOGS_SIZE: Key = key("diag.retention.logs-max-size-label", "Maximum log storage");
 pub const AUDIT_AGE: Key = key("diag.retention.audit-max-age-label", "Keep audit trail for");
-pub const AUDIT_SIZE: Key = key("diag.retention.audit-max-size-label", "Maximum audit storage");
+pub const AUDIT_SIZE: Key = key(
+    "diag.retention.audit-max-size-label",
+    "Maximum audit storage",
+);
 pub const DAYS_UNIT: Key = key("diag.retention.logs-max-age-unit", "days");
 pub const MB_UNIT: Key = key("diag.retention.size-unit.mb", "MB");
 pub const VERBOSE: Key = key(
     "settings.diagnostics.service-stability.verbose.label",
     "Verbose service logging",
 );
-pub const VERBOSE_OFF: Key = key("settings.diagnostics.service-stability.verbose.option-off", "Normal");
+pub const VERBOSE_OFF: Key = key(
+    "settings.diagnostics.service-stability.verbose.option-off",
+    "Normal",
+);
 pub const VERBOSE_HOUR: Key = key(
     "settings.diagnostics.service-stability.verbose.option-one-hour",
     "Verbose for 1 hour",
@@ -458,7 +523,10 @@ pub const TRACE_LOG: Key = key(
     "Write connection trace to service log",
 );
 pub const TRACE_OFF: Key = key("settings.diagnostics.conn-trace.ndjson.option-off", "Off");
-pub const TRACE_HOUR: Key = key("settings.diagnostics.conn-trace.ndjson.option-one-hour", "Write for 1 hour");
+pub const TRACE_HOUR: Key = key(
+    "settings.diagnostics.conn-trace.ndjson.option-one-hour",
+    "Write for 1 hour",
+);
 pub const TRACE_FOUR: Key = key(
     "settings.diagnostics.conn-trace.ndjson.option-four-hours",
     "Write for 4 hours",
@@ -517,7 +585,10 @@ pub const PIN_LKG_NOTE: Key = key(
 
 pub const TRAFFIC_NOTE: Key = key("settings.traffic.description", "");
 pub const TRAFFIC_TODAY: Key = key("settings.traffic.period-today", "Today");
-pub const TRAFFIC_SESSION: Key = key("settings.traffic.period-session", "Additional adapter session");
+pub const TRAFFIC_SESSION: Key = key(
+    "settings.traffic.period-session",
+    "Additional adapter session",
+);
 pub const TRAFFIC_ALL_TIME: Key = key("settings.traffic.period-all-time", "All time");
 pub const TRAFFIC_RECEIVED: Key = key("settings.traffic.received", "Received");
 pub const TRAFFIC_SENT: Key = key("settings.traffic.sent", "Sent");
@@ -526,8 +597,14 @@ pub const TRAFFIC_NO_DATA: Key = key(
     "No data yet — counting starts once traffic flows.",
 );
 pub const TRAFFIC_ENABLED: Key = key("settings.traffic.master-toggle", "Count traffic");
-pub const TRAFFIC_LOOPBACK: Key = key("settings.traffic.count-loopback", "Count local (localhost) traffic");
-pub const TRAFFIC_VIRTUAL: Key = key("settings.traffic.count-virtual", "Count virtual (VM) adapters");
+pub const TRAFFIC_LOOPBACK: Key = key(
+    "settings.traffic.count-loopback",
+    "Count local (localhost) traffic",
+);
+pub const TRAFFIC_VIRTUAL: Key = key(
+    "settings.traffic.count-virtual",
+    "Count virtual (VM) adapters",
+);
 pub const TRAFFIC_RETENTION: Key = key(
     "settings.traffic.retention-days",
     "Keep daily history for (days)",
@@ -548,7 +625,10 @@ pub const UPDATES_NOTE: Key = key(
 
 // ── Terminal ─────────────────────────────────────────────────────────────────
 
-pub const PREF_PLAIN: Key = key("tui.settings.terminal.plain", "Line mode for screen readers");
+pub const PREF_PLAIN: Key = key(
+    "tui.settings.terminal.plain",
+    "Line mode for screen readers",
+);
 pub const PREF_NO_COLOR: Key = key("tui.settings.terminal.no-color", "No colours");
 pub const PREF_ASCII: Key = key(
     "tui.settings.terminal.ascii",
@@ -619,46 +699,245 @@ pub const NEEDS_ELEVATION_UNIX: Key = key(
 #[cfg(test)]
 pub fn all() -> Vec<Key> {
     let mut keys = vec![
-        SECTIONS, NOTIFICATIONS, ROUTING, FAILURE_POLICY, SERVICE, PRESETS, LOGS, TRAFFIC,
-        UPDATES, TERMINAL, ON, OFF, NOT_SET, LOADING, NO_DATA, SAVING, SAVED, NOT_SAVED,
-        LOAD_FAILED, OFFLINE, NUMBER_RANGE, RESULT, NEW_VALUE, EDIT_HINT, PICK_HINT, CONFIRM,
-        CONFIRM_WORD, MORE_ABOVE, HELP_FOCUS, HELP_ENTER, HELP_ESC, PLAIN_SECTIONS, PLAIN_ITEMS, PLAIN_BACK,
-        PLAIN_PICK, PLAIN_EDIT, PLAIN_CONFIRM, PLAIN_NO_ITEM, HIDDEN_HEADING, HIDDEN_DESCRIPTION,
-        HIDDEN_SHOWN, HIDDEN_FOREVER, HIDDEN_UNTIL, HIDE_SHOW, FOR_A_DAY, FOR_7_DAYS, FOR_30_DAYS,
-        FOREVER, BLOCK_GROUP, MUTE_ALL, MUTE_HOST, MUTE_APP, MUTE_REASON, MUTE_UNTIL,
-        MUTES_HEADING, MUTES_EMPTY, ADD_HEADING, ADD_DESCRIPTION, SCOPE_ALL, SCOPE_HOST,
-        SCOPE_APP, SCOPE_LABEL, HOST_FIELD, APP_FIELD, DURATION, UNIT, MINUTES, HOURS, DAYS,
-        MUTE_ADDED, NEED_TARGET, DELETE, CLEAR, ADD, UNSUPPORTED, DEFAULT_ROUTE,
-        DEFAULT_ROUTE_NOTE, MODE_PREFER_PRIMARY, MODE_PREFER_SECONDARY, MODE_STRICT_SECONDARY,
-        SUBDOMAINS, SUBDOMAINS_NOTE, LEAK_TITLE, LEAK_ENABLE, LEAK_ENABLE_NOTE, FAILURE_MODE,
-        FAIL_CLOSED, FAIL_OPEN, FAIL_CLOSED_NOTE, FAIL_OPEN_NOTE, PROTOCOLS, PROTOCOL_TCP,
-        PROTOCOL_UDP, PROTOCOL_ICMP, PROTOCOL_IGMP, PROTOCOL_GRE, PROTOCOL_ESP, PROTOCOL_LAST,
-        BLOCK_ALL, BLOCK_ALL_NOTE, ALLOW_DNS, ALLOW_DNS_NOTE, SHARED_STRICT, SHARED_STRICT_NOTE,
-        SHARED_IP, SHARED_IP_NOTE, SHARED_MAJORITY_IP, SHARED_MAJORITY_RULES, SHARED_ANY,
-        DNS_VIA_SECONDARY, DNS_VIA_SECONDARY_NOTE, DNS_FAST, FAKE_IP, FAKE_IP_UDP, FAKE_IP_RST,
-        LIVENESS, LIVENESS_DISABLED, LIVENESS_RANGE, SECONDS, DOH_TITLE, DOH_ENABLE, DOH_SCOPE,
-        DOH_LEAK_ONLY, DOH_ALWAYS, HOSTS_TITLE, HOSTS_BYPASS, LOCAL_TITLE, LOCAL_AUTO,
-        SHORT_TITLE, SHORT_NOTE, SHORT_ENABLE, SHORT_FIELD, AUTO_TITLE, PROBE_AUTO,
-        PROBE_TIMEOUT, PROBE_TARGETS, PROBE_REPEAT, PROBE_RESET, AUTO_MODE, AUTO_OFF,
-        AUTO_SUGGEST, AUTO_AUTO, AUTO_EAGER, SYSTEM_TITLE, RULE_LOCK, SERVICE_DRIVEN,
-        STOP_PERSIST, POLICY_DESCRIPTION, POLICY_BEST_EFFORT, POLICY_BEST_EFFORT_NOTE,
-        POLICY_ALL, POLICY_ALL_NOTE, POLICY_PREFLIGHT, POLICY_PREFLIGHT_NOTE, POLICY_ELEVATION,
-        SERVICE_STATE, SERVICE_START_MODE, RUN_RUNNING, RUN_STOPPED, RUN_STARTING, RUN_STOPPING,
-        RUN_NOT_INSTALLED, RUN_UNKNOWN, MODE_WITH_SYSTEM, MODE_ON_LAUNCH, SERVICE_START,
-        SERVICE_STOP, SERVICE_RESTART, SERVICE_NOTE, SERVICE_DONE, SERVICE_QUERY_FAILED,
-        SERVICE_NO_MANAGER, EXPORT_DESCRIPTION, EXPORT_PATH, EXPORT_RUN, EXPORT_NEED_PATH,
-        EXPORT_EXISTS, EXPORT_DONE, EXPORT_WRITE_FAILED, RULES_NOTE, RETENTION_TITLE, LOGS_AGE,
-        LOGS_SIZE, AUDIT_AGE, AUDIT_SIZE, DAYS_UNIT, MB_UNIT, VERBOSE, VERBOSE_OFF,
-        VERBOSE_HOUR, VERBOSE_FOUR, VERBOSE_RESTART, TRACE_LOG, TRACE_OFF, TRACE_HOUR,
-        TRACE_FOUR, TRACE_RESTART, WINDOW_UNTIL, CLEAR_LOGS, LOGS_CLEARED, STORAGE_TITLE,
-        STORAGE_STATE, STORAGE_CACHE, STORAGE_LOGS, STORAGE_AUDIT, STORAGE_TOTAL,
-        REVISIONS_TITLE, REVISIONS_NOTE, SUPERSEDED_DAYS, SUPERSEDED_COUNT, REJECTED_DAYS,
-        ROLLEDBACK_DAYS, ROLLEDBACK_COUNT, PIN_LKG, PIN_LKG_NOTE, TRAFFIC_NOTE, TRAFFIC_TODAY,
-        TRAFFIC_SESSION, TRAFFIC_ALL_TIME, TRAFFIC_RECEIVED, TRAFFIC_SENT, TRAFFIC_NO_DATA,
-        TRAFFIC_ENABLED, TRAFFIC_LOOPBACK, TRAFFIC_VIRTUAL, TRAFFIC_RETENTION, TRAFFIC_RESET,
-        TRAFFIC_RESET_DONE, VERSION, UPDATES_NOTE, PREF_PLAIN, PREF_NO_COLOR, PREF_ASCII,
-        PREF_NOTE, PREF_SAVED, PREF_NO_FILE, PREF_SAVE_FAILED, ERROR_UNKNOWN,
-        NEEDS_ELEVATION_WINDOWS, NEEDS_ELEVATION_UNIX,
+        SECTIONS,
+        NOTIFICATIONS,
+        ROUTING,
+        FAILURE_POLICY,
+        SERVICE,
+        PRESETS,
+        LOGS,
+        TRAFFIC,
+        UPDATES,
+        TERMINAL,
+        ON,
+        OFF,
+        NOT_SET,
+        LOADING,
+        NO_DATA,
+        SAVING,
+        SAVED,
+        NOT_SAVED,
+        LOAD_FAILED,
+        OFFLINE,
+        NUMBER_RANGE,
+        RESULT,
+        NEW_VALUE,
+        EDIT_HINT,
+        PICK_HINT,
+        CONFIRM,
+        MORE_ABOVE,
+        HELP_FOCUS,
+        HELP_ENTER,
+        HELP_ESC,
+        PLAIN_SECTIONS,
+        PLAIN_ITEMS,
+        PLAIN_BACK,
+        PLAIN_PICK,
+        PLAIN_EDIT,
+        PLAIN_CONFIRM,
+        PLAIN_NO_ITEM,
+        HIDDEN_HEADING,
+        HIDDEN_DESCRIPTION,
+        HIDDEN_SHOWN,
+        HIDDEN_FOREVER,
+        HIDDEN_UNTIL,
+        HIDE_SHOW,
+        FOR_A_DAY,
+        FOR_7_DAYS,
+        FOR_30_DAYS,
+        FOREVER,
+        BLOCK_GROUP,
+        MUTE_ALL,
+        MUTE_HOST,
+        MUTE_APP,
+        MUTE_REASON,
+        MUTE_UNTIL,
+        MUTES_HEADING,
+        MUTES_EMPTY,
+        ADD_HEADING,
+        ADD_DESCRIPTION,
+        SCOPE_ALL,
+        SCOPE_HOST,
+        SCOPE_APP,
+        SCOPE_LABEL,
+        HOST_FIELD,
+        APP_FIELD,
+        DURATION,
+        UNIT,
+        MINUTES,
+        HOURS,
+        DAYS,
+        MUTE_ADDED,
+        NEED_TARGET,
+        DELETE,
+        CLEAR,
+        ADD,
+        UNSUPPORTED,
+        DEFAULT_ROUTE,
+        DEFAULT_ROUTE_NOTE,
+        MODE_PREFER_PRIMARY,
+        MODE_PREFER_SECONDARY,
+        MODE_STRICT_SECONDARY,
+        SUBDOMAINS,
+        SUBDOMAINS_NOTE,
+        LEAK_TITLE,
+        LEAK_ENABLE,
+        LEAK_ENABLE_NOTE,
+        FAILURE_MODE,
+        FAIL_CLOSED,
+        FAIL_OPEN,
+        FAIL_CLOSED_NOTE,
+        FAIL_OPEN_NOTE,
+        PROTOCOLS,
+        PROTOCOL_TCP,
+        PROTOCOL_UDP,
+        PROTOCOL_ICMP,
+        PROTOCOL_IGMP,
+        PROTOCOL_GRE,
+        PROTOCOL_ESP,
+        PROTOCOL_LAST,
+        BLOCK_ALL,
+        BLOCK_ALL_NOTE,
+        ALLOW_DNS,
+        ALLOW_DNS_NOTE,
+        SHARED_STRICT,
+        SHARED_STRICT_NOTE,
+        SHARED_IP,
+        SHARED_IP_NOTE,
+        SHARED_MAJORITY_IP,
+        SHARED_MAJORITY_RULES,
+        SHARED_ANY,
+        DNS_VIA_SECONDARY,
+        DNS_VIA_SECONDARY_NOTE,
+        DNS_FAST,
+        FAKE_IP,
+        FAKE_IP_UDP,
+        FAKE_IP_RST,
+        LIVENESS,
+        LIVENESS_DISABLED,
+        LIVENESS_RANGE,
+        SECONDS,
+        DOH_TITLE,
+        DOH_ENABLE,
+        DOH_SCOPE,
+        DOH_LEAK_ONLY,
+        DOH_ALWAYS,
+        HOSTS_TITLE,
+        HOSTS_BYPASS,
+        LOCAL_TITLE,
+        LOCAL_AUTO,
+        SHORT_TITLE,
+        SHORT_NOTE,
+        SHORT_ENABLE,
+        SHORT_FIELD,
+        AUTO_TITLE,
+        PROBE_AUTO,
+        PROBE_TIMEOUT,
+        PROBE_TARGETS,
+        PROBE_REPEAT,
+        PROBE_RESET,
+        AUTO_MODE,
+        AUTO_OFF,
+        AUTO_SUGGEST,
+        AUTO_AUTO,
+        AUTO_EAGER,
+        SYSTEM_TITLE,
+        RULE_LOCK,
+        SERVICE_DRIVEN,
+        STOP_PERSIST,
+        POLICY_DESCRIPTION,
+        POLICY_BEST_EFFORT,
+        POLICY_BEST_EFFORT_NOTE,
+        POLICY_ALL,
+        POLICY_ALL_NOTE,
+        POLICY_PREFLIGHT,
+        POLICY_PREFLIGHT_NOTE,
+        POLICY_ELEVATION,
+        SERVICE_STATE,
+        SERVICE_START_MODE,
+        RUN_RUNNING,
+        RUN_STOPPED,
+        RUN_STARTING,
+        RUN_STOPPING,
+        RUN_NOT_INSTALLED,
+        RUN_UNKNOWN,
+        MODE_WITH_SYSTEM,
+        MODE_ON_LAUNCH,
+        SERVICE_START,
+        SERVICE_STOP,
+        SERVICE_RESTART,
+        SERVICE_NOTE,
+        SERVICE_DONE,
+        SERVICE_QUERY_FAILED,
+        SERVICE_NO_MANAGER,
+        EXPORT_DESCRIPTION,
+        EXPORT_PATH,
+        EXPORT_RUN,
+        EXPORT_NEED_PATH,
+        EXPORT_EXISTS,
+        EXPORT_DONE,
+        EXPORT_WRITE_FAILED,
+        RULES_NOTE,
+        RETENTION_TITLE,
+        LOGS_AGE,
+        LOGS_SIZE,
+        AUDIT_AGE,
+        AUDIT_SIZE,
+        DAYS_UNIT,
+        MB_UNIT,
+        VERBOSE,
+        VERBOSE_OFF,
+        VERBOSE_HOUR,
+        VERBOSE_FOUR,
+        VERBOSE_RESTART,
+        TRACE_LOG,
+        TRACE_OFF,
+        TRACE_HOUR,
+        TRACE_FOUR,
+        TRACE_RESTART,
+        WINDOW_UNTIL,
+        CLEAR_LOGS,
+        LOGS_CLEARED,
+        STORAGE_TITLE,
+        STORAGE_STATE,
+        STORAGE_CACHE,
+        STORAGE_LOGS,
+        STORAGE_AUDIT,
+        STORAGE_TOTAL,
+        REVISIONS_TITLE,
+        REVISIONS_NOTE,
+        SUPERSEDED_DAYS,
+        SUPERSEDED_COUNT,
+        REJECTED_DAYS,
+        ROLLEDBACK_DAYS,
+        ROLLEDBACK_COUNT,
+        PIN_LKG,
+        PIN_LKG_NOTE,
+        TRAFFIC_NOTE,
+        TRAFFIC_TODAY,
+        TRAFFIC_SESSION,
+        TRAFFIC_ALL_TIME,
+        TRAFFIC_RECEIVED,
+        TRAFFIC_SENT,
+        TRAFFIC_NO_DATA,
+        TRAFFIC_ENABLED,
+        TRAFFIC_LOOPBACK,
+        TRAFFIC_VIRTUAL,
+        TRAFFIC_RETENTION,
+        TRAFFIC_RESET,
+        TRAFFIC_RESET_DONE,
+        VERSION,
+        UPDATES_NOTE,
+        PREF_PLAIN,
+        PREF_NO_COLOR,
+        PREF_ASCII,
+        PREF_NOTE,
+        PREF_SAVED,
+        PREF_NO_FILE,
+        PREF_SAVE_FAILED,
+        ERROR_UNKNOWN,
+        NEEDS_ELEVATION_WINDOWS,
+        NEEDS_ELEVATION_UNIX,
     ];
     keys.extend(ERRORS.iter().map(|(_, k)| *k));
     keys

@@ -26,6 +26,8 @@
 //! |                                 | shows for one value, via `rule_value_validation`.                 |
 //! | `local.rule-values-classify`    | A pasted address list, each line sorted into exact IP / subnet /  |
 //! |                                 | range with that type's verdict.                                   |
+//! | `local.user-settings.intent-*`  | What the user decided about the service's settings, read from and |
+//! |                                 | recorded in their own settings file, for "Restore my settings".   |
 //!
 //! Slug shape mirrors the IpcOperationName convention
 //! (`<domain>.<resource>.<verb>`) — though `local.*` has no verb tier
@@ -70,6 +72,17 @@ pub enum LocalHandlerError {
     MalformedRulesJson(#[from] serde_json::Error),
     #[error("canonicalization failed: {0}")]
     CanonicalisationFailed(#[from] RulesJsonCodecError),
+    #[error("user settings: {message}")]
+    UserSettings { code: &'static str, message: String },
+}
+
+impl From<crate::user_settings_bridge::IntentError> for LocalHandlerError {
+    fn from(error: crate::user_settings_bridge::IntentError) -> Self {
+        Self::UserSettings {
+            code: error.wire_code(),
+            message: error.to_string(),
+        }
+    }
 }
 
 impl LocalHandlerError {
@@ -83,6 +96,7 @@ impl LocalHandlerError {
             LocalHandlerError::MissingField(_) => "missing-field",
             LocalHandlerError::MalformedRulesJson(_) => "malformed-input",
             LocalHandlerError::CanonicalisationFailed(_) => "canonicalisation-failed",
+            LocalHandlerError::UserSettings { code, .. } => code,
         }
     }
 }
@@ -109,6 +123,10 @@ pub fn handle_local_request(
         "local.vm-inventory.list" => handle_vm_inventory_list(payload),
         "local.vm-nat.bind" => handle_vm_nat_bind(payload),
         "local.system-theme" => Ok(handle_system_theme()),
+        "local.user-settings.intent-get" => Ok(crate::user_settings_bridge::intent_get()?),
+        "local.user-settings.intent-record" => {
+            Ok(crate::user_settings_bridge::intent_record(payload)?)
+        }
         other => Err(LocalHandlerError::UnknownOperation(other.to_string())),
     }
 }

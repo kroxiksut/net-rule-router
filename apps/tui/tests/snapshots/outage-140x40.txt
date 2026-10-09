@@ -1,0 +1,40 @@
+Service: OK
+> Screens                               Blocked while the route was down
+  1 Status                              What leak protection held back while the additional route was down. Your rules send these addresses
+  2 First run                           there, so they were blocked instead of leaving through the main connection.
+  3 Interfaces and routes               The additional route has been down since 2026-10-06 11:50:00.
+  4 Rules                               3: Open interfaces and routes
+  5 Overlaps
+  6 Suggested addresses                 Connections
+  7 Connection trace                    Process | Remote | Attempts | First | Last
+>     Blocked while the route was down  > 1. browser.exe | video.example.com · 203.0.113.5:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06
+  8 Cache                               11:59:00
+  9 Diagnostics and logs                  2. updater.exe | cdn.example.net · [2001:db8::7]:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06
+  0 Settings                            11:59:00
+                                          3. ? | 198.51.100.9 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
+                                        Rows 1–3 of 3.
+
+
+                                        Selected connection
+                                        Process: browser.exe
+                                        Path: /opt/example/browser.exe
+                                        Remote: video.example.com · 203.0.113.5:443
+                                        Attempts: 12
+                                        First: 2026-10-06 11:51:00
+                                        Last: 2026-10-06 11:59:00
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+F1: help   q: quit

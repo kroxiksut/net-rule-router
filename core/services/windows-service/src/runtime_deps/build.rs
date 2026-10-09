@@ -464,7 +464,8 @@ pub(crate) fn build_supervised_runtime_deps(
     let pass_inputs = {
         use nrr_platform_api::adapters::AdapterEventSource;
         use nrr_service_runtime::pass_inputs::{
-            applying_revision, hashed, table_writes, PassInputs, PLAN_BLIND_STATE_TABLES,
+            applying_revision, hashed, table_writes, verify_verdicts, PassInputs,
+            PLAN_BLIND_STATE_TABLES,
         };
         let state_db = artifacts.topology.state_db_path.clone();
         let cache = cache_store.clone();
@@ -508,6 +509,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 )
                 .with_source("state", table_writes(state_db, PLAN_BLIND_STATE_TABLES))
                 .with_source("applying", applying_revision())
+                .with_source("verdicts", verify_verdicts())
                 .with_source(
                     "cache",
                     Arc::new(move || cache.as_ref()?.lock().ok()?.change_generation()),

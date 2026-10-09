@@ -73,6 +73,8 @@ QtObject {
                     "Could not add the mute: ") + root.ipcErrorLabel(code)
                 return
             }
+            if (root.settingsRestoreController)
+                root.settingsRestoreController.recordMutes((p && p.mutes) || [])
             notificationsController.dismissNotification(notificationId)
         })
     }
@@ -219,7 +221,11 @@ QtObject {
         else if (actionKey === "open-auto-rule-suggestions") root.autoRuleSuggestionsController.openAutoRuleSuggestions()
         else if (actionKey === "open-interfaces") root.section = "interfaces-routes"
         else if (actionKey === "open-rules") root.section = "rules"
+        else if (actionKey === "open-outage-blocks") root.openOutageBlocks()
+        else if (actionKey === "verify-verdicts-move") root.moveVerifyVerdicts()
+        else if (actionKey === "verify-verdicts-later") root.dismissVerifyVerdicts()
         else if (actionKey === "open-routing-settings") root.section = "settings"
+        else if (actionKey === "restore-settings") root.settingsRestoreController.restore()
         else if (actionKey === "open-release-page") {
             // The release the notice names; else the project's releases page.
             var u = (root.updateCheckController.offer || {}).url || ""

@@ -37,6 +37,15 @@ ru              # Российская Федерация (.ru)
 
 *.google.com  # Google services stay on the main route; the AI hosts are routed separately
 
+?*.proton.me  # Foreign messengers and communication tools
+?*.protonmail.com  # Foreign messengers and communication tools
+?*.protonmail.ch  # Foreign messengers and communication tools
+?*.protonvpn.com  # Foreign messengers and communication tools
+?play.google.com  # Google Play store
+?play-lh.googleusercontent.com  # Google Play store
+?accounts.google.com  # Google sign-in
+?accounts.google.ru  # Google sign-in under the .ru zone
+
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 

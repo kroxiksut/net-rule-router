@@ -160,10 +160,10 @@ impl NetworkCarving {
                 take_addresses(&self.main_addresses);
                 take_addresses(&self.additional_addresses);
             }
-            (RuleAction::Route | RuleAction::VerifyPrimary, Link::Main) => {
+            (RuleAction::Route | RuleAction::Verify, Link::Main) => {
                 take_addresses(&self.additional_addresses)
             }
-            (RuleAction::Route | RuleAction::VerifyPrimary, Link::Additional) => {
+            (RuleAction::Route | RuleAction::Verify, Link::Additional) => {
                 take_addresses(&self.main_addresses)
             }
         }
@@ -178,13 +178,13 @@ impl NetworkCarving {
                     .chain(&self.additional_networks)
                     .filter(|n| narrower(n, false)),
             ),
-            (RuleAction::Route | RuleAction::VerifyPrimary, Link::Main) => holes.extend(
+            (RuleAction::Route | RuleAction::Verify, Link::Main) => holes.extend(
                 self.additional_networks
                     .iter()
                     .filter(|n| narrower(n, false)),
             ),
             // The main link wins a tie between two route networks.
-            (RuleAction::Route | RuleAction::VerifyPrimary, Link::Additional) => {
+            (RuleAction::Route | RuleAction::Verify, Link::Additional) => {
                 holes.extend(self.main_networks.iter().filter(|n| narrower(n, true)));
             }
         }

@@ -242,7 +242,7 @@ Dialog {
                 ThemedButton {
                     id: notNowButton
                     theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                    text: dialog.tr("dialog.drift.not-now", "Not now")
+                    text: dialog.tr("action.not-now", "Not now")
                     Accessible.role: Accessible.Button
                     Accessible.name: text
                     Accessible.description: dialog.tr(

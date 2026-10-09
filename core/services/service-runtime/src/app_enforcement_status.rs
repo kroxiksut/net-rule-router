@@ -240,7 +240,12 @@ impl FailClosedPostureStatus {
 /// the caller's own. The push fires on change only, so without this a client
 /// that connects later never learns a standing state.
 #[derive(Clone, Default)]
-pub struct RouteEnforcementStatus(Arc<Mutex<ReportsByPrincipal>>);
+pub struct RouteEnforcementStatus {
+    reports: Arc<Mutex<ReportsByPrincipal>>,
+    /// Told when a principal's additional route goes down or comes back, so
+    /// the outage list opens and closes at the instant the status shows.
+    outages: Arc<std::sync::OnceLock<Arc<crate::outage_blocks::OutageBlocks>>>,
+}
 
 /// Principal → role → report.
 type ReportsByPrincipal = HashMap<String, BTreeMap<String, EnforcementStatusDto>>;
@@ -251,21 +256,66 @@ impl RouteEnforcementStatus {
         Self::default()
     }
 
-    /// Store `report` for `principal`. Returns whether it differs from the
-    /// stored one, which is what decides the push.
-    pub fn record(&self, principal: &str, report: &EnforcementStatusDto) -> bool {
-        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        let roles = guard.entry(principal.to_string()).or_default();
-        if roles.get(&report.role) == Some(report) {
-            return false;
+    /// Open and close `outages` episodes from the additional route's status.
+    /// The first store stays; `false` says one was already attached.
+    pub fn watch_outages(&self, outages: Arc<crate::outage_blocks::OutageBlocks>) -> bool {
+        self.outages.set(outages).is_ok()
+    }
+
+    /// Store `report` for `principal`, stamped with when its status began.
+    /// Returns the stored report when it differs from the previous one, which
+    /// is what decides the push.
+    pub fn record(
+        &self,
+        principal: &str,
+        report: &EnforcementStatusDto,
+    ) -> Option<EnforcementStatusDto> {
+        let now_ms = crate::conn_observation_consumer::now_unix_ms();
+        self.record_at(principal, report, i64::try_from(now_ms).unwrap_or(i64::MAX))
+    }
+
+    /// [`Self::record`] at `now_ms`. The start time moves only when the status
+    /// does: new candidates for the same status are the same outage.
+    pub fn record_at(
+        &self,
+        principal: &str,
+        report: &EnforcementStatusDto,
+        now_ms: i64,
+    ) -> Option<EnforcementStatusDto> {
+        let stored = {
+            let mut guard = self.reports.lock().unwrap_or_else(|p| p.into_inner());
+            let roles = guard.entry(principal.to_string()).or_default();
+            let previous = roles.get(&report.role);
+            let since_unix_ms = match previous {
+                Some(previous) if previous.status == report.status => previous.since_unix_ms,
+                _ => Some(now_ms),
+            };
+            let stored = EnforcementStatusDto {
+                since_unix_ms,
+                ..report.clone()
+            };
+            if previous == Some(&stored) {
+                return None;
+            }
+            roles.insert(report.role.clone(), stored.clone());
+            stored
+        };
+        if stored.role == "secondary" {
+            if let Some(outages) = self.outages.get() {
+                let at_ms = u64::try_from(now_ms).unwrap_or(0);
+                if stored.status == "ok" {
+                    outages.outage_ended(principal, at_ms);
+                } else {
+                    outages.outage_began(principal, at_ms);
+                }
+            }
         }
-        roles.insert(report.role.clone(), report.clone());
-        true
+        Some(stored)
     }
 
     /// `principal`'s last status for `role`, when one was reported.
     pub fn status_of(&self, principal: &str, role: &str) -> Option<String> {
-        self.0
+        self.reports
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(principal)
@@ -276,7 +326,7 @@ impl RouteEnforcementStatus {
     /// `principal`'s reports, ordered by role. Never another principal's: the
     /// candidates name that user's adapters.
     pub fn for_principal(&self, principal: &str) -> Vec<EnforcementStatusDto> {
-        self.0
+        self.reports
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(principal)
@@ -338,36 +388,118 @@ mod tests {
         );
     }
 
-    #[test]
-    fn route_enforcement_keeps_the_last_report_per_role_and_principal() {
-        let report = |status: &str, role: &str| EnforcementStatusDto {
+    fn status_report(status: &str, role: &str) -> EnforcementStatusDto {
+        EnforcementStatusDto {
             status: status.into(),
             role: role.into(),
             candidates: Vec::new(),
-        };
+            since_unix_ms: None,
+        }
+    }
+
+    fn stamped(status: &str, role: &str, since: i64) -> EnforcementStatusDto {
+        EnforcementStatusDto {
+            since_unix_ms: Some(since),
+            ..status_report(status, role)
+        }
+    }
+
+    #[test]
+    fn route_enforcement_keeps_the_last_report_per_role_and_principal() {
+        let report = status_report;
         let writer = RouteEnforcementStatus::new();
         let reader = writer.clone();
-        assert!(writer.record("S-1", &report("secondary-down", "secondary")));
+        assert!(writer
+            .record_at("S-1", &report("secondary-down", "secondary"), 10)
+            .is_some());
         assert!(
-            !writer.record("S-1", &report("secondary-down", "secondary")),
+            writer
+                .record_at("S-1", &report("secondary-down", "secondary"), 20)
+                .is_none(),
             "the same report again is not a change"
         );
-        assert!(writer.record("S-1", &report("ok", "primary")));
-        assert!(writer.record("S-2", &report("adapter-gone", "secondary")));
+        assert!(writer
+            .record_at("S-1", &report("ok", "primary"), 30)
+            .is_some());
+        assert!(writer
+            .record_at("S-2", &report("adapter-gone", "secondary"), 40)
+            .is_some());
         assert_eq!(
             reader.for_principal("S-1"),
             vec![
-                report("ok", "primary"),
-                report("secondary-down", "secondary")
+                stamped("ok", "primary", 30),
+                stamped("secondary-down", "secondary", 10)
             ]
         );
-        assert!(writer.record("S-1", &report("ok", "secondary")));
+        assert!(writer
+            .record_at("S-1", &report("ok", "secondary"), 50)
+            .is_some());
         assert_eq!(reader.status_of("S-1", "secondary").as_deref(), Some("ok"));
         assert_eq!(
             reader.for_principal("S-2"),
-            vec![report("adapter-gone", "secondary")]
+            vec![stamped("adapter-gone", "secondary", 40)]
         );
         assert!(reader.for_principal("S-3").is_empty());
+    }
+
+    #[test]
+    fn since_moves_only_when_the_status_does() {
+        let board = RouteEnforcementStatus::new();
+        let gone = |candidates: &[&str]| EnforcementStatusDto {
+            candidates: candidates.iter().map(|c| (*c).to_string()).collect(),
+            ..status_report("adapter-gone", "secondary")
+        };
+        assert_eq!(
+            board
+                .record_at("S-1", &gone(&["Tunnel A"]), 100)
+                .and_then(|r| r.since_unix_ms),
+            Some(100)
+        );
+        let pushed = board.record_at("S-1", &gone(&["Tunnel A", "Tunnel B"]), 200);
+        assert_eq!(
+            pushed.and_then(|r| r.since_unix_ms),
+            Some(100),
+            "new candidates are still the same outage"
+        );
+        assert_eq!(
+            board
+                .record_at("S-1", &status_report("secondary-down", "secondary"), 300)
+                .and_then(|r| r.since_unix_ms),
+            Some(300)
+        );
+        assert_eq!(
+            board
+                .record_at("S-1", &status_report("ok", "secondary"), 400)
+                .and_then(|r| r.since_unix_ms),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn the_secondary_status_opens_and_closes_the_outage_list() {
+        use crate::outage_blocks::OutageBlocks;
+        let board = RouteEnforcementStatus::new();
+        let outages = Arc::new(OutageBlocks::new());
+        assert!(board.clone().watch_outages(Arc::clone(&outages)));
+        assert!(!board.watch_outages(Arc::new(OutageBlocks::new())));
+
+        board.record_at("S-1", &status_report("ok", "primary"), 50);
+        assert_eq!(
+            outages.snapshot("S-1").episode,
+            None,
+            "the main link is not the outage"
+        );
+        board.record_at("S-1", &status_report("secondary-down", "secondary"), 100);
+        board.record_at("S-1", &status_report("adapter-gone", "secondary"), 150);
+        let open = outages.snapshot("S-1").episode;
+        assert_eq!(open.map(|e| (e.since_ms, e.until_ms)), Some((100, None)));
+        board.record_at("S-1", &status_report("ok", "secondary"), 300);
+        let closed = outages.snapshot("S-1").episode;
+        assert_eq!(
+            closed.map(|e| (e.since_ms, e.until_ms)),
+            Some((100, Some(300)))
+        );
+        assert_eq!(outages.snapshot("S-2").episode, None);
     }
 
     #[test]

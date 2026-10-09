@@ -11,7 +11,7 @@ use crate::{js, Route};
 /// The preset format version this build writes. Mirrors
 /// `nrr_domain::rules_file::CURRENT_RULES_FILE_FORMAT_VERSION` through the
 /// GUI's `CANONICAL_PRESET_FORMAT_VERSION`, which a GUI test pins to it.
-pub const PRESET_FORMAT_VERSION: u32 = 6;
+pub const PRESET_FORMAT_VERSION: u32 = 7;
 
 /// Room between a rule and its inline comment.
 const COMMENT_GAP: &str = "          # ";
@@ -110,10 +110,11 @@ fn one_line(value: &str) -> String {
 
 /// The text of the rules file for `route` (`buildCanonicalRulesText`).
 ///
-/// Host values are written in Unicode form, as stored. A block or verify row
-/// rides in the secondary file, marked by `+block` or a `?` before the value;
-/// a disabled row is written commented out. An app-authored domain rule moves
-/// to `--- Auto` with the provenance tokens the parser reads it back from.
+/// Host values are written in Unicode form, as stored. A block row rides in
+/// the secondary file marked by `+block`; a `?` row is marked by a `?` before
+/// the value in its own file; a disabled row is written commented out. An
+/// app-authored domain rule moves to `--- Auto` with the provenance tokens the
+/// parser reads it back from.
 pub fn build_rules_file_text(
     rows: &[RuleRow],
     route: Route,
@@ -143,7 +144,7 @@ pub fn build_rules_file_text(
         if !row.enabled {
             line.push_str("# ");
         }
-        if row.target_route == TargetRoute::Verify {
+        if row.is_verify() {
             line.push('?');
         }
         line.push_str(value);
@@ -225,6 +226,7 @@ mod tests {
             rule_type: RuleType::Application,
             match_value: "client".to_owned(),
             target_route: TargetRoute::Secondary,
+            verify: false,
             comment: String::new(),
             origin: None,
         };
