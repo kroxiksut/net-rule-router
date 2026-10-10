@@ -171,6 +171,11 @@ pub const OUTAGE_OPEN_ROUTES: Key = key(
 pub const COL_ATTEMPTS: Key = key("diag.outage-blocks.col-attempts", "Attempts");
 pub const COL_FIRST: Key = key("diag.outage-blocks.col-first", "First");
 pub const COL_LAST: Key = key("diag.outage-blocks.col-last", "Last");
+pub const OUTAGE_UNRESOLVED: Key = key("diag.outage-blocks.unresolved", "did not resolve");
+pub const OUTAGE_UNRESOLVED_NOTE: Key = key(
+    "diag.outage-blocks.unresolved-note",
+    "Names marked “did not resolve” got no address, so the program could not even start a connection.",
+);
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 
@@ -479,6 +484,8 @@ pub const ALL: &[Key] = &[
     COL_ATTEMPTS,
     COL_FIRST,
     COL_LAST,
+    OUTAGE_UNRESOLVED,
+    OUTAGE_UNRESOLVED_NOTE,
     CACHE_LIST,
     CACHE_DETAIL,
     CACHE_TOTAL,

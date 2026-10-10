@@ -99,12 +99,11 @@ impl SecondaryRouteCoordinator {
                 if let Some(cached) = cache.get(&secondary.interface_index) {
                     server_ips = cached.clone();
                 }
-            } else {
+            } else if cache.get(&secondary.interface_index) != Some(&server_ips) {
                 cache.insert(secondary.interface_index, server_ips.clone());
-                // write-through so the observed server
-                // IPs survive a service restart (the catch-all kill-switch will
-                // not arm without a server exemption). Best-effort; the closure
-                // logs+swallows any storage error. Invoked outside the DB lock.
+                // Written so the catch-all can arm after a restart; only on a
+                // change, because the write moves the pass's `state` input and
+                // a steady tunnel would otherwise force a full pass every tick.
                 if let Some(persist) = self.server_ip_persist.as_ref() {
                     persist(&server_ips);
                 }

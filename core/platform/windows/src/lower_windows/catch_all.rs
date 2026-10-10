@@ -62,7 +62,7 @@ pub fn lower_catch_all_kill_switch(
         let user_sid = if is_packet {
             None
         } else {
-            flow.principal.0.as_ref().map(|p| p.as_stored().to_string())
+            user_sid_of(&flow.principal)
         };
         let local_interface_luid =
             matches!(flow.egress, EgressConstraint::OnlyVia(EgressRef::Secondary))

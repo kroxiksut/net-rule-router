@@ -114,6 +114,34 @@ fn screen_text(app: &AppState, id: ScreenId) -> String {
     out
 }
 
+/// Not in the table, so the screen has to say they exist and do nothing.
+#[test]
+fn rules_this_build_cannot_read_are_counted_on_screen() {
+    let fake = FakeService::new(ConnectionStatus::Connected);
+    fake.answer(
+        IpcOperationName::RulesList,
+        json!({
+            "rows": [rule("r1", "domain", "example.com", "secondary")],
+            "supported-rule-types": ["domain"],
+            "unrecognized": 2
+        }),
+    );
+    let app = on_rules(&fake);
+    assert!(
+        screen_text(&app, ScreenId::Rules).contains("Rules this version cannot read: 2."),
+        "{}",
+        screen_text(&app, ScreenId::Rules)
+    );
+
+    let plain = on_rules(&service(vec![rule(
+        "r1",
+        "domain",
+        "example.com",
+        "secondary",
+    )]));
+    assert!(!screen_text(&plain, ScreenId::Rules).contains("cannot read"));
+}
+
 fn overlaps_text(app: &mut AppState) -> String {
     app.open(ScreenId::Overlaps);
     screen_text(app, ScreenId::Overlaps)
@@ -287,6 +315,328 @@ fn imported_rules_are_not_confirmed_for_the_user() {
         overlaps.contains("1 overlap(s) not confirmed"),
         "{overlaps}"
     );
+}
+
+// ── Discarding edits ─────────────────────────────────────────────────────────
+
+/// "Show the rules the service applies" really drops the edits on screen.
+#[test]
+fn discarding_edits_brings_back_the_rules_in_force() {
+    let fake = service(vec![rule("1", "domain", "example.com", "secondary")]);
+    let mut app = on_rules(&fake);
+    answer(&mut app, &["t 1"]);
+    assert!(super::holds_unapplied(&app), "switched off on screen");
+    answer(&mut app, &["r", "1"]);
+    drain(&mut app, &fake);
+    assert!(!super::holds_unapplied(&app));
+    let kept = app.rules.table.rules().next().expect("the rule");
+    assert!(kept.enabled, "the service's rule is back as it is applied");
+}
+
+// ── The main-route check ─────────────────────────────────────────────────────
+
+mod main_route {
+    use std::time::Instant;
+
+    use nrr_shared::ipc::IpcOperationName;
+    use serde_json::{json, Value};
+
+    use super::super::main_route::POLL;
+    use super::super::Mode;
+    use super::{answer, on_rules, rule, screen_text, service, ADD_DOMAIN};
+    use crate::backend::BackendEvent;
+    use crate::link::Link;
+    use crate::plain::PlainSession;
+    use crate::screens::suggestions::tests::{drain, render};
+    use crate::screens::ScreenId;
+    use crate::state::{AppState, Focus};
+    use crate::testing::{app_at, assert_snapshot, texts_en, FakeService, Fixture};
+
+    fn marked(id: &str, rule_type: &str, value: &str, route: &str, verdict: &str) -> Value {
+        let mut entry = rule(id, rule_type, value, route);
+        entry["main-route"] = Value::from(verdict);
+        entry
+    }
+
+    /// A row of every verdict, a zone, and two rules never asked about.
+    fn every_verdict() -> Vec<Value> {
+        vec![
+            marked("1", "domain", "silent.example", "secondary", "silent"),
+            marked("2", "domain", "answered.example", "secondary", "answered"),
+            marked("3", "domain", "new.example", "secondary", "no-address"),
+            marked("4", "domain", "odd.example", "secondary", "unclear"),
+            rule("5", "zone", "ru", "secondary"),
+            rule("6", "domain", "main.example", "primary"),
+            rule("7", "domain", "later.example", "secondary"),
+        ]
+    }
+
+    fn rules_list(rows: Vec<Value>, pending: u32) -> Value {
+        json!({
+            "rows": rows,
+            "supported-rule-types": ["zone", "domain", "exact-ip", "application"],
+            "main-route-pending": pending
+        })
+    }
+
+    /// Runs the polls the screen asked to have run later.
+    fn run_later(app: &mut AppState, fake: &FakeService) {
+        let later = app.outbox.take_delayed();
+        assert!(!later.is_empty(), "a poll was asked for");
+        for (delay, job) in later {
+            assert_eq!(delay, POLL);
+            let reply = job(fake);
+            app.apply(BackendEvent::Reply(reply), &texts_en(), Instant::now());
+        }
+    }
+
+    fn note(app: &AppState) -> String {
+        app.rules
+            .note
+            .as_ref()
+            .map(|note| note.text(&texts_en()))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_column_names_every_verdict_and_the_zone() {
+        let mut app = on_rules(&service(every_verdict()));
+        let text = screen_text(&app, ScreenId::Rules);
+        for expected in [
+            "silent.example \u{2014} Additional \u{b7} Main route: does not reach",
+            "answered.example \u{2014} Additional \u{b7} Main route: reaches",
+            "new.example \u{2014} Additional \u{b7} Main route: not seen yet",
+            "odd.example \u{2014} Additional \u{b7} Main route: could not check",
+            "ru \u{2014} Additional \u{b7} Main route: not checked",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+        for unmarked in [
+            "main.example \u{2014} Primary\n",
+            "later.example \u{2014} Additional\n",
+        ] {
+            assert!(text.contains(unmarked), "{unmarked}\n{text}");
+        }
+
+        // The chosen rule explains its word.
+        app.focus = Focus::Feed;
+        let chosen = screen_text(&app, ScreenId::Rules);
+        assert!(
+            chosen.contains("Nothing answered at this address over the main connection"),
+            "{chosen}"
+        );
+        assert_snapshot("rules-main-route-80x24", &render(&app, 80, 24));
+    }
+
+    #[test]
+    fn without_a_verdict_or_a_check_the_list_has_no_column() {
+        let app = on_rules(&service(vec![
+            rule("1", "zone", "ru", "secondary"),
+            rule("2", "domain", "example.com", "secondary"),
+        ]));
+        let text = screen_text(&app, ScreenId::Rules);
+        assert!(!text.contains("Main route"), "{text}");
+    }
+
+    #[test]
+    fn the_order_puts_what_the_main_route_does_not_reach_first() {
+        let mut app = on_rules(&service(every_verdict()));
+        answer(&mut app, &["O"]);
+        let text = screen_text(&app, ScreenId::Rules);
+        assert!(text.contains("Sort: Main route check"), "{text}");
+        let order = [
+            "silent.example",
+            "answered.example",
+            "odd.example",
+            "new.example",
+            "later.example",
+            "main.example",
+            "ru \u{2014}",
+        ];
+        let at: Vec<usize> = order
+            .iter()
+            .map(|value| {
+                text.find(value)
+                    .unwrap_or_else(|| panic!("{value}\n{text}"))
+            })
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}\n{text}");
+
+        // `e 1` names the first rule as shown.
+        answer(&mut app, &["e 1"]);
+        let Mode::Form(form) = &app.rules.mode else {
+            panic!("the form is open");
+        };
+        assert_eq!(form.value, "silent.example");
+
+        answer(&mut app, &["!", "O"]);
+        assert!(!screen_text(&app, ScreenId::Rules).contains("Sort:"));
+    }
+
+    #[test]
+    fn a_check_asks_about_additional_route_hosts_and_keeps_edits_on_screen() {
+        let fake = service(vec![
+            rule("1", "domain", "*.Video.example", "secondary"),
+            rule("2", "domain", "shop.example", "secondary"),
+            rule("3", "zone", "ru", "secondary"),
+            rule("4", "domain", "main.example", "primary"),
+        ]);
+        fake.answer(
+            IpcOperationName::AutoRuleCandidatesProbe,
+            json!({ "accepted": 2 }),
+        );
+        let mut app = on_rules(&fake);
+        answer(&mut app, &ADD_DOMAIN);
+        answer(&mut app, &["added.example", "2", "", "", "1"]);
+        assert!(matches!(app.rules.mode, Mode::List), "saved");
+        assert!(super::super::holds_unapplied(&app), "an edit waits");
+
+        answer(&mut app, &["c"]);
+        assert!(screen_text(&app, ScreenId::Rules).contains("Checking..."));
+        drain(&mut app, &fake);
+        let asked = fake.sent(IpcOperationName::AutoRuleCandidatesProbe);
+        assert_eq!(
+            asked[0]["rule-hostnames"],
+            json!(["video.example", "shop.example", "added.example"])
+        );
+        let text = screen_text(&app, ScreenId::Rules);
+        assert!(
+            text.contains("Checking 2 addresses over the main connection"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ru \u{2014} Additional \u{b7} Main route: not checked"),
+            "{text}"
+        );
+
+        fake.answer(
+            IpcOperationName::RulesList,
+            rules_list(
+                vec![
+                    marked("1", "domain", "*.video.example", "secondary", "answered"),
+                    rule("2", "domain", "shop.example", "secondary"),
+                ],
+                1,
+            ),
+        );
+        run_later(&mut app, &fake);
+        let text = screen_text(&app, ScreenId::Rules);
+        assert!(
+            text.contains("Checking addresses over the main connection: 1 of 2"),
+            "{text}"
+        );
+
+        // A second press while it runs starts nothing.
+        answer(&mut app, &["c"]);
+        drain(&mut app, &fake);
+        assert_eq!(
+            fake.sent(IpcOperationName::AutoRuleCandidatesProbe).len(),
+            1
+        );
+
+        fake.answer(
+            IpcOperationName::RulesList,
+            rules_list(
+                vec![
+                    marked("1", "domain", "*.video.example", "secondary", "answered"),
+                    marked("2", "domain", "shop.example", "secondary", "silent"),
+                ],
+                0,
+            ),
+        );
+        run_later(&mut app, &fake);
+        assert!(app.rules.main_route.check.is_none());
+        assert!(app.outbox.take_delayed().is_empty(), "no more polls");
+        assert_eq!(
+            note(&app),
+            "Main route check finished: reaches 1, does not reach 1, not checked 1."
+        );
+        let text = screen_text(&app, ScreenId::Rules);
+        assert!(
+            text.contains("shop.example \u{2014} Additional \u{b7} Main route: does not reach"),
+            "{text}"
+        );
+        assert!(text.contains("added.example"), "the edit is still there");
+        assert!(super::super::holds_unapplied(&app), "and still not applied");
+    }
+
+    #[test]
+    fn nothing_to_ask_about_sends_nothing() {
+        let fake = service(vec![
+            rule("1", "zone", "ru", "secondary"),
+            rule("2", "domain", "main.example", "primary"),
+        ]);
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["c"]);
+        drain(&mut app, &fake);
+        assert!(fake
+            .sent(IpcOperationName::AutoRuleCandidatesProbe)
+            .is_empty());
+        assert_eq!(
+            note(&app),
+            "There are no additional-route address rules to check."
+        );
+    }
+
+    #[test]
+    fn a_check_the_service_takes_nothing_of_ends_at_once() {
+        let fake = service(vec![rule("1", "domain", "shop.example", "secondary")]);
+        fake.answer(
+            IpcOperationName::AutoRuleCandidatesProbe,
+            json!({ "accepted": 0 }),
+        );
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["c"]);
+        drain(&mut app, &fake);
+        assert!(app.rules.main_route.check.is_none());
+        assert!(app.outbox.take_delayed().is_empty());
+        assert!(note(&app).starts_with("Nothing to check"), "{}", note(&app));
+    }
+
+    #[test]
+    fn line_mode_reads_the_check_as_it_goes() {
+        let fake = service(vec![
+            rule("1", "domain", "shop.example", "secondary"),
+            rule("2", "zone", "ru", "secondary"),
+        ]);
+        fake.answer(
+            IpcOperationName::AutoRuleCandidatesProbe,
+            json!({ "accepted": 1 }),
+        );
+        let texts = texts_en();
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        let mut session = PlainSession::new(Vec::new());
+        session.start(&app, &texts).expect("start");
+        session.input("4", &mut app, &texts).expect("open rules");
+        drain(&mut app, &fake);
+        session.input("c", &mut app, &texts).expect("check");
+        drain(&mut app, &fake);
+        session.input("", &mut app, &texts).expect("read again");
+        fake.answer(
+            IpcOperationName::RulesList,
+            rules_list(
+                vec![marked("1", "domain", "shop.example", "secondary", "silent")],
+                0,
+            ),
+        );
+        run_later(&mut app, &fake);
+        session.input("O", &mut app, &texts).expect("order");
+        let text = String::from_utf8(session.into_inner()).expect("UTF-8");
+        assert!(
+            text.contains("c: check whether the main route reaches"),
+            "{text}"
+        );
+        assert!(
+            text.contains("shop.example \u{2014} Additional \u{b7} Main route: does not reach"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Main route check finished: reaches 0, does not reach 1, not checked 0."),
+            "{text}"
+        );
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert_snapshot("rules-main-route-plain", &text);
+    }
 }
 
 // ── The rule-set folder ──────────────────────────────────────────────────────

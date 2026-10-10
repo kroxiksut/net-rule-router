@@ -104,6 +104,12 @@ pub fn run() -> ExitCode {
     // support ticket that reads as "the product silently does nothing".
     report_enforcement_readiness();
 
+    // Before any probe, lookup or relay opens a socket: an unmarked one meets
+    // the machine-scope filters like any service account's traffic.
+    nrr_platform_api::own_traffic::install_own_traffic_marker(Box::new(
+        nrr_platform_linux::own_traffic::SoMarkOwnTraffic,
+    ));
+
     tracing::info!(
         target: "nrr::lifecycle",
         msg_key = "linux-svc-bootstrap-complete",

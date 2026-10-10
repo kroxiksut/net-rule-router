@@ -244,6 +244,12 @@ pub(crate) fn build_ipc_surface(
     // The daemon's own resolver: under the DNS redirect `/etc/resolv.conf`
     // leads back into our listener.
     dns_resolver: Arc<dyn nrr_platform_api::dns::DnsResolverPort>,
+    // The centre the drop consumer records into, so a mute reloads the live
+    // ledger, and the backlog it writes.
+    block_notice_center: Arc<nrr_service_runtime::block_notice_center::BlockNoticeCenter>,
+    block_notice_journal: Arc<
+        dyn nrr_service_runtime::block_notice_journal_store::BlockNoticeJournalStore,
+    >,
 ) -> IpcSurface {
     // Cloned before the facade takes ownership: storage usage counts the same
     // log directory the diagnostics reader serves from, and on Linux that lives
@@ -461,6 +467,9 @@ pub(crate) fn build_ipc_surface(
         .with_conn_trace_ring(conn_trace_ring)
         // The same status the planner publishes rule conflicts into.
         .with_app_enforcement_status(app_enforcement)
+        // The cycle pushes channel status on change only; a client that
+        // connects later reads the standing reports here.
+        .with_route_enforcement_status(cycle.enforcement_status().unwrap_or_default())
         .with_state_schema_version(
             stats_state_conn
                 .lock()
@@ -499,16 +508,16 @@ pub(crate) fn build_ipc_surface(
             as Arc<
                 dyn nrr_service_runtime::ipc_handlers::doh_resolvers::DohResolverListStore,
             >)
-        // Notice mutes ("don't show") are personal settings, not block
-        // observation: the centre stays unfed until this OS raises block notices.
+        // Notice mutes ("don't show"), written to the store the centre loads.
         .with_block_notice_mutes(
             Arc::new(
                 nrr_service_runtime::block_notice_mute_store::SqliteBlockNoticeMuteStore::new(
                     Arc::clone(&stats_state_conn),
                 ),
             ),
-            Arc::new(nrr_service_runtime::block_notice_center::BlockNoticeCenter::new()),
-        );
+            block_notice_center,
+        )
+        .with_block_notice_journal(block_notice_journal);
     // The stability fields this daemon applies live are the verbose window,
     // resumed here from the stored deadline, and the connection trace's log
     // window; the rest of the row is stored and not read.
@@ -548,14 +557,16 @@ pub(crate) fn build_ipc_surface(
     let deps = match auto_rules {
         Some(engine) => {
             // Lets the service change the user's rules itself: a `?` rule the
-            // main link is shown not to reach, twins an old build stored.
-            engine.attach_author(Arc::new(
+            // main link is shown not to reach, twins an old build stored. The
+            // same author answers a notice's "route via the additional link".
+            let author: Arc<dyn nrr_service_runtime::auto_rules::AutoRuleAuthor> = Arc::new(
                 nrr_service_runtime::auto_rules::ProductionAutoRuleAuthor::new(
                     Arc::new(ProductionRulesProvider::new(Arc::clone(&stats_state_conn))),
                     Arc::clone(&mutation_executor)
                         as Arc<dyn nrr_service_runtime::ipc_handlers::MutationExecutor>,
                 ),
-            ));
+            );
+            engine.attach_author(Arc::clone(&author));
             // A `?` verdict takes effect now rather than at the next tick.
             let verify_cycle = Arc::clone(&cycle);
             let runner = main_link_probe(
@@ -574,7 +585,9 @@ pub(crate) fn build_ipc_surface(
                     &stats_state_conn,
                 )),
             });
-            deps.with_auto_rule_probe(runner).with_auto_rules(engine)
+            deps.with_auto_rule_probe(runner)
+                .with_auto_rules(engine)
+                .with_block_notice_author(author)
         }
         None => deps,
     };

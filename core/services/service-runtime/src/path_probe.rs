@@ -152,6 +152,7 @@ impl SystemPathProbe {
             Some(socket2::Protocol::TCP),
         )
         .map_err(|_| PathVerdict::Indeterminate)?;
+        nrr_platform_api::own_traffic::mark_own_socket(&socket);
         if let Some(source) = source {
             // Binding is what decides the link. Without it the OS would pick by
             // route — and the pinned destination's route points at the tunnel,
@@ -331,6 +332,12 @@ impl PathProber {
             probe,
             last_probed: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// A prober over the same mechanism with a repeat memory of its own.
+    #[must_use]
+    pub fn sibling(&self) -> Self {
+        Self::new(Arc::clone(&self.probe))
     }
 
     /// Probe `targets` on port `port` from `source`, respecting `limits`.

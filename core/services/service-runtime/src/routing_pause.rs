@@ -173,18 +173,39 @@ impl RoutingPauseCoordinator {
         self
     }
 
-    /// `true` when `sid` is the user the route table is actually built for — the
-    /// coordinator's effective routing SID (the first connected-tray SID, or the
-    /// console user under service-driven scope with no tray). Always `false`
+    /// `true` when the route table serves `sid` — a connected tray, or a
+    /// signed-in user under service-driven scope with no tray. Always `false`
     /// without a route coordinator. This — not `registry.is_active` alone — is
-    /// what makes a no-tray console safe-disable tear down the console user's
-    /// routes and filters.
+    /// what makes a no-tray safe-disable tear down that user's routes and
+    /// filters.
     fn is_effective(&self, sid: &str) -> bool {
         self.route_coord
             .as_ref()
-            .and_then(|c| c.effective_routing_sid(&self.registry.active_sids()))
-            .as_deref()
-            == Some(sid)
+            .is_some_and(|c| c.is_served(sid, &self.registry.active_sids()))
+    }
+
+    /// Take a paused user's routes out of the table. Alone in it, the table is
+    /// theirs to tear down; beside other users, a recompute drops only their
+    /// share — the pause flag is already stored, so it reads them as paused.
+    fn withdraw_routes(&self) {
+        let shared = self
+            .route_coord
+            .as_ref()
+            .is_some_and(|c| c.served_sids(&self.registry.active_sids()).len() > 1);
+        if !shared {
+            self.teardown_routes();
+            return;
+        }
+        if let Some(coord) = self.route_coord.as_ref() {
+            if let Err(e) = coord.recompute_active(&self.registry.active_sids()) {
+                tracing::warn!(
+                    target: "nrr::routing-pause",
+                    msg_key = "routingpause-route-teardown-failed",
+                    error = %e,
+                    "routing-pause route teardown failed (best-effort)",
+                );
+            }
+        }
     }
 
     /// Tear down the single-owner route table for a pause (best-effort). The
@@ -269,12 +290,11 @@ impl RoutingPauseCoordinator {
                     message: e,
                 })?;
         }
-        // ROUTE-half — tear the single-owner route table for the effective
-        // routing user. The WFP-only removal above left the `/32` host routes and
+        // ROUTE-half — the WFP-only removal above left the `/32` host routes and
         // `/2` counter-overlays installed, so matched traffic kept egressing the
         // secondary until now.
         if effective {
-            self.teardown_routes();
+            self.withdraw_routes();
         }
         self.audit.emit(RoutingPauseAuditEvent::Paused {
             sid: sid.to_string(),
@@ -344,9 +364,9 @@ impl RoutingPauseCoordinator {
         // suspended" while the console user's routes and filters stayed live.
         let mut sids = self.registry.active_sids();
         if let Some(coord) = self.route_coord.as_ref() {
-            if let Some(eff) = coord.effective_routing_sid(&sids) {
-                if !sids.iter().any(|s| s == &eff) {
-                    sids.push(eff);
+            for served in coord.served_sids(&sids) {
+                if !sids.contains(&served) {
+                    sids.push(served);
                 }
             }
         }

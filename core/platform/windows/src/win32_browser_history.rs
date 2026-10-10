@@ -48,7 +48,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use nrr_platform_api::browser_history::{
-    hostname_from_history_url, BrowserHistoryError, BrowserHistoryReadPort,
+    hostname_from_history_url, summarize_source_labels, BrowserHistoryError, BrowserHistoryReadPort,
+};
+use nrr_sqlite_support::browser_history::{
+    read_history_copy, HistoryQuery, CHROMIUM_QUERY, COPIED_SIDE_FILES, FIREFOX_QUERY,
+    MAX_HISTORY_BYTES, SIDE_FILES,
 };
 
 /// Production browser-history reader (Chromium-, Opera- and Firefox-family
@@ -78,27 +82,6 @@ struct HistorySource {
     label: &'static str,
 }
 
-/// What is read from one browser family's database. The file is the user's,
-/// so `table` must be a real table: a view of that name could run anything.
-#[derive(Clone, Copy, Debug)]
-struct HistoryQuery {
-    table: &'static str,
-    sql: &'static str,
-}
-
-const CHROMIUM_QUERY: HistoryQuery = HistoryQuery {
-    table: "urls",
-    sql: "SELECT url FROM urls",
-};
-const FIREFOX_QUERY: HistoryQuery = HistoryQuery {
-    table: "moz_places",
-    sql: "SELECT url FROM moz_places WHERE url IS NOT NULL",
-};
-
-/// Longest one database may keep the service's thread busy; past it the read
-/// stops with what it has.
-const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
 impl BrowserHistoryReadPort for WindowsBrowserHistoryRead {
     fn read_history_hostnames(&self, principal: &str) -> Result<Vec<String>, BrowserHistoryError> {
         let roots = profile_roots_for(principal);
@@ -110,7 +93,7 @@ impl BrowserHistoryReadPort for WindowsBrowserHistoryRead {
         tracing::info!(
             target: "nrr::browser-history",
             msg_key = "win-browserhistory-discovery-finished",
-            sources = %summarize_sources(&sources),
+            sources = %summarize_source_labels(sources.iter().map(|s| s.label)),
             "browser-history discovery finished",
         );
         // Mail-client account servers ride the same port: a mail
@@ -431,26 +414,6 @@ mod profile_root {
     }
 }
 
-/// Compact per-label source counts for the discovery-summary log line, in
-/// first-seen order: `"chrome:2 firefox:1"`; `"none"` when nothing was found.
-fn summarize_sources(sources: &[HistorySource]) -> String {
-    let mut counts: Vec<(&'static str, usize)> = Vec::new();
-    for src in sources {
-        match counts.iter_mut().find(|(label, _)| *label == src.label) {
-            Some((_, n)) => *n += 1,
-            None => counts.push((src.label, 1)),
-        }
-    }
-    if counts.is_empty() {
-        return "none".to_string();
-    }
-    counts
-        .iter()
-        .map(|(label, n)| format!("{label}:{n}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Profile directories inside a Chromium `User Data` folder: `Default` plus any
 /// `Profile N`. Returns an empty vec if the folder is absent.
 fn chromium_profile_dirs(user_data: &Path) -> Vec<PathBuf> {
@@ -470,20 +433,6 @@ fn chromium_profile_dirs(user_data: &Path) -> Vec<PathBuf> {
     }
     dirs
 }
-
-/// Largest History DB copied; a bigger one is skipped rather than letting a
-/// user-supplied file fill the service's disk.
-const MAX_HISTORY_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// Upper bound on URL rows read from one source.
-const MAX_HISTORY_ROWS: usize = 2_000_000;
-
-/// SQLite's side files, in the order the copy creates them. The WAL holds
-/// every commit since the last checkpoint and a hot rollback journal the
-/// undo of an interrupted one, so both are copied; the `-shm` index is not,
-/// because SQLite rebuilds it from the WAL when the first connection opens.
-const SIDE_FILES: [&str; 3] = ["-wal", "-journal", "-shm"];
-const COPIED_SIDE_FILES: [&str; 2] = ["-wal", "-journal"];
 
 /// Copy `src.db_path` and its side files to private temp files and read the
 /// URL column into hostnames, replaying what SQLite has not yet folded into
@@ -517,11 +466,15 @@ fn read_source_hostnames(
         budget -= copied;
     }
     copy.close_all();
-    read_hostnames_replaying_journals(copy.path(), src.query).or_else(|replay_error| {
-        // A WAL copied across a checkpoint may not fit the main file; the
-        // checkpointed history alone is still worth having.
-        read_hostnames_from_db(copy.path(), src.query).map_err(|_| replay_error)
-    })
+    let read = read_history_copy(copy.path(), src.query, hostname_from_history_url)?;
+    if read.cut_short {
+        tracing::info!(
+            target: "nrr::browser-history",
+            hosts = read.hosts.len(),
+            "browser-history read stopped at its time budget; keeping what was read",
+        );
+    }
+    Ok(read.hosts)
 }
 
 /// The source's `suffix` side file through the same checks as the database,
@@ -962,144 +915,11 @@ mod os {
     }
 }
 
-/// Open `db` READ-ONLY as it stands and project `query`'s single URL column
-/// into distinct hostnames. `immutable=1` ignores the side files, so only
-/// checkpointed history is seen.
-fn read_hostnames_from_db(db: &Path, query: HistoryQuery) -> Result<Vec<String>, String> {
-    use rusqlite::OpenFlags;
-    let conn = rusqlite::Connection::open_with_flags(
-        db_uri(db, "?mode=ro&immutable=1"),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| format!("open: {e}"))?;
-    hostnames_from(&conn, query)
-}
-
-/// As [`read_hostnames_from_db`], but SQLite first replays the WAL and rolls
-/// back a hot journal found beside `copy`. Both write, so the connection is
-/// read-write: `copy` must be a private copy, never a browser's live file.
-fn read_hostnames_replaying_journals(
-    copy: &Path,
-    query: HistoryQuery,
-) -> Result<Vec<String>, String> {
-    use rusqlite::config::DbConfig;
-    use rusqlite::OpenFlags;
-    let conn = rusqlite::Connection::open_with_flags(
-        db_uri(copy, ""),
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| format!("open: {e}"))?;
-    // The copy is about to be deleted; folding the WAL into it is wasted I/O.
-    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
-        .map_err(|e| format!("harden: {e}"))?;
-    conn.execute_batch("PRAGMA query_only = ON;")
-        .map_err(|e| format!("harden: {e}"))?;
-    hostnames_from(&conn, query)
-}
-
-fn db_uri(db: &Path, params: &str) -> String {
-    format!("file:{}{params}", db.to_string_lossy().replace('?', "%3f"))
-}
-
-/// The file is user-supplied: defensive mode on, schema untrusted, the source
-/// a real table, and the whole read under [`READ_BUDGET`].
-fn hostnames_from(conn: &rusqlite::Connection, query: HistoryQuery) -> Result<Vec<String>, String> {
-    hostnames_within(conn, query, READ_BUDGET)
-}
-
-fn hostnames_within(
-    conn: &rusqlite::Connection,
-    query: HistoryQuery,
-    budget: std::time::Duration,
-) -> Result<Vec<String>, String> {
-    use rusqlite::config::DbConfig;
-    use std::time::Instant;
-    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
-        .map_err(|e| format!("harden: {e}"))?;
-    conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;")
-        .map_err(|e| format!("harden: {e}"))?;
-    // Interrupts any statement past the deadline, the schema parse included.
-    let deadline = Instant::now() + budget;
-    conn.progress_handler(10_000, Some(move || Instant::now() >= deadline));
-    require_plain_table(conn, query.table)?;
-    let mut stmt = conn
-        .prepare(query.sql)
-        .map_err(|e| format!("prepare: {e}"))?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| format!("query: {e}"))?;
-    let mut hosts: Vec<String> = Vec::new();
-    for url in rows.take(MAX_HISTORY_ROWS).flatten() {
-        if let Some(host) = hostname_from_history_url(&url) {
-            hosts.push(host);
-        }
-    }
-    if Instant::now() >= deadline {
-        tracing::info!(
-            target: "nrr::browser-history",
-            hosts = hosts.len(),
-            "browser-history read stopped at its time budget; keeping what was read",
-        );
-    }
-    hosts.sort_unstable();
-    hosts.dedup();
-    Ok(hosts)
-}
-
-/// `name` must be an ordinary table whose `url` is a stored column: a view,
-/// a virtual table or a generated column would run the file's own SQL.
-fn require_plain_table(conn: &rusqlite::Connection, name: &str) -> Result<(), String> {
-    let mut stmt = conn
-        .prepare("SELECT type, rootpage FROM main.sqlite_master WHERE name = ?1 COLLATE NOCASE")
-        .map_err(|e| format!("schema: {e}"))?;
-    let entries: Vec<(String, i64)> = stmt
-        .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))
-        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| format!("schema: {e}"))?;
-    if !matches!(entries.as_slice(), [(kind, root)] if kind == "table" && *root > 0) {
-        return Err(format!("`{name}` is not a plain table"));
-    }
-    let stored: bool = conn
-        .query_row(
-            "SELECT count(*) = 1 FROM pragma_table_xinfo(?1) \
-             WHERE name = 'url' COLLATE NOCASE AND hidden = 0",
-            [name],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("schema: {e}"))?;
-    if !stored {
-        return Err(format!("`{name}.url` is not a stored column"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use nrr_sqlite_support::browser_history::read_hostnames_from_db;
 
-    #[test]
-    fn mail_prefs_parser_keeps_only_server_hostnames() {
-        let prefs = r#"
-user_pref("mail.server.server1.hostname", "imap.mail.example");
-user_pref("mail.server.server2.hostname", "MAIL.UNIV.EXAMPLE");
-user_pref("mail.server.server2.name", "work account");
-user_pref("mail.smtpserver.smtp1.hostname", "smtp.mail.example");
-user_pref("mail.smtpserver.smtp1.username", "someone@example.com");
-user_pref("mail.identity.id1.useremail", "someone@example.com");
-user_pref("network.dns.disableIPv6", true);
-"#;
-        let hosts = nrr_platform_api::browser_history::mail_server_hostnames_from_prefs(prefs);
-        assert_eq!(
-            hosts,
-            vec![
-                "imap.mail.example",
-                "mail.univ.example",
-                "smtp.mail.example"
-            ],
-            "only *.hostname prefs may cross, lower-cased; identities and \
-             usernames must never leak"
-        );
-    }
+    use super::*;
 
     #[test]
     fn thunderbird_profiles_are_discovered_under_roaming() {
@@ -1343,7 +1163,9 @@ user_pref("network.dns.disableIPv6", true);
         );
         // Positive control: the main file alone holds only the checkpointed row.
         assert_eq!(
-            read_hostnames_from_db(&db, CHROMIUM_QUERY).unwrap(),
+            read_hostnames_from_db(&db, CHROMIUM_QUERY, hostname_from_history_url)
+                .unwrap()
+                .hosts,
             ["checkpointed.example"]
         );
         assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
@@ -1383,11 +1205,12 @@ user_pref("network.dns.disableIPv6", true);
         // Positive control: the main file alone does not read as committed.
         let main_only = dir.path().join("main-only.sqlite");
         std::fs::copy(&db, &main_only).unwrap();
-        let main_only = read_hostnames_from_db(&main_only, CHROMIUM_QUERY);
+        let main_only =
+            read_hostnames_from_db(&main_only, CHROMIUM_QUERY, hostname_from_history_url);
         assert!(
             main_only
                 .as_ref()
-                .map_or(true, |h| h.iter().any(|h| h == "uncommitted.example")),
+                .map_or(true, |r| r.hosts.iter().any(|h| h == "uncommitted.example")),
             "{main_only:?}"
         );
         let me = test_principal(dir.path());
@@ -1566,103 +1389,6 @@ user_pref("network.dns.disableIPv6", true);
         }
     }
 
-    #[test]
-    fn reads_and_dedupes_hostnames_from_chromium_urls_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("History");
-        make_db(
-            &db,
-            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT)",
-            &[
-                "https://feed.example/feed",
-                "https://feed.example/other", // same host, deduped
-                "https://search.example/",
-                "about:blank",       // no host, dropped
-                "chrome://settings", // pseudo-scheme, dropped
-            ],
-        );
-        let hosts = read_hostnames_from_db(&db, CHROMIUM_QUERY).unwrap();
-        assert_eq!(
-            hosts,
-            vec!["feed.example".to_string(), "search.example".to_string()]
-        );
-    }
-
-    #[test]
-    fn missing_db_is_an_error_not_a_panic() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("nope.sqlite");
-        assert!(read_hostnames_from_db(&missing, CHROMIUM_QUERY).is_err());
-    }
-
-    /// A user-planted view named like the table would spin the service
-    /// forever; it is refused before it runs. Same for a generated `url`.
-    #[test]
-    fn a_view_or_generated_column_in_place_of_the_table_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let view = dir.path().join("view.sqlite");
-        make_db(
-            &view,
-            "CREATE VIEW URLS AS WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) \
-             SELECT 'http://a.example/' AS url FROM c WHERE x < 0;",
-            &[],
-        );
-        let started = std::time::Instant::now();
-        assert!(read_hostnames_replaying_journals(&view, CHROMIUM_QUERY).is_err());
-        assert!(read_hostnames_from_db(&view, CHROMIUM_QUERY).is_err());
-        assert!(started.elapsed() < READ_BUDGET);
-
-        let generated = dir.path().join("generated.sqlite");
-        let conn = rusqlite::Connection::open(&generated).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE urls (id INTEGER PRIMARY KEY, raw TEXT, \
-             url TEXT GENERATED ALWAYS AS ('http://' || raw || '/'));
-             INSERT INTO urls (raw) VALUES ('gen.example');",
-        )
-        .unwrap();
-        drop(conn);
-        assert!(read_hostnames_from_db(&generated, CHROMIUM_QUERY).is_err());
-
-        // Positive control: the plain table is read.
-        let plain = dir.path().join("plain.sqlite");
-        make_db(
-            &plain,
-            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT)",
-            &["https://plain.example/"],
-        );
-        assert_eq!(
-            read_hostnames_from_db(&plain, CHROMIUM_QUERY).unwrap(),
-            ["plain.example"]
-        );
-    }
-
-    /// The read stops at its budget instead of running as long as the file
-    /// makes it.
-    #[test]
-    fn a_read_stops_at_its_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("big.sqlite");
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT);
-             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 50000)
-             INSERT INTO urls (url) SELECT 'https://h' || x || '.example/' FROM c;",
-        )
-        .unwrap();
-        drop(conn);
-        let open = || rusqlite::Connection::open(&db).unwrap();
-
-        let all =
-            hostnames_within(&open(), CHROMIUM_QUERY, std::time::Duration::from_secs(60)).unwrap();
-        assert_eq!(all.len(), 50_000, "positive control: the whole table");
-
-        let cut = hostnames_within(&open(), CHROMIUM_QUERY, std::time::Duration::ZERO);
-        assert!(
-            !matches!(&cut, Ok(hosts) if hosts.len() == 50_000),
-            "a spent budget did not stop the read"
-        );
-    }
-
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"").unwrap();
@@ -1764,7 +1490,7 @@ user_pref("network.dns.disableIPv6", true);
     }
 
     #[test]
-    fn summarize_sources_counts_per_label_in_order() {
+    fn discovered_sources_are_summarized_per_label_in_order() {
         let dir = tempfile::tempdir().unwrap();
         touch(
             &dir.path()
@@ -1788,8 +1514,10 @@ user_pref("network.dns.disableIPv6", true);
                 .join("places.sqlite"),
         );
         let sources = discover_history_sources(&roots(dir.path()));
-        assert_eq!(summarize_sources(&sources), "chrome:2 firefox:1");
-        assert_eq!(summarize_sources(&[]), "none");
+        assert_eq!(
+            summarize_source_labels(sources.iter().map(|s| s.label)),
+            "chrome:2 firefox:1"
+        );
     }
 
     #[test]

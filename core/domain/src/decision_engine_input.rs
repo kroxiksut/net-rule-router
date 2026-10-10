@@ -66,6 +66,17 @@ pub fn normalize_runtime_input(input: &RuntimeInput) -> NormalizedDecisionInput 
     }
 }
 
+/// `raw` as the lowercase ASCII (punycode) hostname the caches and decisions
+/// key on, or `None` when it is not a hostname. `тест.рф` and
+/// `xn--e1aybc.xn--p1ai` give the same answer.
+#[must_use]
+pub fn hostname_ace(raw: &str) -> Option<String> {
+    match normalize_hostname_value(Some(raw)).0 {
+        NormalizedHostname::Valid(host) => Some(host),
+        _ => None,
+    }
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 fn normalize_hostname_value(raw: Option<&str>) -> (NormalizedHostname, Vec<NormalizationWarning>) {
@@ -907,5 +918,18 @@ mod tests {
         assert!(n.match_class_availability.application.is_some());
         assert!(!n.match_class_availability.nothing_available());
         assert_eq!(n.availability_signals.len(), 3);
+    }
+
+    #[test]
+    fn a_unicode_and_a_punycode_spelling_are_one_ace_hostname() {
+        assert_eq!(
+            hostname_ace("Тест.РФ."),
+            hostname_ace("xn--e1aybc.xn--p1ai")
+        );
+        assert_eq!(
+            hostname_ace("xn--e1aybc.xn--p1ai").as_deref(),
+            Some("xn--e1aybc.xn--p1ai")
+        );
+        assert_eq!(hostname_ace("not a host"), None);
     }
 }

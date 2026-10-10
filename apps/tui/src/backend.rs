@@ -66,21 +66,34 @@ impl std::fmt::Debug for Reply {
 /// Jobs a key or an answer asked for; the loop that owns the backend sends
 /// them, so the state never holds the backend itself.
 #[derive(Default)]
-pub struct Outbox(Vec<Job>);
+pub struct Outbox {
+    now: Vec<Job>,
+    later: Vec<(Duration, Job)>,
+}
 
 impl Outbox {
     pub fn push(&mut self, job: Job) {
-        self.0.push(job);
+        self.now.push(job);
+    }
+
+    /// A job queued only after `delay`: a poll that must not hold up the
+    /// jobs thread while it waits.
+    pub fn push_after(&mut self, delay: Duration, job: Job) {
+        self.later.push((delay, job));
     }
 
     pub fn take(&mut self) -> Vec<Job> {
-        std::mem::take(&mut self.0)
+        std::mem::take(&mut self.now)
+    }
+
+    pub fn take_delayed(&mut self) -> Vec<(Duration, Job)> {
+        std::mem::take(&mut self.later)
     }
 }
 
 impl std::fmt::Debug for Outbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Outbox({})", self.0.len())
+        write!(f, "Outbox({} + {} later)", self.now.len(), self.later.len())
     }
 }
 
@@ -142,6 +155,16 @@ impl Backend {
     pub fn send_outbox(&self, outbox: &mut Outbox) {
         for job in outbox.take() {
             self.run_job(job);
+        }
+        for (delay, job) in outbox.take_delayed() {
+            let jobs = self.jobs.clone();
+            // Without a thread the poll is lost, as a failed call would be.
+            let _ = thread::Builder::new()
+                .name("nrr-tui-timer".into())
+                .spawn(move || {
+                    thread::sleep(delay);
+                    let _ = jobs.send(job);
+                });
         }
     }
 }

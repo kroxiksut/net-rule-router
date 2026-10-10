@@ -199,7 +199,7 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
         }),
         Command::Start => with_port(exe, "start", |port| match port.start(TRANSITION_TIMEOUT) {
             Ok(()) => {
-                println!("Start requested.");
+                println!("Started.");
                 exit::SUCCESS
             }
             Err(err) => report_failure("start", &err, ctx, "start"),
@@ -449,6 +449,15 @@ fn report_failure(
         ServiceControlError::NotInstalled => {
             eprintln!("The {PRODUCT_NAME} service is not installed.");
             eprintln!("Install it first: {exe} install");
+        }
+        // Not "failed": the start was accepted and may still finish.
+        ServiceControlError::Timeout {
+            operation: "start",
+            seconds,
+        } => {
+            eprintln!("{operation}: the service has not reported itself running after {seconds}s.");
+            eprintln!("It may still be starting. Check with: {exe} status");
+            eprintln!("If it stays that way, its log says where it stopped: {exe} diag logs");
         }
         other => eprintln!("{operation} failed: {other}"),
     }

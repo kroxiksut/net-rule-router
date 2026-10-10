@@ -35,7 +35,7 @@ pub fn lower_fake_ip_pool(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
 
     let mut out = Vec::new();
     for flow in flows {
-        let user_sid = flow.principal.0.as_ref().map(|p| p.as_stored().to_string());
+        let user_sid = user_sid_of(&flow.principal);
         let action = match flow.verdict {
             Verdict::Permit => WfpAction::Permit,
             Verdict::Block => WfpAction::Block,

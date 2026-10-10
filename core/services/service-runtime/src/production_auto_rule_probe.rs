@@ -26,7 +26,7 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::ipc_handlers::providers::AutoRuleProbeRunner;
 use crate::main_route_verdicts::{MainRouteVerdict, MainRouteVerdicts};
 use crate::observed_host_names::ObservedHostNames;
-use crate::path_probe::{PathProber, ProbeLimits, ProbeTarget};
+use crate::path_probe::{PathProber, ProbeLimits, ProbePassSummary, ProbeTarget};
 use crate::per_sid_orchestrator::RoutePolicySource;
 use crate::route_coordinator::SecondaryRouteCoordinator;
 
@@ -38,6 +38,15 @@ const PROBE_PORT: u16 = 443;
 /// Addresses taken from the observed-name memory per host. The pass stops at
 /// the first one that answers either way, so a few only cover one that is down.
 const MAX_OBSERVED_ADDRESSES: usize = 4;
+
+/// Hosts one check of the user's rules may examine. A rule set of a few
+/// hundred hosts is checked whole in one click; a hand-made file of thousands
+/// would turn it into minutes of probing.
+const RULE_CHECK_MAX_HOSTS: usize = 512;
+
+/// Probes a rule check runs at once: a few hundred hosts finish in tens of
+/// seconds, and the main link carries no more than a handful of handshakes.
+const RULE_CHECK_WORKERS: usize = 4;
 
 /// Where a probe's packets leave from: the principal's main link and, when
 /// one is bound, its additional link — each as the IPv4 address it carries.
@@ -56,6 +65,9 @@ pub struct ProductionAutoRuleProbe {
     cache: Arc<dyn FqdnCacheLookup>,
     egress: Arc<dyn EgressSources>,
     prober: Arc<PathProber>,
+    /// The rule check's own repeat memory: a host a suggestion pass just asked
+    /// about must still get a mark beside the user's rule.
+    rule_prober: Arc<PathProber>,
     limits_for: Arc<dyn Fn(&str) -> ProbeLimits + Send + Sync>,
     /// Where a rule-host pass leaves its answers. `None` keeps the runner
     /// suggestion-only, exactly as before.
@@ -95,6 +107,7 @@ impl ProductionAutoRuleProbe {
             engine,
             cache,
             egress,
+            rule_prober: Arc::new(prober.sibling()),
             prober,
             limits_for,
             verdicts: None,
@@ -127,24 +140,145 @@ impl ProductionAutoRuleProbe {
         self
     }
 
-    /// Probe targets for hosts the caller's rules already name.
+    /// Probe targets for hosts the caller's rules already name, and the hosts
+    /// with no known address.
     ///
-    /// Same rule as for suggestions: a host with nothing cached is skipped
-    /// rather than resolved here — resolving would send a query the user did
-    /// not ask for, and the answer would arrive after this pass.
-    fn rule_targets(&self, hostnames: &[String]) -> Vec<ProbeTarget> {
-        hostnames
-            .iter()
-            .map(|h| h.trim().trim_start_matches("*.").to_ascii_lowercase())
-            .filter(|h| !h.is_empty())
-            .filter_map(|hostname| {
-                let addresses = crate::dns_wire::only_v4(&self.cache.ips_for_hostname(&hostname));
-                (!addresses.is_empty()).then_some(ProbeTarget {
+    /// Same rule as for suggestions: a host with nothing cached is not resolved
+    /// here — resolving would send a query the user did not ask for, and the
+    /// answer would arrive after this pass.
+    fn rule_targets(&self, hostnames: &[String]) -> (Vec<ProbeTarget>, Vec<String>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        let mut unknown = Vec::new();
+        for raw in hostnames {
+            let bare = raw.trim().trim_start_matches("*.");
+            let Some(hostname) = nrr_domain::decision_engine_input::hostname_ace(bare) else {
+                continue;
+            };
+            if !seen.insert(hostname.clone()) {
+                continue;
+            }
+            let addresses = crate::dns_wire::only_v4(&self.cache.ips_for_hostname(&hostname));
+            if addresses.is_empty() {
+                unknown.push(hostname);
+            } else {
+                targets.push(ProbeTarget {
                     hostname,
                     addresses,
-                })
-            })
-            .collect()
+                });
+            }
+        }
+        (targets, unknown)
+    }
+
+    /// The user's own rules: every host in one go, a few at a time, each
+    /// answer filed beside its rule and counted off so a client can follow.
+    fn probe_rule_hosts(&self, sid: &str, hostnames: &[String]) -> AutoRuleCandidatesProbeResponse {
+        let Some(verdicts) = self.verdicts.clone() else {
+            return AutoRuleCandidatesProbeResponse::default();
+        };
+        let (mut targets, unknown) = self.rule_targets(hostnames);
+        let now = std::time::Instant::now();
+        for host in &unknown {
+            verdicts.record(sid, host, MainRouteVerdict::NoAddress, now);
+        }
+        let over_limit = targets.len().saturating_sub(RULE_CHECK_MAX_HOSTS) as u32;
+        targets.truncate(RULE_CHECK_MAX_HOSTS);
+        if targets.is_empty() {
+            return AutoRuleCandidatesProbeResponse {
+                accepted: 0,
+                over_limit,
+            };
+        }
+        let accepted = targets.len() as u32;
+        let limits = (self.limits_for)(sid);
+        let (source, _) = self.egress.egress_source_ips(sid);
+        let prober = Arc::clone(&self.rule_prober);
+        let sid_owned = sid.to_string();
+        let no_address = unknown.len();
+        verdicts.begin(sid, accepted);
+        let store = Arc::clone(&verdicts);
+        let spawned = std::thread::Builder::new()
+            .name("nrr-rule-host-probe".into())
+            .spawn(move || {
+                let chunks: Vec<&[ProbeTarget]> = targets.chunks(limits.max_targets).collect();
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let total = std::sync::Mutex::new(ProbePassSummary::default());
+                std::thread::scope(|scope| {
+                    for _ in 0..RULE_CHECK_WORKERS.min(chunks.len()) {
+                        scope.spawn(|| loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(chunk) = chunks.get(i) else { break };
+                            let (sink, sink_sid) = (Arc::clone(&store), sid_owned.clone());
+                            let file = move |host: &str, answered: bool| {
+                                sink.record(
+                                    &sink_sid,
+                                    host,
+                                    if answered {
+                                        MainRouteVerdict::Answered
+                                    } else {
+                                        MainRouteVerdict::Silent
+                                    },
+                                    std::time::Instant::now(),
+                                );
+                            };
+                            let summary = prober.run_pass(
+                                chunk,
+                                PROBE_PORT,
+                                source,
+                                limits,
+                                std::time::Instant::now(),
+                                &file,
+                            );
+                            // A host the probe could not measure gets an honest
+                            // mark rather than none; one skipped as recently
+                            // checked keeps the answer it already has.
+                            let now = std::time::Instant::now();
+                            for target in chunk.iter() {
+                                if store.get(&sid_owned, &target.hostname, now).is_none() {
+                                    store.record(
+                                        &sid_owned,
+                                        &target.hostname,
+                                        MainRouteVerdict::Unclear,
+                                        now,
+                                    );
+                                }
+                            }
+                            store.settle(&sid_owned, chunk.len() as u32);
+                            let mut t = total.lock().unwrap_or_else(|p| p.into_inner());
+                            t.answered += summary.answered;
+                            t.silent += summary.silent;
+                            t.indeterminate += summary.indeterminate;
+                            t.skipped_recent += summary.skipped_recent;
+                        });
+                    }
+                });
+                let t = total.into_inner().unwrap_or_else(|p| p.into_inner());
+                tracing::info!(
+                    target: "nrr::auto-rules",
+                    msg_key = "prod-autorule-rule-hosts-checked",
+                    answered = t.answered,
+                    silent = t.silent,
+                    indeterminate = t.indeterminate,
+                    skipped_recent = t.skipped_recent,
+                    no_address,
+                    "checked whether the main link reaches the hosts the user's rules name",
+                );
+            });
+        if let Err(e) = spawned {
+            verdicts.settle(sid, accepted);
+            tracing::warn!(
+                target: "nrr::auto-rules",
+                msg_key = "prod-autorule-probe-spawn-failed",
+                error = %e,
+                "could not start the main-link probe pass",
+            );
+            return AutoRuleCandidatesProbeResponse::default();
+        }
+        AutoRuleCandidatesProbeResponse {
+            accepted,
+            over_limit,
+        }
     }
 
     /// The hosts to examine: the named suggestions, or every pending one.
@@ -183,15 +317,11 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
         ids: &[String],
         rule_hostnames: &[String],
     ) -> AutoRuleCandidatesProbeResponse {
+        if !rule_hostnames.is_empty() {
+            return self.probe_rule_hosts(sid, rule_hostnames);
+        }
         let limits = (self.limits_for)(sid);
-        // Rule hosts and suggestions are the same question over the same
-        // mechanism; only where the verdict is filed differs.
-        let rules_pass = !rule_hostnames.is_empty();
-        let targets = if rules_pass {
-            self.rule_targets(rule_hostnames)
-        } else {
-            self.targets(sid, ids)
-        };
+        let targets = self.targets(sid, ids);
         if targets.is_empty() {
             return AutoRuleCandidatesProbeResponse::default();
         }
@@ -203,13 +333,9 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
         let engine = Arc::clone(&self.engine);
         let prober = Arc::clone(&self.prober);
         let sid_owned = sid.to_string();
-        let verdicts = self.verdicts.clone();
-        // The second question is only worth asking about SUGGESTIONS, and only
-        // when there is a tunnel to ask over.
-        let secondary = (!rules_pass)
-            .then(|| self.secondary_prober.clone())
-            .flatten()
-            .zip(secondary_source);
+        // The second question is only worth asking when there is a tunnel to
+        // ask over.
+        let secondary = self.secondary_prober.clone().zip(secondary_source);
         let targets_for_second = targets.clone();
         let engine_for_second = Arc::clone(&self.engine);
         let sid_for_second = sid.to_string();
@@ -218,25 +344,6 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
             .spawn(move || {
                 use nrr_domain::companion_affinity::PrimaryHealthEvent;
                 let report = move |hostname: &str, answered: bool| {
-                    if rules_pass {
-                        // A rule's own address: the answer belongs beside the
-                        // rule, not in the suggestion engine's health signal —
-                        // feeding it there would let a check the user ran on
-                        // their own rules reshape what gets suggested.
-                        if let Some(store) = verdicts.as_ref() {
-                            store.record(
-                                &sid_owned,
-                                hostname,
-                                if answered {
-                                    MainRouteVerdict::Answered
-                                } else {
-                                    MainRouteVerdict::Silent
-                                },
-                                std::time::Instant::now(),
-                            );
-                        }
-                        return;
-                    }
                     engine.note_primary_health(
                         &sid_owned,
                         hostname,
@@ -483,6 +590,125 @@ mod tests {
         assert_eq!(
             egress_sources_from(Some("eth9"), Some("tun9"), &links, &routes),
             (None, None)
+        );
+    }
+
+    // ── The user's own rules ─────────────────────────────────────────────────
+
+    struct NoRules;
+    impl crate::per_sid_orchestrator::RulesProvider for NoRules {
+        fn active_rules(&self) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+            None
+        }
+        fn active_rules_for(
+            &self,
+            _principal: &str,
+        ) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+            None
+        }
+    }
+
+    struct MainLinkOnly;
+    impl EgressSources for MainLinkOnly {
+        fn egress_source_ips(&self, _sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
+            (Some(Ipv4Addr::new(192, 0, 2, 10)), None)
+        }
+    }
+
+    fn rule_check(
+        cache: Arc<crate::fqdn_cache_lookup::MockFqdnCacheLookup>,
+        verdict: crate::path_probe::PathVerdict,
+        verdicts: Arc<MainRouteVerdicts>,
+    ) -> ProductionAutoRuleProbe {
+        use crate::auto_rules::{
+            AutoRulesModeFn, DismissalStore, InMemoryDismissalStore, InMemoryPendingStore,
+        };
+        let mode: AutoRulesModeFn =
+            Arc::new(|_: &str| nrr_storage::auto_rules::AutoRulesMode::Suggest);
+        let engine = Arc::new(AutoRulesEngine::new(
+            Arc::new(NoRules) as Arc<dyn crate::per_sid_orchestrator::RulesProvider>,
+            mode,
+            Arc::new(InMemoryDismissalStore::new()) as Arc<dyn DismissalStore>,
+            Arc::new(InMemoryPendingStore::new()),
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        let probe = Arc::new(crate::path_probe::MockPathProbe::new(verdict));
+        ProductionAutoRuleProbe::over(
+            engine,
+            cache,
+            Arc::new(MainLinkOnly),
+            Arc::new(PathProber::new(probe)),
+            Arc::new(|_: &str| ProbeLimits::default()),
+        )
+        .with_verdicts(verdicts)
+    }
+
+    fn wait_until_settled(verdicts: &MainRouteVerdicts, sid: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while verdicts.pending(sid) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the check never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn one_rule_check_marks_every_host_past_the_suggestion_limit() {
+        let cache = Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new());
+        let hosts: Vec<String> = (0..20).map(|i| format!("h{i}.example")).collect();
+        for (i, host) in hosts.iter().enumerate() {
+            cache.set_ips(host, vec![Ipv4Addr::new(192, 0, 2, i as u8 + 1)]);
+        }
+        let verdicts = Arc::new(MainRouteVerdicts::new());
+        let runner = rule_check(
+            cache,
+            crate::path_probe::PathVerdict::Answered,
+            Arc::clone(&verdicts),
+        );
+        let mut asked = hosts.clone();
+        asked.push("unseen.example".into());
+
+        let answer = runner.probe("S-1", &[], &asked);
+
+        assert_eq!(
+            answer.accepted, 20,
+            "the eight-host limit of suggestions does not apply"
+        );
+        wait_until_settled(&verdicts, "S-1");
+        let now = std::time::Instant::now();
+        for host in &hosts {
+            assert_eq!(
+                verdicts.get("S-1", host, now),
+                Some(MainRouteVerdict::Answered),
+                "{host}"
+            );
+        }
+        assert_eq!(
+            verdicts.get("S-1", "unseen.example", now),
+            Some(MainRouteVerdict::NoAddress),
+            "a host nothing has visited says so instead of staying blank"
+        );
+    }
+
+    #[test]
+    fn a_host_the_probe_cannot_measure_is_marked_unclear() {
+        let cache = Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new());
+        cache.set_ips("a.example", vec![Ipv4Addr::new(192, 0, 2, 1)]);
+        let verdicts = Arc::new(MainRouteVerdicts::new());
+        let runner = rule_check(
+            cache,
+            crate::path_probe::PathVerdict::Indeterminate,
+            Arc::clone(&verdicts),
+        );
+
+        runner.probe("S-1", &[], &["*.a.example".to_string()]);
+
+        wait_until_settled(&verdicts, "S-1");
+        assert_eq!(
+            verdicts.get("S-1", "a.example", std::time::Instant::now()),
+            Some(MainRouteVerdict::Unclear)
         );
     }
 }

@@ -27,13 +27,21 @@
 use std::sync::Arc;
 
 use nrr_platform_api::enforcement::{
-    ApplyReport, EnforcementBackend, EnforcementCapabilities, EnforcementPlan,
+    ApplyReport, EnforcementBackend, EnforcementCapabilities, EnforcementPlan, PrincipalScope,
 };
 use nrr_platform_api::error::PlatformError;
-use nrr_platform_api::types::WfpFilterId;
+use nrr_platform_api::types::{WfpFilterId, WfpPrincipal};
 use nrr_platform_api::wfp::{FilterFailureMode, RetireHeld, WfpSession};
 
 use crate::lower_windows::{lower_plan, EgressLuids};
+
+/// Whether `plan` carries the service-account set — only the route-table
+/// owner's plan does.
+fn carries_service_accounts(plan: &EnforcementPlan) -> bool {
+    plan.flows
+        .iter()
+        .any(|flow| flow.principal == PrincipalScope::ServiceAccounts)
+}
 
 /// Enforces a plan with the Windows Filtering Platform.
 pub struct WfpEnforcement {
@@ -83,14 +91,22 @@ impl EnforcementBackend for WfpEnforcement {
         // it. A record with no user condition belongs to no principal and is
         // left alone here.
         // On Windows the stored principal IS the SID string, which is what the
-        // `ALE_USER_ID` condition carries back on enumeration.
+        // `ALE_USER_ID` condition carries back on enumeration. The
+        // service-account set belongs to whichever plan carries it; a plan
+        // without it leaves it to that plan, or to `reconcile_all`'s sweep.
         let sid = plan.principal.as_stored();
+        let owns_service_accounts = carries_service_accounts(plan);
         let removals: Vec<WfpFilterId> = self
             .session
             .enumerate_our_filters()?
             .into_iter()
             .filter(|record| {
-                record.user_sid.as_deref() == Some(sid) && !desired.contains(&record.id.raw)
+                let ours = match WfpPrincipal::of(record.user_sid.as_deref()) {
+                    WfpPrincipal::User(owner) => owner == sid,
+                    WfpPrincipal::ServiceAccounts => owns_service_accounts,
+                    WfpPrincipal::Anyone => false,
+                };
+                ours && !desired.contains(&record.id.raw)
             })
             .map(|record| record.id)
             .collect();
@@ -147,6 +163,22 @@ impl EnforcementBackend for WfpEnforcement {
             total.failed += report.failed;
             total.notes.extend(report.notes);
         }
+        // Nobody owns the route table any more: the service-account set an
+        // earlier owner installed would otherwise outlive every plan.
+        if !plans.iter().any(carries_service_accounts) {
+            let orphans: Vec<WfpFilterId> = self
+                .session
+                .enumerate_our_filters()?
+                .into_iter()
+                .filter(|record| {
+                    WfpPrincipal::of(record.user_sid.as_deref()) == WfpPrincipal::ServiceAccounts
+                })
+                .map(|record| record.id)
+                .collect();
+            if !orphans.is_empty() {
+                let _retired = self.session.execute_replacement(&[], &orphans, self.mode)?;
+            }
+        }
         Ok(total)
     }
 
@@ -200,7 +232,7 @@ mod tests {
                 dst_port: None,
                 protocol: None,
             },
-            principal: PrincipalScope(UserPrincipal::from_windows_sid(sid).ok()),
+            principal: PrincipalScope::from_user(UserPrincipal::from_windows_sid(sid).ok()),
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,

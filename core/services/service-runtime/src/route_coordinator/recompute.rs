@@ -1,34 +1,44 @@
-//! Who the route table currently belongs to, and the passes that rewrite it.
+//! Who the route table currently serves, and the passes that rewrite it.
 //!
-//! The table is machine-wide, so exactly one principal owns it at a time; the
-//! choice of that principal is what these methods decide before anything is
-//! applied.
+//! The table is machine-wide, so it carries the union of every served user's
+//! routes; where two users want one destination through different links, the
+//! one served longer keeps it (see [`super::served`] and [`super::merge`]).
 
 use super::*;
 
 impl SecondaryRouteCoordinator {
-    /// Recompute the route table for the **active console-session user**
-    /// (Free single-active-user model). `active_sids` is the routing-active
-    /// set from `ActiveSidRegistry`; in Free at most one is active. With
-    /// none active the table is torn down (no user → no routes; M-1).
+    /// Recompute the route table for every served user: the tray-connected
+    /// SIDs in `active_sids` and, under service-driven scope, everyone signed
+    /// in at the console or remotely. With nobody served the table is torn
+    /// down (no user → no routes).
     ///
-    /// Resolves the active user's secondary target (binding × live adapter
-    /// info) itself, so the wiring layer only has to forward the trigger.
-    /// Per-session routing for several concurrently-active users cannot be
-    /// expressed in a machine-wide table; the first active SID owns it.
+    /// Resolves each user's secondary target (binding × live adapter info)
+    /// itself, so the wiring layer only has to forward the trigger.
     pub fn recompute_active(
         &self,
         active_sids: &[String],
     ) -> Result<RouteReconcileDelta, PlatformError> {
-        // Pick the routing user via the shared gate. `None` → tear down.
-        let Some(sid) = self.effective_routing_sid(active_sids) else {
-            tracing::info!(
-                target: "nrr::route-coordinator",
-                msg_key = "route-no-routing-user",
-                active_count = active_sids.len(),
-                "no routing user to enforce (no tray, and either app-driven scope or no console session) — tearing down secondary routes",
-            );
-            return self.reconciler.clear();
+        let served = self.served_sids_fresh(active_sids);
+        let sid = match served.as_slice() {
+            [] => {
+                tracing::info!(
+                    target: "nrr::route-coordinator",
+                    msg_key = "route-no-routing-user",
+                    active_count = active_sids.len(),
+                    "no routing user to enforce (no tray, and either app-driven scope or nobody signed in) — tearing down secondary routes",
+                );
+                self.publish_served_nobody();
+                return self.reconciler.clear();
+            }
+            [sid] => sid.clone(),
+            several => {
+                tracing::debug!(
+                    target: "nrr::route-coordinator",
+                    users = several.len(),
+                    "recompute_active for every signed-in user",
+                );
+                return self.recompute_served(several);
+            }
         };
         // Safe-disable (ROUTE-half) — a paused routing user's routes must never
         // be (re)installed. This single choke point covers EVERY re-drive
@@ -47,6 +57,7 @@ impl SecondaryRouteCoordinator {
                         sid = %sid,
                         "routing paused for this user (teardown policy) — tearing down secondary routes",
                     );
+                    self.publish_served_nobody();
                     return self.reconciler.clear();
                 }
                 PausedRouteDisposition::KeepSecondaryHosts => {
@@ -59,13 +70,6 @@ impl SecondaryRouteCoordinator {
                     return self.teardown_keep_rule_routes();
                 }
             }
-        }
-        if active_sids.is_empty() {
-            tracing::debug!(
-                target: "nrr::route-coordinator",
-                sid = %sid,
-                "no tray connected; service-driven scope → enforcing active console user's policy",
-            );
         }
         // Per-cycle heartbeat — debug so it does not flood the log every
         // poll interval. State changes (routes added/removed, resolve
@@ -80,41 +84,22 @@ impl SecondaryRouteCoordinator {
         self.recompute_for(&sid, &resolution)
     }
 
-    /// the SID whose policy is actually enforced for
-    /// `active_sids`: the first connected-tray SID (M-1), or — under
-    /// service-driven scope with no tray — the signed-in user the OS reports
-    /// (console session, else the sole remote one), so rules hold with no app
-    /// running, from boot.
-    /// `None` means "nothing to enforce" (app-driven with no tray, or no
-    /// console session). SHARED by `recompute_active`, the FQDN seeder, the
-    /// DNS-observation consumer, and the policy-change trigger so all four
-    /// target the SAME user the route table is built for — otherwise
-    /// ExactFqdn/Suffix/Zone rules never get seeded for the console user from
-    /// boot and only ExactIp + a warm cache enforce.
+    /// The longest-served user: the one whose routing never yields to anyone.
+    ///
+    /// Only for what the machine can do for ONE user at a time — the DNS
+    /// answers (a query carries no trace of who asked), the fake-IP relay, the
+    /// upstream resolver's preferred link. Anything per user (routes, filters,
+    /// seeding, learning) asks [`Self::served_sids`] instead.
     pub fn effective_routing_sid(&self, active_sids: &[String]) -> Option<String> {
-        if let Some(s) = active_sids.first() {
-            return Some(s.clone());
-        }
-        if (self.rule_scope_service_driven)() {
-            return self.api.interactive_user_sid();
-        }
-        None
+        self.served_sids(active_sids).into_iter().next()
     }
 
-    /// the SID SET whose WFP enforcement should be
-    /// installed right now: every routing-active (tray-connected) SID, or —
-    /// with no tray at all — the single effective routing user from
-    /// [`Self::effective_routing_sid`] (console-session user under
-    /// service-driven scope). Gives the WFP orchestrator the same no-tray
-    /// fallback the route half already has, so enforcement self-arms from
-    /// boot / survives a dead tray subscription instead of waiting for a
-    /// tray connect. Multi-tray SIDs pass through unchanged (the fallback
-    /// only fills an EMPTY set — it never overrides connected trays).
+    /// The SID set whose WFP enforcement should be installed right now: every
+    /// served user (see [`Self::served_sids`]), so enforcement self-arms from
+    /// boot and survives a dead tray subscription instead of waiting for a
+    /// tray connect.
     pub fn effective_enforcement_sids(&self, tray_active: &[String]) -> Vec<String> {
-        if !tray_active.is_empty() {
-            return tray_active.to_vec();
-        }
-        self.effective_routing_sid(&[]).into_iter().collect()
+        self.served_sids(tray_active)
     }
 
     /// unconditional teardown of every owned route,

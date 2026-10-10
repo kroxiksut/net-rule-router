@@ -1,0 +1,50 @@
+{
+  "description": "rules.js mainRouteCheckHosts: the hosts Check the main route asks about: enabled host rules of the additional route, ACE form when the row has one, no leading *., lower-cased, each once in first-seen order",
+  "cases": [
+    { "name": "empty table", "input": { "rows": [] }, "expected": [] },
+    { "name": "one domain", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "example.com", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": ["example.com"] },
+    { "name": "suffix loses its star", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "*.Example.COM", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": ["example.com"] },
+    { "name": "other host spellings count", "input": { "rows": [
+      { "ruleType": "suffix-domain", "matchValue": "a.example", "targetRoute": "secondary", "enabled": true },
+      { "ruleType": "exact-fqdn", "matchValue": "b.example", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": ["a.example", "b.example"] },
+    { "name": "ace form wins", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "пример.рф", "aceMatchValue": "xn--e1afmkfd.xn--p1ai", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": ["xn--e1afmkfd.xn--p1ai"] },
+    { "name": "empty ace form falls back", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "site.example", "aceMatchValue": "", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": ["site.example"] },
+    { "name": "trimmed after the star", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "*. spaced.example ", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": ["spaced.example"] },
+    { "name": "duplicates once, first seen first", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "b.example", "targetRoute": "secondary", "enabled": true },
+      { "ruleType": "domain", "matchValue": "a.example", "targetRoute": "secondary", "enabled": true },
+      { "ruleType": "domain", "matchValue": "*.B.example", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": ["b.example", "a.example"] },
+    { "name": "zone is not asked about", "input": { "rows": [
+      { "ruleType": "zone", "matchValue": "ru", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": [] },
+    { "name": "other routes and types are not", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "main.example", "targetRoute": "primary", "enabled": true },
+      { "ruleType": "domain", "matchValue": "ads.example", "targetRoute": "block", "enabled": true },
+      { "ruleType": "exact-ip", "matchValue": "192.0.2.1", "targetRoute": "secondary", "enabled": true },
+      { "ruleType": "subnet", "matchValue": "198.51.100.0/24", "targetRoute": "secondary", "enabled": true },
+      { "ruleType": "application", "matchValue": "app.exe", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": [] },
+    { "name": "disabled and unmarked rows are not", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "off.example", "targetRoute": "secondary", "enabled": false },
+      { "ruleType": "domain", "matchValue": "unset.example", "targetRoute": "secondary" }
+    ] }, "expected": [] },
+    { "name": "unsure rule on the additional route counts", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "maybe.example", "targetRoute": "secondary", "enabled": true, "verify": true }
+    ] }, "expected": ["maybe.example"] },
+    { "name": "a bare star is nothing", "input": { "rows": [
+      { "ruleType": "domain", "matchValue": "*.", "targetRoute": "secondary", "enabled": true }
+    ] }, "expected": [] }
+  ]
+}

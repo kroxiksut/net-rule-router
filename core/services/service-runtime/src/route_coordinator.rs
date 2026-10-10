@@ -1,14 +1,13 @@
 //! secondary-route coordinator.
 //!
 //! Ties [`crate::route_codegen`] (rules → desired routes) to
-//! [`crate::route_reconciler`] (desired → system route table) for the
-//! **active console-session user** (Free single-active-user model — see
-//! `route_reconciler` module doc). The wiring layer
-//! ([`crate::runtime_deps`] in `nrr-windows-service`) resolves *which*
-//! user is active and the secondary adapter target, then calls
-//! [`SecondaryRouteCoordinator::recompute_for`] on every trigger (active
-//! user changed, that user's rules changed, secondary availability
-//! changed, FQDN cache warmed).
+//! [`crate::route_reconciler`] (desired → system route table) for every
+//! served user — each one signed in at the console or remotely — laid into
+//! the one machine table longest-served first. The wiring layer
+//! ([`crate::runtime_deps`] in `nrr-windows-service`) forwards every trigger
+//! (a user signed in or out, their rules changed, secondary availability
+//! changed, FQDN cache warmed) to
+//! [`SecondaryRouteCoordinator::recompute_active`].
 // The log-once latches live in `route_coordinator::notice_latches`; the
 // kill-switch / fail-closed exemption sets in `::exemptions`. Same
 // inherent impl, split across files.
@@ -178,14 +177,14 @@ pub enum PausedRouteDisposition {
 /// the pause coordinator owns the route coordinator, not the reverse.
 pub type PausedCheckFn = Arc<dyn Fn(&str) -> PausedRouteDisposition + Send + Sync>;
 
-/// Owns the route reconciler and the inputs needed to recompute the
-/// desired route set for the active console-session user.
 /// per-probe ICMP-echo timeout. Short: a live tunnel
 /// peer answers in a few ms; a dead one times out. The tracker's window (many
 /// seconds of continuous failure) is what actually decides death, so this only
 /// bounds a single probe.
 const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// Owns the route reconciler and the inputs needed to recompute the desired
+/// route set for the served users.
 pub struct SecondaryRouteCoordinator {
     reconciler: SecondaryRouteReconciler,
     api: Arc<dyn RouteTablePort>,
@@ -276,6 +275,22 @@ pub struct SecondaryRouteCoordinator {
     /// The resolution each principal's last full recompute used. A first
     /// contact plans from it instead of re-reading the adapters on the DNS path.
     last_resolution: Mutex<HashMap<String, RouteResolution>>,
+    /// How long each served user has been served; the longer-served one keeps
+    /// a contested destination.
+    served_ranks: Mutex<served::ServedRanks>,
+    /// The last enumeration of signed-in users, for the per-answer readers.
+    session_cache: Mutex<served::SessionCache>,
+    /// Who the enumerations listed, so one that misses a user does not
+    /// unserve them at once (see [`served::DEPARTURE_GRACE`]).
+    signed_in_memory: Mutex<served::SignedInMemory>,
+    /// Which link the last pass's table sends each named destination through,
+    /// and for whom.
+    merged_view: Mutex<Arc<merge::MergedRouteView>>,
+    /// Each served user's routes that went into the last pass's table: what a
+    /// user paused under the persist policy keeps.
+    contributions: Mutex<HashMap<String, Vec<RouteEntry>>>,
+    /// Conflicts between users already reported, so each is said once.
+    reported_conflicts: Mutex<users::ReportedConflicts>,
     /// live routing-scope read (service-driven vs
     /// app-driven). See [`RuleScopeProvider`].
     rule_scope_service_driven: RuleScopeProvider,
@@ -346,21 +361,25 @@ pub struct SecondaryRouteCoordinator {
 
 mod apply;
 mod liveness;
+mod merge;
 mod network_facts;
 mod networks;
 mod recompute;
 mod resolve;
+mod served;
+mod users;
 mod wiring;
 
+pub use served::{ServedPrincipals, DEPARTURE_GRACE};
+
 /// wraps the WFP per-SID apply trigger so a policy
-/// change also recomputes the **route table** for the active user.
+/// change also recomputes the **route table** for the served users.
 ///
 /// `RoutePolicyUpdate` (binding change) and rules mutations both fire
 /// `on_policy_changed(sid)`. The inner trigger recompiles that SID's WFP
-/// filters (already M-1-gated on tray presence). This wrapper additionally
-/// recomputes the route table **only when the changed SID is the active
-/// routing user** — routes follow the single active console user, so a
-/// background user's edit must not rewrite the machine-wide table.
+/// filters. This wrapper additionally recomputes the route table **only when
+/// the changed SID is served** — a user who is not signed in has nothing in
+/// the machine-wide table to rewrite.
 pub struct RouteAndFilterApplyTrigger {
     inner: Arc<dyn crate::ipc_handlers::providers::RoutePolicyApplyTrigger>,
     route_coord: Arc<SecondaryRouteCoordinator>,
@@ -385,31 +404,18 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger for RouteAndFilterA
     fn on_policy_changed(&self, sid: &str) {
         // 1. WFP filters (per-SID, M-1-gated inside the inner trigger).
         self.inner.on_policy_changed(sid);
-        // 2. Route table — re-drive when the changed policy affects the user we
-        //    actually enforce for. With a tray that's a connected SID; under
-        //    service-driven scope with NO tray it is the active console user, so
-        //    a change to THEIR rules — or to the shared baseline they inherit —
-        //    must re-drive even though the registry is empty, or
-        //    service-driven-from-boot policy edits go unenforced until a tray
-        //    connects or the periodic safety recompute catches up.
+        // 2. Route table — re-drive when the changed policy affects a user we
+        //    serve, tray or no tray: under service-driven scope a signed-in
+        //    user's edit must re-drive even with the registry empty.
         let active = self.registry.active_sids();
-        let relevant = match self.route_coord.effective_routing_sid(&active).as_deref() {
-            Some(eff) => {
-                eff == sid
-                    // The shared baseline is read THROUGH by every user who has
-                    // not diverged from it, so editing it changes what we
-                    // enforce for whoever we enforce for — with a tray
-                    // connected exactly as much as without one. Gating this on
-                    // an empty registry meant an admin's baseline edit reached
-                    // the filters and stopped at the route table for as long as
-                    // a tray was up. Deciding here whether the effective
-                    // principal still inherits would mean re-deriving their
-                    // revision; the recompute is a diff and costs one no-op
-                    // pass when they do not.
-                    || sid == nrr_domain::user_principal::BASELINE_PRINCIPAL
-            }
-            None => false,
-        };
+        let served = self.route_coord.served_sids(&active);
+        let relevant = !served.is_empty()
+            && (served.iter().any(|s| s == sid)
+                // The shared baseline is read THROUGH by every user who has not
+                // diverged from it, so editing it changes what we enforce for
+                // them; the recompute is a diff and costs one no-op pass when
+                // nobody inherits it.
+                || sid == nrr_domain::user_principal::BASELINE_PRINCIPAL);
         if relevant {
             match self.route_coord.recompute_active(&active) {
                 Ok(delta) if !delta.is_noop() => tracing::info!(

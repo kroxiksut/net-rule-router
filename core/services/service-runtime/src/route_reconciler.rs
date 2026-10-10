@@ -7,17 +7,14 @@
 //! longer desired and **adds** newly-desired ones, in a single
 //! [`RoutingTransaction`] that rolls back on partial failure.
 //!
-//! ## Single-active-user model (Free)
+//! ## One table, several users
 //!
 //! The Windows route table is **machine-wide** — a route entry has no user
-//! dimension. So the table reflects exactly one user's routing at a time:
-//! the active console-session user. When the active
-//! user changes, the wiring recomputes the desired set for the new user
-//! and calls `reconcile`, which tears down the previous user's routes and
-//! installs the new user's. Per-SID WFP filters (the kill-switch) remain
-//! per-user and simultaneous; only the route table is single-owner.
-//! Simultaneous distinct routing for multiple concurrently-active sessions
-//! needs a kernel callout driver and is not supported (`strategy.rs`).
+//! dimension. So the desired set is the union of every signed-in user's
+//! routes, merged by the route coordinator: a destination two users send
+//! through different links goes the way of the one served longer. Per-SID
+//! WFP filters (the kill-switch) stay per user. This reconciler sees only
+//! the merged set.
 //!
 //! ## Ownership tracking
 //!
@@ -39,8 +36,9 @@ use crate::route_codegen::{OVERLAY_HIGH, OVERLAY_LOW};
 
 /// Identity of a route for diffing — everything but `metric`/`is_ours`.
 /// Two routes with the same key are "the same route"; a metric-only change
-/// is not a meaningful diff for our `/32` host routes.
-type RouteKey = (IpAddr, u8, IpAddr, u32);
+/// is not a meaningful diff for our `/32` host routes. The table is part of
+/// it: two users' tables may hold the same route.
+type RouteKey = (IpAddr, u8, IpAddr, u32, nrr_platform_api::RouteTableRef);
 
 fn route_key(r: &RouteEntry) -> RouteKey {
     (
@@ -48,6 +46,7 @@ fn route_key(r: &RouteEntry) -> RouteKey {
         r.prefix_length,
         r.next_hop,
         r.interface_index,
+        r.table.clone(),
     )
 }
 
@@ -356,7 +355,16 @@ impl SecondaryRouteReconciler {
     /// signature, so the next reconcile keeps what is still wanted and takes
     /// back the rest. Returns how many rows carried it.
     pub fn adopt_signed_routes(&self) -> Result<usize, PlatformError> {
-        let found = signed_routes(self.api.as_ref())?;
+        self.adopt_signed_routes_with(&|_: &RouteEntry| false)
+    }
+
+    /// [`Self::adopt_signed_routes`], also taking the rows `also_ours` claims
+    /// (every route in a table only we write).
+    pub fn adopt_signed_routes_with(
+        &self,
+        also_ours: &dyn Fn(&RouteEntry) -> bool,
+    ) -> Result<usize, PlatformError> {
+        let found = signed_routes(self.api.as_ref(), also_ours)?;
         let count = found.len();
         let mut owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
         for route in found {
@@ -570,12 +578,16 @@ impl std::fmt::Display for RouteSweepError {
 }
 
 /// The rows of the live table carrying our signature
-/// ([`crate::route_codegen::is_owned_route`]), stamped as ours.
-fn signed_routes(api: &dyn RouteTablePort) -> Result<Vec<RouteEntry>, PlatformError> {
+/// ([`crate::route_codegen::is_owned_route`]) or claimed by `also_ours`,
+/// stamped as ours.
+fn signed_routes(
+    api: &dyn RouteTablePort,
+    also_ours: &dyn Fn(&RouteEntry) -> bool,
+) -> Result<Vec<RouteEntry>, PlatformError> {
     Ok(api
         .get_ip_forward_table()?
         .into_iter()
-        .filter(crate::route_codegen::is_owned_route)
+        .filter(|r| crate::route_codegen::is_owned_route(r) || also_ours(r))
         .map(|mut r| {
             r.is_ours = true;
             r
@@ -587,7 +599,15 @@ fn signed_routes(api: &dyn RouteTablePort) -> Result<Vec<RouteEntry>, PlatformEr
 /// running to say which it installed. Returns how many went. Recognition is
 /// [`crate::route_codegen::is_owned_route`] alone, so this needs no stored state.
 pub fn sweep_owned_routes(api: Arc<dyn RouteTablePort>) -> Result<usize, RouteSweepError> {
-    let orphans = signed_routes(api.as_ref()).map_err(RouteSweepError::Enumerate)?;
+    sweep_owned_routes_with(api, &|_: &RouteEntry| false)
+}
+
+/// [`sweep_owned_routes`], also removing the rows `also_ours` claims.
+pub fn sweep_owned_routes_with(
+    api: Arc<dyn RouteTablePort>,
+    also_ours: &dyn Fn(&RouteEntry) -> bool,
+) -> Result<usize, RouteSweepError> {
+    let orphans = signed_routes(api.as_ref(), also_ours).map_err(RouteSweepError::Enumerate)?;
     if orphans.is_empty() {
         return Ok(0);
     }

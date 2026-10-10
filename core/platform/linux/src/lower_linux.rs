@@ -21,9 +21,11 @@
 
 use nrr_platform_api::enforcement::{
     AppScope, DstMatch, EgressConstraint, EgressRef, EnforcementPlan, FlowMatch, FlowRule, L4Proto,
-    PrincipalScope, Verdict,
+    PrincipalScope, UserPrincipal, Verdict,
 };
+use nrr_platform_api::own_traffic::OWN_TRAFFIC_MARK;
 
+use crate::drop_tag::{DropKind, DropTag};
 use crate::nft_ir::{NftFamily, NftMatch, NftRule, NftRuleset, NftVerdict};
 
 /// Table name we own. Everything this product installs lives inside it, so
@@ -168,17 +170,53 @@ pub struct ScopedPlan<'a> {
     pub egress: &'a EgressNames,
 }
 
+/// Whose plan speaks for the machine's service accounts, and which uids those
+/// are on this machine. The default lowers no service-account rule at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceAccountScope {
+    /// The route-table owner: only its plan's service-account rules lower.
+    pub owner: Option<UserPrincipal>,
+    /// Sorted, disjoint inclusive uid ranges
+    /// ([`crate::service_account_uids::service_account_uids`]).
+    pub uids: Vec<(u32, u32)>,
+}
+
+impl ServiceAccountScope {
+    fn speaks_for(&self, plan: &EnforcementPlan) -> bool {
+        !self.uids.is_empty() && self.owner.as_ref() == Some(&plan.principal)
+    }
+}
+
 /// Lower plans that each carry their own egress resolution.
 pub fn lower_scoped(plans: &[ScopedPlan<'_>]) -> LoweredPlan {
+    lower_scoped_with(plans, &ServiceAccountScope::default())
+}
+
+/// [`lower_scoped`], with the route-table owner's service-account rules
+/// lowered onto `service_accounts.uids`.
+///
+/// Every other plan's service-account rules are dropped: one owner speaks for
+/// the machine, and a second set would pin system traffic to two tunnels.
+/// When any is emitted, the chain opens with an accept for our own mark — the
+/// service runs as a service account, and its relay, resolver and probes must
+/// leave by the link they chose.
+pub fn lower_scoped_with(
+    plans: &[ScopedPlan<'_>],
+    service_accounts: &ServiceAccountScope,
+) -> LoweredPlan {
     let mut indexed: Vec<(usize, usize, &FlowRule)> = plans
         .iter()
         .enumerate()
         .flat_map(|(plan_idx, scoped)| {
+            let speaks = service_accounts.speaks_for(scoped.plan);
             scoped
                 .plan
                 .flows
                 .iter()
                 .enumerate()
+                .filter(move |(_, flow)| {
+                    speaks || flow.principal != PrincipalScope::ServiceAccounts
+                })
                 .map(move |(flow_idx, flow)| (plan_idx, flow_idx, flow))
         })
         .collect();
@@ -198,8 +236,10 @@ pub fn lower_scoped(plans: &[ScopedPlan<'_>]) -> LoweredPlan {
     let mut rules: Vec<NftRule> = Vec::new();
     let mut unsupported = Vec::new();
 
+    let mut serves_system_traffic = false;
     for (plan_idx, index, flow) in indexed {
-        let lowered = lower_flow(flow, plans[plan_idx].egress);
+        serves_system_traffic |= flow.principal == PrincipalScope::ServiceAccounts;
+        let lowered = lower_flow(flow, plans[plan_idx].egress, &service_accounts.uids);
         rules.extend(lowered.rules);
         if let Some(reason) = lowered.unsupported {
             unsupported.push(UnsupportedRule {
@@ -209,7 +249,17 @@ pub fn lower_scoped(plans: &[ScopedPlan<'_>]) -> LoweredPlan {
             });
         }
     }
-    let rules = crate::nft_merge::fold_into_sets(prune_unreachable(rules));
+    let mut rules = crate::nft_merge::fold_into_sets(prune_unreachable(rules));
+    if serves_system_traffic {
+        rules.insert(
+            0,
+            NftRule {
+                matches: vec![NftMatch::Mark(OWN_TRAFFIC_MARK)],
+                verdict: NftVerdict::Accept,
+                comment: "own-traffic".to_owned(),
+            },
+        );
+    }
 
     LoweredPlan {
         ruleset: NftRuleset {
@@ -276,23 +326,34 @@ impl LoweredFlow {
     }
 }
 
-fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> LoweredFlow {
+fn lower_flow(flow: &FlowRule, egress: &EgressNames, service_uids: &[(u32, u32)]) -> LoweredFlow {
     if let AppScope::Program { key, .. } = &flow.app {
         return LoweredFlow::unsupported(UnsupportedReason::AppScoped { key: key.clone() });
     }
 
     let mut base = Vec::new();
-    if let PrincipalScope(Some(principal)) = &flow.principal {
-        // Per-user matching is a plain condition here — the capability Windows
-        // has to emulate with per-SID filter sets. A principal we cannot express
-        // as a uid must FAIL the rule, never widen it: dropping the condition
-        // turns one user's rule into a machine-wide one.
-        let Some(uid) = principal.as_unix_uid() else {
-            return LoweredFlow::unsupported(UnsupportedReason::UnresolvablePrincipal {
-                stored: principal.as_stored().to_owned(),
-            });
-        };
-        base.push(NftMatch::SkUid(uid));
+    match &flow.principal {
+        PrincipalScope::User(principal) => {
+            // Per-user matching is a plain condition here — the capability
+            // Windows has to emulate with per-SID filter sets. A principal we
+            // cannot express as a uid must FAIL the rule, never widen it:
+            // dropping the condition turns one user's rule into a machine-wide
+            // one.
+            let Some(uid) = principal.as_unix_uid() else {
+                return LoweredFlow::unsupported(UnsupportedReason::UnresolvablePrincipal {
+                    stored: principal.as_stored().to_owned(),
+                });
+            };
+            base.push(NftMatch::SkUid(uid));
+        }
+        // First, so a user's packet leaves the rule at its first comparison.
+        PrincipalScope::ServiceAccounts => {
+            if service_uids.is_empty() {
+                return LoweredFlow::rules(Vec::new());
+            }
+            base.push(NftMatch::SkUidSet(service_uids.to_vec()));
+        }
+        PrincipalScope::Machine => {}
     }
     base.extend(lower_flow_match(&flow.flow));
 
@@ -301,7 +362,7 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> LoweredFlow {
     match &flow.egress {
         EgressConstraint::Any => LoweredFlow::rules(vec![NftRule {
             matches: base,
-            verdict: verdict_of(flow.verdict),
+            verdict: verdict_of(flow),
             comment,
         }]),
         EgressConstraint::OnlyVia(reference) => {
@@ -320,7 +381,7 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> LoweredFlow {
                 return LoweredFlow {
                     rules: vec![NftRule {
                         matches: base,
-                        verdict: NftVerdict::Drop,
+                        verdict: NftVerdict::DropReported(drop_tag(flow, true)),
                         comment: format!("{comment} leak-guard (pinned link absent)"),
                     }],
                     unsupported: Some(UnsupportedReason::UnresolvedEgress),
@@ -350,7 +411,7 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> LoweredFlow {
                 // the pin exists to prevent.
                 NftRule {
                     matches: base,
-                    verdict: NftVerdict::Drop,
+                    verdict: NftVerdict::DropReported(drop_tag(flow, true)),
                     comment: format!("{comment} leak-guard"),
                 },
             ])
@@ -397,10 +458,38 @@ const fn protocol_number(proto: L4Proto) -> u8 {
     }
 }
 
-const fn verdict_of(verdict: Verdict) -> NftVerdict {
-    match verdict {
+/// Every drop we emit is reported: the observer cannot tell a dropped
+/// connection from one never made, and the drop is the only place that knows.
+fn verdict_of(flow: &FlowRule) -> NftVerdict {
+    match flow.verdict {
         Verdict::Permit => NftVerdict::Accept,
-        Verdict::Block => NftVerdict::Drop,
+        Verdict::Block => NftVerdict::DropReported(drop_tag(flow, false)),
+    }
+}
+
+/// The role of a drop, from the band that produced it. `leak_guard` marks the
+/// drop half of an egress pin, whatever its band.
+fn drop_tag(flow: &FlowRule, leak_guard: bool) -> DropTag {
+    use nrr_platform_api::enforcement::PrecedenceClass as P;
+    let kind = if leak_guard {
+        DropKind::Pin
+    } else {
+        match flow.precedence.class {
+            P::KillSwitchBlock => DropKind::FailClosed,
+            P::CatchAllBlock if matches!(flow.flow.dst, DstMatch::SubnetV6 { prefix: 0, .. }) => {
+                DropKind::Ipv6Cut
+            }
+            P::CatchAllBlock => DropKind::BlockAll,
+            P::DohBlock => DropKind::DnsLockdown,
+            P::HardBlock => DropKind::Rule,
+            P::DefaultCatchAll => DropKind::Default,
+            P::FakeIpPool => DropKind::RelayPool,
+            P::RouteRule(_) | P::CatchAllExempt | P::KillSwitchPermit => DropKind::Other,
+        }
+    };
+    DropTag {
+        kind,
+        system: flow.principal == PrincipalScope::ServiceAccounts,
     }
 }
 
@@ -451,7 +540,7 @@ mod tests {
                 dst_port: None,
                 protocol: None,
             },
-            principal: PrincipalScope(None),
+            principal: PrincipalScope::Machine,
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
@@ -465,6 +554,10 @@ mod tests {
             routes: Vec::new(),
             policy_rules: Vec::new(),
         }
+    }
+
+    fn pin_drop() -> NftVerdict {
+        NftVerdict::DropReported(DropTag::user(DropKind::Pin))
     }
 
     fn names() -> EgressNames {
@@ -572,7 +665,7 @@ mod tests {
             .contains(&NftMatch::OutInterface("tun0".into())));
 
         let guard = &lowered.ruleset.rules[1];
-        assert_eq!(guard.verdict, NftVerdict::Drop);
+        assert_eq!(guard.verdict, pin_drop());
         assert!(
             !guard
                 .matches
@@ -628,7 +721,7 @@ mod tests {
             DstMatch::HostV4(v4(203, 0, 113, 1)),
             Verdict::Permit,
         )]);
-        alice.flows[0].principal = PrincipalScope(Some(UserPrincipal::from_linux_uid(1000)));
+        alice.flows[0].principal = PrincipalScope::User(UserPrincipal::from_linux_uid(1000));
 
         let mut bob = plan_of(vec![rule(
             PrecedenceClass::RouteRule(RouteRole::Secondary),
@@ -637,7 +730,7 @@ mod tests {
             Verdict::Permit,
         )]);
         bob.principal = UserPrincipal::from_linux_uid(1001);
-        bob.flows[0].principal = PrincipalScope(Some(UserPrincipal::from_linux_uid(1001)));
+        bob.flows[0].principal = PrincipalScope::User(UserPrincipal::from_linux_uid(1001));
 
         let lowered = lower_plans(&[alice, bob], &names());
 
@@ -670,7 +763,7 @@ mod tests {
         )]);
         let sid = UserPrincipal::from_windows_sid("S-1-5-21-1-2-3-1001").expect("valid sid");
         foreign.principal = sid.clone();
-        foreign.flows[0].principal = PrincipalScope(Some(sid));
+        foreign.flows[0].principal = PrincipalScope::User(sid);
 
         let lowered = lower_plan(&foreign, &names());
 
@@ -712,7 +805,7 @@ mod tests {
             .ruleset
             .rules
             .iter()
-            .all(|r| r.verdict == NftVerdict::Drop));
+            .all(|r| r.verdict == pin_drop()));
         assert_eq!(lowered.ruleset.rules.len(), 1);
         assert_eq!(
             lowered.unsupported,
@@ -769,7 +862,7 @@ mod tests {
         // link that went down blocks the traffic it carried instead of handing
         // it to the default route.
         assert_eq!(lowered.ruleset.rules.len(), 1);
-        assert_eq!(lowered.ruleset.rules[0].verdict, NftVerdict::Drop);
+        assert_eq!(lowered.ruleset.rules[0].verdict, pin_drop());
         assert_eq!(
             lowered.unsupported[0].reason,
             UnsupportedReason::UnresolvedEgress
@@ -793,7 +886,7 @@ mod tests {
             DstMatch::HostV4(v4(198, 51, 100, 8)),
             Verdict::Permit,
         );
-        scoped.principal = PrincipalScope(Some(UserPrincipal::from_linux_uid(1001)));
+        scoped.principal = PrincipalScope::User(UserPrincipal::from_linux_uid(1001));
 
         let lowered = lower_plan(&plan_of(vec![scoped]), &names());
         assert!(lowered.ruleset.rules[0]
@@ -864,7 +957,7 @@ mod tests {
                     dst_port: None,
                     protocol: None,
                 },
-                principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(1000))),
+                principal: PrincipalScope::User(UserPrincipal::from_linux_uid(1000)),
                 app: AppScope::Any,
                 egress: EgressConstraint::OnlyVia(EgressRef::Secondary),
                 coverage: Coverage::ConnectOnly,
@@ -903,7 +996,7 @@ mod tests {
                 dst_port: None,
                 protocol: None,
             },
-            principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(1000))),
+            principal: PrincipalScope::User(UserPrincipal::from_linux_uid(1000)),
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage,
@@ -937,7 +1030,7 @@ mod tests {
                 dst_port: None,
                 protocol,
             },
-            principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(uid))),
+            principal: PrincipalScope::User(UserPrincipal::from_linux_uid(uid)),
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
@@ -979,7 +1072,7 @@ mod tests {
                     dst_port: None,
                     protocol: None,
                 },
-                principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(uid))),
+                principal: PrincipalScope::User(UserPrincipal::from_linux_uid(uid)),
                 app: AppScope::Any,
                 egress: EgressConstraint::Any,
                 coverage: Coverage::ConnectOnly,
@@ -996,7 +1089,10 @@ mod tests {
             net: std::net::Ipv6Addr::UNSPECIFIED,
             prefix: 0,
         }));
-        assert_eq!(rule.verdict, NftVerdict::Drop);
+        assert_eq!(
+            rule.verdict,
+            NftVerdict::DropReported(DropTag::user(DropKind::Ipv6Cut))
+        );
     }
 
     /// The pruning is per user, and it has to be: one user's blanket drop says
@@ -1017,7 +1113,7 @@ mod tests {
                     dst_port: None,
                     protocol: None,
                 },
-                principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(uid))),
+                principal: PrincipalScope::User(UserPrincipal::from_linux_uid(uid)),
                 app: AppScope::Any,
                 egress: EgressConstraint::Any,
                 coverage: Coverage::ConnectOnly,
@@ -1046,7 +1142,7 @@ mod tests {
         );
         pinned.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
         // Nothing bound, so the secondary name does not resolve.
-        let lowered = lower_flow(&pinned, &EgressNames::default());
+        let lowered = lower_flow(&pinned, &EgressNames::default(), &[]);
         assert_eq!(
             lowered.unsupported,
             Some(UnsupportedReason::UnresolvedEgress),
@@ -1058,6 +1154,161 @@ mod tests {
             "the guard stands: {:?}",
             lowered.rules
         );
-        assert_eq!(lowered.rules[0].verdict, NftVerdict::Drop);
+        assert_eq!(lowered.rules[0].verdict, pin_drop());
+    }
+
+    fn service_pin(ip: Ipv4Addr) -> FlowRule {
+        let mut flow = rule(
+            PrecedenceClass::KillSwitchPermit,
+            0,
+            DstMatch::HostV4(ip),
+            Verdict::Permit,
+        );
+        flow.principal = PrincipalScope::ServiceAccounts;
+        flow.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+        flow
+    }
+
+    fn owner_scope() -> ServiceAccountScope {
+        ServiceAccountScope {
+            owner: Some(UserPrincipal::from_linux_uid(1000)),
+            uids: vec![(0, 999), (65534, 65534)],
+        }
+    }
+
+    /// The owner's service-account pins fold into one accept and one drop over
+    /// the service uids, behind the accept for our own marked traffic — three
+    /// rules however many addresses, which is the per-packet cost.
+    #[test]
+    fn the_owners_service_account_pins_lower_to_a_uid_set_behind_our_mark() {
+        let plan = plan_of((1..=20).map(|i| service_pin(v4(198, 51, 100, i))).collect());
+        let egress = names();
+        let lowered = lower_scoped_with(
+            &[ScopedPlan {
+                plan: &plan,
+                egress: &egress,
+            }],
+            &owner_scope(),
+        );
+        let rules = &lowered.ruleset.rules;
+        assert_eq!(rules.len(), 3, "{rules:?}");
+        assert_eq!(rules[0].matches, vec![NftMatch::Mark(OWN_TRAFFIC_MARK)]);
+        assert_eq!(rules[0].verdict, NftVerdict::Accept);
+        for rule in &rules[1..] {
+            assert_eq!(
+                rule.matches.first(),
+                Some(&NftMatch::SkUidSet(owner_scope().uids)),
+                "{rule:?}"
+            );
+        }
+        assert_eq!(rules[1].verdict, NftVerdict::Accept);
+        assert_eq!(
+            rules[2].verdict,
+            NftVerdict::DropReported(DropTag {
+                kind: DropKind::Pin,
+                system: true,
+            })
+        );
+    }
+
+    #[test]
+    fn service_account_rules_of_a_plan_that_does_not_own_the_table_never_lower() {
+        let plan = plan_of(vec![service_pin(v4(198, 51, 100, 1))]);
+        let egress = names();
+        let scoped = [ScopedPlan {
+            plan: &plan,
+            egress: &egress,
+        }];
+        let other_owner = ServiceAccountScope {
+            owner: Some(UserPrincipal::from_linux_uid(1001)),
+            ..owner_scope()
+        };
+        for scope in [ServiceAccountScope::default(), other_owner] {
+            let lowered = lower_scoped_with(&scoped, &scope);
+            assert!(lowered.ruleset.rules.is_empty(), "{scope:?}");
+        }
+        assert!(lower_plan(&plan, &egress).ruleset.rules.is_empty());
+    }
+
+    /// The observer learns which rule dropped a packet only from the tag, so
+    /// every band has to name itself, and no accept may carry one.
+    #[test]
+    fn every_drop_is_reported_under_its_bands_kind_and_no_accept_is() {
+        let cases = [
+            (PrecedenceClass::KillSwitchBlock, DropKind::FailClosed),
+            (PrecedenceClass::CatchAllBlock, DropKind::BlockAll),
+            (PrecedenceClass::DohBlock, DropKind::DnsLockdown),
+            (PrecedenceClass::HardBlock, DropKind::Rule),
+            (PrecedenceClass::DefaultCatchAll, DropKind::Default),
+            (PrecedenceClass::FakeIpPool, DropKind::RelayPool),
+        ];
+        for (class, kind) in cases {
+            let block = rule(class, 0, DstMatch::HostV4(v4(192, 0, 2, 1)), Verdict::Block);
+            let lowered = lower_flow(&block, &names(), &[]);
+            assert_eq!(
+                lowered.rules[0].verdict,
+                NftVerdict::DropReported(DropTag::user(kind)),
+                "{class:?}"
+            );
+
+            let permit = rule(
+                class,
+                0,
+                DstMatch::HostV4(v4(192, 0, 2, 1)),
+                Verdict::Permit,
+            );
+            let lowered = lower_flow(&permit, &names(), &[]);
+            assert_eq!(lowered.rules[0].verdict, NftVerdict::Accept, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn a_whole_family_close_is_reported_as_the_ipv6_cut_not_the_block_all() {
+        let v6_all = DstMatch::SubnetV6 {
+            net: std::net::Ipv6Addr::UNSPECIFIED,
+            prefix: 0,
+        };
+        let v6_net = DstMatch::SubnetV6 {
+            net: "2001:db8::"
+                .parse()
+                .unwrap_or(std::net::Ipv6Addr::UNSPECIFIED),
+            prefix: 32,
+        };
+        let tag_of = |dst| {
+            let block = rule(PrecedenceClass::CatchAllBlock, 0, dst, Verdict::Block);
+            lower_flow(&block, &names(), &[]).rules[0].verdict
+        };
+        assert_eq!(
+            tag_of(v6_all),
+            NftVerdict::DropReported(DropTag::user(DropKind::Ipv6Cut))
+        );
+        assert_eq!(
+            tag_of(v6_net),
+            NftVerdict::DropReported(DropTag::user(DropKind::BlockAll))
+        );
+    }
+
+    /// Folding keeps working on reported drops: guards of one band still
+    /// become one set, and the set keeps the band's tag.
+    #[test]
+    fn reported_guards_still_fold_into_one_set() {
+        let flows = (1..=10)
+            .map(|i| {
+                let mut pinned = rule(
+                    PrecedenceClass::KillSwitchPermit,
+                    i,
+                    DstMatch::HostV4(v4(198, 51, 100, i as u8)),
+                    Verdict::Permit,
+                );
+                pinned.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+                pinned
+            })
+            .collect();
+        let lowered = lower_plan(&plan_of(flows), &names());
+        let rules = &lowered.ruleset.rules;
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        assert_eq!(rules[0].verdict, NftVerdict::Accept);
+        assert_eq!(rules[1].verdict, pin_drop());
+        assert!(matches!(rules[1].matches[0], NftMatch::DstSetV4(ref set) if set.len() == 10));
     }
 }

@@ -91,6 +91,7 @@ impl UpstreamProbe for UdpUpstreamProbe {
         let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
             return false;
         };
+        nrr_platform_api::own_traffic::mark_own_socket(&sock);
         // Connected, so the kernel drops datagrams from anyone but the server
         // being probed. Unconnected, any host on the segment could answer for
         // it — and this probe is what decides which upstream we then trust with

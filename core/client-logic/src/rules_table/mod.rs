@@ -8,6 +8,7 @@
 //! the other link reaches it.
 
 mod file_text;
+mod main_route;
 mod search;
 mod wire;
 
@@ -18,6 +19,7 @@ use nrr_shared::rules_json::RuleAction;
 use crate::Route;
 
 pub use file_text::{build_rules_file_text, RulesFileOptions, PRESET_FORMAT_VERSION};
+pub use main_route::{main_route_check_hosts, main_route_rank};
 pub use search::{normalize_host_input, row_matches_search, search_box_text};
 pub use wire::{
     drift_row_from_parsed_rule, drift_row_from_service_wire, file_row_from_service_wire,

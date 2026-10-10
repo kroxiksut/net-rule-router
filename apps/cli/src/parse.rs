@@ -95,6 +95,14 @@ pub enum ParseError {
         flag: &'static str,
         value: String,
     },
+    /// A number outside the range the flag accepts.
+    OutOfRange {
+        verb: &'static str,
+        flag: &'static str,
+        value: String,
+        min: usize,
+        max: usize,
+    },
     /// A positional argument the verb has no use for.
     UnexpectedArgument {
         verb: &'static str,
@@ -135,6 +143,18 @@ impl std::fmt::Display for ParseError {
             }
             Self::InvalidValue { verb, flag, value } => {
                 write!(f, "`{verb} --{flag}`: `{value}` is not a valid value")
+            }
+            Self::OutOfRange {
+                verb,
+                flag,
+                value,
+                min,
+                max,
+            } => {
+                write!(
+                    f,
+                    "`{verb} --{flag}`: `{value}` is out of range, use {min} to {max}"
+                )
             }
             Self::UnexpectedArgument { verb, argument } => {
                 write!(f, "`{verb}` does not take the argument `{argument}`")
@@ -304,16 +324,23 @@ fn build(
             let tail = match flag(flags, "tail") {
                 Some(f) => {
                     let raw = f.value.as_deref().unwrap_or_default();
+                    let n = raw.parse::<usize>().map_err(|_| ParseError::InvalidValue {
+                        verb: spec.name,
+                        flag: "tail",
+                        value: raw.to_string(),
+                    })?;
                     // Zero is a usage error, not "print nothing": asking for no
                     // lines is never what someone means.
-                    raw.parse::<usize>()
-                        .ok()
-                        .filter(|n| (1..=crate::logs::MAX_TAIL).contains(n))
-                        .ok_or_else(|| ParseError::InvalidValue {
+                    if !(1..=crate::logs::MAX_TAIL).contains(&n) {
+                        return Err(ParseError::OutOfRange {
                             verb: spec.name,
                             flag: "tail",
                             value: raw.to_string(),
-                        })?
+                            min: 1,
+                            max: crate::logs::MAX_TAIL,
+                        });
+                    }
+                    n
                 }
                 None => crate::logs::DEFAULT_TAIL,
             };
@@ -581,6 +608,22 @@ mod tests {
                 start_mode: ServiceStartMode::WithWindows
             })
         );
+    }
+
+    #[test]
+    fn a_tail_past_the_limit_names_the_limit() {
+        let err = p(&["diag", "logs", "--tail=5000"]).expect_err("past the limit");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "`logs --tail`: `5000` is out of range, use 1 to {}",
+                crate::logs::MAX_TAIL
+            )
+        );
+        assert!(matches!(
+            p(&["diag", "logs", "--tail=many"]),
+            Err(ParseError::InvalidValue { .. })
+        ));
     }
 
     #[test]

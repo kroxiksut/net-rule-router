@@ -94,7 +94,19 @@ pub struct ProductionPrincipalPlanSource {
     /// Tunnel servers no live route names. `None` plans around the live host
     /// routes alone.
     tunnel_servers: Option<TunnelServerSources>,
+    /// Servers a tunnel client was caught dialling through the guard; this
+    /// session only, never persisted.
+    learned_vpn_endpoints: Option<Arc<crate::vpn_endpoint_learning::LearnedVpnEndpoints>>,
+    /// The main link's DNS servers, for the service-account guard. `None`
+    /// plans no service-account rule.
+    service_accounts: Option<crate::per_sid_orchestrator::PrimaryDnsServersFn>,
+    service_account_dns_log: crate::enforcement_planner::ServiceAccountDnsLog,
+    /// Tables only we write; every route in them is ours.
+    own_tables: Option<OwnTablesFn>,
 }
+
+/// Whether a route table is one only this product writes.
+pub type OwnTablesFn = Arc<dyn Fn(&nrr_platform_api::RouteTableRef) -> bool + Send + Sync>;
 
 /// The tunnel servers known beyond the bound links' host routes: the kernel
 /// tunnels' peers and the servers remembered from earlier passes and runs.
@@ -147,7 +159,32 @@ impl ProductionPrincipalPlanSource {
             conflicts: None,
             network_hold_log: NetworkHoldLog::default(),
             tunnel_servers: None,
+            learned_vpn_endpoints: None,
+            service_accounts: None,
+            service_account_dns_log: crate::enforcement_planner::ServiceAccountDnsLog::default(),
+            own_tables: None,
         }
+    }
+
+    /// Tables only we write — per-user ones. Without this, our own routes
+    /// there read as the tunnel's: a host route via the main gateway as a
+    /// tunnel server, an overlay half as the tunnel's catch-all.
+    #[must_use]
+    pub fn with_own_route_tables(mut self, own: OwnTablesFn) -> Self {
+        self.own_tables = Some(own);
+        self
+    }
+
+    /// Plan the guard's service-account twins into every plan; the lowering
+    /// keeps only the route-table owner's. `primary_dns` names the main link's
+    /// resolvers, which stay open for system traffic.
+    #[must_use]
+    pub fn with_service_accounts(
+        mut self,
+        primary_dns: crate::per_sid_orchestrator::PrimaryDnsServersFn,
+    ) -> Self {
+        self.service_accounts = Some(primary_dns);
+        self
     }
 
     /// Remember the tunnel servers each pass sees and plan around them while
@@ -165,6 +202,17 @@ impl ProductionPrincipalPlanSource {
             endpoints,
             pass_peers: Mutex::new(None),
         });
+        self
+    }
+
+    /// Plan around the tunnel servers the drop observer learned, so a client
+    /// the guard caught reconnects on the next pass.
+    #[must_use]
+    pub fn with_learned_vpn_endpoints(
+        mut self,
+        learned: Arc<crate::vpn_endpoint_learning::LearnedVpnEndpoints>,
+    ) -> Self {
+        self.learned_vpn_endpoints = Some(learned);
         self
     }
 
@@ -227,12 +275,12 @@ impl ProductionPrincipalPlanSource {
                 );
             })
             .ok()?;
-        // This path keeps no record of what it installed; our signature is it.
-        let reading = Arc::new(MachineReading::new(
-            Ok(routes),
-            Ok(adapters),
-            crate::route_codegen::is_owned_route,
-        ));
+        // This path keeps no record of what it installed; our signature and
+        // our tables are it.
+        let own_tables = self.own_tables.as_deref();
+        let reading = Arc::new(MachineReading::new(Ok(routes), Ok(adapters), |r| {
+            crate::route_codegen::is_owned_route(r) || own_tables.is_some_and(|own| own(&r.table))
+        }));
         *cached = Some(Arc::clone(&reading));
         Some(reading)
     }
@@ -374,6 +422,8 @@ impl ProductionPrincipalPlanSource {
             (fail_closed, blocks)
         };
         flows.extend(guard);
+        let service = self.service_account_flows(stored, &policy, availability, &flows, &ownership);
+        flows.extend(service);
 
         // Browser DoH hides the names wildcard rules learn from, so blocking it
         // sends the browser back to plaintext DNS. Same gate as the codegen.
@@ -735,10 +785,17 @@ impl ProductionPrincipalPlanSource {
     }
 
     /// The servers known beyond the live host routes: the kernel tunnels'
-    /// peers and the remembered ones. Empty without a memory.
+    /// peers, the remembered ones and the learned ones.
     fn known_tunnel_servers(&self) -> Vec<std::net::IpAddr> {
+        let learned = self
+            .learned_vpn_endpoints
+            .as_ref()
+            .map(|learned| learned.current(std::time::SystemTime::now()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(std::net::IpAddr::V4);
         let Some(sources) = self.tunnel_servers.as_ref() else {
-            return Vec::new();
+            return learned.collect();
         };
         sources
             .pass_peers()
@@ -751,6 +808,7 @@ impl ProductionPrincipalPlanSource {
                     .into_iter()
                     .map(std::net::IpAddr::V4),
             )
+            .chain(learned)
             .collect()
     }
 
@@ -876,6 +934,90 @@ impl ProductionPrincipalPlanSource {
         let mut flows = plan_fail_closed_destinations(stored, &protected, protocols);
         flows.extend(plan_fail_closed_networks(stored, &holds, protocols));
         flows
+    }
+}
+
+impl ProductionPrincipalPlanSource {
+    /// The service accounts' share of this principal's guard: the pins while
+    /// the tunnel is up, the address blocks once it is gone and the guard fails
+    /// closed — never the blanket either posture may give the user.
+    fn service_account_flows(
+        &self,
+        stored: &str,
+        policy: &PerSidPolicySnapshot,
+        availability: ChannelAvailability,
+        rule_flows: &[FlowRule],
+        ownership: &crate::address_ownership::AddressOwnership,
+    ) -> Vec<FlowRule> {
+        use crate::enforcement_planner::{
+            plan_service_account_flows, service_account_guard, ServiceAccountInput,
+            ServiceAccountPosture,
+        };
+        let Some(primary_dns) = self.service_accounts.as_ref() else {
+            return Vec::new();
+        };
+        let posture = if !policy.kill_switch_enabled {
+            None
+        } else if availability.secondary {
+            Some(ServiceAccountPosture::Pin)
+        } else if policy.block_secondary_when_unavailable && policy.kill_switch_fail_closed {
+            Some(ServiceAccountPosture::Block)
+        } else {
+            None
+        };
+        let Some(posture) = posture else {
+            return Vec::new();
+        };
+        let protected: Vec<std::net::IpAddr> = secondary_destinations(rule_flows)
+            .into_iter()
+            .filter(|ip| ownership.may_block(*ip))
+            .collect();
+        let exemptions = self.exemptions_for(policy);
+        let holds = NetworkHolds::for_pass(ownership, &protected, || never_blocked(&exemptions));
+        let servers: Vec<std::net::IpAddr> = exemptions
+            .server_ips
+            .iter()
+            .map(|ip| std::net::IpAddr::V4(*ip))
+            .chain(
+                exemptions
+                    .server_ips_v6
+                    .iter()
+                    .map(|ip| std::net::IpAddr::V6(*ip)),
+            )
+            .collect();
+        let local: Vec<nrr_shared::ip_block::IpBlock> = exemptions
+            .local_subnets
+            .iter()
+            .map(|(net, len)| (std::net::IpAddr::V4(*net), *len))
+            .chain(
+                exemptions
+                    .local_subnets_v6
+                    .iter()
+                    .map(|(net, len)| (std::net::IpAddr::V6(*net), *len)),
+            )
+            .filter_map(|(net, len)| nrr_shared::ip_block::IpBlock::new(net, len))
+            .collect();
+        let dns = primary_dns();
+        let Some(guard) = service_account_guard(&ServiceAccountInput {
+            is_route_table_owner: true,
+            posture: Some(posture),
+            destinations: &protected,
+            holds: &holds,
+            tunnel_servers: &servers,
+            local_subnets: &local,
+            primary_dns: &dns,
+        }) else {
+            return Vec::new();
+        };
+        self.service_account_dns_log.note(&guard.dns_spared);
+        // No per-program match on this platform: the service's own traffic
+        // leaves by its mark, and the tunnel's servers are subtracted above.
+        plan_service_account_flows(
+            stored,
+            &guard,
+            KillSwitchProtocols::from_bits(policy.kill_switch_protocols),
+            &[],
+        )
     }
 }
 
@@ -1888,6 +2030,58 @@ mod tests {
         assert!(blanket_blocks(&plan) > 0);
         assert!(exempts(&plan, DstMatch::HostV4(ours)));
         assert!(coverage.kill_switch_complete);
+    }
+
+    /// A user's own table holds a primary exception: a host route via the
+    /// main gateway, a server's shape. Every route in that table is ours, so
+    /// it is never taken for the tunnel server.
+    #[test]
+    fn a_host_route_in_a_per_user_table_is_never_a_tunnel_server() {
+        use nrr_platform_api::route_table::RouteTablePort;
+        let ours = Ipv4Addr::new(198, 51, 100, 78);
+        let users_table = nrr_platform_api::RouteTableRef::Tagged(0x8000_03E8);
+        let plan_with = |own: Option<OwnTablesFn>| {
+            let (api, links) = machine(false);
+            let mut table = api.get_ip_forward_table().expect("mock table");
+            table.push(nrr_platform_api::types::RouteEntry {
+                destination: IpAddr::V4(ours),
+                prefix_length: 32,
+                next_hop: IpAddr::V4(GATEWAY),
+                interface_index: 2,
+                metric: 0,
+                is_ours: false,
+                table: users_table.clone(),
+            });
+            api.set_route_table(table);
+            let source = source(
+                Arc::new(OneSecondaryRule(
+                    RouteBehaviorMode::StrictSecondaryFailClosed,
+                )),
+                Arc::new(Policy::armed()),
+            )
+            .with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            );
+            let source = match own {
+                Some(own) => source.with_own_route_tables(own),
+                None => source,
+            };
+            source
+                .plan_with_coverage(&user(), availability(true))
+                .expect("the rule must plan")
+        };
+
+        let own: OwnTablesFn = {
+            let users_table = users_table.clone();
+            Arc::new(move |t: &nrr_platform_api::RouteTableRef| *t == users_table)
+        };
+        let (plan, _) = plan_with(Some(own));
+        assert!(!exempts(&plan, DstMatch::HostV4(ours)));
+
+        // Positive control: the same row in a table not ours is a server.
+        let (plan, _) = plan_with(None);
+        assert!(exempts(&plan, DstMatch::HostV4(ours)));
     }
 
     /// Without the bound tunnel's link the attached subnets cannot be read,

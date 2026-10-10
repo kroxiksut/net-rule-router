@@ -154,8 +154,8 @@ pub mod vpn_discovery;
 pub mod app_group_discovery;
 pub mod wfp;
 // Opt-in browser-history read (Chrome/Edge/Firefox History SQLite → visited
-// hostnames). Pure rusqlite + std; compiles cross-platform (the profile
-// discovery finds nothing off-Windows and returns NoBrowsersFound).
+// hostnames). The SQLite read is shared (`nrr-sqlite-support`); compiles
+// cross-platform (discovery finds nothing off-Windows: NoBrowsersFound).
 pub mod win32_browser_history;
 pub mod win32_ffi;
 pub mod windows_api;

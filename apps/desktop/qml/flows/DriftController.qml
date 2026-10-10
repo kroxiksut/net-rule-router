@@ -642,6 +642,7 @@ QtObject {
             // rules yet" instead of the generic "do not all agree", which
             // sent the user hunting for a nonexistent difference.
             root._serviceRulesEmpty = rows.length === 0
+            root.serviceUnrecognizedRules = Number(p.unrecognized || 0)
             var pendingP = true, pendingS = true
             var maybeDone = function() {
                 if (!pendingP && !pendingS) finish()

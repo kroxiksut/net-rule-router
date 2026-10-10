@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use nrr_shared::ipc_payloads::{EnforcementStatusDto, SnapshotInitialResponse, StatusUpdateEvent};
+use nrr_shared::ipc_payloads::{
+    EnforcementStatusDto, RoutesHeldDto, SnapshotInitialResponse, StatusUpdateEvent,
+};
 
 use crate::backend::{BackendEvent, Outbox, PushEvent};
 use crate::i18n::{Key, Texts};
@@ -70,6 +72,8 @@ pub struct AppState {
     pub fetch_error: Option<String>,
     /// Keyed by role slug; an empty key is a report about no single role.
     pub enforcement_down: BTreeMap<String, EnforcementDown>,
+    /// This user's destinations another signed-in user's routing holds.
+    pub routes_held: Option<RoutesHeldDto>,
     /// The newest notices, at most [`FEED_CAPACITY`].
     pub notices: Vec<Notice>,
     /// Notices ever received, the dropped ones included.
@@ -110,6 +114,7 @@ impl AppState {
             snapshot: None,
             fetch_error: None,
             enforcement_down: BTreeMap::new(),
+            routes_held: None,
             notices: Vec::new(),
             notice_count: 0,
             last_notice_at: None,
@@ -196,11 +201,18 @@ impl AppState {
             }
             BackendEvent::Snapshot(snapshot) => {
                 let reports = snapshot.enforcement_status.clone();
+                let held = snapshot.routes_held_by_another_user.clone();
                 self.snapshot = Some(*snapshot);
                 self.fetch_error = None;
                 crate::screens::wizard::snapshot_arrived(self);
                 crate::restore::on_snapshot(self);
-                self.apply_standing_enforcement(reports, texts, now)
+                let mut effects = self.apply_standing_enforcement(reports, texts, now);
+                for effect in self.routes_held_changed(held, texts, now) {
+                    if !effects.contains(&effect) {
+                        effects.push(effect);
+                    }
+                }
+                effects
             }
             BackendEvent::FetchFailed(error) => {
                 self.fetch_error = Some(error);
@@ -218,7 +230,16 @@ impl AppState {
                 role,
                 candidates,
                 ..
-            } => self.enforcement_changed(status, role, candidates, texts, now),
+            } => {
+                // The leak-guard banner is read from the snapshot, and a link
+                // coming back moves no adapter: re-read it, as the GUI does.
+                let restored = status.is_empty() || status == "ok";
+                let mut effects = self.enforcement_changed(status, role, candidates, texts, now);
+                if restored && !effects.contains(&Effect::Refresh) {
+                    effects.push(Effect::Refresh);
+                }
+                effects
+            }
             StatusUpdateEvent::RoutingPauseStateChanged { paused, .. } => {
                 if let Some(snapshot) = self.snapshot.as_mut() {
                     snapshot.routing_paused = paused;
@@ -228,6 +249,10 @@ impl AppState {
             StatusUpdateEvent::VerifyVerdictsChanged { .. } => {
                 crate::screens::rules::verdicts::load(self);
                 Vec::new()
+            }
+            StatusUpdateEvent::RoutesHeldByAnotherUser { count, sample, .. } => {
+                let held = (count > 0).then_some(RoutesHeldDto { count, sample });
+                self.routes_held_changed(held, texts, now)
             }
             StatusUpdateEvent::HostUnreachableOnBothRoutes { host, .. } => self.notify(
                 NoticeLevel::Info,
@@ -330,6 +355,35 @@ impl AppState {
         effects
     }
 
+    /// Another user's routing holds some of this user's destinations, or
+    /// stopped holding them. The snapshot repeats the standing report on every
+    /// refresh, so one equal to the state held is not news.
+    fn routes_held_changed(
+        &mut self,
+        held: Option<RoutesHeldDto>,
+        texts: &Texts,
+        now: Instant,
+    ) -> Vec<Effect> {
+        if self.routes_held == held {
+            return Vec::new();
+        }
+        let was_held = self.routes_held.is_some();
+        self.routes_held = held.clone();
+        match held {
+            Some(held) => {
+                let (title, body) = routes_held_text(&held, texts);
+                self.notify(NoticeLevel::Warning, title, body, now)
+            }
+            None if was_held => self.notify(
+                NoticeLevel::Info,
+                texts.get(keys::ROUTES_HELD_TITLE),
+                texts.get(keys::ROUTES_HELD_CLEARED),
+                now,
+            ),
+            None => Vec::new(),
+        }
+    }
+
     /// A standing state per role: a later report replaces it, `ok` ends it.
     fn enforcement_changed(
         &mut self,
@@ -384,6 +438,19 @@ impl AppState {
             Vec::new()
         }
     }
+}
+
+/// The GUI's wording for destinations another signed-in user's routing holds.
+pub fn routes_held_text(held: &RoutesHeldDto, texts: &Texts) -> (String, String) {
+    let count = held.count.to_string();
+    let list = held.sample.join(", ");
+    (
+        texts.get(keys::ROUTES_HELD_TITLE),
+        texts.fill(
+            keys::ROUTES_HELD_BODY,
+            &[("count", count.as_str()), ("list", list.as_str())],
+        ),
+    )
 }
 
 /// The GUI's wording for an enforcement report: what happened, and what to do.
@@ -497,7 +564,11 @@ mod tests {
         assert_eq!(app.notices.len(), 1);
         assert_eq!(app.notices[0].level, NoticeLevel::Warning);
 
-        app.apply(enforcement("ok", "secondary"), &t, Instant::now());
+        assert!(
+            app.apply(enforcement("ok", "secondary"), &t, Instant::now())
+                .contains(&Effect::Refresh),
+            "a link back re-reads the snapshot (the leak-guard banner lives there)"
+        );
         assert_eq!(app.routing_state(), RoutingState::Active);
         assert_eq!(app.notices.len(), 2, "the return is news too");
         assert!(
@@ -513,6 +584,97 @@ mod tests {
             ..Fixture::healthy()
         };
         assert_eq!(connected(&paused).routing_state(), RoutingState::Paused);
+    }
+
+    fn held(count: u64, sample: &[&str]) -> BackendEvent {
+        BackendEvent::Push(PushEvent::Status(Box::new(
+            StatusUpdateEvent::RoutesHeldByAnotherUser {
+                sid: "S".into(),
+                count,
+                sample: sample.iter().map(|s| s.to_string()).collect(),
+            },
+        )))
+    }
+
+    #[test]
+    fn destinations_held_by_another_user_are_told_once_and_their_end_too() {
+        let t = texts();
+        let mut app = connected(&Fixture::healthy());
+        app.apply(
+            held(2, &["198.51.100.1", "203.0.113.0/24"]),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+        assert_eq!(
+            app.notices[0].title,
+            "Some addresses follow another user's route"
+        );
+        assert!(
+            app.notices[0].body.contains("Addresses affected: 2")
+                && app.notices[0]
+                    .body
+                    .ends_with("Among them: 198.51.100.1, 203.0.113.0/24."),
+            "{:?}",
+            app.notices[0]
+        );
+        assert_eq!(
+            app.routing_state(),
+            RoutingState::Active,
+            "the rules are in force; another user's route carries some of them"
+        );
+
+        // The snapshot repeats the standing report on every refresh.
+        let mut snapshot = Fixture::healthy().snapshot();
+        snapshot.routes_held_by_another_user = Some(RoutesHeldDto {
+            count: 2,
+            sample: vec!["198.51.100.1".into(), "203.0.113.0/24".into()],
+        });
+        app.apply(
+            BackendEvent::Snapshot(Box::new(snapshot)),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1, "the same state is not news");
+
+        app.apply(held(0, &[]), &t, Instant::now());
+        assert_eq!(app.notices.len(), 2);
+        assert_eq!(app.notices[1].level, NoticeLevel::Info);
+        assert_eq!(
+            app.notices[1].body,
+            "Addresses from your rules follow your own route again."
+        );
+        assert!(app.routes_held.is_none());
+    }
+
+    /// A terminal opened after the conflict began learns it from the snapshot.
+    #[test]
+    fn a_late_terminal_learns_held_destinations_from_the_snapshot() {
+        let t = texts();
+        let mut app = AppState::new(ScreenId::Status, false);
+        app.apply(BackendEvent::Link(Link::Connected), &t, Instant::now());
+        let mut snapshot = Fixture::healthy().snapshot();
+        snapshot.routes_held_by_another_user = Some(RoutesHeldDto {
+            count: 1,
+            sample: vec!["198.51.100.1".into()],
+        });
+        app.apply(
+            BackendEvent::Snapshot(Box::new(snapshot)),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+
+        // A later snapshot without it says the conflict is over.
+        app.apply(
+            BackendEvent::Snapshot(Box::new(Fixture::healthy().snapshot())),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 2);
+        assert_eq!(app.notices[1].level, NoticeLevel::Info);
     }
 
     #[test]

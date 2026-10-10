@@ -27,6 +27,15 @@ pub struct RulesListResponse {
     pub supported_rule_types: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_revision_id: Option<String>,
+    /// Rules of the requested routes this build cannot read: kept in the rule
+    /// set for a newer build, left out of `rows`, never applied.
+    #[serde(default)]
+    pub unrecognized: u32,
+    /// Addresses the caller's running main-route check has yet to answer;
+    /// zero when no check is running. A client polls the list while it is
+    /// above zero instead of guessing how long the check takes.
+    #[serde(default)]
+    pub main_route_pending: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +58,9 @@ pub struct RuleRowEntry {
     /// `rule_value_validation::validate_rule_value`.
     pub validation_status: String,
     /// What the last main-link check found for this rule's address:
-    /// `"answered"`, `"silent"`, or absent when it was never checked.
+    /// `"answered"`, `"silent"`, `"no-address"` (nothing is known about its
+    /// addresses yet, so there was nothing to try), `"unclear"` (the attempt
+    /// could not be made), or absent when it was never checked.
     ///
     /// A FACT about reachability, never advice: a site can answer on the main
     /// link and still refuse to serve the user there, which is the very reason

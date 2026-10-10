@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! SQLite plumbing both local databases share: connection setup and the
-//! migration runner.
+//! migration runner; plus the read of a browser's history copy, which both
+//! platform readers share ([`browser_history`]).
 //!
 //! One copy on purpose. While the service store and the GUI sidecar each had
 //! their own, every fix to the runner — the history gap below the maximum, the
@@ -12,6 +13,8 @@ use std::fmt;
 use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
+
+pub mod browser_history;
 
 /// Milliseconds since the Unix epoch; zero for a clock set before it. The
 /// value is a timestamp column, never a deadline.

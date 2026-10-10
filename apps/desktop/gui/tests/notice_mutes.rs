@@ -51,7 +51,7 @@ fn pure_kinds() -> BTreeSet<String> {
 #[test]
 fn every_notice_kind_is_named_alike_in_the_service_and_the_windows() {
     let domain = domain_kinds();
-    assert_eq!(domain.len(), 7, "{domain:?}");
+    assert_eq!(domain.len(), 8, "{domain:?}");
     assert_eq!(pure_kinds(), domain);
 }
 

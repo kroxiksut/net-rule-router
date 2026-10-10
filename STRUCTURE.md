@@ -34,7 +34,7 @@ Core product domain logic and service runtime:
 - **`core/services/windows-service`** — Windows service entrypoint: SCM/console entry, named-pipe server host, production dependency wiring. Orchestration logic belongs in `service-runtime`
 - **`core/services/linux-service`** — Linux daemon entrypoint; produces `nrr-serviced` with an `nrr-service` alias
 - **`core/services/service-runtime`** — Service orchestration shared by both OS entrypoints: enforcement planning and codegen, route coordination, DNS listener/resolver and fake-IP, kill-switch, auto-rules, IPC handlers, per-SID orchestration, session registry
-- **`core/sqlite-support`** — The one SQLite migration runner and connection setup, shared by `storage` and `storage-sidecar`; depends on no `nrr-*` crate
+- **`core/sqlite-support`** — The one SQLite migration runner and connection setup, shared by `storage` and `storage-sidecar`, plus the reading of browser-history copies both OS platform crates share; depends on no `nrr-*` crate
 - **`core/storage`** — SQLite persistence (domain cache, service state, traffic stats)
 - **`core/storage-sidecar`** — GUI-owned SQLite sidecar (rule labels, passthrough, not-yet-applied edits); never holds routing policy
 - **`core/diagnostics`** — Audit logs, operational logs, retention, archive generation
@@ -181,7 +181,7 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `apps/tui` can depend on: `client-logic/`, `ipc-client/`, `contracts/`, `platform-api/`, plus the platform crate of the target OS
 - `services/*-service` can depend on: `service-runtime/`, `contracts/`, `platform/`
 - `service-runtime` can depend on: `platform/`, `domain/`, `contracts/`, `storage/`, `diagnostics/`
-- `platform-api/` and the per-OS platform crates can depend on: `domain/`, `contracts/`
+- `platform-api/` and the per-OS platform crates can depend on: `domain/`, `contracts/`; the per-OS crates also on `sqlite-support/`
 - `storage/` can depend on: `domain/`, `platform-api/`, `sqlite-support/`
 - `storage-sidecar/` can depend on: `sqlite-support/` only
 - `sqlite-support/` depends on no `nrr-*` crate

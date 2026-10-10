@@ -676,6 +676,8 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             history.discard_leftover_copies();
             let rules: Arc<dyn RulesProvider> =
                 Arc::new(ProductionRulesProvider::new(Arc::clone(conn)));
+            // The boot auto-seed reads one browser profile set: the
+            // longest-served user's.
             let active_sid: nrr_service_runtime::dns_observation_consumer::ActiveSidFn = {
                 let reg = Arc::clone(&sid_registry);
                 let coord = route_coordinator.clone();
@@ -885,7 +887,8 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         // Expected-route inputs for the conn-trace viewer: rules +
         // FQDN cache + routing-active SID. Each row then carries where policy
         // EXPECTS it to egress, so the GUI can flag a secondary-expected flow
-        // that actually left over the primary.
+        // that actually left over the primary. A trace row names no user, so
+        // the expectation is the longest-served user's.
         if let (Some(state_conn), Some(cache_arc)) = (settings_conn.as_ref(), cache_store.as_ref())
         {
             let rules: Arc<dyn nrr_service_runtime::per_sid_orchestrator::RulesProvider> =

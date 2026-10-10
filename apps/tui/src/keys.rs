@@ -266,6 +266,18 @@ pub const EXTERNAL_ADDRESS_BODY: Key = key(
     "External address of the additional route: {address}",
 );
 pub const EXTERNAL_ADDRESS_ADAPTER: Key = key("tray.external-address.adapter", "Adapter: {name}");
+pub const ROUTES_HELD_TITLE: Key = key(
+    "notifications.routes-held.title",
+    "Some addresses follow another user's route",
+);
+pub const ROUTES_HELD_BODY: Key = key(
+    "notifications.routes-held.body",
+    "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their route, or are blocked for you if leak protection is on. Among them: {list}.",
+);
+pub const ROUTES_HELD_CLEARED: Key = key(
+    "notifications.routes-held.cleared",
+    "Addresses from your rules follow your own route again.",
+);
 
 // ── Keys and help ────────────────────────────────────────────────────────────
 
@@ -394,6 +406,9 @@ pub const ALL: &[Key] = &[
     EXTERNAL_ADDRESS_TITLE,
     EXTERNAL_ADDRESS_BODY,
     EXTERNAL_ADDRESS_ADAPTER,
+    ROUTES_HELD_TITLE,
+    ROUTES_HELD_BODY,
+    ROUTES_HELD_CLEARED,
     HELP_TITLE,
     HELP_SCREENS,
     HELP_MOVE,

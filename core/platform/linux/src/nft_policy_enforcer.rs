@@ -24,14 +24,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nrr_platform_api::adapters::AdapterEventSource;
+use nrr_platform_api::adapters::{replacement_candidates, AdapterEventSource};
 use nrr_platform_api::enforcement::{
-    ApplyReport, ChannelAvailability, EgressBindingSource, EnforcementFailure, EnforcementPlan,
-    PolicyEnforcer, UserPrincipal,
+    ApplyReport, ChannelAvailability, ChannelReport, ChannelState, EgressBindingSource,
+    EnforcementFailure, EnforcementPlan, PolicyEnforcer, UserPrincipal,
 };
 use nrr_platform_api::fake_ip::stale_flows::FlowLinks;
 
-use crate::lower_linux::{lower_scoped, EgressNames, ScopedPlan};
+use crate::lower_linux::{lower_scoped_with, EgressNames, ScopedPlan, ServiceAccountScope};
 use crate::nft_apply::{NftApplyError, NftCliEnforcement};
 use crate::nft_ir::NftRuleset;
 
@@ -71,7 +71,14 @@ pub struct NftPolicyEnforcer {
     /// Set by an explicit apply: the next unchanged pass checks the kernel
     /// whatever the recheck clock says.
     verify_next: AtomicBool,
+    /// Who owns the route table and which uids are service accounts, read per
+    /// pass. `None` lowers no service-account rule.
+    service_accounts: Option<ServiceAccountScopeSource>,
 }
+
+/// The route-table owner and the service uids as they stand this pass, given
+/// the uids of the users present (their own plans cover them).
+pub type ServiceAccountScopeSource = Arc<dyn Fn(&[u32]) -> ServiceAccountScope + Send + Sync>;
 
 /// `false` = this interface has been declared dead. Anything else — alive,
 /// unprobeable, feature off — is `true`, because the only safe direction for an
@@ -91,7 +98,16 @@ impl NftPolicyEnforcer {
             liveness: None,
             applied: Mutex::new(None),
             verify_next: AtomicBool::new(false),
+            service_accounts: None,
         }
+    }
+
+    /// Lower the route-table owner's service-account rules onto the uids
+    /// `source` names. Without it they are left out.
+    #[must_use]
+    pub fn with_service_accounts(mut self, source: ServiceAccountScopeSource) -> Self {
+        self.service_accounts = Some(source);
+        self
     }
 
     /// Consult `oracle` about the additional link before calling it available.
@@ -148,6 +164,14 @@ fn report_apply_cost(lower: Duration, nft: Duration, rules: usize) {
     );
 }
 
+/// Whether a link answers to `name` in any state — the same match the binding
+/// resolution makes, without its "up" requirement.
+fn link_named(adapters: &[nrr_platform_api::adapters::AdapterInfo], name: &str) -> bool {
+    adapters
+        .iter()
+        .any(|a| a.friendly_name == name || a.adapter_name == name)
+}
+
 impl NftPolicyEnforcer {
     /// Resolve one principal's bindings against the links present now.
     fn resolve(
@@ -185,7 +209,18 @@ impl PolicyEnforcer for NftPolicyEnforcer {
             .collect();
 
         let started = Instant::now();
-        let mut lowered = lower_scoped(&scoped);
+        let service_accounts = self
+            .service_accounts
+            .as_ref()
+            .map(|source| {
+                let present: Vec<u32> = plans
+                    .iter()
+                    .filter_map(|plan| plan.principal.as_unix_uid())
+                    .collect();
+                source(&present)
+            })
+            .unwrap_or_default();
+        let mut lowered = lower_scoped_with(&scoped, &service_accounts);
         lowered.ruleset.table.clone_from(&self.table);
         let lowered_at = Instant::now();
         let notes_for_unsupported = || -> Vec<String> {
@@ -262,19 +297,28 @@ impl PolicyEnforcer for NftPolicyEnforcer {
     }
 
     fn channel_availability(&self, principal: &UserPrincipal) -> ChannelAvailability {
-        // A read failure reports both channels down. That is the safe reading:
-        // the caller's fail-closed branch blocks rather than routes, and
-        // claiming a link is up when we could not look is how traffic leaves
-        // over the wrong one.
+        self.channel_report(principal).availability()
+    }
+
+    fn channel_report(&self, principal: &UserPrincipal) -> ChannelReport {
+        // A read failure reports both channels unusable. That is the safe
+        // reading: the caller's fail-closed branch blocks rather than routes,
+        // and claiming a link is up when we could not look is how traffic
+        // leaves over the wrong one.
         let Ok(adapters) = self.adapters.enumerate_all() else {
-            return ChannelAvailability::default();
+            return ChannelReport::default();
         };
-        let names = self.resolve(principal, &adapters);
+        let binding = self.bindings.bindings_for(principal);
+        let names = EgressNames::resolve_from_adapters(
+            &adapters,
+            binding.primary.as_deref(),
+            binding.secondary.as_deref(),
+        );
         // A resolved name is necessary but not sufficient for the additional
         // link: a tunnel whose peer stopped answering still presents an `Up`
         // interface with an address, and routing traffic into it is a silent
         // black hole rather than a leak the user can see.
-        let secondary_alive = names.secondary.as_ref().is_some_and(|name| {
+        let secondary_alive = |name: &String| {
             let Some(oracle) = self.liveness.as_ref() else {
                 return true;
             };
@@ -282,11 +326,26 @@ impl PolicyEnforcer for NftPolicyEnforcer {
                 .iter()
                 .find(|a| &a.friendly_name == name || &a.adapter_name == name)
                 .is_none_or(|adapter| oracle(adapter.index))
-        });
-        ChannelAvailability {
-            primary: names.primary.is_some(),
-            secondary: secondary_alive,
-        }
+        };
+        let secondary = match names.secondary.as_ref() {
+            Some(name) if secondary_alive(name) => ChannelState::Usable,
+            Some(_) => ChannelState::Down,
+            // A tunnel's link exists here only while it is connected, so a
+            // missing additional link is one switched off, not one to replace.
+            None => match binding.secondary {
+                Some(_) => ChannelState::Down,
+                None => ChannelState::Unbound,
+            },
+        };
+        let primary = match (names.primary, binding.primary.as_deref()) {
+            (Some(_), _) => ChannelState::Usable,
+            (None, None) => ChannelState::Unbound,
+            (None, Some(bound)) if link_named(&adapters, bound) => ChannelState::Down,
+            (None, Some(_)) => ChannelState::Absent {
+                replacements: replacement_candidates(&adapters, false),
+            },
+        };
+        ChannelReport { primary, secondary }
     }
 
     fn flow_links(&self, principal: &UserPrincipal) -> FlowLinks {
@@ -461,6 +520,78 @@ mod tests {
         enforcer.distrust_installed();
         enforcer.enforce(&[]).expect("restoring apply");
         assert_eq!(logged(&log, "run"), 3, "a chain that differs was trusted");
+    }
+
+    /// Down asks the user to wait, absent to choose again: a missing tunnel
+    /// is one switched off, a missing main link one to replace.
+    #[test]
+    fn the_report_tells_a_link_that_is_down_from_one_that_is_gone() {
+        use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+
+        struct Bound(Option<&'static str>, Option<&'static str>);
+        impl EgressBindingSource for Bound {
+            fn bindings_for(&self, _: &UserPrincipal) -> EgressBinding {
+                EgressBinding {
+                    primary: self.0.map(str::to_owned),
+                    secondary: self.1.map(str::to_owned),
+                }
+            }
+        }
+        let link = |name: &str, index: u32, up: bool| AdapterInfo {
+            index,
+            adapter_name: name.to_owned(),
+            description: String::new(),
+            friendly_name: name.to_owned(),
+            mac: None,
+            interface_type: InterfaceType::Ethernet,
+            oper_status: if up {
+                IfOperStatus::Up
+            } else {
+                IfOperStatus::Down
+            },
+            ipv4_addresses: vec![std::net::Ipv4Addr::new(192, 0, 2, index as u8)],
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+        };
+        let report = |bound: Bound, links: Vec<AdapterInfo>| {
+            let adapters = MockAdapterEventSource::new();
+            *adapters.adapters.lock().unwrap_or_else(|p| p.into_inner()) = links;
+            NftPolicyEnforcer::new(Arc::new(bound), Arc::new(adapters))
+                .channel_report(&UserPrincipal::from_linux_uid(1000))
+        };
+
+        let all_up = report(
+            Bound(Some("eth0"), Some("wg0")),
+            vec![link("eth0", 2, true), link("wg0", 7, true)],
+        );
+        assert_eq!(all_up.primary, ChannelState::Usable);
+        assert_eq!(all_up.secondary, ChannelState::Usable);
+        assert_eq!(
+            all_up.availability(),
+            ChannelAvailability {
+                primary: true,
+                secondary: true
+            }
+        );
+
+        let tunnel_off = report(
+            Bound(Some("eth0"), Some("wg0")),
+            vec![link("eth0", 2, true)],
+        );
+        assert_eq!(tunnel_off.secondary, ChannelState::Down);
+
+        let cable_out = report(Bound(Some("eth0"), None), vec![link("eth0", 2, false)]);
+        assert_eq!(cable_out.primary, ChannelState::Down);
+        assert_eq!(cable_out.secondary, ChannelState::Unbound);
+
+        let dongle_gone = report(Bound(Some("usb0"), None), vec![link("wlan0", 3, true)]);
+        assert_eq!(
+            dongle_gone.primary,
+            ChannelState::Absent {
+                replacements: vec!["wlan0".to_owned()]
+            }
+        );
+        assert!(!dongle_gone.availability().primary);
     }
 
     #[test]

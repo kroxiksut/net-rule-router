@@ -28,16 +28,27 @@ fn effective_routing_sid_prefers_registry_then_console_under_service_driven() {
 }
 
 #[test]
-fn effective_enforcement_sids_falls_back_to_console_only_when_no_tray() {
+fn effective_enforcement_sids_serve_trays_and_signed_in_users() {
     // the WFP orchestrator's SID set.
     let api = Arc::new(MockWindowsApi::new());
     api.set_console_user_sid(Some("S-CONSOLE"));
     let coord = coordinator_with_scope(Arc::clone(&api), Arc::new(FakeRules::new()), true);
 
-    // 1. Connected trays pass through unchanged (incl. multi-tray) —
-    //    the fallback never overrides them.
+    // 1. Connected trays first (incl. multi-tray), then the signed-in user
+    //    who has no tray: service-driven scope serves them too.
     let trays = vec!["S-TRAY-1".to_string(), "S-TRAY-2".to_string()];
-    assert_eq!(coord.effective_enforcement_sids(&trays), trays);
+    assert_eq!(
+        coord.effective_enforcement_sids(&trays),
+        vec![
+            "S-TRAY-1".to_string(),
+            "S-TRAY-2".to_string(),
+            "S-CONSOLE".to_string()
+        ],
+    );
+    // App-driven scope serves the trays alone.
+    let coord_app_trays =
+        coordinator_with_scope(Arc::clone(&api), Arc::new(FakeRules::new()), false);
+    assert_eq!(coord_app_trays.effective_enforcement_sids(&trays), trays);
 
     // 2. No tray + service-driven scope → the console user.
     assert_eq!(

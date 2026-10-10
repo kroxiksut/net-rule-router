@@ -174,9 +174,38 @@ pub fn mail_server_hostnames_from_prefs(prefs_js: &str) -> Vec<String> {
     hosts
 }
 
+/// Per-label source counts for the discovery log line, in first-seen order:
+/// `"chrome:2 firefox:1"`; `"none"` when nothing was found.
+pub fn summarize_source_labels<'a>(labels: impl IntoIterator<Item = &'a str>) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for label in labels {
+        match counts.iter_mut().find(|(seen, _)| *seen == label) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((label, 1)),
+        }
+    }
+    if counts.is_empty() {
+        return "none".to_string();
+    }
+    counts
+        .iter()
+        .map(|(label, n)| format!("{label}:{n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_labels_are_counted_in_first_seen_order() {
+        assert_eq!(
+            summarize_source_labels(["chrome", "firefox", "chrome"]),
+            "chrome:2 firefox:1"
+        );
+        assert_eq!(summarize_source_labels([]), "none");
+    }
 
     #[test]
     fn mail_prefs_parser_keeps_only_server_hostnames() {

@@ -22,7 +22,7 @@ pub(super) fn lower_flow(flow: &FlowRule) -> Vec<WfpFilterSpec> {
         Verdict::Permit => WfpAction::Permit,
         Verdict::Block => WfpAction::Block,
     };
-    let user_sid = flow.principal.0.as_ref().map(|p| p.as_stored().to_string());
+    let user_sid = user_sid_of(&flow.principal);
     let weight = base + u64::from(flow.precedence.ordinal);
 
     // The fail-closed default block (`StrictSecondaryFailClosed`): a

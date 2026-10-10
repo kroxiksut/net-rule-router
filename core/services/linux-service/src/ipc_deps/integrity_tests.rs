@@ -139,6 +139,10 @@ impl Machine {
             None,
             Arc::new(FileKeyStore::in_state_dir(&self.state_dir())),
             Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
+            Arc::new(nrr_service_runtime::block_notice_center::BlockNoticeCenter::new()),
+            Arc::new(
+                nrr_service_runtime::block_notice_journal_store::InMemoryBlockNoticeJournalStore::new(),
+            ),
         )
     }
 

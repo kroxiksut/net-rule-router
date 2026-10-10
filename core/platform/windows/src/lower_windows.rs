@@ -42,9 +42,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_platform_api::enforcement::{
     AppScope, Coverage, DstMatch, EgressConstraint, EgressRef, EnforcementPlan, FlowRule, L4Proto,
-    PrecedenceClass, Verdict,
+    PrecedenceClass, PrincipalScope, Verdict,
 };
-use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey};
+use nrr_platform_api::types::{
+    WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey, SERVICE_ACCOUNTS_PRINCIPAL,
+};
 use nrr_platform_api::wfp_slotting::{pack_both, pack_v4, FamilyChunk, V4SlotChunk};
 use nrr_shared::RouteRole;
 
@@ -125,6 +127,16 @@ const _: () = {
     assert!(CATCHALL_BLOCK_WEIGHT > BASE_SECONDARY);
     assert!(BASE_SECONDARY > DEFAULT_BLOCK_WEIGHT);
 };
+
+/// The `ALE_USER_ID` a scope lowers to: none for the machine, the SID for a
+/// user, and the service-accounts principal the apply layer expands.
+fn user_sid_of(scope: &PrincipalScope) -> Option<String> {
+    match scope {
+        PrincipalScope::Machine => None,
+        PrincipalScope::User(user) => Some(user.as_stored().to_string()),
+        PrincipalScope::ServiceAccounts => Some(SERVICE_ACCOUNTS_PRINCIPAL.to_string()),
+    }
+}
 
 mod app_and_dns;
 mod catch_all;

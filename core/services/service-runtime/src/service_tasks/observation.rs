@@ -106,6 +106,10 @@ pub struct AppObservationWiring {
     /// Where this tick is the only drain of the source, the connection-trace
     /// panel reads the same batch through it.
     pub trace: Option<Arc<crate::conn_observation_consumer::ConnTraceTee>>,
+    /// Where the source also reports our drops, the full consumer reads the
+    /// batch in place of `trace` and the bare fold into `store`: notices, the
+    /// outage list and the learners need the verdict the tee ignores.
+    pub consumer: Option<Arc<crate::conn_observation_consumer::ConnectionObservationConsumer>>,
 }
 
 /// Fold observed connections into the destinations application rules route.
@@ -126,7 +130,10 @@ pub fn build_app_observation_task(
     wiring: AppObservationWiring,
     on_new_destination: Option<crate::supervised_runtime::RouteRecomputeHook>,
 ) -> ServiceTask {
-    let ring = wiring.trace.as_ref().map(|tee| tee.ring());
+    let ring = match wiring.consumer.as_ref() {
+        Some(consumer) => consumer.trace_ring().cloned(),
+        None => wiring.trace.as_ref().map(|tee| tee.ring()),
+    };
     ServiceTask::periodic(
         TASK_ID_APP_OBSERVATION,
         TaskClass::Optional,
@@ -157,7 +164,24 @@ pub fn build_app_observation_task(
 /// be read from a log is a decision nothing checks.
 pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
     let mut learnt = 0usize;
-    let batch = wiring.source.drain();
+    let mut batch = wiring.source.drain();
+    if let Some(consumer) = wiring.consumer.as_ref() {
+        if batch.is_empty() {
+            return 0;
+        }
+        // A socket table has no clock of its own: the drain time stands in.
+        let now = SystemTime::now();
+        let now_ms = crate::conn_observation_consumer::now_unix_ms();
+        for observation in &mut batch {
+            observation.observed_unix_ms.get_or_insert(now_ms);
+        }
+        let summary = consumer.consume(&batch, now);
+        // Each of these changes what the next pass plans.
+        return (summary.app_ips_added
+            + summary.app_ips_retracted
+            + summary.vpn_endpoints_learned
+            + summary.vpn_client_apps_learned) as usize;
+    }
     if let Some(trace) = wiring.trace.as_ref() {
         trace.record(&batch, crate::conn_observation_consumer::now_unix_ms());
     }

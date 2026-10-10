@@ -20,6 +20,17 @@ impl ConnectionObservationConsumer {
         let now_ms = now
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let paired;
+        let batch: &[ConnectionObservation] = match self.drop_pairing.as_ref() {
+            Some(pairing) => {
+                paired = pairing
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .pair(batch, now_ms);
+                &paired
+            }
+            None => batch,
+        };
 
         // Live context, read once per batch. Prefer the full unicast table
         // (IPv4 + IPv6 → ifindex) so v6 egress is labelled; fall back to the
@@ -37,26 +48,30 @@ impl ConnectionObservationConsumer {
             .as_ref()
             .map(|read| read())
             .unwrap_or_default();
-        let (primary_ifindex, secondary_ifindex) = match active_sid_now.as_deref() {
-            Some(sid) => self.coordinator.resolve_egress_ifindexes(sid),
-            None => (None, None),
+        // Owner-scoped, each connection is resolved against its own user's
+        // links below instead.
+        let (active_primary, active_secondary) = match active_sid_now.as_deref() {
+            Some(sid) if !self.owner_scoped => (self.egress_of)(sid),
+            _ => (None, None),
         };
+        let mut owner_links: std::collections::HashMap<String, (Option<u32>, Option<u32>)> =
+            std::collections::HashMap::new();
         // The active user's additional route is usable again, so their outage
         // is over — also when no status change said so (a tunnel the liveness
         // probe had declared dead).
         if let (Some(ring), Some(sid), Some(_)) = (
             self.trace_ring.as_ref(),
             active_sid_now.as_deref(),
-            secondary_ifindex,
+            active_secondary,
         ) {
             ring.outage_blocks().outage_ended(sid, now_ms);
         }
         // The "no rule covers this host" catch-all's id is deterministic
         // (same hash the codegen used to mint it) — computed once per batch,
         // only when a notice or the trace will read it, so an idle observer
-        // never pays for it.
-        let default_block_id: Option<u64> = (self.block_notice_sink.is_some()
-            || self.trace_ring.is_some())
+        // never pays for it. A wired classifier replaces it.
+        let default_block_id: Option<u64> = (self.not_covered_drop_check.is_none()
+            && (self.block_notice_sink.is_some() || self.trace_ring.is_some()))
         .then(|| {
             active_sid_now.as_deref().map(|sid| {
                 crate::wfp_codegen::filter_id_for(sid, "default", "", "default", "block-all").raw
@@ -96,6 +111,11 @@ impl ConnectionObservationConsumer {
             // confirm that somebody went there waits forever — the whole point
             // is that they went and it did not work.
             self.confirm_placeholder_use(obs.remote.ip(), obs.observed_unix_ms.unwrap_or(now_ms));
+            let (primary_ifindex, secondary_ifindex) = if self.owner_scoped {
+                self.owner_links(&mut owner_links, obs.user_sid.as_deref(), now_ms)
+            } else {
+                (active_primary, active_secondary)
+            };
             let mut rec = classify_connection(obs, &unicast, primary_ifindex, secondary_ifindex);
             self.note_unanswered(obs, &rec, now_ms);
             // A resend or an orderly close is evidence about a peer, not a
@@ -146,6 +166,13 @@ impl ConnectionObservationConsumer {
                 .nrr_drop_spec_id
                 .zip(self.killswitch_app_scope_check.as_ref())
                 .is_some_and(|(spec_id, check)| check(spec_id));
+            // System traffic the owner's guard dropped. Only the tunnel
+            // learners below may read it: it is nobody's notice, outage or name.
+            let service_account_drop = rec.blocked_by_nrr == Some(true)
+                && rec
+                    .nrr_drop_spec_id
+                    .zip(self.service_account_drop_check.as_ref())
+                    .is_some_and(|(spec_id, check)| check(spec_id));
             let mut drop_reason = None;
             if rec.blocked_by_nrr == Some(true) {
                 let reason = self.reason_for_drop(&rec, killswitch_verified, default_block_id);
@@ -172,7 +199,10 @@ impl ConnectionObservationConsumer {
                     killswitch_verified && secondary_ifindex.is_some();
                 // Block-notice reporting: a foreign filter (`Some(false)`) is
                 // never ours to explain, so only OUR drops reach the sink.
-                if rec.blocked_by_nrr == Some(true) && !pinned_while_secondary_live {
+                if rec.blocked_by_nrr == Some(true)
+                    && !pinned_while_secondary_live
+                    && !service_account_drop
+                {
                     self.note_block_attempt(&rec, killswitch_verified, default_block_id);
                     outage_drop = drop_reason
                         == Some(nrr_domain::block_notice::BlockReason::RouteUnavailable)
@@ -185,7 +215,12 @@ impl ConnectionObservationConsumer {
                 // the secondary is resolved and USABLE should be impossible
                 // (the block-all is only for outage windows). See the summary
                 // field doc for the tolerated edge-of-window races.
-                if rec.blocked_by_nrr == Some(true) && pinned_while_secondary_live {
+                // A service bound to the main link is what the service-account
+                // pin exists to catch, not a pin that outran its route.
+                if rec.blocked_by_nrr == Some(true)
+                    && pinned_while_secondary_live
+                    && !service_account_drop
+                {
                     summary.killswitch_drops_live_secondary += 1;
                     // Split by blocking scope. An app-scoped block
                     // covers destinations the routing layer has never seen, so
@@ -282,6 +317,7 @@ impl ConnectionObservationConsumer {
             if let Some(learner) = self.reverse_dns_learner.as_ref() {
                 if rec.verdict == ConnectionVerdict::Block
                     && rec.blocked_by_nrr == Some(true)
+                    && !service_account_drop
                     // Never learn from a P2P process's dropped peers:
                     // their ISP-pool PTRs forward-confirm and match broad zone
                     // rules, flooding the zone permit cap with junk.
@@ -497,5 +533,27 @@ impl ConnectionObservationConsumer {
             );
         }
         summary
+    }
+
+    /// `owner`'s links, asked once per batch. An owner whose additional route
+    /// is usable has no outage, whatever the status said last.
+    fn owner_links(
+        &self,
+        seen: &mut std::collections::HashMap<String, (Option<u32>, Option<u32>)>,
+        owner: Option<&str>,
+        now_ms: u64,
+    ) -> (Option<u32>, Option<u32>) {
+        let Some(owner) = owner.filter(|o| !o.is_empty()) else {
+            return (None, None);
+        };
+        if let Some(links) = seen.get(owner) {
+            return *links;
+        }
+        let links = (self.egress_of)(owner);
+        if let (Some(ring), Some(_)) = (self.trace_ring.as_ref(), links.1) {
+            ring.outage_blocks().outage_ended(owner, now_ms);
+        }
+        seen.insert(owner.to_owned(), links);
+        links
     }
 }

@@ -5,12 +5,14 @@
 # at a listener that is gone. Linux counterpart of reset-network.ps1.
 #
 #   1. stop the unit, best-effort: a live daemon would put everything back;
-#   2. run the daemon's own `cleanup` verb (DNS redirect, nftables table, owned
-#      routes), from the staged install or the build tree;
+#   2. run the daemon's own `cleanup` verb (DNS redirect, nftables table,
+#      per-user routing rules, owned routes), from the staged install or the
+#      build tree;
 #   3. a binary older than that verb: its `restore-dns` (the unit's stop hook)
 #      for the DNS redirect, then the table by hand;
 #   4. with no binary, or when it fails, the same undo by hand, step for step.
-#      The by-hand path does not know the daemon's routes; a reboot drops them.
+#      By hand the per-user rules and tables go, but not the daemon's routes in
+#      the main table; a reboot drops them.
 #
 # Idempotent: with nothing left behind every step is a no-op and it exits 0.
 # Elevates itself through sudo.
@@ -98,6 +100,12 @@ resolv_conf="/etc/resolv.conf"
 resolv_system_copy="$NRR_STATE_DIR/resolv.conf.system"
 resolv_system_link="$NRR_STATE_DIR/resolv.conf.system-link"
 ours_marker="# NetRuleRouter answers DNS here; the system's own file returns when it stops."
+
+# Mirrors of platform/linux policy_routing: PRIORITY_BAND, and SYSTEM_TABLE,
+# from which every table up is ours.
+rule_priority_first=30100
+rule_priority_last=30119
+our_table_first=2147483647
 
 failures=0
 fail() {
@@ -258,6 +266,53 @@ undo_dns_by_hand() {
   undo_resolv_conf_file
 }
 
+# One `ip rule` field: the word after `$2` on the line `$1`.
+rule_field() {
+  awk -v key="$2" '{for (i = 1; i < NF; i++) if ($i == key) { print $(i + 1); exit }}' <<<"$1"
+}
+
+# The per-user routing rules (ours: a uid range in our band), then the tables
+# they pointed at. Without its rule a table is inert, so rules go first.
+undo_routing_by_hand() {
+  if ! command -v ip >/dev/null 2>&1; then
+    nrr_gray "    ip is not installed; no rules to remove"
+    return 0
+  fi
+  local family rules line prio uids lookup table
+  for family in -4 -6; do
+    # With IPv6 disabled `ip -6` fails outright, and nothing of ours is there.
+    rules="$(ip "$family" rule show 2>/dev/null)" || continue
+    while IFS= read -r line; do
+      prio="${line%%:*}"
+      case "$prio" in '' | *[!0-9]*) continue ;; esac
+      if [ "$prio" -lt "$rule_priority_first" ] || [ "$prio" -gt "$rule_priority_last" ]; then
+        continue
+      fi
+      uids="$(rule_field "$line" uidrange)"
+      lookup="$(rule_field "$line" lookup)"
+      [ -n "$uids" ] && [ -n "$lookup" ] || continue
+      if ip "$family" rule del priority "$prio" uidrange "$uids" lookup "$lookup"; then
+        echo "    removed rule $prio (ip $family, uids $uids)"
+      else
+        fail "ip $family rule del priority $prio uidrange $uids lookup $lookup"
+      fi
+    done <<<"$rules"
+    while IFS= read -r table; do
+      [ -n "$table" ] || continue
+      if ip "$family" route flush table "$table"; then
+        echo "    flushed table $table (ip $family)"
+      else
+        fail "ip $family route flush table $table"
+      fi
+    done < <(ip "$family" route show table all 2>/dev/null |
+      awk -v first="$our_table_first" '{
+        for (i = 1; i < NF; i++)
+          if ($i == "table" && $(i + 1) ~ /^[0-9]+$/ && $(i + 1) + 0 >= first + 0 && $(i + 1) + 0 < 4294967295)
+            print $(i + 1)
+      }' | sort -u)
+  done
+}
+
 nrr_cyan "==> stop $NRR_UNIT_NAME (best-effort)"
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   if systemctl stop "$NRR_UNIT_NAME" 2>/dev/null; then
@@ -322,6 +377,9 @@ if [ "$cleaned" -eq 0 ]; then
   else
     fail "nft delete table $NRR_NFT_FAMILY $NRR_NFT_TABLE"
   fi
+
+  nrr_cyan "==> per-user routing rules"
+  undo_routing_by_hand
 fi
 
 echo

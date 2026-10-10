@@ -239,6 +239,7 @@ fn attempt(
     deadline: Instant,
 ) -> io::Result<Option<Ipv4Addr>> {
     let socket = UdpSocket::bind(SocketAddrV4::new(source, 0))?;
+    crate::own_traffic::mark_own_socket(&socket);
     // Pinning the peer makes the kernel drop datagrams from anywhere else and
     // surfaces an ICMP port-unreachable as an error instead of a silent wait.
     socket.connect(SocketAddr::V4(server))?;

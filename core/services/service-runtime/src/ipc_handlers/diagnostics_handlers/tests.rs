@@ -1442,3 +1442,51 @@ fn the_outage_list_follows_the_trace_switch_and_says_when_nothing_watches() {
         "positive control: switched on, the same entry is served"
     );
 }
+
+/// A name that got no address during the outage travels beside the drops,
+/// scoped like them: the caller's own, never another user's.
+#[test]
+fn names_that_did_not_resolve_travel_beside_the_drops_and_stay_the_callers() {
+    use nrr_domain::user_principal::UserPrincipal;
+    let me = UserPrincipal::from_linux_uid(1000);
+    let other = UserPrincipal::from_linux_uid(1001);
+    let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+        4,
+    ));
+    ring.mark_observer_active();
+    ring.outage_blocks().mark_fed();
+    ring.outage_blocks().outage_began(me.as_stored(), 1_000);
+    ring.outage_blocks().outage_began(other.as_stored(), 1_000);
+    note_outage_drop(&ring, me.as_stored(), "mine.exe", "198.51.100.1:443", 2_000);
+    let outages = ring.outage_blocks();
+    outages.record_unresolved(me.as_stored(), "chat.example.com", 2_100);
+    outages.record_unresolved(me.as_stored(), "chat.example.com", 2_400);
+    outages.record_unresolved(other.as_stored(), "theirs.example.net", 2_200);
+    let handler = ConnTraceOutageBlocksListHandler::new(Arc::clone(&ring));
+
+    let wire = call_as(
+        &handler,
+        IpcOperationName::ConnTraceOutageBlocksList,
+        &ctx_for(Some(me.clone()), false),
+    );
+    let name = &wire["unresolved-names"][0]["name"];
+    assert_eq!(name, "chat.example.com");
+    let mine = outage_list(&handler, &ctx_for(Some(me), false));
+    assert_eq!(mine.entries.len(), 1, "the drop is untouched");
+    assert_eq!(
+        mine.unresolved_names,
+        vec![nrr_shared::ipc_payloads::OutageUnresolvedNameDto {
+            name: "chat.example.com".into(),
+            first_seen_ms: 2_100,
+            last_seen_ms: 2_400,
+            attempts: 2,
+        }]
+    );
+
+    let theirs = outage_list(&handler, &ctx_for(Some(other), true));
+    assert_eq!(theirs.unresolved_names.len(), 1);
+    assert_eq!(theirs.unresolved_names[0].name, "theirs.example.net");
+
+    let anonymous = outage_list(&handler, &ctx_for(None, true));
+    assert!(anonymous.unresolved_names.is_empty());
+}

@@ -12,8 +12,8 @@
 use super::*;
 
 /// How long a missing bound adapter must stay missing before it is announced
-/// as removed. A few reconciles: long enough for the OS to report a switch-off.
-pub(super) const GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+/// as removed; one value for every platform's status.
+pub(super) const GONE_GRACE: std::time::Duration = crate::channel_status::GONE_GRACE;
 
 impl SecondaryRouteCoordinator {
     /// Returns `true` the first time a given `stale → healed` binding mapping

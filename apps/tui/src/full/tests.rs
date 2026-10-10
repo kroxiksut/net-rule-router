@@ -279,6 +279,11 @@ fn keys_move_between_screens_focus_and_help() {
     assert_eq!(app.screen, ScreenId::Rules);
     press(&mut app, KeyCode::Char('0'));
     assert_eq!(app.screen, ScreenId::Settings);
+    // Settings opens into its sections, as the trace does into its sub-screen.
+    for _ in crate::screens::settings::Category::ALL {
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.screen, ScreenId::Settings);
+    }
     press(&mut app, KeyCode::Down);
     assert_eq!(app.screen, ScreenId::Status);
 
@@ -306,4 +311,42 @@ fn zero_opens_the_settings_sections() {
     let picture = render(&app, COLOUR, 80, 24, Instant::now());
     assert!(picture.contains("> 0 Settings"), "{picture}");
     assert!(picture.contains("Settings sections"), "{picture}");
+    assert!(picture.contains("      Notifications"), "{picture}");
+}
+
+#[test]
+fn the_settings_sections_open_from_the_menu() {
+    let texts = texts_en();
+    let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    let menu =
+        |app: &AppState| -> Vec<String> { menu_lines(app, &texts).iter().map(line_text).collect() };
+    assert!(
+        !menu(&app).iter().any(|l| l.contains("Notifications")),
+        "folded while Settings is closed"
+    );
+
+    press(&mut app, KeyCode::Char('0'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.screen, ScreenId::Settings);
+    assert_eq!(
+        app.settings.open,
+        Some(crate::screens::settings::Category::Routing)
+    );
+    let shown = menu(&app);
+    assert!(shown.contains(&"  0 Settings".to_owned()), "{shown:?}");
+    assert!(
+        shown.contains(&">     Routing behavior".to_owned()),
+        "{shown:?}"
+    );
+    let panels = content_panels(&app, &texts);
+    assert_eq!(
+        panels.last().map(|p| p.title.as_str()),
+        Some("Routing behavior")
+    );
+
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.settings.open, None, "back on the list of sections");
+    assert!(menu(&app).contains(&"> 0 Settings".to_owned()));
 }

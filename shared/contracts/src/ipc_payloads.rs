@@ -820,6 +820,19 @@ pub enum StatusUpdateEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since_unix_ms: Option<i64>,
     },
+    /// Some of this SID's routed destinations are held by another signed-in
+    /// user's routing: the machine has one route table, and the user served
+    /// longer keeps a destination both want through different links. Never
+    /// names that user. Published on change; `count = 0` ends it, and the
+    /// standing value rides `SnapshotInitialResponse::routes_held_by_another_user`.
+    RoutesHeldByAnotherUser {
+        sid: String,
+        count: u64,
+        /// A few of the destinations, as the user wrote them: an address, or a
+        /// network with its prefix.
+        #[serde(default)]
+        sample: Vec<String>,
+    },
 }
 
 impl StatusUpdateEvent {
@@ -847,6 +860,7 @@ impl StatusUpdateEvent {
             | Self::BlockNoticeMutesChanged { sid }
             | Self::VerifyVerdictsChanged { sid, .. }
             | Self::EnforcementStatusChanged { sid, .. }
+            | Self::RoutesHeldByAnotherUser { sid, .. }
             | Self::AutostartStateChanged { sid, .. } => Some(sid.as_str()),
             // The baseline carries no SID and reaches everyone.
             Self::RevisionStatusChanged { sid, .. } | Self::MutationProgress { sid, .. } => {
@@ -1030,6 +1044,20 @@ pub struct SnapshotInitialResponse {
     /// was reported yet. Wire key: `enforcement-status`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enforcement_status: Vec<EnforcementStatusDto>,
+    /// The caller's standing `RoutesHeldByAnotherUser` report, for a client
+    /// that connects after the push. Absent when nothing of theirs is held.
+    /// Wire key: `routes-held-by-another-user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes_held_by_another_user: Option<RoutesHeldDto>,
+}
+
+/// The payload of [`StatusUpdateEvent::RoutesHeldByAnotherUser`] without the SID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RoutesHeldDto {
+    pub count: u64,
+    #[serde(default)]
+    pub sample: Vec<String>,
 }
 
 /// One role's standing enforcement report: the payload of the last

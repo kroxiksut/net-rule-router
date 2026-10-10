@@ -78,11 +78,8 @@ impl ConnTraceTee {
             if log_ndjson {
                 log_observed_connection(&rec);
             }
-            // TODO: rows reach this tee with no verdict (procfs lists sockets,
-            // never nftables decisions), so the outage list is not fed here; a
-            // drop attributed to the leak-guard rule (an NFLOG group or a
-            // per-rule counter) plus a per-user "additional route down" signal
-            // would close it.
+            // No verdict reaches this tee, so the outage list is not fed here:
+            // it is the path for when the drop reports could not start.
             self.ring.push(rec);
         }
     }

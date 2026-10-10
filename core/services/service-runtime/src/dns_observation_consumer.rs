@@ -54,6 +54,9 @@ const WARNED_HOSTS_CAP: usize = 4096;
 /// Returns the routing-active SID (Free single-active-user), or `None`.
 pub type ActiveSidFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// Everyone whose rules are in force, lead principal first.
+pub type PresentSidsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Outcome of consuming a batch of observations.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ConsumeSummary {
@@ -93,6 +96,11 @@ pub struct DnsObservationConsumer {
     /// routes out the secondary link.
     fqdn_lookup: Arc<dyn FqdnCacheLookup>,
     active_sid: ActiveSidFn,
+    /// Every served principal when several can be signed in at once. The
+    /// first gets the full treatment (collateral, learning); the others get
+    /// their rule hosts cached, which is what their routes need. `None`
+    /// serves `active_sid` alone.
+    present_sids: Option<PresentSidsFn>,
     /// Dedup keys (`"{direct_host}|{ip}"`) for collateral warnings already
     /// emitted this process lifetime, so the periodic observe tick does not
     /// re-warn the same victim/IP pair every few seconds.

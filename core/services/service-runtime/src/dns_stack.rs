@@ -72,6 +72,8 @@ pub struct DnsStackInputs {
     pub signed_in: Option<Flag>,
     /// Routes a rule host's never-seen addresses before its answer goes out.
     pub route_coordinator: Option<Arc<crate::route_coordinator::SecondaryRouteCoordinator>>,
+    /// Where a rule host that got no address during an outage is listed.
+    pub outage_blocks: Option<Arc<crate::outage_blocks::OutageBlocks>>,
 }
 
 /// The factory the [`DnsResolverController`] calls on each start. The
@@ -83,6 +85,7 @@ pub fn build_dns_resolver_factory(
     inputs: DnsStackInputs,
     platform: DnsStackPlatform,
 ) -> DnsResolverFactory {
+    let _ = configured_dns_servers().set(Arc::clone(&platform.system_dns));
     let watch = watch_dns_changes(
         platform.network_changes.as_ref(),
         platform.dns_config_changes.as_ref(),
@@ -94,6 +97,29 @@ pub fn build_dns_resolver_factory(
         let _subscribed = &watch;
         build_dns_resolver_instance(&inputs, &platform, fed)
     })
+}
+
+/// The machine's configured DNS servers, as the DNS stack reads them. Filled
+/// once the stack is built; the enforcement pass reads it rather than
+/// enumerating the machine a second time.
+pub fn configured_dns_servers() -> &'static std::sync::OnceLock<Arc<dyn SystemDnsServersPort>> {
+    static SERVERS: std::sync::OnceLock<Arc<dyn SystemDnsServersPort>> = std::sync::OnceLock::new();
+    &SERVERS
+}
+
+/// The configured DNS servers if the list is at hand within a few
+/// milliseconds; empty otherwise — the enforcement pass never waits on the OS.
+pub fn configured_dns_servers_now() -> Vec<std::net::IpAddr> {
+    configured_dns_servers()
+        .get()
+        .map(|servers| {
+            servers
+                .upstream_candidates_v4_within(Duration::from_millis(20))
+                .into_iter()
+                .map(|candidate| std::net::IpAddr::V4(candidate.server))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One process-wide fact — "what the DNS guard reads may have changed" —
@@ -314,6 +340,16 @@ fn build_dns_resolver_instance(
     // the guard blocks an unresolved link — handing it over is the leak.
     if let Some(armed) = inputs.fail_closed_armed.clone() {
         listener = listener.with_leak_guard_posture(Arc::new(move || armed()));
+    }
+    // A site that failed before any connection still belongs in the outage
+    // list; filed under the principal this resolver answers for.
+    if let Some(outages) = inputs.outage_blocks.as_ref() {
+        listener = listener.with_unresolved_observer(Arc::new(
+            crate::outage_blocks::OutageUnresolvedNames::new(
+                Arc::clone(outages),
+                Arc::clone(active_sid),
+            ),
+        ));
     }
     // Fake-IP is wired regardless of its toggle: the live `running` gate, not a
     // resolver rebuild, turns it on and off.

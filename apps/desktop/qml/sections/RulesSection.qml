@@ -66,17 +66,23 @@ ColumnLayout {
     // add / remove / toggle / move). Every displayModel row carries `masterId`
     // (= the rule id, a stable R-NNNN) so the delegate maps back to the master
     // for selection and edits.
-    /// True while a main-route check is in flight. The pass is accepted, not
-    /// awaited: verdicts arrive with the next rules read.
+    /// True while a main-route check is in flight: from the request until the
+    /// service reports nothing left to answer.
     property bool mainRouteCheckBusy: false
+    /// Hosts the running check was accepted for; the progress line counts
+    /// down from it.
+    property int mainRouteCheckTotal: 0
+    /// The hosts the last check sent, for the summary at its end.
+    property var mainRouteCheckHosts: []
+    /// The "Main route" column shows once there is something to put in it:
+    /// a mark on any row, or a check started in this session.
+    property bool mainRouteCheckRan: false
+    property bool mainRouteColumnVisible: false
 
-    /// Ask the service whether the main route reaches the addresses this rule
-    /// set names.
-    ///
-    /// Only address rules can be checked — an application rule names a program,
-    /// not a destination. Hosts with nothing resolved yet are skipped by the
-    /// service rather than resolved on the spot, so a fresh rule may need one
-    /// more pass before it has an answer.
+    /// Ask the service whether the main route reaches the addresses of the
+    /// additional-route rules — the only rules the answer says something
+    /// about. Hosts with nothing resolved yet come back marked as such rather
+    /// than resolved on the spot.
     function _checkMainRoute() {
         if (section.mainRouteCheckBusy) return
         if (!root.bridgeAvailable
@@ -85,50 +91,112 @@ ColumnLayout {
                 "Adapter bindings can only be changed while the background service is running.")
             return
         }
-        var hosts = []
-        var seen = ({})
+        var rows = []
         for (var i = 0; i < root.rulesModel.count; i += 1) {
             var entry = root.rulesModel.get(i)
-            var type = String(entry.ruleType || "")
-            if (type !== "domain" && type !== "zone") continue
-            if (entry.enabled === false) continue
-            var host = String(entry.matchValue || "").replace(/^\*\./, "")
-            if (host === "" || seen[host]) continue
-            seen[host] = true
-            hosts.push(host)
+            rows.push({
+                ruleType: entry.ruleType,
+                matchValue: entry.matchValue,
+                aceMatchValue: entry.aceMatchValue,
+                targetRoute: entry.targetRoute,
+                enabled: entry.enabled
+            })
         }
+        var hosts = Rules.mainRouteCheckHosts(rows)
         if (hosts.length === 0) {
             root.statusLine = root.tr("rules.main-route.nothing-to-check",
-                "There are no address rules to check.")
+                "There are no additional-route address rules to check.")
             return
         }
         var corr = root.rpc.rpcAutoRuleCandidatesProbe({ "rule-hostnames": hosts })
         if (!corr || corr === "") return
         section.mainRouteCheckBusy = true
+        section.mainRouteCheckRan = true
+        section.mainRouteCheckHosts = hosts
         root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
-            section.mainRouteCheckBusy = false
             if (!ok) {
+                section.mainRouteCheckBusy = false
                 root.statusLine = root.ipcErrorLabel(code)
                 return
             }
             var accepted = Number((payload || {}).accepted || 0)
-            root.statusLine = accepted > 0
-                ? root.tr("rules.main-route.check-started",
-                        "Checking {count} addresses over the main connection...")
-                    .replace("{count}", String(accepted))
-                : root.tr("rules.main-route.check-nothing",
+            section.mainRouteCheckTotal = accepted
+            if (accepted === 0) {
+                section.mainRouteCheckBusy = false
+                root.statusLine = root.tr("rules.main-route.check-nothing",
                     "Nothing to check: these addresses were checked recently, or none of them has been resolved yet.")
-            if (accepted > 0) mainRouteVerdictsLater.restart()
+                // Hosts with no known address are marked at once.
+                root.refreshMainRouteMarks()
+                return
+            }
+            root.statusLine = root.tr("rules.main-route.check-started",
+                    "Checking {count} addresses over the main connection...")
+                .replace("{count}", String(accepted))
+            mainRoutePoll.polls = 0
+            mainRoutePoll.restart()
         })
     }
 
-    /// The pass runs for seconds; re-read the rules once it has had time to
-    /// file its verdicts.
+    /// The summary once the service has answered every host: counted per
+    /// host, since one host can stand behind several rows.
+    function _reportMainRouteCheckDone() {
+        var wanted = ({})
+        for (var h = 0; h < section.mainRouteCheckHosts.length; h += 1) {
+            wanted[section.mainRouteCheckHosts[h]] = true
+        }
+        var seen = ({})
+        var answered = 0
+        var silent = 0
+        for (var i = 0; i < root.rulesModel.count; i += 1) {
+            var entry = root.rulesModel.get(i)
+            var host = String(entry.aceMatchValue || entry.matchValue || "")
+                .trim().replace(/^\*\./, "").toLowerCase()
+            if (!wanted[host] || seen[host]) continue
+            seen[host] = true
+            var mark = String(entry.mainRoute || "")
+            if (mark === "answered") answered += 1
+            else if (mark === "silent") silent += 1
+        }
+        var total = section.mainRouteCheckHosts.length
+        root.statusLine = root.tr("rules.main-route.check-done",
+                "Main route check finished: reaches {answered}, does not reach {silent}, not checked {other}.")
+            .replace("{answered}", String(answered))
+            .replace("{silent}", String(silent))
+            .replace("{other}", String(Math.max(0, total - answered - silent)))
+    }
+
+    /// Follows the running check: marks arrive with each rules read, and the
+    /// service says how many hosts are still outstanding. Not a reload — that
+    /// would ask to discard unsaved edits.
     Timer {
-        id: mainRouteVerdictsLater
-        interval: 6000
-        onTriggered: if (typeof root.reloadActiveRulesFromService === "function")
-            root.reloadActiveRulesFromService()
+        id: mainRoutePoll
+        interval: 2000
+        repeat: true
+        // A service that restarts mid-check forgets the check; give up after
+        // ten minutes rather than poll forever.
+        property int polls: 0
+        onTriggered: {
+            polls += 1
+            if (polls > 300 || typeof root.refreshMainRouteMarks !== "function") {
+                stop()
+                section.mainRouteCheckBusy = false
+                return
+            }
+            root.refreshMainRouteMarks(function(pending) {
+                if (!section.mainRouteCheckBusy) return
+                if (pending > 0) {
+                    var total = section.mainRouteCheckTotal
+                    root.statusLine = root.tr("rules.main-route.check-progress",
+                            "Checking addresses over the main connection: {done} of {total}...")
+                        .replace("{done}", String(Math.max(0, total - pending)))
+                        .replace("{total}", String(total))
+                    return
+                }
+                mainRoutePoll.stop()
+                section.mainRouteCheckBusy = false
+                section._reportMainRouteCheckDone()
+            })
+        }
     }
 
     function rebuildDisplay() {
@@ -136,11 +204,13 @@ ColumnLayout {
                 || !root.rulesModel) return
         var arr = []
         var invalid = 0
+        var marked = false
         for (var i = 0; i < root.rulesModel.count; i += 1) {
             var entry = root.rulesModel.get(i)
             // Before the filter, deliberately: the count answers "how much of
             // my set will not apply", which the current filter must not change.
             if (String(entry.validationStatus || "valid") === "error") invalid += 1
+            if (String(entry.mainRoute || "") !== "") marked = true
             if (!section.passesFilter(entry)) continue
             var snapshot = {}
             var keys = Object.keys(entry)
@@ -166,6 +236,7 @@ ColumnLayout {
             arr.push(snapshot)
         }
         section.invalidRuleCount = invalid
+        section.mainRouteColumnVisible = marked || section.mainRouteCheckRan
         arr.sort(compareRules)
         displayModel.clear()
         // Single append for the whole snapshot — see `_appendRowsChunked` in
@@ -315,6 +386,7 @@ ColumnLayout {
     property int colTypeWidth: 130
     property int colMatchWidth: 200
     property int colRouteWidth: 130
+    property int colMainRouteWidth: 170
     readonly property int columnMinWidth: 60
 
     // Natural pixel width of all table
@@ -329,7 +401,8 @@ ColumnLayout {
     readonly property int tableContentWidth: {
         var cells = 32 + colIdWidth + 6 + colTypeWidth + 6 + colMatchWidth + 6
             + 20 + colRouteWidth + 28
-        var gaps = root.uiTheme.spacingMd * 9
+            + (mainRouteColumnVisible ? colMainRouteWidth : 0)
+        var gaps = root.uiTheme.spacingMd * (mainRouteColumnVisible ? 10 : 9)
         var pad = root.uiTheme.spacingSm * 2
         return cells + commentMinWidth + gaps + pad
     }
@@ -532,6 +605,9 @@ ColumnLayout {
             if (cmp === 0) cmp = String(a.matchValue || "").localeCompare(String(b.matchValue || ""))
         } else if (sortBy === "by-route") {
             cmp = String(a.targetRoute || "").localeCompare(String(b.targetRoute || ""))
+            if (cmp === 0) cmp = String(a.matchValue || "").localeCompare(String(b.matchValue || ""))
+        } else if (sortBy === "by-main-route") {
+            cmp = Rules.mainRouteRank(a.mainRoute) - Rules.mainRouteRank(b.mainRoute)
             if (cmp === 0) cmp = String(a.matchValue || "").localeCompare(String(b.matchValue || ""))
         } else {
             // display-order: rule ids encode insertion order
@@ -778,6 +854,20 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
             }
         }
+    }
+
+    // They are not in the table at all, so without this line nothing says that
+    // part of the user's rules does nothing on this version.
+    Label {
+        Layout.fillWidth: true
+        visible: root.serviceUnrecognizedRules > 0
+        wrapMode: Text.WordWrap
+        color: root.textColor
+        text: root.uiRevision >= 0
+            ? root.tr("rules.unrecognized-note",
+                "Rules this version cannot read: {n}. They are kept in your rules and are not applied; a newer version of the app applies them.")
+                .replace("{n}", String(root.serviceUnrecognizedRules))
+            : ""
     }
 
     RowLayout {
@@ -1922,7 +2012,7 @@ ColumnLayout {
             id: sortCombo
             theme: root.uiTheme
             implicitWidth: 220
-            model: [ "by-display-order", "by-match-value", "by-type", "by-route" ]
+            model: [ "by-display-order", "by-match-value", "by-type", "by-route", "by-main-route" ]
             function sortLabel(id) { return root.tr("rules.sort." + id, id) }
             labelResolver: function(item) { return sortCombo.sortLabel(item) }
             currentIndex: Pure.optionIndexByValue(model, "by-display-order", 0)
@@ -2312,6 +2402,29 @@ ColumnLayout {
                 }
             }
 
+            // Main route column header → sorts by what the last check found
+            MouseArea {
+                visible: section.mainRouteColumnVisible
+                Layout.preferredWidth: section.colMainRouteWidth
+                Layout.preferredHeight: mainRouteHeader.implicitHeight
+                cursorShape: Qt.PointingHandCursor
+                hoverEnabled: true
+                onClicked: section.setSortBy("by-main-route")
+                ToolTip.visible: containsMouse && root.prefs.tooltipsEnabled
+                ToolTip.delay: 400
+                ToolTip.text: root.tr("rules.column.main-route-tooltip",
+                    "What the last check found: does this address answer over the main connection. Appears after \"Check the main route\".")
+                Label {
+                    id: mainRouteHeader
+                    anchors.fill: parent
+                    text: root.tr("rules.column.main-route", "Main route") + " " + section.sortArrowFor("by-main-route")
+                    color: section.sortBy === "by-main-route" ? root.uiTheme.colorAccent : root.textColor
+                    font.bold: true
+                    elide: Text.ElideRight
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+
             // Enable column header (compact). Click bulk-toggles all
             // visible rows on/off (kept as a convenience — the same
             // action is also available via the bulk-ops bar on the
@@ -2588,6 +2701,34 @@ ColumnLayout {
                                 "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.")
                             : ""
                     }
+                    // What the last main-route check found. A fact, not advice:
+                    // a site can answer on the main route and still refuse to
+                    // serve the user there, which is why the rule exists.
+                    Label {
+                        id: mainRouteCell
+                        visible: section.mainRouteColumnVisible
+                        Layout.preferredWidth: section.colMainRouteWidth
+                        Layout.alignment: Qt.AlignVCenter
+                        readonly property string mark: {
+                            var slug = String(model.mainRoute || "")
+                            if (slug !== "") return slug
+                            return String(model.ruleType || "") === "zone"
+                                && String(model.targetRoute || "") === "secondary" ? "zone" : ""
+                        }
+                        text: root.uiRevision >= 0 && mark !== ""
+                            ? root.tr("rules.main-route." + mark, mark) : ""
+                        color: mark === "silent" ? root.textColor : root.mutedTextColor
+                        font.bold: mark === "silent"
+                        elide: Text.ElideRight
+                        opacity: model.enabled ? 1.0 : 0.5
+                        Accessible.name: root.uiRevision >= 0 && mark !== ""
+                            ? root.tr("rules.column.main-route", "Main route") + ": " + text : ""
+                        HoverHandler { id: mainRouteCellHover }
+                        ToolTip.visible: mainRouteCellHover.hovered && mainRouteCell.mark !== ""
+                        ToolTip.delay: 300
+                        ToolTip.text: root.uiRevision >= 0 && mark !== ""
+                            ? root.tr("rules.main-route." + mark + "-tooltip", "") : ""
+                    }
                     // Compact per-row enable toggle. Was
                     // the leftmost column; moved here so the leading
                     // column is owned by the bulk-selection checkbox.
@@ -2831,54 +2972,6 @@ ColumnLayout {
                         ToolTip.text: root.tr("rules.app-pins.tooltip",
                             "These are the addresses this application has been seen using, and they now travel the additional link for EVERY program on this computer — a route cannot be told which process it is for. An address another program starts using is given back to the main connection automatically.")
                             + "\n" + String(model.pinnedSample || "")
-                    }
-                    Item { Layout.fillWidth: true }
-                }
-                // What the last main-route check found for this address.
-                // Deliberately a fact and not advice: a site can answer on the
-                // main route and still refuse to serve the user there, which is
-                // the very reason a rule exists for it.
-                RowLayout {
-                    Layout.fillWidth: true
-                    Layout.leftMargin: 28
-                    visible: String(model.mainRoute || "") !== ""
-                    Rectangle {
-                        id: mainRouteBadge
-                        readonly property bool answered:
-                            String(model.mainRoute || "") === "answered"
-                        Layout.alignment: Qt.AlignVCenter
-                        radius: root.uiTheme.radiusSm
-                        color: "transparent"
-                        border.width: 1
-                        border.color: root.mutedTextColor
-                        opacity: model.enabled ? 0.9 : 0.5
-                        implicitWidth: mainRouteBadgeLabel.implicitWidth
-                            + root.uiTheme.spacingSm * 2
-                        implicitHeight: mainRouteBadgeLabel.implicitHeight
-                            + root.uiTheme.spacingXxs * 2
-                        Label {
-                            id: mainRouteBadgeLabel
-                            anchors.centerIn: parent
-                            text: {
-                                if (root.uiRevision < 0) return ""
-                                return mainRouteBadge.answered
-                                    ? root.tr("rules.main-route.answered",
-                                        "the main route reaches it")
-                                    : root.tr("rules.main-route.silent",
-                                        "the main route does not reach it")
-                            }
-                            color: root.mutedTextColor
-                            font.pixelSize: Math.max(10,
-                                root.uiTheme.baseFontSizePx - 2)
-                        }
-                        HoverHandler { id: mainRouteBadgeHover }
-                        ToolTip.visible: mainRouteBadgeHover.hovered
-                        ToolTip.delay: 300
-                        ToolTip.text: mainRouteBadge.answered
-                            ? root.tr("rules.main-route.answered-tooltip",
-                                "Something answered at this address over the main connection. That does not mean the site works there — it may still refuse to serve you. Checked within the last half hour.")
-                            : root.tr("rules.main-route.silent-tooltip",
-                                "Nothing answered at this address over the main connection, so this rule is doing real work. Checked within the last half hour.")
                     }
                     Item { Layout.fillWidth: true }
                 }

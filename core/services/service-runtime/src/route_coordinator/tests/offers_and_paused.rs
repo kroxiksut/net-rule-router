@@ -572,6 +572,55 @@ fn kill_switch_exemptions_cache_keeps_server_ip_after_bootstrap_route_vanishes()
     );
 }
 
+/// The write moves the pass's `state` input: repeating it for a steady tunnel
+/// turned every timer tick into a full pass.
+#[test]
+fn kill_switch_exemptions_persist_the_server_set_only_when_it_changes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let api = Arc::new(MockWindowsApi::new());
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
+    let vpn_id = vpn.stable_id();
+    let eth_id = eth.stable_id();
+    api.set_adapter_infos(vec![vpn, eth]);
+    let server_route = |last: u8| route_entry([203, 0, 113, last], 32, [192, 168, 1, 1], 12, 5);
+    api.set_route_table(vec![server_route(7)]);
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_primary("S-IVANOV", &eth_id);
+    policy.bind_secondary("S-IVANOV", &vpn_id);
+    let writes = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&writes);
+    let coord = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy)
+        .with_bootstrap_server_persistence(
+            Arc::new(move |_ips: &[Ipv4Addr]| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(Vec::new),
+        );
+    let resolve = || {
+        coord
+            .kill_switch_exemptions("S-IVANOV", &coord.read_machine())
+            .expect("exemptions resolve");
+    };
+
+    resolve();
+    resolve();
+    resolve();
+    assert_eq!(
+        writes.load(Ordering::Relaxed),
+        1,
+        "a steady server is written once"
+    );
+
+    api.set_route_table(vec![]);
+    resolve();
+    assert_eq!(writes.load(Ordering::Relaxed), 1, "a blip writes nothing");
+
+    api.set_route_table(vec![server_route(8)]);
+    resolve();
+    assert_eq!(writes.load(Ordering::Relaxed), 2, "a new server is written");
+}
+
 #[test]
 fn description_matches_display_name_version_robust_and_symmetric() {
     // Live description carries an extra version token vs the saved name.

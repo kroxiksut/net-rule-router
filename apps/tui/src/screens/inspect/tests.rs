@@ -435,14 +435,17 @@ fn log_lines_are_translated_with_their_fields() {
 
 /// Line mode: the screen, its commands, a page at a time.
 fn transcript(answers: &[&str]) -> String {
-    let fake = service();
+    transcript_with(&service(), answers)
+}
+
+fn transcript_with(fake: &FakeService, answers: &[&str]) -> String {
     let texts = texts_en();
     let mut app = connected();
     let mut session = PlainSession::new(Vec::new());
     session.start(&app, &texts).expect("start");
     for answer in answers {
         session.input(answer, &mut app, &texts).expect("answer");
-        settle(&mut app, &fake);
+        settle(&mut app, fake);
         session.changed(&app, &texts).expect("changed");
     }
     String::from_utf8(session.into_inner()).expect("line mode writes UTF-8")
@@ -646,6 +649,74 @@ fn line_mode_reads_the_outage_list() {
     );
     assert!(!text.contains('\u{1b}'), "{text}");
     assert_snapshot("plain-outage", &text);
+}
+
+/// An outage answer whose names never resolved, after the blocked rows.
+fn outage_with_names(entries: Value) -> Value {
+    let mut answer = outage(json!({ "since-unix-ms": NOON - 600_000 }), 0);
+    answer["entries"] = entries;
+    answer["unresolved-names"] = json!([{
+        "name": "chat.example.com",
+        "first-seen-ms": NOON - 300_000,
+        "last-seen-ms": NOON - 30_000,
+        "attempts": 5
+    }]);
+    answer
+}
+
+#[test]
+fn a_name_that_did_not_resolve_is_listed_after_the_blocked_rows_and_marked() {
+    let rows = outage(Value::Null, 0)["entries"].clone();
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ConnTraceOutageBlocksList,
+        outage_with_names(rows),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::OutageBlocks);
+    let text = view_text(&app, ScreenId::OutageBlocks);
+    assert!(
+        text.contains(
+            "4. — | chat.example.com · did not resolve | 5 | 2026-10-06 11:55:00 | 2026-10-06 11:59:30"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("Names marked “did not resolve” got no address"),
+        "{text}"
+    );
+
+    key(&mut app, KeyCode::Tab);
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Down);
+    }
+    let text = view_text(&app, ScreenId::OutageBlocks);
+    assert!(
+        text.contains("Remote: chat.example.com · did not resolve"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Process:"),
+        "no program to name:
+{text}"
+    );
+
+    let plain = transcript_with(&fake, &["7", "o", "", "d 4"]);
+    assert!(
+        plain.contains("Remote: chat.example.com · did not resolve"),
+        "{plain}"
+    );
+}
+
+/// Names alone are not "nothing was blocked".
+#[test]
+fn an_outage_with_only_names_does_not_say_nothing_was_blocked() {
+    let text = outage_text(outage_with_names(json!([])));
+    assert!(
+        text.contains("chat.example.com · did not resolve"),
+        "{text}"
+    );
+    assert!(!text.contains("Nothing was blocked"), "{text}");
 }
 
 #[test]

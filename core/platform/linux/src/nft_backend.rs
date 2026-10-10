@@ -143,7 +143,7 @@ mod tests {
                 dst_port: None,
                 protocol: None,
             },
-            principal: PrincipalScope(None),
+            principal: PrincipalScope::Machine,
             app: AppScope::Program {
                 key: "messenger".into(),
                 exe_paths: Vec::new(),

@@ -35,6 +35,19 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
     if secondary_luid == 0 {
         return Vec::new();
     }
+    // The packed collectors hold one principal each, so the owner's flows and
+    // the service-account twins are packed apart — merged, one scope's
+    // addresses would be enforced under the other's condition.
+    let (service, own): (Vec<&FlowRule>, Vec<&FlowRule>) = plan
+        .flows
+        .iter()
+        .partition(|flow| flow.principal == PrincipalScope::ServiceAccounts);
+    let mut out = lower_kill_switch_flows(&own, secondary_luid);
+    out.extend(lower_kill_switch_flows(&service, secondary_luid));
+    out
+}
+
+fn lower_kill_switch_flows(flows: &[&FlowRule], secondary_luid: u64) -> Vec<WfpFilterSpec> {
     let mut out = Vec::new();
     // Per-destination flows are COLLECTED, then packed into chunks below —
     // the standing-filter-count fix. App pairs and lone permits stay per-flow.
@@ -42,9 +55,9 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
     let mut packet_pins = ProtoSetCollect::default();
     let mut fc_ale = ProtoSetCollect::default();
     let mut fc_packet = ProtoSetCollect::default();
-    for flow in &plan.flows {
+    for flow in flows.iter().copied() {
         let ord = u64::from(flow.precedence.ordinal);
-        let user_sid = flow.principal.0.as_ref().map(|p| p.as_stored().to_string());
+        let user_sid = user_sid_of(&flow.principal);
         let proto = flow.flow.protocol.map(l4proto_to_ip_number);
         let app = app_pattern_of(&flow.app);
         match flow.precedence.class {
@@ -216,8 +229,8 @@ pub(super) fn only_v4(ips: &[IpAddr]) -> Vec<Ipv4Addr> {
         .collect()
 }
 
-/// Destination collector for the packed ALE pin pair. The principal is
-/// identical across a per-SID plan's flows; the first one seen is kept.
+/// Destination collector for the packed ALE pin pair. The caller hands it one
+/// principal's flows; the first scope seen is kept.
 #[derive(Default)]
 struct SetCollect {
     user_sid: Option<String>,

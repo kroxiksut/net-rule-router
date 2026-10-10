@@ -188,6 +188,21 @@ QtObject {
                 if (kind !== "" && Pure.noticeKindMuted(mutes, kind, now)) muted.push(_pushNotices[i].id)
             }
             for (var j = 0; j < muted.length; j += 1) _dropPushNotice(muted[j])
+            secondaryDownMuted = Pure.noticeKindMuted(mutes, "secondary-down", now)
+        })
+    }
+
+    /// The window's "additional adapter missing" banner says what the
+    /// `secondary-down` notice says, so muting that notice hides it too.
+    property bool secondaryDownMuted: false
+    function refreshSecondaryDownMuted() {
+        if (!root.bridgeAvailable || !root.rpc
+                || typeof root.rpc.rpcBlockNoticeMutesList !== "function") return
+        var corr = root.rpc.rpcBlockNoticeMutesList()
+        if (!corr) return
+        root.rpc.registerRpcCallback(corr, function(ok, p) {
+            if (!ok || !p) return
+            secondaryDownMuted = Pure.noticeKindMuted(p.mutes || [], "secondary-down", Date.now())
         })
     }
 

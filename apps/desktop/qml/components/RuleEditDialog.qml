@@ -491,501 +491,513 @@ Dialog {
         }
         root.saveRule()
     }
-    ColumnLayout {
+    // A form taller than the window scrolls inside it rather than pushing its
+    // last rows under the buttons (a 720 px screen with every hint showing).
+    height: root ? Math.min(implicitHeight, root.height - 2 * _edgeGap) : implicitHeight
+    ScrollView {
+        id: formScroll
         anchors.fill: parent
-        anchors.margins: root.uiTheme.spacingMd
-        spacing: root.uiTheme.spacingSm
-        Label { text: root.tr("label.rule-type", "Rule type"); color: root.textColor }
-        ThemedComboBox {
-            id: ruleTypeCombo
-            theme: root.uiTheme
-            Layout.fillWidth: true
-            model: root.ruleTypesModel
-            textRole: "id"
-            valueRole: "id"
-            labelResolver: function(item) { return item ? root.ruleTypeLabel(item.id) : "" }
-            displayText: root.uiRevision >= 0 && currentIndex >= 0 && currentIndex < root.ruleTypesModel.count
-                ? root.ruleTypeLabel(root.ruleTypesModel.get(currentIndex).id) : ""
-            popup.width: root.comboPopupWidth(ruleTypeCombo, root.ruleTypesModel, "id", function(item) { return root.ruleTypeLabel(item.id) })
-            // A pasted list takes each line's type from the line itself.
-            enabled: !ruleDialog.listMode
-            onActivated: ruleDialog.localRuleType = root.ruleTypesModel.get(currentIndex).id
-            // All rule types are selectable. `application` routes the app's
-            // OBSERVED destinations via the secondary (app-routing via
-            // observation); the Add form still defaults to "domain".
-            delegate: ItemDelegate {
-                width: ListView.view ? ListView.view.width : ruleTypeCombo.popup.width
-                highlighted: ruleTypeCombo.highlightedIndex === index
-                background: Rectangle {
-                    color: highlighted ? root.uiTheme.colorAccent : root.uiTheme.colorPanel
-                    border.width: root.uiTheme.borderWidth
-                    border.color: root.uiTheme.stateDefaultBorder
-                }
-                contentItem: Text {
-                    leftPadding: root.uiTheme.spacingSm
-                    rightPadding: root.uiTheme.spacingSm
-                    text: root.ruleTypeLabel(model.id)
-                    color: !enabled
-                               ? Qt.rgba(root.uiTheme.colorText.r, root.uiTheme.colorText.g,
-                                         root.uiTheme.colorText.b, 0.45)
-                               : (highlighted ? root.uiTheme.colorOnAccent : root.uiTheme.colorText)
-                    verticalAlignment: Text.AlignVCenter
-                    elide: Text.ElideRight
-                }
-            }
-        }
-        CheckBox {
-            id: listModeCheck
-            visible: root.editingRule < 0 && ruleDialog.listAvailable
-                && ruleDialog.isAddressRuleType(ruleDialog.localRuleType)
-            checked: ruleDialog.listMode
-            text: root.uiRevision >= 0
-                ? root.tr("rules.paste.toggle", "Add a list of addresses, subnets and ranges")
-                : ""
-            onToggled: {
-                ruleDialog.listMode = checked
-                if (checked) listInput.forceActiveFocus()
-            }
-            Accessible.role: Accessible.CheckBox
-            Accessible.name: text
-        }
-        Label {
-            visible: ruleDialog.listMode
-            Layout.fillWidth: true
-            Layout.preferredWidth: 0
-            wrapMode: Text.WordWrap
-            color: root.textColor
-            text: root.uiRevision >= 0
-                ? root.tr("rules.paste.label",
-                    "One entry per line. Addresses, subnets and ranges can be mixed: each is added as its own type.")
-                : ""
-        }
-        ScrollView {
-            id: listInputScroll
-            visible: ruleDialog.listMode
-            Layout.fillWidth: true
-            Layout.preferredHeight: 120
-            clip: true
-            ThemedTextArea {
-                id: listInput
+        clip: true
+        contentWidth: availableWidth
+        contentHeight: formColumn.implicitHeight + 2 * root.uiTheme.spacingMd
+        ColumnLayout {
+            id: formColumn
+            x: root.uiTheme.spacingMd
+            y: root.uiTheme.spacingMd
+            width: formScroll.availableWidth - 2 * root.uiTheme.spacingMd
+            spacing: root.uiTheme.spacingSm
+            Label { text: root.tr("label.rule-type", "Rule type"); color: root.textColor }
+            ThemedComboBox {
+                id: ruleTypeCombo
                 theme: root.uiTheme
-                wrapMode: TextArea.NoWrap
-                placeholderText: root.uiRevision >= 0
-                    ? root.tr("rules.placeholder.address-list",
-                        "192.0.2.10, 198.51.100.0/24, 203.0.113.5-203.0.113.40")
+                Layout.fillWidth: true
+                model: root.ruleTypesModel
+                textRole: "id"
+                valueRole: "id"
+                labelResolver: function(item) { return item ? root.ruleTypeLabel(item.id) : "" }
+                displayText: root.uiRevision >= 0 && currentIndex >= 0 && currentIndex < root.ruleTypesModel.count
+                    ? root.ruleTypeLabel(root.ruleTypesModel.get(currentIndex).id) : ""
+                popup.width: root.comboPopupWidth(ruleTypeCombo, root.ruleTypesModel, "id", function(item) { return root.ruleTypeLabel(item.id) })
+                // A pasted list takes each line's type from the line itself.
+                enabled: !ruleDialog.listMode
+                onActivated: ruleDialog.localRuleType = root.ruleTypesModel.get(currentIndex).id
+                // All rule types are selectable. `application` routes the app's
+                // OBSERVED destinations via the secondary (app-routing via
+                // observation); the Add form still defaults to "domain".
+                delegate: ItemDelegate {
+                    width: ListView.view ? ListView.view.width : ruleTypeCombo.popup.width
+                    highlighted: ruleTypeCombo.highlightedIndex === index
+                    background: Rectangle {
+                        color: highlighted ? root.uiTheme.colorAccent : root.uiTheme.colorPanel
+                        border.width: root.uiTheme.borderWidth
+                        border.color: root.uiTheme.stateDefaultBorder
+                    }
+                    contentItem: Text {
+                        leftPadding: root.uiTheme.spacingSm
+                        rightPadding: root.uiTheme.spacingSm
+                        text: root.ruleTypeLabel(model.id)
+                        color: !enabled
+                                   ? Qt.rgba(root.uiTheme.colorText.r, root.uiTheme.colorText.g,
+                                             root.uiTheme.colorText.b, 0.45)
+                                   : (highlighted ? root.uiTheme.colorOnAccent : root.uiTheme.colorText)
+                        verticalAlignment: Text.AlignVCenter
+                        elide: Text.ElideRight
+                    }
+                }
+            }
+            CheckBox {
+                id: listModeCheck
+                visible: root.editingRule < 0 && ruleDialog.listAvailable
+                    && ruleDialog.isAddressRuleType(ruleDialog.localRuleType)
+                checked: ruleDialog.listMode
+                text: root.uiRevision >= 0
+                    ? root.tr("rules.paste.toggle", "Add a list of addresses, subnets and ranges")
                     : ""
-                onTextChanged: ruleDialog.listText = text
-                // Tab leaves the field, as in every other control of the form.
-                Keys.onTabPressed: function(event) {
-                    var next = listInput.nextItemInFocusChain(true)
-                    if (next) next.forceActiveFocus(Qt.TabFocusReason)
-                    event.accepted = true
+                onToggled: {
+                    ruleDialog.listMode = checked
+                    if (checked) listInput.forceActiveFocus()
                 }
-                Keys.onBacktabPressed: function(event) {
-                    var prev = listInput.nextItemInFocusChain(false)
-                    if (prev) prev.forceActiveFocus(Qt.BacktabFocusReason)
-                    event.accepted = true
-                }
-                Accessible.role: Accessible.EditableText
-                Accessible.name: listModeCheck.text
-                Accessible.description: root.uiRevision >= 0
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+            }
+            Label {
+                visible: ruleDialog.listMode
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                wrapMode: Text.WordWrap
+                color: root.textColor
+                text: root.uiRevision >= 0
                     ? root.tr("rules.paste.label",
                         "One entry per line. Addresses, subnets and ranges can be mixed: each is added as its own type.")
                     : ""
             }
-        }
-        Label {
-            id: listSummary
-            visible: ruleDialog.listMode && ruleDialog.listRows.length > 0
-            Layout.fillWidth: true
-            Layout.preferredWidth: 0
-            wrapMode: Text.WordWrap
-            color: root.textColor
-            text: root.uiRevision >= 0 ? ruleDialog.listSummaryText() : ""
-            Accessible.role: Accessible.StaticText
-            Accessible.name: text
-        }
-        ScrollView {
-            id: listPreview
-            visible: listSummary.visible
-            Layout.fillWidth: true
-            Layout.preferredHeight: Math.min(160, listPreviewColumn.implicitHeight)
-            clip: true
-            contentWidth: availableWidth
-            ColumnLayout {
-                id: listPreviewColumn
-                width: listPreview.availableWidth
-                spacing: 2
-                Repeater {
-                    model: ruleDialog.listRows
-                    delegate: RowLayout {
-                        required property var modelData
-                        Layout.fillWidth: true
-                        spacing: root.uiTheme.spacingSm
-                        Label {
-                            Layout.preferredWidth: 200
-                            Layout.alignment: Qt.AlignTop
-                            elide: Text.ElideMiddle
-                            color: root.textColor
-                            text: String(modelData.value)
-                        }
-                        Label {
+            ScrollView {
+                id: listInputScroll
+                visible: ruleDialog.listMode
+                Layout.fillWidth: true
+                Layout.preferredHeight: 120
+                clip: true
+                ThemedTextArea {
+                    id: listInput
+                    theme: root.uiTheme
+                    wrapMode: TextArea.NoWrap
+                    placeholderText: root.uiRevision >= 0
+                        ? root.tr("rules.placeholder.address-list",
+                            "192.0.2.10, 198.51.100.0/24, 203.0.113.5-203.0.113.40")
+                        : ""
+                    onTextChanged: ruleDialog.listText = text
+                    // Tab leaves the field, as in every other control of the form.
+                    Keys.onTabPressed: function(event) {
+                        var next = listInput.nextItemInFocusChain(true)
+                        if (next) next.forceActiveFocus(Qt.TabFocusReason)
+                        event.accepted = true
+                    }
+                    Keys.onBacktabPressed: function(event) {
+                        var prev = listInput.nextItemInFocusChain(false)
+                        if (prev) prev.forceActiveFocus(Qt.BacktabFocusReason)
+                        event.accepted = true
+                    }
+                    Accessible.role: Accessible.EditableText
+                    Accessible.name: listModeCheck.text
+                    Accessible.description: root.uiRevision >= 0
+                        ? root.tr("rules.paste.label",
+                            "One entry per line. Addresses, subnets and ranges can be mixed: each is added as its own type.")
+                        : ""
+                }
+            }
+            Label {
+                id: listSummary
+                visible: ruleDialog.listMode && ruleDialog.listRows.length > 0
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                wrapMode: Text.WordWrap
+                color: root.textColor
+                text: root.uiRevision >= 0 ? ruleDialog.listSummaryText() : ""
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            ScrollView {
+                id: listPreview
+                visible: listSummary.visible
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.min(160, listPreviewColumn.implicitHeight)
+                clip: true
+                contentWidth: availableWidth
+                ColumnLayout {
+                    id: listPreviewColumn
+                    width: listPreview.availableWidth
+                    spacing: 2
+                    Repeater {
+                        model: ruleDialog.listRows
+                        delegate: RowLayout {
+                            required property var modelData
                             Layout.fillWidth: true
-                            Layout.preferredWidth: 0
-                            wrapMode: Text.WordWrap
-                            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-                            color: String(modelData.status) === "error" ? root.uiTheme.colorDanger
-                                : String(modelData.status) === "warning" ? root.uiTheme.colorWarning
-                                : root.mutedTextColor
-                            text: root.uiRevision >= 0 ? ruleDialog.listRowText(modelData) : ""
-                            Accessible.role: Accessible.StaticText
-                            Accessible.name: String(modelData.value) + ": " + text
+                            spacing: root.uiTheme.spacingSm
+                            Label {
+                                Layout.preferredWidth: 200
+                                Layout.alignment: Qt.AlignTop
+                                elide: Text.ElideMiddle
+                                color: root.textColor
+                                text: String(modelData.value)
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                Layout.preferredWidth: 0
+                                wrapMode: Text.WordWrap
+                                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                                color: String(modelData.status) === "error" ? root.uiTheme.colorDanger
+                                    : String(modelData.status) === "warning" ? root.uiTheme.colorWarning
+                                    : root.mutedTextColor
+                                text: root.uiRevision >= 0 ? ruleDialog.listRowText(modelData) : ""
+                                Accessible.role: Accessible.StaticText
+                                Accessible.name: String(modelData.value) + ": " + text
+                            }
                         }
                     }
                 }
             }
-        }
-        Label {
-            visible: !ruleDialog.listMode
-            text: root.tr("label.match-value", "Match value")
-            color: root.textColor
-        }
-        ThemedTextField {
-            id: matchValueField
-            theme: root.uiTheme
-            visible: !ruleDialog.listMode
-            Layout.fillWidth: true
-            text: ruleDialog.localValue
-            onTextChanged: {
-                // Reduce a pasted browser URL to its bare host (a no-op for
-                // plain hostnames, IPs and application names).
-                var norm = Rules.normalizeHostInput(ruleDialog.localRuleType, text)
-                if (norm !== text) {
-                    text = norm    // re-enters onTextChanged; norm has no URL
-                    return          // punctuation, so the next pass settles.
-                }
-                ruleDialog.localValue = text
-            }
-            // Placeholder mirrors the canonical example for the chosen
-            // rule type so the user sees the expected shape (e.g.
-            // `192.0.2.1` for Exact IP) without typing first.
-            placeholderText: root.uiRevision >= 0
-                ? ruleDialog.matchValuePlaceholder(ruleDialog.localRuleType)
-                : ""
-            maximumLength: ruleDialog.matchValueMaxLength(ruleDialog.localRuleType)
-            // Validator uses partial-match-friendly regex so each
-            // keystroke is accepted (Qt rejects Invalid intermediate
-            // input outright, which would block the first character).
-            // Strict per-type semantic checks live in
-            // ruleDialog.isMatchValueValid() and gate the OK button.
-            validator: RegularExpressionValidator {
-                regularExpression: ruleDialog.matchValueRegex(ruleDialog.localRuleType)
-            }
-            // Click-to-clear-example hook: when the field text equals
-            // the type-specific example placeholder (e.g. user
-            // explicitly inserted it), the first focus clears it so
-            // typing replaces the example. For an empty field, Qt
-            // already hides the placeholder on focus automatically.
-            onActiveFocusChanged: {
-                if (activeFocus
-                        && text !== ""
-                        && text === ruleDialog.matchValuePlaceholder(ruleDialog.localRuleType)) {
-                    text = ""
-                }
-            }
-        }
-        // Browse for an executable (application rules
-        // only). Fills the match value with the exe's file name; matching
-        // is by name, so a full path is reduced to its basename.
-        RowLayout {
-            Layout.fillWidth: true
-            visible: ruleDialog.localRuleType === "application"
-            ThemedButton {
-                theme: root.uiTheme
-                text: root.tr("action.browse", "Browse...")
-                onClicked: appExeFileDialog.open()
-            }
-            Item { Layout.fillWidth: true }
-        }
-        FileDialog {
-            id: appExeFileDialog
-            title: root.tr("rules.app-browse-title", "Select the application executable")
-            fileMode: FileDialog.OpenFile
-            nameFilters: [
-                root.tr("rules.app-browse-filter-exe", "Executables (*.exe)"),
-                root.tr("rules.app-browse-filter-all", "All files (*)")
-            ]
-            onAccepted: {
-                var name = String(selectedFile).replace(/^.*[\\\/]/, "").replace(/[?#].*$/, "")
-                if (name !== "") {
-                    matchValueField.text = name
-                    ruleDialog.localValue = name
-                }
-            }
-        }
-        Label {
-            Layout.fillWidth: true
-            visible: !ruleDialog.listMode
-            wrapMode: Text.WordWrap
-            color: root.mutedTextColor
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            text: root.uiRevision >= 0
-                ? ruleDialog.matchValueHint(ruleDialog.localRuleType)
-                : ""
-        }
-        // Roadmap note for Application rules: routing a whole app's traffic
-        // (per-process) is a planned free feature pending the kernel driver.
-        // Until then, route an app by its destinations. Shown only for the
-        // `application` rule type so it's contextual, not noise.
-        Label {
-            Layout.fillWidth: true
-            visible: ruleDialog.localRuleType === "application"
-            wrapMode: Text.WordWrap
-            color: root.mutedTextColor
-            font.italic: true
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            text: root.uiRevision >= 0
-                ? root.tr("rules.application-routing-note",
-                    "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.")
-                : ""
-        }
-        // Where a per-application block is not leak-proof, say so next to the
-        // control that creates one — a user who blocks an app must not read
-        // the rule as a guarantee the platform cannot give.
-        Label {
-            Layout.fillWidth: true
-            visible: ruleDialog.localRuleType === "application"
-                && !root.supports("perAppBlockLeakproof")
-            wrapMode: Text.WordWrap
-            color: root.uiTheme.colorWarning
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            text: root.uiRevision >= 0
-                ? root.tr("rules.application-not-leakproof",
-                    "On this system an application rule is not airtight: connections the app makes before it is recognised can still get through.")
-                : ""
-        }
-        // What this rule will actually cover, spelled out. A bare
-        // `example.com` is an exact host on its own; subdomains come from the
-        // "Treat a domain as domain + *.domain" setting, which ships ON. A
-        // user cannot be expected to hold that in their head while typing, and
-        // the answer changes with a setting they may have turned off.
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            color: root.mutedTextColor
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            visible: ruleDialog.localRuleType === "domain"
-                && ruleDialog.localValue !== ""
-                && ruleDialog.isMatchValueValid(ruleDialog.localRuleType, ruleDialog.localValue)
-            text: root.uiRevision >= 0 ? ruleDialog._coverageHint() : ""
-        }
-        // Offered ONLY when subdomain coverage is off machine-wide: with the
-        // setting on, a "without subdomains" choice would be a lie — the
-        // service expands every bare domain anyway.
-        CheckBox {
-            Layout.fillWidth: true
-            visible: ruleDialog.localRuleType === "domain"
-                && root.prefs.routeIncludeSubdomains === false
-            checked: ruleDialog.localValue.indexOf("*.") === 0
-            text: root.tr("dialog.rule.include-subdomains", "Include subdomains")
-            onToggled: {
-                var v = ruleDialog.localValue
-                var bare = v.indexOf("*.") === 0 ? v.substring(2) : v
-                matchValueField.text = checked ? ("*." + bare) : bare
-            }
-        }
-        // Why the value cannot be saved, in the rules table's words. A blank
-        // value is incomplete, not wrong.
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            color: root.uiTheme.colorDanger
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            visible: !ruleDialog.listMode && ruleDialog.localValue !== ""
-                && ruleDialog.isMatchValueRefused(ruleDialog.localRuleType, ruleDialog.localValue)
-            text: root.uiRevision >= 0 ? ruleDialog.refusalText() : ""
-        }
-        // Saveable, but not quite what was typed or not fully protected — a
-        // wide network, host bits cleared, an unusual address.
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            color: root.uiTheme.colorWarning
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            visible: !ruleDialog.listMode && ruleDialog.localValue !== ""
-                && ruleDialog.isMatchValueWarned(ruleDialog.localRuleType, ruleDialog.localValue)
-            text: root.uiRevision >= 0 ? ruleDialog.warningText() : ""
-            Accessible.role: Accessible.StaticText
-            Accessible.name: text
-        }
-        Label { text: root.tr("label.target-route", "Target route"); color: root.textColor }
-        ThemedComboBox {
-            id: routeTargetCombo
-            theme: root.uiTheme
-            Layout.fillWidth: true
-            model: root.routeRoleOptions(ruleDialog.allowBlockRoute)
-            textRole: "label"
-            valueRole: "id"
-            popup.width: root.comboPopupWidth(routeTargetCombo, model, "label", null)
-            onActivated: ruleDialog.localRoute = model[currentIndex].id
-            // A new model (the type changed) resets the index; put it back.
-            onModelChanged: Qt.callLater(ruleDialog._syncRouteCombo)
-        }
-        // Own width only, like the enable toggle: a row-wide hit area turns a
-        // missed click into a changed rule.
-        RowLayout {
-            Layout.fillWidth: true
-            CheckBox {
-                id: ruleVerifyCheck
-                enabled: ruleDialog.verifyOffered
-                checked: ruleDialog.localVerify
-                onToggled: ruleDialog.localVerify = checked
-                text: root.uiRevision >= 0
-                    ? root.tr("dialog.rule.verify", "Unsure — check where it works")
-                    : ""
-                Accessible.role: Accessible.CheckBox
-                Accessible.name: text
-                Accessible.description: verifyHint.text
-            }
-            Item { Layout.fillWidth: true }
-        }
-        Label {
-            id: verifyHint
-            Layout.fillWidth: true
-            Layout.preferredWidth: 0
-            wrapMode: Text.WordWrap
-            color: root.mutedTextColor
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            visible: ruleDialog.verifyOffered && ruleDialog.localVerify
-            text: root.uiRevision >= 0
-                ? root.tr("dialog.rule.verify-hint",
-                    "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.")
-                : ""
-            Accessible.role: Accessible.StaticText
-            Accessible.name: text
-        }
-        // The other route's rules this one overlaps, and which of them wins.
-        Label {
-            Layout.fillWidth: true
-            Layout.preferredWidth: 0
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            color: root.mutedTextColor
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            visible: !ruleDialog.listMode && text !== ""
-                && ruleDialog.isMatchValueValid(ruleDialog.localRuleType, ruleDialog.localValue)
-            text: root.uiRevision >= 0 ? ruleDialog.overlapText() : ""
-            Accessible.role: Accessible.StaticText
-            Accessible.name: text
-        }
-        RowLayout {
-            Layout.fillWidth: true
-            Label { text: root.tr("label.comment", "Comment"); color: root.textColor }
-            Item { Layout.fillWidth: true }
             Label {
+                visible: !ruleDialog.listMode
+                text: root.tr("label.match-value", "Match value")
+                color: root.textColor
+            }
+            ThemedTextField {
+                id: matchValueField
+                theme: root.uiTheme
+                visible: !ruleDialog.listMode
+                Layout.fillWidth: true
+                text: ruleDialog.localValue
+                onTextChanged: {
+                    // Reduce a pasted browser URL to its bare host (a no-op for
+                    // plain hostnames, IPs and application names).
+                    var norm = Rules.normalizeHostInput(ruleDialog.localRuleType, text)
+                    if (norm !== text) {
+                        text = norm    // re-enters onTextChanged; norm has no URL
+                        return          // punctuation, so the next pass settles.
+                    }
+                    ruleDialog.localValue = text
+                }
+                // Placeholder mirrors the canonical example for the chosen
+                // rule type so the user sees the expected shape (e.g.
+                // `192.0.2.1` for Exact IP) without typing first.
+                placeholderText: root.uiRevision >= 0
+                    ? ruleDialog.matchValuePlaceholder(ruleDialog.localRuleType)
+                    : ""
+                maximumLength: ruleDialog.matchValueMaxLength(ruleDialog.localRuleType)
+                // Validator uses partial-match-friendly regex so each
+                // keystroke is accepted (Qt rejects Invalid intermediate
+                // input outright, which would block the first character).
+                // Strict per-type semantic checks live in
+                // ruleDialog.isMatchValueValid() and gate the OK button.
+                validator: RegularExpressionValidator {
+                    regularExpression: ruleDialog.matchValueRegex(ruleDialog.localRuleType)
+                }
+                // Click-to-clear-example hook: when the field text equals
+                // the type-specific example placeholder (e.g. user
+                // explicitly inserted it), the first focus clears it so
+                // typing replaces the example. For an empty field, Qt
+                // already hides the placeholder on focus automatically.
+                onActiveFocusChanged: {
+                    if (activeFocus
+                            && text !== ""
+                            && text === ruleDialog.matchValuePlaceholder(ruleDialog.localRuleType)) {
+                        text = ""
+                    }
+                }
+            }
+            // Browse for an executable (application rules
+            // only). Fills the match value with the exe's file name; matching
+            // is by name, so a full path is reduced to its basename.
+            RowLayout {
+                Layout.fillWidth: true
+                visible: ruleDialog.localRuleType === "application"
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("action.browse", "Browse...")
+                    onClicked: appExeFileDialog.open()
+                }
+                Item { Layout.fillWidth: true }
+            }
+            FileDialog {
+                id: appExeFileDialog
+                title: root.tr("rules.app-browse-title", "Select the application executable")
+                fileMode: FileDialog.OpenFile
+                nameFilters: [
+                    root.tr("rules.app-browse-filter-exe", "Executables (*.exe)"),
+                    root.tr("rules.app-browse-filter-all", "All files (*)")
+                ]
+                onAccepted: {
+                    var name = String(selectedFile).replace(/^.*[\\\/]/, "").replace(/[?#].*$/, "")
+                    if (name !== "") {
+                        matchValueField.text = name
+                        ruleDialog.localValue = name
+                    }
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: !ruleDialog.listMode
+                wrapMode: Text.WordWrap
                 color: root.mutedTextColor
                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-                text: root.tr("rules.comment.char-counter", "{used}/{max}")
-                    .replace("{used}", ruleDialog.localComment.length)
-                    .replace("{max}", ruleDialog.commentMaxLength)
+                text: root.uiRevision >= 0
+                    ? ruleDialog.matchValueHint(ruleDialog.localRuleType)
+                    : ""
             }
-        }
-        ThemedTextField {
-            id: ruleCommentField
-            theme: root.uiTheme
-            Layout.fillWidth: true
-            text: ruleDialog.localComment
-            onTextChanged: {
-                if (text.length > ruleDialog.commentMaxLength) {
-                    text = text.substring(0, ruleDialog.commentMaxLength)
-                }
-                ruleDialog.localComment = text
+            // Roadmap note for Application rules: routing a whole app's traffic
+            // (per-process) is a planned free feature pending the kernel driver.
+            // Until then, route an app by its destinations. Shown only for the
+            // `application` rule type so it's contextual, not noise.
+            Label {
+                Layout.fillWidth: true
+                visible: ruleDialog.localRuleType === "application"
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                font.italic: true
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                text: root.uiRevision >= 0
+                    ? root.tr("rules.application-routing-note",
+                        "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.")
+                    : ""
             }
-            maximumLength: ruleDialog.commentMaxLength
-            placeholderText: root.uiRevision >= 0
-                ? root.tr("rules.comment.max-length",
-                    "Up to {max} characters").replace("{max}", ruleDialog.commentMaxLength)
-                : ""
-        }
-        // Enabled toggle. Disabled rules stay in the
-        // rules file (and on disk) but are NOT applied to routing.
-        //
-        // Deliberately NOT `Layout.fillWidth`: with it the hit area spanned the
-        // whole 560 px dialog, so a click that merely missed the comment field
-        // just above landed here and silently disabled the rule. The box now
-        // takes only its own width (indicator + label) and sits a full
-        // `spacingMd` below the comment field.
-        RowLayout {
-            Layout.fillWidth: true
-            Layout.topMargin: root.uiTheme.spacingMd
+            // Where a per-application block is not leak-proof, say so next to the
+            // control that creates one — a user who blocks an app must not read
+            // the rule as a guarantee the platform cannot give.
+            Label {
+                Layout.fillWidth: true
+                visible: ruleDialog.localRuleType === "application"
+                    && !root.supports("perAppBlockLeakproof")
+                wrapMode: Text.WordWrap
+                color: root.uiTheme.colorWarning
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                text: root.uiRevision >= 0
+                    ? root.tr("rules.application-not-leakproof",
+                        "On this system an application rule is not airtight: connections the app makes before it is recognised can still get through.")
+                    : ""
+            }
+            // What this rule will actually cover, spelled out. A bare
+            // `example.com` is an exact host on its own; subdomains come from the
+            // "Treat a domain as domain + *.domain" setting, which ships ON. A
+            // user cannot be expected to hold that in their head while typing, and
+            // the answer changes with a setting they may have turned off.
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: ruleDialog.localRuleType === "domain"
+                    && ruleDialog.localValue !== ""
+                    && ruleDialog.isMatchValueValid(ruleDialog.localRuleType, ruleDialog.localValue)
+                text: root.uiRevision >= 0 ? ruleDialog._coverageHint() : ""
+            }
+            // Offered ONLY when subdomain coverage is off machine-wide: with the
+            // setting on, a "without subdomains" choice would be a lie — the
+            // service expands every bare domain anyway.
             CheckBox {
-                id: ruleEnabledCheck
-                checked: ruleDialog.localEnabled
-                onToggled: ruleDialog.localEnabled = checked
-                text: ruleDialog.localEnabled
-                    ? root.tr("dialog.rule.enabled-on", "Rule is enabled (applied to routing)")
-                    : root.tr("dialog.rule.enabled-off", "Rule is disabled (kept in the file, not applied)")
-                Accessible.role: Accessible.CheckBox
+                Layout.fillWidth: true
+                visible: ruleDialog.localRuleType === "domain"
+                    && root.prefs.routeIncludeSubdomains === false
+                checked: ruleDialog.localValue.indexOf("*.") === 0
+                text: root.tr("dialog.rule.include-subdomains", "Include subdomains")
+                onToggled: {
+                    var v = ruleDialog.localValue
+                    var bare = v.indexOf("*.") === 0 ? v.substring(2) : v
+                    matchValueField.text = checked ? ("*." + bare) : bare
+                }
+            }
+            // Why the value cannot be saved, in the rules table's words. A blank
+            // value is incomplete, not wrong.
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.uiTheme.colorDanger
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: !ruleDialog.listMode && ruleDialog.localValue !== ""
+                    && ruleDialog.isMatchValueRefused(ruleDialog.localRuleType, ruleDialog.localValue)
+                text: root.uiRevision >= 0 ? ruleDialog.refusalText() : ""
+            }
+            // Saveable, but not quite what was typed or not fully protected — a
+            // wide network, host bits cleared, an unusual address.
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.uiTheme.colorWarning
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: !ruleDialog.listMode && ruleDialog.localValue !== ""
+                    && ruleDialog.isMatchValueWarned(ruleDialog.localRuleType, ruleDialog.localValue)
+                text: root.uiRevision >= 0 ? ruleDialog.warningText() : ""
+                Accessible.role: Accessible.StaticText
                 Accessible.name: text
             }
-            // Absorbs the leftover row width so the click zone above stops at
-            // the label instead of stretching across the dialog.
-            Item { Layout.fillWidth: true }
-        }
-        // How far a domain rule actually reaches. A suffix rule matches every
-        // name under the value, most of which the user never listed — that is
-        // how a background client's own subdomain ends up routed. Stating the
-        // reach is cheap; discovering it from a blocked connection is not.
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            color: root.mutedTextColor
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            visible: text !== ""
-            text: {
-                if (root.uiRevision < 0) return ""
-                var rt = ruleDialog.localRuleType
-                if (rt !== "domain" && rt !== "suffix-domain") return ""
-                var val = String(ruleDialog.localValue || "").trim()
-                if (val === "") return ""
-                if (Pure.isPublicSuffixValue(val)) {
-                    return root.tr("rules.value.public-suffix-warning",
-                        "{value} is a public registry, not one service: the rule would "
-                        + "route unrelated owners. Use a zone rule if that is what you want.")
+            Label { text: root.tr("label.target-route", "Target route"); color: root.textColor }
+            ThemedComboBox {
+                id: routeTargetCombo
+                theme: root.uiTheme
+                Layout.fillWidth: true
+                model: root.routeRoleOptions(ruleDialog.allowBlockRoute)
+                textRole: "label"
+                valueRole: "id"
+                popup.width: root.comboPopupWidth(routeTargetCombo, model, "label", null)
+                onActivated: ruleDialog.localRoute = model[currentIndex].id
+                // A new model (the type changed) resets the index; put it back.
+                onModelChanged: Qt.callLater(ruleDialog._syncRouteCombo)
+            }
+            // Own width only, like the enable toggle: a row-wide hit area turns a
+            // missed click into a changed rule.
+            RowLayout {
+                Layout.fillWidth: true
+                CheckBox {
+                    id: ruleVerifyCheck
+                    enabled: ruleDialog.verifyOffered
+                    checked: ruleDialog.localVerify
+                    onToggled: ruleDialog.localVerify = checked
+                    text: root.uiRevision >= 0
+                        ? root.tr("dialog.rule.verify", "Unsure — check where it works")
+                        : ""
+                    Accessible.role: Accessible.CheckBox
+                    Accessible.name: text
+                    Accessible.description: verifyHint.text
+                }
+                Item { Layout.fillWidth: true }
+            }
+            Label {
+                id: verifyHint
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: ruleDialog.verifyOffered && ruleDialog.localVerify
+                text: root.uiRevision >= 0
+                    ? root.tr("dialog.rule.verify-hint",
+                        "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.")
+                    : ""
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            // The other route's rules this one overlaps, and which of them wins.
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                color: root.mutedTextColor
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: !ruleDialog.listMode && text !== ""
+                    && ruleDialog.isMatchValueValid(ruleDialog.localRuleType, ruleDialog.localValue)
+                text: root.uiRevision >= 0 ? ruleDialog.overlapText() : ""
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Label { text: root.tr("label.comment", "Comment"); color: root.textColor }
+                Item { Layout.fillWidth: true }
+                Label {
+                    color: root.mutedTextColor
+                    font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                    text: root.tr("rules.comment.char-counter", "{used}/{max}")
+                        .replace("{used}", ruleDialog.localComment.length)
+                        .replace("{max}", ruleDialog.commentMaxLength)
+                }
+            }
+            ThemedTextField {
+                id: ruleCommentField
+                theme: root.uiTheme
+                Layout.fillWidth: true
+                text: ruleDialog.localComment
+                onTextChanged: {
+                    if (text.length > ruleDialog.commentMaxLength) {
+                        text = text.substring(0, ruleDialog.commentMaxLength)
+                    }
+                    ruleDialog.localComment = text
+                }
+                maximumLength: ruleDialog.commentMaxLength
+                placeholderText: root.uiRevision >= 0
+                    ? root.tr("rules.comment.max-length",
+                        "Up to {max} characters").replace("{max}", ruleDialog.commentMaxLength)
+                    : ""
+            }
+            // Enabled toggle. Disabled rules stay in the
+            // rules file (and on disk) but are NOT applied to routing.
+            //
+            // Deliberately NOT `Layout.fillWidth`: with it the hit area spanned the
+            // whole 560 px dialog, so a click that merely missed the comment field
+            // just above landed here and silently disabled the rule. The box now
+            // takes only its own width (indicator + label) and sits a full
+            // `spacingMd` below the comment field.
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: root.uiTheme.spacingMd
+                CheckBox {
+                    id: ruleEnabledCheck
+                    checked: ruleDialog.localEnabled
+                    onToggled: ruleDialog.localEnabled = checked
+                    text: ruleDialog.localEnabled
+                        ? root.tr("dialog.rule.enabled-on", "Rule is enabled (applied to routing)")
+                        : root.tr("dialog.rule.enabled-off", "Rule is disabled (kept in the file, not applied)")
+                    Accessible.role: Accessible.CheckBox
+                    Accessible.name: text
+                }
+                // Absorbs the leftover row width so the click zone above stops at
+                // the label instead of stretching across the dialog.
+                Item { Layout.fillWidth: true }
+            }
+            // How far a domain rule actually reaches. A suffix rule matches every
+            // name under the value, most of which the user never listed — that is
+            // how a background client's own subdomain ends up routed. Stating the
+            // reach is cheap; discovering it from a blocked connection is not.
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: text !== ""
+                text: {
+                    if (root.uiRevision < 0) return ""
+                    var rt = ruleDialog.localRuleType
+                    if (rt !== "domain" && rt !== "suffix-domain") return ""
+                    var val = String(ruleDialog.localValue || "").trim()
+                    if (val === "") return ""
+                    if (Pure.isPublicSuffixValue(val)) {
+                        return root.tr("rules.value.public-suffix-warning",
+                            "{value} is a public registry, not one service: the rule would "
+                            + "route unrelated owners. Use a zone rule if that is what you want.")
+                            .replace("{value}", val)
+                    }
+                    // A plain domain rule already says how far it reaches, in the
+                    // coverage line above and in the words of the setting that
+                    // decides it. Saying it twice, in two wordings, read as two
+                    // different rules being described.
+                    if (rt !== "suffix-domain") return ""
+                    return root.tr("rules.value.suffix-reach",
+                        "Matches every name under {value}, including ones you did not list.")
                         .replace("{value}", val)
                 }
-                // A plain domain rule already says how far it reaches, in the
-                // coverage line above and in the words of the setting that
-                // decides it. Saying it twice, in two wordings, read as two
-                // different rules being described.
-                if (rt !== "suffix-domain") return ""
-                return root.tr("rules.value.suffix-reach",
-                    "Matches every name under {value}, including ones you did not list.")
-                    .replace("{value}", val)
             }
-        }
-        // Punycode/IDN hint. When the user types a
-        // non-ASCII hostname (e.g. `пример.рф`), surface the ASCII /
-        // Punycode form so they can verify what will reach the WFP
-        // filter engine. Auto-fill happens at save time; this label
-        // is just informational. Bridge-only — preview / Tray omits.
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            color: root.mutedTextColor
-            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
-            visible: text !== ""
-            text: {
-                if (root.uiRevision < 0) return ""
-                var rt = ruleDialog.localRuleType
-                if (rt !== "zone" && rt !== "domain" && rt !== "suffix-domain"
-                        && rt !== "exact-fqdn") return ""
-                var val = ruleDialog.localValue
-                if (!val) return ""
-                var ace = root._punycodeFor(val)
-                if (ace === "") return ""
-                return root.tr("rules.value.punycode-hint",
-                    "Punycode: {ace}").replace("{ace}", ace)
+            // Punycode/IDN hint. When the user types a
+            // non-ASCII hostname (e.g. `пример.рф`), surface the ASCII /
+            // Punycode form so they can verify what will reach the WFP
+            // filter engine. Auto-fill happens at save time; this label
+            // is just informational. Bridge-only — preview / Tray omits.
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                visible: text !== ""
+                text: {
+                    if (root.uiRevision < 0) return ""
+                    var rt = ruleDialog.localRuleType
+                    if (rt !== "zone" && rt !== "domain" && rt !== "suffix-domain"
+                            && rt !== "exact-fqdn") return ""
+                    var val = ruleDialog.localValue
+                    if (!val) return ""
+                    var ace = root._punycodeFor(val)
+                    if (ace === "") return ""
+                    return root.tr("rules.value.punycode-hint",
+                        "Punycode: {ace}").replace("{ace}", ace)
+                }
             }
         }
     }

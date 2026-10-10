@@ -127,13 +127,13 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
             if let Some(signing) = revision_signing.as_ref() {
                 coordinator = signing.sign(coordinator);
             }
-            // No-tray routing-user fallback: an
-            // activation with a dead tray subscription must still dispatch to
-            // the console-session user (service-driven scope), not to nobody.
+            // An activation must reach every served user — a dead tray
+            // subscription or no tray at all (service-driven scope) included.
             if let Some(rc) = route_coordinator.as_ref() {
                 let rc = Arc::clone(rc);
+                let registry = Arc::clone(&sid_registry);
                 coordinator = coordinator
-                    .with_fallback_routing_sid(Arc::new(move || rc.effective_routing_sid(&[])));
+                    .with_served_sids(Arc::new(move || rc.served_sids(&registry.active_sids())));
             }
             Some(Arc::new(coordinator))
         }

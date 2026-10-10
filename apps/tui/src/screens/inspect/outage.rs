@@ -1,5 +1,6 @@
 //! «Blocked while the route was down»: what leak protection held back during
-//! the last outage of the additional route, one row per program and address.
+//! the last outage of the additional route, one row per program and address,
+//! then the routed names that never resolved, as the GUI lists them.
 //! The same `conn-trace.outage-blocks.list` the GUI reads, on every visit and
 //! on `r`; it never refreshes by itself, so a row is not pulled from under
 //! someone reading it.
@@ -9,6 +10,7 @@ use nrr_ipc_client::IpcClient;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     ConnTraceOutageBlocksRequest, ConnTraceOutageBlocksResponse, OutageBlockDto,
+    OutageUnresolvedNameDto,
 };
 
 use super::{
@@ -30,12 +32,42 @@ pub struct OutageState {
     generation: u64,
 }
 
+/// One line of the list: a blocked address, or a name that got none.
+#[derive(Clone, Copy)]
+enum Row<'a> {
+    Blocked(&'a OutageBlockDto),
+    Unresolved(&'a OutageUnresolvedNameDto),
+}
+
 impl OutageState {
     fn entries(&self) -> &[OutageBlockDto] {
         self.answer
             .as_ref()
             .map(|a| a.entries.as_slice())
             .unwrap_or_default()
+    }
+
+    fn unresolved(&self) -> &[OutageUnresolvedNameDto] {
+        self.answer
+            .as_ref()
+            .map(|a| a.unresolved_names.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// Blocked addresses first, then names that did not resolve.
+    fn row_count(&self) -> usize {
+        self.entries().len() + self.unresolved().len()
+    }
+
+    fn row(&self, index: usize) -> Option<Row<'_>> {
+        let entries = self.entries();
+        match entries.get(index) {
+            Some(entry) => Some(Row::Blocked(entry)),
+            None => self
+                .unresolved()
+                .get(index - entries.len())
+                .map(Row::Unresolved),
+        }
     }
 
     /// The route is down right now.
@@ -72,7 +104,9 @@ fn load(app: &mut AppState) {
             state.loading = false;
             match result {
                 Ok(answer) => {
-                    state.pager.clamp(answer.entries.len());
+                    state
+                        .pager
+                        .clamp(answer.entries.len() + answer.unresolved_names.len());
                     state.answer = Some(answer);
                 }
                 Err(slug) => state.error = Some(slug),
@@ -86,18 +120,21 @@ pub struct OutageScreen;
 impl Screen for OutageScreen {
     fn view(&self, app: &AppState, texts: &Texts) -> ScreenView {
         let state = &app.inspect.outage;
-        let entries = state.entries();
+        let count = state.row_count();
         let mut pager = state.pager;
-        pager.clamp(entries.len());
-        let detail = entries
-            .get(pager.selected)
-            .map(|e| detail_lines(texts, e))
+        pager.clamp(count);
+        let detail = state
+            .row(pager.selected)
+            .map(|row| detail_lines(texts, row))
             .unwrap_or_default();
         let mut list = Vec::new();
-        if !entries.is_empty() {
+        if count > 0 {
             list.push(ViewLine::new(vec![Segment::strong(header(texts))]));
-            list.extend(page_lines(texts, pager, entries.len(), false, |row| {
-                row_text(&entries[row])
+            list.extend(page_lines(texts, pager, count, false, |index| {
+                state
+                    .row(index)
+                    .map(|row| row_text(texts, row))
+                    .unwrap_or_default()
             }));
         }
         let title = texts.get(ScreenId::OutageBlocks.title());
@@ -152,13 +189,13 @@ impl Screen for OutageScreen {
             return true;
         }
         let state = &mut app.inspect.outage;
-        let len = state.entries().len();
+        let len = state.row_count();
         state.pager.on_key(key.code, len)
     }
 
     fn on_line(&self, app: &mut AppState, line: &str) -> bool {
         let state = &mut app.inspect.outage;
-        let len = state.entries().len();
+        let len = state.row_count();
         match command(line) {
             ("n", "") => {
                 state.pager.next_page(len);
@@ -224,8 +261,12 @@ fn summary_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         && answer.observer_active
         && answer.gui_stream_enabled
         && answer.entries.is_empty()
+        && answer.unresolved_names.is_empty()
     {
         lines.push(ViewLine::text(texts.get(keys::OUTAGE_EMPTY)));
+    }
+    if !answer.unresolved_names.is_empty() {
+        lines.push(ViewLine::text(texts.get(keys::OUTAGE_UNRESOLVED_NOTE)));
     }
     if answer.omitted > 0 {
         lines.push(ViewLine::new(vec![Segment::strong(texts.fill(
@@ -255,15 +296,30 @@ fn header(texts: &Texts) -> String {
     .join(" | ")
 }
 
-fn row_text(e: &OutageBlockDto) -> String {
-    format!(
-        "{} | {} | {} | {} | {}",
-        process(e),
-        remote_text(e),
-        e.attempts,
-        clock_time(e.first_seen_ms),
-        clock_time(e.last_seen_ms),
-    )
+fn row_text(texts: &Texts, row: Row<'_>) -> String {
+    match row {
+        Row::Blocked(e) => format!(
+            "{} | {} | {} | {} | {}",
+            process(e),
+            remote_text(e),
+            e.attempts,
+            clock_time(e.first_seen_ms),
+            clock_time(e.last_seen_ms),
+        ),
+        Row::Unresolved(n) => format!(
+            "— | {} | {} | {} | {}",
+            unresolved_text(texts, n),
+            n.attempts,
+            clock_time(n.first_seen_ms),
+            clock_time(n.last_seen_ms),
+        ),
+    }
+}
+
+/// The name with the word that says why it has no address — never a colour
+/// alone, so plain mode and a screen reader carry it too.
+fn unresolved_text(texts: &Texts, n: &OutageUnresolvedNameDto) -> String {
+    format!("{} · {}", n.name, texts.get(keys::OUTAGE_UNRESOLVED))
 }
 
 fn process(e: &OutageBlockDto) -> &str {
@@ -294,7 +350,18 @@ fn remote_text(e: &OutageBlockDto) -> String {
     }
 }
 
-fn detail_lines(texts: &Texts, e: &OutageBlockDto) -> Vec<ViewLine> {
+fn detail_lines(texts: &Texts, row: Row<'_>) -> Vec<ViewLine> {
+    let e = match row {
+        Row::Blocked(e) => e,
+        Row::Unresolved(n) => {
+            return vec![
+                field(texts, keys::COL_REMOTE, &unresolved_text(texts, n)),
+                field(texts, keys::COL_ATTEMPTS, &n.attempts.to_string()),
+                field(texts, keys::COL_FIRST, &clock_time(n.first_seen_ms)),
+                field(texts, keys::COL_LAST, &clock_time(n.last_seen_ms)),
+            ];
+        }
+    };
     let mut lines = vec![field(texts, keys::COL_PROCESS, process(e))];
     if !e.process_path.is_empty() {
         lines.push(ViewLine::text(

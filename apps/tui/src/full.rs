@@ -15,7 +15,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::backend::{Backend, BackendEvent, Command};
 use crate::i18n::Texts;
 use crate::keys;
-use crate::screens::{connection_lines, screen, ScreenId, COMMON_HELP};
+use crate::screens::{connection_lines, menu_step, screen, MenuItem, ScreenId, COMMON_HELP};
 use crate::state::{AppState, Effect, Focus, NoticeLevel};
 use crate::view::{Panel, Tone, ViewLine};
 
@@ -133,11 +133,11 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, texts: &Texts) {
             app.focus = Focus::Feed;
         }
         KeyCode::Up => match app.focus {
-            Focus::Menu => app.open(app.screen.previous()),
+            Focus::Menu => menu_step(app, false),
             Focus::Feed => app.scroll = app.scroll.saturating_sub(1),
         },
         KeyCode::Down => match app.focus {
-            Focus::Menu => app.open(app.screen.next()),
+            Focus::Menu => menu_step(app, true),
             Focus::Feed => app.scroll = app.scroll.saturating_add(1),
         },
         KeyCode::PageUp if app.focus == Focus::Feed => app.scroll = app.scroll.saturating_sub(10),
@@ -190,20 +190,28 @@ pub fn header_lines(app: &AppState, texts: &Texts, options: RenderOptions) -> Ve
         .collect()
 }
 
-/// The menu: the current screen carries `>`; while the menu has the focus its
-/// row is also inverted, so focus never depends on colour. A sub-screen shows,
-/// indented under its parent, only while it is open.
+/// The menu: the current row carries `>`; while the menu has the focus it is
+/// also inverted, so focus never depends on colour. A sub-screen shows,
+/// indented under its parent, only while it is open; so do the Settings
+/// sections.
 pub fn menu_lines(app: &AppState, texts: &Texts) -> Vec<Line<'static>> {
-    ScreenId::ALL
-        .iter()
-        .filter(|&&id| id.hotkey().is_some() || id == app.screen)
-        .map(|&id| {
-            let current = id == app.screen;
+    let here = MenuItem::current(app);
+    MenuItem::shown(app)
+        .into_iter()
+        .map(|item| {
+            let current = item == here;
             let marker = if current { '>' } else { ' ' };
-            let title = texts.get(id.title());
-            let text = match id.hotkey() {
-                Some(key) => format!("{marker} {key} {title}"),
-                None => format!("{marker}     {title}"),
+            let text = match item {
+                MenuItem::Screen(id) => {
+                    let title = texts.get(id.title());
+                    match id.hotkey() {
+                        Some(key) => format!("{marker} {key} {title}"),
+                        None => format!("{marker}     {title}"),
+                    }
+                }
+                MenuItem::Section(category) => {
+                    format!("{marker}     {}", texts.get(category.title()))
+                }
             };
             if current && app.focus == Focus::Menu {
                 Line::styled(text, Style::default().add_modifier(Modifier::REVERSED))

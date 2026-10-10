@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use nrr_domain::user_principal::UserPrincipal;
 use nrr_platform_api::active_principals::ActivePrincipalSource;
 use nrr_platform_api::enforcement::{
-    plan_delta, ApplyReport, ChannelAvailability, EnforcementPlan, PolicyEnforcer,
+    plan_delta, ApplyReport, ChannelAvailability, ChannelReport, EnforcementPlan, PolicyEnforcer,
 };
 
 /// Produces one principal's neutral plan from the stored policy.
@@ -179,6 +179,11 @@ pub struct PrincipalEnforcementCycle {
     presence_listener: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
     /// Whether the last pass's authority named anybody.
     someone_present: AtomicBool,
+    /// The present user whose routes the service accounts follow.
+    route_owner: Arc<crate::route_table_owner::RouteTableOwner>,
+    /// Tells each present principal whether their channels carry their rules.
+    /// `None` reports nothing.
+    channel_status: Option<crate::channel_status::ChannelStatusPublisher>,
 }
 
 /// One line counting what changed between two passes, per principal. Counts
@@ -288,7 +293,44 @@ impl PrincipalEnforcementCycle {
             flow_reset: None,
             presence_listener: std::sync::OnceLock::new(),
             someone_present: AtomicBool::new(false),
+            route_owner: Arc::default(),
+            channel_status: None,
         }
+    }
+
+    /// Report each present principal's channel status on `board`, which the
+    /// snapshot serves and the outage list listens to; pushed through the
+    /// events attached with [`Self::with_events`].
+    #[must_use]
+    pub fn with_enforcement_status(
+        mut self,
+        board: crate::app_enforcement_status::RouteEnforcementStatus,
+    ) -> Self {
+        self.channel_status = Some(crate::channel_status::ChannelStatusPublisher::new(board));
+        self
+    }
+
+    /// The board this cycle reports on, when it reports.
+    pub fn enforcement_status(
+        &self,
+    ) -> Option<crate::app_enforcement_status::RouteEnforcementStatus> {
+        self.channel_status.as_ref().map(|p| p.board().clone())
+    }
+
+    /// Share the route-table owner with a consumer built before this cycle
+    /// (the enforcer, whose machine-scope rules follow the same user).
+    #[must_use]
+    pub fn with_route_table_owner(
+        mut self,
+        owner: Arc<crate::route_table_owner::RouteTableOwner>,
+    ) -> Self {
+        self.route_owner = owner;
+        self
+    }
+
+    /// Who owns the route table as of the last pass that read presence.
+    pub fn route_table_owner(&self) -> Arc<crate::route_table_owner::RouteTableOwner> {
+        Arc::clone(&self.route_owner)
     }
 
     /// Call `listener` after every pass that finds somebody present, with the
@@ -387,8 +429,8 @@ impl PrincipalEnforcementCycle {
             return CycleOutcome::Stopped;
         }
         let mut timings = crate::phase_timings::PhaseTimings::start();
-        let active = match self.principals.active_principals() {
-            Ok(active) => active,
+        let present = match self.principals.present_principals() {
+            Ok(present) => present,
             Err(e) => {
                 self.someone_present.store(false, Ordering::Release);
                 return CycleOutcome::AuthorityUnavailable {
@@ -397,16 +439,29 @@ impl PrincipalEnforcementCycle {
             }
         };
 
+        let owner = crate::route_table_owner::choose_route_table_owner(&present).cloned();
+        let active: Vec<UserPrincipal> = present.into_iter().map(|p| p.principal).collect();
         self.someone_present
             .store(!active.is_empty(), Ordering::Release);
-        let availability: Vec<ChannelAvailability> = active
+        let reports: Vec<ChannelReport> = active
             .iter()
-            .map(|principal| self.enforcer.channel_availability(principal))
+            .map(|principal| self.enforcer.channel_report(principal))
             .collect();
+        let availability: Vec<ChannelAvailability> =
+            reports.iter().map(ChannelReport::availability).collect();
+        // Before the skip below: a binding gone long enough is news although
+        // nothing the pass reads has moved.
+        if let Some(status) = self.channel_status.as_ref() {
+            status.observe(
+                self.events.as_deref(),
+                active.iter().map(UserPrincipal::as_stored).zip(&reports),
+                std::time::Instant::now(),
+            );
+        }
         let fingerprint = self
             .inputs
             .as_ref()
-            .and_then(|inputs| inputs.fingerprint(&(&active, &availability)));
+            .and_then(|inputs| inputs.fingerprint(&(&active, &availability, &owner)));
         timings.mark("authority");
         if skip_if_unchanged && !self.retry_requested.load(Ordering::Acquire) {
             if let (Some(inputs), Some(fp)) = (self.inputs.as_ref(), fingerprint) {
@@ -441,6 +496,9 @@ impl PrincipalEnforcementCycle {
 
         let changed = last.as_deref().map(Vec::as_slice) != Some(plans.as_slice());
         timings.mark("plan");
+
+        // Recorded before the enforcer runs, which may read it.
+        self.route_owner.record(owner.as_ref());
 
         // Planning above is not instant, and a stop can land inside it.
         if crate::teardown_in_progress() {
@@ -478,7 +536,12 @@ impl PrincipalEnforcementCycle {
                 // steering, and the caller reports that rather than discarding
                 // a policy that is already half in force.
                 let routes = self.routes.as_ref().map(|applier| {
-                    applier.apply(&plans).unwrap_or_else(|reason| {
+                    let pass = crate::route_apply::RoutePass {
+                        plans: &plans,
+                        present: &active,
+                        owner: owner.as_ref(),
+                    };
+                    applier.apply_pass(pass).unwrap_or_else(|reason| {
                         crate::route_apply::RouteApplyReport {
                             failure: Some(reason),
                             ..Default::default()
@@ -849,7 +912,7 @@ mod tests {
                     dst_port: None,
                     protocol: None,
                 },
-                principal: nrr_platform_api::enforcement::PrincipalScope(None),
+                principal: nrr_platform_api::enforcement::PrincipalScope::Machine,
                 app: nrr_platform_api::enforcement::AppScope::Any,
                 egress: nrr_platform_api::enforcement::EgressConstraint::Any,
                 coverage: Coverage::ConnectOnly,
@@ -1225,7 +1288,7 @@ mod tests {
                 dst_port: None,
                 protocol: None,
             },
-            principal: PrincipalScope(None),
+            principal: PrincipalScope::Machine,
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,
@@ -1435,7 +1498,7 @@ mod tests {
                                 dst_port: None,
                                 protocol: None,
                             },
-                            principal: PrincipalScope(Some(principal.clone())),
+                            principal: PrincipalScope::User(principal.clone()),
                             app: AppScope::Any,
                             egress: EgressConstraint::Any,
                             coverage: Coverage::ConnectOnly,
@@ -1491,5 +1554,559 @@ mod tests {
 
         assert!(matches!(c.tick(), CycleOutcome::Stopped));
         assert_eq!(enforcer.calls().len(), 1);
+    }
+
+    /// Without per-user routing one table serves everybody, so it carries the
+    /// owner's routes; with it, each user keeps their own.
+    mod route_table_owner {
+        use super::*;
+        use nrr_platform_api::active_principals::PresentPrincipal;
+        use nrr_platform_api::adapters::{
+            AdapterInfo, IfOperStatus, InterfaceType, MockAdapterEventSource,
+        };
+        use nrr_platform_api::enforcement::{
+            DstMatch, EgressBinding, EgressBindingSource, EgressRef, RouteIntent, RouteTableRef,
+        };
+        use nrr_platform_api::error::PlatformError;
+        use nrr_platform_api::route_table::RouteTablePort;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        const SHARED_HOST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
+        const ETH: u32 = 2;
+        const TUN: u32 = 7;
+
+        /// Presence the test moves between passes.
+        struct Seats(Mutex<Vec<PresentPrincipal>>);
+        impl ActivePrincipalSource for Seats {
+            fn active_principals(&self) -> Result<Vec<UserPrincipal>, ActivePrincipalError> {
+                Ok(self
+                    .present_principals()?
+                    .into_iter()
+                    .map(|p| p.principal)
+                    .collect())
+            }
+            fn present_principals(&self) -> Result<Vec<PresentPrincipal>, ActivePrincipalError> {
+                Ok(self.0.lock().unwrap_or_else(|p| p.into_inner()).clone())
+            }
+            fn authority(&self) -> &'static str {
+                "seats"
+            }
+        }
+
+        /// uid 1000 sends the shared host over the tunnel, uid 1001 over the
+        /// main link: one address, two answers.
+        struct Disagreeing;
+        impl PrincipalPlanSource for Disagreeing {
+            fn plan_for(
+                &self,
+                principal: &UserPrincipal,
+                _availability: ChannelAvailability,
+            ) -> Option<PlannedPolicy> {
+                let egress = match principal.as_unix_uid()? {
+                    1000 => EgressRef::Secondary,
+                    1001 => EgressRef::Primary,
+                    _ => return None,
+                };
+                Some(PlannedPolicy {
+                    plan: EnforcementPlan {
+                        principal: principal.clone(),
+                        flows: Vec::new(),
+                        routes: vec![RouteIntent {
+                            dst: DstMatch::HostV4(SHARED_HOST),
+                            egress,
+                            metric: crate::route_codegen::SECONDARY_ROUTE_METRIC,
+                            table: RouteTableRef::Main,
+                        }],
+                        policy_rules: Vec::new(),
+                    },
+                    protection_complete: true,
+                    fail_closed_blocks: 0,
+                })
+            }
+        }
+
+        struct BothBound;
+        impl EgressBindingSource for BothBound {
+            fn bindings_for(&self, _: &UserPrincipal) -> EgressBinding {
+                EgressBinding {
+                    primary: Some("eth0".into()),
+                    secondary: Some("tun0".into()),
+                }
+            }
+        }
+
+        fn link(name: &str, index: u32, gateway: Option<Ipv4Addr>) -> AdapterInfo {
+            AdapterInfo {
+                index,
+                adapter_name: name.to_owned(),
+                description: String::new(),
+                friendly_name: name.to_owned(),
+                mac: None,
+                interface_type: InterfaceType::Ethernet,
+                oper_status: IfOperStatus::Up,
+                ipv4_addresses: Vec::new(),
+                ipv6_addresses: Vec::new(),
+                gateways: gateway.into_iter().collect(),
+            }
+        }
+
+        fn present(uid: u32, at_seat: bool, signed_in_at: Option<u64>) -> PresentPrincipal {
+            PresentPrincipal {
+                principal: UserPrincipal::from_linux_uid(uid),
+                at_seat,
+                signed_in_at,
+            }
+        }
+
+        struct Rig {
+            cycle: PrincipalEnforcementCycle,
+            seats: Arc<Seats>,
+            table: Arc<nrr_platform_api::MockWindowsApi>,
+            enforcer: Arc<RecordingEnforcer>,
+        }
+
+        fn rig(initial: Vec<PresentPrincipal>) -> Rig {
+            let seats = Arc::new(Seats(Mutex::new(initial)));
+            let table = Arc::new(nrr_platform_api::MockWindowsApi::new());
+            let adapters = Arc::new(MockAdapterEventSource::new());
+            *adapters.adapters.lock().unwrap_or_else(|p| p.into_inner()) = vec![
+                link("eth0", ETH, Some(Ipv4Addr::new(192, 0, 2, 1))),
+                link("tun0", TUN, None),
+            ];
+            let enforcer = Arc::new(RecordingEnforcer::new(false));
+            let cycle = PrincipalEnforcementCycle::new(
+                Arc::clone(&seats) as Arc<dyn ActivePrincipalSource>,
+                Arc::new(Disagreeing),
+                Arc::clone(&enforcer) as Arc<dyn PolicyEnforcer>,
+            )
+            .with_routes(Arc::new(crate::route_apply::PlannedRouteApplier::new(
+                Arc::clone(&table) as Arc<dyn RouteTablePort>,
+                adapters,
+                Arc::new(BothBound),
+            )));
+            Rig {
+                cycle,
+                seats,
+                table,
+                enforcer,
+            }
+        }
+
+        impl Rig {
+            fn seat(&self, now: Vec<PresentPrincipal>) {
+                *self.seats.0.lock().unwrap_or_else(|p| p.into_inner()) = now;
+            }
+
+            /// Interfaces the shared host is routed through.
+            fn shared_host_links(&self) -> Vec<u32> {
+                self.table
+                    .get_ip_forward_table()
+                    .expect("table")
+                    .iter()
+                    .filter(|r| r.destination == IpAddr::V4(SHARED_HOST))
+                    .map(|r| r.interface_index)
+                    .collect()
+            }
+
+            fn owner_uid(&self) -> Option<u32> {
+                self.cycle
+                    .route_table_owner()
+                    .current()
+                    .and_then(|p| p.as_unix_uid())
+            }
+        }
+
+        /// Hands every user a table of their own; the service accounts get
+        /// table 1.
+        struct PerUser;
+        impl nrr_platform_api::route_table::PrincipalRoutingPort for PerUser {
+            fn table_for(&self, principal: &UserPrincipal) -> Option<RouteTableRef> {
+                principal.as_unix_uid().map(RouteTableRef::Tagged)
+            }
+            fn system_table(&self) -> RouteTableRef {
+                RouteTableRef::Tagged(1)
+            }
+            fn is_principal_table(&self, table: &RouteTableRef) -> bool {
+                matches!(table, RouteTableRef::Tagged(1 | 1000 | 1001))
+            }
+            fn reconcile_selectors(
+                &self,
+                _plan: &nrr_platform_api::route_table::SelectorPlan,
+            ) -> Result<nrr_platform_api::route_table::SelectorDelta, PlatformError> {
+                Ok(Default::default())
+            }
+            fn clear_selectors(&self) -> Result<usize, PlatformError> {
+                Ok(0)
+            }
+        }
+
+        #[test]
+        fn with_per_user_routing_each_user_keeps_their_own_route() {
+            let seats = Arc::new(Seats(Mutex::new(vec![
+                present(1000, true, Some(50)),
+                present(1001, false, Some(10)),
+            ])));
+            let table = Arc::new(nrr_platform_api::MockWindowsApi::new());
+            let adapters = Arc::new(MockAdapterEventSource::new());
+            *adapters.adapters.lock().unwrap_or_else(|p| p.into_inner()) = vec![
+                link("eth0", ETH, Some(Ipv4Addr::new(192, 0, 2, 1))),
+                link("tun0", TUN, None),
+            ];
+            let cycle = PrincipalEnforcementCycle::new(
+                seats as Arc<dyn ActivePrincipalSource>,
+                Arc::new(Disagreeing),
+                Arc::new(RecordingEnforcer::new(false)) as Arc<dyn PolicyEnforcer>,
+            )
+            .with_routes(Arc::new(
+                crate::route_apply::PlannedRouteApplier::new(
+                    Arc::clone(&table) as Arc<dyn RouteTablePort>,
+                    adapters,
+                    Arc::new(BothBound),
+                )
+                .with_principal_routing(Arc::new(PerUser)),
+            ));
+
+            assert!(matches!(cycle.tick(), CycleOutcome::Applied { .. }));
+
+            let mut links: Vec<(RouteTableRef, u32)> = table
+                .get_ip_forward_table()
+                .expect("table")
+                .into_iter()
+                .filter(|r| r.destination == IpAddr::V4(SHARED_HOST))
+                .map(|r| (r.table, r.interface_index))
+                .collect();
+            links.sort_by_key(|(t, _)| format!("{t:?}"));
+            assert_eq!(
+                links,
+                vec![
+                    (RouteTableRef::Tagged(1), TUN),
+                    (RouteTableRef::Tagged(1000), TUN),
+                    (RouteTableRef::Tagged(1001), ETH),
+                ],
+                "each user's own route, the seat user's for the system",
+            );
+        }
+
+        #[test]
+        fn only_the_owner_s_route_for_a_shared_address_lands() {
+            let r = rig(vec![
+                present(1000, true, Some(50)),
+                present(1001, false, Some(10)),
+            ]);
+            assert!(matches!(r.cycle.tick(), CycleOutcome::Applied { .. }));
+            assert_eq!(r.shared_host_links(), vec![TUN], "the seat user's route");
+            assert_eq!(r.owner_uid(), Some(1000));
+            assert_eq!(
+                r.enforcer.calls(),
+                vec![vec!["unix:uid:1000".to_owned(), "unix:uid:1001".to_owned()]],
+                "both users' filters stay in force",
+            );
+
+            r.seat(vec![
+                present(1000, false, Some(50)),
+                present(1001, true, Some(10)),
+            ]);
+            r.cycle.tick();
+            assert_eq!(
+                r.shared_host_links(),
+                vec![ETH],
+                "the table follows the seat"
+            );
+            assert_eq!(r.owner_uid(), Some(1001));
+        }
+
+        #[test]
+        fn with_nobody_at_a_seat_the_earliest_sign_in_owns_the_table() {
+            let r = rig(vec![
+                present(1000, false, Some(50)),
+                present(1001, false, Some(10)),
+            ]);
+            r.cycle.tick();
+            assert_eq!(r.shared_host_links(), vec![ETH]);
+            assert_eq!(r.owner_uid(), Some(1001));
+        }
+
+        #[test]
+        fn when_the_owner_leaves_the_next_one_s_routes_take_over() {
+            let r = rig(vec![
+                present(1001, false, Some(10)),
+                present(1000, false, Some(50)),
+            ]);
+            r.cycle.tick();
+            assert_eq!(r.shared_host_links(), vec![ETH]);
+
+            r.seat(vec![present(1000, false, Some(50))]);
+            r.cycle.tick();
+            assert_eq!(r.shared_host_links(), vec![TUN]);
+            assert_eq!(r.owner_uid(), Some(1000));
+        }
+
+        #[test]
+        fn nobody_present_leaves_no_routes() {
+            let r = rig(vec![present(1000, true, Some(50))]);
+            r.cycle.tick();
+            assert_eq!(r.shared_host_links(), vec![TUN]);
+
+            r.seat(Vec::new());
+            r.cycle.tick();
+            assert!(r.shared_host_links().is_empty());
+            assert_eq!(r.owner_uid(), None);
+        }
+
+        /// Switching the seat between two signed-in users leaves the present
+        /// set as it was; the owner is what moved.
+        #[test]
+        fn a_seat_switch_is_not_skipped_as_unchanged() {
+            let Rig {
+                cycle,
+                seats,
+                table,
+                enforcer,
+            } = rig(vec![
+                present(1000, true, Some(50)),
+                present(1001, false, Some(10)),
+            ]);
+            let r = Rig {
+                cycle: cycle.with_pass_inputs(
+                    crate::pass_inputs::PassInputs::new().with_source("test", Arc::new(|| Some(1))),
+                ),
+                seats,
+                table,
+                enforcer,
+            };
+            r.cycle.tick_if_changed_logged("timer");
+            assert!(matches!(
+                r.cycle.tick_if_changed_logged("timer"),
+                CycleOutcome::Unchanged
+            ));
+
+            r.seat(vec![
+                present(1000, false, Some(50)),
+                present(1001, true, Some(10)),
+            ]);
+            assert!(!matches!(
+                r.cycle.tick_if_changed_logged("timer"),
+                CycleOutcome::Unchanged
+            ));
+            assert_eq!(r.shared_host_links(), vec![ETH]);
+        }
+    }
+
+    /// What the cycle tells each present principal about their own channels.
+    mod channel_status {
+        use super::*;
+        use nrr_platform_api::enforcement::{ChannelState, EnforcementFailure};
+        use nrr_shared::ipc_payloads::StatusUpdateEvent;
+        use std::collections::HashMap;
+
+        /// Every plan applies; each principal's channels read as the test set
+        /// them, usable until then.
+        #[derive(Default)]
+        struct Channels(Mutex<HashMap<String, ChannelReport>>);
+        impl Channels {
+            fn set_secondary(&self, principal: &UserPrincipal, secondary: ChannelState) {
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                    principal.as_stored().to_owned(),
+                    ChannelReport {
+                        primary: ChannelState::Usable,
+                        secondary,
+                    },
+                );
+            }
+        }
+        impl PolicyEnforcer for Channels {
+            fn enforce(
+                &self,
+                plans: &[EnforcementPlan],
+            ) -> Result<ApplyReport, EnforcementFailure> {
+                Ok(ApplyReport {
+                    applied: plans.len(),
+                    skipped: 0,
+                    failed: 0,
+                    notes: Vec::new(),
+                })
+            }
+            fn channel_availability(&self, principal: &UserPrincipal) -> ChannelAvailability {
+                self.channel_report(principal).availability()
+            }
+            fn channel_report(&self, principal: &UserPrincipal) -> ChannelReport {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(principal.as_stored())
+                    .cloned()
+                    .unwrap_or(ChannelReport {
+                        primary: ChannelState::Usable,
+                        secondary: ChannelState::Usable,
+                    })
+            }
+            fn teardown(&self) -> Result<(), EnforcementFailure> {
+                Ok(())
+            }
+        }
+
+        struct Rig {
+            cycle: PrincipalEnforcementCycle,
+            channels: Arc<Channels>,
+            bus: Arc<crate::ipc_handlers::event_bus::EventBus>,
+            outages: Arc<crate::outage_blocks::OutageBlocks>,
+        }
+
+        fn rig() -> Rig {
+            let channels = Arc::new(Channels::default());
+            let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+            let outages = Arc::new(crate::outage_blocks::OutageBlocks::new());
+            let board = crate::app_enforcement_status::RouteEnforcementStatus::new();
+            assert!(board.watch_outages(Arc::clone(&outages)));
+            let cycle = PrincipalEnforcementCycle::new(
+                Arc::new(ScriptedPrincipals {
+                    answer: Some(vec![uid(1000), uid(1001)]),
+                }),
+                Arc::new(PlanEveryone {
+                    without_policy: Vec::new(),
+                }),
+                Arc::clone(&channels) as Arc<dyn PolicyEnforcer>,
+            )
+            .with_events(Arc::clone(&bus))
+            .with_enforcement_status(board);
+            Rig {
+                cycle,
+                channels,
+                bus,
+                outages,
+            }
+        }
+
+        /// `(role, status)` of every status push `principal`'s client got.
+        fn heard(
+            bus: &crate::ipc_handlers::event_bus::EventBus,
+            principal: &UserPrincipal,
+        ) -> Vec<(String, String)> {
+            let sub = bus.subscribe_as(
+                format!("gui-{}", principal.as_stored()),
+                Some(principal.as_stored().to_owned()),
+                Some(0),
+            );
+            bus.peek_pending_for(&sub.subscription_id, 256)
+                .into_iter()
+                .filter_map(|e| match e.event {
+                    StatusUpdateEvent::EnforcementStatusChanged { status, role, .. } => {
+                        Some((role, status))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn said(role: &str, status: &str) -> (String, String) {
+            (role.to_owned(), status.to_owned())
+        }
+
+        #[test]
+        fn a_tunnel_going_down_is_told_once_and_only_to_its_owner() {
+            let r = rig();
+            r.cycle.tick();
+            let healthy = vec![said("primary", "ok"), said("secondary", "ok")];
+            assert_eq!(heard(&r.bus, &uid(1000)), healthy);
+
+            r.channels.set_secondary(&uid(1000), ChannelState::Down);
+            r.cycle.tick();
+            r.cycle.tick();
+            let mut down = healthy.clone();
+            down.push(said("secondary", "secondary-down"));
+            assert_eq!(
+                heard(&r.bus, &uid(1000)),
+                down,
+                "an unchanged pass is not news"
+            );
+            assert_eq!(
+                heard(&r.bus, &uid(1001)),
+                healthy,
+                "another user's link is not theirs"
+            );
+
+            let board = r.cycle.enforcement_status().expect("wired");
+            assert_eq!(
+                board
+                    .status_of(uid(1000).as_stored(), "secondary")
+                    .as_deref(),
+                Some("secondary-down"),
+                "a client that connects later reads the standing status",
+            );
+
+            r.channels.set_secondary(&uid(1000), ChannelState::Usable);
+            r.cycle.tick();
+            let mut back = down;
+            back.push(said("secondary", "ok"));
+            assert_eq!(heard(&r.bus, &uid(1000)), back);
+        }
+
+        #[test]
+        fn the_outage_list_opens_and_closes_with_the_owners_tunnel() {
+            let r = rig();
+            r.cycle.tick();
+            assert_eq!(r.outages.snapshot(uid(1000).as_stored()).episode, None);
+
+            r.channels.set_secondary(&uid(1000), ChannelState::Down);
+            r.cycle.tick();
+            let open = r.outages.snapshot(uid(1000).as_stored()).episode;
+            assert!(open.is_some_and(|e| e.until_ms.is_none()), "{open:?}");
+            assert_eq!(r.outages.snapshot(uid(1001).as_stored()).episode, None);
+
+            r.channels.set_secondary(&uid(1000), ChannelState::Usable);
+            r.cycle.tick();
+            let closed = r.outages.snapshot(uid(1000).as_stored()).episode;
+            assert!(closed.is_some_and(|e| e.until_ms.is_some()), "{closed:?}");
+        }
+
+        /// Read before the skip: a change the plans cannot see is still told.
+        #[test]
+        fn a_skipped_pass_still_reports() {
+            let Rig {
+                cycle, channels, ..
+            } = rig();
+            let cycle = cycle.with_pass_inputs(
+                crate::pass_inputs::PassInputs::new().with_source("test", Arc::new(|| Some(1))),
+            );
+            channels.set_secondary(&uid(1001), ChannelState::Down);
+            assert!(matches!(
+                cycle.tick_if_changed_logged("timer"),
+                CycleOutcome::Applied { .. }
+            ));
+            // Unbinding a link that was down leaves every plan as it was.
+            channels.set_secondary(&uid(1001), ChannelState::Unbound);
+            assert!(matches!(
+                cycle.tick_if_changed_logged("timer"),
+                CycleOutcome::Unchanged
+            ));
+            let board = cycle.enforcement_status().expect("wired");
+            assert_eq!(
+                board
+                    .status_of(uid(1001).as_stored(), "secondary")
+                    .as_deref(),
+                Some("ok"),
+                "the outage ends with the binding",
+            );
+        }
+
+        #[test]
+        fn without_a_board_nothing_is_reported() {
+            let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+            let channels = Arc::new(Channels::default());
+            channels.set_secondary(&uid(1000), ChannelState::Down);
+            let cycle = PrincipalEnforcementCycle::new(
+                Arc::new(ScriptedPrincipals {
+                    answer: Some(vec![uid(1000)]),
+                }),
+                Arc::new(PlanEveryone {
+                    without_policy: Vec::new(),
+                }),
+                channels,
+            )
+            .with_events(Arc::clone(&bus));
+            cycle.tick();
+            assert!(cycle.enforcement_status().is_none());
+            assert!(heard(&bus, &uid(1000)).is_empty());
+        }
     }
 }

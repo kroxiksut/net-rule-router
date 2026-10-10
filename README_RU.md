@@ -292,6 +292,7 @@ explain mode, защита от утечки, предлагаемые адре�
 | [`docs/ru/quickstart.md`](docs/ru/quickstart.md) | Быстрый старт: от установки до первого применённого правила |
 | [`docs/ru/routing-modes.md`](docs/ru/routing-modes.md) | Переключатели маршрутизации: что даёт каждый и как их сочетать |
 | [`docs/ru/what-routing-changes.md`](docs/ru/what-routing-changes.md) | Кто что видит, когда сайт идёт по правилу, и чего маршрутизация сознательно не трогает |
+| [`docs/ru/several-users.md`](docs/ru/several-users.md) | Несколько вошедших одновременно: правила действуют у всех, и единственное ограничение на Windows |
 | [`docs/ru/blocked-site-browser-errors.md`](docs/ru/blocked-site-browser-errors.md) | Что означает ошибка браузера, когда маршрутизируемый сайт не открывается |
 | [`docs/ru/cache-and-seeding.md`](docs/ru/cache-and-seeding.md) | Как заполняется кэш FQDN/IP, включая засев из истории браузера |
 | [`docs/ru/where-files-live.md`](docs/ru/where-files-live.md) | Где хранятся настройки, правила, кэши и логи |

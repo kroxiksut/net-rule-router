@@ -420,6 +420,9 @@ SystemTrayIcon {
             case "enforcement-status-changed":
                 _onEnforcementStatusChanged(event)
                 break
+            case "routes-held-by-another-user":
+                _onRoutesHeldByAnotherUser(event)
+                break
             case "unassigned-tunnel-detected":
                 _onUnassignedTunnel(event)
                 break
@@ -984,7 +987,7 @@ SystemTrayIcon {
             })
         }
         var body = tr("notifications.verify-verdicts.body",
-            "They do get through over the other route and use it until the next restart. “Move” writes them there for good; “Not now” keeps them as written and checks again after the restart.")
+            "They do get through over the other route and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.")
         if (notice.more > 0) {
             body += "\n" + tr("notifications.block-notice.backlog.more", "and {count} more")
                 .replace("{count}", String(notice.more))
@@ -2231,6 +2234,49 @@ SystemTrayIcon {
                     accent: true
                 },
                 secondaryAction: tray._noticeMuteAction("unassigned-tunnel"),
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    /// The set of held destinations last announced ("" while none is held),
+    /// so the same set is not raised twice.
+    property string _routesHeldShown: ""
+
+    /// Some of this user's destinations follow another signed-in user's route.
+    /// Said once per change; when it ends, a notice still waiting is dropped.
+    function _onRoutesHeldByAnotherUser(event) {
+        var count = Number(event.count || 0)
+        var sample = (event.sample instanceof Array) ? event.sample : []
+        if (count <= 0) {
+            _routesHeldShown = ""
+            var kept = _noticeQueue.filter(function(n) { return n.kind !== "routes-held" })
+            if (kept.length !== _noticeQueue.length) _noticeQueue = kept
+            return
+        }
+        var signature = String(count) + "|" + sample.join(",")
+        if (_routesHeldShown === signature) return
+        _routesHeldShown = signature
+        if (!showNotifications) {
+            console.log("tray routes-held notice: suppressed — notifications are off")
+            return
+        }
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) return
+        _offerNotice("routes-held", "routes-held", function() {
+            if (tray._routesHeldShown !== signature) {
+                tray._scheduleDrain()
+                return
+            }
+            promptWindow.present({
+                titleText: tr("notifications.routes-held.title",
+                    "Some addresses follow another user's route"),
+                bodyText: tr("notifications.routes-held.body",
+                        "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their route, or are blocked for you if leak protection is on. Among them: {list}.")
+                    .replace("{count}", String(count))
+                    .replace("{list}", sample.join(", ")),
+                secondaryAction: tray._noticeMuteAction("routes-held"),
                 dismissActionId: "enforcement-dismiss",
                 autoRetireMs: tray._enforcementNoticeMs
             })

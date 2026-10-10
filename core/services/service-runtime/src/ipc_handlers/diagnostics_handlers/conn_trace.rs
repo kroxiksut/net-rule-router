@@ -5,6 +5,7 @@ use super::*;
 
 use nrr_shared::ipc_payloads::{
     ConnTraceOutageBlocksRequest, ConnTraceOutageBlocksResponse, OutageBlockDto, OutageEpisodeDto,
+    OutageUnresolvedNameDto,
 };
 
 /// The local own-machine viewer shows real addresses and full exe paths, like
@@ -347,6 +348,7 @@ impl IpcHandler for ConnTraceOutageBlocksListHandler {
             entries: Vec::new(),
             omitted: 0,
             redacted: false,
+            unresolved_names: Vec::new(),
             observer_active,
             gui_stream_enabled,
         };
@@ -383,6 +385,16 @@ impl IpcHandler for ConnTraceOutageBlocksListHandler {
                 attempts: e.attempts,
             })
             .collect();
+        let unresolved_names = snapshot
+            .unresolved
+            .into_iter()
+            .map(|n| OutageUnresolvedNameDto {
+                name: n.name,
+                first_seen_ms: wire_ms(n.first_seen_ms),
+                last_seen_ms: wire_ms(n.last_seen_ms),
+                attempts: n.attempts,
+            })
+            .collect();
         serialise(
             OP,
             &ConnTraceOutageBlocksResponse {
@@ -391,8 +403,9 @@ impl IpcHandler for ConnTraceOutageBlocksListHandler {
                     until_unix_ms: ep.until_ms.map(wire_ms),
                 }),
                 entries,
-                omitted: snapshot.omitted,
+                omitted: snapshot.omitted.saturating_add(snapshot.unresolved_omitted),
                 redacted: false,
+                unresolved_names,
                 observer_active,
                 gui_stream_enabled: true,
             },

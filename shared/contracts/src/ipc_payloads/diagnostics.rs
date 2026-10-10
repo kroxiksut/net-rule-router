@@ -496,6 +496,17 @@ pub struct OutageBlockDto {
     pub attempts: u32,
 }
 
+/// A name the caller's programs asked for during the outage that got no
+/// address, so no connection was made: no program, no address.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutageUnresolvedNameDto {
+    pub name: String,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    pub attempts: u32,
+}
+
 /// Wire response for `ConnTraceOutageBlocksList`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -507,12 +518,16 @@ pub struct ConnTraceOutageBlocksResponse {
     /// Most recently attempted first.
     #[serde(default)]
     pub entries: Vec<OutageBlockDto>,
-    /// Folded entries dropped to keep the list bounded, oldest first. Nonzero
-    /// means the list is incomplete and the GUI must say so.
+    /// Entries and names dropped to keep the lists bounded, oldest first.
+    /// Nonzero means the list is incomplete and the GUI must say so.
     #[serde(default)]
     pub omitted: u32,
     /// `true` when the compact redaction tier is active (IPs masked).
     pub redacted: bool,
+    /// Names that did not resolve, most recently asked first. Absent from an
+    /// older service.
+    #[serde(default)]
+    pub unresolved_names: Vec<OutageUnresolvedNameDto>,
     /// `false` when nothing can see these drops on this machine, so an empty
     /// list means "not watching" rather than "nothing was blocked".
     #[serde(default = "default_true")]

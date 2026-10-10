@@ -448,8 +448,23 @@ pub fn log_observed_connection(rec: &ConnectionTraceRecord) {
 /// SID + rules per call.
 pub struct ConnectionObservationConsumer {
     api: Arc<dyn RouteTablePort>,
-    coordinator: Arc<SecondaryRouteCoordinator>,
+    /// A principal's usable `(primary, secondary)` interface indexes.
+    egress_of: EgressIfindexesFn,
     active_sid: ActiveSidFn,
+    /// Label each connection against its OWN user's links rather than the
+    /// active user's — where several users each bind links of their own.
+    owner_scoped: bool,
+    /// Per owner, the outage episode (its start) whose notice went out. Read
+    /// only under [`Self::owner_scoped`], where one machine-wide latch would
+    /// let one user's outage silence another's.
+    outage_announced_for: Mutex<std::collections::HashMap<String, u64>>,
+    /// Classifier for the "no rule covers this host" catch-all, for a platform
+    /// whose drop ids name their role directly. `None` derives the id from the
+    /// codegen hash instead.
+    not_covered_drop_check: Option<KillswitchDropCheckFn>,
+    /// Folds a socket-table row into the drop report of the same connection.
+    /// `None` where the sources never describe one connection twice.
+    drop_pairing: Option<Mutex<drop_pairing::DropSocketPairing>>,
     /// Whether to emit the per-connection detail line (process + remote IP +
     /// egress) to the operational NDJSON. Shared with the settings writer so
     /// the toggle applies without a restart; read once per batch. The
@@ -509,6 +524,11 @@ pub struct ConnectionObservationConsumer {
     /// `None` leaves such a drop reported as a rule block, which is the one
     /// reading that sends the user editing rules over a switch.
     dns_lockdown_drop_check: Option<KillswitchDropCheckFn>,
+    /// Classifier for the service-account twins of the owner's guard: `true`
+    /// when the dropping filter guards system traffic. Such a drop may teach a
+    /// tunnel endpoint and nothing else — no notice, no outage row, no name
+    /// learning, no flow reset. `None` treats every drop as a user's.
+    service_account_drop_check: Option<KillswitchDropCheckFn>,
     /// Proactive VPN-client learning — when wired, the OBSERVED
     /// PROCESS PATH of every role-verified kill-switch drop from a VPN-named
     /// process is handed to this sink, which registers the client for an
@@ -625,6 +645,10 @@ const MAX_STALE_FLOW_RESETS_PER_BATCH: usize = 64;
 /// learned server is exempted on the next recompute. `Send + Sync` so the
 /// consumer can live behind an `Arc` shared with the supervised task.
 pub type VpnEndpointLearnFn = Arc<dyn Fn(std::net::Ipv4Addr) + Send + Sync>;
+
+/// A principal's usable `(primary, secondary)` interface indexes; `None` for a
+/// link unbound, absent or (secondary) declared dead.
+pub type EgressIfindexesFn = Arc<dyn Fn(&str) -> (Option<u32>, Option<u32>) + Send + Sync>;
 
 /// Delete one `(app, destination)` pair from the cross-session store, so a
 /// withdrawal survives the restart that would otherwise re-seed it.
@@ -774,6 +798,7 @@ mod builder;
 mod companion;
 mod connection_facts;
 mod consume;
+mod drop_pairing;
 mod drop_reporter;
 mod stall_evidence;
 mod trace_tee;
@@ -786,5 +811,7 @@ use connection_facts::{
     process_is_p2p_fcrdns_suppressed, process_name_matches_vpn,
 };
 
+#[cfg(test)]
+mod owner_tests;
 #[cfg(test)]
 mod tests;

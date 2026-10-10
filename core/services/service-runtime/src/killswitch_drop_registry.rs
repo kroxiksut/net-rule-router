@@ -45,6 +45,10 @@
 //!   to a public resolver of its own instead of the one policy provides, which
 //!   is neither the tunnel's business nor a rule the user wrote. Like the v6
 //!   cut it is identifiable but never role-verifying.
+//! - **service-accounts** — the owner's pins twinned for system traffic. Role-
+//!   verifying (a tunnel client running as a service still teaches its
+//!   endpoint), but no user's drop: notices, the outage list and name learning
+//!   skip it.
 
 use std::collections::HashSet;
 use std::sync::RwLock;
@@ -61,6 +65,8 @@ pub struct ScopedBlockIds {
     pub ipv6_cut: HashSet<u64>,
     /// The DoH/DoT lockdown band; identifiable, never role-verifying.
     pub dns_lockdown: HashSet<u64>,
+    /// Subset of `all` scoped to the machine's service accounts.
+    pub service_accounts: HashSet<u64>,
 }
 
 impl ScopedBlockIds {
@@ -146,6 +152,17 @@ impl KillswitchBlockFilterRegistry {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .app_scoped
+            .contains(&id)
+    }
+
+    /// Whether `id` guards the machine's service accounts. Such a drop is
+    /// system traffic, not the user's: it may teach a tunnel endpoint, and
+    /// nothing else may read it.
+    pub fn is_service_account(&self, id: u64) -> bool {
+        self.blocks
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .service_accounts
             .contains(&id)
     }
 }
@@ -276,5 +293,18 @@ mod tests {
         }
         .is_empty());
         assert!(ScopedBlockIds::default().is_empty());
+    }
+
+    #[test]
+    fn service_account_ids_verify_a_drop_and_stay_identifiable() {
+        let registry = KillswitchBlockFilterRegistry::new();
+        registry.publish_scoped(ScopedBlockIds {
+            all: HashSet::from([1, 2]),
+            service_accounts: HashSet::from([2]),
+            ..ScopedBlockIds::default()
+        });
+        assert!(registry.contains(2));
+        assert!(registry.is_service_account(2));
+        assert!(!registry.is_service_account(1));
     }
 }

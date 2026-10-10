@@ -186,6 +186,11 @@ impl IpcHandler for SnapshotInitialHandler {
         } else {
             self.route_enforcement.for_principal(ctx.caller_stored())
         };
+        let routes_held_by_another_user = if ctx.caller_stored().is_empty() {
+            None
+        } else {
+            self.route_enforcement.routes_held(ctx.caller_stored())
+        };
 
         let resp = SnapshotInitialResponse {
             health,
@@ -206,6 +211,7 @@ impl IpcHandler for SnapshotInitialHandler {
             kill_switch_block_all_armed,
             rule_conflicts,
             enforcement_status,
+            routes_held_by_another_user,
         };
         serde_json::to_value(resp).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
@@ -497,5 +503,57 @@ mod tests {
             anonymous.get("enforcement-status").is_none(),
             "a caller with no principal is shown nobody's"
         );
+    }
+
+    /// A client that connects after another user took some of its
+    /// destinations learns it here — its own report only.
+    #[test]
+    fn surfaces_only_the_callers_routes_held_by_another_user() {
+        use nrr_domain::user_principal::UserPrincipal;
+        use nrr_shared::ipc_payloads::RoutesHeldDto;
+        let caller = UserPrincipal::from_linux_uid(1000);
+        let other = UserPrincipal::from_linux_uid(1001);
+        let board = crate::app_enforcement_status::RouteEnforcementStatus::new();
+        let held = RoutesHeldDto {
+            count: 1,
+            sample: vec!["198.51.100.1".into()],
+        };
+        board.record_routes_held(caller.as_stored(), held.clone());
+        let h = SnapshotInitialHandler::new(
+            Arc::new(FakeHealth {
+                state: ServiceRuntimeState::Running,
+                severity: ServiceHealthSeverity::Ok,
+            }),
+            Arc::new(FakePolicy { revision: None }),
+            Arc::new(FakeAdapters::empty()),
+            Arc::new(FakeDiagnostics::healthy()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutePolicy::default()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeApplyFailurePolicy),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutingPause),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeAutostart),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRetention),
+            AppEnforcementStatus::new(),
+            crate::app_enforcement_status::SharedIpExemptionStatus::new(),
+            crate::app_enforcement_status::BlockAllPostureStatus::new(),
+        )
+        .with_route_enforcement_status(board);
+
+        let own = IpcRequestContext {
+            caller_principal: Some(caller),
+            ..ctx()
+        };
+        let resp = h.handle(&req(), &own).unwrap();
+        assert_eq!(resp["routes-held-by-another-user"]["count"], 1);
+        let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
+        assert_eq!(parsed.routes_held_by_another_user, Some(held));
+
+        let theirs = IpcRequestContext {
+            caller_principal: Some(other),
+            ..ctx()
+        };
+        let resp = h.handle(&req(), &theirs).unwrap();
+        assert!(resp.get("routes-held-by-another-user").is_none());
+        let anonymous = h.handle(&req(), &ctx()).unwrap();
+        assert!(anonymous.get("routes-held-by-another-user").is_none());
     }
 }

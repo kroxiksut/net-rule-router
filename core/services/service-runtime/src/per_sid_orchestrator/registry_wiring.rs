@@ -39,6 +39,11 @@ pub fn wire_orchestrator_to_registry(
 /// agree on the enforced user even when no tray/GUI process is running.
 pub type FallbackRoutingSidFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// Everyone whose rules are in force right now, tray or no tray — every user
+/// signed in at the console or remotely under service-driven scope. Production
+/// answers with the route coordinator's served set.
+pub type ServedSidsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Production [`RoutePolicyApplyTrigger`].
 ///
 /// Fired by `RoutePolicyUpdateHandler` after a successful per-SID policy
@@ -57,6 +62,8 @@ pub struct OrchestratorRoutePolicyApplyTrigger {
     orchestrator: Arc<PerSidApplyOrchestrator>,
     registry: Arc<ActiveSidRegistry>,
     fallback_routing_sid: Option<FallbackRoutingSidFn>,
+    /// Every served user; a tray-less one counts like a connected tray.
+    served_sids: Option<ServedSidsFn>,
     /// "is this SID routing-paused?". A
     /// policy edit (e.g. reset-to-baseline) by a paused user must NOT reinstall
     /// their WFP filters — the other three enforcement paths already subtract
@@ -78,8 +85,17 @@ impl OrchestratorRoutePolicyApplyTrigger {
             orchestrator,
             registry,
             fallback_routing_sid: None,
+            served_sids: None,
             paused_check: None,
         }
+    }
+
+    /// Attach the served set, so a policy change by any signed-in user
+    /// recompiles their filters, not only the first one's.
+    #[must_use]
+    pub fn with_served_sids(mut self, served: ServedSidsFn) -> Self {
+        self.served_sids = Some(served);
+        self
     }
 
     /// attach the no-tray routing-user fallback.
@@ -104,12 +120,16 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger
     fn on_policy_changed(&self, sid: &str) {
         let tray_active = self.registry.active_sids().iter().any(|s| s == sid);
         let console_active = !tray_active
-            && self
+            && (self
                 .fallback_routing_sid
                 .as_ref()
                 .and_then(|f| f())
                 .as_deref()
-                == Some(sid);
+                == Some(sid)
+                || self
+                    .served_sids
+                    .as_ref()
+                    .is_some_and(|served| served().iter().any(|s| s == sid)));
         if !tray_active && !console_active {
             // Not routing-active — the new policy applies when the SID next
             // becomes routing-active via the reconcile listener. Installing now

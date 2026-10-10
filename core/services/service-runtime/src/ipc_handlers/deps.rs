@@ -212,9 +212,9 @@ pub struct IpcHandlerDeps {
     /// blocking unknown traffic" banner. Defaults to disarmed; production
     /// wires the orchestrator's clone via `with_block_all_posture_status`.
     pub block_all_posture: crate::app_enforcement_status::BlockAllPostureStatus,
-    /// The route coordinator's standing per-role enforcement reports, which
-    /// `SnapshotInitial` serves to the caller. Empty by default; production
-    /// wires the coordinator's own via `with_route_enforcement_status`.
+    /// The standing per-role enforcement reports, which `SnapshotInitial`
+    /// serves to the caller. Empty by default; production wires the board its
+    /// writer reports on (route coordinator or enforcement cycle).
     pub route_enforcement: crate::app_enforcement_status::RouteEnforcementStatus,
     /// Live fake-IP datapath probe over the `FakeIpController`, so
     /// `service.health.get` / `snapshot.initial.get` can surface a

@@ -50,7 +50,7 @@ impl Failure {
         }
     }
 
-    fn of(error: &IpcClientError) -> Self {
+    pub(super) fn of(error: &IpcClientError) -> Self {
         Self::code(ipc_error_to_wire(error).0)
     }
 

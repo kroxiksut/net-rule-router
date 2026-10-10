@@ -88,6 +88,8 @@ pub mod local_time;
 // inside the logon phase where an early arm costs the user a frozen screen.
 pub mod logon_session;
 pub mod network_change;
+// The service's own sockets, tagged so machine-scope filters let them through.
+pub mod own_traffic;
 // Make a directory reachable by name from the user's shell (the administrative
 // console's directory on PATH). The decision — is it already there, what does
 // the list become — is pure and lives here; the mechanism is per-OS (per-user

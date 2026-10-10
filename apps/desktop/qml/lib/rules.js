@@ -603,3 +603,38 @@ function driftRowFromParsedRule(r, route) {
         verify: parsedRuleVerify(r)
     }
 }
+
+// Sort rank of a main-route verdict: what the main route does not reach
+// first, a rule never checked last.
+function mainRouteRank(slug) {
+    switch (String(slug || "")) {
+    case "silent": return 0
+    case "answered": return 1
+    case "unclear": return 2
+    case "no-address": return 3
+    default: return 4
+    }
+}
+
+// The hosts "Check the main route" asks about: the enabled host rules of the
+// additional route, in ACE form when the row carries it, without a leading
+// `*.`, lower-cased, each once. A zone names no single address to try.
+function mainRouteCheckHosts(rows) {
+    var hosts = []
+    var seen = ({})
+    var list = rows || []
+    for (var i = 0; i < list.length; i += 1) {
+        var row = list[i] || {}
+        var rt = String(row.ruleType || "")
+        if (rt !== "domain" && rt !== "suffix-domain" && rt !== "exact-fqdn") continue
+        if (row.enabled !== true || String(row.targetRoute || "") !== "secondary") continue
+        var ace = (row.aceMatchValue === undefined || row.aceMatchValue === null)
+            ? "" : String(row.aceMatchValue)
+        var value = ace !== "" ? ace : String(row.matchValue || "")
+        var host = value.replace(/^\*\./, "").trim().toLowerCase()
+        if (host === "" || seen[host] === true) continue
+        seen[host] = true
+        hosts.push(host)
+    }
+    return hosts
+}

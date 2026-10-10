@@ -291,47 +291,16 @@ pub(super) fn mac_anchor_id(info: &AdapterInfo) -> Option<String> {
     mac_dash(info).map(|mac| format!("win-mac:{mac}"))
 }
 
-/// The name to store for an adapter: the connection name the GUI lists, with
-/// the driver description as the fallback.
-/// Live connections worth offering when the bound one is gone.
-///
-/// Tunnel-looking connections come FIRST when there are any, by the same
-/// keyword classification the adapter screen uses: for the ADDITIONAL route
-/// an Ethernet and a VPN are not interchangeable — one is what the rules
-/// point at, the other is the link the rules exist to route around. Nothing
-/// is removed — an unrecognised tunnel name still appears, lower down.
-/// Guessing is still refused; only the order changes, which is what lets the
-/// surface above put a button on the first entry.
+/// Live connections worth offering when the bound one is gone; tunnels first
+/// for the additional route. One definition, shared with the other platform.
 pub(super) fn replacement_candidates(infos: &[AdapterInfo], role: &str) -> Vec<String> {
-    // Our own fake-IP adapter carries traffic back into us; it is never a route.
-    let usable = infos.iter().filter(|i| {
-        crate::route_coordinator::classify_availability(i)
-            == Some(crate::route_coordinator::AdapterAvailability::Available)
-            && i.friendly_name.trim() != nrr_shared::product_identity::TUN_ADAPTER_NAME
-    });
-    if role != "secondary" {
-        return usable
-            .map(|i| preferred_display_name(i).to_string())
-            .collect();
-    }
-    let (tunnels, rest): (Vec<&AdapterInfo>, Vec<&AdapterInfo>) = usable.partition(|i| {
-        nrr_platform_api::vpn_discovery::looks_like_vpn(preferred_display_name(i))
-            || nrr_platform_api::vpn_discovery::looks_like_vpn(&i.description)
-    });
-    tunnels
-        .into_iter()
-        .chain(rest)
-        .map(|i| preferred_display_name(i).to_string())
-        .collect()
+    nrr_platform_api::adapters::replacement_candidates(infos, role == "secondary")
 }
 
+/// The name to store for an adapter: the connection name the GUI lists, with
+/// the driver description as the fallback.
 pub(super) fn preferred_display_name(info: &AdapterInfo) -> &str {
-    let friendly = info.friendly_name.trim();
-    if friendly.is_empty() {
-        &info.description
-    } else {
-        friendly
-    }
+    nrr_platform_api::adapters::preferred_display_name(info)
 }
 
 /// Derive a usable next-hop for a secondary adapter that exposes **no**

@@ -115,10 +115,10 @@ pub const SLOTS_PER_RULE: u32 = WFP_SLOTS_PER_RULE as u32;
 /// the whole machine: one user's policy would have governed everyone the first
 /// time two people logged in.
 ///
-/// The baseline maps to `None` deliberately: it belongs to no user, and a rule
-/// planned from it is meant to hold for all of them.
+/// The baseline maps to the machine deliberately: it belongs to no user, and a
+/// rule planned from it is meant to hold for all of them.
 fn principal_scope(sid: &str) -> PrincipalScope {
-    PrincipalScope(
+    PrincipalScope::from_user(
         UserPrincipal::from_stored(sid)
             .ok()
             .filter(|p| !p.is_baseline()),
@@ -652,6 +652,8 @@ mod fail_closed;
 pub use fail_closed::*;
 mod routes;
 pub use routes::*;
+mod service_accounts;
+pub use service_accounts::*;
 // ── Derived sets ────────────────────────────────────────────────────────────
 //
 // What the kill-switch, its exemptions and the GUI need is not the plan itself

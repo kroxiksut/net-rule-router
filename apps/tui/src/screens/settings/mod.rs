@@ -602,6 +602,18 @@ fn back(app: &mut AppState) -> bool {
     true
 }
 
+/// The list of sections, as going back from a section shows it.
+pub fn show_sections(app: &mut AppState) {
+    back(app);
+}
+
+/// Opens `category`, as choosing it in the list of sections does.
+pub fn open_category(app: &mut AppState, category: Category) {
+    if let Some(index) = Category::ALL.iter().position(|c| *c == category) {
+        open_section(app, index);
+    }
+}
+
 /// Enter on the cursor row: open the section, or start changing the row.
 fn enter(app: &mut AppState) {
     if app.settings.open.is_none() {

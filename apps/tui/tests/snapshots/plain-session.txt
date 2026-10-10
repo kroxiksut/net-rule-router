@@ -52,6 +52,7 @@ Commands on this screen:
   o: choose the folder with your rule sets
   r: show the rules the service applies
   m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
 Type a screen number, h for help or q to quit, then press Enter.
 Help — Rules:
   A number: open that screen
@@ -71,6 +72,7 @@ Commands on this screen:
   o: choose the folder with your rule sets
   r: show the rules the service applies
   m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
 Screens:
   1. Status
   2. First run
@@ -105,4 +107,5 @@ Commands on this screen:
   o: choose the folder with your rule sets
   r: show the rules the service applies
   m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
 Type a screen number, h for help or q to quit, then press Enter.

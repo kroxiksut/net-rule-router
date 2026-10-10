@@ -6,6 +6,7 @@
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     ConnTraceOutageBlocksRequest, ConnTraceOutageBlocksResponse, OutageBlockDto, OutageEpisodeDto,
+    OutageUnresolvedNameDto,
 };
 use serde_json::json;
 
@@ -50,6 +51,12 @@ fn a_response_round_trips_under_kebab_keys() {
         entries: vec![entry()],
         omitted: 2,
         redacted: false,
+        unresolved_names: vec![OutageUnresolvedNameDto {
+            name: "chat.example.com".into(),
+            first_seen_ms: 1_700_000_001_000,
+            last_seen_ms: 1_700_000_004_000,
+            attempts: 4,
+        }],
         observer_active: true,
         gui_stream_enabled: true,
     };
@@ -71,6 +78,10 @@ fn a_response_round_trips_under_kebab_keys() {
         assert!(row.get(key).is_some(), "{key} missing from {row}");
     }
     assert_eq!(wire["omitted"], 2);
+    let name = &wire["unresolved-names"][0];
+    for key in ["name", "first-seen-ms", "last-seen-ms", "attempts"] {
+        assert!(name.get(key).is_some(), "{key} missing from {name}");
+    }
     assert_eq!(wire["observer-active"], true);
     assert_eq!(wire["gui-stream-enabled"], true);
     let back: ConnTraceOutageBlocksResponse =
@@ -88,6 +99,7 @@ fn an_ongoing_outage_has_no_until_and_no_outage_has_no_episode() {
         entries: Vec::new(),
         omitted: 0,
         redacted: false,
+        unresolved_names: Vec::new(),
         observer_active: true,
         gui_stream_enabled: true,
     };
@@ -111,6 +123,10 @@ fn a_minimal_response_decodes_with_the_safe_defaults() {
     assert_eq!(parsed.episode, None);
     assert!(parsed.entries.is_empty());
     assert_eq!(parsed.omitted, 0);
+    assert!(
+        parsed.unresolved_names.is_empty(),
+        "an older service sends no names"
+    );
     assert!(parsed.observer_active);
     assert!(parsed.gui_stream_enabled);
 }

@@ -12,7 +12,8 @@
 //! of the logon phase or minutes after the user is already working.
 //!
 //! The route path already gates on the same condition ("no routing user to
-//! enforce"); this closes the gap that left DNS ungated.
+//! enforce"); this closes the gap that left DNS ungated. The same edges also
+//! start a route pass, so a user who signs in without a tray is served at once.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,21 +30,42 @@ use crate::network_rearm::DebouncedTrigger;
 /// the correct answer to all of them. Kept short — the user is already waiting.
 pub const LOGON_DEBOUNCE: Duration = Duration::from_millis(750);
 
+/// How long after a sign-in the route pass runs. Longer than
+/// [`LOGON_DEBOUNCE`]: the new session's token is issued a moment after the
+/// logon edge, and a pass before it would not see the user. Without the pass a
+/// user signed in with no tray waits for the periodic one, up to half a minute.
+pub const LOGON_ROUTE_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// How long after a sign-out the second route pass runs: past the departure
+/// grace the first pass started, so the leaver's routes go now rather than on
+/// the periodic pass.
+pub const LOGOFF_ROUTE_DEBOUNCE: Duration = Duration::from_secs(
+    LOGON_ROUTE_DEBOUNCE.as_secs() + crate::route_coordinator::DEPARTURE_GRACE.as_secs() + 1,
+);
+
+/// The route pass a sign-in or sign-out starts, beside the resolver re-arm.
+pub struct LogonRoutePass {
+    pub hook: Arc<dyn Fn() + Send + Sync>,
+    pub arrival_window: Duration,
+    pub departure_window: Duration,
+}
+
 /// Composes a [`LogonSessionObserver`] with a re-arm action: every sign-in pokes
-/// a debounced trigger that re-applies the persisted enforcement mode. Holds
-/// both the subscription and the trigger; drop order (subscription first — see
-/// field order) cancels the OS registration before the debounce thread stops, so
-/// no callback fires into a dead trigger.
+/// a debounced trigger that re-applies the persisted enforcement mode, and, when
+/// given one, the route pass. Holds the subscription and the triggers; drop
+/// order (subscription first — see field order) cancels the OS registration
+/// before the debounce threads stop, so no callback fires into a dead trigger.
 pub struct LogonSessionRearm {
     // Rust drops fields top-to-bottom: cancel OS callbacks BEFORE the debounce
-    // thread stops.
+    // threads stop.
     _subscription: LogonSessionSubscription,
     _trigger: DebouncedTrigger,
+    _route_triggers: Option<(DebouncedTrigger, DebouncedTrigger)>,
 }
 
 impl LogonSessionRearm {
     /// Subscribe `observer` so a sign-in debounces into `rearm`. Sign-OUT is
-    /// deliberately not wired here: tearing the resolver down is the route
+    /// deliberately not wired to it: tearing the resolver down is the route
     /// path's business, and doing it from two owners races.
     /// Returns `Err` if the OS registration fails — the caller keeps whatever
     /// periodic re-arm it already has.
@@ -52,16 +74,49 @@ impl LogonSessionRearm {
         rearm: Arc<dyn Fn() + Send + Sync>,
         window: Duration,
     ) -> Result<Self, PlatformError> {
+        Self::start_with_routes(observer, rearm, window, None)
+    }
+
+    /// [`Self::start`], plus `routes`: a sign-in runs the route pass once its
+    /// window passes, and a sign-out runs it twice — once to notice the leaver,
+    /// once past the departure grace to drop them. One subscription for both:
+    /// a platform may hold a single callback. The OS callback only pokes; every
+    /// pass runs on a debounce thread.
+    pub fn start_with_routes(
+        observer: &dyn LogonSessionObserver,
+        rearm: Arc<dyn Fn() + Send + Sync>,
+        window: Duration,
+        routes: Option<LogonRoutePass>,
+    ) -> Result<Self, PlatformError> {
         let trigger = DebouncedTrigger::new(rearm, window);
         let poke = trigger.poker();
-        let subscription = observer.subscribe(Arc::new(move |event| {
-            if event == LogonSessionEvent::SignedIn {
+        let route_triggers = routes.map(|r| {
+            (
+                DebouncedTrigger::new(Arc::clone(&r.hook), r.arrival_window),
+                DebouncedTrigger::new(r.hook, r.departure_window),
+            )
+        });
+        let route_pokes = route_triggers
+            .as_ref()
+            .map(|(arrival, departure)| (arrival.poker(), departure.poker()));
+        let subscription = observer.subscribe(Arc::new(move |event| match event {
+            LogonSessionEvent::SignedIn => {
                 poke();
+                if let Some((arrival, _)) = route_pokes.as_ref() {
+                    arrival();
+                }
+            }
+            LogonSessionEvent::SignedOut => {
+                if let Some((arrival, departure)) = route_pokes.as_ref() {
+                    arrival();
+                    departure();
+                }
             }
         }))?;
         Ok(Self {
             _subscription: subscription,
             _trigger: trigger,
+            _route_triggers: route_triggers,
         })
     }
 }
@@ -304,6 +359,80 @@ mod tests {
         observer.fire(LogonSessionEvent::SignedIn);
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(arms.load(Ordering::SeqCst), 1);
+        drop(rearm);
+    }
+
+    fn counting_hook(runs: &Arc<AtomicUsize>) -> Arc<dyn Fn() + Send + Sync> {
+        let runs = Arc::clone(runs);
+        Arc::new(move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+
+    fn wait_for(runs: &AtomicUsize, at_least: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while runs.load(Ordering::SeqCst) < at_least && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A sign-in runs one route pass, off the OS callback, after the route
+    /// window; the resolver re-arm still runs on its own.
+    #[test]
+    fn a_sign_in_runs_one_route_pass_after_its_window() {
+        let arms = Arc::new(AtomicUsize::new(0));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let observer = FakeObserver::default();
+        let rearm = LogonSessionRearm::start_with_routes(
+            &observer,
+            counting_hook(&arms),
+            Duration::from_millis(20),
+            Some(LogonRoutePass {
+                hook: counting_hook(&passes),
+                arrival_window: Duration::from_millis(150),
+                departure_window: Duration::from_millis(400),
+            }),
+        )
+        .expect("fake subscribe never fails");
+
+        observer.fire(LogonSessionEvent::SignedIn);
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            0,
+            "the OS callback only pokes; the pass waits for its window"
+        );
+        wait_for(&passes, 1);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(passes.load(Ordering::SeqCst), 1, "one sign-in, one pass");
+        assert_eq!(arms.load(Ordering::SeqCst), 1);
+        drop(rearm);
+    }
+
+    /// A sign-out runs the pass that notices the leaver and the one past the
+    /// departure grace; the resolver is not re-armed by it.
+    #[test]
+    fn a_sign_out_runs_a_pass_and_another_past_the_grace() {
+        let arms = Arc::new(AtomicUsize::new(0));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let observer = FakeObserver::default();
+        let rearm = LogonSessionRearm::start_with_routes(
+            &observer,
+            counting_hook(&arms),
+            Duration::from_millis(20),
+            Some(LogonRoutePass {
+                hook: counting_hook(&passes),
+                arrival_window: Duration::from_millis(50),
+                departure_window: Duration::from_millis(300),
+            }),
+        )
+        .expect("fake subscribe never fails");
+
+        observer.fire(LogonSessionEvent::SignedOut);
+        wait_for(&passes, 1);
+        assert_eq!(passes.load(Ordering::SeqCst), 1, "the departure pass waits");
+        wait_for(&passes, 2);
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
+        assert_eq!(arms.load(Ordering::SeqCst), 0);
         drop(rearm);
     }
 

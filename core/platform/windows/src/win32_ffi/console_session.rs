@@ -51,28 +51,50 @@ pub fn interactive_user_sid() -> Option<String> {
     console_fallback_sid(current_process_user_sid())
 }
 
+/// Every user signed in interactively, console user first, each once: the
+/// console session, then attached remote sessions, then disconnected ones (a
+/// disconnected user's programs keep running and keep needing their routes).
+/// Service accounts never count. Same cost as [`interactive_user_sid`]: the
+/// console lookup is live, the session enumeration answers from a short cache.
+pub fn interactive_user_sids() -> Vec<String> {
+    let console = active_console_user_sid_via_wts();
+    let remote = remote_sessions_cached();
+    let mut users = ordered_session_users(console.as_deref(), &remote);
+    if users.is_empty() {
+        users.extend(console_fallback_sid(current_process_user_sid()));
+    }
+    users
+}
+
 /// How long one session enumeration answers. The routing SID is asked on every
 /// pass and policy edit; a sign-in re-arms through its own SCM event, so a
 /// second of staleness costs nothing.
 const REMOTE_LOOKUP_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn remote_user_sid_cached() -> Option<String> {
-    use std::sync::Mutex;
-    use std::time::Instant;
-    static LAST: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
-    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((at, sid)) = last.as_ref() {
-        if at.elapsed() < REMOTE_LOOKUP_TTL {
-            return sid.clone();
-        }
-    }
-    let sid = remote_user_sid();
-    *last = Some((Instant::now(), sid.clone()));
-    sid
+    sole_session_user(&remote_sessions_cached())
 }
 
-/// The user of the remote sessions, when exactly one user holds them.
-fn remote_user_sid() -> Option<String> {
+/// The non-console sessions with their users, from one enumeration per
+/// [`REMOTE_LOOKUP_TTL`]: the single-user and the all-users answers share it.
+fn remote_sessions_cached() -> Vec<(SessionState, Option<String>)> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    type Cached = Option<(Instant, Vec<(SessionState, Option<String>)>)>;
+    static LAST: Mutex<Cached> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((at, sessions)) = last.as_ref() {
+        if at.elapsed() < REMOTE_LOOKUP_TTL {
+            return sessions.clone();
+        }
+    }
+    let sessions = remote_sessions();
+    *last = Some((Instant::now(), sessions.clone()));
+    sessions
+}
+
+/// Every non-console user session with its state and user.
+fn remote_sessions() -> Vec<(SessionState, Option<String>)> {
     // SAFETY: takes no args; returns the console session id or 0xFFFFFFFF.
     let console = unsafe { WTSGetActiveConsoleSessionId() };
     let mut info: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
@@ -83,7 +105,7 @@ fn remote_user_sid() -> Option<String> {
         .is_err()
         || info.is_null()
     {
-        return None;
+        return Vec::new();
     }
     // SAFETY: WTS returned `count` contiguous entries at `info`, alive until freed.
     let entries = unsafe { std::slice::from_raw_parts(info, count as usize) };
@@ -96,7 +118,7 @@ fn remote_user_sid() -> Option<String> {
     // SAFETY: `info` came from WTSEnumerateSessionsW and is freed exactly once;
     // `entries` is not used past this point.
     unsafe { WTSFreeMemory(info.cast()) };
-    sole_session_user(&sessions)
+    sessions
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +154,31 @@ fn sole_session_user(sessions: &[(SessionState, Option<String>)]) -> Option<Stri
         }
     }
     None
+}
+
+/// The console user, then the users of attached sessions, then those of
+/// disconnected ones; each user once, service accounts never.
+fn ordered_session_users(
+    console: Option<&str>,
+    sessions: &[(SessionState, Option<String>)],
+) -> Vec<String> {
+    let mut users: Vec<String> = Vec::new();
+    let mut push = |sid: &str| {
+        if sid.starts_with(INTERACTIVE_USER_SID_PREFIX) && !users.iter().any(|u| u == sid) {
+            users.push(sid.to_string());
+        }
+    };
+    if let Some(sid) = console {
+        push(sid);
+    }
+    for level in [SessionState::Active, SessionState::Disconnected] {
+        sessions
+            .iter()
+            .filter(|(state, _)| *state == level)
+            .filter_map(|(_, sid)| sid.as_deref())
+            .for_each(&mut push);
+    }
+    users
 }
 
 fn session_user_sid(session_id: u32) -> Option<String> {
@@ -320,6 +367,31 @@ mod tests {
             Some(ALICE)
         );
         assert_eq!(sole_session_user(&[]), None);
+    }
+
+    #[test]
+    fn every_signed_in_user_is_listed_console_first_and_once() {
+        use SessionState::*;
+        const CAROL: &str = "S-1-5-21-111-222-333-1003";
+        assert_eq!(
+            ordered_session_users(
+                Some(CAROL),
+                &[
+                    at(Disconnected, BOB),
+                    at(Active, ALICE),
+                    at(Active, CAROL),
+                    at(Active, "S-1-5-18"),
+                    (Active, None),
+                ],
+            ),
+            vec![CAROL.to_string(), ALICE.to_string(), BOB.to_string()],
+        );
+        // Two remote users and nobody at the console are both served.
+        assert_eq!(
+            ordered_session_users(None, &[at(Active, ALICE), at(Active, BOB)]),
+            vec![ALICE.to_string(), BOB.to_string()],
+        );
+        assert!(ordered_session_users(Some("S-1-5-18"), &[]).is_empty());
     }
 
     #[test]

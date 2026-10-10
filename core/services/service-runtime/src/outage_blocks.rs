@@ -5,14 +5,20 @@
 //! when their additional route goes down, closes when it comes back, and its
 //! list stays readable until the next outage opens. Memory only, bounded per
 //! principal, fed by the connection observer off the data path.
+//!
+//! A rule host whose lookup already failed never becomes a connection, so the
+//! local resolver files those names beside the drops, on its failure branch.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 
 /// Folded entries kept per principal.
 pub const MAX_ENTRIES_PER_PRINCIPAL: usize = 500;
+
+/// Names that did not resolve, kept per principal.
+pub const MAX_UNRESOLVED_PER_PRINCIPAL: usize = 200;
 
 /// How long after the route came back a drop still belongs to the outage that
 /// just ended. The observer drains every few seconds and the leak guard
@@ -42,6 +48,17 @@ pub struct OutageBlock {
     pub attempts: u32,
 }
 
+/// A rule host that got no address during the outage: no connection was
+/// made, so there is no program and no address to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnresolvedName {
+    /// Lower-case, without the trailing dot.
+    pub name: String,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    pub attempts: u32,
+}
+
 /// A principal's last outage as read: entries most recently attempted first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OutageSnapshot {
@@ -49,6 +66,10 @@ pub struct OutageSnapshot {
     pub entries: Vec<OutageBlock>,
     /// Entries evicted to stay within [`MAX_ENTRIES_PER_PRINCIPAL`].
     pub omitted: u32,
+    /// Most recently asked first.
+    pub unresolved: Vec<UnresolvedName>,
+    /// Names evicted to stay within [`MAX_UNRESOLVED_PER_PRINCIPAL`].
+    pub unresolved_omitted: u32,
 }
 
 /// One drop the outage caused, as the observer hands it over.
@@ -67,6 +88,8 @@ struct PrincipalOutage {
     episode: OutageEpisode,
     entries: HashMap<(IpAddr, String), OutageBlock>,
     omitted: u32,
+    unresolved: HashMap<String, UnresolvedName>,
+    unresolved_omitted: u32,
 }
 
 impl PrincipalOutage {
@@ -78,6 +101,8 @@ impl PrincipalOutage {
             },
             entries: HashMap::new(),
             omitted: 0,
+            unresolved: HashMap::new(),
+            unresolved_omitted: 0,
         }
     }
 }
@@ -126,6 +151,23 @@ impl OutageBlocks {
             if state.episode.until_ms.is_none() {
                 state.episode.until_ms = Some(at_ms.max(state.episode.since_ms));
             }
+        }
+    }
+
+    /// When the episode a drop by `sid` at `at_ms` would join began, or `at_ms`
+    /// when it would open one: [`Self::record`]'s choice, read without making it.
+    pub fn episode_for_drop(&self, sid: &str, at_ms: u64) -> u64 {
+        let guard = self.principals.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.get(sid) {
+            Some(state)
+                if state
+                    .episode
+                    .until_ms
+                    .is_none_or(|until| at_ms <= until.saturating_add(TAIL_GRACE_MS)) =>
+            {
+                state.episode.since_ms
+            }
+            _ => at_ms,
         }
     }
 
@@ -195,6 +237,60 @@ impl OutageBlocks {
         );
     }
 
+    /// A rule host `sid`'s programs asked for got no address. A failed lookup
+    /// does not prove an outage the way a drop does, so it never opens an
+    /// episode: it joins an open one or the tail of the last. Called on the
+    /// resolver's answer path, so it never waits: a busy store skips this
+    /// attempt, and the program asks again within a second.
+    pub fn record_unresolved(&self, sid: &str, name: &str, at_ms: u64) {
+        let name = name.trim_end_matches('.');
+        if sid.is_empty() || name.is_empty() {
+            return;
+        }
+        let mut guard = match self.principals.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        let Some(state) = guard.get_mut(sid) else {
+            return;
+        };
+        if state
+            .episode
+            .until_ms
+            .is_some_and(|until| at_ms > until.saturating_add(TAIL_GRACE_MS))
+        {
+            return;
+        }
+        let key = name.to_ascii_lowercase();
+        if let Some(entry) = state.unresolved.get_mut(&key) {
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.first_seen_ms = entry.first_seen_ms.min(at_ms);
+            entry.last_seen_ms = entry.last_seen_ms.max(at_ms);
+            return;
+        }
+        if state.unresolved.len() >= MAX_UNRESOLVED_PER_PRINCIPAL {
+            let oldest = state
+                .unresolved
+                .iter()
+                .min_by_key(|(_, e)| e.last_seen_ms)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                state.unresolved.remove(&oldest);
+                state.unresolved_omitted = state.unresolved_omitted.saturating_add(1);
+            }
+        }
+        state.unresolved.insert(
+            key.clone(),
+            UnresolvedName {
+                name: key,
+                first_seen_ms: at_ms,
+                last_seen_ms: at_ms,
+                attempts: 1,
+            },
+        );
+    }
+
     /// `sid`'s last outage, or an empty snapshot when it had none.
     pub fn snapshot(&self, sid: &str) -> OutageSnapshot {
         let guard = self.principals.lock().unwrap_or_else(|p| p.into_inner());
@@ -203,18 +299,57 @@ impl OutageBlocks {
         };
         let episode = state.episode;
         let omitted = state.omitted;
+        let unresolved_omitted = state.unresolved_omitted;
         let mut entries: Vec<OutageBlock> = state.entries.values().cloned().collect();
+        let mut unresolved: Vec<UnresolvedName> = state.unresolved.values().cloned().collect();
         drop(guard);
         entries.sort_by(|a, b| {
             b.last_seen_ms
                 .cmp(&a.last_seen_ms)
                 .then_with(|| a.remote.ip().cmp(&b.remote.ip()))
         });
+        unresolved.sort_by(|a, b| {
+            b.last_seen_ms
+                .cmp(&a.last_seen_ms)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         OutageSnapshot {
             episode: Some(episode),
             entries,
             omitted,
+            unresolved,
+            unresolved_omitted,
         }
+    }
+}
+
+/// Files a rule host's failed lookup under the routing principal's outage. A
+/// query carries no trace of who asked, so the principal is the one the
+/// resolver already answers for; with none, nothing is filed.
+pub struct OutageUnresolvedNames {
+    outages: std::sync::Arc<OutageBlocks>,
+    principal: crate::supervised_runtime::ActiveRoutingSidFn,
+}
+
+impl OutageUnresolvedNames {
+    pub fn new(
+        outages: std::sync::Arc<OutageBlocks>,
+        principal: crate::supervised_runtime::ActiveRoutingSidFn,
+    ) -> Self {
+        Self { outages, principal }
+    }
+}
+
+impl crate::dns_resolver::UnresolvedRuleHostObserver for OutageUnresolvedNames {
+    fn note_unresolved(&self, hostname: &str) {
+        let Some(sid) = (self.principal)() else {
+            return;
+        };
+        self.outages.record_unresolved(
+            &sid,
+            hostname,
+            crate::conn_observation_consumer::now_unix_ms(),
+        );
     }
 }
 
@@ -373,6 +508,28 @@ mod tests {
     }
 
     #[test]
+    fn the_episode_a_drop_would_join_is_the_one_record_picks() {
+        let store = OutageBlocks::new();
+        assert_eq!(
+            store.episode_for_drop("S-1", 4_000),
+            4_000,
+            "none yet: opens"
+        );
+        store.outage_began("S-1", 1_000);
+        assert_eq!(store.episode_for_drop("S-1", 4_000), 1_000);
+        store.outage_ended("S-1", 5_000);
+        assert_eq!(store.episode_for_drop("S-1", 5_000 + TAIL_GRACE_MS), 1_000);
+        let later = 5_000 + TAIL_GRACE_MS + 1;
+        assert_eq!(store.episode_for_drop("S-1", later), later);
+        store.record(drop_of("S-1", "mail.exe", addr(12, 443), later));
+        assert_eq!(
+            store.snapshot("S-1").episode.map(|e| e.since_ms),
+            Some(later)
+        );
+        assert_eq!(store.episode_for_drop("S-2", 9), 9, "another principal's");
+    }
+
+    #[test]
     fn principals_never_see_each_others_drops() {
         let store = OutageBlocks::new();
         store.outage_began("S-1", 1_000);
@@ -393,5 +550,101 @@ mod tests {
             None,
             "one user's route coming back ends only their outage"
         );
+    }
+
+    #[test]
+    fn a_failed_lookup_folds_by_name_counting_attempts() {
+        let store = OutageBlocks::new();
+        store.outage_began("S-1", 1_000);
+        store.record_unresolved("S-1", "chat.example.com.", 2_000);
+        store.record_unresolved("S-1", "Chat.Example.com", 3_000);
+        store.record_unresolved("S-1", "api.example.com", 2_500);
+        store.record(drop_of("S-1", "browser.exe", addr(10, 443), 2_000));
+        let snap = store.snapshot("S-1");
+        assert_eq!(snap.entries.len(), 1, "drops are kept apart from names");
+        assert_eq!(snap.unresolved.len(), 2);
+        let chat = &snap.unresolved[0];
+        assert_eq!(chat.name, "chat.example.com");
+        assert_eq!(chat.attempts, 2);
+        assert_eq!(chat.first_seen_ms, 2_000);
+        assert_eq!(chat.last_seen_ms, 3_000);
+        assert_eq!(snap.unresolved[1].name, "api.example.com", "newest first");
+        assert_eq!(snap.unresolved_omitted, 0);
+    }
+
+    #[test]
+    fn a_failed_lookup_never_opens_an_outage_and_stops_after_the_tail() {
+        let store = OutageBlocks::new();
+        store.record_unresolved("S-1", "chat.example.com", 1_000);
+        assert_eq!(
+            store.snapshot("S-1"),
+            OutageSnapshot::default(),
+            "no outage, nothing to file it under"
+        );
+
+        store.outage_began("S-1", 2_000);
+        store.outage_ended("S-1", 5_000);
+        store.record_unresolved("S-1", "late.example.com", 5_000 + TAIL_GRACE_MS);
+        store.record_unresolved("S-1", "after.example.com", 5_000 + TAIL_GRACE_MS + 1);
+        let snap = store.snapshot("S-1");
+        let names: Vec<&str> = snap.unresolved.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["late.example.com"], "only the tail joins");
+        assert_eq!(
+            snap.episode.and_then(|e| e.until_ms),
+            Some(5_000),
+            "a failed lookup does not reopen the outage"
+        );
+
+        store.outage_began("S-1", 100_000);
+        assert!(
+            store.snapshot("S-1").unresolved.is_empty(),
+            "the next outage starts clean"
+        );
+    }
+
+    #[test]
+    fn past_the_name_cap_the_longest_unseen_name_goes_and_is_counted() {
+        let store = OutageBlocks::new();
+        store.outage_began("S-1", 0);
+        for n in 0..MAX_UNRESOLVED_PER_PRINCIPAL as u64 {
+            store.record_unresolved("S-1", &format!("host{n}.example.com"), 1_000 + n);
+        }
+        store.record_unresolved("S-1", "host0.example.com", 9_000);
+        store.record_unresolved("S-1", "new.example.com", 9_500);
+        let snap = store.snapshot("S-1");
+        assert_eq!(snap.unresolved.len(), MAX_UNRESOLVED_PER_PRINCIPAL);
+        assert_eq!(snap.unresolved_omitted, 1);
+        assert_eq!(snap.omitted, 0, "names do not count against the drops");
+        let names: Vec<&str> = snap.unresolved.iter().map(|n| n.name.as_str()).collect();
+        assert!(!names.contains(&"host1.example.com"), "longest unseen");
+        assert!(names.contains(&"host0.example.com"));
+        assert_eq!(names[0], "new.example.com");
+    }
+
+    #[test]
+    fn a_failed_lookup_is_filed_only_under_its_own_principal() {
+        let store = OutageBlocks::new();
+        store.outage_began("S-1", 1_000);
+        store.record_unresolved("S-2", "chat.example.com", 2_000);
+        store.record_unresolved("", "chat.example.com", 2_000);
+        store.record_unresolved("S-1", "", 2_000);
+        store.record_unresolved("S-1", ".", 2_000);
+        assert!(store.snapshot("S-1").unresolved.is_empty());
+        assert_eq!(store.snapshot("S-2"), OutageSnapshot::default());
+    }
+
+    #[test]
+    fn the_resolver_files_under_the_routing_principal_or_not_at_all() {
+        use crate::dns_resolver::UnresolvedRuleHostObserver;
+        use std::sync::Arc;
+        let store = Arc::new(OutageBlocks::new());
+        store.outage_began("S-1", 1);
+        let nobody = OutageUnresolvedNames::new(Arc::clone(&store), Arc::new(|| None::<String>));
+        nobody.note_unresolved("chat.example.com");
+        assert!(store.snapshot("S-1").unresolved.is_empty());
+        let routing =
+            OutageUnresolvedNames::new(Arc::clone(&store), Arc::new(|| Some("S-1".to_string())));
+        routing.note_unresolved("chat.example.com");
+        assert_eq!(store.snapshot("S-1").unresolved.len(), 1);
     }
 }

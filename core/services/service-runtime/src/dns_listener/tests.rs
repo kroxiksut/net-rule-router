@@ -1634,3 +1634,110 @@ fn a_through_the_resolver_chain_asks_once_for_a() {
         vec![IpAddr::V4(Ipv4Addr::new(100, 64, 0, 78))]
     );
 }
+
+// ── Names that got no address ───────────────────────────────────────────────
+
+#[derive(Default)]
+struct NotedNames(Mutex<Vec<String>>);
+impl UnresolvedRuleHostObserver for NotedNames {
+    fn note_unresolved(&self, hostname: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(hostname.to_string());
+    }
+}
+impl NotedNames {
+    fn names(&self) -> Vec<String> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+struct MissesDeadline;
+impl SyncReconciler for MissesDeadline {
+    fn reconcile_now(&self, _d: Duration) -> ReconcileOutcome {
+        ReconcileOutcome::DeadlineExceeded
+    }
+}
+
+/// The leak guard withholding a rule host's answer is the moment a site
+/// fails before any connection: the name is reported.
+#[test]
+fn a_withheld_rule_host_is_reported_as_unresolved() {
+    let noted = Arc::new(NotedNames::default());
+    let l = DnsInterceptListener::new(
+        Arc::new(Oracle(vec!["assistant.example".to_string()])),
+        Arc::new(Upstream(Ok(resolved(&[Ipv4Addr::new(100, 64, 0, 159)])))),
+        Arc::new(NoopSink),
+        Arc::new(MissesDeadline),
+        "192.0.2.1:53".parse().unwrap(),
+        Duration::from_millis(150),
+        Duration::from_millis(150),
+    )
+    .with_leak_guard_posture(Arc::new(|| true))
+    .with_unresolved_observer(Arc::clone(&noted) as Arc<dyn UnresolvedRuleHostObserver>);
+    match l.answer_query(&query("assistant.example", QTYPE_A)) {
+        ListenerAction::Respond(bytes) => assert_eq!(bytes[3] & 0x0F, RCODE_SERVFAIL),
+        other => panic!("expected SERVFAIL, got {other:?}"),
+    }
+    assert_eq!(noted.names(), ["assistant.example"]);
+}
+
+/// A full rule-host lane with nothing cached fails the name; one answered
+/// from the cache, a direct name and an answered rule host do not.
+#[test]
+fn only_a_rule_host_left_without_an_address_is_reported() {
+    let noted = Arc::new(NotedNames::default());
+    let observer = Arc::clone(&noted) as Arc<dyn UnresolvedRuleHostObserver>;
+    let mut empty = saturated_listener(&[]);
+    empty = empty.with_unresolved_observer(Arc::clone(&observer));
+    let mut cached = saturated_listener(&[Ipv4Addr::new(100, 64, 0, 7)]);
+    cached = cached.with_unresolved_observer(Arc::clone(&observer));
+    {
+        let _full: Vec<_> = (0..MAX_CONCURRENT_RULE_HOST_RESOLVES)
+            .map(|_| empty.rule_host_lane.enter(Duration::ZERO).expect("slot"))
+            .collect();
+        let _full_too: Vec<_> = (0..MAX_CONCURRENT_RULE_HOST_RESOLVES)
+            .map(|_| cached.rule_host_lane.enter(Duration::ZERO).expect("slot"))
+            .collect();
+        empty.answer_query(&query("routed.example", QTYPE_A));
+        cached.answer_query(&query("routed.example", QTYPE_A));
+        empty.answer_query(&query("direct.example", QTYPE_A));
+    }
+    let answered = listener(
+        &["assistant.example"],
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 0, 159)])),
+    )
+    .with_unresolved_observer(observer);
+    answered.answer_query(&query("assistant.example", QTYPE_A));
+    assert_eq!(noted.names(), ["routed.example"]);
+}
+
+/// Our resolve could not reach upstream and the raw forward failed too: the
+/// client got SERVFAIL, and only a rule host's `A` is reported.
+#[test]
+fn a_rule_host_whose_forward_also_failed_is_reported() {
+    let noted = Arc::new(NotedNames::default());
+    let l = listener(
+        &["routed.example"],
+        Err(ResolveError::Unavailable("nothing answered".into())),
+    )
+    .with_unresolved_observer(Arc::clone(&noted) as Arc<dyn UnresolvedRuleHostObserver>);
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("server socket");
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client socket");
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("client timeout");
+    let to = client.local_addr().expect("client addr");
+    for q in [
+        query("routed.example", QTYPE_A),
+        query("routed.example", QTYPE_HTTPS),
+    ] {
+        l.handle_datagram(&server, &q, to, RULE_HOST_LANE_WAIT);
+        let mut buf = [0u8; 512];
+        let n = client.recv(&mut buf).expect("a reply, not silence");
+        assert!(n >= 12);
+        assert_eq!(buf[3] & 0x0F, RCODE_SERVFAIL);
+    }
+    assert_eq!(noted.names(), ["routed.example"], "the A question only");
+}

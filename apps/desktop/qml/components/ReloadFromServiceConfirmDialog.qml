@@ -29,6 +29,8 @@ Dialog {
         "Load active rules from the service?")
     standardButtons: Dialog.NoButton
     closePolicy: Popup.NoAutoClose
+    // The keyboard lands on the answer that loses nothing.
+    onOpened: cancelButton.forceActiveFocus()
     background: Rectangle {
         color: root.ownerRoot ? root.ownerRoot.uiTheme.colorPanel : "transparent"
         border.width: root.ownerRoot ? root.ownerRoot.uiTheme.borderWidth : 0
@@ -49,6 +51,7 @@ Dialog {
             Layout.alignment: Qt.AlignRight
             spacing: root.ownerRoot ? root.ownerRoot.uiTheme.spacingSm : 8
             ThemedButton {
+                id: cancelButton
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 text: root.tr("action.cancel", "Cancel")
                 onClicked: root.close()

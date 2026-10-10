@@ -80,7 +80,8 @@
 //!
 //! Live WFP records carry [`WfpFilterRecord::app_pattern`] as `None` — the
 //! kernel keeps only the NT-path blob. [`WfpFilterRecord::user_sid`] is read
-//! back from the `ALE_USER_ID` descriptor, which names the SID in its one ACE.
+//! back from the `ALE_USER_ID` descriptor: the SID of its one ACE, or the
+//! service-accounts principal for the multi-ACE descriptor that stands for it.
 
 #![allow(unsafe_code)]
 
@@ -112,6 +113,7 @@ use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use crate::error::PlatformError;
 use crate::types::{
     WfpAction, WfpEngineToken, WfpFilterId, WfpFilterRecord, WfpFilterSpec, WfpLayerKey,
+    WfpPrincipal, SERVICE_ACCOUNTS_PRINCIPAL, SERVICE_ACCOUNT_SIDS,
 };
 
 use super::wfp_engine::token_to_handle;
@@ -215,8 +217,12 @@ pub fn add_filter(
     // before returning, on every path including early errors.
     let mut sd_handle: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
     let mut sd_size: u32 = 0;
-    if let Some(sid) = &spec.user_sid {
-        let (h, size) = sddl_for_sid(sid)?;
+    let sd = match spec.principal() {
+        WfpPrincipal::Anyone => None,
+        WfpPrincipal::User(sid) => Some(sddl_for_sid(sid)?),
+        WfpPrincipal::ServiceAccounts => Some(sddl_for_service_accounts()?),
+    };
+    if let Some((h, size)) = sd {
         sd_handle = h;
         sd_size = size;
     }
@@ -819,7 +825,7 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
                 if !blob.data.is_null() {
                     // SAFETY: `data` holds `size` bytes for as long as `row`.
                     let sd = unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) };
-                    out.user_sid = sid_of_user_condition(sd);
+                    out.user_sid = principal_of_user_condition(sd);
                 }
             }
         }
@@ -827,11 +833,40 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
     out
 }
 
+/// What a filter's user condition names, as [`WfpFilterSpec::user_sid`] spells
+/// it: the SID of a one-ACE descriptor, or [`SERVICE_ACCOUNTS_PRINCIPAL`] for
+/// exactly the descriptor [`sddl_for_service_accounts`] writes. Reconcile
+/// deletes by this, so a multi-ACE filter must read back as its owner or it
+/// would outlive every cleanup.
+fn principal_of_user_condition(sd: &[u8]) -> Option<String> {
+    let sids = sids_of_user_condition(sd)?;
+    match sids.as_slice() {
+        [one] => Some(one.clone()),
+        _ => {
+            let mut have: Vec<&str> = sids.iter().map(String::as_str).collect();
+            let mut want: Vec<&str> = SERVICE_ACCOUNT_SIDS.to_vec();
+            have.sort_unstable();
+            want.sort_unstable();
+            (have == want).then(|| SERVICE_ACCOUNTS_PRINCIPAL.to_string())
+        }
+    }
+}
+
 /// The SID of the single allow-ACE in a self-relative security descriptor —
-/// the shape [`sddl_for_sid`] writes. Parsed from the bytes rather than
-/// through SDDL, which prints some account SIDs as aliases. Any other shape
-/// is not one we wrote, so it names nobody.
+/// the shape [`sddl_for_sid`] writes. Any other shape names nobody.
+#[cfg(test)]
 fn sid_of_user_condition(sd: &[u8]) -> Option<String> {
+    match sids_of_user_condition(sd)?.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+/// The SIDs of every allow-ACE in a self-relative security descriptor. Parsed
+/// from the bytes rather than through SDDL, which prints some account SIDs as
+/// aliases. A descriptor holding anything but allow-ACEs is not one we wrote,
+/// so it names nobody.
+fn sids_of_user_condition(sd: &[u8]) -> Option<Vec<String>> {
     const SE_DACL_PRESENT: u16 = 0x0004;
     const SE_SELF_RELATIVE: u16 = 0x8000;
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -845,16 +880,26 @@ fn sid_of_user_condition(sd: &[u8]) -> Option<String> {
     // Header: revision, sbz1, control, then owner/group/sacl/dacl offsets.
     let acl = usize::try_from(u32_at(16)?).ok()?;
     // ACL header: revision, sbz1, size, ace count, sbz2.
-    if acl == 0 || u16_at(acl + 4)? != 1 {
+    let count = if acl == 0 { 0 } else { u16_at(acl + 4)? };
+    if count == 0 {
         return None;
     }
-    let ace = acl + 8;
-    if *sd.get(ace)? != ACCESS_ALLOWED_ACE_TYPE {
-        return None;
+    let mut sids = Vec::with_capacity(usize::from(count));
+    let mut ace = acl + 8;
+    for _ in 0..count {
+        if *sd.get(ace)? != ACCESS_ALLOWED_ACE_TYPE {
+            return None;
+        }
+        // ACE: type, flags, size, access mask, then the SID.
+        let ace_size = usize::from(u16_at(ace + 2)?);
+        if ace_size < 8 {
+            return None;
+        }
+        let ace_end = ace + ace_size;
+        sids.push(format_sid(sd.get(ace + 8..ace_end)?)?);
+        ace = ace_end;
     }
-    // ACE: type, flags, size, access mask, then the SID.
-    let ace_end = ace + usize::from(u16_at(ace + 2)?);
-    format_sid(sd.get(ace + 8..ace_end)?)
+    Some(sids)
 }
 
 /// `S-R-I-S…` from a binary SID: the authority is big-endian, and printed in
@@ -1049,7 +1094,27 @@ fn sddl_for_sid(sid: &str) -> Result<(PSECURITY_DESCRIPTOR, u32), PlatformError>
         });
     }
 
-    let sddl = format!("D:(A;;CC;;;{sid})");
+    descriptor_from_sddl(&format!("D:(A;;CC;;;{sid})"), sid)
+}
+
+/// The descriptor for [`SERVICE_ACCOUNTS_PRINCIPAL`]: one allow-ACE per
+/// [`SERVICE_ACCOUNT_SIDS`] entry. WFP access-checks it against the whole
+/// process token, groups included, so the SERVICE group ACE reaches every
+/// SCM-started process whatever account it runs as.
+fn sddl_for_service_accounts() -> Result<(PSECURITY_DESCRIPTOR, u32), PlatformError> {
+    let aces: String = SERVICE_ACCOUNT_SIDS
+        .iter()
+        .map(|sid| format!("(A;;CC;;;{sid})"))
+        .collect();
+    descriptor_from_sddl(&format!("D:{aces}"), SERVICE_ACCOUNTS_PRINCIPAL)
+}
+
+/// `sddl` as a Win32-allocated self-relative descriptor; `subject` names it in
+/// errors. The caller MUST release the handle with [`LocalFree`].
+fn descriptor_from_sddl(
+    sddl: &str,
+    subject: &str,
+) -> Result<(PSECURITY_DESCRIPTOR, u32), PlatformError> {
     let mut sddl_w: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
 
     let mut psd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
@@ -1071,14 +1136,14 @@ fn sddl_for_sid(sid: &str) -> Result<(PSECURITY_DESCRIPTOR, u32), PlatformError>
         return Err(PlatformError::Win32 {
             operation: SDDL_OP,
             code: e.code().0 as u32,
-            message: format!("SDDL conversion failed for {sid:?}: {e}"),
+            message: format!("SDDL conversion failed for {subject:?}: {e}"),
         });
     }
     if psd.0.is_null() {
         return Err(PlatformError::Win32 {
             operation: SDDL_OP,
             code: 0,
-            message: format!("null SD returned for SID {sid:?}"),
+            message: format!("null SD returned for {subject:?}"),
         });
     }
     Ok((psd, size))
@@ -1374,6 +1439,35 @@ mod tests {
             free_sd_if_owned(psd);
             assert_eq!(sid_of_user_condition(&bytes).as_deref(), Some(sid));
         }
+    }
+
+    /// The service-accounts descriptor reads back as the principal it was built
+    /// from, so per-principal cleanup finds it; a two-ACE descriptor that is
+    /// not that set names nobody. No admin needed.
+    #[test]
+    fn the_service_accounts_descriptor_names_its_principal() {
+        let (psd, size) = sddl_for_service_accounts().expect("sddl");
+        // SAFETY: `psd` points at `size` bytes Win32 allocated, freed below.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(psd.0 as *const u8, size as usize) }.to_vec();
+        free_sd_if_owned(psd);
+        assert_eq!(
+            sids_of_user_condition(&bytes).map(|s| s.len()),
+            Some(SERVICE_ACCOUNT_SIDS.len())
+        );
+        assert_eq!(
+            principal_of_user_condition(&bytes).as_deref(),
+            Some(SERVICE_ACCOUNTS_PRINCIPAL)
+        );
+        assert_eq!(sid_of_user_condition(&bytes), None);
+
+        let (psd, size) =
+            descriptor_from_sddl("D:(A;;CC;;;S-1-5-18)(A;;CC;;;S-1-5-19)", "pair").expect("sddl");
+        // SAFETY: as above.
+        let pair =
+            unsafe { std::slice::from_raw_parts(psd.0 as *const u8, size as usize) }.to_vec();
+        free_sd_if_owned(psd);
+        assert_eq!(principal_of_user_condition(&pair), None);
     }
 
     #[test]

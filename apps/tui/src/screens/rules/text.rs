@@ -48,7 +48,7 @@ pub const VERDICTS_TITLE: Key = key(
 );
 pub const VERDICTS_BODY: Key = key(
     "notifications.verify-verdicts.body",
-    "They do get through over the other route and use it until the next restart. “Move” writes them there for good; “Not now” keeps them as written and checks again after the restart.",
+    "They do get through over the other route and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.",
 );
 pub const VERDICTS_ITEM: Key = key("notifications.verify-verdicts.item", "{value} → {route}");
 pub const VERDICTS_WHERE: Key = key(
@@ -459,6 +459,71 @@ pub const PLAIN_RELOAD: Key = key(
     "r: show the rules the service applies",
 );
 
+// ── The main-route check ─────────────────────────────────────────────────────
+
+pub const MAIN_ROUTE_COLUMN: Key = key("rules.column.main-route", "Main route");
+pub const MAIN_ROUTE_ANSWERED: Key = key("rules.main-route.answered", "reaches");
+pub const MAIN_ROUTE_SILENT: Key = key("rules.main-route.silent", "does not reach");
+pub const MAIN_ROUTE_NO_ADDRESS: Key = key("rules.main-route.no-address", "not seen yet");
+pub const MAIN_ROUTE_UNCLEAR: Key = key("rules.main-route.unclear", "could not check");
+pub const MAIN_ROUTE_ZONE: Key = key("rules.main-route.zone", "not checked");
+pub const MAIN_ROUTE_ANSWERED_HINT: Key = key(
+    "rules.main-route.answered-tooltip",
+    "Something answered at this address over the main connection. That does not mean the site works there — it may still refuse to serve you. Checked within the last half hour.",
+);
+pub const MAIN_ROUTE_SILENT_HINT: Key = key(
+    "rules.main-route.silent-tooltip",
+    "Nothing answered at this address over the main connection, so this rule is doing real work. Checked within the last half hour.",
+);
+pub const MAIN_ROUTE_NO_ADDRESS_HINT: Key = key(
+    "rules.main-route.no-address-tooltip",
+    "Nothing has visited this address on this computer since the service started, so there is nothing to try. Open the site once and check again.",
+);
+pub const MAIN_ROUTE_UNCLEAR_HINT: Key = key(
+    "rules.main-route.unclear-tooltip",
+    "The check could not be made: the main connection has no address right now, or the attempt failed to start. Try again later.",
+);
+pub const MAIN_ROUTE_ZONE_HINT: Key = key(
+    "rules.main-route.zone-tooltip",
+    "A zone covers every site under it, so there is no single address to try.",
+);
+pub const CHECK_BUSY: Key = key(
+    "rules.suggestions.inbox.action-check-main-route-busy",
+    "Checking...",
+);
+pub const CHECK_STARTED: Key = key(
+    "rules.main-route.check-started",
+    "Checking {count} addresses over the main connection...",
+);
+pub const CHECK_PROGRESS: Key = key(
+    "rules.main-route.check-progress",
+    "Checking addresses over the main connection: {done} of {total}...",
+);
+pub const CHECK_DONE: Key = key(
+    "rules.main-route.check-done",
+    "Main route check finished: reaches {answered}, does not reach {silent}, not checked {other}.",
+);
+pub const CHECK_NOTHING: Key = key(
+    "rules.main-route.check-nothing",
+    "Nothing to check: these addresses were checked recently, or none of them has been resolved yet.",
+);
+pub const NOTHING_TO_CHECK: Key = key(
+    "rules.main-route.nothing-to-check",
+    "There are no additional-route address rules to check.",
+);
+pub const CHECK_FAILED: Key = key("tui.suggestions.failed", "Not done: {error}");
+pub const SORT: Key = key("rules.sort.label", "Sort");
+pub const SORT_DISPLAY: Key = key("rules.sort.by-display-order", "Display order");
+pub const SORT_MAIN_ROUTE: Key = key("rules.sort.by-main-route", "Main route check");
+pub const HELP_MAIN_ROUTE: Key = key(
+    "tui.rules.help.main-route",
+    "c: check whether the main route reaches the sites of your additional-route rules; the answer shows beside each rule. Shift+O: list what the main route does not reach first, or back",
+);
+pub const PLAIN_MAIN_ROUTE: Key = key(
+    "tui.rules.plain.main-route",
+    "c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back",
+);
+
 pub const TITLE_BASELINE: Key = key(
     "tui.rules.title-baseline",
     "Rules — baseline for every user",
@@ -468,11 +533,17 @@ pub const BASELINE_NOTE: Key = key(
     "Running as root: these rules are the baseline every user without rules of their own follows, as Set as baseline does in the window.",
 );
 
+pub const UNRECOGNIZED: Key = key(
+    "rules.unrecognized-note",
+    "Rules this version cannot read: {n}. They are kept in your rules and are not applied; a newer version of the app applies them.",
+);
+
 /// Every key above, for the test that holds both locale files to them.
 #[cfg(test)]
 pub const ALL: &[Key] = &[
     TITLE_BASELINE,
     BASELINE_NOTE,
+    UNRECOGNIZED,
     ROUTE_PRIMARY,
     ROUTE_SECONDARY,
     ROUTE_BLOCK,
@@ -635,4 +706,27 @@ pub const ALL: &[Key] = &[
     PLAIN_FOLDER,
     PLAIN_RELOAD,
     PLAIN_VERDICTS,
+    MAIN_ROUTE_COLUMN,
+    MAIN_ROUTE_ANSWERED,
+    MAIN_ROUTE_SILENT,
+    MAIN_ROUTE_NO_ADDRESS,
+    MAIN_ROUTE_UNCLEAR,
+    MAIN_ROUTE_ZONE,
+    MAIN_ROUTE_ANSWERED_HINT,
+    MAIN_ROUTE_SILENT_HINT,
+    MAIN_ROUTE_NO_ADDRESS_HINT,
+    MAIN_ROUTE_UNCLEAR_HINT,
+    MAIN_ROUTE_ZONE_HINT,
+    CHECK_BUSY,
+    CHECK_STARTED,
+    CHECK_PROGRESS,
+    CHECK_DONE,
+    CHECK_NOTHING,
+    NOTHING_TO_CHECK,
+    CHECK_FAILED,
+    SORT,
+    SORT_DISPLAY,
+    SORT_MAIN_ROUTE,
+    HELP_MAIN_ROUTE,
+    PLAIN_MAIN_ROUTE,
 ];

@@ -1007,3 +1007,62 @@ fn a_name_with_markup_never_reaches_the_cache() {
     assert!(lookup.ips_for_hostname("x&y.example").is_empty());
     assert!(!lookup.ips_for_hostname("ok.example").is_empty());
 }
+
+/// Rules per principal, for the several-users cases.
+struct RulesPerSid(HashMap<String, CanonicalRuleSet>);
+impl RulesProvider for RulesPerSid {
+    fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+        None
+    }
+    fn active_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
+        Some(ActiveRulesSnapshot {
+            rule_book: CanonicalRuleBook {
+                primary: CanonicalRuleSet::default(),
+                secondary: self.0.get(principal)?.clone(),
+            },
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+        })
+    }
+}
+
+/// Two signed-in users with their own suffix rules: an observation each one's
+/// rules name is cached for their routes, the first user's included, and a
+/// name nobody names stays out.
+#[test]
+fn every_present_principal_gets_their_rule_hosts_cached() {
+    let (cache, lookup) = in_memory_cache();
+    let mut books = HashMap::new();
+    books.insert(
+        "S-1-5-21-1-2-3-1001".to_string(),
+        CanonicalRuleSet::from_rules(vec![suffix_rule("r-a", "a.example")]),
+    );
+    books.insert(
+        "S-1-5-21-1-2-3-1002".to_string(),
+        CanonicalRuleSet::from_rules(vec![suffix_rule("r-b", "b.example")]),
+    );
+    let consumer = DnsObservationConsumer::new(
+        Arc::new(RulesPerSid(books)) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        active_sid("S-1-5-21-1-2-3-1001"),
+    )
+    .with_present_principals(Arc::new(|| {
+        vec![
+            "S-1-5-21-1-2-3-1001".to_string(),
+            "S-1-5-21-1-2-3-1002".to_string(),
+        ]
+    }));
+    let summary = consumer.consume(
+        &[
+            obs("www.a.example", [198, 51, 100, 1]),
+            obs("www.b.example", [198, 51, 100, 2]),
+            obs("www.c.example", [198, 51, 100, 3]),
+        ],
+        SystemTime::now(),
+    );
+    assert_eq!(summary.matched, 2, "{summary:?}");
+    assert_eq!(summary.ignored, 1, "{summary:?}");
+    assert!(!lookup.ips_for_hostname("www.a.example").is_empty());
+    assert!(!lookup.ips_for_hostname("www.b.example").is_empty());
+    assert!(lookup.ips_for_hostname("www.c.example").is_empty());
+}

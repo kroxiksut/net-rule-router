@@ -195,8 +195,7 @@ fn a_unix_principal_scopes_the_flows_it_plans() {
     for flow in &flows {
         let scoped = flow
             .principal
-            .0
-            .as_ref()
+            .user()
             .and_then(|p| p.as_unix_uid())
             .expect("every flow must carry the uid it was planned for");
         assert_eq!(scoped, 1000);
@@ -225,7 +224,7 @@ fn the_baseline_plans_without_a_principal() {
     .0;
 
     assert!(!flows.is_empty());
-    assert!(flows.iter().all(|f| f.principal.0.is_none()));
+    assert!(flows.iter().all(|f| f.principal.user().is_none()));
 }
 
 #[test]
@@ -261,7 +260,7 @@ fn plans_exact_ip_permits_primary_then_secondary_with_slot_ordinals() {
     );
     assert_eq!(flows[2].precedence.ordinal, 0);
     assert_eq!(
-        flows[0].principal.0.as_ref().map(|p| p.as_stored()),
+        flows[0].principal.user().map(|p| p.as_stored()),
         Some("S-1-5-21-A")
     );
     assert!(flows.iter().all(|f| f.verdict == Verdict::Permit));
@@ -1037,7 +1036,7 @@ fn slice9_plan_report_names_both_caps() {
 fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
     use nrr_platform_api::enforcement::EnforcementPlan;
     use nrr_platform_linux::lower_linux::{lower_plan, EgressNames};
-    use nrr_platform_linux::nft_ir::{NftMatch, NftVerdict};
+    use nrr_platform_linux::nft_ir::NftMatch;
     use nrr_shared::ip_block::IpBlock;
 
     let principal = nrr_platform_api::enforcement::UserPrincipal::from_linux_uid(1000);
@@ -1094,7 +1093,7 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
         for proto in [6u8, 17u8] {
             assert!(
                 rules.iter().any(|r| {
-                    r.verdict == NftVerdict::Drop
+                    r.verdict.is_drop()
                         && r.comment.starts_with("doh-block#")
                         && names(r, IpAddr::V4(ip))
                         && r.matches.contains(&NftMatch::Protocol(proto))
@@ -1109,7 +1108,7 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
         for proto in [6u8, 17u8] {
             assert!(
                 rules.iter().any(|r| {
-                    r.verdict == NftVerdict::Drop
+                    r.verdict.is_drop()
                         && r.comment.starts_with("doh-block#")
                         && names(r, IpAddr::V6(ip))
                         && r.matches.contains(&NftMatch::Protocol(proto))
@@ -1124,7 +1123,7 @@ fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
     for proto in [6u8, 17u8] {
         assert!(
             rules.iter().any(|r| {
-                r.verdict == NftVerdict::Drop
+                r.verdict.is_drop()
                     && r.matches.contains(&NftMatch::Protocol(proto))
                     && r.matches.contains(&NftMatch::DstPort(853))
                     && !r.matches.iter().any(|m| {

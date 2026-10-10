@@ -8,6 +8,7 @@ mod apply;
 mod files;
 mod folder;
 mod form;
+mod main_route;
 mod own_settings;
 mod render;
 mod table;
@@ -153,11 +154,17 @@ impl Note {
         self
     }
 
+    /// The failure fills an `{error}` the sentence has, else follows it.
     pub fn text(&self, texts: &Texts) -> String {
-        let mut out = texts.fill(self.key, &self.args);
-        if let Some(failure) = &self.failure {
-            out.push_str(&failure.text(texts));
-        }
+        let mut out = match &self.failure {
+            Some(failure) if texts.get(self.key).contains("{error}") => {
+                let mut args = self.args.clone();
+                args.push(("error", failure.text(texts)));
+                texts.fill(self.key, &args)
+            }
+            Some(failure) => texts.fill(self.key, &self.args) + &failure.text(texts),
+            None => texts.fill(self.key, &self.args),
+        };
         if let Some(next) = &self.then {
             out.push(' ');
             out.push_str(&next.text(texts));
@@ -188,6 +195,10 @@ pub struct RulesState {
     pub my_rules: String,
     /// `?` rules that work only on the other route, waiting for an answer.
     pub verdicts: verdicts::Verdicts,
+    /// Rules the service keeps but this build cannot read, so never applies.
+    pub unrecognized: u32,
+    /// The main-route check and whether its column is shown.
+    pub main_route: main_route::MainRoute,
 }
 
 impl RulesState {
@@ -224,6 +235,7 @@ impl Screen for RulesScreen {
             text::HELP_FOLDER,
             text::HELP_RELOAD,
             text::HELP_VERDICTS,
+            text::HELP_MAIN_ROUTE,
             text::HELP_FORM,
         ]
     }
@@ -242,6 +254,7 @@ impl Screen for RulesScreen {
             text::PLAIN_FOLDER,
             text::PLAIN_RELOAD,
             text::PLAIN_VERDICTS,
+            text::PLAIN_MAIN_ROUTE,
         ]
     }
 
@@ -464,6 +477,7 @@ fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
     match result {
         Ok(list) => {
             rules.load_error = None;
+            rules.unrecognized = list.unrecognized;
             rules.table.load(&list.rows);
             overlaps::refresh(app);
             verdicts::write_bound_files(app);
@@ -960,11 +974,20 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'o' => start_folder_input(app),
             'm' => return verdicts::move_all(app),
             'n' => return verdicts::not_now(app),
+            'c' => return main_route::start(app),
+            'O' => change_order(app),
             _ => return false,
         },
         _ => return false,
     }
     true
+}
+
+/// The other order; the cursor goes back to the top, as a new filter does.
+fn change_order(app: &mut AppState) {
+    let table = &mut app.rules.table;
+    table.sort = table.sort.next();
+    table.cursor = 0;
 }
 
 /// Text keys; `false` for F1 so the help still opens.
@@ -1141,6 +1164,8 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         "o" => start_folder_input(app),
         "m" => return verdicts::move_all(app),
         "n" => return verdicts::not_now(app),
+        "c" => return main_route::start(app),
+        "O" => change_order(app),
         _ => return false,
     }
     true

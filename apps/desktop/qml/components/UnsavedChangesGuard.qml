@@ -295,6 +295,10 @@ Dialog {
                                 var revert = guard.ownerRoot.revertCallbackForSection(sectionId)
                                 if (revert) revert()
                             }
+                            // The button says the rule edits go away, so they do.
+                            if (typeof guard.ownerRoot.discardRuleEdits === "function") {
+                                guard.ownerRoot.discardRuleEdits()
+                            }
                             if (typeof guard.ownerRoot.clearAllUnsavedChanges === "function") {
                                 guard.ownerRoot.clearAllUnsavedChanges()
                             }

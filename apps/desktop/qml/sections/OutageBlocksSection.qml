@@ -1,5 +1,6 @@
 // What leak protection blocked during the user's last outage of the additional
-// route: one row per program and address, with how many attempts it made.
+// route: one row per program and address, with how many attempts it made, then
+// the routed names that never resolved, so no connection was made at all.
 //
 // The service keeps the list (the connection trace is too short for an
 // outage and mixes in permitted traffic); this page only reads it, on open,
@@ -22,6 +23,12 @@ ColumnLayout {
     readonly property var _episode: _answer ? (_answer.episode || null) : null
     readonly property bool _active: !!_episode && _episode["until-unix-ms"] === undefined
     readonly property var _entries: _answer ? (_answer.entries || []) : []
+    readonly property var _unresolved: _answer ? (_answer["unresolved-names"] || []) : []
+    // One list: blocked addresses first, then names that did not resolve.
+    readonly property var _rows: _entries.concat(_unresolved.map(function(n) {
+        return { unresolved: true, name: String(n.name || ""), attempts: n.attempts,
+                 "first-seen-ms": n["first-seen-ms"], "last-seen-ms": n["last-seen-ms"] }
+    }))
     readonly property int _omitted: _answer ? Number(_answer.omitted || 0) : 0
     readonly property bool _observerActive: !_answer || _answer["observer-active"] !== false
     readonly property bool _streamEnabled: !_answer || _answer["gui-stream-enabled"] !== false
@@ -136,8 +143,12 @@ ColumnLayout {
                 "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running."),
               warn: false },
             { show: !!section._episode && section._observerActive && section._streamEnabled
-                    && section._entries.length === 0,
+                    && section._rows.length === 0,
               text: root.tr("diag.outage-blocks.empty", "Nothing was blocked during this outage."),
+              warn: false },
+            { show: section._unresolved.length > 0,
+              text: root.tr("diag.outage-blocks.unresolved-note",
+                "Names marked “did not resolve” got no address, so the program could not even start a connection."),
               warn: false },
             { show: section._omitted > 0,
               text: root.tr("diag.outage-blocks.omitted", "{count} older entries did not fit in the list.")
@@ -161,7 +172,7 @@ ColumnLayout {
     Frame {
         Layout.fillWidth: true
         Layout.fillHeight: true
-        visible: section._entries.length > 0
+        visible: section._rows.length > 0
         padding: root.uiTheme.spacingSm
         background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
 
@@ -201,7 +212,7 @@ ColumnLayout {
                 Layout.fillHeight: true
                 Layout.minimumHeight: 120
                 clip: true
-                model: section._entries
+                model: section._rows
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: ScrollBar {}
                 Accessible.role: Accessible.List
@@ -210,13 +221,20 @@ ColumnLayout {
                     required property var modelData
                     width: list.width
                     spacing: root.uiTheme.spacingMd
-                    readonly property string _process: String(modelData.process || "")
-                    readonly property string _remote: section._remoteText(modelData)
+                    // No connection was made, so there is no program to name.
+                    readonly property string _process: modelData.unresolved ? "—" : String(modelData.process || "")
+                    readonly property string _remote: modelData.unresolved
+                        ? (root.uiRevision >= 0
+                            ? modelData.name + "  " + root.tr("diag.outage-blocks.unresolved", "did not resolve")
+                            : "")
+                        : section._remoteText(modelData)
                     readonly property string _attempts: String(modelData.attempts || 0)
                     readonly property string _first: Pure.formatTimestamp(modelData["first-seen-ms"])
                     readonly property string _last: Pure.formatTimestamp(modelData["last-seen-ms"])
                     Accessible.role: Accessible.ListItem
-                    Accessible.name: [_process, _remote, _attempts, _first, _last].join(", ")
+                    Accessible.name: (modelData.unresolved
+                        ? [_remote, _attempts, _first, _last]
+                        : [_process, _remote, _attempts, _first, _last]).join(", ")
                     Label {
                         Layout.preferredWidth: section._colProcessWidth
                         elide: Text.ElideRight
@@ -232,6 +250,7 @@ ColumnLayout {
                         Layout.preferredWidth: 0
                         elide: Text.ElideRight
                         textFormat: Text.PlainText
+                        font.italic: !!modelData.unresolved
                         color: root.textColor
                         text: parent._remote
                     }
@@ -258,6 +277,6 @@ ColumnLayout {
     // Keeps the lines at the top when there is no table to take the height.
     Item {
         Layout.fillHeight: true
-        visible: section._entries.length === 0
+        visible: section._rows.length === 0
     }
 }

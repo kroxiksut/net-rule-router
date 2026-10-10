@@ -235,6 +235,42 @@ pub enum WfpAction {
     Permit,
 }
 
+/// [`WfpFilterSpec::user_sid`] value that scopes an ALE filter to the
+/// machine's service accounts instead of one user. Not a SID: the apply layer
+/// expands it into one allow-ACE per [`SERVICE_ACCOUNT_SIDS`] entry, and
+/// enumeration folds that descriptor back into this value.
+pub const SERVICE_ACCOUNTS_PRINCIPAL: &str = "nrr:service-accounts";
+
+/// The accounts [`SERVICE_ACCOUNTS_PRINCIPAL`] stands for: LocalSystem,
+/// LocalService, NetworkService, the SERVICE logon group every
+/// SCM-started process carries, and NT SERVICE\ALL SERVICES. The last two
+/// cover the per-service `S-1-5-80-*` SIDs without naming each one.
+pub const SERVICE_ACCOUNT_SIDS: [&str; 5] =
+    ["S-1-5-18", "S-1-5-19", "S-1-5-20", "S-1-5-6", "S-1-5-80-0"];
+
+/// Who an ALE filter applies to, read from [`WfpFilterSpec::user_sid`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WfpPrincipal<'a> {
+    /// No user condition.
+    Anyone,
+    /// One account, by SID.
+    User(&'a str),
+    /// [`SERVICE_ACCOUNT_SIDS`].
+    ServiceAccounts,
+}
+
+impl<'a> WfpPrincipal<'a> {
+    /// The scope a stored `user_sid` names.
+    #[must_use]
+    pub fn of(user_sid: Option<&'a str>) -> Self {
+        match user_sid {
+            None => Self::Anyone,
+            Some(SERVICE_ACCOUNTS_PRINCIPAL) => Self::ServiceAccounts,
+            Some(sid) => Self::User(sid),
+        }
+    }
+}
+
 /// Specification for a WFP filter to be added.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WfpFilterSpec {
@@ -343,6 +379,12 @@ pub struct WfpFilterSpec {
 }
 
 impl WfpFilterSpec {
+    /// Who this filter applies to.
+    #[must_use]
+    pub fn principal(&self) -> WfpPrincipal<'_> {
+        WfpPrincipal::of(self.user_sid.as_deref())
+    }
+
     /// Validate that every condition this spec carries is expressible at its
     /// layer. Returns the human-readable reason of the first
     /// violation. The real `FwpmFilterAdd0` rejects such filters with

@@ -318,6 +318,12 @@ pub(super) fn build_conn_trace_pair(
         let dns_registry = Arc::clone(vpn_learning.killswitch_drop_registry);
         consumer_builder = consumer_builder
             .with_dns_lockdown_drop_check(Arc::new(move |id| dns_registry.is_dns_lockdown(id)));
+        // …and the service accounts' share of the guard, whose drops are system
+        // traffic: they may teach a tunnel endpoint and nothing else.
+        let service_registry = Arc::clone(vpn_learning.killswitch_drop_registry);
+        consumer_builder = consumer_builder.with_service_account_drop_check(Arc::new(move |id| {
+            service_registry.is_service_account(id)
+        }));
         // The same posture the GUI banner reads decides how a drop is
         // EXPLAINED: while the block-all is armed, an outage is the cause.
         let posture = vpn_learning.block_all_posture.clone();

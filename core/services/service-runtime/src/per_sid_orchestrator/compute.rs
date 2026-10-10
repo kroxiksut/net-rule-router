@@ -143,6 +143,22 @@ pub(super) fn collect_block_ids(specs: &[WfpFilterSpec], into: &mut KillswitchBl
     }
 }
 
+/// [`collect_block_ids`] for the service-account twins: role-verifying like the
+/// owner's (a tunnel client's drop still teaches its endpoint), and marked so
+/// every other drop observer can leave them out.
+pub(super) fn collect_service_account_block_ids(
+    specs: &[WfpFilterSpec],
+    into: &mut KillswitchBlockIds,
+) {
+    collect_block_ids(specs, into);
+    into.service_accounts.extend(
+        specs
+            .iter()
+            .filter(|s| s.action == WfpAction::Block)
+            .map(|s| s.id.raw),
+    );
+}
+
 /// True when `spec` is a BLOCK carrying a destination condition — a remote
 /// address or subnet. The companion egress-conditional permit of such a block
 /// becomes satisfiable as soon as that destination's secondary route exists,

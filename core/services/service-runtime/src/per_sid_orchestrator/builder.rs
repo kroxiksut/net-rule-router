@@ -108,7 +108,21 @@ impl PerSidApplyOrchestrator {
             // announces itself. Production wires the watchdog's queue via
             // `with_rebind_requests`.
             rebind_requests: None,
+            // Default: the service accounts are not guarded. Production wires
+            // the route-table owners via `with_service_accounts`.
+            service_accounts: None,
+            service_account_owner: Mutex::new(Vec::new()),
+            service_account_dns_log: crate::enforcement_planner::ServiceAccountDnsLog::default(),
         }
+    }
+
+    /// Give the machine's service accounts the route-table owners' address
+    /// pins. Read on every compute: an owner change moves the set on the next
+    /// reconcile.
+    #[must_use]
+    pub fn with_service_accounts(mut self, wiring: ServiceAccountWiring) -> Self {
+        self.service_accounts = Some(wiring);
+        self
     }
 
     /// Wire the queue the resume watchdog drains. A fail-closed posture that
@@ -253,11 +267,17 @@ impl PerSidApplyOrchestrator {
             .flat_map(|v| v.dns_lockdown.iter())
             .copied()
             .collect();
+        let service_accounts: HashSet<u64> = by_sid
+            .values()
+            .flat_map(|v| v.service_accounts.iter())
+            .copied()
+            .collect();
         registry.publish_scoped(crate::killswitch_drop_registry::ScopedBlockIds {
             all,
             app_scoped,
             ipv6_cut,
             dns_lockdown,
+            service_accounts,
         });
     }
 

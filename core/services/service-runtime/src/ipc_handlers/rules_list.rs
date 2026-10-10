@@ -107,6 +107,8 @@ mod tests {
                 rows: vec![row("R-1", "primary"), row("R-2", "secondary")],
                 supported_rule_types: vec!["zone".into(), "domain".into()],
                 active_revision_id: Some("rev-1".into()),
+                unrecognized: 0,
+                main_route_pending: 0,
             }),
             last_filter: Mutex::new(None),
         });
@@ -124,6 +126,8 @@ mod tests {
                 rows: Vec::new(),
                 supported_rule_types: Vec::new(),
                 active_revision_id: None,
+                unrecognized: 0,
+                main_route_pending: 0,
             }),
             last_filter: Mutex::new(None),
         });
@@ -144,6 +148,8 @@ mod tests {
                 rows: Vec::new(),
                 supported_rule_types: Vec::new(),
                 active_revision_id: None,
+                unrecognized: 0,
+                main_route_pending: 0,
             }),
             last_filter: Mutex::new(None),
         });

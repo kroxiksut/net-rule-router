@@ -2170,6 +2170,7 @@
       "banner-title": "Rules are managed by your administrator",
       "banner-body": "Changing rules is turned off on this computer. You can still view, search, filter and export them."
     },
+    "unrecognized-note": "Rules this version cannot read: {n}. They are kept in your rules and are not applied; a newer version of the app applies them.",
     "preview-notice": "Rule changes take effect only after you review and apply them.",
     "state": {
       "pending-label": "Pending:",
@@ -2329,13 +2330,16 @@
       "by-display-order": "Display order",
       "by-match-value": "Match value (A–Z)",
       "by-type": "Rule type",
-      "by-route": "Target route"
+      "by-route": "Target route",
+      "by-main-route": "Main route check"
     },
     "column": {
       "id": "ID",
       "type": "Type",
       "match-value": "Match value",
       "route": "Route",
+      "main-route": "Main route",
+      "main-route-tooltip": "What the last check found: does this address answer over the main connection. Appears after \"Check the main route\".",
       "comment": "Comment",
       "enabled": "On",
       "enabled-tooltip": "Click to toggle all visible rules on/off.",
@@ -2518,15 +2522,23 @@
       }
     },
     "main-route": {
-      "answered": "the main route reaches it",
-      "silent": "the main route does not reach it",
+      "answered": "reaches",
+      "silent": "does not reach",
       "answered-tooltip": "Something answered at this address over the main connection. That does not mean the site works there — it may still refuse to serve you. Checked within the last half hour.",
       "silent-tooltip": "Nothing answered at this address over the main connection, so this rule is doing real work. Checked within the last half hour.",
+      "no-address": "not seen yet",
+      "no-address-tooltip": "Nothing has visited this address on this computer since the service started, so there is nothing to try. Open the site once and check again.",
+      "unclear": "could not check",
+      "unclear-tooltip": "The check could not be made: the main connection has no address right now, or the attempt failed to start. Try again later.",
+      "zone": "not checked",
+      "zone-tooltip": "A zone covers every site under it, so there is no single address to try.",
       "action-check": "Check the main route",
-      "action-check-tooltip": "Tries to reach the addresses your rules name over the main connection, and marks what it finds beside each rule. Answering there does not mean the site works there — a rule may still be earning its place.",
+      "action-check-tooltip": "Tries to reach the addresses of your additional-route rules over the main connection, and shows the result in the Main route column. Answering there does not mean the site works there — a rule may still be earning its place.",
       "check-started": "Checking {count} addresses over the main connection...",
+      "check-progress": "Checking addresses over the main connection: {done} of {total}...",
+      "check-done": "Main route check finished: reaches {answered}, does not reach {silent}, not checked {other}.",
       "check-nothing": "Nothing to check: these addresses were checked recently, or none of them has been resolved yet.",
-      "nothing-to-check": "There are no address rules to check."
+      "nothing-to-check": "There are no additional-route address rules to check."
     },
     "invalid-count": "{n} rule(s) will not be applied: the value is not valid.",
     "invalid-count-show": "Show them",
@@ -3296,6 +3308,7 @@
       "svc-boot-wfp-session-slow": "The filtering engine took a long time to hand out a session ({elapsed_ms} ms); enforcement is up but the engine is answering slowly",
       "svc-boot-wfp-session-timeout": "Could not get a filtering-engine session within {budget_secs} s; the service starts WITHOUT enforcement — restart the Base Filtering Engine (BFE) service and then this service",
       "svc-boot-step-budget-exceeded": "Startup step \"{what}\" did not answer within its {budget_secs} s budget; continuing without it",
+      "svc-boot-before-logging": "Before the log opened: {since_process_start_ms} ms since the process was created, of which data folder protection took {lockdown_ms} ms and storage startup {bootstrap_ms} ms.",
       "svc-boot-ndjson-verbosity": "Operational log verbosity set to verbose: {verbose}",
       "svc-boot-crash-recovery-complete": "Crash recovery check complete: {outcome}",
       "tamper-mutation-gate-query-failed": "Could not check for active security alerts ({error}); new rule changes are allowed by default until the check succeeds.",
@@ -3488,6 +3501,8 @@
       "linux-svc-no-state-database": "No state database available; only the handshake, subscription and health operations are served. The GUI will show the service as needing recovery.",
       "linux-svc-app-destinations-persist-failed": "Application destinations could not be saved; continuing anyway: {error}",
       "linux-svc-app-destinations-restored": "Restored {admitted} application destinations from the previous session.",
+      "linux-svc-drop-reports-enabled": "Connections blocked by the rules are reported: block notices and the list of what an outage blocked are fed.",
+      "linux-svc-drop-reports-unavailable": "Reports of connections blocked by the rules are unavailable ({error}). Blocks are still enforced, but block notices and the list of what an outage blocked stay empty.",
       "linux-svc-traffic-db-unavailable": "The traffic-stats database is unavailable ({error}); the traffic counter is off.",
       "linux-svc-traffic-db-recreated": "The traffic-stats database was recreated after a failure to open or migrate it ({reason}).",
       "linux-svc-traffic-sampler-prime-failed": "The traffic sampler could not be started ({error}); the traffic counter is off.",
@@ -3672,6 +3687,8 @@
       "persid-plan-zone-widening-unimplemented": "The \"zone widening\" coverage strategy is selected but not yet supported; falling back to per-IP pinning.",
       "persid-plan-pin-set-trimmed": "Leak protection address set trimmed: {kept} address(es) kept, {dropped} dropped (already routed elsewhere or covered by {app_covered} app-observed destination(s)).",
       "persid-plan-shared-ip-excluded": "Smart leak protection excluded {excluded} shared address(es) from blocking (each is also used by a directly-visited host); {pinned} address(es) remain pinned.",
+      "persid-plan-service-dns-spared": "Additional-link rules name {count} DNS server(s) of the main link ({servers}). System services keep reaching them over the main link: cutting them would break name resolution for the whole machine. Mode B moves name resolution to the service.",
+      "persid-service-accounts-owner-changed": "Users the route table serves changed ({previous} → {owner}): system services now follow their leak protection addresses.",
       "persid-plan-network-too-wide": "{count} network(s) routed through the additional adapter are wider than /{widest_prefix}, so leak protection does not block them while that adapter is down: their traffic may leave through the main adapter (for example: {sample}).",
       "persid-plan-network-over-cap": "{count} network(s) routed through the additional adapter are past the leak protection limit and are not blocked while that adapter is down (for example: {sample}).",
       "persid-plan-network-spared": "Leak protection never blocks {count} network(s) routed through the additional adapter: they cover the local network, a reserved range or the tunnel server, or the main adapter's rules name them too (for example: {sample}).",
@@ -3764,6 +3781,10 @@
       "route-counter-overlay-missing": "No override routes are active — traffic that should use the main connection may still be using the additional route.",
       "route-orphan-enum-failed": "Could not read the system route table while recovering routes from a previous run ({error}).",
       "route-orphans-adopted": "Recovered {count} route(s) left over from a previous run.",
+      "route-table-owner-changed": "The system's own traffic now follows this user's routes.",
+      "route-table-owner-none": "Nobody is signed in: the system's own traffic follows no user's routes.",
+      "per-user-routing-unsupported": "This kernel cannot route each user separately ({reason}): the system route table carries the routes of one signed-in user for everyone.",
+      "own-traffic-mark-failed": "The service could not mark its own connections ({error}): system-wide filters may hold its checks and lookups.",
       "route-killswitch-luid-error": "Leak protection: could not resolve the additional route's interface identifier (index {ifindex}): {error} — staying off.",
       "route-killswitch-table-unreadable": "Leak protection: could not read the system route table, so local-network exceptions are unknown ({error}) — staying off.",
       "route-failclosed-table-unreadable": "Leak protection: could not read the system route table ({error}) — falling back to the last known local networks.",
@@ -3771,6 +3792,8 @@
       "route-secondary-liveness-dead": "The additional route's tunnel (interface {ifindex}, next hop {next_hop}) has been unreachable for {window_secs} second(s) — treating it as down and blocking traffic, even though the adapter still looks up.",
       "route-first-contact-install-failed": "Could not install the immediate route for a newly seen address ({error}) — it will be added on the next routing update.",
       "route-no-routing-user": "No user to route for right now ({active_count} active) — removing additional routes.",
+      "route-users-conflict": "Another signed-in user already routes {count} of this user's destinations ({destinations}) through a different link. They keep those routes; with leak protection on, this user's traffic to them is blocked rather than sent the other way.",
+      "route-users-conflict-cleared": "The route conflict with another signed-in user is over — this user's routes are in the table again.",
       "route-paused-teardown": "Routing is paused for this user (remove-on-pause) — removing additional routes.",
       "route-paused-persist": "Routing is paused for this user (keep-on-pause) — keeping the rule-specific routes and removing only the overlay routes.",
       "route-policy-recomputed": "Routes recomputed after a policy change: {added} added, {removed} removed.",
@@ -3808,6 +3831,7 @@
       "prod-networks-store-decision-failed": "Could not store the local-network decision for {cidr} ({error}).",
       "prod-networks-prune-superseded-failed": "Could not prune superseded local-network answers for adapter {adapter} ({error}).",
       "prod-networks-refusing-anchor-store-failed": "Could not record that a site refuses main-link addresses ({error}).",
+      "prod-autorule-rule-hosts-checked": "Checked whether the main connection reaches the addresses of your rules (reaches: {answered}, does not reach: {silent}, could not check: {indeterminate}, checked recently: {skipped_recent}, address not seen yet: {no_address}).",
       "prod-autorule-main-link-checked": "Checked whether the suggested addresses answer on the main link, as requested (answered: {answered}, silent: {silent}, indeterminate: {indeterminate}, skipped recently checked: {skipped_recent}, skipped over limit: {skipped_over_limit}, source: {source}).",
       "prod-autorule-secondary-reach-checked": "Checked whether the additional route reaches the hosts the main link did not (answered: {answered}, silent: {silent}, indeterminate: {indeterminate}).",
       "prod-autorule-probe-spawn-failed": "Could not start the main-link probe pass ({error}).",
@@ -3887,7 +3911,9 @@
       "col-first": "First",
       "col-last": "Last",
       "open-routes": "Open interfaces and routes",
-      "failed": "Could not load the list: "
+      "failed": "Could not load the list: ",
+      "unresolved": "did not resolve",
+      "unresolved-note": "Names marked “did not resolve” got no address, so the program could not even start a connection."
     }
   },
   "logs": {
@@ -4075,7 +4101,7 @@
     "empty": "No notifications.",
     "verify-verdicts": {
       "title": "Addresses that do not open where they are written: {count}",
-      "body": "They do get through over the other route and use it until the next restart. “Move” writes them there for good; “Not now” keeps them as written and checks again after the restart.",
+      "body": "They do get through over the other route and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.",
       "item": "{value} → {route}",
       "list": "Rules and the route they would move to"
     },
@@ -4212,6 +4238,11 @@
     "host-unreachable": {
       "title": "A site does not answer on either link",
       "body": "{host} did not answer through the main link or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side."
+    },
+    "routes-held": {
+      "title": "Some addresses follow another user's route",
+      "body": "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their route, or are blocked for you if leak protection is on. Among them: {list}.",
+      "cleared": "Addresses from your rules follow your own route again."
     },
     "settings-lost": {
       "title": "The service does not have your settings",
@@ -4502,6 +4533,7 @@
         "files": "i: import the two rules files. x: export them. p: load a country rule set",
         "folder": "o: choose the folder with your rule sets; the rules on screen are saved there as a set",
         "reload": "r: show the rules the service applies, dropping the changes on screen",
+        "main-route": "c: check whether the main route reaches the sites of your additional-route rules; the answer shows beside each rule. Shift+O: list what the main route does not reach first, or back",
         "verdicts": "m: move the rules that work only on the other route there for good. n: not now",
         "form": "In the rule form: Up and Down move between fields, Left and Right change a choice, Space switches the rule on or off, Enter saves, Esc cancels"
       },
@@ -4517,6 +4549,7 @@
         "files": "i: import files. x: export files. p: load a country rule set",
         "folder": "o: choose the folder with your rule sets",
         "reload": "r: show the rules the service applies",
+        "main-route": "c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back",
         "verdicts": "m: move the rules that work only on the other route. n: not now"
       },
       "title-baseline": "Rules — baseline for every user",

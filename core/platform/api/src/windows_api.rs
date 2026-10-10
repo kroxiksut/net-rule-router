@@ -153,6 +153,9 @@ pub struct MockWindowsApi {
     /// tests of the service-driven routing gate. `None` (default) mirrors the
     /// trait default ("no console user").
     console_user_sid: Mutex<Option<String>>,
+    /// Every signed-in user, when a test sets more than the console one.
+    /// `None` answers with the console user alone.
+    interactive_user_sids: Mutex<Option<Vec<String>>>,
 }
 
 // Test-only mock: `Mutex::lock().unwrap()` and similar are acceptable scaffolding.
@@ -172,7 +175,14 @@ impl MockWindowsApi {
             next_engine_token: Mutex::new(1),
             next_filter_id: Mutex::new(1),
             console_user_sid: Mutex::new(None),
+            interactive_user_sids: Mutex::new(None),
         }
+    }
+
+    /// Set every signed-in user `interactive_user_sids` reports, console first.
+    pub fn set_interactive_user_sids(&self, sids: &[&str]) {
+        *self.interactive_user_sids.lock().unwrap() =
+            Some(sids.iter().map(|s| s.to_string()).collect());
     }
 
     /// Set the SID returned by `interactive_user_sid` — the service-driven
@@ -310,6 +320,13 @@ impl RouteTablePort for MockWindowsApi {
 
     fn interactive_user_sid(&self) -> Option<String> {
         self.console_user_sid.lock().unwrap().clone()
+    }
+
+    fn interactive_user_sids(&self) -> Vec<String> {
+        match self.interactive_user_sids.lock().unwrap().clone() {
+            Some(sids) => sids,
+            None => self.interactive_user_sid().into_iter().collect(),
+        }
     }
 
     fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {

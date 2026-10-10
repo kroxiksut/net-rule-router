@@ -1,0 +1,125 @@
+Screens:
+  1. Status
+  2. First run
+  3. Interfaces and routes
+  4. Rules
+  5. Overlaps
+  6. Suggested addresses
+  7. Connection trace
+  8. Cache
+  9. Diagnostics and logs
+  0. Settings
+
+Screen: Status
+Service: OK
+Routing state:
+  Routing active
+  Rules apply on this user session.
+Connections:
+  Main connection: Ethernet — Example Network Adapter — Available — Rules applied
+  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+Notifications:
+  No notifications.
+Commands on this screen:
+  r: restore your settings to a service that lost them
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Rules
+Service: OK
+Rule list:
+  Reading the rules from the service…
+  Route: All routes
+Rules:
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
+  r: show the rules the service applies
+  m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Rules
+Service: OK
+Rule list:
+  Changes: Same as in the service
+  Route: All routes
+  Checking...
+Rules:
+  Rules 1 to 2 of 2; 2 in all.
+    1. [on] R-0001  Domain  shop.example — Additional
+    2. [on] R-0002  Zone  ru — Additional · Main route: not checked
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
+  r: show the rules the service applies
+  m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Rules
+Service: OK
+Rule list:
+  Changes: Same as in the service
+  Route: All routes
+  Checking 1 addresses over the main connection...
+Rules:
+  Rules 1 to 2 of 2; 2 in all.
+    1. [on] R-0001  Domain  shop.example — Additional
+    2. [on] R-0002  Zone  ru — Additional · Main route: not checked
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
+  r: show the rules the service applies
+  m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Rules
+Service: OK
+Rule list:
+  Changes: Same as in the service
+  Route: All routes · Sort: Main route check
+  Main route check finished: reaches 0, does not reach 1, not checked 0.
+Rules:
+  Rules 1 to 2 of 2; 2 in all.
+    1. [on] R-0001  Domain  shop.example — Additional · Main route: does not reach
+    2. [on] R-0002  Zone  ru — Additional · Main route: not checked
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
+  r: show the rules the service applies
+  m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+Type a screen number, h for help or q to quit, then press Enter.

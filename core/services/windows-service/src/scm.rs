@@ -121,12 +121,14 @@ pub fn run_under_scm() -> Result<(), ScmError> {
 fn scm_service_main(_args: Vec<OsString>) {
     // Before stderr is pointed into the log directory: that file is the first
     // thing written into the data tree.
+    let lockdown_started = std::time::Instant::now();
     let refused = crate::lock_down_data_tree().err();
+    let lockdown = lockdown_started.elapsed();
     // Without the capture, a panic during startup leaves no trace anywhere.
     if refused.is_none() {
         capture_stderr();
     }
-    let _ = run_scm_inner(refused);
+    let _ = run_scm_inner(refused, lockdown);
 }
 
 /// Send stderr to a file in the log directory. Resolves the directory
@@ -156,7 +158,7 @@ fn running_controls() -> ServiceControlAccept {
         | ServiceControlAccept::SESSION_CHANGE
 }
 
-fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
+fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmError> {
     let stop = StopToken::new();
     let stop_for_handler = stop.clone();
 
@@ -293,7 +295,9 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
     // from this point onward. Run the supervised runtime body so the
     // bootstrap artefacts (and the `Arc<LogWriter>` shared with the
     // global subscriber) live for the full runtime duration.
+    let bootstrap_started = std::time::Instant::now();
     let artifacts = run_bootstrap(&cfg);
+    let bootstrap = bootstrap_started.elapsed();
     // Carries the live tracing-reload handle out of this block so it can
     // be threaded into `build_supervised_runtime_deps` below, letting a
     // mid-session verbose-logging Save apply without a service restart.
@@ -314,6 +318,20 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
             msg_key = "svc-boot-ndjson-verbosity",
             verbose,
             "operational NDJSON verbosity",
+        );
+        // Everything above ran before there was a log to write to; without
+        // this line a slow start shows only as a gap before the first one.
+        let since_process_start_ms =
+            nrr_platform_windows::service_control::own_process_start_time()
+                .and_then(|created| created.elapsed().ok())
+                .map_or(0, |age| age.as_millis() as u64);
+        tracing::info!(
+            target: "nrr::boot",
+            msg_key = "svc-boot-before-logging",
+            since_process_start_ms,
+            lockdown_ms = lockdown.as_millis() as u64,
+            bootstrap_ms = bootstrap.as_millis() as u64,
+            "time spent before the log opened",
         );
     }
 

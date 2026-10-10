@@ -153,6 +153,9 @@ pub enum NoticeKind {
     RulesDrift,
     /// The additional connection is down; routine for a VPN switched off.
     SecondaryDown,
+    /// Some of this user's addresses follow another signed-in user's route;
+    /// nothing this user can fix.
+    RoutesHeld,
 }
 
 impl NoticeKind {
@@ -167,6 +170,7 @@ impl NoticeKind {
             Self::LocalNetworks => "local-networks",
             Self::RulesDrift => "rules-drift",
             Self::SecondaryDown => "secondary-down",
+            Self::RoutesHeld => "routes-held",
         }
     }
 
@@ -176,7 +180,7 @@ impl NoticeKind {
         Self::ALL.into_iter().find(|kind| kind.slug() == slug)
     }
 
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::BlockBacklog,
         Self::ExternalAddress,
         Self::RoutingRestored,
@@ -184,6 +188,7 @@ impl NoticeKind {
         Self::LocalNetworks,
         Self::RulesDrift,
         Self::SecondaryDown,
+        Self::RoutesHeld,
     ];
 }
 

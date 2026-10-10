@@ -282,7 +282,9 @@ mod tests {
         let path = dir.join("tray.sock");
         drop(UnixDatagram::bind(&path).expect("previous owner binds"));
         assert!(path.exists(), "a dead owner leaves its file behind");
-        let claim = claim_in(&dir, "tray").expect("claim succeeds");
+        // Same fork window as in the test above: a parallel spawn may still
+        // hold the dropped socket for a moment.
+        let claim = claim_within(&dir, "tray", Duration::from_secs(2));
         assert!(
             claim.is_some(),
             "a file with no live socket must be reclaimed"

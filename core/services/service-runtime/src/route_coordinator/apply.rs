@@ -8,7 +8,7 @@ use super::*;
 impl SecondaryRouteCoordinator {
     /// Recompute and apply the system route table from `sid`'s effective rule
     /// book and resolved routing inputs (own revision, or baseline via the
-    /// provider's read-through).
+    /// provider's read-through) — the table serving `sid` alone.
     ///
     /// `resolution.secondary == None` means the user has no usable secondary
     /// right now — every owned route is torn down so traffic falls back to the
@@ -22,134 +22,27 @@ impl SecondaryRouteCoordinator {
         sid: &str,
         resolution: &RouteResolution,
     ) -> Result<RouteReconcileDelta, PlatformError> {
-        self.remember_resolution(sid, resolution);
-        let Some(secondary) = resolution.secondary else {
-            // resolve() already logged the specific reason. The tunnel is gone,
-            // so its interior is nobody's subnet any more — publish the empty
-            // set rather than leave a stale one gating fake-IP answers.
-            crate::secondary_subnets::global_secondary_subnets().publish(Vec::new());
+        let plan = self.plan_user_routes(sid, resolution, None);
+        match resolution.secondary {
+            // The tunnel's own interior, refreshed while we already hold the
+            // enumeration: the fake-IP answerer must never substitute an
+            // address inside it.
+            Some(_) => self.publish_secondary_subnets(sid),
+            // The tunnel is gone, so its interior is nobody's subnet any more.
+            None => crate::secondary_subnets::global_secondary_subnets().publish(Vec::new()),
+        }
+        self.publish_served_alone(sid, &plan);
+        let (Some(secondary), true) = (plan.secondary, plan.planned) else {
             return self.reconciler.clear();
         };
-        // The tunnel's own interior, refreshed while we already hold the
-        // enumeration: the fake-IP answerer must never substitute an address
-        // inside it (a VPN client authorizing against its own tunnel address is
-        // the live case).
-        self.publish_secondary_subnets(sid);
-        let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
-            // No effective rules for this principal → no routes.
-            tracing::info!(
-                target: "nrr::route-coordinator",
-                msg_key = "route-no-active-rules",
-                sid = %sid,
-                "no active rules for this user — no secondary routes",
-            );
-            return self.reconciler.clear();
-        };
-        // The tunnel's own redirect prefixes shape mode A's counter-overlay.
-        // Read here, not cached: a client that reconnects may lay them out
-        // differently, and the reconcile that follows must answer that layout.
-        let table = self
-            .api
-            .get_ip_forward_table()
-            .map(|t| self.stamped_with_ownership(t));
-        let tunnel_catch_alls = table
-            .as_ref()
-            .map(|t| crate::route_codegen::tunnel_catch_all_prefixes(t, secondary.interface_index))
-            .unwrap_or_default();
-        // The rest of the machine reading only when a network rule will use it:
-        // the adapter enumeration is a cost the host-only book never pays.
-        let networks = match &table {
-            Ok(t)
-                if crate::route_codegen::network_routes::names_networks(
-                    &snapshot.rule_book,
-                    self.network_support,
-                ) =>
-            {
-                self.network_facts_from(resolution, t, false)
-            }
-            _ => crate::route_codegen::network_routes::NetworkRouteFacts::from_catch_alls(
-                &tunnel_catch_alls,
-            ),
-        };
-        let mut out = self.planned_routes(
-            sid,
-            resolution,
-            &secondary,
-            &snapshot.rule_book,
-            &tunnel_catch_alls,
-            &networks,
-        );
-        // DNS-over-secondary — the route half of the setting. Emitted here, not
-        // in `generate_routes`, because it is not derived from the rule book:
-        // it is service-owned infrastructure that must ride the same reconcile
-        // (and the same teardown) as everything else we install.
-        if self
-            .dns_via_secondary
-            .as_ref()
-            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-        {
-            // Fast liveness check: the dead verdict above has a whole
-            // hysteresis window of lag, and for that
-            // window these `/32`s would blackhole every direct dial to the
-            // public resolvers system-wide — including a VPN client's own
-            // bootstrap DNS, which is exactly what has to work for the tunnel
-            // to come back. One failed probe pulls the resolver routes; one
-            // successful probe restores them on the next recompute.
-            if self.liveness.in_failing_run(secondary.interface_index) {
-                tracing::debug!(
-                    target: "nrr::route-coordinator",
-                    sid = %sid,
-                    secondary_ifindex = secondary.interface_index,
-                    "DNS-over-secondary: last tunnel probe failed — leaving the public resolvers on the primary path until the tunnel answers again",
-                );
-            } else {
-                let dns_routes = crate::route_codegen::dns_via_secondary_routes(
-                    crate::dns_egress::PUBLIC_DNS_SERVERS,
-                    &secondary,
-                );
-                tracing::debug!(
-                    target: "nrr::route-coordinator",
-                    sid = %sid,
-                    routes = dns_routes.len(),
-                    secondary_ifindex = secondary.interface_index,
-                    "DNS-over-secondary: routing the service's upstream resolvers through the tunnel",
-                );
-                out.routes.extend(dns_routes);
-            }
-        }
-        if !out.diagnostics.is_empty() {
-            // Counted by kind, not summed: a bare total can't distinguish a
-            // missing primary from a cold DNS cache.
-            let tally = diagnostic_tally(&out.diagnostics);
-            tracing::debug!(
-                target: "nrr::route-coordinator",
-                sid = %sid,
-                diagnostics = out.diagnostics.len(),
-                routes = out.routes.len(),
-                hostname_unresolved = tally.hostname_unresolved,
-                suffix_empty = tally.suffix_empty,
-                zone_empty = tally.zone_empty,
-                app_rule_address_and_app_not_routed = tally.app_rule_address_and_app_not_routed,
-                app_rule_unobserved = tally.app_rule_unobserved,
-                app_rule_dest_claimed_by_main_link = tally.app_rule_dest_claimed_by_main_link,
-                app_rule_dest_used_by_other_process = tally.app_rule_dest_used_by_other_process,
-                address_claimed_by_main_link = tally.address_claimed_by_main_link,
-                primary_exceptions_unavailable = tally.primary_exceptions_unavailable,
-                network_yields_to_local_network = tally.network_yields_to_local_network,
-                network_routed_around_tunnel_server = tally.network_routed_around_tunnel_server,
-                network_claimed_by_main_link = tally.network_claimed_by_main_link,
-                network_routes_capped = tally.network_routes_capped,
-                "route codegen produced diagnostics",
-            );
-        }
+        let out_routes = plan.routes;
         // Route-shape breakdown so the log alone answers "is mode-A selectivity
         // actually in place?" without Get-NetRoute: the counter-overlay
         // (unmatched → primary) only exists when a primary target resolved; a
         // `counter_overlay=0` + `primary=false` in PreferPrimary is the
         // smoking gun for "unmatched traffic is still riding the secondary".
         // Told apart by signature, not length: a rule network can be `/9`.
-        let overlay_shapes: Vec<_> = out
-            .routes
+        let overlay_shapes: Vec<_> = out_routes
             .iter()
             .filter(|r| {
                 crate::route_codegen::is_overlay_route(r)
@@ -158,18 +51,16 @@ impl SecondaryRouteCoordinator {
             .map(|r| (r.destination, r.prefix_length))
             .collect();
         let counter_overlay = overlay_shapes.len();
-        let secondary_routes = out
-            .routes
+        let secondary_routes = out_routes
             .iter()
             .filter(|r| r.prefix_length == 32 && r.interface_index == secondary.interface_index)
             .count();
-        let network_routes = out
-            .routes
+        let network_routes = out_routes
             .iter()
             .filter(|r| r.metric == crate::route_codegen::NETWORK_ROUTE_METRIC)
             .count();
         let primary_present = resolution.primary.is_some();
-        let delta = self.reconciler.reconcile(&out.routes)?;
+        let delta = self.reconciler.reconcile(&out_routes)?;
         // ADD-ONLY, settled on hardware: we never remove the VPN's own
         // routes. Stripping its redirect `/1` pair made the client treat the
         // removal as a fault and reconnect, and in mode A it dropped
@@ -185,7 +76,7 @@ impl SecondaryRouteCoordinator {
                 msg_key = "route-table-unchanged",
                 sid = %sid,
                 secondary_ifindex = secondary.interface_index,
-                desired_routes = out.routes.len(),
+                desired_routes = out_routes.len(),
                 "route table reconciled (no change)",
             );
         } else {
@@ -196,7 +87,7 @@ impl SecondaryRouteCoordinator {
                 mode = ?resolution.mode,
                 primary = primary_present,
                 secondary_ifindex = secondary.interface_index,
-                desired_routes = out.routes.len(),
+                desired_routes = out_routes.len(),
                 secondary_routes,
                 counter_overlay,
                 network_routes,

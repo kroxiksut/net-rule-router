@@ -115,10 +115,18 @@ impl ConnectionObservationConsumer {
             .zip(self.ipv6_cut_drop_check.as_ref())
             .is_some_and(|(spec_id, check)| check(spec_id));
         let armed = self.fail_closed_armed.as_ref().is_some_and(|armed| armed());
+        let not_covered = rec
+            .nrr_drop_spec_id
+            .zip(self.not_covered_drop_check.as_ref())
+            .is_some_and(|(spec_id, check)| check(spec_id));
         block_reason_for(
             rec.nrr_drop_spec_id,
             killswitch_verified,
-            default_block_id,
+            if not_covered {
+                rec.nrr_drop_spec_id
+            } else {
+                default_block_id
+            },
             armed,
             ipv6_cut,
             self.is_dns_lockdown_drop(rec),
@@ -151,29 +159,36 @@ impl ConnectionObservationConsumer {
         ) {
             return;
         }
-        let armed = self.fail_closed_armed.as_ref().is_some_and(|armed| armed());
         let reason = self.reason_for_drop(rec, killswitch_verified, default_block_id);
-        // The outage is one fact about the machine, not one fact per
-        // application that ran into it. A disarmed block-all means the wait is
-        // over, so the next one is news again — this is also what keeps the
-        // latch from surviving a link that came back while nothing was trying.
-        if !armed {
-            self.outage_announced
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-        if !nrr_domain::block_notice::announces_individually(
-            reason,
-            self.outage_announced
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ) {
-            return;
-        }
-        // Latched by the notice that actually announces the outage — not by
-        // any drop that happens to land while one is armed. Marking it on a
-        // rule-block would swallow the outage notice that follows.
-        if reason == nrr_domain::block_notice::BlockReason::RouteUnavailable {
-            self.outage_announced
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        if self.owner_scoped {
+            if !self.announces_for_owner(rec, reason) {
+                return;
+            }
+        } else {
+            let armed = self.fail_closed_armed.as_ref().is_some_and(|armed| armed());
+            // The outage is one fact about the machine, not one fact per
+            // application that ran into it. A disarmed block-all means the wait
+            // is over, so the next one is news again — this is also what keeps
+            // the latch from surviving a link that came back while nothing was
+            // trying.
+            if !armed {
+                self.outage_announced
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            if !nrr_domain::block_notice::announces_individually(
+                reason,
+                self.outage_announced
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ) {
+                return;
+            }
+            // Latched by the notice that actually announces the outage — not
+            // by any drop that happens to land while one is armed. Marking it
+            // on a rule-block would swallow the outage notice that follows.
+            if reason == nrr_domain::block_notice::BlockReason::RouteUnavailable {
+                self.outage_announced
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         let host = match rec.remote.ip() {
             IpAddr::V4(ip) => self
@@ -197,6 +212,40 @@ impl ConnectionObservationConsumer {
             },
             rec.observed_unix_ms,
         );
+    }
+
+    /// Whether `rec`'s owner hears of this drop: an outage once per episode of
+    /// their outage list, every other cause per its own episode as usual.
+    fn announces_for_owner(
+        &self,
+        rec: &ConnectionTraceRecord,
+        reason: nrr_domain::block_notice::BlockReason,
+    ) -> bool {
+        use nrr_domain::block_notice::{announces_individually, BlockReason};
+        const MAX_LATCHED_OWNERS: usize = 64;
+        let Some(ring) = self
+            .trace_ring
+            .as_ref()
+            .filter(|_| reason == BlockReason::RouteUnavailable)
+        else {
+            return announces_individually(reason, false);
+        };
+        let owner = rec.user_sid.as_deref().unwrap_or_default();
+        let episode = ring
+            .outage_blocks()
+            .episode_for_drop(owner, rec.observed_unix_ms.unwrap_or_else(now_unix_ms));
+        let mut announced = self
+            .outage_announced_for
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !announces_individually(reason, announced.get(owner) == Some(&episode)) {
+            return false;
+        }
+        if announced.len() >= MAX_LATCHED_OWNERS && !announced.contains_key(owner) {
+            announced.clear();
+        }
+        announced.insert(owner.to_owned(), episode);
+        true
     }
 
     /// Detail-log ONE blocked connection, once per

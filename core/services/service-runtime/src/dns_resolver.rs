@@ -483,6 +483,20 @@ impl CompanionRescueObserver for NoopCompanionRescue {
     fn note_rescued_companion(&self, _hostname: &str) {}
 }
 
+/// Told when a rule host's `A` lookup ends with no address for the client, so
+/// a name that failed before any connection still shows up somewhere. Called
+/// only on that failure branch; an implementation must never wait.
+pub trait UnresolvedRuleHostObserver: Send + Sync {
+    fn note_unresolved(&self, hostname: &str);
+}
+
+/// No-op [`UnresolvedRuleHostObserver`] — failed lookups are not kept.
+pub struct NoopUnresolvedRuleHosts;
+
+impl UnresolvedRuleHostObserver for NoopUnresolvedRuleHosts {
+    fn note_unresolved(&self, _hostname: &str) {}
+}
+
 /// cap on the `A` records a RULE-host answer
 /// carries. Small enough to keep the pinned set from absorbing a CDN's whole
 /// pool, large enough for client-side connection resilience.

@@ -84,10 +84,6 @@ impl ScreenId {
         }
     }
 
-    fn index(self) -> usize {
-        Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
-    }
-
     /// The jump key shown beside the menu item: `1`–`9`, then `0`. A
     /// sub-screen has none: it opens from its parent.
     pub fn hotkey(self) -> Option<char> {
@@ -98,13 +94,70 @@ impl ScreenId {
     pub fn from_hotkey(c: char) -> Option<Self> {
         Self::KEYED.into_iter().find(|s| s.hotkey() == Some(c))
     }
+}
 
-    pub fn next(self) -> Self {
-        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+/// One row of the menu: a screen, or a Settings section under Settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuItem {
+    Screen(ScreenId),
+    Section(settings::Category),
+}
+
+impl MenuItem {
+    /// Every row Up and Down walk through: each sub-screen right after its
+    /// parent, the Settings sections right after Settings.
+    fn walk() -> impl Iterator<Item = Self> {
+        ScreenId::ALL.into_iter().flat_map(|id| {
+            let sections: &[settings::Category] = if id == ScreenId::Settings {
+                &settings::Category::ALL
+            } else {
+                &[]
+            };
+            std::iter::once(Self::Screen(id)).chain(sections.iter().map(|c| Self::Section(*c)))
+        })
     }
 
-    pub fn previous(self) -> Self {
-        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    /// The row the interface is on.
+    pub fn current(app: &AppState) -> Self {
+        match (app.screen, app.settings.open) {
+            (ScreenId::Settings, Some(category)) => Self::Section(category),
+            (screen, _) => Self::Screen(screen),
+        }
+    }
+
+    /// The rows the menu shows: the screens with a key, an open sub-screen
+    /// under its parent, and the Settings sections while Settings is open.
+    pub fn shown(app: &AppState) -> Vec<Self> {
+        Self::walk()
+            .filter(|item| match item {
+                Self::Screen(id) => id.hotkey().is_some() || *id == app.screen,
+                Self::Section(_) => app.screen == ScreenId::Settings,
+            })
+            .collect()
+    }
+}
+
+/// Up or Down in the menu: the next row of the walk, round at the ends.
+pub fn menu_step(app: &mut AppState, forward: bool) {
+    let walk: Vec<MenuItem> = MenuItem::walk().collect();
+    let here = MenuItem::current(app);
+    let at = walk.iter().position(|item| *item == here).unwrap_or(0);
+    let next = if forward {
+        (at + 1) % walk.len()
+    } else {
+        (at + walk.len() - 1) % walk.len()
+    };
+    match walk[next] {
+        MenuItem::Screen(ScreenId::Settings) => {
+            settings::show_sections(app);
+            app.open(ScreenId::Settings);
+        }
+        MenuItem::Screen(id) => app.open(id),
+        MenuItem::Section(category) => {
+            settings::show_sections(app);
+            app.open(ScreenId::Settings);
+            settings::open_category(app, category);
+        }
     }
 }
 
@@ -192,9 +245,52 @@ mod tests {
             if let Some(key) = s.hotkey() {
                 assert_eq!(ScreenId::from_hotkey(key), Some(s));
             }
-            assert_eq!(s.next().previous(), s);
         }
         assert_eq!(ScreenId::OutageBlocks.hotkey(), None);
-        assert_eq!(ScreenId::Trace.next(), ScreenId::OutageBlocks);
+        let walk: Vec<MenuItem> = MenuItem::walk().collect();
+        let trace = walk
+            .iter()
+            .position(|i| *i == MenuItem::Screen(ScreenId::Trace))
+            .unwrap_or_default();
+        assert_eq!(walk[trace + 1], MenuItem::Screen(ScreenId::OutageBlocks));
+    }
+
+    #[test]
+    fn the_settings_sections_follow_settings_in_the_menu() {
+        let mut app = AppState::new(ScreenId::Diagnostics, false);
+        menu_step(&mut app, true);
+        assert_eq!(
+            MenuItem::current(&app),
+            MenuItem::Screen(ScreenId::Settings)
+        );
+        let shown = MenuItem::shown(&app);
+        assert_eq!(shown.len(), 10 + settings::Category::ALL.len());
+        assert_eq!(
+            shown[10],
+            MenuItem::Section(settings::Category::Notifications)
+        );
+
+        for category in settings::Category::ALL {
+            menu_step(&mut app, true);
+            assert_eq!(app.screen, ScreenId::Settings);
+            assert_eq!(MenuItem::current(&app), MenuItem::Section(category));
+        }
+        menu_step(&mut app, true);
+        assert_eq!(app.screen, ScreenId::Status);
+        assert_eq!(MenuItem::shown(&app).len(), 10, "folded away again");
+
+        menu_step(&mut app, false);
+        assert_eq!(
+            MenuItem::current(&app),
+            MenuItem::Section(settings::Category::Terminal)
+        );
+        for _ in settings::Category::ALL {
+            menu_step(&mut app, false);
+        }
+        assert_eq!(
+            MenuItem::current(&app),
+            MenuItem::Screen(ScreenId::Settings)
+        );
+        assert_eq!(app.settings.open, None, "back on the list of sections");
     }
 }

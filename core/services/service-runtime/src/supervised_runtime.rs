@@ -694,7 +694,17 @@ pub fn run_supervised_runtime(
         // waits for the same reason: it changes the machine's network for a
         // user who is not there yet, inside the OS's own sign-in phase.
         if let Some(observer) = deps.logon_session_observer.as_ref() {
-            match crate::logon_rearm::LogonSessionRearm::start(
+            // A user who signs in with no tray is served from this pass rather
+            // than the periodic one; a sign-out drops the leaver past the grace.
+            let route_pass =
+                deps.route_recompute_hook
+                    .clone()
+                    .map(|hook| crate::logon_rearm::LogonRoutePass {
+                        hook,
+                        arrival_window: crate::logon_rearm::LOGON_ROUTE_DEBOUNCE,
+                        departure_window: crate::logon_rearm::LOGOFF_ROUTE_DEBOUNCE,
+                    });
+            match crate::logon_rearm::LogonSessionRearm::start_with_routes(
                 observer.as_ref(),
                 on_signed_in(
                     resolver_controller.clone(),
@@ -702,6 +712,7 @@ pub fn run_supervised_runtime(
                     deps.sign_in_gate.clone(),
                 ),
                 crate::logon_rearm::LOGON_DEBOUNCE,
+                route_pass,
             ) {
                 Ok(rearm) => {
                     tracing::info!(
@@ -1362,17 +1373,16 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         }
     }
 
-    // 8. auto-rules-tick. Harvests the companion-domain evidence
-    // the observe tick accumulates and either offers it or applies it, per the
-    // active user's `auto_rules_mode`. Slow (30 s) and Optional — the discovery
-    // pass is a convenience, never a routing dependency.
-    if let (Some(engine), Some(active_sid)) = (
-        deps.auto_rules_engine.as_ref(),
-        deps.active_routing_sid.as_ref(),
-    ) {
+    // 8. auto-rules-tick. Harvests the companion-domain evidence the observe
+    // tick accumulates, offers or applies it per each present user's
+    // `auto_rules_mode`, and checks their `?` rules. Optional — never a routing
+    // dependency.
+    if let (Some(engine), Some(present)) =
+        (deps.auto_rules_engine.as_ref(), present_principals_fn(deps))
+    {
         if let Err(e) = supervisor.spawn(crate::service_tasks::build_auto_rules_task(
             Arc::clone(engine),
-            Arc::clone(active_sid),
+            present,
             deps.auto_rule_probe.clone(),
         )) {
             tracing::warn!(

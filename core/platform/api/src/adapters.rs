@@ -311,6 +311,46 @@ pub fn classify_availability(info: &AdapterInfo) -> Option<AdapterAvailability> 
     })
 }
 
+/// The name to store for an adapter: the connection name the GUI lists, with
+/// the driver description as the fallback.
+pub fn preferred_display_name(info: &AdapterInfo) -> &str {
+    let friendly = info.friendly_name.trim();
+    if friendly.is_empty() {
+        &info.description
+    } else {
+        friendly
+    }
+}
+
+/// Live connections worth offering when the bound one is gone.
+///
+/// With `tunnels_first` (the additional route), tunnel-looking connections lead,
+/// by the keyword classification the adapter screen uses: there an Ethernet and
+/// a VPN are not interchangeable. Nothing is removed, so an unrecognised tunnel
+/// still appears lower down; only the order changes, which is what lets the
+/// surface above put a button on the first entry.
+pub fn replacement_candidates(infos: &[AdapterInfo], tunnels_first: bool) -> Vec<String> {
+    // Our own fake-IP adapter carries traffic back into us; it is never a route.
+    let usable = infos.iter().filter(|i| {
+        classify_availability(i) == Some(AdapterAvailability::Available)
+            && i.friendly_name.trim() != nrr_shared::product_identity::TUN_ADAPTER_NAME
+    });
+    if !tunnels_first {
+        return usable
+            .map(|i| preferred_display_name(i).to_string())
+            .collect();
+    }
+    let (tunnels, rest): (Vec<&AdapterInfo>, Vec<&AdapterInfo>) = usable.partition(|i| {
+        crate::vpn_discovery::looks_like_vpn(preferred_display_name(i))
+            || crate::vpn_discovery::looks_like_vpn(&i.description)
+    });
+    tunnels
+        .into_iter()
+        .chain(rest)
+        .map(|i| preferred_display_name(i).to_string())
+        .collect()
+}
+
 // ── AdapterAvailabilityChange ─────────────────────────────────────────────────
 
 /// An availability change that has passed the debounce window.

@@ -1646,3 +1646,43 @@ fn a_first_contact_drop_on_a_live_secondary_never_joins_the_outage_list() {
         "the usable secondary closed the open outage"
     );
 }
+
+/// System traffic the owner's guard dropped is nobody's notice: the user did
+/// not send it and can do nothing about it.
+#[test]
+fn a_service_account_drop_raises_no_notice() {
+    let (consumer, attempts) = raw_attempt_consumer(true);
+    let consumer = consumer.with_service_account_drop_check(Arc::new(|id| id == 777));
+
+    consumer.consume(&[block_obs(Some(true), Some(777))], SystemTime::now());
+    assert!(attempts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_empty());
+
+    // Positive control: a drop by the owner's own filter still speaks.
+    let (consumer, attempts) = raw_attempt_consumer(true);
+    let consumer = consumer.with_service_account_drop_check(Arc::new(|id| id == 778));
+    consumer.consume(&[block_obs(Some(true), Some(777))], SystemTime::now());
+    assert_eq!(attempts.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+}
+
+#[test]
+fn a_service_account_drop_never_reaches_the_reverse_learner() {
+    const SERVICE_SPEC: u64 = 9;
+    let (consumer, named) = reverse_learner_consumer(Arc::new(|_: u64| false));
+    let consumer = consumer.with_service_account_drop_check(Arc::new(|id| id == SERVICE_SPEC));
+    let dropped = |spec| {
+        let mut o = block_obs(Some(true), Some(spec));
+        o.remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 443));
+        o
+    };
+    consumer.consume(&[dropped(SERVICE_SPEC)], SystemTime::now());
+    assert!(named.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+
+    consumer.consume(&[dropped(SERVICE_SPEC + 1)], SystemTime::now());
+    assert_eq!(
+        *named.lock().unwrap_or_else(|p| p.into_inner()),
+        vec![Ipv4Addr::new(198, 51, 100, 4)]
+    );
+}

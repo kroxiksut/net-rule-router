@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
-use nrr_shared::ipc_payloads::{EnforcementStatusDto, RuleConflictDto};
+use nrr_shared::ipc_payloads::{EnforcementStatusDto, RoutesHeldDto, RuleConflictDto};
 
 /// Ceiling on the conflicts kept per principal, so one pathological rule book
 /// cannot grow the snapshot past a frame.
@@ -236,19 +236,25 @@ impl FailClosedPostureStatus {
 }
 
 /// The last enforcement report per principal and role: the route coordinator
-/// writes it as it decides whether to push, the `SnapshotInitial` handler reads
-/// the caller's own. The push fires on change only, so without this a client
-/// that connects later never learns a standing state.
+/// or the enforcement cycle writes it as it decides whether to push, the
+/// `SnapshotInitial` handler reads the caller's own. The push fires on change
+/// only, so without this a client that connects later never learns a standing
+/// state.
 #[derive(Clone, Default)]
 pub struct RouteEnforcementStatus {
     reports: Arc<Mutex<ReportsByPrincipal>>,
     /// Told when a principal's additional route goes down or comes back, so
     /// the outage list opens and closes at the instant the status shows.
     outages: Arc<std::sync::OnceLock<Arc<crate::outage_blocks::OutageBlocks>>>,
+    /// Per principal, the destinations another signed-in user's routing holds.
+    held: Arc<Mutex<HashMap<String, RoutesHeldDto>>>,
 }
 
 /// Principal → role → report.
 type ReportsByPrincipal = HashMap<String, BTreeMap<String, EnforcementStatusDto>>;
+
+/// The role a report about the whole setup carries rather than one link's.
+pub const MACHINE_WIDE_ROLE: &str = "";
 
 impl RouteEnforcementStatus {
     /// Construct with nothing reported.
@@ -313,6 +319,66 @@ impl RouteEnforcementStatus {
         Some(stored)
     }
 
+    /// Record `status` for `principal`'s `role` and, when it differs from the
+    /// standing one, push it to that principal only. Recorded with or without a
+    /// bus: the snapshot reads it too. Keyed by role: one user can have a
+    /// resolved secondary and a missing primary at once, and a single latch per
+    /// principal made the two overwrite each other into an endless push.
+    pub fn publish(
+        &self,
+        events: Option<&crate::ipc_handlers::event_bus::EventBus>,
+        principal: &str,
+        status: &str,
+        role: &str,
+        candidates: Vec<String>,
+    ) {
+        let report = EnforcementStatusDto {
+            status: status.to_string(),
+            role: role.to_string(),
+            candidates,
+            since_unix_ms: None,
+        };
+        let Some(report) = self.record(principal, &report) else {
+            return;
+        };
+        let Some(bus) = events else {
+            return;
+        };
+        bus.publish_for(
+            principal,
+            nrr_shared::ipc_payloads::StatusUpdateEvent::EnforcementStatusChanged {
+                sid: principal.to_string(),
+                status: report.status,
+                role: report.role,
+                candidates: report.candidates,
+                since_unix_ms: report.since_unix_ms,
+            },
+        );
+    }
+
+    /// End a standing machine-wide report (`no-policy`, `adapters-unreadable`)
+    /// once its cause is gone: no role-specific report replaces it, so without
+    /// this its notice and snapshot entry would outlive the cause.
+    pub fn clear_machine_wide(
+        &self,
+        events: Option<&crate::ipc_handlers::event_bus::EventBus>,
+        principal: &str,
+    ) {
+        self.clear_role(events, principal, MACHINE_WIDE_ROLE);
+    }
+
+    /// Report `role` back to `ok` when something else stands for it.
+    pub fn clear_role(
+        &self,
+        events: Option<&crate::ipc_handlers::event_bus::EventBus>,
+        principal: &str,
+        role: &str,
+    ) {
+        if self.status_of(principal, role).is_some_and(|s| s != "ok") {
+            self.publish(events, principal, "ok", role, Vec::new());
+        }
+    }
+
     /// `principal`'s last status for `role`, when one was reported.
     pub fn status_of(&self, principal: &str, role: &str) -> Option<String> {
         self.reports
@@ -332,6 +398,29 @@ impl RouteEnforcementStatus {
             .get(principal)
             .map(|roles| roles.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Store what of `principal`'s routing another user holds; a zero count
+    /// forgets it. `true` when that changed, which decides the push.
+    pub fn record_routes_held(&self, principal: &str, report: RoutesHeldDto) -> bool {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        if report.count == 0 {
+            return held.remove(principal).is_some();
+        }
+        if held.get(principal) == Some(&report) {
+            return false;
+        }
+        held.insert(principal.to_string(), report);
+        true
+    }
+
+    /// `principal`'s standing report; never another principal's.
+    pub fn routes_held(&self, principal: &str) -> Option<RoutesHeldDto> {
+        self.held
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(principal)
+            .cloned()
     }
 }
 
@@ -386,6 +475,26 @@ mod tests {
             !status.set_rule_conflicts("S-1", Vec::new()),
             "clearing an empty set is not a change"
         );
+    }
+
+    #[test]
+    fn routes_held_are_kept_per_principal_and_a_zero_count_ends_them() {
+        let board = RouteEnforcementStatus::new();
+        let held = RoutesHeldDto {
+            count: 2,
+            sample: vec!["198.51.100.1".into(), "198.51.100.2".into()],
+        };
+        assert!(board.record_routes_held("S-1", held.clone()));
+        assert!(!board.record_routes_held("S-1", held.clone()), "no change");
+        assert_eq!(board.routes_held("S-1"), Some(held));
+        assert_eq!(board.routes_held("S-2"), None, "another user sees none");
+        let over = RoutesHeldDto {
+            count: 0,
+            sample: Vec::new(),
+        };
+        assert!(board.record_routes_held("S-1", over.clone()));
+        assert_eq!(board.routes_held("S-1"), None);
+        assert!(!board.record_routes_held("S-1", over), "already over");
     }
 
     fn status_report(status: &str, role: &str) -> EnforcementStatusDto {

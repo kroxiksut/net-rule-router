@@ -667,7 +667,8 @@ ApplicationWindow {
     // reactively even though the name comes from a JS function.
     readonly property bool secondaryBannerVisible:
         secondaryReconfirmVisible
-        || (secondaryUnresolvedVisible && prefs.missingSecondaryBannerAcknowledged !== true)
+        || (secondaryUnresolvedVisible && prefs.missingSecondaryBannerAcknowledged !== true
+            && !notificationsController.secondaryDownMuted)
         || (vpnSplitConflictBannerVisible && !interfacesRolesController._vpnSplitAcked())
     // The secondary-adapter banner in its AMBER (problem) flavour, as opposed
     // to the blue VPN-split explainer.
@@ -699,6 +700,7 @@ ApplicationWindow {
         emitPrefs()
     }
     onSecondaryUnresolvedVisibleChanged: {
+        if (secondaryUnresolvedVisible) notificationsController.refreshSecondaryDownMuted()
         if (!secondaryUnresolvedVisible && prefs.missingSecondaryBannerAcknowledged === true) {
             Qt.callLater(_clearMissingSecondaryBannerAck)
         }
@@ -1275,9 +1277,17 @@ ApplicationWindow {
         if (rulesGuardDirty()) ids.push("rules")
         return ids
     }
+    /// The guard's "Discard" for rules: with the service reachable the table
+    /// goes back to the rules it applies. Without it there is nothing to go
+    /// back to, so the edit stays and the guard only stands down.
+    function discardRuleEdits() {
+        if (!rulesNotAppliedToService || !_routingBackendConnected()) return
+        _refreshRulesFromService({ silent: false, confirmedEmpty: true })
+    }
     function clearAllUnsavedChanges() {
-        // The rule state survives a Discard (the table is not reverted), so
-        // record the acknowledgement instead of pretending it is clean.
+        // Without the service the rule edit survives a Discard, so record the
+        // acknowledgement instead of pretending it is clean; the reload that
+        // reverts it otherwise re-arms the guard on its own.
         _rulesGuardAcknowledged = true
         if (Object.keys(unsavedChangesRegistry).length === 0) {
             uiRevision += 1
@@ -2436,6 +2446,7 @@ ApplicationWindow {
             // statuses before this call: it skips a report equal to the one
             // already held, so a premature write hid the notice and the chip.
             _applyStandingEnforcementStatus(p["enforcement-status"])
+            _applyStandingRoutesHeld(p["routes-held-by-another-user"])
         })
     }
     // Heal the service-side link-provider SSOT after a
@@ -2762,7 +2773,7 @@ ApplicationWindow {
     /// the first few rules with the route they would move to.
     function verifyVerdictsBody(notice) {
         var lines = [tr("notifications.verify-verdicts.body",
-            "They do get through over the other route and use it until the next restart. “Move” writes them there for good; “Not now” keeps them as written and checks again after the restart.")]
+            "They do get through over the other route and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.")]
         for (var i = 0; i < notice.shown.length; i += 1) {
             lines.push(tr("notifications.verify-verdicts.item", "{value} → {route}")
                 .replace("{value}", notice.shown[i].value)
@@ -3655,6 +3666,9 @@ ApplicationWindow {
             case "enforcement-status-changed":
                 _onEnforcementStatusChanged(event)
                 break
+            case "routes-held-by-another-user":
+                _onRoutesHeldByAnotherUser(event)
+                break
             case "adapters-changed":
                 // The service's adapter monitor detected a
                 // topology change (e.g. the secondary adapter went up or down). Re-pull the
@@ -3939,6 +3953,52 @@ ApplicationWindow {
             return
         }
         notificationsController._addPushNotice(card)
+    }
+
+    /// Id of the card about destinations another signed-in user's routing
+    /// holds, and the state it shows ("" when nothing is held).
+    property string _routesHeldNoticeId: ""
+    property string _routesHeldSignature: ""
+
+    /// Some of this user's destinations follow another signed-in user's route.
+    /// One card per distinct set: a dismissed one stays dismissed while the set
+    /// is the same, a changed set is news, and a zero count takes it down.
+    function _onRoutesHeldByAnotherUser(event) {
+        var count = Number((event && event.count) || 0)
+        var sample = (event && event.sample instanceof Array) ? event.sample : []
+        var signature = count > 0 ? String(count) + "|" + sample.join(",") : ""
+        _routesHeldSignature = signature
+        if (_routesHeldNoticeId !== "")
+            notificationsController._dropPushNotice(_routesHeldNoticeId)
+        _routesHeldNoticeId = ""
+        if (signature === "") return
+        var noticeId = "routes-held:" + signature
+        _routesHeldNoticeId = noticeId
+        notificationsController._addPushNoticeUnlessMuted("routes-held", {
+            "id": noticeId,
+            "severity": "warning",
+            "dismissible": true,
+            "kind": "routes-held",
+            "noticeMuteKind": "routes-held",
+            // The same set coming back on another day is worth saying again.
+            "refractoryMs": 86400000,
+            "title": tr("notifications.routes-held.title",
+                "Some addresses follow another user's route"),
+            "body": tr("notifications.routes-held.body",
+                "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their route, or are blocked for you if leak protection is on. Among them: {list}.")
+                .replace("{count}", String(count))
+                .replace("{list}", sample.join(", "))
+        }, function() { return _routesHeldNoticeId === noticeId })
+    }
+
+    /// The snapshot's standing report, handled as the push it stands for; one
+    /// equal to the state already held is skipped, as for enforcement reports.
+    function _applyStandingRoutesHeld(report) {
+        var count = Number((report && report.count) || 0)
+        var sample = (report && report.sample instanceof Array) ? report.sample : []
+        var signature = count > 0 ? String(count) + "|" + sample.join(",") : ""
+        if (signature === _routesHeldSignature) return
+        _onRoutesHeldByAnotherUser({ "count": count, "sample": sample })
     }
 
     /// One reason slug -> the sentence explaining it. Mirrors the tray's own
@@ -6314,6 +6374,37 @@ ApplicationWindow {
             _refreshRulesFromService({ silent: false })
         }
     }
+    // The main-route check files its verdicts while it runs; only those marks
+    // are taken in, so unsaved edits survive and nothing is asked. `onDone`
+    // gets how many hosts the check has yet to answer.
+    function refreshMainRouteMarks(onDone) {
+        if (!bridgeAvailable
+                || typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcRulesList !== "function") return
+        var corr = nrrNativeBridge.rpcRulesList()
+        rpcTransport.registerRpcCallback(corr, function(ok, p) {
+            if (!ok || !p) return
+            var marks = ({})
+            var rows = p.rows || []
+            for (var i = 0; i < rows.length; i += 1) {
+                var key = String(rows[i]["rule-type"] || "") + "|"
+                    + String(rows[i]["match-value"] || "").toLowerCase()
+                marks[key] = String(rows[i]["main-route"] || "")
+            }
+            var changed = false
+            for (var j = 0; j < rulesModel.count; j += 1) {
+                var entry = rulesModel.get(j)
+                var mark = marks[String(entry.ruleType || "") + "|"
+                    + String(entry.matchValue || "").toLowerCase()]
+                if (mark !== undefined && mark !== String(entry.mainRoute || "")) {
+                    rulesModel.setProperty(j, "mainRoute", mark)
+                    changed = true
+                }
+            }
+            if (changed) rulesModelEdited()
+            if (typeof onDone === "function") onDone(Number(p["main-route-pending"] || 0))
+        })
+    }
     // Persistent main GUI flow (13.R2-GUI.4.c): when `minimizeToTrayInsteadOfClose`
     // is enabled, the X button hides the window without exiting the host
     // process. The launcher and Qt host remain alive, so a subsequent tray
@@ -8267,6 +8358,9 @@ ApplicationWindow {
     /// of the generic three-way "do not all agree" text. Written only by
     /// `_driftRefreshServiceHashInto` (the sole live service-rules read).
     property bool _serviceRulesEmpty: false
+    /// Rules the service keeps but this version cannot read, so never applies
+    /// (written by a newer version). Same single read as above.
+    property int serviceUnrecognizedRules: 0
 
     /// When `true`, a quiet "Merge available" affordance is
     /// offered: a route's linked file and the service revision have genuinely

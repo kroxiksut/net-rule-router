@@ -118,6 +118,7 @@ fn socket_bound(
     }
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
         .map_err(|_| LinkProbeOutcome::NotRun)?;
+    nrr_platform_api::own_traffic::mark_own_socket(&socket);
     socket
         .bind_device(Some(link.as_bytes()))
         .map_err(|_| LinkProbeOutcome::NotRun)?;

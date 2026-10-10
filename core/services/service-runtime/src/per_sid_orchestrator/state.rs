@@ -73,6 +73,31 @@ pub type FailClosedExemptionsResolver =
 /// the registry via [`PerSidApplyOrchestrator::with_vpn_client_apps_provider`].
 pub type VpnClientAppsProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
+/// Everyone the machine's route table serves right now — the principals whose
+/// guards the service accounts share. Production answers with the route
+/// coordinator's served set.
+pub type RoutingOwnerFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Does the machine table send this destination through another user's link
+/// than `sid`'s own? Such a destination stays out of `sid`'s share: system
+/// traffic to it follows the other user's route.
+pub type RoutedElsewhereFn = Arc<dyn Fn(&str, nrr_shared::ip_block::IpBlock) -> bool + Send + Sync>;
+
+/// DNS servers configured on the main link, read without waiting on the OS.
+pub type PrimaryDnsServersFn = Arc<dyn Fn() -> Vec<std::net::IpAddr> + Send + Sync>;
+
+/// What the service-account guard needs beyond the owner's own pass. Absent,
+/// the service accounts get nothing — the shape from before they were guarded.
+#[derive(Clone)]
+pub struct ServiceAccountWiring {
+    pub routing_owners: RoutingOwnerFn,
+    pub routed_elsewhere: RoutedElsewhereFn,
+    /// The service's own executable: its relay, resolver and probes must leave
+    /// by whichever link they choose.
+    pub own_executable: Option<String>,
+    pub primary_dns: PrimaryDnsServersFn,
+}
+
 /// Most rule hosts one apply asks DNS about. A first apply on a large preset
 /// can list hundreds; resolving them all at once would be a query burst on
 /// behalf of sites the user may never open. The rest are picked up by the
@@ -314,4 +339,10 @@ pub struct PerSidApplyOrchestrator {
     /// past a heartbeat asks here for a fresh binding resolution — the machine
     /// may have woken into a network where the bound tunnel adapter is gone.
     pub(super) rebind_requests: Option<Arc<crate::power_resume::RebindRequests>>,
+    /// The service-account guard's inputs. `None` (default) guards nobody.
+    pub(super) service_accounts: Option<ServiceAccountWiring>,
+    /// The route-table owners the last reconcile saw, sorted: one who left
+    /// drops their set, one who arrived installs theirs.
+    pub(super) service_account_owner: Mutex<Vec<String>>,
+    pub(super) service_account_dns_log: crate::enforcement_planner::ServiceAccountDnsLog,
 }

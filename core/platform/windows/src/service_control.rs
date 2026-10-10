@@ -35,6 +35,10 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 /// Poll cadence while waiting for a state transition.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// The most a pending service's own wait hint may stretch a start wait: past
+/// it, a hint reads as a hang rather than a slow step.
+const MAX_WAIT_HINT: Duration = Duration::from_secs(120);
+
 /// Best-effort drain budget applied when uninstall has to stop a running
 /// service first. Uninstall proceeds even if the service is slow to go down —
 /// SCM marks a still-running service for deletion on exit.
@@ -271,14 +275,17 @@ impl ServiceControlPort for WindowsServiceControl {
         // which gives whoever polls status afterwards a clean hand-off instead
         // of a race.
         //
-        // Only RUNNING ends the wait. `StartPending` is the state `start()`
-        // has just put the service into, so accepting it made the first poll
-        // succeed unconditionally: a service wedged in START_PENDING, or one
-        // that died a second later, reported itself started and the timeout
-        // branch was unreachable. STOPPED is equally terminal, and sooner —
-        // the service ran and gave up, and no amount of further waiting
-        // changes that.
-        let deadline = Instant::now() + timeout;
+        // Only RUNNING ends the wait: accepting START_PENDING made a wedged
+        // service read as started. STOPPED is terminal too — the service ran
+        // and gave up.
+        //
+        // A pending service names how long its next step may take (wait hint)
+        // and moves its checkpoint as it goes; the wait honours that, as the
+        // service manager does, so a start slower than `timeout` but still
+        // reporting is not called a failure.
+        let waited_since = Instant::now();
+        let deadline = waited_since + timeout;
+        let mut progress = (status.checkpoint, waited_since);
         loop {
             let status = service.query_status().map_err(map_service_error)?;
             match status.current_state {
@@ -291,10 +298,14 @@ impl ServiceControlPort for WindowsServiceControl {
                 }
                 _ => {}
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if status.checkpoint != progress.0 {
+                progress = (status.checkpoint, now);
+            }
+            if start_wait_over(now, deadline, progress.1, status.wait_hint) {
                 return Err(ServiceControlError::Timeout {
                     operation: "start",
-                    seconds: timeout.as_secs(),
+                    seconds: waited_since.elapsed().as_secs(),
                 });
             }
             std::thread::sleep(POLL_INTERVAL);
@@ -369,6 +380,12 @@ impl ServiceControlPort for WindowsServiceControl {
             running_since: status.process_id.and_then(process_start_time),
         }))
     }
+}
+
+/// When this process was created: what a slow start is measured from, since the
+/// image load and the service manager's dispatch come before `main`.
+pub fn own_process_start_time() -> Option<std::time::SystemTime> {
+    process_start_time(std::process::id())
 }
 
 /// Creation time of a running process, or `None` when it cannot be read (the
@@ -622,6 +639,17 @@ fn adoption_verdict(
     Ok(())
 }
 
+/// A start wait ends only past both the caller's `deadline` and what the
+/// pending service promised: its wait hint, counted from its last checkpoint move.
+fn start_wait_over(
+    now: Instant,
+    deadline: Instant,
+    last_progress: Instant,
+    wait_hint: Duration,
+) -> bool {
+    now >= deadline.max(last_progress + wait_hint.min(MAX_WAIT_HINT))
+}
+
 /// Poll SCM until the service reports `Stopped` or the budget expires.
 fn wait_for_stopped(service: &Service, timeout: Duration) -> Result<(), ServiceControlError> {
     let deadline = Instant::now() + timeout;
@@ -740,6 +768,48 @@ fn sweep_enforcement_state() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_start_slower_than_the_budget_is_waited_for_while_the_service_promised_it() {
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_secs(15);
+        let hint = Duration::from_secs(30);
+        // 16 s in, the service said at 0 s that its step may take 30 s.
+        assert!(!start_wait_over(
+            t0 + Duration::from_secs(16),
+            deadline,
+            t0,
+            hint
+        ));
+        assert!(start_wait_over(
+            t0 + Duration::from_secs(30),
+            deadline,
+            t0,
+            hint
+        ));
+        // A checkpoint move at 25 s renews the promise.
+        let moved = t0 + Duration::from_secs(25);
+        assert!(!start_wait_over(
+            t0 + Duration::from_secs(40),
+            deadline,
+            moved,
+            hint
+        ));
+        // No hint: the caller's budget alone decides.
+        assert!(start_wait_over(
+            t0 + Duration::from_secs(15),
+            deadline,
+            t0,
+            Duration::ZERO
+        ));
+        // A hint of hours reads as a hang once the cap is spent.
+        assert!(start_wait_over(
+            t0 + MAX_WAIT_HINT,
+            deadline,
+            t0,
+            Duration::from_secs(36_000)
+        ));
+    }
 
     fn census(entries: &[&str], foreign: &[&str]) -> crate::trusted_location::TreeOwnership {
         crate::trusted_location::TreeOwnership {

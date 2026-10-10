@@ -148,6 +148,106 @@ fn parse_show_user_states(stdout: &str) -> HashMap<u32, String> {
     states
 }
 
+/// How one live user is signed in, as far as choosing between users needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SignInFacts {
+    /// Their session is the active one on a seat: the person at the machine.
+    at_seat: bool,
+    /// Monotonic start of their earliest live user session, in microseconds.
+    signed_in_at: Option<u64>,
+}
+
+/// The properties [`parse_session_facts`] reads.
+const SESSION_PROPERTIES: [&str; 6] = [
+    "--property=User",
+    "--property=Seat",
+    "--property=Active",
+    "--property=State",
+    "--property=Class",
+    "--property=TimestampMonotonic",
+];
+
+/// Seat and sign-in facts for `uids`: two `loginctl` calls, made only when
+/// there is somebody to choose between. Unreadable means no facts, which
+/// leaves logind's own order to decide.
+fn sign_in_facts(uids: &[u32]) -> HashMap<u32, SignInFacts> {
+    let uids: Vec<String> = uids.iter().map(u32::to_string).collect();
+    let mut args = vec!["show-user"];
+    args.extend(uids.iter().map(String::as_str));
+    args.push("--property=Sessions");
+    let Ok(out) = crate::command::output_with_timeout(
+        "loginctl",
+        &args,
+        crate::command::DEFAULT_COMMAND_TIMEOUT,
+    ) else {
+        return HashMap::new();
+    };
+    let sessions = parse_session_ids(&String::from_utf8_lossy(&out.stdout));
+    // `show-session` with no id describes the caller's own session.
+    if sessions.is_empty() {
+        return HashMap::new();
+    }
+    let mut args = vec!["show-session"];
+    args.extend(sessions.iter().map(String::as_str));
+    args.extend(SESSION_PROPERTIES);
+    crate::command::output_with_timeout("loginctl", &args, crate::command::DEFAULT_COMMAND_TIMEOUT)
+        .map(|out| parse_session_facts(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_default()
+}
+
+/// `Sessions=2 5 c1` lines, one per user, as `show-user` prints them.
+fn parse_session_ids(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("Sessions="))
+        .flat_map(str::split_whitespace)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// One block per session, as `show-session` prints them, folded per user.
+///
+/// Only `user*` classes count: a greeter, a lock screen, a background job or the
+/// per-user service manager is nobody signing in, and the manager session of a
+/// lingering account would otherwise date from boot.
+fn parse_session_facts(stdout: &str) -> HashMap<u32, SignInFacts> {
+    let mut facts: HashMap<u32, SignInFacts> = HashMap::new();
+    for block in stdout.split("\n\n") {
+        let mut uid = None;
+        let mut seat = "";
+        let mut active = false;
+        let mut state = "";
+        let mut class = "";
+        let mut started = None;
+        for line in block.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key {
+                "User" => uid = value.parse::<u32>().ok(),
+                "Seat" => seat = value,
+                "Active" => active = value == "yes",
+                "State" => state = value,
+                "Class" => class = value,
+                "TimestampMonotonic" => started = value.parse::<u64>().ok().filter(|t| *t > 0),
+                _ => {}
+            }
+        }
+        let Some(uid) = uid else { continue };
+        if !class.starts_with("user") || state == "closing" {
+            continue;
+        }
+        let entry = facts.entry(uid).or_default();
+        entry.at_seat |= active && !seat.is_empty();
+        entry.signed_in_at = match (entry.signed_in_at, started) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    facts
+}
+
 /// Everything that can go wrong asking the question.
 #[derive(Debug)]
 pub enum LogindError {
@@ -254,6 +354,34 @@ impl nrr_platform_api::active_principals::ActivePrincipalSource for LogindActive
         Ok(users
             .into_iter()
             .map(|u| nrr_platform_api::enforcement::UserPrincipal::from_linux_uid(u.uid))
+            .collect())
+    }
+
+    fn present_principals(
+        &self,
+    ) -> Result<
+        Vec<nrr_platform_api::active_principals::PresentPrincipal>,
+        nrr_platform_api::active_principals::ActivePrincipalError,
+    > {
+        let users = live_users().map_err(|e| {
+            nrr_platform_api::active_principals::ActivePrincipalError::new(e.to_string())
+        })?;
+        // One user has nobody to be chosen over: the common tick asks nothing more.
+        let facts = if users.len() > 1 {
+            sign_in_facts(&users.iter().map(|u| u.uid).collect::<Vec<_>>())
+        } else {
+            HashMap::new()
+        };
+        Ok(users
+            .into_iter()
+            .map(|u| {
+                let f = facts.get(&u.uid).copied().unwrap_or_default();
+                nrr_platform_api::active_principals::PresentPrincipal {
+                    principal: nrr_platform_api::enforcement::UserPrincipal::from_linux_uid(u.uid),
+                    at_seat: f.at_seat,
+                    signed_in_at: f.signed_in_at,
+                }
+            })
             .collect())
     }
 
@@ -376,6 +504,53 @@ mod tests {
         for spelling in LIST_USERS_SPELLINGS {
             assert_eq!(spelling[0], "list-users");
         }
+    }
+
+    #[test]
+    fn show_user_sessions_are_listed_across_users() {
+        let ids = parse_session_ids("Sessions=2 5\n\nSessions=c1\n\nSessions=\n");
+        assert_eq!(ids, ["2", "5", "c1"]);
+    }
+
+    #[test]
+    fn the_active_session_on_a_seat_marks_the_person_at_the_machine() {
+        let facts = parse_session_facts(concat!(
+            "User=1000\nSeat=seat0\nActive=yes\nState=active\nClass=user\nTimestampMonotonic=900\n\n",
+            "User=1001\nSeat=\nActive=yes\nState=active\nClass=user\nTimestampMonotonic=100\n\n",
+            "User=1002\nSeat=seat0\nActive=no\nState=online\nClass=user\nTimestampMonotonic=50\n",
+        ));
+        assert_eq!(
+            facts[&1000],
+            SignInFacts {
+                at_seat: true,
+                signed_in_at: Some(900)
+            }
+        );
+        assert!(!facts[&1001].at_seat, "a remote session has no seat");
+        assert!(
+            !facts[&1002].at_seat,
+            "a seat session switched away from is not active"
+        );
+    }
+
+    #[test]
+    fn the_earliest_live_user_session_dates_the_sign_in() {
+        let facts = parse_session_facts(concat!(
+            "User=1000\nSeat=\nActive=no\nState=online\nClass=user\nTimestampMonotonic=700\n\n",
+            "User=1000\nSeat=\nActive=no\nState=online\nClass=user\nTimestampMonotonic=300\n\n",
+            "User=1000\nSeat=\nActive=no\nState=closing\nClass=user\nTimestampMonotonic=10\n\n",
+            "User=1000\nSeat=\nActive=no\nState=online\nClass=manager\nTimestampMonotonic=5\n",
+        ));
+        assert_eq!(facts[&1000].signed_in_at, Some(300));
+    }
+
+    #[test]
+    fn a_greeter_or_a_manager_alone_is_no_sign_in() {
+        let facts = parse_session_facts(concat!(
+            "User=120\nSeat=seat0\nActive=yes\nState=active\nClass=greeter\nTimestampMonotonic=5\n\n",
+            "User=900\nSeat=\nActive=no\nState=online\nClass=manager\nTimestampMonotonic=6\n",
+        ));
+        assert!(facts.is_empty());
     }
 
     #[test]

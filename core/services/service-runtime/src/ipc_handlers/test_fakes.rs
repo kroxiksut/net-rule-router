@@ -446,6 +446,8 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
                 rows: Vec::new(),
                 supported_rule_types: Vec::new(),
                 active_revision_id: None,
+                unrecognized: 0,
+                main_route_pending: 0,
             }),
             last_filter: Mutex::new(None),
         }),

@@ -27,8 +27,8 @@ use crate::dns_resolver::{
     handle_a_query, AaaaOutcome, CompanionCandidateLookup, CompanionRescueObserver,
     DirectAnswerGate, DirectFakeIpAnswerer, FactSink, FakeIpAnswerer, NoopCompanionCandidates,
     NoopCompanionRescue, NoopDirectAnswerGate, NoopDirectFakeIp, NoopFakeIpAnswerer,
-    NoopSecondaryOwnedIps, QueryOutcome, ResolveError, RuleHostOracle, SecondaryOwnedIps,
-    SyncReconciler, UpstreamResolver,
+    NoopSecondaryOwnedIps, NoopUnresolvedRuleHosts, QueryOutcome, ResolveError, RuleHostOracle,
+    SecondaryOwnedIps, SyncReconciler, UnresolvedRuleHostObserver, UpstreamResolver,
 };
 use crate::dns_wire::{
     build_a_response, build_error_response, build_negative_response, only_v4,
@@ -231,6 +231,9 @@ pub struct DnsInterceptListener {
     /// it is — see [`crate::dns_resolver::LeakGuardPosture`]. The default never
     /// blocks, keeping the historic fail-open.
     leak_guard: Arc<dyn crate::dns_resolver::LeakGuardPosture>,
+    /// Told about a rule host this listener answered with no address. The
+    /// default keeps nothing.
+    unresolved: Arc<dyn UnresolvedRuleHostObserver>,
     /// The default is `Off`, which handles every AAAA exactly as before IPv6
     /// could be routed.
     ipv6_disposition: Ipv6DispositionFn,
@@ -336,6 +339,7 @@ impl DnsInterceptListener {
             companion_candidates: Arc::new(NoopCompanionCandidates),
             companion_rescue: Arc::new(NoopCompanionRescue),
             leak_guard: Arc::new(crate::dns_resolver::OpenLeakGuard),
+            unresolved: Arc::new(NoopUnresolvedRuleHosts),
             ipv6_disposition: Arc::new(|| crate::enforcement_planner::Ipv6Guard::Off),
             enforced_view: Arc::new(crate::dns_resolver::NoEnforcement),
             upstream_dns: Arc::new(crate::dns_upstream::UpstreamDnsPool::fixed(upstream_dns)),
@@ -371,6 +375,16 @@ impl DnsInterceptListener {
         posture: Arc<dyn crate::dns_resolver::LeakGuardPosture>,
     ) -> Self {
         self.leak_guard = posture;
+        self
+    }
+
+    /// Report every rule host this listener could not give an address, so the
+    /// outage list can name a site that failed before any connection.
+    pub fn with_unresolved_observer(
+        mut self,
+        observer: Arc<dyn UnresolvedRuleHostObserver>,
+    ) -> Self {
+        self.unresolved = observer;
         self
     }
 
@@ -711,6 +725,7 @@ impl DnsInterceptListener {
     fn rule_host_answer_without_upstream(&self, query: &[u8], qname: &str) -> ListenerAction {
         let cached = self.sink.cached_routable_ips(qname);
         if cached.is_empty() {
+            self.unresolved.note_unresolved(qname);
             return build_error_response(query, RCODE_SERVFAIL)
                 .map_or(ListenerAction::Drop, ListenerAction::Respond);
         }
@@ -853,8 +868,11 @@ impl DnsInterceptListener {
             // Withheld deliberately: SERVFAIL, never a forward. Forwarding here
             // would hand the caller the very addresses the guard is holding
             // back, over the OS's own resolver.
-            QueryOutcome::Withheld => build_error_response(query, RCODE_SERVFAIL)
-                .map_or(ListenerAction::Drop, ListenerAction::Respond),
+            QueryOutcome::Withheld => {
+                self.unresolved.note_unresolved(&q.qname);
+                build_error_response(query, RCODE_SERVFAIL)
+                    .map_or(ListenerAction::Drop, ListenerAction::Respond)
+            }
             QueryOutcome::Upstream(ResolveError::NoRecords) => {
                 negative_answer(query).map_or(ListenerAction::Forward, ListenerAction::Respond)
             }
@@ -999,7 +1017,10 @@ impl DnsInterceptListener {
                         let _ = socket.send_to(&resp, src);
                     }
                     // Silence costs the client its own timeout on top of ours.
-                    None => self.answer_servfail(socket, query, src),
+                    None => {
+                        self.answer_servfail(socket, query, src);
+                        self.note_failed_rule_host_forward(question.as_ref());
+                    }
                 }
             }
             ListenerAction::Drop => {}
@@ -1406,6 +1427,17 @@ impl DnsInterceptListener {
         None
     }
 
+    /// A rule host's `A` reaches the raw forward only when our own resolve
+    /// could not reach upstream; the forward failing too leaves the client
+    /// with no address. Asked after the SERVFAIL went out.
+    fn note_failed_rule_host_forward(&self, question: Option<&ParsedQuestion>) {
+        if let Some(q) = question.filter(|q| q.qtype == QTYPE_A) {
+            if self.oracle.is_rule_host(&q.qname) {
+                self.unresolved.note_unresolved(&q.qname);
+            }
+        }
+    }
+
     /// Tell the client the lookup failed instead of leaving it to time out.
     /// Under an armed block-all the wait is pure loss: the address it is
     /// waiting for would not have connected anyway.
@@ -1424,6 +1456,7 @@ impl DnsInterceptListener {
     /// through it, the rule host cache that routes and pins are derived from.
     fn forward_to(&self, query: &[u8], upstream: SocketAddr, window: Duration) -> Option<Vec<u8>> {
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        nrr_platform_api::own_traffic::mark_own_socket(&sock);
         sock.set_read_timeout(Some(window)).ok()?;
         sock.connect(upstream).ok()?;
         sock.send(query).ok()?;

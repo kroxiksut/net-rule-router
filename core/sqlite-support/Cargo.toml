@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.94.1"
 publish = false
 license = "MPL-2.0"
-description = "The one SQLite migration runner and connection setup shared by the service store and the GUI sidecar"
+description = "The one SQLite migration runner and connection setup shared by the service store and the GUI sidecar, and the browser-history read shared by the platform crates"
 # A leaf: nothing `nrr-*` below it. The sidecar must stay free of the
 # service-side store, and the two meet here instead.
 
@@ -13,7 +13,8 @@ description = "The one SQLite migration runner and connection setup shared by th
 path = "src/lib.rs"
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+# `hooks` for the progress handler that bounds a browser-history read.
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 
 [dev-dependencies]
 tempfile = "3"

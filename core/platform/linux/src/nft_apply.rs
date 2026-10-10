@@ -20,15 +20,21 @@
 //! and a firewall that owns the machine.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use nftables::batch::Batch;
 use nftables::expr::{Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField};
 use nftables::schema::{Chain, FlushObject, NfCmd, NfListObject, Nftables, Rule, Table};
-use nftables::stmt::{Match, Operator, Statement};
+use nftables::stmt::{JumpTarget, Limit, Log, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 
-use crate::nft_ir::{NftMatch, NftRule, NftRuleset, NftVerdict, NRR_CHAIN_PRIORITY};
+use crate::drop_tag::{
+    DropTag, DROP_LOG_BURST, DROP_LOG_RATE_PER_SECOND, NFLOG_SNAPLEN, NRR_NFLOG_GROUP,
+};
+use crate::nft_ir::{
+    reported_drop_tags, NftMatch, NftRule, NftRuleset, NftVerdict, NRR_CHAIN_PRIORITY,
+};
 
 const FAMILY: NfFamily = NfFamily::INet;
 
@@ -40,13 +46,26 @@ pub fn probe_table_name(table: &str) -> String {
     format!("{table}_probe")
 }
 
-/// Render the ruleset as a single nftables transaction.
+/// Whether a reported drop logs on its way out. `Silent` renders it as a
+/// plain drop, for a kernel that refuses the log statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropReporting {
+    Logged,
+    Silent,
+}
+
+/// Render the ruleset as a single nftables transaction, drops reported.
 ///
 /// Pure: no process is started and no kernel is touched, so the shape of what
 /// would be applied is assertable in a unit test.
-pub fn render_batch<'a>(ruleset: &'a NftRuleset) -> Nftables<'a> {
-    let table: Cow<'a, str> = Cow::Borrowed(ruleset.table.as_str());
-    let chain: Cow<'a, str> = Cow::Borrowed(ruleset.chain.as_str());
+pub fn render_batch(ruleset: &NftRuleset) -> Nftables<'_> {
+    render_batch_with(ruleset, DropReporting::Logged)
+}
+
+/// [`render_batch`], with the drop reporting chosen.
+pub fn render_batch_with(ruleset: &NftRuleset, reporting: DropReporting) -> Nftables<'_> {
+    let table: Cow<'_, str> = Cow::Borrowed(ruleset.table.as_str());
+    let chain: Cow<'_, str> = Cow::Borrowed(ruleset.chain.as_str());
 
     let mut batch = Batch::new();
     remove_table(&mut batch, Cow::Owned(probe_table_name(&ruleset.table)));
@@ -78,17 +97,78 @@ pub fn render_batch<'a>(ruleset: &'a NftRuleset) -> Nftables<'a> {
         chain.clone(),
         true,
     )));
+    add_drop_chains(&mut batch, table.clone(), &ruleset.rules, reporting);
 
     for rule in &ruleset.rules {
-        batch.add(rule_object(&table, &chain, rule));
+        batch.add(rule_object(&table, &chain, rule, reporting));
     }
     batch.to_nftables()
+}
+
+/// One chain per tag the rules jump to: a rate-limited log, then the drop.
+/// Never flushed separately — the table flush empties them — and never
+/// deleted, so a jump cannot outlive its target. Silent reporting needs none.
+fn add_drop_chains<'a, 'r>(
+    batch: &mut Batch<'a>,
+    table: Cow<'a, str>,
+    rules: impl IntoIterator<Item = &'r NftRule>,
+    reporting: DropReporting,
+) {
+    if reporting == DropReporting::Silent {
+        return;
+    }
+    for tag in reported_drop_tags(rules) {
+        let chain: Cow<'a, str> = Cow::Owned(tag.chain_name());
+        batch.add(NfListObject::Chain(chain_object(
+            table.clone(),
+            chain.clone(),
+            false,
+        )));
+        for expr in [drop_report_statements(tag), vec![Statement::Drop(None)]] {
+            batch.add(NfListObject::Rule(Rule {
+                family: FAMILY,
+                table: table.clone(),
+                chain: chain.clone(),
+                expr: Cow::Owned(expr),
+                handle: None,
+                index: None,
+                comment: None,
+            }));
+        }
+    }
+}
+
+/// Over the limit the rule stops matching and the packet falls through to the
+/// drop unlogged — which is why the limit sits here and not in front of the drop.
+fn drop_report_statements(tag: DropTag) -> Vec<Statement<'static>> {
+    vec![
+        Statement::Limit(Limit {
+            rate: DROP_LOG_RATE_PER_SECOND,
+            rate_unit: None,
+            per: Some(Cow::Borrowed("second")),
+            burst: Some(DROP_LOG_BURST),
+            burst_unit: None,
+            inv: None,
+        }),
+        Statement::Log(Some(Log {
+            prefix: Some(Cow::Owned(tag.prefix())),
+            group: Some(u32::from(NRR_NFLOG_GROUP)),
+            snaplen: Some(NFLOG_SNAPLEN),
+            queue_threshold: None,
+            level: None,
+            flags: None,
+        })),
+    ]
 }
 
 /// `indices` of the ruleset, applied for real into the probe twin: the kernel
 /// judges them as it would in our table, which `nft --check` never asks it to.
 /// The chain opens with an unconditional accept, so a probed rule never sees a
 /// packet, even if the twin outlives the search.
+///
+/// Drops are probed silent: whether the kernel takes the drop report is
+/// settled before any search, and a search that blamed the report would skip
+/// the very drops that guard against leaks.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn render_probe_batch<'a>(ruleset: &'a NftRuleset, indices: &[usize]) -> Nftables<'a> {
     let table: Cow<'a, str> = Cow::Owned(probe_table_name(&ruleset.table));
@@ -112,7 +192,7 @@ fn render_probe_batch<'a>(ruleset: &'a NftRuleset, indices: &[usize]) -> Nftable
         comment: None,
     }));
     for rule in indices.iter().filter_map(|&i| ruleset.rules.get(i)) {
-        batch.add(rule_object(&table, &chain, rule));
+        batch.add(rule_object(&table, &chain, rule, DropReporting::Silent));
     }
     batch.to_nftables()
 }
@@ -164,23 +244,28 @@ fn rule_object<'a>(
     table: &Cow<'a, str>,
     chain: &Cow<'a, str>,
     rule: &'a NftRule,
+    reporting: DropReporting,
 ) -> NfListObject<'a> {
     NfListObject::Rule(Rule {
         family: FAMILY,
         table: table.clone(),
         chain: chain.clone(),
-        expr: Cow::Owned(render_rule(rule)),
+        expr: Cow::Owned(render_rule(rule, reporting)),
         handle: None,
         index: None,
         comment: (!rule.comment.is_empty()).then_some(Cow::Borrowed(rule.comment.as_str())),
     })
 }
 
-fn render_rule(rule: &NftRule) -> Vec<Statement<'static>> {
+fn render_rule(rule: &NftRule, reporting: DropReporting) -> Vec<Statement<'static>> {
     let mut statements: Vec<Statement<'static>> = rule.matches.iter().map(render_match).collect();
     statements.push(match rule.verdict {
         NftVerdict::Accept => Statement::Accept(None),
         NftVerdict::Drop => Statement::Drop(None),
+        NftVerdict::DropReported(_) if reporting == DropReporting::Silent => Statement::Drop(None),
+        NftVerdict::DropReported(tag) => Statement::Jump(JumpTarget {
+            target: Cow::Owned(tag.chain_name()),
+        }),
     });
     statements
 }
@@ -220,6 +305,31 @@ fn render_match(m: &NftMatch) -> Statement<'static> {
                 key: MetaKey::Skuid,
             })),
             right: Expression::Number(*uid),
+            op: Operator::EQ,
+        }),
+        NftMatch::SkUidSet(ranges) => Statement::Match(Match {
+            left: Expression::Named(NamedExpression::Meta(Meta {
+                key: MetaKey::Skuid,
+            })),
+            right: Expression::Named(NamedExpression::Set(
+                ranges
+                    .iter()
+                    .map(|&(first, last)| {
+                        nftables::expr::SetItem::Element(if first == last {
+                            Expression::Number(first)
+                        } else {
+                            Expression::Range(Box::new(nftables::expr::Range {
+                                range: [Expression::Number(first), Expression::Number(last)],
+                            }))
+                        })
+                    })
+                    .collect(),
+            )),
+            op: Operator::EQ,
+        }),
+        NftMatch::Mark(mark) => Statement::Match(Match {
+            left: Expression::Named(NamedExpression::Meta(Meta { key: MetaKey::Mark })),
+            right: Expression::Number(*mark),
             op: Operator::EQ,
         }),
     }
@@ -369,6 +479,10 @@ const NFT_TIMEOUT: Duration = Duration::from_secs(20);
 /// `nft`'s exit status when it cannot open a netlink socket to the kernel.
 const NFT_EXIT_NONL: i32 = 3;
 
+/// Set once the kernel has refused the drop reports' log statement (no
+/// `nfnetlink_log`, a container that cannot load it). One kernel per process.
+static KERNEL_REFUSED_DROP_LOG: AtomicBool = AtomicBool::new(false);
+
 /// Applies rulesets by driving `nft`.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -378,6 +492,7 @@ pub struct NftCliEnforcement {
     /// Placed before our own arguments; lets a test's `sh -c` see them as `$@`.
     leading_args: &'static [&'static str],
     timeout: Duration,
+    drop_log_refused: &'static AtomicBool,
 }
 
 impl Default for NftCliEnforcement {
@@ -392,11 +507,12 @@ impl NftCliEnforcement {
             program: None,
             leading_args: &[],
             timeout: NFT_TIMEOUT,
+            drop_log_refused: &KERNEL_REFUSED_DROP_LOG,
         }
     }
 
     #[cfg(all(test, target_os = "linux"))]
-    pub(crate) const fn with_program(
+    pub(crate) fn with_program(
         program: &'static str,
         leading_args: &'static [&'static str],
         timeout: Duration,
@@ -405,13 +521,26 @@ impl NftCliEnforcement {
             program: Some(program),
             leading_args,
             timeout,
+            // Its own flag: a stand-in refusing the log must not silence the
+            // drops of every other test in the process.
+            drop_log_refused: Box::leak(Box::new(AtomicBool::new(false))),
+        }
+    }
+
+    /// Whether drops are reported on this kernel. `Silent` once it refused the
+    /// log statement; drop reports are then unavailable, never the drops.
+    pub fn drop_reporting(&self) -> DropReporting {
+        if self.drop_log_refused.load(Ordering::Relaxed) {
+            DropReporting::Silent
+        } else {
+            DropReporting::Logged
         }
     }
 
     /// Apply the ruleset as one transaction.
     #[cfg(target_os = "linux")]
     pub fn apply(&self, ruleset: &NftRuleset) -> Result<(), NftApplyError> {
-        self.run_batch(&render_batch(ruleset), &[])
+        self.run_batch(&render_batch_with(ruleset, self.drop_reporting()), &[])
             .map_err(classify)
     }
 
@@ -441,19 +570,24 @@ impl NftCliEnforcement {
         &self,
         ruleset: &NftRuleset,
     ) -> Result<NftApplyOutcome, NftApplyError> {
-        let failure = match self.run_batch(&render_batch(ruleset), &[]) {
-            Ok(()) => {
-                return Ok(NftApplyOutcome {
-                    applied: ruleset.rules.len(),
-                    skipped: Vec::new(),
-                })
-            }
+        let reporting = self.drop_reporting();
+        let clean = || NftApplyOutcome {
+            applied: ruleset.rules.len(),
+            skipped: Vec::new(),
+        };
+        let failure = match self.run_batch(&render_batch_with(ruleset, reporting), &[]) {
+            Ok(()) => return Ok(clean()),
             Err(failure) => failure,
         };
         let worth_a_search = kernel_answered(&failure);
         let refusal = classify(failure);
         if !worth_a_search {
             return Err(refusal);
+        }
+        // A kernel without NFLOG refuses every reported drop. Enforcing without
+        // the reports beats enforcing nothing, and costs a run only on a refusal.
+        if self.retry_silent(ruleset, reporting, &refusal) {
+            return Ok(clean());
         }
         // The bare table and chain are the control: refused too, the host or
         // our layout is at fault and no rule is to blame. That also settles an
@@ -468,7 +602,11 @@ impl NftCliEnforcement {
         })
         .and_then(|offenders| {
             let (kept, skipped) = without_rules(ruleset, &offenders);
-            self.apply(&kept)?;
+            if let Err(refused) = self.apply(&kept) {
+                if !self.retry_silent(&kept, reporting, &refused) {
+                    return Err(refused);
+                }
+            }
             Ok(NftApplyOutcome {
                 applied: kept.rules.len(),
                 skipped,
@@ -481,6 +619,33 @@ impl NftCliEnforcement {
             let _ = self.run_batch(&batch.to_nftables(), &[]);
         }
         outcome
+    }
+
+    /// After a refused logged apply: whether the same ruleset with silent drops
+    /// went in. If so, the log is what the kernel refused, and this process
+    /// stops asking for it.
+    #[cfg(target_os = "linux")]
+    fn retry_silent(
+        &self,
+        ruleset: &NftRuleset,
+        reporting: DropReporting,
+        refusal: &NftApplyError,
+    ) -> bool {
+        if reporting == DropReporting::Silent || reported_drop_tags(&ruleset.rules).is_empty() {
+            return false;
+        }
+        let silent = render_batch_with(ruleset, DropReporting::Silent);
+        if self.run_batch(&silent, &[]).is_err() {
+            return false;
+        }
+        self.drop_log_refused.store(true, Ordering::Relaxed);
+        tracing::warn!(
+            target: "nrr::enforcement",
+            error = %refusal,
+            "the kernel refused to log dropped packets; the drops are enforced, but \
+             which connections they stopped is no longer reported on this machine",
+        );
+        true
     }
 
     /// The rules at `indices` applied into the probe twin.
@@ -1089,6 +1254,81 @@ mod tests {
         assert!(json.contains("route-secondary#0"), "{json}");
     }
 
+    fn reported(kind: crate::drop_tag::DropKind, comment: &str) -> NftRule {
+        NftRule {
+            matches: vec![NftMatch::SkUid(1000)],
+            verdict: NftVerdict::DropReported(DropTag::user(kind)),
+            comment: comment.to_owned(),
+        }
+    }
+
+    /// The drop chain exists before the first rule jumps to it, logs under the
+    /// limit, then drops; an accept path gains nothing.
+    #[test]
+    fn a_reported_drop_jumps_to_a_chain_that_logs_under_a_limit_then_drops() {
+        use crate::drop_tag::DropKind;
+        let set = ruleset(vec![
+            plain("accept"),
+            reported(DropKind::Pin, "a"),
+            reported(DropKind::Pin, "b"),
+            reported(DropKind::Rule, "c"),
+        ]);
+        let batch = render_batch(&set);
+        assert_eq!(
+            commands(&batch)[6..],
+            [
+                "add chain nrr/output hooked",
+                "add chain nrr/drop_pin",
+                "add rule nrr/drop_pin",
+                "add rule nrr/drop_pin",
+                "add chain nrr/drop_rule",
+                "add rule nrr/drop_rule",
+                "add rule nrr/drop_rule",
+                "add rule nrr/output",
+                "add rule nrr/output",
+                "add rule nrr/output",
+                "add rule nrr/output",
+            ]
+        );
+        let json = serde_json::to_string(&batch).expect("the batch must serialise");
+        assert!(
+            json.contains(r#"{"limit":{"rate":20,"per":"second","burst":50}},{"log":{"prefix":"nrr:pin","group":20050,"snaplen":80}}"#),
+            "{json}"
+        );
+        assert!(json.contains(r#""jump":{"target":"drop_pin"}"#), "{json}");
+        assert!(json.contains(r#""jump":{"target":"drop_rule"}"#), "{json}");
+        let value = serde_json::to_value(&batch).expect("the batch must serialise");
+        let accept = value["nftables"]
+            .as_array()
+            .expect("a command list")
+            .iter()
+            .filter_map(|c| c["add"].get("rule"))
+            .find(|r| r["comment"] == "accept")
+            .expect("the accept rule");
+        assert_eq!(accept["expr"], serde_json::json!([{ "accept": null }]));
+    }
+
+    #[test]
+    fn silent_reporting_renders_a_plain_drop_and_no_drop_chain() {
+        let set = ruleset(vec![reported(crate::drop_tag::DropKind::Pin, "a")]);
+        let json = serde_json::to_string(&render_batch_with(&set, DropReporting::Silent))
+            .expect("the batch must serialise");
+        assert!(!json.contains("drop_pin"), "{json}");
+        assert!(!json.contains(r#""log""#), "{json}");
+        assert!(json.contains(r#""drop":null"#), "{json}");
+    }
+
+    /// The search must never blame a guard for the log the kernel would not
+    /// take: probes carry the drop, not the report.
+    #[test]
+    fn a_probe_renders_reported_drops_silent() {
+        let set = ruleset(vec![reported(crate::drop_tag::DropKind::Pin, "a")]);
+        let json = serde_json::to_string(&render_probe_batch(&set, &[0]))
+            .expect("the batch must serialise");
+        assert!(!json.contains("drop_pin"), "{json}");
+        assert!(json.contains(r#""drop":null"#), "{json}");
+    }
+
     #[test]
     fn a_subnet_renders_as_a_prefix_and_a_host_does_not() {
         let subnet = json_of(&ruleset(vec![NftRule {
@@ -1486,6 +1726,44 @@ mod cli_tests {
             "{last}"
         );
         assert!(!last.contains("kernel-refuses"), "{last}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// A kernel without NFLOG: the logged batch is refused, the silent one
+    /// goes in whole, and later applies stop asking for the log.
+    #[test]
+    fn a_kernel_refusing_the_log_still_gets_every_drop() {
+        let (cli, log) = recording(
+            "nolog",
+            r#"case "$input" in *'"log"'*) echo 'Error: Could not process rule: No such file or directory' >&2; exit 1;; esac"#,
+        );
+        let mut set = set_of(&["a"]);
+        set.rules.push(NftRule {
+            matches: Vec::new(),
+            verdict: crate::nft_ir::NftVerdict::DropReported(DropTag::user(
+                crate::drop_tag::DropKind::Pin,
+            )),
+            comment: "guard".into(),
+        });
+        assert_eq!(cli.drop_reporting(), DropReporting::Logged);
+        assert_eq!(
+            cli.apply_best_effort(&set),
+            Ok(NftApplyOutcome {
+                applied: 2,
+                skipped: Vec::new(),
+            })
+        );
+        assert_eq!(cli.drop_reporting(), DropReporting::Silent);
+        assert_eq!(batches(&log).len(), 2);
+        assert_eq!(cli.apply(&set), Ok(()));
+        let runs = batches(&log);
+        assert!(!runs[2].contains(r#""log""#), "{}", runs[2]);
+        assert!(runs[2].contains("guard"), "{}", runs[2]);
+        // Another enforcer of the process keeps its own answer.
+        assert_eq!(
+            NftCliEnforcement::new().drop_reporting(),
+            DropReporting::Logged
+        );
         let _ = std::fs::remove_file(&log);
     }
 

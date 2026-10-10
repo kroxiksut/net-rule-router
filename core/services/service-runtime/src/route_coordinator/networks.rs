@@ -205,9 +205,6 @@ impl SecondaryRouteCoordinator {
         });
     }
 
-    /// Tell subscribers whether this SID's policy is in force, and what to do
-    /// when it is not. Published on CHANGE only: the resolve runs at reconcile
-    /// cadence and an unchanged state is not news.
     /// Tell the user a tunnel is up while nothing is bound to the additional
     /// route — the setup where every rule that names the additional route
     /// silently does nothing, which reads as the product being broken.
@@ -250,6 +247,9 @@ impl SecondaryRouteCoordinator {
         );
     }
 
+    /// Tell subscribers whether this SID's policy is in force, and what to do
+    /// when it is not. Published on CHANGE only: the resolve runs at reconcile
+    /// cadence and an unchanged state is not news.
     pub(super) fn publish_enforcement_status(
         &self,
         sid: &str,
@@ -257,42 +257,14 @@ impl SecondaryRouteCoordinator {
         role: &str,
         candidates: Vec<String>,
     ) {
-        // Keyed by role: one user can have a resolved secondary and a missing
-        // primary at the same time, and a single per-SID latch made the two
-        // states overwrite each other into an endless alternating push.
-        // Recorded with or without a bus: the snapshot reads it too.
-        let report = nrr_shared::ipc_payloads::EnforcementStatusDto {
-            status: status.to_string(),
-            role: role.to_string(),
-            candidates,
-            since_unix_ms: None,
-        };
-        let Some(report) = self.enforcement_status.record(sid, &report) else {
-            return;
-        };
-        let Some(bus) = self.events.as_ref() else {
-            return;
-        };
-        bus.publish_for(
-            sid,
-            nrr_shared::ipc_payloads::StatusUpdateEvent::EnforcementStatusChanged {
-                sid: sid.to_string(),
-                status: report.status,
-                role: report.role,
-                candidates: report.candidates,
-                since_unix_ms: report.since_unix_ms,
-            },
-        );
+        self.enforcement_status
+            .publish(self.events.as_deref(), sid, status, role, candidates);
     }
 
-    /// The machine-wide report (`no-policy`, `adapters-unreadable`) ends once a
-    /// resolve gets past both; without this its notice and snapshot entry would
-    /// outlive the cause, since no role-specific report replaces it.
+    /// The machine-wide report ends once a resolve gets past both its causes.
     pub(super) fn clear_machine_wide_enforcement_status(&self, sid: &str) {
-        let standing = self.enforcement_status.status_of(sid, "");
-        if standing.is_some_and(|s| s != "ok") {
-            self.publish_enforcement_status(sid, "ok", "", Vec::new());
-        }
+        self.enforcement_status
+            .clear_machine_wide(self.events.as_deref(), sid);
     }
 
     /// Resolve one route binding (primary or secondary) to a

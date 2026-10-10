@@ -124,7 +124,7 @@ pub(super) fn rule_chunk_key(flow: &FlowRule) -> Option<(RuleChunkKey, IpAddr)> 
             },
             action,
             all_packets: flow.coverage == Coverage::AllPackets,
-            user_sid: flow.principal.0.as_ref().map(|p| p.as_stored().to_string()),
+            user_sid: user_sid_of(&flow.principal),
         },
         ip,
     ))

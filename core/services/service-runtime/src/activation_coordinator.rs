@@ -116,6 +116,9 @@ pub struct ActivationCoordinator {
     /// revision goes active in storage, and no WFP filter is ever compiled
     /// until the next tray connect.
     fallback_routing_sid: Option<crate::per_sid_orchestrator::FallbackRoutingSidFn>,
+    /// Every served user, tray or no tray. A signed-in user without a tray is
+    /// as routing-active as one with it, so an activation reaches them too.
+    served_sids: Option<crate::per_sid_orchestrator::ServedSidsFn>,
     activation_gate: gate::ActivationGate,
     activation_wait: std::time::Duration,
 }
@@ -151,6 +154,7 @@ impl ActivationCoordinator {
             signing_key: None,
             key_store: None,
             fallback_routing_sid: None,
+            served_sids: None,
             activation_gate: gate::ActivationGate::default(),
             activation_wait: gate::ACTIVATION_GATE_WAIT,
         }
@@ -168,9 +172,17 @@ impl ActivationCoordinator {
         self
     }
 
+    /// Attach the served set (see the `served_sids` field doc).
+    #[must_use]
+    pub fn with_served_sids(mut self, served: crate::per_sid_orchestrator::ServedSidsFn) -> Self {
+        self.served_sids = Some(served);
+        self
+    }
+
     /// The SIDs an activation applies to — every routing-active (tray-connected)
-    /// SID, or the fallback routing user with no tray at all — SCOPED to the
-    /// principal whose revision is being applied.
+    /// SID plus every served user without a tray (or, unwired, the fallback
+    /// routing user with no tray at all) — SCOPED to the principal whose
+    /// revision is being applied.
     ///
     /// A revision belongs to one principal. Applying it to everyone active is
     /// how a second user's machine ends up enforcing the first user's rules,
@@ -182,16 +194,16 @@ impl ActivationCoordinator {
     /// Shared by dry-run, Phase 1 and the pre-flight re-check so all three see
     /// the SAME set.
     fn apply_target_sids(&self, principal: &str) -> Vec<String> {
-        let active = self.sid_registry.active_sids();
-        let active = if active.is_empty() {
-            self.fallback_routing_sid
-                .as_ref()
-                .and_then(|f| f())
-                .into_iter()
-                .collect()
-        } else {
-            active
-        };
+        let mut active = self.sid_registry.active_sids();
+        if let Some(served) = self.served_sids.as_ref() {
+            for sid in served() {
+                if !active.contains(&sid) {
+                    active.push(sid);
+                }
+            }
+        } else if active.is_empty() {
+            active.extend(self.fallback_routing_sid.as_ref().and_then(|f| f()));
+        }
         if principal != nrr_storage::BASELINE_PRINCIPAL {
             return active.into_iter().filter(|s| s == principal).collect();
         }

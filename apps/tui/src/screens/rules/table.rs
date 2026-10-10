@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use nrr_client_logic::rules_table::{
-    file_row_from_service_wire, row_matches_search, RowOrigin, RuleRow, RuleType, TargetRoute,
+    file_row_from_service_wire, main_route_check_hosts, main_route_rank, row_matches_search,
+    RowOrigin, RuleRow, RuleType, TargetRoute,
 };
 use nrr_client_logic::Route;
 use nrr_domain::rule_value_validation::validate_rule_value;
@@ -61,6 +62,9 @@ pub struct Row {
     /// Lower-case ACE value, so a search finds either spelling.
     pub ace_lower: String,
     pub verdict: Verdict,
+    /// What the last main-route check found (`answered`, `silent`,
+    /// `no-address`, `unclear`); `None` when it never asked about this rule.
+    pub main_route: Option<String>,
 }
 
 impl Row {
@@ -76,8 +80,45 @@ impl Row {
             service_id: None,
             ace_lower,
             verdict,
+            main_route: None,
         }
     }
+
+    fn main_route_rank(&self) -> u8 {
+        main_route_rank(self.main_route.as_deref().unwrap_or_default())
+    }
+
+    /// The host a main-route check asks about for this rule, if any.
+    pub fn check_host(&self) -> Option<String> {
+        main_route_check_hosts([(&self.rule, Some(self.ace_lower.as_str()))])
+            .into_iter()
+            .next()
+    }
+
+    /// An edit that leaves the host as it was keeps the host's verdict.
+    pub fn inherit_main_route(&mut self, old: &Row) {
+        if self.mark_key() == old.mark_key() {
+            self.main_route.clone_from(&old.main_route);
+        }
+    }
+
+    /// Whose verdict a `rules.list` entry carries: the type as one spelling,
+    /// the value as the service holds it.
+    fn mark_key(&self) -> (String, String) {
+        (
+            self.rule.rule_type.canonical_slug().into_owned(),
+            self.ace_lower.clone(),
+        )
+    }
+}
+
+fn entry_mark_key(entry: &RuleRowEntry) -> (String, String) {
+    (
+        RuleType::from_slug(&entry.rule_type)
+            .canonical_slug()
+            .into_owned(),
+        entry.match_value.trim().to_lowercase(),
+    )
 }
 
 /// The table's route filter, in the GUI's order.
@@ -123,6 +164,32 @@ impl RouteFilter {
     }
 }
 
+/// The list's order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortMode {
+    /// As the rules are kept.
+    #[default]
+    Display,
+    /// What the main route does not reach first, unchecked rules last.
+    MainRoute,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Display => Self::MainRoute,
+            Self::MainRoute => Self::Display,
+        }
+    }
+
+    pub fn label(self) -> Key {
+        match self {
+            Self::Display => text::SORT_DISPLAY,
+            Self::MainRoute => text::SORT_MAIN_ROUTE,
+        }
+    }
+}
+
 /// The words for a route, as the table and the review show it.
 pub fn route_label(route: &TargetRoute) -> Option<Key> {
     match route {
@@ -148,6 +215,7 @@ pub struct Table {
     baseline: Option<Vec<RuleRow>>,
     pub filter: RouteFilter,
     pub search: String,
+    pub sort: SortMode,
     /// Position of the chosen row among the visible ones.
     pub cursor: usize,
     /// Sections of the last imported files this build does not apply, per
@@ -156,9 +224,11 @@ pub struct Table {
 }
 
 impl Table {
-    /// Master indices of the rows the filter and the search let through.
+    /// Master indices of the rows the filter and the search let through, in
+    /// the chosen order.
     pub fn visible(&self) -> Vec<usize> {
-        self.rows
+        let mut shown: Vec<usize> = self
+            .rows
             .iter()
             .enumerate()
             .filter(|(_, row)| {
@@ -166,7 +236,15 @@ impl Table {
                     && row_matches_search(&row.rule, &row.ace_lower, &self.search)
             })
             .map(|(i, _)| i)
-            .collect()
+            .collect();
+        if self.sort == SortMode::MainRoute {
+            // Stable: equal verdicts keep the value order, as the GUI's sort.
+            shown.sort_by_cached_key(|&i| {
+                let row = &self.rows[i];
+                (row.main_route_rank(), row.rule.match_value.to_lowercase())
+            });
+        }
+        shown
     }
 
     pub fn selected(&self) -> Option<usize> {
@@ -230,11 +308,35 @@ impl Table {
                 rule.id = rule_id(i + 1);
                 let mut row = Row::new(rule);
                 row.service_id = Some(entry.id.clone());
+                row.main_route = entry.main_route.clone();
                 row
             })
             .collect();
         self.mark_applied();
         self.clamp_cursor();
+    }
+
+    /// Takes in the main-route verdicts of a fresh read and nothing else, so
+    /// edits on screen survive.
+    pub fn merge_main_route(&mut self, entries: &[RuleRowEntry]) {
+        let marks: HashMap<(String, String), Option<String>> = entries
+            .iter()
+            .map(|entry| (entry_mark_key(entry), entry.main_route.clone()))
+            .collect();
+        for row in &mut self.rows {
+            if let Some(mark) = marks.get(&row.mark_key()) {
+                row.main_route.clone_from(mark);
+            }
+        }
+    }
+
+    /// The hosts a main-route check asks about.
+    pub fn check_hosts(&self) -> Vec<String> {
+        main_route_check_hosts(
+            self.rows
+                .iter()
+                .map(|r| (&r.rule, Some(r.ace_lower.as_str()))),
+        )
     }
 
     /// The rows on screen are what the service now applies.

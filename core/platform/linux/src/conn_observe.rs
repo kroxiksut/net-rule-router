@@ -311,7 +311,7 @@ fn outbound_sockets(text: &str, v6: bool, protocol: TransportProtocol) -> Vec<Pr
         .collect()
 }
 
-fn unmapped(endpoint: SocketAddr) -> SocketAddr {
+pub(crate) fn unmapped(endpoint: SocketAddr) -> SocketAddr {
     match endpoint.ip() {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(endpoint, |v4| {
             SocketAddr::new(IpAddr::V4(v4), endpoint.port())

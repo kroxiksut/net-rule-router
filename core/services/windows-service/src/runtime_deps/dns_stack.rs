@@ -29,6 +29,7 @@ pub(super) fn build_dns_resolver_factory(
     route_coordinator: Option<
         Arc<nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator>,
     >,
+    outage_blocks: Option<Arc<nrr_service_runtime::outage_blocks::OutageBlocks>>,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverFactory> {
     use nrr_platform_windows::dns_redirect::{
         NrptDnsRedirect, PowerShellRunner, TransactedNrptStore, WindowsSearchList,
@@ -51,6 +52,7 @@ pub(super) fn build_dns_resolver_factory(
         auto_rules,
         signed_in,
         route_coordinator,
+        outage_blocks,
     };
     let platform = DnsStackPlatform {
         // One enumeration costs a PowerShell run; built once here, so every

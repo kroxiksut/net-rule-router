@@ -23,9 +23,41 @@ pub trait ActivePrincipalSource: Send + Sync {
     /// answered. An empty vector means "nobody", which is a real answer.
     fn active_principals(&self) -> Result<Vec<UserPrincipal>, ActivePrincipalError>;
 
+    /// The same set with what is known about how each one is signed in, in
+    /// the same order. Answers the one question a machine-wide resource asks:
+    /// whose is it. Default: no seat or time facts, which leaves the order.
+    fn present_principals(&self) -> Result<Vec<PresentPrincipal>, ActivePrincipalError> {
+        Ok(self
+            .active_principals()?
+            .into_iter()
+            .map(PresentPrincipal::bare)
+            .collect())
+    }
+
     /// Short name of the authority consulted, for logs ("logind", "tray-ipc").
     /// An operator reading "no active users" needs to know who was asked.
     fn authority(&self) -> &'static str;
+}
+
+/// A present principal and how they are signed in.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PresentPrincipal {
+    pub principal: UserPrincipal,
+    /// The person is at the machine: their session is the active one on a seat.
+    pub at_seat: bool,
+    /// When their earliest live session began, as an ordering key valid only
+    /// within one answer of one source. `None`: no session (linger) or unknown.
+    pub signed_in_at: Option<u64>,
+}
+
+impl PresentPrincipal {
+    pub fn bare(principal: UserPrincipal) -> Self {
+        Self {
+            principal,
+            at_seat: false,
+            signed_in_at: None,
+        }
+    }
 }
 
 /// Why the active set could not be read.

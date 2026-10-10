@@ -960,13 +960,15 @@ impl PerSidApplyOrchestrator {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
             g.keys().cloned().collect()
         };
+        let mut fresh = std::collections::BTreeSet::new();
         for sid in want.difference(&have) {
             self.install_for_sid(sid)?;
+            fresh.insert(sid.clone());
         }
         for sid in have.difference(&want) {
             self.remove_for_sid(sid)?;
         }
-        Ok(())
+        self.follow_route_table_owner(&fresh)
     }
 
     /// Delete filters from `previous` that `kept` no longer contains. A

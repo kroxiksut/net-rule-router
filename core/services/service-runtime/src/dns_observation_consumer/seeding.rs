@@ -22,12 +22,10 @@ impl DnsObservationConsumer {
     /// read error is logged at debug and yields an empty summary.
     pub fn seed_from_os_cache(&self, now: SystemTime) -> ConsumeSummary {
         let mut summary = ConsumeSummary::default();
-        let Some(sid) = (self.active_sid)() else {
+        let books = self.present_rule_books();
+        if books.is_empty() {
             return summary;
-        };
-        let Some(snapshot) = self.rules_provider.active_rules_for(&sid) else {
-            return summary;
-        };
+        }
         let entries = match self.dns_cache_read.read_resolver_cache() {
             Ok(e) => e,
             Err(e) => {
@@ -49,8 +47,10 @@ impl DnsObservationConsumer {
             if routable.is_empty() {
                 continue;
             }
-            let matches = rule_set_matches(&entry.canonical_hostname, &snapshot.rule_book.primary)
-                || rule_set_matches(&entry.canonical_hostname, &snapshot.rule_book.secondary);
+            let matches = books.iter().any(|book| {
+                rule_set_matches(&entry.canonical_hostname, &book.primary)
+                    || rule_set_matches(&entry.canonical_hostname, &book.secondary)
+            });
             if !matches {
                 summary.ignored = summary.ignored.saturating_add(1);
                 continue;
@@ -91,12 +91,10 @@ impl DnsObservationConsumer {
         addresses: &[Ipv4Addr],
         now: SystemTime,
     ) -> bool {
-        let Some(sid) = (self.active_sid)() else {
+        let books = self.present_rule_books();
+        if books.is_empty() {
             return false;
-        };
-        let Some(snapshot) = self.rules_provider.active_rules_for(&sid) else {
-            return false;
-        };
+        }
         let routable: Vec<Ipv4Addr> = addresses
             .iter()
             .copied()
@@ -105,8 +103,12 @@ impl DnsObservationConsumer {
         if routable.is_empty() {
             return false;
         }
-        let in_primary = rule_set_matches(hostname, &snapshot.rule_book.primary);
-        let in_secondary = rule_set_matches(hostname, &snapshot.rule_book.secondary);
+        let in_primary = books
+            .iter()
+            .any(|book| rule_set_matches(hostname, &book.primary));
+        let in_secondary = books
+            .iter()
+            .any(|book| rule_set_matches(hostname, &book.secondary));
         if !in_primary && !in_secondary {
             return false;
         }
@@ -149,6 +151,15 @@ impl DnsObservationConsumer {
             );
         }
         kept
+    }
+
+    /// The rule books of every present principal that has one.
+    fn present_rule_books(&self) -> Vec<nrr_domain::canonical::CanonicalRuleBook> {
+        self.principals()
+            .iter()
+            .filter_map(|sid| self.rules_provider.active_rules_for(sid))
+            .map(|snapshot| snapshot.rule_book)
+            .collect()
     }
 
     /// Filter `addresses` down to the pairs not seen within
@@ -194,15 +205,15 @@ impl DnsObservationConsumer {
         let Some(registry) = self.known_direct.as_ref() else {
             return false;
         };
-        let Some(sid) = (self.active_sid)() else {
+        // Direct only when NO present principal's rules name it: the registry
+        // exempts the address from every block-all on the machine.
+        let books = self.present_rule_books();
+        if books.is_empty() {
             return false;
-        };
-        let Some(snapshot) = self.rules_provider.active_rules_for(&sid) else {
-            return false;
-        };
-        if rule_set_matches(hostname, &snapshot.rule_book.primary)
-            || rule_set_matches(hostname, &snapshot.rule_book.secondary)
-        {
+        }
+        if books.iter().any(|book| {
+            rule_set_matches(hostname, &book.primary) || rule_set_matches(hostname, &book.secondary)
+        }) {
             return false;
         }
         let routable: Vec<Ipv4Addr> = addresses

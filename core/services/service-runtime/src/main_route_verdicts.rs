@@ -29,6 +29,11 @@ pub enum MainRouteVerdict {
     Answered,
     /// Nothing answered within the probe budget.
     Silent,
+    /// Nothing is known about the host's addresses, so there was nothing to
+    /// try. Not resolved on the spot: that would send a query nobody made.
+    NoAddress,
+    /// The attempt could not be made (no source address, socket refused).
+    Unclear,
 }
 
 impl MainRouteVerdict {
@@ -38,6 +43,8 @@ impl MainRouteVerdict {
         match self {
             Self::Answered => "answered",
             Self::Silent => "silent",
+            Self::NoAddress => "no-address",
+            Self::Unclear => "unclear",
         }
     }
 }
@@ -49,6 +56,8 @@ type HostVerdicts = HashMap<String, (MainRouteVerdict, Instant)>;
 #[derive(Debug, Default)]
 pub struct MainRouteVerdicts {
     inner: Mutex<HashMap<String, HostVerdicts>>,
+    /// Hosts each principal's running checks have yet to answer.
+    pending: Mutex<HashMap<String, u32>>,
 }
 
 impl MainRouteVerdicts {
@@ -75,6 +84,35 @@ impl MainRouteVerdicts {
             .insert(key, (verdict, now));
     }
 
+    /// A check of `count` hosts has started for `sid`.
+    pub fn begin(&self, sid: &str, count: u32) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let left = pending.entry(sid.to_string()).or_default();
+        *left = left.saturating_add(count);
+    }
+
+    /// `count` hosts of a running check for `sid` are answered.
+    pub fn settle(&self, sid: &str, count: u32) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(left) = pending.get_mut(sid) {
+            *left = left.saturating_sub(count);
+            if *left == 0 {
+                pending.remove(sid);
+            }
+        }
+    }
+
+    /// Hosts `sid`'s running checks have yet to answer.
+    #[must_use]
+    pub fn pending(&self, sid: &str) -> u32 {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// The verdict for `hostname`, or `None` when it was never checked or the
     /// answer has aged out.
     #[must_use]
@@ -86,14 +124,12 @@ impl MainRouteVerdicts {
     }
 }
 
-/// Rule values carry the shapes a rule file allows; the probe and the lookup
-/// must agree on one spelling.
+/// Rule values carry the shapes a rule file allows, an IDN in either spelling
+/// among them; the probe and the lookup must agree on one.
 fn normalize(hostname: &str) -> String {
-    hostname
-        .trim()
-        .trim_start_matches("*.")
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
+    let bare = hostname.trim().trim_start_matches("*.");
+    nrr_domain::decision_engine_input::hostname_ace(bare)
+        .unwrap_or_else(|| bare.trim_end_matches('.').to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -113,6 +149,14 @@ mod tests {
     }
 
     #[test]
+    fn an_idn_reads_back_in_either_spelling() {
+        let v = MainRouteVerdicts::new();
+        let now = Instant::now();
+        v.record("S-1", "xn--e1aybc.xn--p1ai", MainRouteVerdict::Silent, now);
+        assert_eq!(v.get("S-1", "тест.рф", now), Some(MainRouteVerdict::Silent));
+    }
+
+    #[test]
     fn an_unchecked_host_has_no_verdict() {
         let v = MainRouteVerdicts::new();
         assert_eq!(v.get("S-1", "example.com", Instant::now()), None);
@@ -128,6 +172,18 @@ mod tests {
             None,
             "an answer this old describes a different network"
         );
+    }
+
+    #[test]
+    fn pending_counts_down_to_nothing_and_stays_per_principal() {
+        let v = MainRouteVerdicts::new();
+        v.begin("S-1", 3);
+        v.begin("S-2", 1);
+        v.settle("S-1", 2);
+        assert_eq!(v.pending("S-1"), 1);
+        v.settle("S-1", 5);
+        assert_eq!(v.pending("S-1"), 0, "over-settling cannot go negative");
+        assert_eq!(v.pending("S-2"), 1);
     }
 
     #[test]

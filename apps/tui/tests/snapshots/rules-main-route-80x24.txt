@@ -1,0 +1,24 @@
+Service: OK
+┌Screens───────────────────┐┌Rule list─────────────────────────────────────────┐
+│  1 Status                ││Changes: Same as in the service                   │
+│  2 First run             ││Route: All routes                                 │
+│  3 Interfaces and routes │└──────────────────────────────────────────────────┘
+│> 4 Rules                 │┌Rules─────────────────────────────────────────────┐
+│  5 Overlaps              ││Rules 1 to 7 of 7; 7 in all.                      │
+│  6 Suggested addresses   ││> 1. [on] R-0001  Domain  silent.example —        │
+│  7 Connection trace      ││Additional · Main route: does not reach           │
+│  8 Cache                 ││     Nothing answered at this address over the    │
+│  9 Diagnostics and logs  ││main connection, so this rule is doing real work. │
+│  0 Settings              ││Checked within the last half hour.                │
+│                          ││  2. [on] R-0002  Domain  answered.example —      │
+│                          ││Additional · Main route: reaches                  │
+│                          ││  3. [on] R-0003  Domain  new.example — Additional│
+│                          ││· Main route: not seen yet                        │
+│                          ││  4. [on] R-0004  Domain  odd.example — Additional│
+│                          ││· Main route: could not check                     │
+│                          ││  5. [on] R-0005  Zone  ru — Additional · Main    │
+│                          ││route: not checked                                │
+│                          ││  6. [on] R-0006  Domain  main.example — Primary  │
+│                          ││  7. [on] R-0007  Domain  later.example —         │
+└──────────────────────────┘└──────────────────────────────────────────────────┘
+F1: help   q: quit

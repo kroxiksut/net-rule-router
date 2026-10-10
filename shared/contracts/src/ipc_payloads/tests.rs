@@ -243,6 +243,11 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             sid: "S-1-5-21".into(),
             pending_count: 3,
         },
+        StatusUpdateEvent::RoutesHeldByAnotherUser {
+            sid: "S-1-5-21".into(),
+            count: 2,
+            sample: vec!["198.51.100.1".into(), "203.0.113.0/24".into()],
+        },
     ]
 }
 
@@ -332,11 +337,32 @@ fn push_event_keys_the_ui_reads_are_stable() {
     assert_eq!(verdicts["type"], "verify-verdicts-changed");
     assert_eq!(verdicts["pending-count"], 3);
 
+    let held = serde_json::to_value(StatusUpdateEvent::RoutesHeldByAnotherUser {
+        sid: "S-1-5-21".into(),
+        count: 2,
+        sample: vec!["198.51.100.1".into()],
+    })
+    .expect("serialise");
+    assert_eq!(held["type"], "routes-held-by-another-user");
+    assert_eq!(held["count"], 2);
+    assert_eq!(held["sample"][0], "198.51.100.1");
+
     let alerts = serde_json::to_value(StatusUpdateEvent::SecurityAlertsChanged).expect("serialise");
     assert_eq!(
         alerts,
         serde_json::json!({ "type": "security-alerts-changed" })
     );
+}
+
+/// Which destinations another signed-in user holds is that user's news alone.
+#[test]
+fn routes_held_by_another_user_reaches_only_its_own_user() {
+    let event = StatusUpdateEvent::RoutesHeldByAnotherUser {
+        sid: "S-1-5-21-1".into(),
+        count: 1,
+        sample: Vec::new(),
+    };
+    assert_eq!(event.addressee(), Some("S-1-5-21-1"));
 }
 
 /// The alert gate refuses every user's rule changes, so the news that it

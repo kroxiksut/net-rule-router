@@ -17,12 +17,13 @@ pub(super) fn build_apply_trigger(
 ) -> Arc<dyn nrr_service_runtime::ipc_handlers::providers::RoutePolicyApplyTrigger> {
     let mut orchestrator_trigger =
         OrchestratorRoutePolicyApplyTrigger::new(Arc::clone(orch), Arc::clone(sid_registry));
-    // A policy update from a GUI-only connection
-    // (dead tray subscription) must still recompile for the console user.
+    // A policy update from a GUI-only connection (dead tray subscription), or
+    // by a signed-in user with no tray, must still recompile their filters.
     if let Some(coord) = route_coordinator {
         let coord = Arc::clone(coord);
+        let registry = Arc::clone(sid_registry);
         orchestrator_trigger = orchestrator_trigger
-            .with_fallback_routing_sid(Arc::new(move || coord.effective_routing_sid(&[])));
+            .with_served_sids(Arc::new(move || coord.served_sids(&registry.active_sids())));
     }
     // A policy edit by a routing-PAUSED user
     // must not reinstall their filters. Fail-CLOSED to paused on a pause-state

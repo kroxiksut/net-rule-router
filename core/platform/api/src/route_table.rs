@@ -15,6 +15,7 @@
 //! its own Windows-shaped port.
 
 use crate::adapters::AdapterInfo;
+use crate::enforcement::{RouteTableRef, UserPrincipal};
 use crate::error::PlatformError;
 use crate::types::RouteEntry;
 
@@ -62,6 +63,14 @@ pub trait RouteTablePort: Send + Sync {
         None
     }
 
+    /// Every user signed in interactively (console and remote, attached or
+    /// disconnected), console user first, each once. The default answers with
+    /// [`Self::interactive_user_sid`], which is right for a platform with one
+    /// seat.
+    fn interactive_user_sids(&self) -> Vec<String> {
+        self.interactive_user_sid().into_iter().collect()
+    }
+
     /// Resolve an interface index to the stable 64-bit interface identity the
     /// enforcement layer pins an egress condition on.
     ///
@@ -71,4 +80,57 @@ pub trait RouteTablePort: Send + Sync {
     /// the same role for them; the contract is only that it is stable for the
     /// life of the interface and non-zero.
     fn interface_luid_for_index(&self, ifindex: u32) -> Result<u64, PlatformError>;
+}
+
+// ── Per-principal routing ────────────────────────────────────────────────────
+
+/// What the selectors in front of one routing table must know about it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TableSelector {
+    /// The longest IPv4 overlay prefix the table holds. Routes this wide yield
+    /// to the main table's more specific ones (the LAN, the tunnel's own subnet,
+    /// a VPN server's host route), exactly as they did beside them in `main`.
+    /// `None`: the table holds no overlay.
+    pub overlay_prefix_v4: Option<u8>,
+}
+
+/// The selectors one routing pass asks for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectorPlan {
+    /// Every present user: their traffic looks up their own table.
+    pub users: Vec<(UserPrincipal, TableSelector)>,
+    /// The machine's service accounts look up the system table; `None` with
+    /// nobody present.
+    pub system: Option<TableSelector>,
+}
+
+/// What a selector reconcile changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectorDelta {
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Per-user policy routing: each present user's routes live in a table of
+/// their own, picked by who sends the packet, so one user's rules never steer
+/// another's traffic. Linux selects by uid (`ip rule uidrange`); a platform
+/// without a driverless equivalent does not implement this port.
+pub trait PrincipalRoutingPort: Send + Sync {
+    /// The table holding `principal`'s routes; `None` when this machine has
+    /// none to give them.
+    fn table_for(&self, principal: &UserPrincipal) -> Option<RouteTableRef>;
+
+    /// The table the machine's service accounts look up.
+    fn system_table(&self) -> RouteTableRef;
+
+    /// Whether `table` is one this port hands out: every route in it is ours.
+    fn is_principal_table(&self, table: &RouteTableRef) -> bool;
+
+    /// Make the installed selectors exactly the ones `plan` needs.
+    /// [`PlatformError::NotSupported`] means the kernel cannot select by user,
+    /// and nothing of ours is left selecting.
+    fn reconcile_selectors(&self, plan: &SelectorPlan) -> Result<SelectorDelta, PlatformError>;
+
+    /// Remove every selector of ours. Returns how many went.
+    fn clear_selectors(&self) -> Result<usize, PlatformError>;
 }

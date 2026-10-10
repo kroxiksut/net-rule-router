@@ -1,4 +1,5 @@
 use super::*;
+use crate::drop_tag::{DropKind, DropTag};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 fn host(last: u8) -> NftMatch {
@@ -110,6 +111,20 @@ fn bands_never_share_a_set() {
 }
 
 #[test]
+fn drops_of_different_tags_never_share_a_set() {
+    let pin = NftVerdict::DropReported(DropTag::user(DropKind::Pin));
+    let rule_drop = NftVerdict::DropReported(DropTag::user(DropKind::Rule));
+    let folded = fold_into_sets(vec![
+        rule(vec![host(1)], pin, "x#0"),
+        rule(vec![host(2)], rule_drop, "x#0"),
+        rule(vec![host(3)], pin, "x#0"),
+    ]);
+    let verdicts: Vec<NftVerdict> = folded.iter().map(|r| r.verdict).collect();
+    assert_eq!(verdicts, vec![pin, rule_drop]);
+    assert_eq!(folded[0].comment, "x#0 +1");
+}
+
+#[test]
 fn the_families_never_share_a_set() {
     let v6 = NftMatch::DstV6 {
         net: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
@@ -148,6 +163,11 @@ fn matches(m: &NftMatch, p: &Packet) -> bool {
         NftMatch::DstPort(port) => *port == p.port,
         NftMatch::OutInterface(dev) => dev == p.oif,
         NftMatch::SkUid(uid) => *uid == p.uid,
+        NftMatch::SkUidSet(ranges) => ranges
+            .iter()
+            .any(|(first, last)| (*first..=*last).contains(&p.uid)),
+        // The generated packets carry no mark.
+        NftMatch::Mark(_) => false,
     }
 }
 
@@ -194,10 +214,13 @@ fn random_rule(g: &mut Lcg) -> NftRule {
     if g.next(3) == 0 {
         matches.push(NftMatch::OutInterface("wg0".into()));
     }
-    let verdict = if g.next(2) == 0 {
-        NftVerdict::Accept
-    } else {
-        NftVerdict::Drop
+    // Drops of two tags too: the report must name the rule that dropped, so a
+    // fold may not let one tag's drop overtake another's.
+    let verdict = match g.next(4) {
+        0 | 1 => NftVerdict::Accept,
+        2 => NftVerdict::Drop,
+        _ if g.next(2) == 0 => NftVerdict::DropReported(DropTag::user(DropKind::Pin)),
+        _ => NftVerdict::DropReported(DropTag::user(DropKind::BlockAll)),
     };
     // Two bands, so the property also covers rules a band keeps apart.
     rule(matches, verdict, if g.next(2) == 0 { "a#1" } else { "b#1" })

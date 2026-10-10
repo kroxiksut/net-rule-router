@@ -7,7 +7,9 @@
 //! decode each other.
 
 use nrr_shared::diagnostics_dto::DiagnosticsStatusDto;
-use nrr_shared::ipc_payloads::{EnforcementStatusDto, SnapshotInitialResponse, StatusUpdateEvent};
+use nrr_shared::ipc_payloads::{
+    EnforcementStatusDto, RoutesHeldDto, SnapshotInitialResponse, StatusUpdateEvent,
+};
 use serde_json::{json, Value};
 
 /// A snapshot as a service without the field sends it.
@@ -139,4 +141,43 @@ fn an_older_push_decodes_with_no_since() {
         }
         other => panic!("unexpected event {other:?}"),
     }
+}
+
+/// Destinations held by another signed-in user: absent when there are none,
+/// and shaped like the push so the client feeds both to one handler.
+#[test]
+fn routes_held_by_another_user_is_optional_and_shaped_like_its_push() {
+    let older = parse(snapshot_without_enforcement());
+    assert_eq!(older.routes_held_by_another_user, None);
+    let wire = serde_json::to_value(&older).unwrap_or_else(|e| panic!("{e}"));
+    assert!(wire.get("routes-held-by-another-user").is_none(), "{wire}");
+
+    let mut v = snapshot_without_enforcement();
+    v["routes-held-by-another-user"] = json!({ "count": 3, "sample": ["198.51.100.1"] });
+    let held = parse(v)
+        .routes_held_by_another_user
+        .unwrap_or_else(|| panic!("the report must decode"));
+    assert_eq!(
+        held,
+        RoutesHeldDto {
+            count: 3,
+            sample: vec!["198.51.100.1".into()],
+        }
+    );
+
+    let mut pushed = serde_json::to_value(StatusUpdateEvent::RoutesHeldByAnotherUser {
+        sid: "S-1-5-21-0".into(),
+        count: 3,
+        sample: vec!["198.51.100.1".into()],
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    let fields = pushed
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("an event is an object"));
+    fields.remove("type");
+    fields.remove("sid");
+    assert_eq!(
+        serde_json::to_value(&held).unwrap_or_else(|e| panic!("{e}")),
+        pushed
+    );
 }

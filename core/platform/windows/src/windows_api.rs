@@ -80,6 +80,17 @@ impl RouteTablePort for ProductionWindowsApi {
         }
     }
 
+    fn interactive_user_sids(&self) -> Vec<String> {
+        #[cfg(target_os = "windows")]
+        {
+            crate::win32_ffi::console_session::interactive_user_sids()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Vec::new()
+        }
+    }
+
     fn interface_luid_for_index(&self, ifindex: u32) -> Result<u64, PlatformError> {
         // Real ConvertInterfaceIndexToLuid on Windows.
         production_interface_luid_for_index(ifindex)

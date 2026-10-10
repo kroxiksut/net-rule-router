@@ -112,7 +112,8 @@ use state::*;
 pub use state::{
     FailClosedExemptionsResolver, FakeIpContextProvider, FilterFailureModeSource,
     FlowLinksResolver, Ipv6GuardResolver, KillSwitchResolver, MachineReader,
-    PerSidApplyOrchestrator, RouteSyncHook, UnresolvedHostsSink, VpnClientAppsProvider,
+    PerSidApplyOrchestrator, PrimaryDnsServersFn, RouteSyncHook, RoutedElsewhereFn, RoutingOwnerFn,
+    ServiceAccountWiring, UnresolvedHostsSink, VpnClientAppsProvider,
 };
 
 mod posture;
@@ -124,11 +125,13 @@ mod shadow_compare;
 mod registry_wiring;
 pub use registry_wiring::{
     wire_orchestrator_to_registry, FallbackRoutingSidFn, OrchestratorRoutePolicyApplyTrigger,
-    TriggerPausedCheckFn,
+    ServedSidsFn, TriggerPausedCheckFn,
 };
 
 mod apply;
 mod builder;
 mod plan;
+mod service_accounts;
+use service_accounts::OwnerGuard;
 #[cfg(test)]
 mod tests;

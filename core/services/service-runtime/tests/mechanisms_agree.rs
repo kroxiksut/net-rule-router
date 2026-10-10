@@ -1275,7 +1275,7 @@ fn plan_outcome(flows: &[nrr_platform_api::enforcement::FlowRule], ip: IpAddr) -
 fn nft_outcome(flows: &[nrr_platform_api::enforcement::FlowRule], ip: IpAddr) -> Outcome {
     use nrr_platform_api::enforcement::{EnforcementPlan, UserPrincipal};
     use nrr_platform_linux::lower_linux::{lower_plan, EgressNames};
-    use nrr_platform_linux::nft_ir::{NftMatch, NftVerdict};
+    use nrr_platform_linux::nft_ir::NftMatch;
     let lowered = lower_plan(
         &EnforcementPlan {
             principal: UserPrincipal::from_linux_uid(1000),
@@ -1301,7 +1301,7 @@ fn nft_outcome(flows: &[nrr_platform_api::enforcement::FlowRule], ip: IpAddr) ->
     });
     match first {
         None => Outcome::Default,
-        Some(rule) if rule.verdict == NftVerdict::Drop => Outcome::Block,
+        Some(rule) if rule.verdict.is_drop() => Outcome::Block,
         Some(rule) if rule.comment.starts_with("route-primary") => {
             Outcome::Route(RouteRole::Primary)
         }

@@ -664,6 +664,13 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             Arc::new(move || coord.effective_routing_sid(&reg.active_sids()))
                         },
                     )
+                    // Every signed-in user's suffix and zone hosts reach the
+                    // cache their routes are built from, not only the first's.
+                    .with_present_principals({
+                        let reg = Arc::clone(&sid_registry);
+                        let coord = Arc::clone(&route_coord);
+                        Arc::new(move || coord.served_sids(&reg.active_sids()))
+                    })
                     .with_dns_cache_read(dns_cache_read)
                     // FCrDNS direct-learning target.
                     .with_known_direct_registry(Arc::clone(&known_direct))
@@ -680,6 +687,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     // is logged as "pin skipped" instead of "egresses the
                     // secondary". Same usability source of truth the conn-observe
                     // live-secondary drop counter reads.
+                    // Judged for the lead user, whose collateral this consumer
+                    // reports.
                     .with_secondary_usable_gate({
                         let reg = Arc::clone(&sid_registry);
                         let coord = Arc::clone(&route_coord);
@@ -943,6 +952,30 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             let registry = Arc::clone(&learned_vpn_client_apps);
                             Arc::new(move || registry.current())
                         })
+                        // System services get the address pins of every user
+                        // the table serves, each narrowed to what the table
+                        // actually sends through that user's link.
+                        .with_service_accounts(
+                            nrr_service_runtime::per_sid_orchestrator::ServiceAccountWiring {
+                                routing_owners: {
+                                    let coord = Arc::clone(&route_coord);
+                                    let registry = Arc::clone(&sid_registry);
+                                    Arc::new(move || coord.served_sids(&registry.active_sids()))
+                                },
+                                routed_elsewhere: {
+                                    let coord = Arc::clone(&route_coord);
+                                    Arc::new(move |sid: &str, block| {
+                                        coord.routed_for_another_user(sid, block)
+                                    })
+                                },
+                                own_executable: std::env::current_exe()
+                                    .ok()
+                                    .map(|path| path.to_string_lossy().into_owned()),
+                                primary_dns: Arc::new(
+                                    nrr_service_runtime::dns_stack::configured_dns_servers_now,
+                                ),
+                            },
+                        )
                         // A rule can name a host nothing has resolved yet — the
                         // browser tab that prompted it is sitting on an
                         // established socket and will never ask DNS again. Ask
@@ -1064,9 +1097,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     ),
                 }
                 // Recompute the route table on every active-user transition
-                // (login/logout/switch). The Free model routes for the single
-                // active console user; an empty active set tears the table
-                // down (no user → no routes).
+                // (login/logout/switch). Every served user's routes share the
+                // table; nobody served tears it down (no user → no routes).
                 {
                     let coord = Arc::clone(&route_coord);
                     sid_registry.add_listener(Arc::new(move |snapshot: &[String]| {

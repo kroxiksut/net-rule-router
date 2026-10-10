@@ -20,9 +20,9 @@ use nrr_client_logic::review::{self, Outcome};
 use nrr_client_logic::route_policy;
 use nrr_client_logic::rules_table::{
     build_rules_file_text, drift_row_from_parsed_rule, drift_row_from_service_wire,
-    file_row_from_service_wire, normalize_host_input, parsed_rule_target_route, parsed_rule_verify,
-    rule_row_to_wire_dto, RowOrigin, RuleRow, RuleType, RulesFileOptions, TargetRoute,
-    WireDtoOptions, PRESET_FORMAT_VERSION,
+    file_row_from_service_wire, main_route_check_hosts, main_route_rank, normalize_host_input,
+    parsed_rule_target_route, parsed_rule_verify, rule_row_to_wire_dto, RowOrigin, RuleRow,
+    RuleType, RulesFileOptions, TargetRoute, WireDtoOptions, PRESET_FORMAT_VERSION,
 };
 use nrr_client_logic::Route;
 use nrr_shared::ipc_payloads::{
@@ -421,6 +421,33 @@ fn row_is_verify_matches_js() {
         &mut JsLib::rules(),
         |input| format!("rowIsVerify({})", arg(input, "row")),
         |input| Value::from(row_from_js(&input["row"]).is_verify()),
+    );
+}
+
+#[test]
+fn main_route_rank_matches_js() {
+    check(
+        "main_route_rank",
+        &mut JsLib::rules(),
+        |input| format!("mainRouteRank({})", arg(input, "slug")),
+        |input| Value::from(main_route_rank(text(input, "slug"))),
+    );
+}
+
+#[test]
+fn main_route_check_hosts_matches_js() {
+    check(
+        "main_route_check_hosts",
+        &mut JsLib::rules(),
+        |input| format!("mainRouteCheckHosts({})", arg(input, "rows")),
+        |input| {
+            let given = input["rows"].as_array().expect("rows is an array");
+            let rows: Vec<RuleRow> = given.iter().map(row_from_js).collect();
+            let ace = given
+                .iter()
+                .map(|row| row.get("aceMatchValue").and_then(Value::as_str));
+            Value::from(main_route_check_hosts(rows.iter().zip(ace)))
+        },
     );
 }
 

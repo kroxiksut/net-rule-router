@@ -7,7 +7,8 @@
 //! functions only — no I/O, no IPC, no clock.
 //!
 //! - [`placeholders`] — `{name}` filling and plural categories.
-//! - [`rules_table`] — table rows, their wire form and the two rules files.
+//! - [`rules_table`] — table rows, their wire form, the two rules files and
+//!   the main-route check.
 //! - [`review`] — a rules change's preview, refusal and outcome.
 //! - [`route_policy`] — the full-replacement `route.policy.update` request.
 //! - [`rules_overlaps`] — overlaps the user made on purpose.

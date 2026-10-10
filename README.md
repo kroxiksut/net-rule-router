@@ -287,6 +287,7 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 | [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md) | Preset & rule file format |
 | [`docs/en/routing-modes.md`](docs/en/routing-modes.md) | The routing switches: what each one buys you, and how they combine |
 | [`docs/en/what-routing-changes.md`](docs/en/what-routing-changes.md) | Who sees what once a site is routed — and what routing deliberately leaves alone |
+| [`docs/en/several-users.md`](docs/en/several-users.md) | Several users signed in at once: everyone's rules apply, and the one Windows limitation |
 | [`docs/en/blocked-site-browser-errors.md`](docs/en/blocked-site-browser-errors.md) | What a browser error means when a routed site does not open |
 | [`docs/en/cache-and-seeding.md`](docs/en/cache-and-seeding.md) | How the FQDN/IP cache fills up, including opt-in browser-history seeding |
 | [`docs/en/where-files-live.md`](docs/en/where-files-live.md) | Where settings, rules, caches and logs are stored |

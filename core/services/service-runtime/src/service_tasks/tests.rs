@@ -617,6 +617,7 @@ fn an_observed_connection_becomes_a_destination_the_rule_can_route() {
         source: source.clone(),
         store: Arc::clone(&store),
         trace: None,
+        consumer: None,
     };
 
     assert_eq!(fold_observations(&wiring), 1);
@@ -632,6 +633,64 @@ fn an_observed_connection_becomes_a_destination_the_rule_can_route() {
         Ipv4Addr::new(203, 0, 113, 154),
     ));
     assert_eq!(fold_observations(&wiring), 0);
+}
+
+/// With a consumer wired, it reads the batch in place of the tee and the bare
+/// fold: the destination is still learnt, and an unstamped row gets the drain
+/// time.
+#[test]
+fn a_wired_consumer_reads_the_batch_and_stamps_the_drain_time() {
+    use crate::app_observation_lookup::AppObservationLookup;
+    use crate::conn_observation_consumer::{ConnectionObservationConsumer, ConnectionTraceRing};
+    use nrr_platform_api::conn_observe::{
+        ConnectionObservation, ConnectionProgress, ConnectionVerdict,
+        MockConnectionObservationSource, TransportProtocol,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let source = Arc::new(MockConnectionObservationSource::new());
+    source.push(ConnectionObservation {
+        pid: 42,
+        process_path: Some("/usr/bin/messenger".to_owned()),
+        user_sid: Some("unix:uid:1000".to_owned()),
+        protocol: TransportProtocol::Tcp,
+        local: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 40000),
+        remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 154)), 443),
+        verdict: ConnectionVerdict::Block,
+        drop_filter_id: None,
+        blocked_by_nrr: Some(true),
+        nrr_drop_spec_id: Some(7),
+        observed_unix_ms: None,
+        progress: ConnectionProgress::Attempt,
+    });
+    let store = Arc::new(crate::app_observation_lookup::AppObservationStore::new());
+    let ring = Arc::new(ConnectionTraceRing::new(8));
+    let consumer = ConnectionObservationConsumer::with_egress(
+        Arc::new(nrr_platform_api::windows_api::MockWindowsApi::new()),
+        Arc::new(|_: &str| (None, None)),
+        Arc::new(|| None),
+        false,
+    )
+    .with_owner_scoped_egress()
+    .with_drop_pairing()
+    .with_app_observations(Arc::clone(&store))
+    .with_trace_ring(Arc::clone(&ring));
+    let wiring = AppObservationWiring {
+        source: source.clone(),
+        store: Arc::clone(&store),
+        trace: None,
+        consumer: Some(Arc::new(consumer)),
+    };
+
+    assert_eq!(fold_observations(&wiring), 1);
+    assert_eq!(
+        store.ips_for_app("messenger"),
+        vec![Ipv4Addr::new(203, 0, 113, 154)],
+    );
+    let (rows, total) = ring.snapshot(0, 8);
+    assert_eq!(total, 1);
+    assert!(rows[0].observed_unix_ms.is_some());
+    assert_eq!(rows[0].nrr_block_reason, Some("blocked-by-rule"));
 }
 
 /// The refresh pass reads the open connections and restamps only what the

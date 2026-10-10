@@ -121,7 +121,7 @@ fn a_network_is_planned_as_subnet_flows_never_as_hosts() {
     assert_eq!(flows[1].verdict, Verdict::Block);
     assert_eq!(flows[1].precedence.class, PrecedenceClass::HardBlock);
     assert_eq!(flows[1].coverage, Coverage::AllPackets);
-    assert!(flows.iter().all(|f| f.principal.0.is_some()));
+    assert!(flows.iter().all(|f| f.principal.user().is_some()));
     // Hosts are what the per-address guards read; a network adds none.
     assert!(route_destinations(&flows, RouteRole::Primary).is_empty());
     assert_eq!(

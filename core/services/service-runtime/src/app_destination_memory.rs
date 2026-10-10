@@ -151,6 +151,18 @@ impl AppDestinationMemory {
         if pairs.is_empty() {
             return 0;
         }
+        // Rows an earlier build wrote passed an older filter: hold them to the
+        // one `flush` applies today. With nobody's rules readable yet there is
+        // nothing to hold them to; codegen still gates them by the rules.
+        let books = self.present_books();
+        let pairs: Vec<(String, Ipv4Addr)> = if books.is_empty() {
+            pairs
+        } else {
+            pairs
+                .into_iter()
+                .filter(|(key, ip)| books.iter().any(|book| admits(book, key, *ip)))
+                .collect()
+        };
         let seeded = self.observations.seed_many(&pairs);
         if seeded > 0 {
             tracing::info!(
@@ -177,6 +189,19 @@ impl AppDestinationMemory {
             self.flush_for(&snapshot, now, &mut written, &mut summary);
         }
         summary
+    }
+
+    /// The rule books in force: every present user's, else the active one.
+    fn present_books(&self) -> Vec<CanonicalRuleBook> {
+        let mut books: Vec<CanonicalRuleBook> = (self.present)()
+            .iter()
+            .filter_map(|sid| self.rules.active_rules_for(sid))
+            .map(|snapshot| snapshot.rule_book)
+            .collect();
+        if books.is_empty() {
+            books.extend(self.rules.active_rules().map(|snapshot| snapshot.rule_book));
+        }
+        books
     }
 
     /// Write back one principal's routed applications. `written` spans the whole
@@ -226,6 +251,16 @@ impl AppDestinationMemory {
             summary.destinations = summary.destinations.saturating_add(confirmed.len() as u32);
         }
     }
+}
+
+/// Whether `book` would let `flush` write `ip` for the application keyed `key`.
+/// Keys are compared normalised: earlier builds stored the rule spelling.
+fn admits(book: &CanonicalRuleBook, key: &str, ip: Ipv4Addr) -> bool {
+    let key = crate::app_observation_lookup::app_key(key);
+    routed_app_patterns(&book.secondary)
+        .iter()
+        .any(|pattern| crate::app_observation_lookup::app_key(pattern) == key)
+        && !named_by_address_rule(book, ip)
 }
 
 /// Whether an address rule — an exact address, or a subnet or range holding it
@@ -457,20 +492,61 @@ mod tests {
 
     #[test]
     fn a_remembered_destination_opens_nothing_for_an_app_without_a_rule() {
-        // The codegen iterates RULES, so a pre-seeded destination for a process
-        // nobody routed produces no route — the memory cannot widen enforcement.
+        // Held to today's flush filter: no rule routes chrome.exe, so its row
+        // from an earlier session is not loaded at all.
         let table = Arc::new(FakeTable::default());
         let rules = book(vec![app_rule("r1", "messenger.exe")]);
         FakeTable::persist_fn(&table)("chrome.exe", &[ip(9)], SystemTime::now());
 
         let store = Arc::new(AppObservationStore::new());
         let mem = memory(&store, rules.clone(), &table);
-        assert_eq!(mem.warm_load(SystemTime::now()), 1, "the row is loaded…");
-        assert!(
-            routes_for(&rules, &store).is_empty(),
-            "…but no rule names chrome.exe, so nothing is routed"
-        );
-        assert_eq!(store.ips_for_app("chrome.exe"), vec![ip(9)]);
+        assert_eq!(mem.warm_load(SystemTime::now()), 0);
+        assert!(routes_for(&rules, &store).is_empty());
+        assert!(store.ips_for_app("chrome.exe").is_empty());
+    }
+
+    /// Rows an earlier build wrote for an address a rule now names — routed or
+    /// blocked — stay in the table but never reach the store.
+    #[test]
+    fn a_remembered_address_a_rule_now_names_is_not_loaded() {
+        let table = Arc::new(FakeTable::default());
+        let now = SystemTime::now();
+        FakeTable::persist_fn(&table)("messenger", &[ip(5), ip(50), ip(60)], now);
+        let mut rules = book(vec![app_rule("r1", "messenger.exe")]);
+        let address = |id: &str, ip: Ipv4Addr| CanonicalRule {
+            address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(ip))),
+            app_match: None,
+            ..app_rule(id, "unused.exe")
+        };
+        let mut blocked = address("b-1", ip(60));
+        blocked.action = RuleAction::Block;
+        rules.primary = CanonicalRuleSet::from_rules(vec![address("i-1", ip(50)), blocked]);
+
+        let store = Arc::new(AppObservationStore::new());
+        let mem = memory(&store, rules, &table);
+        assert_eq!(mem.warm_load(now), 1);
+        assert_eq!(store.ips_for_app("messenger.exe"), vec![ip(5)]);
+    }
+
+    /// An address only a Block rule names is not an app destination either.
+    #[test]
+    fn an_address_only_a_block_rule_names_is_not_remembered() {
+        let table = Arc::new(FakeTable::default());
+        let store = Arc::new(AppObservationStore::new());
+        store.record("messenger.exe", ip(5));
+        store.record("messenger.exe", ip(60));
+        let mut rules = book(vec![app_rule("r1", "messenger.exe")]);
+        rules.primary = CanonicalRuleSet::from_rules(vec![CanonicalRule {
+            address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(60)))),
+            app_match: None,
+            action: RuleAction::Block,
+            ..app_rule("b-1", "unused.exe")
+        }]);
+
+        let mem = memory(&store, rules, &table);
+        mem.flush(SystemTime::now());
+        let rows = table.rows.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), vec![ip(5)]);
     }
 
     #[test]

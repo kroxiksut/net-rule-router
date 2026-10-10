@@ -9,6 +9,7 @@
 //! Behaviour is unchanged: the body is the same statements in the same order.
 
 use super::*;
+use crate::enforcement_planner::ServiceAccountPosture;
 
 impl PerSidApplyOrchestrator {
     /// `pub(super)` rather than private: the impl is split across files, so the
@@ -539,6 +540,13 @@ impl PerSidApplyOrchestrator {
                     "tunnel clients' install trees joined the fail-closed exemption — the transport process is not the binary we resolved",
                 );
             }
+            // What the service accounts' set exempts: the clients themselves,
+            // never the user's own main-link apps.
+            let tunnel_clients: Vec<String> = recognised_clients
+                .iter()
+                .chain(&client_tree_paths)
+                .cloned()
+                .collect();
             let exempt_patterns: Vec<String> = {
                 let mut seen = std::collections::HashSet::new();
                 recognised_clients
@@ -889,6 +897,33 @@ impl PerSidApplyOrchestrator {
                             ks
                         }
                     };
+                    // The service accounts get the pins whenever the owner's
+                    // guard holds anything — the address pairs, never the
+                    // blanket the tunnel-default modes give the owner.
+                    if !ks.is_empty() || fail_closed {
+                        let service = self.service_account_filters(
+                            sid,
+                            intent,
+                            OwnerGuard {
+                                posture: ServiceAccountPosture::Pin,
+                                destinations: &ks_dest_ips,
+                                holds: &holds,
+                                tunnel_servers: OwnerGuard::servers_of(
+                                    &resolution.bootstrap_server_ips,
+                                    &resolution.bootstrap_server_ips_v6,
+                                ),
+                                local_subnets: OwnerGuard::subnets_of(
+                                    &resolution.local_subnets,
+                                    &resolution.local_subnets_v6,
+                                ),
+                                secondary_luid: resolution.secondary_luid,
+                                protocols,
+                            },
+                            &tunnel_clients,
+                        );
+                        collect_service_account_block_ids(&service, &mut killswitch_block_ids);
+                        filters.extend(service);
+                    }
                     // A blanket block covers every network, so only a
                     // per-destination posture leaves any of them open.
                     let per_destination = behavior_mode == RouteBehaviorMode::PreferPrimary
@@ -1148,6 +1183,39 @@ impl PerSidApplyOrchestrator {
                         );
                         app_block_emitted |= !app_blocks.is_empty();
                         fc.extend(app_blocks);
+                        // Address blocks only for the service accounts, even
+                        // when the owner's posture escalated to a blanket one.
+                        let service_holds = if effective_block_all {
+                            crate::enforcement_planner::NetworkHolds::for_pass(
+                                &ownership,
+                                &ks_dest_ips,
+                                || exemptions.never_blocked_networks(),
+                            )
+                        } else {
+                            holds.clone()
+                        };
+                        let service = self.service_account_filters(
+                            sid,
+                            intent,
+                            OwnerGuard {
+                                posture: ServiceAccountPosture::Block,
+                                destinations: &ks_dest_ips,
+                                holds: &service_holds,
+                                tunnel_servers: OwnerGuard::servers_of(
+                                    &exemptions.bootstrap_server_ips,
+                                    &exemptions.bootstrap_server_ips_v6,
+                                ),
+                                local_subnets: OwnerGuard::subnets_of(
+                                    &exemptions.local_subnets,
+                                    &exemptions.local_subnets_v6,
+                                ),
+                                secondary_luid: 0,
+                                protocols,
+                            },
+                            &tunnel_clients,
+                        );
+                        collect_service_account_block_ids(&service, &mut killswitch_block_ids);
+                        filters.extend(service);
                         // Full-level only on a posture change or a heartbeat (the
                         // block-all/per-IP split is part of the posture, so a
                         // coverage escalation still re-logs immediately); steady

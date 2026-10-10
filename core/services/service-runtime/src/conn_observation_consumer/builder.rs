@@ -16,10 +16,30 @@ impl ConnectionObservationConsumer {
         active_sid: ActiveSidFn,
         log_ndjson: bool,
     ) -> Self {
+        Self::with_egress(
+            api,
+            Arc::new(move |sid: &str| coordinator.resolve_egress_ifindexes(sid)),
+            active_sid,
+            log_ndjson,
+        )
+    }
+
+    /// For a platform that resolves a principal's links without a route
+    /// coordinator.
+    pub fn with_egress(
+        api: Arc<dyn RouteTablePort>,
+        egress_of: EgressIfindexesFn,
+        active_sid: ActiveSidFn,
+        log_ndjson: bool,
+    ) -> Self {
         Self {
             api,
-            coordinator,
+            egress_of,
             active_sid,
+            owner_scoped: false,
+            outage_announced_for: Mutex::new(std::collections::HashMap::new()),
+            not_covered_drop_check: None,
+            drop_pairing: None,
             log_ndjson: Arc::new(AtomicBool::new(log_ndjson)),
             app_observations: None,
             app_destination_forget: None,
@@ -30,6 +50,7 @@ impl ConnectionObservationConsumer {
             killswitch_app_scope_check: None,
             ipv6_cut_drop_check: None,
             dns_lockdown_drop_check: None,
+            service_account_drop_check: None,
             vpn_client_app_learner: None,
             reverse_dns_learner: None,
             drop_logged: Mutex::new(HashSet::new()),
@@ -228,6 +249,39 @@ impl ConnectionObservationConsumer {
     /// governs it, instead of as a rule the user never wrote.
     pub fn with_dns_lockdown_drop_check(mut self, check: KillswitchDropCheckFn) -> Self {
         self.dns_lockdown_drop_check = Some(check);
+        self
+    }
+
+    /// Wire the service-account classifier (in production: the same registry's
+    /// `is_service_account`) so a drop of system traffic stays out of the
+    /// user's notices, outage list and learners — the tunnel-endpoint ones
+    /// excepted.
+    pub fn with_service_account_drop_check(mut self, check: KillswitchDropCheckFn) -> Self {
+        self.service_account_drop_check = Some(check);
+        self
+    }
+
+    /// Label each connection, and decide its outage, by its owner's links
+    /// rather than the active user's (see [`Self::owner_scoped`]).
+    #[must_use]
+    pub fn with_owner_scoped_egress(mut self) -> Self {
+        self.owner_scoped = true;
+        self
+    }
+
+    /// Wire the "no rule covers this host" classifier for drop ids that name
+    /// their role, in place of the codegen-hash comparison.
+    #[must_use]
+    pub fn with_not_covered_drop_check(mut self, check: KillswitchDropCheckFn) -> Self {
+        self.not_covered_drop_check = Some(check);
+        self
+    }
+
+    /// Fold a socket-table row into the drop report of the same connection,
+    /// for a source pair that reports a dropped connection twice.
+    #[must_use]
+    pub fn with_drop_pairing(mut self) -> Self {
+        self.drop_pairing = Some(Mutex::new(drop_pairing::DropSocketPairing::default()));
         self
     }
 

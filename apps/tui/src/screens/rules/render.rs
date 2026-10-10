@@ -8,14 +8,15 @@ use serde_json::Value;
 
 use super::apply::Review;
 use super::form::{offered_types, route_options, Field, Form};
-use super::table::{route_label, RouteFilter, Row, Verdict, VerdictStatus, PAGE};
+use super::table::{route_label, RouteFilter, Row, SortMode, Verdict, VerdictStatus, PAGE};
 
 /// Lines of the changes view's entry list one window shows.
 pub const REVIEW_PAGE: usize = 12;
 /// Overlaps the form spells out before it counts the rest.
 const FORM_OVERLAPS: usize = 3;
 use super::{
-    text, verdicts, Busy, Choice, ChoicePurpose, Input, InputPurpose, Mode, Phase, SetList,
+    main_route, text, verdicts, Busy, Choice, ChoicePurpose, Input, InputPurpose, Mode, Phase,
+    SetList,
 };
 use crate::i18n::Texts;
 use crate::keys;
@@ -81,6 +82,12 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             StateTone::Caution,
         )]));
     }
+    if rules.unrecognized > 0 {
+        lines.push(ViewLine::new(vec![Segment::state(
+            texts.fill(text::UNRECOGNIZED, &[("n", rules.unrecognized.to_string())]),
+            StateTone::Caution,
+        )]));
+    }
     if table.is_loaded() || !table.rows.is_empty() {
         let word = if table.is_dirty() {
             Segment::state(texts.get(text::PENDING), StateTone::Caution)
@@ -132,7 +139,14 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         filter.push(Segment::strong(format!(" · {}: ", texts.get(text::SEARCH))));
         filter.push(Segment::plain(table.search.clone()));
     }
+    if table.sort != SortMode::Display {
+        filter.push(Segment::strong(format!(" · {}: ", texts.get(text::SORT))));
+        filter.push(Segment::plain(texts.get(table.sort.label())));
+    }
     lines.push(ViewLine::new(filter));
+    if let Some(check) = &rules.main_route.check {
+        lines.push(ViewLine::text(main_route::progress_text(check, texts)));
+    }
     lines.extend(verdict_lines(app, texts));
     if let Some(note) = &rules.note {
         lines.push(ViewLine::text(note.text(texts)));
@@ -215,10 +229,17 @@ fn verdict_word(verdict: &Verdict, texts: &Texts) -> Option<Segment> {
     }
 }
 
-fn row_lines(n: usize, row: &Row, chosen: bool, texts: &Texts) -> Vec<ViewLine> {
+/// One rule; `with_main_route` when the list shows the main-route column.
+fn row_lines(
+    n: usize,
+    row: &Row,
+    chosen: bool,
+    with_main_route: bool,
+    texts: &Texts,
+) -> Vec<ViewLine> {
     let rule = &row.rule;
     let switch = texts.get(if rule.enabled { text::ON } else { text::OFF });
-    let head = format!(
+    let mut head = format!(
         "{}{n}. [{switch}] {}  {}  {} — {}",
         if chosen { "> " } else { "  " },
         rule.id,
@@ -226,6 +247,18 @@ fn row_lines(n: usize, row: &Row, chosen: bool, texts: &Texts) -> Vec<ViewLine> 
         rule.match_value,
         rule_route_text(rule, texts),
     );
+    let cell = if with_main_route {
+        main_route::cell(row)
+    } else {
+        None
+    };
+    if let Some((word, _)) = cell {
+        head.push_str(&format!(
+            " · {}: {}",
+            texts.get(text::MAIN_ROUTE_COLUMN),
+            texts.get(word)
+        ));
+    }
     let mut first = vec![if chosen {
         Segment::strong(head)
     } else {
@@ -236,8 +269,8 @@ fn row_lines(n: usize, row: &Row, chosen: bool, texts: &Texts) -> Vec<ViewLine> 
         first.push(word);
     }
     let mut lines = vec![ViewLine::new(first)];
-    // The chosen row says the rest: what the validator found, who wrote it,
-    // and its note.
+    // The chosen row says the rest: what the validator found, what the main
+    // route answered, who wrote it, and its note.
     if chosen {
         let mut details = Vec::new();
         if row.verdict.status != VerdictStatus::Valid {
@@ -245,6 +278,9 @@ fn row_lines(n: usize, row: &Row, chosen: bool, texts: &Texts) -> Vec<ViewLine> 
         }
         if rule.is_verify() {
             details.push(texts.get(text::VERIFY_HINT));
+        }
+        if let Some((_, hint)) = cell {
+            details.push(texts.get(hint));
         }
         if rule.auto_origin().is_some() {
             details.push(texts.get(text::AUTO_ORIGIN));
@@ -289,9 +325,16 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             ("total", total),
         ],
     ))];
+    let column = main_route::column_shown(app);
     for (at, &master) in visible.iter().enumerate().take(last).skip(first) {
         let chosen = at == cursor && app.focus == crate::state::Focus::Feed;
-        lines.extend(row_lines(at + 1, &table.rows[master], chosen, texts));
+        lines.extend(row_lines(
+            at + 1,
+            &table.rows[master],
+            chosen,
+            column,
+            texts,
+        ));
     }
     lines
 }

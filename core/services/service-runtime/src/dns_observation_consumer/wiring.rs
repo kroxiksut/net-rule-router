@@ -14,6 +14,7 @@ impl DnsObservationConsumer {
             cache,
             fqdn_lookup,
             active_sid,
+            present_sids: None,
             collateral_warned: Mutex::new(BoundedRecentSet::new(WARNED_HOSTS_CAP)),
             dns_cache_read: Arc::new(NoopDnsCacheRead),
             known_direct: None,
@@ -23,6 +24,21 @@ impl DnsObservationConsumer {
             auto_rules: None,
             census_purged: Mutex::new(BoundedRecentSet::new(WARNED_HOSTS_CAP)),
             observed_names: None,
+        }
+    }
+
+    /// Serve every present principal, not only the first (see the field doc).
+    #[must_use]
+    pub fn with_present_principals(mut self, present: PresentSidsFn) -> Self {
+        self.present_sids = Some(present);
+        self
+    }
+
+    /// The principals whose rules decide what is kept, lead first.
+    pub(super) fn principals(&self) -> Vec<String> {
+        match self.present_sids.as_ref() {
+            Some(present) => present(),
+            None => (self.active_sid)().into_iter().collect(),
         }
     }
 

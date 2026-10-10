@@ -203,7 +203,9 @@ impl IcmpSocket {
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Self(fd))
+        let socket = Self(fd);
+        nrr_platform_api::own_traffic::mark_own_socket(&socket);
+        Ok(socket)
     }
 
     pub(crate) fn set_receive_timeout(&self, timeout: Duration) -> std::io::Result<()> {
@@ -312,6 +314,14 @@ impl IcmpSocket {
             return Err(std::io::Error::last_os_error());
         }
         Ok(read as usize)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::os::fd::AsFd for IcmpSocket {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: the descriptor stays open for as long as `self` lives.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
     }
 }
 

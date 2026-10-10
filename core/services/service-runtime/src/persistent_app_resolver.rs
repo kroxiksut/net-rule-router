@@ -13,15 +13,12 @@
 //!
 //! # Behaviour
 //!
-//! `resolve(pattern)`:
-//! 1. Ask the inner resolver.
-//! 2. Non-empty → **write-through**: persist the fresh resolution (best-effort;
-//!    a storage error is logged and swallowed, never fails the resolve) and
-//!    return it. This is how the table gets populated while the client IS
-//!    discoverable (e.g. the first time it runs).
-//! 3. Empty → **fall back**: load the persisted paths, keep only the ones that
-//!    still exist on disk (`Path::is_file`), and return those (possibly empty).
-//!    A since-uninstalled binary is thus not resurrected.
+//! `resolve(pattern)` answers the inner resolver's paths plus every path seen
+//! before that still exists on disk (`Path::is_file`), and writes that union
+//! through (best-effort; a storage error is logged and swallowed). A program
+//! found only while it runs — outside every walked install root — is thus
+//! covered from its next start on, not from its first connection; a deleted
+//! binary is not resurrected.
 //!
 //! The decorator is neutral (no Windows APIs) — it composes any inner resolver
 //! with any state-DB connection, so it is fully unit-testable with a scripted
@@ -112,6 +109,24 @@ impl PersistentAppPathResolver {
         }
     }
 
+    /// Paths already known for `pattern` that still exist: the last set written,
+    /// or the stored one before this run has written any.
+    fn known_survivors(&self, pattern: &str) -> Vec<PathBuf> {
+        let held = self
+            .last_written
+            .lock()
+            .ok()
+            .and_then(|seen| seen.get(pattern).cloned());
+        match held {
+            Some(paths) => paths
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|p| Path::is_file(p))
+                .collect(),
+            None => self.load_survivors(pattern),
+        }
+    }
+
     /// Load persisted paths for `pattern`, keeping only survivors that still
     /// exist on disk. A poisoned lock / storage error degrades to an empty set.
     fn load_survivors(&self, pattern: &str) -> Vec<PathBuf> {
@@ -147,15 +162,16 @@ impl PersistentAppPathResolver {
 
 impl AppPathResolver for PersistentAppPathResolver {
     fn resolve(&self, name_or_glob: &str) -> Vec<PathBuf> {
-        let live = self.inner.resolve(name_or_glob);
-        if !live.is_empty() {
-            // Fresh resolution — persist it as the new last-good and use it.
-            self.persist(name_or_glob, &live);
-            return live;
+        let mut paths = self.inner.resolve(name_or_glob);
+        for known in self.known_survivors(name_or_glob) {
+            if !paths.contains(&known) {
+                paths.push(known);
+            }
         }
-        // Inner found nothing (client not running / not installed on a known
-        // path) — fall back to the last-good on-disk survivors.
-        self.load_survivors(name_or_glob)
+        if !paths.is_empty() {
+            self.persist(name_or_glob, &paths);
+        }
+        paths
     }
 
     /// Straight through: this decorator remembers RESOLUTIONS, and an install
@@ -249,7 +265,7 @@ mod tests {
         // A changed answer is written.
         let other = touch(&dir, "vpn2.exe");
         inner.set("vpn.exe", vec![other.clone()]);
-        assert_eq!(resolver.resolve("vpn.exe"), vec![other]);
+        assert_eq!(resolver.resolve("vpn.exe"), vec![other, exe]);
         assert!(stored_at(&conn) > first - 10_000);
     }
 
@@ -318,27 +334,39 @@ mod tests {
         );
     }
 
+    /// A program the walks never reach is found only while it runs; once seen
+    /// it stays covered while its file exists, so its next start already has
+    /// its rule in place.
     #[test]
-    fn write_through_supersedes_stale_persisted_set() {
+    fn a_path_seen_once_stays_while_its_file_exists() {
         let (dir, conn) = state_conn();
-        let old = touch(&dir, "old.exe");
-        let new = touch(&dir, "new.exe");
-        {
-            let guard = conn.lock().unwrap();
-            AppPatternResolutionsRepository::new(&guard)
-                .upsert("vpn*", &[old.to_string_lossy().into_owned()], 100)
-                .expect("seed old");
-        }
+        let installed = touch(&dir, "app-store.exe");
+        let running_only = touch(&dir, "app-cli.exe");
         let inner = Arc::new(ScriptedInner::default());
-        inner.set("vpn*", vec![new.clone()]);
-        let resolver = PersistentAppPathResolver::new(inner, Arc::clone(&conn));
+        inner.set("app*", vec![installed.clone(), running_only.clone()]);
+        let resolver = PersistentAppPathResolver::new(inner.clone(), Arc::clone(&conn));
+        assert_eq!(
+            resolver.resolve("app*"),
+            vec![installed.clone(), running_only.clone()]
+        );
 
-        // Live wins and replaces the persisted set.
-        assert_eq!(resolver.resolve("vpn*"), vec![new.clone()]);
-        let guard = conn.lock().unwrap();
-        let persisted = AppPatternResolutionsRepository::new(&guard)
-            .load("vpn*")
-            .expect("load");
-        assert_eq!(persisted, vec![new.to_string_lossy().into_owned()]);
+        // The process exits: the inner resolver sees only the installed one.
+        inner.set("app*", vec![installed.clone()]);
+        assert_eq!(
+            resolver.resolve("app*"),
+            vec![installed.clone(), running_only.clone()],
+            "the stopped program keeps its path",
+        );
+
+        // A fresh run reads the same from storage.
+        let restarted = PersistentAppPathResolver::new(inner.clone(), Arc::clone(&conn));
+        assert_eq!(
+            restarted.resolve("app*"),
+            vec![installed.clone(), running_only.clone()]
+        );
+
+        // Deleted from disk: gone.
+        std::fs::remove_file(&running_only).expect("remove");
+        assert_eq!(resolver.resolve("app*"), vec![installed]);
     }
 }

@@ -9,15 +9,89 @@ impl DnsObservationConsumer {
     /// Consume a batch of observations: cache the ones matching an active
     /// rule, discard the rest. No active user / no rules → nothing matches.
     pub fn consume(&self, observations: &[DnsObservation], now: SystemTime) -> ConsumeSummary {
-        let mut summary = ConsumeSummary::default();
         if observations.is_empty() {
-            return summary;
+            return ConsumeSummary::default();
         }
-        let Some(sid) = (self.active_sid)() else {
+        let principals = self.principals();
+        let Some((lead, others)) = principals.split_first() else {
             // No routing-active user → nothing to enforce.
-            summary.ignored = observations.len() as u32;
-            return summary;
+            return ConsumeSummary {
+                ignored: observations.len() as u32,
+                ..ConsumeSummary::default()
+            };
         };
+        if others.is_empty() {
+            return self.consume_for(lead, observations, now, None);
+        }
+        let mut kept = vec![false; observations.len()];
+        let mut summary = self.consume_for(lead, observations, now, Some(&mut kept));
+        for sid in others {
+            self.keep_rule_hosts_for(sid, observations, now, &mut kept, &mut summary);
+        }
+        summary
+    }
+
+    /// Another signed-in user's share of a batch: the hosts their rules name
+    /// go into the cache their routes are built from. Collateral and learning
+    /// stay with the lead principal — both feed machine-wide state once.
+    fn keep_rule_hosts_for(
+        &self,
+        sid: &str,
+        observations: &[DnsObservation],
+        now: SystemTime,
+        kept: &mut [bool],
+        summary: &mut ConsumeSummary,
+    ) {
+        let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
+            return;
+        };
+        for (index, obs) in observations.iter().enumerate() {
+            if kept[index] || obs.ipv4s.is_empty() {
+                continue;
+            }
+            if !obs
+                .hostname
+                .split('.')
+                .all(|label| nrr_shared::dns_name::is_learnable_label(label.as_bytes()))
+            {
+                continue;
+            }
+            let routable: Vec<Ipv4Addr> = obs
+                .ipv4s
+                .iter()
+                .copied()
+                .filter(|ip| !is_non_routable_v4(ip))
+                .collect();
+            if routable.is_empty() {
+                continue;
+            }
+            if rule_set_matches(&obs.hostname, &snapshot.rule_book.secondary)
+                || rule_set_matches(&obs.hostname, &snapshot.rule_book.primary)
+            {
+                kept[index] = true;
+                summary.ignored = summary.ignored.saturating_sub(1);
+                self.upsert_counted(
+                    &obs.hostname,
+                    &routable,
+                    now,
+                    StorageResolutionSource::Dns,
+                    summary,
+                );
+            }
+        }
+    }
+
+    /// The full treatment of a batch for `sid`. `kept`, when given, marks each
+    /// observation cached for `sid`, so another principal's pass skips it.
+    fn consume_for(
+        &self,
+        sid: &str,
+        observations: &[DnsObservation],
+        now: SystemTime,
+        mut kept: Option<&mut Vec<bool>>,
+    ) -> ConsumeSummary {
+        let mut summary = ConsumeSummary::default();
+        let sid = sid.to_string();
         let Some(snapshot) = self.rules_provider.active_rules_for(&sid) else {
             summary.ignored = observations.len() as u32;
             return summary;
@@ -188,6 +262,9 @@ impl DnsObservationConsumer {
                 );
             }
             if in_primary || in_secondary {
+                if let Some(kept) = kept.as_deref_mut() {
+                    kept[index] = true;
+                }
                 if let Some(engine) = self.auto_rules.as_ref() {
                     engine.note_verify_candidate(&sid, &obs.hostname, &routable);
                 }

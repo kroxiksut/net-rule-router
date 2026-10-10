@@ -27,6 +27,8 @@ fn resp(rows: Vec<RuleRowEntry>) -> RulesListResponse {
         rows,
         supported_rule_types: rule_type_slugs(),
         active_revision_id: Some("rev-1".into()),
+        unrecognized: 0,
+        main_route_pending: 0,
     }
 }
 

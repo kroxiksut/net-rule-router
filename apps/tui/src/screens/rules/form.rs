@@ -398,11 +398,13 @@ impl Form {
         }
         match self.editing {
             Some(i) if i < table.rows.len() => {
-                let service_id = table.rows[i].service_id.take();
-                table.rows[i] = Row {
-                    service_id,
+                let old = &table.rows[i];
+                let mut row = Row {
+                    service_id: old.service_id.clone(),
                     ..Row::new(rule)
                 };
+                row.inherit_main_route(old);
+                table.rows[i] = row;
                 table.select(i);
                 Saved::Updated
             }

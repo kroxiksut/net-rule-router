@@ -1,0 +1,14 @@
+{
+  "description": "rules.js mainRouteRank: the main-route column's sort order; what the main route does not reach first, a rule never checked last",
+  "cases": [
+    { "name": "silent", "input": { "slug": "silent" }, "expected": 0 },
+    { "name": "answered", "input": { "slug": "answered" }, "expected": 1 },
+    { "name": "unclear", "input": { "slug": "unclear" }, "expected": 2 },
+    { "name": "no address", "input": { "slug": "no-address" }, "expected": 3 },
+    { "name": "empty", "input": { "slug": "" }, "expected": 4 },
+    { "name": "null", "input": { "slug": null }, "expected": 4 },
+    { "name": "absent", "input": {}, "expected": 4 },
+    { "name": "unknown verdict", "input": { "slug": "refused" }, "expected": 4 },
+    { "name": "case-sensitive", "input": { "slug": "Silent" }, "expected": 4 }
+  ]
+}

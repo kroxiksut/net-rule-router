@@ -206,9 +206,36 @@ impl Precedence {
     }
 }
 
-/// Which principal a rule applies to. `None` is system-wide (no per-user scope).
+/// Which principal a rule applies to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PrincipalScope(pub Option<UserPrincipal>);
+pub enum PrincipalScope {
+    /// Every account on the machine.
+    Machine,
+    /// One user's processes.
+    User(UserPrincipal),
+    /// The machine's service accounts, never a signed-in user: on Windows
+    /// LocalSystem, LocalService, NetworkService and every service SID; on
+    /// Linux the system uid range and `nobody`, minus the uids of present
+    /// users. Each lowering resolves the set; the plan only names it.
+    ServiceAccounts,
+}
+
+impl PrincipalScope {
+    /// One user, or the whole machine when there is none.
+    #[must_use]
+    pub fn from_user(user: Option<UserPrincipal>) -> Self {
+        user.map_or(Self::Machine, Self::User)
+    }
+
+    /// The user this scope names, if it names exactly one.
+    #[must_use]
+    pub fn user(&self) -> Option<&UserPrincipal> {
+        match self {
+            Self::User(user) => Some(user),
+            Self::Machine | Self::ServiceAccounts => None,
+        }
+    }
+}
 
 /// A neutral stable adapter identity. On Windows this resolves to a LUID, on
 /// Linux to an interface name — at lowering time, never in the plan. It is the
@@ -551,6 +578,13 @@ pub trait PolicyEnforcer: Send + Sync {
     /// is why it is asked every pass rather than cached.
     fn channel_availability(&self, principal: &UserPrincipal) -> ChannelAvailability;
 
+    /// [`Self::channel_availability`] with the reason behind each `false`, so
+    /// the user can be told what to do. One reading answers both: the cycle
+    /// asks this instead, never both. The default knows only usable or not.
+    fn channel_report(&self, principal: &UserPrincipal) -> ChannelReport {
+        ChannelReport::from(self.channel_availability(principal))
+    }
+
     /// Which link each of the principal's connections leaves through, so a
     /// sweep spares one riding a link that is neither of theirs. The default
     /// knows no link, which spares nothing.
@@ -624,6 +658,60 @@ pub struct ChannelAvailability {
     pub secondary: bool,
 }
 
+/// Why one bound channel is, or is not, usable right now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ChannelState {
+    /// The links could not be read.
+    #[default]
+    Unknown,
+    /// Nothing is bound to this role.
+    Unbound,
+    Usable,
+    /// The bound link is here but cannot carry traffic: not up, or up with its
+    /// far end declared dead.
+    Down,
+    /// No link answers to the bound name, so there is nothing to wait for.
+    /// `replacements` are the usable links the user could pick instead.
+    Absent {
+        replacements: Vec<String>,
+    },
+}
+
+/// [`ChannelAvailability`] with the reason behind each answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ChannelReport {
+    pub primary: ChannelState,
+    pub secondary: ChannelState,
+}
+
+impl ChannelReport {
+    /// What the planner reads: only a usable channel carries traffic.
+    pub fn availability(&self) -> ChannelAvailability {
+        ChannelAvailability {
+            primary: self.primary == ChannelState::Usable,
+            secondary: self.secondary == ChannelState::Usable,
+        }
+    }
+}
+
+/// A platform that answers only usable-or-not: an unusable channel reads as
+/// down, the one reason that asks nothing of the user but to wait.
+impl From<ChannelAvailability> for ChannelReport {
+    fn from(availability: ChannelAvailability) -> Self {
+        let state = |usable: bool| {
+            if usable {
+                ChannelState::Usable
+            } else {
+                ChannelState::Down
+            }
+        };
+        Self {
+            primary: state(availability.primary),
+            secondary: state(availability.secondary),
+        }
+    }
+}
+
 /// Which adapters a principal has bound to the primary and secondary roles.
 ///
 /// Names as the user saved them — resolving them to a live interface is the
@@ -657,7 +745,7 @@ mod tests {
     /// element could not be built, this would not compile — that is the point.
     fn hardest_plan() -> EnforcementPlan {
         let user = UserPrincipal::from_linux_uid(1000);
-        let scope = || PrincipalScope(Some(user.clone()));
+        let scope = || PrincipalScope::User(user.clone());
         let mut flows = Vec::new();
 
         // 1. Primary ExactIp permit — a site pinned to the primary link.
@@ -946,7 +1034,7 @@ mod tests {
             .any(|f| f.coverage == Coverage::ConnectOnly));
 
         // Per-principal scoping is expressible.
-        assert!(plan.flows.iter().all(|f| f.principal.0.is_some()));
+        assert!(plan.flows.iter().all(|f| f.principal.user().is_some()));
 
         // A named per-app scope with exe paths (the Windows ALE_APP_ID consumer).
         assert!(plan.flows.iter().any(
@@ -1056,7 +1144,7 @@ mod tests {
                 dst_port: None,
                 protocol: None,
             },
-            principal: PrincipalScope(None),
+            principal: PrincipalScope::Machine,
             app: AppScope::Any,
             egress: EgressConstraint::Any,
             coverage: Coverage::ConnectOnly,

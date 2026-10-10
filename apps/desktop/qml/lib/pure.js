@@ -1077,7 +1077,9 @@ var MUTABLE_NOTICE_KINDS = {
     "local-networks": ["notifications.local-networks.title", "A local network was found"],
     "rules-drift": ["tray.rules-drift.title", "Your rules files differ from what is applied"],
     "secondary-down": ["notifications.enforcement.secondary-down.title",
-        "The additional connection is not up"]
+        "The additional connection is not up"],
+    "routes-held": ["notifications.routes-held.title",
+        "Some addresses follow another user's route"]
 }
 
 // How long each answer of the chooser holds; 0 is "until lifted".

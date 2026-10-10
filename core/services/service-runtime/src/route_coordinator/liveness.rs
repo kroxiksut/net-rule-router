@@ -51,6 +51,8 @@ impl SecondaryRouteCoordinator {
             Ok(i) => i,
             Err(_) => return,
         };
+        // Two users on one tunnel: one echo per tick, not one per user.
+        let mut probed_now: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for sid in sids {
             let Some(policy) = self.route_source.load_for_sid(sid) else {
                 continue;
@@ -81,7 +83,7 @@ impl SecondaryRouteCoordinator {
                     // echo; an echo to 0.0.0.0 would fail every time and declare
                     // a working link dead. Nothing is recorded, so the window
                     // stays empty and the gate stays open.
-                    if t.gateway.is_unspecified() {
+                    if t.gateway.is_unspecified() || !probed_now.insert(t.interface_index) {
                         continue;
                     }
                     let reachable = probe.is_reachable(t.gateway, LIVENESS_PROBE_TIMEOUT);
@@ -175,7 +177,8 @@ impl SecondaryRouteCoordinator {
     /// resolution the last recompute used — nothing enumerates adapters on the
     /// DNS path — and installs only the `/32`s the planner asks for these
     /// addresses: one it declines (a shared address, a main-link claim) stays
-    /// unrouted. Returns how many of `addresses` now have their route.
+    /// unrouted, and so does one another signed-in user already routes through
+    /// a different link. Returns how many of `addresses` now have their route.
     pub fn route_first_contact(&self, sid: &str, addresses: &[Ipv4Addr]) -> usize {
         if addresses.is_empty() {
             return 0;
@@ -209,6 +212,8 @@ impl SecondaryRouteCoordinator {
             .filter(|r| {
                 r.prefix_length == 32
                     && matches!(r.destination, std::net::IpAddr::V4(d) if addresses.contains(&d))
+                    && !nrr_shared::ip_block::IpBlock::new(r.destination, 32)
+                        .is_some_and(|block| self.routed_for_another_user(sid, block))
             })
             .collect();
         if wanted.is_empty() {

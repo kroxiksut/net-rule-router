@@ -807,9 +807,9 @@ pub(crate) fn build_supervised_runtime_deps(
             let registry = Arc::clone(&sid_registry);
             Arc::new(move || {
                 coord
-                    .effective_routing_sid(&registry.active_sids())
-                    .and_then(|sid| coord.resolve_secondary_link(&sid))
-                    .into_iter()
+                    .served_sids(&registry.active_sids())
+                    .iter()
+                    .filter_map(|sid| coord.resolve_secondary_link(sid))
                     .collect()
             })
         };
@@ -923,6 +923,8 @@ pub(crate) fn build_supervised_runtime_deps(
             _ => None,
         };
 
+    // The relay answers by name and a query names no user: the longest-served
+    // one's rules decide.
     {
         let registry = Arc::clone(&sid_registry);
         let coord = route_coordinator.clone();
@@ -932,12 +934,11 @@ pub(crate) fn build_supervised_runtime_deps(
         }));
     }
 
-    // The routing-active SID for the seed task, console-SID-aware via the
-    // coordinator's gate: the
-    // connected-tray SID, or — service-driven scope with no tray — the active
-    // console user, so the seeder resolves THEIR ExactFqdn rules from boot (not
-    // just ExactIp). Defensive registry-only fallback if the coordinator is
-    // absent (it never is when the seeder exists, but keep the closure total).
+    // The longest-served user. Per-user tasks (seeding, auto-rules) read
+    // `present_principals` below; this one feeds what the machine does for ONE
+    // user at a time: the DNS answers (a query carries no trace of who asked),
+    // the fake-IP relay and the upstream resolver's preferred link. Defensive
+    // registry-only fallback if the coordinator is absent.
     let active_routing_sid: Option<nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn> =
         rule_hostname_seeder.as_ref().map(|_| {
             let registry = Arc::clone(&sid_registry);
@@ -949,13 +950,14 @@ pub(crate) fn build_supervised_runtime_deps(
         });
 
     // "Is anyone signed in?" A connected tray proves a session; on a cold boot
-    // none is running yet, so the console session is what answers first.
+    // none is running yet, so the sessions are what answer first — two remote
+    // users with nobody at the console are as signed in as one.
     let signed_in: Arc<dyn Fn() -> bool + Send + Sync> = {
         let reg = Arc::clone(&sid_registry);
         Arc::new(move || {
             !reg.active_sids().is_empty()
-                || nrr_platform_windows::win32_ffi::console_session::interactive_user_sid()
-                    .is_some()
+                || !nrr_platform_windows::win32_ffi::console_session::interactive_user_sids()
+                    .is_empty()
         })
     };
     // Machine-wide network work waits for that user: the resolver arm's
@@ -1104,24 +1106,23 @@ pub(crate) fn build_supervised_runtime_deps(
                     as nrr_service_runtime::conn_observation_consumer::AppDestinationForgetFn
             }),
             // Read fresh on every batch, so a rule the user just added or
-            // removed changes what may own a pin without a restart.
-            routed_apps: match (settings_conn.as_ref(), active_routing_sid.as_ref()) {
-                (Some(conn), Some(active_sid)) => {
+            // removed changes what may own a pin without a restart. Every
+            // served user's routed programs: any of them may own one.
+            routed_apps: match (settings_conn.as_ref(), route_coordinator.as_ref()) {
+                (Some(conn), Some(coord)) => {
                     let rules: Arc<dyn nrr_service_runtime::per_sid_orchestrator::RulesProvider> =
                         Arc::new(ProductionRulesProvider::new(Arc::clone(conn)));
-                    let active_sid = Arc::clone(active_sid);
+                    let coord = Arc::clone(coord);
+                    let registry = Arc::clone(&sid_registry);
                     Some(Arc::new(move || {
-                        let Some(sid) = active_sid() else {
-                            return Vec::new();
-                        };
-                        let Some(snapshot) = rules.active_rules_for(&sid) else {
-                            return Vec::new();
-                        };
-                        nrr_service_runtime::app_destination_memory::routed_app_patterns(
-                            &snapshot.rule_book.secondary,
-                        )
-                        .into_iter()
-                        .collect()
+                        use nrr_service_runtime::app_destination_memory::routed_app_patterns;
+                        let mut apps = std::collections::BTreeSet::new();
+                        for sid in coord.served_sids(&registry.active_sids()) {
+                            if let Some(snapshot) = rules.active_rules_for(&sid) {
+                                apps.extend(routed_app_patterns(&snapshot.rule_book.secondary));
+                            }
+                        }
+                        apps.into_iter().collect()
                     })
                         as nrr_service_runtime::conn_observation_consumer::RoutedAppsFn)
                 }
@@ -1416,6 +1417,9 @@ pub(crate) fn build_supervised_runtime_deps(
         auto_rules_engine.clone(),
         Some(Arc::clone(&signed_in)),
         route_coordinator.clone(),
+        conn_trace_ring
+            .as_ref()
+            .map(|ring| Arc::clone(ring.outage_blocks())),
     ) {
         dns_resolver_controller.set_factory(factory);
         dns_resolver_controller.set_sign_in_probe(Arc::clone(&signed_in));
@@ -1534,6 +1538,8 @@ pub(crate) fn build_supervised_runtime_deps(
 
     // Assemble the traffic-counter sampling-tick deps: the sampler
     // plus resolvers for the active user's route roles and the current settings.
+    // The counters are per adapter, machine-wide; one user's bindings only
+    // name which adapter plays which role.
     let traffic_tick = match (traffic_sampler.as_ref(), settings_conn.as_ref()) {
         (Some(sampler), Some(state_conn)) => {
             let roles: nrr_service_runtime::TrafficRoleResolver = {
@@ -1650,9 +1656,13 @@ pub(crate) fn build_supervised_runtime_deps(
             },
         ),
         dns_observation: None,
-        // One console user at a time here, so the per-user tasks keep reading
-        // `active_routing_sid`. The list form exists for platforms where several
-        // people are logged in at once.
-        present_principals: None,
+        // Every served user — console and remote sessions, tray or no tray —
+        // so the per-user tasks (rule-host seeding, auto-rules) cover each one.
+        present_principals: route_coordinator.clone().map(|coord| {
+            Arc::new(nrr_service_runtime::route_coordinator::ServedPrincipals {
+                coord,
+                registry: Arc::clone(&sid_registry),
+            }) as Arc<dyn nrr_platform_api::active_principals::ActivePrincipalSource>
+        }),
     }
 }

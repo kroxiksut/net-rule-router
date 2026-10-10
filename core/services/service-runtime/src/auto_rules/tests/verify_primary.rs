@@ -303,6 +303,36 @@ fn a_main_route_rule_that_does_not_open_there_gets_a_verdict_not_a_rewrite() {
 }
 
 #[test]
+fn the_service_tick_checks_every_present_user() {
+    // Linux names each logged-in user; a tick bound to one console user left
+    // every `?` rule there unchecked.
+    let users = ["S-verify-tick-a", "S-verify-tick-b"];
+    let s = setup(
+        users[0],
+        main_route_book(),
+        PathVerdict::Silent,
+        PathVerdict::Answered,
+    );
+    for sid in users {
+        s.engine
+            .note_verify_candidate(sid, "mail.proton.example", &[HOST_IP]);
+    }
+    let engine = Arc::new(s.engine);
+    let mut task = crate::service_tasks::build_auto_rules_task(
+        Arc::clone(&engine),
+        Arc::new(move || users.iter().map(|u| (*u).to_owned()).collect()),
+        None,
+    );
+    let stop = crate::lifecycle::StopToken::new();
+    for _ in 0..2 {
+        (task.tick)(&stop);
+    }
+    for sid in users {
+        assert_eq!(engine.verify_verdicts(sid).len(), 1, "{sid}");
+    }
+}
+
+#[test]
 fn an_additional_route_rule_is_checked_there_and_offered_the_main_one() {
     let sid = "S-verify-additional";
     let s = setup(

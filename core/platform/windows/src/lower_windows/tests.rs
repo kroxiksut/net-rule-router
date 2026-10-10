@@ -17,7 +17,7 @@ fn route_flow(role: RouteRole, ordinal: u32, ip: Ipv4Addr) -> FlowRule {
             dst_port: None,
             protocol: None,
         },
-        principal: PrincipalScope(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
+        principal: PrincipalScope::from_user(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
         app: AppScope::Any,
         egress: EgressConstraint::Any,
         coverage: Coverage::ConnectOnly,
@@ -45,7 +45,7 @@ fn block_flow(ordinal: u32, ip: Ipv4Addr) -> FlowRule {
             dst_port: None,
             protocol: None,
         },
-        principal: PrincipalScope(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
+        principal: PrincipalScope::from_user(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
         app: AppScope::Any,
         egress: EgressConstraint::Any,
         coverage: Coverage::AllPackets,
@@ -149,7 +149,7 @@ fn fail_closed_ale_groups_per_protocol_get_distinct_ids() {
             dst_port: None,
             protocol: Some(protocol),
         },
-        principal: PrincipalScope(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
+        principal: PrincipalScope::from_user(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
         app: AppScope::Any,
         egress: EgressConstraint::Any,
         coverage: Coverage::ConnectOnly,
@@ -181,7 +181,7 @@ fn network_flow(class: PrecedenceClass, ordinal: u32, dst: DstMatch) -> FlowRule
             dst_port: None,
             protocol: None,
         },
-        principal: PrincipalScope(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
+        principal: PrincipalScope::from_user(UserPrincipal::from_windows_sid("S-1-5-21-A").ok()),
         app: AppScope::Any,
         egress: EgressConstraint::Any,
         coverage: if block {
@@ -265,4 +265,60 @@ fn pieces_sharing_a_weight_still_get_distinct_ids() {
     let out = lower_route_rules(&plan(vec![piece(1), piece(2)]));
     assert_eq!(out.len(), 2);
     assert_ne!(out[0].id, out[1].id);
+}
+
+fn pin_flow(principal: PrincipalScope, ordinal: u32, ip: Ipv4Addr) -> FlowRule {
+    FlowRule {
+        verdict: Verdict::Permit,
+        precedence: Precedence {
+            class: PrecedenceClass::KillSwitchPermit,
+            ordinal,
+        },
+        flow: FlowMatch {
+            dst: DstMatch::HostV4(ip),
+            dst_port: None,
+            protocol: None,
+        },
+        principal,
+        app: AppScope::Any,
+        egress: EgressConstraint::OnlyVia(EgressRef::Secondary),
+        coverage: Coverage::ConnectOnly,
+    }
+}
+
+/// The service-account twins are packed apart from the owner's pins and carry
+/// the service-accounts principal, so neither scope enforces the other's set.
+#[test]
+fn service_account_pins_lower_apart_from_the_owners() {
+    let owner = PrincipalScope::from_user(UserPrincipal::from_windows_sid("S-1-5-21-A").ok());
+    let p = plan(vec![
+        pin_flow(owner, 0, Ipv4Addr::new(198, 51, 100, 1)),
+        pin_flow(
+            PrincipalScope::ServiceAccounts,
+            0,
+            Ipv4Addr::new(198, 51, 100, 2),
+        ),
+    ]);
+    let out = lower_kill_switch(&p, 7);
+    let service: Vec<&WfpFilterSpec> = out
+        .iter()
+        .filter(|f| f.user_sid.as_deref() == Some(SERVICE_ACCOUNTS_PRINCIPAL))
+        .collect();
+    let owners: Vec<&WfpFilterSpec> = out
+        .iter()
+        .filter(|f| f.user_sid.as_deref() == Some("S-1-5-21-A"))
+        .collect();
+    assert_eq!(service.len(), 2, "{out:?}");
+    assert_eq!(owners.len(), 2, "{out:?}");
+    let (mine, theirs) = (
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(198, 51, 100, 2),
+    );
+    for f in &service {
+        assert!(f.covers_v4(theirs) && !f.covers_v4(mine), "{f:?}");
+        assert!(f.layer.supports_ale_scoping(), "{f:?}");
+    }
+    for f in &owners {
+        assert!(f.covers_v4(mine) && !f.covers_v4(theirs), "{f:?}");
+    }
 }

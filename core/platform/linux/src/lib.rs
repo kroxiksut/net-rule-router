@@ -161,6 +161,11 @@ pub mod logrotate;
 #[cfg(target_os = "linux")]
 pub mod logind;
 
+/// `SO_MARK` on the service's own sockets, so machine-scope filters let them
+/// through.
+#[cfg(target_os = "linux")]
+pub mod own_traffic;
+
 /// Linux host system-information collector for the diagnostic archive — the
 /// analog of `nrr_platform_windows::system_info`. Reads procfs / `os-release`
 /// (`/proc/cpuinfo`, `/proc/meminfo`, `/etc/os-release`) to enrich the
@@ -198,6 +203,19 @@ pub mod nft_apply;
 /// mechanism) and reports what could not be expressed rather than dropping it.
 pub mod nft_backend;
 pub mod nft_policy_enforcer;
+
+/// Which of our rules dropped a packet: the tag the lowering puts on a drop and
+/// the drop observer reads back. Pure.
+pub mod drop_tag;
+
+/// The drops our own rules made, read back from their NFLOG reports — the
+/// verdict the procfs observer cannot see. Parsing is pure and tested on every
+/// host; the socket and the observer are Linux-only.
+pub mod nflog;
+
+/// Which uids are the machine's service accounts, for the filters and the
+/// routing table that follow the route-table owner. Pure but for one file read.
+pub mod service_account_uids;
 
 /// The `/proc` and desktop-entry scans both discoveries below classify.
 mod app_scan;
@@ -267,6 +285,8 @@ pub mod dns_config_change;
 pub mod network_change;
 // The IPv4 route table over rtnetlink — the mechanism behind `RouteTablePort`'s
 // route half.
+/// Per-user routing: a table per present user, picked by `ip rule uidrange`.
+pub mod policy_routing;
 pub mod route_table;
 
 /// Linux active-reachability backend behind

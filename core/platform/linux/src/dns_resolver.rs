@@ -186,6 +186,7 @@ impl LinuxDnsResolver {
     ) -> Result<DnsAnswer, UdpFailure> {
         let socket =
             UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| net_error(e, canonical))?;
+        nrr_platform_api::own_traffic::mark_own_socket(&socket);
         socket
             .set_read_timeout(Some(wait))
             .map_err(|e| net_error(e, canonical))?;
@@ -219,8 +220,18 @@ impl LinuxDnsResolver {
                 hostname: canonical.to_owned(),
             });
         };
-        let mut stream =
-            TcpStream::connect_timeout(&target, wait).map_err(|e| plain_net(e, canonical))?;
+        // Marked before the handshake, so it never leaves unmarked.
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(target),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .map_err(|e| plain_net(e, canonical))?;
+        nrr_platform_api::own_traffic::mark_own_socket(&socket);
+        socket
+            .connect_timeout(&target.into(), wait)
+            .map_err(|e| plain_net(e, canonical))?;
+        let mut stream = TcpStream::from(socket);
         // `None` here would mean "block forever", so an exhausted budget after
         // the connect ends the attempt instead.
         let Some(read_wait) = self.wait_left(deadline) else {

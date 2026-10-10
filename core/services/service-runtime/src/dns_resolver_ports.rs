@@ -339,6 +339,7 @@ impl DirectUdpUpstreamResolver {
             None => std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
                 .map_err(|e| ResolveError::Unavailable(format!("bind: {e}")))?,
         };
+        nrr_platform_api::own_traffic::mark_own_socket(&sock);
         // Connected, so the kernel drops every datagram that did not come from
         // the server we asked. An unconnected socket accepts an answer from
         // anyone who guesses the ephemeral port, and what it answers into is the

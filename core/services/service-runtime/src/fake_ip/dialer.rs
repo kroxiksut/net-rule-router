@@ -450,28 +450,21 @@ impl RelayDialer for SystemRelayDialer {
     fn connect_tcp(&self, target: &UpstreamTarget) -> Result<Box<dyn RelayStream>, RelayError> {
         let address = self.dial_address(target)?;
         let started = std::time::Instant::now();
-        let stream = match self.bind_address_for(target.route, &address)? {
-            None => TcpStream::connect_timeout(&address, UPSTREAM_CONNECT_TIMEOUT)
-                .map_err(|e| dial_failed(e, address, started.elapsed()))?,
-            Some(bind) => {
-                // `std` cannot bind before connect; `socket2` can.
-                let domain = if address.is_ipv4() {
-                    socket2::Domain::IPV4
-                } else {
-                    socket2::Domain::IPV6
-                };
-                let socket = socket2::Socket::new(
-                    domain,
-                    socket2::Type::STREAM,
-                    Some(socket2::Protocol::TCP),
-                )?;
-                socket.bind(&bind.into())?;
-                socket
-                    .connect_timeout(&address.into(), UPSTREAM_CONNECT_TIMEOUT)
-                    .map_err(|e| dial_failed(e, address, started.elapsed()))?;
-                socket.into()
-            }
-        };
+        let bind = self.bind_address_for(target.route, &address)?;
+        // `std` can neither bind nor mark a socket before connect; `socket2` can.
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(address),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        nrr_platform_api::own_traffic::mark_own_socket(&socket);
+        if let Some(bind) = bind {
+            socket.bind(&bind.into())?;
+        }
+        socket
+            .connect_timeout(&address.into(), UPSTREAM_CONNECT_TIMEOUT)
+            .map_err(|e| dial_failed(e, address, started.elapsed()))?;
+        let stream = TcpStream::from(socket);
         stream.set_nodelay(true).ok();
         // Both timeouts exist so worker threads stay joinable: the reader turns
         // a silent-forever upstream into periodic teardown checks, the writer
@@ -490,6 +483,7 @@ impl RelayDialer for SystemRelayDialer {
             (None, SocketAddr::V6(_)) => SocketAddr::new(IpAddr::from([0u16; 8]), 0),
         };
         let socket = UdpSocket::bind(bind)?;
+        nrr_platform_api::own_traffic::mark_own_socket(&socket);
         socket.connect(address)?;
         // A read timeout turns a blocking `recv` into a poll tick, so the reader
         // worker observes teardown between datagrams instead of parking forever.

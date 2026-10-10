@@ -8,6 +8,7 @@
     { "name": "a week", "input": { "kind": "external-address", "choice": "7d", "now": 0 }, "expected": { "scope": { "kind": "notice", "notice": "external-address" }, "until-unix-ms": 604800000 } },
     { "name": "a month", "input": { "kind": "local-networks", "choice": "30d", "now": 5 }, "expected": { "scope": { "kind": "notice", "notice": "local-networks" }, "until-unix-ms": 2592000005 } },
     { "name": "rules drift forever", "input": { "kind": "rules-drift", "choice": "forever", "now": 9 }, "expected": { "scope": { "kind": "notice", "notice": "rules-drift" } } },
+    { "name": "routes held for a day", "input": { "kind": "routes-held", "choice": "1d", "now": 0 }, "expected": { "scope": { "kind": "notice", "notice": "routes-held" }, "until-unix-ms": 86400000 } },
     { "name": "show is not a mute", "input": { "kind": "rules-drift", "choice": "show", "now": 9 }, "expected": null }
   ]
 }

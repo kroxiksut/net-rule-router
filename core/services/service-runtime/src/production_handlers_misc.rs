@@ -135,6 +135,7 @@ impl ProductionRulesSnapshotProvider {
         annotate_hosts_overrides(resp, &map);
         if let Some(store) = self.verdicts.as_ref() {
             if !principal.is_empty() {
+                resp.main_route_pending = store.pending(principal);
                 let now = std::time::Instant::now();
                 for row in &mut resp.rows {
                     if row.rule_type != "domain" && row.rule_type != "zone" {
@@ -196,6 +197,8 @@ impl ProductionRulesSnapshotProvider {
                 rows: Vec::new(),
                 supported_rule_types: rule_type_slugs(),
                 active_revision_id,
+                unrecognized: 0,
+                main_route_pending: 0,
             };
         };
 
@@ -211,7 +214,9 @@ impl ProductionRulesSnapshotProvider {
         // a client would send it back rewritten as a rule it understands.
         let readable = |d: &&nrr_shared::rules_json::RuleDto| !d.is_unrecognized();
         let mut rows: Vec<RuleRowEntry> = Vec::new();
+        let mut unrecognized = 0usize;
         if want_primary {
+            unrecognized += dto.primary.iter().filter(|d| d.is_unrecognized()).count();
             rows.extend(
                 dto.primary
                     .iter()
@@ -220,6 +225,7 @@ impl ProductionRulesSnapshotProvider {
             );
         }
         if want_secondary {
+            unrecognized += dto.secondary.iter().filter(|d| d.is_unrecognized()).count();
             rows.extend(
                 dto.secondary
                     .iter()
@@ -231,6 +237,8 @@ impl ProductionRulesSnapshotProvider {
             rows,
             supported_rule_types: rule_type_slugs(),
             active_revision_id,
+            unrecognized: u32::try_from(unrecognized).unwrap_or(u32::MAX),
+            main_route_pending: 0,
         }
     }
 }
@@ -241,6 +249,8 @@ impl RulesSnapshotProvider for ProductionRulesSnapshotProvider {
             rows: Vec::new(),
             supported_rule_types: rule_type_slugs(),
             active_revision_id: None,
+            unrecognized: 0,
+            main_route_pending: 0,
         };
         let mut resp = {
             let Ok(conn) = self.conn.lock() else {
@@ -269,6 +279,8 @@ impl RulesSnapshotProvider for ProductionRulesSnapshotProvider {
             rows: Vec::new(),
             supported_rule_types: rule_type_slugs(),
             active_revision_id: None,
+            unrecognized: 0,
+            main_route_pending: 0,
         };
         let mut resp = {
             let Ok(conn) = self.conn.lock() else {
@@ -1628,5 +1640,10 @@ mod rules_list_projection_tests {
         let listed = ProductionRulesSnapshotProvider::project(record(json), RulesRouteFilter::All);
         let ids: Vec<&str> = listed.rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["r-1"]);
+        // Hidden, but counted, so the screen can say they do nothing here.
+        assert_eq!(listed.unrecognized, 2);
+        let primary_only =
+            ProductionRulesSnapshotProvider::project(record(json), RulesRouteFilter::Primary);
+        assert_eq!(primary_only.unrecognized, 1);
     }
 }

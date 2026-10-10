@@ -1,4 +1,5 @@
-//! Linux mechanism for the IPv4 route table: rtnetlink.
+//! Linux mechanism for the route tables and the policy rules that pick one:
+//! rtnetlink.
 //!
 //! The kernel's own interface for reading and changing routes — the same one
 //! `ip route` drives. We already speak it in [`crate::network_change`] (an
@@ -251,13 +252,28 @@ struct DumpChunk {
     error: Option<i32>,
 }
 
-/// Walk one received datagram, collecting IPv4 routes.
+/// Walk one received datagram, collecting routes.
+fn parse_dump_chunk(datagram: &[u8]) -> DumpChunk {
+    let mut chunk = DumpChunk::default();
+    let (done, error) = walk_datagram(datagram, |message_type, body| {
+        if message_type == RTM_NEWROUTE {
+            if let Some(route) = parse_route_message(body) {
+                chunk.routes.push(route);
+            }
+        }
+    });
+    chunk.done = done;
+    chunk.error = error;
+    chunk
+}
+
+/// Hand every message of one received datagram to `on_message`; returns
+/// whether `NLMSG_DONE` was seen and the kernel's negative errno, if any.
 ///
 /// One `recv` can hold several messages back to back, each padded to a 4-byte
 /// boundary. A malformed or truncated length ends the walk rather than looping:
 /// a bad frame costs the rest of that datagram, not the thread.
-fn parse_dump_chunk(datagram: &[u8]) -> DumpChunk {
-    let mut chunk = DumpChunk::default();
+fn walk_datagram(datagram: &[u8], mut on_message: impl FnMut(u16, &[u8])) -> (bool, Option<i32>) {
     let mut offset = 0usize;
     while offset + NLMSG_HEADER_LEN <= datagram.len() {
         let length = u32::from_ne_bytes([
@@ -267,35 +283,26 @@ fn parse_dump_chunk(datagram: &[u8]) -> DumpChunk {
             datagram[offset + 3],
         ]) as usize;
         if length < NLMSG_HEADER_LEN || offset + length > datagram.len() {
-            return chunk;
+            return (false, None);
         }
         let message_type = u16::from_ne_bytes([datagram[offset + 4], datagram[offset + 5]]);
         let body = &datagram[offset + NLMSG_HEADER_LEN..offset + length];
         match message_type {
-            NLMSG_DONE => {
-                chunk.done = true;
-                return chunk;
-            }
+            NLMSG_DONE => return (true, None),
             NLMSG_ERROR => {
                 // `struct nlmsgerr` opens with the negative errno.
                 if body.len() >= 4 {
                     let code = i32::from_ne_bytes([body[0], body[1], body[2], body[3]]);
                     if code != 0 {
-                        chunk.error = Some(code);
-                        return chunk;
+                        return (false, Some(code));
                     }
                 }
             }
-            RTM_NEWROUTE => {
-                if let Some(route) = parse_route_message(body) {
-                    chunk.routes.push(route);
-                }
-            }
-            _ => {}
+            other => on_message(other, body),
         }
         offset += align(length);
     }
-    chunk
+    (false, None)
 }
 
 /// Parse one `RTM_NEWROUTE` body into a neutral [`RouteEntry`].
@@ -385,6 +392,138 @@ fn parse_route_message(body: &[u8]) -> Option<RouteEntry> {
     })
 }
 
+// ── FIB rules: the selectors of policy routing (pure) ────────────────────────
+
+const RTM_NEWRULE: u16 = 32;
+const RTM_DELRULE: u16 = 33;
+const RTM_GETRULE: u16 = 34;
+/// `struct fib_rule_hdr`: family, dst_len, src_len, tos, table, two reserved
+/// bytes, action, flags.
+const FIB_RULE_HDR_LEN: usize = 12;
+/// `FR_ACT_TO_TBL` — look up a table.
+const FR_ACT_TO_TBL: u8 = 1;
+/// `FIB_RULE_INVERT` in `fib_rule_hdr.flags`.
+const FIB_RULE_INVERT: u32 = 0x2;
+const FRA_PRIORITY: u16 = 6;
+const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
+const FRA_TABLE: u16 = 15;
+const FRA_UID_RANGE: u16 = 20;
+/// Attributes that narrow a rule beyond a uid (addresses, interfaces, marks,
+/// ports, a goto); ours carry none of them.
+const FRA_NARROWING: [u16; 14] = [1, 2, 3, 4, 10, 11, 12, 13, 16, 17, 19, 22, 23, 24];
+
+/// One policy-routing rule as the kernel holds it: in its family, traffic of
+/// `uid_range` looks up `table` at `priority`, ignoring answers no longer than
+/// `suppress_prefixlen`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct FibRule {
+    pub ipv6: bool,
+    pub priority: u32,
+    pub table: u32,
+    /// `None` selects every user — never a rule we write.
+    pub uid_range: Option<(u32, u32)>,
+    pub suppress_prefixlen: Option<u8>,
+    /// The rule also matches on something else (a mark, an interface, an
+    /// address, an inversion), so it is somebody else's whatever its priority.
+    pub narrowed: bool,
+}
+
+/// Encode `RTM_NEWRULE` / `RTM_DELRULE` for one rule.
+fn encode_rule_mutation(message_type: u16, rule: &FibRule, sequence: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(64);
+    body.push(if rule.ipv6 { AF_INET6_U8 } else { AF_INET_U8 });
+    body.extend_from_slice(&[0, 0, 0]); // dst_len, src_len, tos
+                                        // As for routes: a table beyond a byte travels in FRA_TABLE alone.
+    body.push(u8::try_from(rule.table).unwrap_or(0));
+    body.extend_from_slice(&[0, 0]);
+    body.push(FR_ACT_TO_TBL);
+    body.extend_from_slice(&0u32.to_ne_bytes());
+    debug_assert_eq!(body.len(), FIB_RULE_HDR_LEN);
+    push_attr(&mut body, FRA_PRIORITY, &rule.priority.to_ne_bytes());
+    push_attr(&mut body, FRA_TABLE, &rule.table.to_ne_bytes());
+    if let Some(length) = rule.suppress_prefixlen {
+        push_attr(
+            &mut body,
+            FRA_SUPPRESS_PREFIXLEN,
+            &u32::from(length).to_ne_bytes(),
+        );
+    }
+    if let Some((first, last)) = rule.uid_range {
+        let mut range = [0u8; 8];
+        range[..4].copy_from_slice(&first.to_ne_bytes());
+        range[4..].copy_from_slice(&last.to_ne_bytes());
+        push_attr(&mut body, FRA_UID_RANGE, &range);
+    }
+    let flags = match message_type {
+        RTM_NEWRULE => NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        _ => NLM_F_REQUEST | NLM_F_ACK,
+    };
+    frame(message_type, flags, sequence, &body)
+}
+
+/// Encode the `RTM_GETRULE` dump request; `AF_UNSPEC` returns both families.
+fn encode_rule_dump(sequence: u32) -> Vec<u8> {
+    frame(
+        RTM_GETRULE,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        sequence,
+        &[0u8; FIB_RULE_HDR_LEN],
+    )
+}
+
+/// Parse one `RTM_NEWRULE` body. `None` for a family we do not route or a
+/// rule that does not look up a table.
+fn parse_rule_message(body: &[u8]) -> Option<FibRule> {
+    if body.len() < FIB_RULE_HDR_LEN {
+        return None;
+    }
+    let ipv6 = match body[0] {
+        AF_INET_U8 => false,
+        AF_INET6_U8 => true,
+        _ => return None,
+    };
+    if body[7] != FR_ACT_TO_TBL {
+        return None;
+    }
+    let flags = u32::from_ne_bytes([body[8], body[9], body[10], body[11]]);
+    let mut rule = FibRule {
+        ipv6,
+        priority: 0,
+        table: u32::from(body[4]),
+        uid_range: None,
+        suppress_prefixlen: None,
+        narrowed: body[1..4].iter().any(|b| *b != 0) || flags & FIB_RULE_INVERT != 0,
+    };
+    let word = |p: &[u8]| <[u8; 4]>::try_from(p).ok().map(u32::from_ne_bytes);
+    let mut offset = FIB_RULE_HDR_LEN;
+    while offset + RTATTR_HEADER_LEN <= body.len() {
+        let len = u16::from_ne_bytes([body[offset], body[offset + 1]]) as usize;
+        let attr_type = u16::from_ne_bytes([body[offset + 2], body[offset + 3]]);
+        if len < RTATTR_HEADER_LEN || offset + len > body.len() {
+            break;
+        }
+        let payload = &body[offset + RTATTR_HEADER_LEN..offset + len];
+        match attr_type {
+            FRA_PRIORITY => rule.priority = word(payload).unwrap_or(rule.priority),
+            FRA_TABLE => rule.table = word(payload).unwrap_or(rule.table),
+            // The kernel reports an unset suppression as -1.
+            FRA_SUPPRESS_PREFIXLEN => {
+                rule.suppress_prefixlen = word(payload).and_then(|v| u8::try_from(v).ok());
+            }
+            FRA_UID_RANGE if payload.len() == 8 => {
+                rule.uid_range = Some((
+                    u32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]),
+                    u32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]),
+                ));
+            }
+            other if FRA_NARROWING.contains(&other) => rule.narrowed = true,
+            _ => {}
+        }
+        offset += align(len);
+    }
+    Some(rule)
+}
+
 // ── Socket round-trip (Linux only) ───────────────────────────────────────────
 
 /// Read the IPv4 route table.
@@ -432,6 +571,44 @@ pub fn delete_ipv4_route(entry: &RouteEntry) -> Result<(), PlatformError> {
         socket.sequence,
     )?)?;
     socket.expect_ack("delete an IPv4 route")
+}
+
+/// Read every policy-routing rule, both families.
+#[cfg(target_os = "linux")]
+pub(crate) fn get_fib_rules() -> Result<Vec<FibRule>, PlatformError> {
+    let socket = NetlinkRequestSocket::open()?;
+    socket.send(&encode_rule_dump(socket.sequence))?;
+    let mut rules = Vec::new();
+    loop {
+        let datagram = socket.receive()?;
+        let (done, error) = walk_datagram(&datagram, |message_type, body| {
+            if message_type == RTM_NEWRULE {
+                rules.extend(parse_rule_message(body));
+            }
+        });
+        if let Some(code) = error {
+            return Err(errno_error("dump the policy routing rules", code));
+        }
+        if done {
+            return Ok(rules);
+        }
+    }
+}
+
+/// Add one policy-routing rule.
+#[cfg(target_os = "linux")]
+pub(crate) fn add_fib_rule(rule: &FibRule) -> Result<(), PlatformError> {
+    let socket = NetlinkRequestSocket::open()?;
+    socket.send(&encode_rule_mutation(RTM_NEWRULE, rule, socket.sequence))?;
+    socket.expect_ack("add a policy routing rule")
+}
+
+/// Delete one policy-routing rule; `ENOENT` when it is already gone.
+#[cfg(target_os = "linux")]
+pub(crate) fn delete_fib_rule(rule: &FibRule) -> Result<(), PlatformError> {
+    let socket = NetlinkRequestSocket::open()?;
+    socket.send(&encode_rule_mutation(RTM_DELRULE, rule, socket.sequence))?;
+    socket.expect_ack("delete a policy routing rule")
 }
 
 /// Wrap a kernel errno in the neutral error the port declares.
@@ -792,6 +969,137 @@ mod tests {
         body[7] = RTN_UNICAST;
         push_attr(&mut body, RTA_DST, &[10, 0, 0, 0]);
         assert!(parse_route_message(&body).is_none());
+    }
+
+    fn rule_body(rule: &FibRule) -> Vec<u8> {
+        encode_rule_mutation(RTM_NEWRULE, rule, 1)[NLMSG_HEADER_LEN..].to_vec()
+    }
+
+    fn uid_rule(suppress: Option<u8>) -> FibRule {
+        FibRule {
+            ipv6: false,
+            priority: 30_100,
+            table: 0x8000_03E8,
+            uid_range: Some((1000, 1000)),
+            suppress_prefixlen: suppress,
+            narrowed: false,
+        }
+    }
+
+    /// Every field the kernel matches a rule by survives the wire, the wide
+    /// table included.
+    #[test]
+    fn an_encoded_uid_rule_parses_back_to_the_same_rule() {
+        for rule in [
+            uid_rule(None),
+            uid_rule(Some(2)),
+            FibRule {
+                ipv6: true,
+                ..uid_rule(None)
+            },
+            FibRule {
+                table: 254,
+                ..uid_rule(Some(1))
+            },
+        ] {
+            let msg = encode_rule_mutation(RTM_NEWRULE, &rule, 1);
+            let declared = u32::from_ne_bytes([msg[0], msg[1], msg[2], msg[3]]) as usize;
+            assert_eq!(declared, msg.len());
+            assert_eq!(u16::from_ne_bytes([msg[4], msg[5]]), RTM_NEWRULE);
+            let parsed = parse_rule_message(&msg[NLMSG_HEADER_LEN..]).expect("parse");
+            assert_eq!(parsed, rule);
+        }
+    }
+
+    /// The bytes a kernel reads: the header, then priority, table, suppression
+    /// and the uid range in that order, each a padded `rtattr`.
+    #[test]
+    fn a_uid_rule_has_the_layout_the_kernel_reads() {
+        let msg = encode_rule_mutation(RTM_NEWRULE, &uid_rule(Some(2)), 7);
+        let flags = u16::from_ne_bytes([msg[6], msg[7]]);
+        assert_eq!(flags, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+        assert_eq!(u32::from_ne_bytes([msg[8], msg[9], msg[10], msg[11]]), 7);
+        let body = &msg[NLMSG_HEADER_LEN..];
+        assert_eq!(&body[..8], &[AF_INET_U8, 0, 0, 0, 0, 0, 0, FR_ACT_TO_TBL]);
+        assert_eq!(&body[8..12], &[0, 0, 0, 0]);
+        let range = [1000u32.to_ne_bytes(), 1000u32.to_ne_bytes()].concat();
+        let mut want = Vec::new();
+        for (kind, payload) in [
+            (FRA_PRIORITY, 30_100u32.to_ne_bytes().to_vec()),
+            (FRA_TABLE, 0x8000_03E8u32.to_ne_bytes().to_vec()),
+            (FRA_SUPPRESS_PREFIXLEN, 2u32.to_ne_bytes().to_vec()),
+            (FRA_UID_RANGE, range),
+        ] {
+            want.extend_from_slice(&((RTATTR_HEADER_LEN + payload.len()) as u16).to_ne_bytes());
+            want.extend_from_slice(&kind.to_ne_bytes());
+            want.extend_from_slice(&payload);
+        }
+        assert_eq!(&body[FIB_RULE_HDR_LEN..], want.as_slice());
+    }
+
+    /// A delete asks for nothing to be created.
+    #[test]
+    fn a_rule_delete_carries_no_create_flags() {
+        let msg = encode_rule_mutation(RTM_DELRULE, &uid_rule(None), 1);
+        assert_eq!(u16::from_ne_bytes([msg[4], msg[5]]), RTM_DELRULE);
+        assert_eq!(
+            u16::from_ne_bytes([msg[6], msg[7]]),
+            NLM_F_REQUEST | NLM_F_ACK
+        );
+    }
+
+    /// The kernel dumps an unset suppression as -1; that is "none", not 255.
+    #[test]
+    fn an_unset_suppression_reads_as_none() {
+        let mut body = rule_body(&uid_rule(None));
+        push_attr(&mut body, FRA_SUPPRESS_PREFIXLEN, &u32::MAX.to_ne_bytes());
+        assert_eq!(
+            parse_rule_message(&body).expect("parse").suppress_prefixlen,
+            None
+        );
+    }
+
+    /// A rule that also matches a mark or an interface is not a uid selector,
+    /// whatever its priority says.
+    #[test]
+    fn a_rule_with_another_selector_reads_as_narrowed() {
+        let mut body = rule_body(&uid_rule(None));
+        push_attr(&mut body, 10, &51820u32.to_ne_bytes()); // FRA_FWMARK
+        assert!(parse_rule_message(&body).expect("parse").narrowed);
+
+        let mut inverted = rule_body(&uid_rule(None));
+        inverted[8..12].copy_from_slice(&FIB_RULE_INVERT.to_ne_bytes());
+        assert!(parse_rule_message(&inverted).expect("parse").narrowed);
+    }
+
+    /// Rules of other actions (`unreachable`, `goto`) are not table lookups.
+    #[test]
+    fn a_rule_that_looks_up_nothing_is_skipped() {
+        let mut body = rule_body(&uid_rule(None));
+        body[7] = 7; // FR_ACT_UNREACHABLE
+        assert!(parse_rule_message(&body).is_none());
+    }
+
+    /// A rule dump shares the walker with routes: every message of a datagram,
+    /// up to `NLMSG_DONE`.
+    #[test]
+    fn a_rule_dump_datagram_yields_every_rule() {
+        let mut datagram = encode_rule_mutation(RTM_NEWRULE, &uid_rule(None), 1);
+        datagram.extend(encode_rule_mutation(RTM_NEWRULE, &uid_rule(Some(1)), 1));
+        datagram.extend(frame(NLMSG_DONE, 0, 1, &[]));
+        let mut rules = Vec::new();
+        let (done, error) = walk_datagram(&datagram, |kind, body| {
+            if kind == RTM_NEWRULE {
+                rules.extend(parse_rule_message(body));
+            }
+        });
+        assert!(done);
+        assert_eq!(error, None);
+        assert_eq!(rules, vec![uid_rule(None), uid_rule(Some(1))]);
+        assert_eq!(
+            encode_rule_dump(1).len(),
+            NLMSG_HEADER_LEN + FIB_RULE_HDR_LEN
+        );
     }
 
     #[cfg(target_os = "linux")]

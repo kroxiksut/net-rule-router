@@ -1,5 +1,6 @@
 //! `cleanup`: give the machine back what this daemon put on it — the DNS
-//! redirect, the nftables table, the routes it owns — once the process that
+//! redirect, the nftables table, the per-user routing rules and the routes it
+//! owns — once the process that
 //! would have removed them is gone. `nrr-cli reset-network` and
 //! `scripts/reset-network.sh` both run this, so there is one undo, not three.
 //!
@@ -32,6 +33,8 @@ pub(crate) trait CleanupHost {
     fn restore_dns(&self) -> Result<(), String>;
     /// `Ok(false)` when there is no `nft` to ask, and so no table either.
     fn delete_table(&self) -> Result<bool, String>;
+    /// How many per-user routing rules went.
+    fn sweep_rules(&self) -> Result<usize, String>;
     /// How many routes went.
     fn sweep_routes(&self) -> Result<usize, String>;
 }
@@ -47,6 +50,7 @@ pub(crate) enum Outcome {
 pub(crate) struct Report {
     pub dns: Result<(), String>,
     pub table: Result<bool, String>,
+    pub rules: Result<usize, String>,
     pub routes: Result<usize, String>,
     /// Why systemd could not say whether the unit runs, when it could not.
     pub unit_unknown: Option<String>,
@@ -54,7 +58,7 @@ pub(crate) struct Report {
 
 impl Report {
     fn complete(&self) -> bool {
-        self.dns.is_ok() && self.table.is_ok() && self.routes.is_ok()
+        self.dns.is_ok() && self.table.is_ok() && self.rules.is_ok() && self.routes.is_ok()
     }
 }
 
@@ -74,10 +78,13 @@ pub(crate) fn cleanup(host: &dyn CleanupHost) -> Outcome {
     // DNS first: a redirect to a listener that is gone breaks every name.
     let dns = host.restore_dns();
     let table = host.delete_table();
+    // Rules before routes: without a rule pointing at it a table is inert.
+    let rules = host.sweep_rules();
     let routes = host.sweep_routes();
     Outcome::Ran(Report {
         dns,
         table,
+        rules,
         routes,
         unit_unknown,
     })
@@ -152,6 +159,18 @@ pub(crate) fn render(outcome: &Outcome) -> (String, String) {
                     let _ = writeln!(err, "cleanup: nft table {table} could not be deleted: {e}");
                 }
             }
+            match &report.rules {
+                Ok(n) => {
+                    let _ = writeln!(out, "  routing rules:   {n} removed");
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "  routing rules:   NOT removed");
+                    let _ = writeln!(
+                        err,
+                        "cleanup: per-user routing rules could not be removed: {e}"
+                    );
+                }
+            }
             match &report.routes {
                 Ok(n) => {
                     let _ = writeln!(out, "  routes removed:  {n}");
@@ -161,7 +180,7 @@ pub(crate) fn render(outcome: &Outcome) -> (String, String) {
                     let _ = writeln!(err, "cleanup: route sweep failed: {e}");
                 }
             }
-            if report.table.is_err() || report.routes.is_err() {
+            if report.table.is_err() || report.rules.is_err() || report.routes.is_err() {
                 let _ = writeln!(
                     err,
                     "A reboot clears the packet filters and routes that are left."
@@ -206,10 +225,19 @@ impl CleanupHost for SystemHost {
         }
     }
 
+    fn sweep_rules(&self) -> Result<usize, String> {
+        nrr_platform_linux::policy_routing::sweep_selectors().map_err(|e| e.to_string())
+    }
+
+    /// The main table's rows by our signature, and every row of a per-user
+    /// table: only we write those.
     fn sweep_routes(&self) -> Result<usize, String> {
-        nrr_service_runtime::route_reconciler::sweep_owned_routes(Arc::new(
-            nrr_platform_linux::LinuxApi,
-        ))
+        use nrr_platform_api::{RouteEntry, RouteTableRef};
+        use nrr_platform_linux::policy_routing::is_our_table;
+        nrr_service_runtime::route_reconciler::sweep_owned_routes_with(
+            Arc::new(nrr_platform_linux::LinuxApi),
+            &|r: &RouteEntry| matches!(r.table, RouteTableRef::Tagged(n) if is_our_table(n)),
+        )
         .map_err(|e| e.to_string())
     }
 }
@@ -293,6 +321,7 @@ mod tests {
         root: bool,
         files: DnsFiles,
         table_present: Cell<bool>,
+        rules: Cell<usize>,
         routes: Cell<usize>,
         calls: RefCell<Vec<&'static str>>,
     }
@@ -304,6 +333,7 @@ mod tests {
                 root: true,
                 files,
                 table_present: Cell::new(false),
+                rules: Cell::new(0),
                 routes: Cell::new(0),
                 calls: RefCell::new(Vec::new()),
             }
@@ -325,6 +355,10 @@ mod tests {
             self.calls.borrow_mut().push("table");
             self.table_present.set(false);
             Ok(true)
+        }
+        fn sweep_rules(&self) -> Result<usize, String> {
+            self.calls.borrow_mut().push("rules");
+            Ok(self.rules.replace(0))
         }
         fn sweep_routes(&self) -> Result<usize, String> {
             self.calls.borrow_mut().push("routes");
@@ -368,11 +402,15 @@ mod tests {
         );
         let host = FakeHost::new(files.clone());
         host.table_present.set(true);
+        host.rules.set(3);
         host.routes.set(2);
 
         let outcome = cleanup(&host);
 
-        assert_eq!(*host.calls.borrow(), vec!["dns", "table", "routes"]);
+        assert_eq!(
+            *host.calls.borrow(),
+            vec!["dns", "table", "rules", "routes"]
+        );
         assert_eq!(
             std::fs::read_to_string(&files.resolv_conf).unwrap(),
             SYSTEM_RESOLV_CONF
@@ -381,6 +419,7 @@ mod tests {
         let Outcome::Ran(report) = &outcome else {
             panic!("expected a run, got {outcome:?}");
         };
+        assert_eq!(report.rules, Ok(3));
         assert_eq!(report.routes, Ok(2));
         assert_eq!(exit_code(&outcome), 0);
     }
@@ -449,6 +488,9 @@ mod tests {
                 self.0.calls.borrow_mut().push("table");
                 Err("the kernel refused".to_string())
             }
+            fn sweep_rules(&self) -> Result<usize, String> {
+                self.0.sweep_rules()
+            }
             fn sweep_routes(&self) -> Result<usize, String> {
                 self.0.sweep_routes()
             }
@@ -458,7 +500,10 @@ mod tests {
 
         let outcome = cleanup(&host);
 
-        assert_eq!(*host.0.calls.borrow(), vec!["dns", "table", "routes"]);
+        assert_eq!(
+            *host.0.calls.borrow(),
+            vec!["dns", "table", "rules", "routes"]
+        );
         assert_eq!(exit_code(&outcome), EXIT_FAILED);
         assert!(render(&outcome).1.contains("the kernel refused"));
     }

@@ -222,7 +222,8 @@ impl PlatformProfile {
                 // start, whatever happens to the rest of the stored row.
                 verbose_logging: true,
                 local_network_exceptions: false,
-                block_notices: false,
+                // Fed by the drop reports our nftables rules send back.
+                block_notices: true,
                 // The coordinator signs with the daemon's key, and the restart
                 // is authorised with it as on Windows.
                 audit_chain_restart: true,
@@ -344,9 +345,15 @@ mod tests {
         ] {
             assert!(!supports.service_stability_config);
             assert!(!supports.local_network_exceptions);
-            assert!(!supports.block_notices);
         }
+        assert!(!PlatformProfile::macos().supports.block_notices);
         assert!(!PlatformProfile::macos().supports.audit_chain_restart);
+    }
+
+    /// The Linux daemon reads its own drops back, so notices have a source.
+    #[test]
+    fn block_notices_are_offered_where_drops_are_observed() {
+        assert!(PlatformProfile::linux().supports.block_notices);
     }
 
     /// Both services hold the signing key the restart is authorised with.

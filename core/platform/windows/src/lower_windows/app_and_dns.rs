@@ -22,7 +22,7 @@ pub fn lower_doh_dot_block(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
         if flow.precedence.class != PrecedenceClass::DohBlock || flow.verdict != Verdict::Block {
             continue;
         }
-        let user_sid = flow.principal.0.as_ref().map(|p| p.as_stored().to_string());
+        let user_sid = user_sid_of(&flow.principal);
         let proto = flow.flow.protocol.map(l4proto_to_ip_number);
         let ip = match flow.flow.dst {
             DstMatch::HostV4(ip) => IpAddr::V4(ip),
