@@ -416,3 +416,87 @@ fn filters_span_ale_and_packet_layers() {
         .iter()
         .any(|f| f.layer == WfpLayerKey::OutboundTransportV4));
 }
+
+// ── Programs take all their addresses ──────────────────────────────────────
+
+/// With the setting on the app takes main-named addresses too, so its block
+/// must outrank every primary rule permit, and still lose to its own permit
+/// while the tunnel is up.
+#[test]
+fn under_the_takeover_the_app_block_outranks_the_primary_rule_permits() {
+    use crate::wfp_bands::{BAND_WIDTH, BASE_PRIMARY};
+    let apps = ["helper.exe".to_string(), "other.exe".to_string()];
+    let out = app_kill_switch_filters_for("S", &apps, LUID, KillSwitchProtocols::ALL, true);
+    let permits: Vec<&WfpFilterSpec> = out
+        .iter()
+        .filter(|f| f.action == WfpAction::Permit)
+        .collect();
+    let blocks: Vec<&WfpFilterSpec> = out
+        .iter()
+        .filter(|f| f.action == WfpAction::Block)
+        .collect();
+    assert_eq!(blocks.len(), 2);
+    for block in &blocks {
+        assert!(
+            block.weight >= BASE_PRIMARY + BAND_WIDTH,
+            "the app block must outrank every primary rule permit ({:#x})",
+            block.weight
+        );
+        let own_permit = permits
+            .iter()
+            .find(|p| p.app_pattern == block.app_pattern)
+            .expect("each app has its permit");
+        assert!(
+            own_permit.weight > block.weight,
+            "the app's own egress-conditional permit must still win while the tunnel is up"
+        );
+    }
+    // The fail-closed twin keeps the same promise with the tunnel unresolved.
+    let fc = fail_closed_block_apps_for("S", &apps, KillSwitchProtocols::ALL, true);
+    assert!(fc.iter().all(|f| f.weight >= BASE_PRIMARY + BAND_WIDTH));
+}
+
+/// Off is today's behaviour, filter for filter.
+#[test]
+fn without_the_takeover_the_app_pair_is_unchanged() {
+    let apps = ["helper.exe".to_string()];
+    assert_eq!(
+        app_kill_switch_filters_for("S", &apps, LUID, KillSwitchProtocols::ALL, false),
+        app_kill_switch_filters("S", &apps, LUID, KillSwitchProtocols::ALL),
+    );
+    assert_eq!(
+        fail_closed_block_apps_for("S", &apps, KillSwitchProtocols::ALL, false),
+        fail_closed_block_apps("S", &apps, KillSwitchProtocols::ALL),
+    );
+    let block = app_kill_switch_filters("S", &apps, LUID, KillSwitchProtocols::ALL)
+        .into_iter()
+        .find(|f| f.action == WfpAction::Block)
+        .expect("the app block exists");
+    assert!(block.weight >= APP_KILLSWITCH_BLOCK_BASE && block.weight < RULE_PRIMARY_BAND);
+}
+
+/// Switching the setting moves the block to another weight, and a WFP filter
+/// is immutable by key: the id has to change with it.
+#[test]
+fn the_takeover_block_has_its_own_id() {
+    let apps = ["helper.exe".to_string()];
+    let id_of = |on: bool| {
+        app_kill_switch_filters_for("S", &apps, LUID, KillSwitchProtocols::ALL, on)
+            .into_iter()
+            .find(|f| f.action == WfpAction::Block)
+            .expect("the app block exists")
+            .id
+    };
+    assert_ne!(id_of(true), id_of(false));
+}
+
+/// Past the window the block keeps the sub-primary weight rather than climb
+/// into the app permits above it.
+#[test]
+fn an_app_past_the_takeover_window_keeps_the_sub_primary_weight() {
+    use crate::wfp_bands::{APP_TAKEOVER_MAX_APPS, KILLSWITCH_PERMIT_BASE};
+    let last_in = app_block_band(APP_TAKEOVER_MAX_APPS as u64 - 1, true).0;
+    assert!(last_in < KILLSWITCH_PERMIT_BASE);
+    let past = app_block_band(APP_TAKEOVER_MAX_APPS as u64, true);
+    assert_eq!(past, app_block_band(APP_TAKEOVER_MAX_APPS as u64, false));
+}

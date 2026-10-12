@@ -5,7 +5,7 @@
 //! refresh; the client fills it from the user's bindings before asking
 //! [`held_other_role`] or [`offered_for_role`].
 
-use nrr_shared::ipc_payloads::InterfaceRowDto;
+use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
 use nrr_shared::product_identity::TUN_ADAPTER_NAME;
 
 use crate::{js, Route};
@@ -50,6 +50,17 @@ impl RoleHint {
             Self::LooksVpn => "looks-vpn",
         }
     }
+}
+
+/// The enumerations that are this machine's (`INTERFACES_LIVE_SOURCES`). Any
+/// other spelling, an unknown one included, is placeholder rows.
+pub const LIVE_SOURCES: [&str; 2] = ["windows-live", "linux-live"];
+
+/// Whether rows reported with `data_source` name this machine's adapters
+/// (`interfacesSourceIsLive`). Every role assignment is gated on it: a role
+/// bound to a placeholder row names no adapter here.
+pub fn rows_are_live(data_source: &str) -> bool {
+    LIVE_SOURCES.contains(&data_source)
 }
 
 /// Confidence a two-signal heuristic hit scores; a single weak signal stays
@@ -148,4 +159,18 @@ pub fn held_other_role(row: &InterfaceRowDto, role: Route) -> Option<&str> {
 /// and not already holding the other route.
 pub fn offered_for_role(row: &InterfaceRowDto, role: Route) -> bool {
     !is_own_fake_ip_tun(row) && held_other_role(row, role).is_none()
+}
+
+/// The row `binding` names (`boundWireRowIndex`): its current or an earlier id
+/// against the row's id or OS adapter name, ASCII case-insensitive. The first
+/// match wins. This is how a client fills the `selected_role` the service
+/// leaves empty.
+pub fn bound_row_index(rows: &[InterfaceRowDto], binding: &RouteBindingDto) -> Option<usize> {
+    let names = |id: &str| {
+        std::iter::once(binding.stable_id.as_str())
+            .chain(binding.known_stable_ids.iter().map(String::as_str))
+            .any(|known| !known.is_empty() && known.eq_ignore_ascii_case(id))
+    };
+    rows.iter()
+        .position(|row| names(&row.persistent_id) || names(&row.adapter_name))
 }

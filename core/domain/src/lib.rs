@@ -159,59 +159,29 @@ impl fmt::Display for RuleId {
 
 /// Address-based match condition for a routing rule.
 ///
-/// # Priority tiers (runtime evaluation order, default)
+/// Runtime order, narrowest first: `ExactFqdn`, `SuffixDomain`, `ExactIp`,
+/// `Subnet`/`IpRange` (longer prefix first), `Zone`; see
+/// [`RuleEvaluationOrder`]. Longest label wins within a name tier.
 ///
-/// 1. `ExactFqdn` — exact hostname match; highest priority.
-/// 2. `SuffixDomain` — subdomain wildcard; fires after ExactFqdn tier fails.
-/// 3. `Zone` and `ExactIp` — evaluated in user-configurable order (default:
-///    `ExactIp` before `Zone`; setting: `zone_priority_over_ip`).
+/// `SuffixDomain(label)` matches the apex `label` too; an `ExactFqdn` rule on
+/// the apex is a higher tier, so "subdomains here, apex elsewhere" is written
+/// explicitly. `Zone(name)` matches hostnames ending with `.{name}` and needs a
+/// hostname: address-only traffic never matches a zone.
 ///
-/// # Domain semantics
-///
-/// - `ExactFqdn(label)` matches **only** the exact hostname. Priority tier 1.
-///   In the rules file: `example.com` (no `*.` prefix).
-///
-/// - `SuffixDomain(label)` matches `label` itself **and** any subdomain of it
-///   at any depth. Priority tier 2.
-///   In the rules file: `*.example.com` (stored without the `*.` prefix).
-///   Display renders as `*.label`.
-///   Apex coverage loses no expressiveness — an `ExactFqdn` rule
-///   on the apex is tier 1 and still wins, so "subdomains here, apex elsewhere"
-///   is written explicitly instead of arising silently.
-///
-/// Longest label wins within each tier (e.g. `mail.corp.example.com` beats
-/// `corp.example.com` among ExactFqdn rules; ExactFqdn tier always precedes
-/// SuffixDomain tier for the same hostname).
-///
-/// # Zone semantics
-///
-/// `Zone(name)` matches all traffic whose destination hostname ends with
-/// `.{name}` — e.g. zone `intra` matches `server.corp.intra`. Zone applies
-/// only when a hostname is available; IP-only traffic bypasses Zone in Free.
-/// IP subnet zones are not supported.
-///
-/// # ExactIp semantics
-///
-/// `ExactIp(text)` matches one exact IPv4 or IPv6 address. It holds the value
-/// as written in the `--- IP` section; validation parses it, and a value that
-/// is not an address (a subnet, a range, a name) is refused there.
-///
-/// `Subnet(text)` (`--- CIDR`) and `IpRange(text)` (`--- Ranges`) hold their
-/// values the same way. Section is type: a subnet written under `--- IP` is a
-/// line error, never silently re-filed.
+/// `ExactIp`, `Subnet` (`--- CIDR`) and `IpRange` (`--- Ranges`) hold their
+/// values as written; validation parses them. Section is type: a subnet under
+/// `--- IP` is a line error, never silently re-filed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AddressMatch {
-    /// Matches the exact FQDN only (runtime priority tier 1 — highest).
+    /// Matches the exact FQDN only.
     /// File syntax: `example.com`
     ExactFqdn(String),
-    /// Matches the apex itself and any subdomain at any depth (runtime priority tier 2).
+    /// Matches the apex itself and any subdomain at any depth.
     /// File syntax: `*.example.com` — stored without the `*.` prefix.
     SuffixDomain(String),
-    /// Matches all hosts in a TLD or internal domain zone (runtime priority tier 3).
-    /// Zone name is the suffix label — e.g. `ru`, `com`, `intra`, `corp`.
-    /// Runtime priority vs `ExactIp` is user-configurable (default: `ExactIp` wins).
+    /// Matches all hosts in a TLD or internal domain zone, e.g. `ru`, `intra`.
     Zone(String),
-    /// Matches one exact address (runtime priority tier 3 by default; configurable vs Zone).
+    /// Matches one exact address.
     ExactIp(String),
     /// Matches every address of a network, written `a.b.c.d/len`.
     Subnet(String),
@@ -402,50 +372,21 @@ impl RuleBook {
     }
 }
 
-/// Documents the two-pass rule evaluation algorithm used by the routing engine.
+/// The rule evaluation order the engine runs, narrowest first. Carries no
+/// runtime behaviour; `decision_rules_matching::match_rules` is the code.
 ///
-/// This type carries no runtime behaviour. It makes the evaluation order
-/// explicit and discoverable at the domain level.
+/// 0. A literal-IP Block on the observed address vetoes every route on it.
+/// 1. `ExactFqdn`; 2. `SuffixDomain`, longest base domain first.
+/// 3. `ExactIp`; 4. `Subnet`/`IpRange`, longer prefix first; 5. `Zone`,
+///    longer zone first. `ZonePriorityPolicy` can move zones above addresses;
+///    nothing in the product does.
+/// 6. Address-less application rules, exact name before glob.
+/// 7. The behavior mode's default route.
 ///
-/// # Pass 1 — Address rules
-///
-/// All enabled rules whose `address_match` is `Some` are evaluated against the
-/// traffic destination in descending priority:
-///
-/// 1. **ExactFqdn** — fires only on an exact hostname match. Longest label wins
-///    within this tier (`mail.corp.example.com` beats `corp.example.com`). An
-///    optional `app_match` is an AND filter.
-///
-/// 2. **SuffixDomain** — fires if the hostname is the rule's base domain itself
-///    or a subdomain of it at any depth. Longest base domain wins within this
-///    tier, including when the longer suffix matched through its own apex.
-///    ExactFqdn tier always precedes SuffixDomain for the same hostname. An
-///    optional `app_match` is an AND filter.
-///
-/// 3. **Zone and ExactIp** — evaluated in user-configurable order (default:
-///    `ExactIp` before `Zone`; controlled by `zone_priority_over_ip` setting).
-///    Zone fires if the hostname ends with `.{zone_name}`; applies only when a
-///    hostname is available (IP-only traffic skips Zone in Free). IP subnet zones
-///    are not supported. An optional `app_match` is an AND filter.
-///
-/// If Pass 1 finds a match, evaluation stops and the matched route is used.
-///
-/// # Pass 2 — Application-only rules
-///
-/// If Pass 1 produces no match, all enabled rules whose `address_match` is
-/// `None` (app-only rules) are evaluated against the traffic source process.
-/// First match wins in display/insertion order.
-///
-/// # Default route
-///
-/// If neither pass matches, `ActiveConfiguration.behavior_mode` decides the
-/// route: `PreferPrimary`, `PreferSecondaryWhenAvailable`, or
-/// `StrictSecondaryFailClosed`.
-///
-/// # Per-route evaluation
-///
-/// Both passes are applied to each [`RouteRuleSet`] independently. The rule
-/// that fires first (across primary and secondary sets) determines the route.
+/// Both route sets are evaluated together. An app filter on an address rule is
+/// an AND. Ties within a tier: Block, then the main route, then the smallest
+/// rule id. `tests/priority_order_in_docs.rs` holds the public docs to this
+/// order.
 pub struct RuleEvaluationOrder;
 
 /// The single active routing configuration for the Free edition.

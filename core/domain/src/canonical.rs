@@ -109,19 +109,18 @@ pub struct CanonicalAppMatch {
 /// (punycode-encoded per IDNA2008 for internationalized names).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CanonicalAddressMatch {
-    /// Matches the exact FQDN only (runtime priority tier 1 — highest).
+    /// Matches the exact FQDN only.
     /// Normalized: lowercase, no trailing dot, punycode for IDN.
     ExactFqdn(String),
-    /// Matches the apex `label` itself and any subdomain of it at any depth
-    /// (runtime priority tier 2). Stored without `*.` prefix; display renders
-    /// as `*.label`.
+    /// Matches the apex `label` itself and any subdomain of it at any depth.
+    /// Stored without `*.` prefix; display renders as `*.label`.
     ///
     /// Apex coverage costs no expressiveness: `ExactFqdn` is a strictly
     /// higher tier, so "subdomains here, apex elsewhere" is still
     /// expressible by adding an exact rule for the apex. See
     /// [`match_suffix_domain`](crate::decision_matching::match_suffix_domain).
     SuffixDomain(String),
-    /// Matches all hosts in a TLD or internal domain zone (runtime priority tier 3).
+    /// Matches all hosts in a TLD or internal domain zone.
     ///
     /// Zone name is the suffix label — e.g. `ru`, `com`, `intra`, `corp`. Normalized:
     /// lowercase, `*.` prefix stripped if present, punycode for IDN zones
@@ -129,13 +128,9 @@ pub enum CanonicalAddressMatch {
     /// output and the punycode hostnames seen at decision time).
     /// A hostname matches if it ends with `.{zone_name}`. Zone applies only
     /// when a hostname is available; IP-only traffic bypasses Zone in Free.
-    ///
-    /// Runtime priority vs [`CanonicalAddressMatch::ExactIp`] is user-configurable
-    /// (default: ExactIp wins). IP subnet zones are not supported; Free
-    /// supports domain-suffix zones only.
+    /// An address or a network inside the zone beats it.
     Zone(String),
-    /// Matches exactly one address of either family (runtime priority tier 3 by default;
-    /// configurable vs [`CanonicalAddressMatch::Zone`]).
+    /// Matches exactly one address of either family.
     ExactIp(IpAddr),
     /// Matches every address of one network. Within the address tier a longer
     /// prefix beats a shorter one, and an exact address beats any network.

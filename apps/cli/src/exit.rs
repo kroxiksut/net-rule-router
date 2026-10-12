@@ -39,7 +39,9 @@ pub fn for_error(err: &ServiceControlError) -> u8 {
         // No service manager on this host: nothing to install, start or query.
         ServiceControlError::Unsupported { .. }
         | ServiceControlError::ManagerUnavailable { .. } => UNSUPPORTED,
-        ServiceControlError::InvalidState { .. } | ServiceControlError::Mechanism { .. } => FAILED,
+        ServiceControlError::InvalidState { .. }
+        | ServiceControlError::Relocation { .. }
+        | ServiceControlError::Mechanism { .. } => FAILED,
     }
 }
 

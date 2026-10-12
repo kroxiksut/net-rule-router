@@ -47,6 +47,11 @@ void NrrNativeBridge::triggerTrayAction(const QString &actionId) {
         // table that says nothing about the divergence.
         launchMainGuiWithAction(QStringLiteral("rules"), false, false,
                                 QStringLiteral("rules-drift-compare"), {});
+    } else if (actionId == QStringLiteral("add-rule")) {
+        // "Add rule…" while the window is open: its own rule form takes it,
+        // so the rule lands in the table the user is looking at.
+        launchMainGuiWithAction(QStringLiteral("rules"), false, false,
+                                QStringLiteral("add-rule"), {});
     } else if (actionId == QStringLiteral("open-about-window")) {
         launchMainGui({}, true, false);
     } else if (actionId == QStringLiteral("open-license-window")) {

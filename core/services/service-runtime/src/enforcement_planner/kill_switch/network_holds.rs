@@ -168,7 +168,19 @@ impl NetworkHolds {
             return Self::default();
         }
         let main_networks: Vec<IpBlock> = ownership.networks(Link::Main).collect();
-        let main_addresses: Vec<IpAddr> = ownership.main_named().iter().copied().collect();
+        // An address a main-link program took is routed off the tunnel; holding
+        // it would cut that program the takeover setting sent there.
+        let main_addresses: Vec<IpAddr> = ownership
+            .main_named()
+            .iter()
+            .copied()
+            .chain(
+                ownership
+                    .app_taken()
+                    .filter(|(_, link)| *link == Link::Main)
+                    .map(|(ip, _)| ip),
+            )
+            .collect();
         Self::compute(&NetworkHoldInput {
             additional_networks: &additional_networks,
             main_networks: &main_networks,

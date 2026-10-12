@@ -14,7 +14,9 @@
 //!   step owned by the caller, not an OS mechanism; keeping it out is what lets
 //!   this trait live below the orchestration layer instead of dragging it in.
 //! - **Binary replacement / update.** An update is "stop, swap the file, start"
-//!   — three steps the caller composes from the verbs below.
+//!   — three steps the caller composes from the verbs below. The one exception
+//!   is the protected copy an install may register (`service_placement`): it
+//!   belongs to the install, so the install keeps it current.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -72,22 +74,29 @@ pub struct RecoveryPolicy {
     pub first_restart_delay_ms: u32,
     /// Delay (ms) before the second auto-restart.
     pub second_restart_delay_ms: u32,
+    /// Delay (ms) before every auto-restart after the second.
+    pub later_restart_delay_ms: u32,
     /// Number of consecutive crashes that trigger automatic restart. Crashes
     /// beyond this leave the service stopped for operator review.
     pub max_auto_restarts: u8,
     /// How long (seconds) the crash counter is held before resetting.
     pub reset_period_secs: u32,
+    /// Once the restarts are spent, hand the network back: a dead service
+    /// still redirecting name resolution leaves the whole machine offline.
+    pub release_network_when_exhausted: bool,
 }
 
 impl RecoveryPolicy {
-    /// Default production policy: restart twice with escalating delay; stop on
-    /// the third crash and require operator intervention.
+    /// Default production policy: three restarts with escalating delay within
+    /// an hour, then the network is handed back and the service stays stopped.
     pub const fn production() -> Self {
         Self {
             first_restart_delay_ms: 5_000,
             second_restart_delay_ms: 30_000,
-            max_auto_restarts: 2,
-            reset_period_secs: 86_400, // 24 h
+            later_restart_delay_ms: 60_000,
+            max_auto_restarts: 3,
+            reset_period_secs: 3_600,
+            release_network_when_exhausted: true,
         }
     }
 
@@ -96,8 +105,10 @@ impl RecoveryPolicy {
         Self {
             first_restart_delay_ms: 1_000,
             second_restart_delay_ms: 5_000,
+            later_restart_delay_ms: 5_000,
             max_auto_restarts: 5,
-            reset_period_secs: 3_600, // 1 h
+            reset_period_secs: 3_600,
+            release_network_when_exhausted: true,
         }
     }
 }
@@ -276,9 +287,18 @@ pub enum ServiceControlError {
     },
     /// The operation has no implementation on this platform.
     Unsupported { operation: &'static str },
+    /// The binary was in a folder ordinary accounts can change, and the copy
+    /// meant to be registered in its place could not be put where only
+    /// administrators can change it. Nothing was registered.
+    Relocation { detail: String },
     /// Anything else the OS reported, verbatim.
     Mechanism { detail: String },
 }
+
+/// Exit code of the service binary's own `install` / `reinstall` verbs when the
+/// failure is [`ServiceControlError::Relocation`], so the elevated broker that
+/// ran the verb can say which failure it was without parsing text.
+pub const RELOCATION_FAILED_EXIT_CODE: u8 = 9;
 
 impl std::fmt::Display for ServiceControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -295,6 +315,10 @@ impl std::fmt::Display for ServiceControlError {
             Self::Unsupported { operation } => {
                 write!(f, "{operation} is not supported on this platform")
             }
+            Self::Relocation { detail } => write!(
+                f,
+                "could not copy the service to a folder only administrators can change: {detail}"
+            ),
             Self::Mechanism { detail } => write!(f, "{detail}"),
         }
     }
@@ -310,6 +334,11 @@ impl std::error::Error for ServiceControlError {}
 /// the identity of the service they control.
 pub trait ServiceControlPort {
     /// Register the service. Requires administrator/root privilege.
+    ///
+    /// The registered binary may be a protected copy of `binary_path` rather
+    /// than the file itself (`service_placement`); [`Self::query`] names the
+    /// one registered. Installing over a registration of that same copy keeps
+    /// it current instead of failing on the existing name.
     fn install(
         &self,
         spec: &ServiceInstallSpec,
@@ -385,10 +414,15 @@ mod tests {
             "an immediate restart amplifies crash loops"
         );
         assert!(
-            p.second_restart_delay_ms >= p.first_restart_delay_ms,
+            p.second_restart_delay_ms >= p.first_restart_delay_ms
+                && p.later_restart_delay_ms >= p.second_restart_delay_ms,
             "the delay must escalate"
         );
         assert!(p.reset_period_secs > 0, "the reset period must be finite");
+        assert!(
+            p.release_network_when_exhausted,
+            "a service that gave up must not keep the machine offline"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! the parity tests run both implementations over one set of vectors. Pure
 //! functions only — no I/O, no IPC, no clock.
 //!
-//! - [`placeholders`] — `{name}` filling and plural categories.
+//! - [`placeholders`] — `{name}` filling, plural categories and short lists.
 //! - [`rules_table`] — table rows, their wire form, the two rules files and
 //!   the main-route check.
 //! - [`review`] — a rules change's preview, refusal and outcome.
@@ -24,6 +24,8 @@
 //! - [`units`] — byte counts as people read them.
 //! - [`verify_verdicts`] — the notice for `?` rules that work only on the
 //!   other route.
+//! - [`vpn_gateway`] — the rule that lets a VPN reach its gateway over the
+//!   chosen route.
 
 pub mod adapters;
 pub mod auto_rules;
@@ -41,6 +43,7 @@ pub mod rules_table;
 pub mod stability;
 pub mod units;
 pub mod verify_verdicts;
+pub mod vpn_gateway;
 
 /// One of the two adapter routes. Also names the rules file that holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

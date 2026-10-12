@@ -1,0 +1,204 @@
+name: release
+
+# A version tag builds every deliverable and drafts a GitHub Release holding
+# them with one checksum file. The draft is published by hand, after the
+# artifacts have been tried on a clean machine.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Third-party actions are pinned to commits: this job signs nothing, but what
+# it builds is what users install.
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: windows-${{ matrix.arch }} (${{ matrix.variant }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        variant: [full, headless]
+        include:
+          - arch: x64
+            runner: windows-2022
+            rust_target: x86_64-pc-windows-msvc
+            qt_host: windows
+            qt_arch: win64_msvc2022_64
+          # Built on ARM64 itself: Qt's native ARM64 kit carries its own
+          # windeployqt, which a cross-compiled kit does not.
+          - arch: arm64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            qt_host: windows_arm64
+            qt_arch: win64_msvc2022_arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Read pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.rust_target }}
+
+      # No build cache: what ships is built from the tagged sources alone.
+
+      - name: Install Qt
+        if: matrix.variant == 'full'
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
+        with:
+          version: "6.8.3"
+          host: ${{ matrix.qt_host }}
+          arch: ${{ matrix.qt_arch }}
+          cache: true
+
+      - name: Point the Qt host at Qt
+        if: matrix.variant == 'full'
+        shell: bash
+        run: echo "CMAKE_PREFIX_PATH=$QT_ROOT_DIR" >> "$GITHUB_ENV"
+
+      - name: Skip the Qt host
+        if: matrix.variant == 'headless'
+        shell: bash
+        run: echo "NRR_SKIP_QT_HOST=1" >> "$GITHUB_ENV"
+
+      # WiX 6 carries a maintenance-fee licence; 5.0.2 does not.
+      - name: Install installer tools
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $variant = @()
+          if ('${{ matrix.variant }}' -eq 'headless') { $variant = @('-Headless') }
+          powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 `
+            -Arch ${{ matrix.arch }} -OutputRoot "$env:RUNNER_TEMP\dist" -Zip -Installers -Force @variant
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-${{ matrix.arch }}-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/dist/*.zip
+            ${{ runner.temp }}/dist/*.exe
+            ${{ runner.temp }}/dist/*.msi
+          if-no-files-found: error
+
+  linux:
+    name: linux-${{ matrix.arch }} (${{ matrix.variant }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        variant: [headless, full]
+        include:
+          # The images are multi-arch: an ARM runner pulls their arm64 build,
+          # and package-linux.sh names the packages after the machine it runs on.
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          # Built on the oldest glibc the packages should install on: a Linux
+          # binary runs on the C library it was built with and on newer ones.
+          - variant: headless
+            image: debian:10
+            # The base package every system installs, and the archive without a GUI.
+            keep: "netrulerouter_*.deb netrulerouter-[0-9]*.rpm netrulerouter-headless-*.tar.gz"
+          # The oldest Debian whose own Qt is 6.6 or newer. Its base package
+          # would collide with the one above, so only the GUI leaves this job.
+          - variant: full
+            image: debian:13
+            keep: "netrulerouter-gui*.deb netrulerouter-gui*.rpm netrulerouter-[0-9]*.tar.gz"
+    container: ${{ matrix.image }}
+    steps:
+      - name: Point Debian 10 at its archive
+        if: matrix.image == 'debian:10'
+        run: |
+          echo 'deb http://archive.debian.org/debian buster main' > /etc/apt/sources.list
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+
+      - name: Install build tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git \
+            build-essential pkg-config dpkg-dev rpm binutils file
+          if [ "${{ matrix.variant }}" = full ]; then
+            apt-get install -y --no-install-recommends cmake qt6-base-dev qt6-declarative-dev
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          channel="$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)"
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$channel"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Package
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          args="--build --out $RUNNER_TEMP/packages"
+          [ "${{ matrix.variant }}" = headless ] && args="--headless $args"
+          bash scripts/package-linux.sh $args
+          mkdir -p "$RUNNER_TEMP/keep"
+          cd "$RUNNER_TEMP/packages"
+          # Unquoted on purpose: each word is a glob.
+          cp -v ${{ matrix.keep }} "$RUNNER_TEMP/keep/"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-${{ matrix.arch }}-${{ matrix.variant }}
+          path: ${{ runner.temp }}/keep/*
+          if-no-files-found: error
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    # The only job that writes, and it runs no third-party code.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One checksum file over everything the release carries, so a download
+      # from any job can be checked the same way.
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum -- * > SHA256SUMS
+
+      - name: Draft the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" --draft --prerelease \
+            --title "NetRuleRouter $GITHUB_REF_NAME"
+
+      - name: Keep the set when not tagged
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-set
+          path: artifacts

@@ -3,7 +3,8 @@
 //! route-policy field) reaches the service.
 
 use nrr_client_logic::adapters::{
-    display_name, held_other_role, is_own_fake_ip_tun, role_hint, unroutable_reason,
+    display_name, held_other_role, is_own_fake_ip_tun, role_hint, rows_are_live as source_is_live,
+    unroutable_reason,
 };
 use nrr_client_logic::route_policy::{build_full_update_request, name_changes};
 use nrr_client_logic::Route;
@@ -22,14 +23,10 @@ use crate::keys;
 use crate::state::AppState;
 use crate::view::{Segment, StateTone, ViewLine};
 
-/// The enumerations that are this machine's. Anything else, an unknown
-/// spelling included, is placeholder rows that name no adapter here.
-const LIVE_SOURCES: [&str; 2] = ["windows-live", "linux-live"];
-
 pub fn rows_are_live(app: &AppState) -> bool {
     app.snapshot
         .as_ref()
-        .is_some_and(|s| LIVE_SOURCES.contains(&s.adapters.data_source.as_str()))
+        .is_some_and(|s| source_is_live(&s.adapters.data_source))
 }
 
 pub fn binding(app: &AppState, route: Route) -> Option<&RouteBindingDto> {
@@ -433,5 +430,19 @@ mod tests {
         }
         .apply(&mut request);
         assert!(!request.contains_key("primary"));
+    }
+
+    /// The clients' list of live spellings agrees with the enumeration that
+    /// writes them; a new OS added there is placeholder rows until added here.
+    #[test]
+    fn the_live_spellings_are_the_enumerations_own() {
+        use nrr_platform_api::interface_rows::InterfacesDataSource as Source;
+        for source in [Source::WindowsLive, Source::LinuxLive, Source::FallbackMock] {
+            assert_eq!(
+                source_is_live(source.title()),
+                source.is_live(),
+                "{source:?}"
+            );
+        }
     }
 }

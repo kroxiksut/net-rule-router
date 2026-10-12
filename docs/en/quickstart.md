@@ -23,7 +23,9 @@ client, proxy, or anonymity tool.
 
 ## Installation
 
-1. Download the archive from the [releases page](https://github.com/kroxiksut/net-rule-router/releases).
+1. Get the archive. Ready-made archives are not published yet:
+   `scripts/package-windows.ps1` builds one that runs on a machine without Qt
+   or Rust (see [Packaging a portable build](packaging-windows.md)).
 2. Unpack it into any folder — for example, on your Desktop or at the root
    of drive `C:` or `D:`.
 3. Run `NetRuleRouter.exe`. At first launch the app will show the
@@ -49,6 +51,8 @@ routing does not apply.
    first-run wizard offers four options: a country preset, a built-in
    demo set, two `.txt` files of your own, or an empty start. Whatever
    you pick lands in the rules for review before anything is applied.
+   It also offers to start the tray icon at sign-in (on by default), so
+   after a restart the state is in sight without opening the window.
 
    ![First-run setup: name your two connections and pick the protection you want](images/first-run-wizard.png)
 
@@ -79,18 +83,19 @@ routing does not apply.
 ## Rules: how it works
 
 A rule says: "this traffic → through that route". Traffic can be described
-four ways:
+six ways, listed here from the strongest rule to the weakest:
 
 | Type | Example | Matches |
 |-----|--------|---------|
 | Exact domain | `api.example.com` | only this host |
 | Domain with subdomains | `*.example.com` | the domain and all subdomains |
-| Domain zone | `.ru` | all domains in the zone |
 | Exact IP | `203.0.113.7`, `2001:db8::7` | only that address |
+| Network or range | `10.0.0.0/8`, `192.0.2.10-192.0.2.40` | every address in it |
+| Domain zone | `.ru` | all domains in the zone |
 | Application | `chrome.exe` | all traffic from that process |
 
-Rules are applied from specific to general: an exact domain beats
-subdomains, subdomains beat zones. A rule names either an address or an
+The narrower rule wins: a site's own name beats its address, an address beats
+the network around it, a network beats the zone. A rule names either an address or an
 application: a rule that limits an address to one application cannot be
 carried out yet, so the service refuses it.
 
@@ -210,6 +215,12 @@ working over your main link while leak protection is on, instead of being cut
 off with everything else.
 
 ![Point the app at your VPN client so it keeps working while protection is on](images/vpn-client.png)
+
+A second VPN that may connect only from one network — a work VPN allowed only
+from abroad, say — is set up just below, under **Other VPNs (corporate)**: it
+finds that VPN's gateway and adds a rule so the VPN always connects through the
+route you choose. See [A VPN that must connect through the other
+channel](vpn-detection.md#a-vpn-that-must-connect-through-the-other-channel-vpn-over-vpn).
 
 ### Ready-made presets
 

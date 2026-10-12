@@ -560,6 +560,8 @@ fn routing(app: &AppState) -> Vec<Item> {
         )
         .note(t::DEFAULT_ROUTE_NOTE),
         policy_toggle(policy, "include-subdomains", t::SUBDOMAINS).note(t::SUBDOMAINS_NOTE),
+        policy_toggle(policy, "app-rules-take-all-addresses", t::APP_TAKEOVER)
+            .note(t::APP_TAKEOVER_NOTE),
         heading(t::LEAK_TITLE),
     ];
     if !s.supports.kill_switch {
@@ -640,19 +642,28 @@ fn routing(app: &AppState) -> Vec<Item> {
                             );
                         }
                         v.push(stability_toggle(config, "dns-fast-answers", t::DNS_FAST));
-                        if resolver {
-                            v.push(stability_toggle(config, "fake-ip-enabled", t::FAKE_IP));
+                        if s.supports.fake_ip {
+                            if resolver {
+                                v.push(stability_toggle(config, "fake-ip-enabled", t::FAKE_IP));
+                            }
+                            v.push(stability_toggle(
+                                config,
+                                "fake-ip-udp-relay",
+                                t::FAKE_IP_UDP,
+                            ));
+                            v.push(stability_toggle(
+                                config,
+                                "fake-ip-instant-rst",
+                                t::FAKE_IP_RST,
+                            ));
+                        } else if resolver {
+                            // Named and explained, as the GUI does, rather than offered.
+                            v.push(info(Words::Join(vec![
+                                Words::Key(t::FAKE_IP),
+                                raw(": "),
+                                Words::Key(t::UNSUPPORTED),
+                            ])));
                         }
-                        v.push(stability_toggle(
-                            config,
-                            "fake-ip-udp-relay",
-                            t::FAKE_IP_UDP,
-                        ));
-                        v.push(stability_toggle(
-                            config,
-                            "fake-ip-instant-rst",
-                            t::FAKE_IP_RST,
-                        ));
                         if fail_closed {
                             let key = "secondary-liveness-window-secs";
                             let secs = stability::effective(config, key).and_then(|v| v.as_i64());

@@ -775,3 +775,17 @@ fn a_sweep_with_nothing_left_behind_is_clean() {
     assert!(matches!(sweep.search_list, Ok(false)));
     assert!(sweep.is_clean());
 }
+
+/// The emergency reset sweeps without the binary; its copy of the marker and
+/// of our rule's key must be the service's.
+#[test]
+fn the_reset_script_mirrors_the_marker_and_the_rule_key() {
+    let script = include_str!("../../../../../scripts/reset-network.ps1");
+    for (name, value) in [
+        ("$nrptMarker", NRPT_MARKER),
+        ("$nrptRuleKey", NRPT_RULE_KEY),
+    ] {
+        let line = format!("{name} = '{value}'");
+        assert!(script.lines().any(|l| l == line), "{line}");
+    }
+}

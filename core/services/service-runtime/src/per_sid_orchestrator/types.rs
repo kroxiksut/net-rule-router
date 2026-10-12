@@ -104,6 +104,10 @@ pub struct PerSidPolicySnapshot {
     /// the address-ownership arbiter, which is where the two can actually
     /// contest one address.
     pub zone_priority_over_ip: bool,
+    /// An application rule takes every address its program uses, even one the
+    /// other link's address rules name. Off by default. Read by the
+    /// address-ownership arbiter and the per-app kill-switch.
+    pub app_rules_take_all_addresses: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -203,32 +203,50 @@ The additional-route file of the same pair:
 
 ### 1.5 Rule evaluation priority
 
-The following priority order is fixed (highest to lowest):
+The narrower rule wins. The order is fixed (highest to lowest), and the rules of
+both files are evaluated together:
 
-1. **Zones** — zone-level group match. An exact zone match short-circuits all
-   lower tiers.
-2. **Domains — exact FQDN** — `example.com` (no `*.` prefix) matches only
-   the exact hostname. Longest label wins among competing exact rules.
-3. **Domains — suffix/subdomain** — `*.example.com` matches `example.com`
-   itself and any subdomain of it at any depth. Longest base domain wins
-   among competing suffix rules. To route the apex differently from its
-   subdomains, add an exact rule for the apex — it is a higher tier and wins.
-4. **CIDR and Ranges** — a subnet or an IP range. It beats the zone it sits
-   inside. Between networks the longer prefix wins, so `10.1.0.0/16` beats
-   `10.0.0.0/8`. A name beats a subnet that contains its address. The same
-   network on both routes is an error.
-5. **IP** — exact IP address. It beats any network that contains it.
-6. **Application** (`Windows` / `Linux` / `MacOS`) — matched by process
-   filename (exact or glob). Exact names take precedence over glob patterns;
-   among glob matches, the first rule in the file wins. Only the
+1. **Exact domain** — `example.com` (no `*.` prefix) matches only that
+   hostname.
+2. **Domain with subdomains** — `*.example.com` matches `example.com` itself
+   and any subdomain of it at any depth. The longest base domain wins among
+   competing suffix rules. To route the apex differently from its subdomains,
+   add an exact rule for the apex — it is a higher tier and wins.
+3. **IP** — `203.0.113.7`, one exact address. It beats any network that
+   contains it.
+4. **CIDR and Ranges** — `10.1.0.0/16` or `192.0.2.10-192.0.2.40`. Between
+   networks the longer prefix wins, so `10.1.0.0/16` beats `10.0.0.0/8`. The
+   same network on both routes is an error.
+5. **Zones** — `ru` matches every hostname ending in `.ru`. A longer zone beats
+   a shorter one. A network or an exact address inside a zone beats the zone.
+6. **Application** — `chrome.exe` (`Windows` / `Linux` / `MacOS`), matched by
+   process filename (exact or glob). Exact names take precedence over glob
+   patterns; among glob matches, the first rule in the file wins. Only the
    platform-appropriate section is evaluated. The destinations an application
-   rule teaches the router (§1.10) are evaluated at this tier too — below the
-   Domains, CIDR, Ranges and IP tiers, so a top-level address rule for the same
-   address wins.
-7. **Default route** — determined by `ActiveConfiguration.behavior_mode`.
+   rule teaches the router (§1.10) are evaluated at this tier too, so an address
+   rule for the same address wins.
+7. **Default route** — set by the routing mode (see
+   [Routing modes](routing-modes.md)).
 
-Both the primary and additional rule files are evaluated independently. The
-first match across both files determines the route.
+Name rules (tiers 1, 2 and 5) apply only when the destination's name is known.
+
+Two more rules settle the rest:
+
+- A `+block` rule (§1.12) for an exact IP address stops that address whatever
+  other rule names it. Any other block takes its tier in the order above, so a
+  zone block does not stop a site an exact rule routes.
+- When two rules of the same tier are equally specific, a block beats a route
+  and the primary route beats the additional one.
+
+By default a rule for a site or an address wins over a rule for a program.
+The switch **Programs in your rules take all their traffic** (Settings →
+Routing) turns that around for programs: a program you named in a rule then
+sends everything it connects to over that rule's route, even to sites another
+rule sends the other way. Routing works per address, so such a site then goes
+that route for every program on the computer, not only for the one you named.
+An exact-IP `+block` rule still stops its address, and a site your primary
+route names stays reachable for other programs when the additional route is
+down. The switch is off by default.
 
 ### 1.6 Child process tracking (`+children`)
 
@@ -296,15 +314,15 @@ label characters (letters, digits, hyphens, dots for compound zones such as
 
 | Example | Meaning | Priority tier |
 |---|---|---|
-| `example.com` | Exact FQDN — matches `example.com` only | Exact FQDN (tier 2) |
-| `*.example.com` | Suffix — matches `example.com` and any subdomain of it at any depth | Suffix (tier 3) |
+| `example.com` | Exact FQDN — matches `example.com` only | Exact domain (tier 1) |
+| `*.example.com` | Suffix — matches `example.com` and any subdomain of it at any depth | Domain with subdomains (tier 2) |
 
 The `*.` prefix is the explicit subdomain operator. A bare domain name
 without `*.` matches only the exact FQDN. The two forms are orthogonal:
-a host gets matched at tier 2 by its exact entry; it falls through to tier 3
+a host gets matched at tier 1 by its exact entry; it falls through to tier 2
 only if a suffix rule covers it.
 
-Because tier 2 is checked first, writing both forms is how you split a site:
+Because tier 1 is checked first, writing both forms is how you split a site:
 `*.example.com` on one route and `example.com` on the other sends the
 subdomains one way and the bare domain the other.
 

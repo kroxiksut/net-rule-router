@@ -79,6 +79,7 @@ fn planner_input<'a>(
         app_resolver: resolver,
         app_observations: obs,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         packet_blocks: true,
     }
 }
@@ -122,6 +123,7 @@ fn a_declined_shared_address_is_kept_off_the_tunnel() {
             app_resolver: &resolver,
             app_observations: &obs,
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
             secondary_ip_denylist: denylist,
             packet_blocks: true,
         };
@@ -479,6 +481,7 @@ fn slices123_neutral_pipeline_matches_current_codegen() {
         app_resolver: &resolver,
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -729,6 +732,7 @@ fn slice8_derived_sets_match_current_codegen() {
         app_resolver: &resolver,
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -857,6 +861,7 @@ fn slice9_plan_report_matches_current_codegen_diagnostics() {
         app_resolver: &resolver,
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -972,6 +977,7 @@ fn slice9_plan_report_names_both_caps() {
         app_resolver: &resolver,
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1621,6 +1627,7 @@ fn slice5_fail_closed_default_block_matches_current_codegen() {
         app_resolver: &resolver,
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1969,6 +1976,7 @@ fn a_network_carved_past_the_cap_is_a_conflict_in_both_planners() {
         app_resolver: &resolver,
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });

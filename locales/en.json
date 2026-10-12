@@ -205,8 +205,6 @@
         "open-logs": "Open service logs folder",
         "gc-orphan-comments": "Clear orphan comments"
       },
-      "auto-start": "Start with Windows",
-      "auto-start-help": "Service starts automatically on system boot when enabled.",
       "start-mode": {
         "heading": "When the service starts",
         "with-windows": {
@@ -236,7 +234,7 @@
         "tooltip": "Needs administrator rights. Connections open right now may drop."
       },
       "update": {
-        "elsewhere": "Windows starts the background service from another folder, not the one this application runs from.",
+        "elsewhere": "The system starts the background service from another folder, not the one this application runs from.",
         "older": "The running background service is an older build than this application.",
         "detail": "Registered: %1\nThis application: %2",
         "action": "Update service from this folder",
@@ -537,6 +535,27 @@
         "set-up": "Set up my VPN",
         "change": "Change"
       },
+      "vpn-gateway": {
+        "title": "Other VPNs (corporate)",
+        "note": "For a VPN that connects only from one network, such as a work VPN allowed only from abroad: its gateway gets a rule for the channel you choose, so it always connects through that channel. If that channel is down, the VPN does not connect over the other one.",
+        "program": "VPN program",
+        "program-placeholder": "Program file name, for example corpvpn.exe",
+        "detected": "Pick a found program",
+        "channel": "Connect it through",
+        "find": "Find gateway addresses",
+        "finding": "Looking at recent connections...",
+        "failed": "Could not read the connections: ",
+        "observer-off": "On this system NetRuleRouter cannot see where a program connects. Type the gateway address below.",
+        "empty": "{program} has not connected anywhere on the internet recently. Start the VPN and let it try to connect, then search again.",
+        "candidate": "{address} · ports {ports} · last seen {time}",
+        "by-name": "By name: {host}",
+        "omitted": "Addresses not shown: {count}.",
+        "manual-placeholder": "Or type the gateway address or name",
+        "manual-invalid": "This is neither an address nor a host name.",
+        "add": "Add rules",
+        "rule-comment": "VPN gateway: {program}",
+        "apply-hint": "The rules are in your list now. Apply the changes to put them into effect."
+      },
       "shared-addresses": {
         "title": "Shared addresses (one IP serving several sites)",
         "routing-axis": "While the additional adapter is up: whether a shared IP is routed through it.",
@@ -662,6 +681,10 @@
         "label": "Also cover subdomains for domain rules (treat “example.com” as “example.com” + “*.example.com”)",
         "note": "On by default: a rule for a site also covers that site's subdomains, so images and scripts from “cdn.example.com” take the same route as “example.com”. Applies to all your domain rules at once. It only catches subdomains of the SAME site — an IP-check served from a different provider (a third-party domain) still won't be covered — and it sends more traffic through the additional adapter. Turn it off to match the exact domain only."
       },
+      "app-rules-take-all": {
+        "label": "Programs in your rules take all their traffic",
+        "description": "A program you named in a rule sends everything it connects to over that rule's route, even to sites another rule sends the other way. Routing works per address, so those sites then go that route for every program on this computer."
+      },
       "shared-ip": {
         "label": "When a routed domain shares an IP address with other sites",
         "option-majority-of-ip": "Route the shared IP only if most sites on it are yours (balanced)",
@@ -713,11 +736,11 @@
     "general": {
       "autostart": {
         "label": "Start NetRuleRouter tray automatically at sign-in",
-        "description": "Adds an entry under HKEY_CURRENT_USER\\…\\Run that launches the tray icon.",
+        "description": "Adds the tray icon to the programs your system starts when you sign in.",
         "state": {
           "enabled": "Enabled",
           "disabled": "Disabled",
-          "overridden": "Registry value points to another binary — toggle to repair.",
+          "overridden": "The sign-in entry starts another program file — toggle to repair.",
           "absent": "No autostart entry."
         }
       },
@@ -1124,7 +1147,7 @@
     },
     "full-reset": {
       "title": "Full reset",
-      "body": "This resets ALL application settings to defaults, deletes the rules the service keeps for you (back to a post-install state), wipes saved comments and logs, and stops the background service. Your own rules files on disk are left untouched, and the Windows service is NOT uninstalled. This cannot be undone.",
+      "body": "This resets ALL application settings to defaults, deletes the rules the service keeps for you (back to a post-install state), wipes saved comments and logs, and stops the background service. Your own rules files on disk are left untouched, and the background service is NOT uninstalled. This cannot be undone.",
       "ack": "I understand this erases all settings and applied rules",
       "confirm": "Reset everything",
       "other-users": "Other users of this computer have rules here too ({count}). What should be cleared?",
@@ -1251,7 +1274,7 @@
       "close-description": "Close the preview without applying anything",
       "apply-from-preview": "Apply…",
       "apply-from-preview-description": "Close the preview and open the activation flow for these parked changes",
-      "no-elevation-warning": "NetRuleRouter is not running as Administrator. When you apply, Windows will ask for administrator approval once — after you approve it, this and later changes apply without prompting again until you close the app.",
+      "no-elevation-warning": "NetRuleRouter is not running as administrator. When you apply, the system will ask for administrator approval.",
       "session-elevation-active": "You granted administrator approval for this session. Changes apply without another prompt. This temporary approval ends when you close NetRuleRouter.",
       "duplicates-heading": "Rules written into both routes",
       "duplicates-hint": "Each of these is enabled on both routes, so which one carries the traffic is decided by evaluation order rather than by you. Pick the route that should keep it — the other copy stays in your list, switched off.",
@@ -1308,9 +1331,9 @@
       "save-to-file-description": "Write the current rules to your rules files. This works with the service stopped.",
       "stale-pending-warning": "There is already a parked changeset (+{added} / -{removed} / ~{modified}). Choosing \"Work without service\" will replace it.",
       "start-service": "Start service",
-      "start-service-description": "Start the Windows service (requires administrator privileges).",
+      "start-service-description": "Start the background service (requires administrator privileges).",
       "install-service": "Install service…",
-      "install-service-description": "Install the Windows service (requires administrator privileges) and start it.",
+      "install-service-description": "Install the background service (requires administrator privileges) and start it.",
       "work-without": "Work without service",
       "work-without-description": "Park the changes locally; they will not be applied to the network until the service is running.",
       "cancel-description": "Dismiss the dialog without applying or parking the changes."
@@ -1383,7 +1406,7 @@
     },
     "first-launch-install": {
       "title": "Welcome to NetRuleRouter",
-      "body-1": "NetRuleRouter applies routing rules from a Windows background service so they persist across reboots and user sessions.",
+      "body-1": "NetRuleRouter applies routing rules from a background system service so they persist across reboots and user sessions.",
       "body-2": "Installing the service requires Administrator approval (UAC). After install, the service starts automatically.",
       "body-3": "You can skip this step and use NetRuleRouter in read-only preview mode, but routing rules will not apply.",
       "install-button": "Install and start service (recommended)",
@@ -1771,6 +1794,7 @@
     "copied-to-clipboard": "Copied to clipboard.",
     "rules-activate-completed": "Rules activated.",
     "rules-activate-failed": "Failed to activate rules: ",
+    "rules-apply-unexpected-diff": "Not applied: the change would also affect other rules. Open the rules in the main window to review it.",
     "reset-baseline-completed": "Reset to baseline rules. Reloading the active rules...",
     "reset-baseline-failed": "Could not reset to baseline: ",
     "baseline-needs-service": "Connect to the service to edit the baseline rules.",
@@ -1790,6 +1814,7 @@
     "rule-updated": "Rule updated",
     "rule-added": "Rule added",
     "rule-added-disabled": "Rule added but disabled — it will not affect routing until you enable it.",
+    "tray-add-rule-apply-with-edits": "The rule is in the list. Apply it together with your other unsaved rule changes.",
     "rule-duplicate": "A rule with the same type, value and route already exists (R-{id}). Edit that one instead.",
     "rules-bulk-enabled": "{n} rule(s) enabled.",
     "rules-bulk-disabled": "{n} rule(s) disabled.",
@@ -1894,6 +1919,9 @@
     "include-subdomains-on": "Domain rules now also cover subdomains.",
     "include-subdomains-off": "Domain rules now match the exact domain only.",
     "include-subdomains-failed": "Could not update the subdomain setting: ",
+    "app-rules-take-all-on": "Programs in your rules now take all their traffic.",
+    "app-rules-take-all-off": "Rules for sites and addresses take priority over programs again.",
+    "app-rules-take-all-failed": "Could not change how programs in rules are routed: ",
     "shared-ip-policy-set": "Shared-IP handling updated.",
     "shared-ip-policy-failed": "Could not update shared-IP handling: ",
     "kill-switch-on": "Leak protection enabled: matched traffic is blocked if the additional adapter drops.",
@@ -1947,6 +1975,8 @@
     "rules-tidied": "Duplicate subdomain rules the app had added were removed from your rules.",
     "auto-rules-added-unsaved-short": "Addresses added — reload to see them",
     "auto-rules-added-unsaved": "Addresses a routed site needs were added to your rules. Save or discard your edits, then reload the rules to see them.",
+    "tray-rule-added-unsaved-short": "Rule added from the tray — reload to see it",
+    "tray-rule-added-unsaved": "The rule you added from the tray is in your rules. Save or discard your edits, then reload the rules to see it.",
     "bound-file-factory-not-saved": "Nothing was saved — the linked file is part of the app's own rule sets.",
     "auto-rules-off": "Missing companion domains will no longer be collected.",
     "auto-rules-eager-on": "Delivery-looking domains will be offered as soon as they appear.",
@@ -2680,6 +2710,7 @@
   "tray": {
     "menu": {
       "open": "Open",
+      "add-rule": "Add rule…",
       "suggestions": "Suggested addresses",
       "suggestions-count": "Suggested addresses ({count})",
       "kill-switch-on": "Turn leak protection on",
@@ -2687,6 +2718,19 @@
       "safe-disable": "Disable temporarily…",
       "start-service": "Start service",
       "stop-service": "Stop service"
+    },
+    "add-rule": {
+      "title": "Add rule",
+      "saving": "Adding the rule…",
+      "load-failed": "Could not read your rules from the service, so nothing was added. Check that the service is running.",
+      "on-other-route": "{value} is already in your rules, on the route {route}.",
+      "on-other-route-many": "{count} of these are already in your rules, on another route.",
+      "move": "Move to this route",
+      "added": "Rule added: {value} → {route}",
+      "added-disabled": "Rule added, switched off: {value} → {route}. It does not route anything until you switch it on.",
+      "moved": "Rule moved: {value} → {route}",
+      "moved-count": "Moved to this route: {count}.",
+      "changed-elsewhere": "Your rules were changed elsewhere in the meantime, so nothing was added. Open the main window and add the rule there."
     },
     "external": {
       "label": "External IP",
@@ -2698,13 +2742,14 @@
     },
     "suggestions": {
       "silence": "Do not suggest addresses",
-      "silenced": "Address suggestions: silenced",
+      "silence-menu": "Do not suggest addresses…",
+      "silence-body": "New addresses will not be offered for as long as you choose. They keep collecting under Suggested addresses.",
       "for-30-minutes": "For 30 minutes",
       "for-2-hours": "For 2 hours",
       "for-4-hours": "For 4 hours",
       "for-8-hours": "For 8 hours",
       "until-restart": "Until restart",
-      "resume": "Suggest again",
+      "resume": "Suggest addresses again",
       "stop-automatic": "Stop adding automatically"
     },
     "status": {
@@ -3124,14 +3169,14 @@
       "col-process-tip": "The application that opened the connection. Hover a row's process name to see its full path.",
       "col-remote-tip": "The destination address and port the connection went to. Below it, the name this address was answered for, when one was seen; \"(+N)\" means N more names share the address — hover the name for the full list.",
       "col-egress-tip": "Which network link the connection actually left through: Primary (your main link), Additional (the additional link, usually a VPN), Loopback (local, never leaves the PC), Other (another adapter), Unknown (couldn't be determined). This is observation only — it never changes routing.",
-      "col-verdict-tip": "Whether the connection was allowed or dropped. A \"Blocked\" row may be a Windows Firewall or antivirus drop — not necessarily NetRuleRouter.",
+      "col-verdict-tip": "Whether the connection was allowed or dropped. A \"Blocked\" row may be a drop by the system firewall or an antivirus — not necessarily NetRuleRouter.",
       "show-blocked": "Show blocked",
       "show-local": "Show local connections",
       "show-local-tip": "Connections to your own machine or your local network (loopback, link-local, private LAN addresses). They never leave your network, so they say nothing about routing.",
       "group-by-process": "Group by process",
       "group-count": "connection(s)",
       "leak-mismatch-tip": "Mismatch: this address belongs to a rule routed to the additional adapter, but the connection was allowed out over the PRIMARY link — a leak indicator.",
-      "verdict-note": "\"Blocked\" means the connection was dropped by a Windows filter — this can be Windows Firewall or your antivirus, not necessarily NetRuleRouter. NetRuleRouter never blocks traffic on your primary route.",
+      "verdict-note": "\"Blocked\" means the connection was dropped by a filter in the system — this can be the system firewall or your antivirus, not necessarily NetRuleRouter. NetRuleRouter never blocks traffic on your primary route.",
       "egress": {
         "ipv6": "IPv6 (not routed by rules)",
         "primary": "Primary",
@@ -3569,6 +3614,7 @@
       "win-tun-rename-failed": "Could not rename the tunnel adapter's network (was \"{was}\"): {error}.",
       "win-svcctl-untrusted-binary-location": "Registering a service binary in a location non-administrators can change ({problem}) — allowed only in a development build.",
       "win-svcctl-sublayer-delete-failed": "Could not remove the WFP sub-layer ({error}); a reboot will clear it.",
+      "win-svcctl-protected-copy-not-removed": "The service's copy in the administrators-only folder could not be removed ({error}); the next install reuses it.",
       "win-iface-runtime-data-unavailable": "Adapter runtime data (IP/gateway/DNS) could not be read ({error}); affected rows will report no local IP.",
       "win-iface-forwarding-unevaluated": "The route table or adapter list could not be read; forwarding capability is left unevaluated for every adapter.",
       "win-ffi-layer-enumerate-failed": "A WFP filter layer could not be enumerated ({error}); continuing with the layers that answered.",
@@ -3784,7 +3830,10 @@
       "route-table-owner-changed": "The system's own traffic now follows this user's routes.",
       "route-table-owner-none": "Nobody is signed in: the system's own traffic follows no user's routes.",
       "per-user-routing-unsupported": "This kernel cannot route each user separately ({reason}): the system route table carries the routes of one signed-in user for everyone.",
+      "linux-foreign-rule-moved": "A routing rule added after the service's (a VPN connected later) stood in front of them; moved from priority {from} to {to}, where it would have been without the service.",
+      "linux-foreign-rule-move-failed": "A routing rule in front of the service's could not be moved ({error}): until it is, it takes the traffic before the rules do.",
       "own-traffic-mark-failed": "The service could not mark its own connections ({error}): system-wide filters may hold its checks and lookups.",
+      "source-link-pin-failed": "The service could not hold an external address check to its adapter ({error}): the answer may describe another connection.",
       "route-killswitch-luid-error": "Leak protection: could not resolve the additional route's interface identifier (index {ifindex}): {error} — staying off.",
       "route-killswitch-table-unreadable": "Leak protection: could not read the system route table, so local-network exceptions are unknown ({error}) — staying off.",
       "route-failclosed-table-unreadable": "Leak protection: could not read the system route table ({error}) — falling back to the last known local networks.",
@@ -3985,6 +4034,7 @@
     "invalid-version": "Service version is incompatible",
     "malformed-request": "Request was rejected as malformed",
     "busy-conflict": "Service is busy with another operation",
+    "service-relocation-failed": "The service could not be copied to a folder only administrators can change. Check that the application folder can be read and that there is free space on the system drive, then try again.",
     "activation-not-recorded": "The change could not be saved, so it was not applied. The previous rules stay in effect. Review the changes and apply again.",
     "no-last-known-good": "There is no earlier version of your rules to roll back to.",
     "revision-not-found": "That version of the rules no longer exists.",
@@ -4523,6 +4573,13 @@
       "plain-choice-prompt": "Type the number of your choice and press Enter; ! cancels.",
       "plain-review-prompt": "Type y and press Enter to apply these changes, or n to go back to editing; > and < scroll the list.",
       "plain-review-critical-prompt": "The risk is critical. Type c and press Enter to tick the box above, then y to apply; n goes back to editing.",
+      "gateway": {
+        "program-question": "Which VPN program? Type its file name, for example corpvpn.exe.",
+        "channel-question": "Through which channel should it connect?",
+        "pick": "Type a number to add that address, or type the gateway address or name.",
+        "pick-keys": "Up and Down choose, Enter adds the chosen address; typing an address or name adds that instead. Esc cancels.",
+        "none-found": "No addresses found. Type the gateway address or name."
+      },
       "help": {
         "focus": "Tab or Enter in the menu: move into the rule list; Esc: back to the menu",
         "move": "Up, Down, Page Up, Page Down, Home, End: choose a rule",
@@ -4534,6 +4591,7 @@
         "folder": "o: choose the folder with your rule sets; the rules on screen are saved there as a set",
         "reload": "r: show the rules the service applies, dropping the changes on screen",
         "main-route": "c: check whether the main route reaches the sites of your additional-route rules; the answer shows beside each rule. Shift+O: list what the main route does not reach first, or back",
+        "gateway": "v: add a rule for a VPN's gateway, so that VPN connects through the channel you choose",
         "verdicts": "m: move the rules that work only on the other route there for good. n: not now",
         "form": "In the rule form: Up and Down move between fields, Left and Right change a choice, Space switches the rule on or off, Enter saves, Esc cancels"
       },
@@ -4550,6 +4608,7 @@
         "folder": "o: choose the folder with your rule sets",
         "reload": "r: show the rules the service applies",
         "main-route": "c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back",
+        "gateway": "v: add a rule for a VPN's gateway",
         "verdicts": "m: move the rules that work only on the other route. n: not now"
       },
       "title-baseline": "Rules — baseline for every user",

@@ -64,7 +64,7 @@ by itself.
 | `1` | Status | Whether the service is running and routing is active, limited or paused — in words; both routes and their adapters; the notification feed; pause and resume |
 | `2` | First run | Language, which adapter is primary and which additional, a rule set to start from, leak protection |
 | `3` | Interfaces and routes | Adapters with their type, state and addresses; which one carries which route; checking an adapter |
-| `4` | Rules | The rule table with search and filter; add, change, delete, switch on and off; mark a rule *not sure* to have it checked on the primary route first; your folder of rule sets; import and export; applying your changes. `c` checks whether the primary route reaches the sites of your additional-route rules, and the answer shows beside each rule, so you can see which rules still do real work; `Shift+O` lists the sites the primary route does not reach first |
+| `4` | Rules | The rule table with search and filter; add, change, delete, switch on and off; mark a rule *not sure* to have it checked on the primary route first; your folder of rule sets; import and export; applying your changes. `c` checks whether the primary route reaches the sites of your additional-route rules, and the answer shows beside each rule, so you can see which rules still do real work; `Shift+O` lists the sites the primary route does not reach first. `v` adds a rule for a VPN's gateway, so a VPN that may connect only from one network (a work VPN allowed only from abroad, say) always connects through the route you choose: it asks for the program and the route, lists the addresses that program connected to lately, and takes a number or an address you type |
 | `5` | Overlaps | Pairs of rules that cover the same traffic, and which route actually wins |
 | `6` | Suggested addresses | Accept or decline what the application suggests adding to your rules |
 | `7` | Connection trace | Recent connections and which route they took, with an explanation for any line. `o` opens the list of what was blocked while the additional route was down |
@@ -86,6 +86,7 @@ same thing on every screen.
 | `1`–`9`, `0` | Jump to a screen |
 | `Tab`, `Shift+Tab` | Move between the panels of a screen |
 | Arrows, `Enter` | Move within a list, open or confirm |
+| `Space` | Switch the selected rule or setting on and off; in the rule form, change the type or the route |
 | `/` | Search in a list |
 | `Esc` | Back, or cancel |
 | `Ctrl+S` | Apply your rule changes |

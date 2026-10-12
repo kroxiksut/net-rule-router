@@ -65,7 +65,7 @@ Dialog {
             text: root.tr("dialog.full-reset.body",
                 "This resets ALL application settings to defaults, clears the rules "
                 + "applied by the service (back to an empty post-install state), and "
-                + "wipes saved comments and logs. The Windows service is NOT "
+                + "wipes saved comments and logs. The background service is NOT "
                 + "uninstalled. This cannot be undone.")
         }
         // Only asked when someone else's routing is actually stored here.

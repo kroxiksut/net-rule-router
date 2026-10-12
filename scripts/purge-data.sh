@@ -14,10 +14,18 @@
 # The audit trail is not part of a user cleanup, so /var/lib/netrulerouter/audit
 # survives unless --purge-audit says otherwise.
 #
+# Other accounts' data is listed, never deleted: an elevated delete inside a
+# home its owner can rearrange could be steered elsewhere. A run that finished
+# but left such data exits with 5.
+#
+# --user-only takes the caller's own profile alone and leaves the service and
+# the machine-wide footprint to a full run (or to the package manager).
+#
 # Usage:
 #   ./scripts/purge-data.sh                     # show what would go
 #   ./scripts/purge-data.sh --yes
 #   ./scripts/purge-data.sh --yes --purge-audit
+#   ./scripts/purge-data.sh --yes --user-only
 
 set -euo pipefail
 
@@ -27,22 +35,25 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   cat <<'EOF'
-Usage: purge-data.sh [--yes] [--purge-audit] [--profile auto|dev|release]
+Usage: purge-data.sh [--yes] [--purge-audit] [--user-only] [--profile auto|dev|release]
 
   --yes           actually delete; without it nothing is touched
   --purge-audit   also delete the audit trail (kept by default)
+  --user-only     only your own profile: no service, no machine-wide files
   --profile       passed to uninstall-service.sh (default: auto)
 EOF
 }
 
 apply=0
 purge_audit=0
+user_only=0
 profile="auto"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --yes) apply=1; shift ;;
     --purge-audit) purge_audit=1; shift ;;
+    --user-only) user_only=1; shift ;;
     --profile) profile="${2:-}"; shift 2 ;;
     --profile=*) profile="${1#--profile=}"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -64,10 +75,15 @@ esac
 # The per-user half comes from the caller's own XDG variables; the privileged
 # steps elevate one at a time on their own.
 nrr_refuse_sudo "Privileged steps elevate themselves."
+if [ "$user_only" -eq 0 ]; then
+  nrr_refuse_if_package_managed "apt purge / dnf remove netrulerouter first, or pass --user-only to clear your own profile."
+fi
 
 removed_list=""
 absent_list=""
 failed_list=""
+
+left_list=""
 
 mark_removed() { removed_list="$removed_list  $1"$'\n'; }
 mark_absent() { absent_list="$absent_list  $1"$'\n'; }
@@ -188,35 +204,88 @@ run_uninstall_desktop() {
   "$script_dir/uninstall-desktop.sh" >/dev/null || nrr_yellow "uninstall-desktop.sh failed"
 }
 
+# Login accounts other than the caller, as `name:home` lines. System
+# accounts below UID_MIN keep no desktop profile of ours.
+other_accounts() {
+  local uid_min self_uid
+  uid_min="$(awk '$1 == "UID_MIN" { print $2; exit }' /etc/login.defs 2>/dev/null || true)"
+  case "$uid_min" in '' | *[!0-9]*) uid_min=1000 ;; esac
+  self_uid="$(id -u)"
+  getent passwd | awk -F: -v min="$uid_min" -v self="$self_uid" \
+    '$3 >= min && $3 != self && $3 != 65534 && $6 ~ /^\/./ { print $1 ":" $6 }' || true
+}
+
+# Another account's home is usually closed to us, so the look goes through
+# root; a dry run asks sudo only if it would not prompt.
+exists_as_root() {
+  [ -e "$1" ] && return 0
+  [ "$(id -u)" -ne 0 ] || return 1
+  if [ "$apply" -eq 1 ]; then
+    nrr_run_privileged test -e "$1" 2>/dev/null
+  else
+    sudo -n test -e "$1" 2>/dev/null
+  fi
+}
+
+# Read-only: what other accounts keep, for them to remove themselves.
+list_other_users_data() {
+  local account name home user_path found=0
+  while IFS= read -r account; do
+    [ -n "$account" ] || continue
+    name="${account%%:*}"
+    home="${account#*:}"
+    while IFS= read -r user_path; do
+      case "$user_path" in
+        "$home"/*) ;;
+        *) continue ;;
+      esac
+      if exists_as_root "$user_path"; then
+        nrr_yellow "  left         $user_path ($name)"
+        left_list="$left_list  $user_path"$'\n'
+        found=1
+      fi
+    done < <(
+      HOME="$home"
+      unset XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CONFIG_HOME XDG_RUNTIME_DIR TMPDIR
+      nrr_user_footprint_paths
+    )
+  done < <(other_accounts)
+  if [ "$found" -eq 0 ]; then
+    nrr_gray "  none found"
+  fi
+}
+
 if [ "$apply" -eq 0 ]; then
   nrr_cyan "==> dry run: nothing will be deleted (pass --yes to act)"
 fi
-if [ "$purge_audit" -eq 0 ]; then
+if [ "$purge_audit" -eq 0 ] && [ "$user_only" -eq 0 ]; then
   nrr_gray "    audit trail at $NRR_AUDIT_DIR is kept (--purge-audit removes it)"
 fi
 
-nrr_cyan "==> service"
-run_uninstall
+if [ "$user_only" -eq 0 ]; then
+  nrr_cyan "==> service"
+  run_uninstall
 
-nrr_cyan "==> network state"
-run_network_reset
+  nrr_cyan "==> network state"
+  run_network_reset
 
-nrr_cyan "==> machine-wide footprint"
-purge_path "$NRR_UNIT_FILE" system
-purge_path "$NRR_LOGROTATE_CONFIG" system
-purge_path "$NRR_POLKIT_POLICY" system
-purge_path "$NRR_SERVICE_INSTALL_DIR" system
-purge_path "$NRR_LEGACY_SERVICE_INSTALL_DIR" system
-# Only a link into the install directory is ours; a same-named program is not.
-for console_name in "${NRR_CONSOLE_EXE_NAMES[@]}"; do
-  console_link="$NRR_COMMAND_LINK_DIR/$console_name"
-  if [ -L "$console_link" ] && [ "$(readlink "$console_link")" = "$NRR_SERVICE_INSTALL_DIR/$console_name" ]; then
-    purge_path "$console_link" system
-  fi
-done
-purge_state_dir
-purge_path "$NRR_LOG_DIR" system
-purge_path "$NRR_RUNTIME_DIR" system
+  nrr_cyan "==> machine-wide footprint"
+  purge_path "$NRR_UNIT_FILE" system
+  purge_path "$NRR_LOGROTATE_CONFIG" system
+  purge_path "$NRR_POLKIT_POLICY" system
+  purge_path "$NRR_SERVICE_INSTALL_DIR" system
+  purge_path "$NRR_LEGACY_SERVICE_INSTALL_DIR" system
+  # Only a link into the install directory is ours; a same-named program is not.
+  for console_name in "${NRR_CONSOLE_EXE_NAMES[@]}"; do
+    console_link="$NRR_COMMAND_LINK_DIR/$console_name"
+    if [ -L "$console_link" ] && [ "$(readlink "$console_link")" = "$NRR_SERVICE_INSTALL_DIR/$console_name" ]; then
+      purge_path "$console_link" system
+    fi
+  done
+  purge_state_dir
+  purge_path "$NRR_LOG_DIR" system
+  purge_path "$NRR_RUNTIME_DIR" system
+fi
 
 nrr_cyan "==> profile of $(id -un)"
 run_uninstall_desktop
@@ -235,7 +304,12 @@ if [ "$apply" -eq 1 ]; then
   done <<<"$user_paths"
 fi
 
-if [ "$apply" -eq 1 ]; then
+if [ "$user_only" -eq 0 ]; then
+  nrr_cyan "==> other accounts (listed, not deleted)"
+  list_other_users_data
+fi
+
+if [ "$apply" -eq 1 ] && [ "$user_only" -eq 0 ]; then
   nrr_run_privileged systemctl daemon-reload || true
   nrr_run_privileged systemctl reset-failed "$NRR_UNIT_NAME" >/dev/null 2>&1 || true
 fi
@@ -257,6 +331,10 @@ if [ -n "$absent_list" ]; then
   nrr_gray "not present:"
   printf '%s' "$absent_list"
 fi
+if [ -n "$left_list" ]; then
+  nrr_yellow "left for their own accounts to remove (each user runs: purge-data.sh --yes --user-only):"
+  printf '%s' "$left_list"
+fi
 if [ -n "$failed_list" ]; then
   nrr_yellow "could not remove:"
   printf '%s' "$failed_list"
@@ -264,3 +342,7 @@ if [ -n "$failed_list" ]; then
 fi
 
 nrr_green "Purge complete."
+# Done, but other accounts still hold data: say so through the exit code too.
+if [ -n "$left_list" ]; then
+  exit 5
+fi

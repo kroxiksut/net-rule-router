@@ -499,7 +499,9 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // Read the caller's declined companion-domain suggestions.
         | IpcOperationName::AutoRuleDismissedList
         // Read the caller's check verdicts.
-        | IpcOperationName::VerifyVerdictsList => IpcOperationClass::ReadSnapshot,
+        | IpcOperationName::VerifyVerdictsList
+        // Where one program connected, from the in-memory trace.
+        | IpcOperationName::VpnGatewayCandidatesList => IpcOperationClass::ReadSnapshot,
         // StatusUpdatesSubscribe sets up a long-lived push channel —
         // classified as DiagnosticQuery (no mutation queue, no elevation).
         IpcOperationName::StatusUpdatesSubscribe => IpcOperationClass::DiagnosticQuery,

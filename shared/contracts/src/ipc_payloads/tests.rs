@@ -124,6 +124,7 @@ fn route_policy_update_request_sample(auto_rules_mode: &str) -> RoutePolicyUpdat
         zone_priority_over_ip: false,
         short_name_completion: false,
         short_name_suffix: String::new(),
+        app_rules_take_all_addresses: false,
         binding_source: BindingSourceDto::UserAssigned,
         apply_only: Vec::new(),
     }
@@ -173,6 +174,26 @@ fn eager_delivery_names_travels_as_kebab_case_and_defaults_off() {
     let parsed: RoutePolicyUpdateRequest =
         serde_json::from_value(json).expect("deserialise pre-field payload");
     assert!(!parsed.auto_rules_eager_delivery_names);
+}
+
+#[test]
+fn app_rules_take_all_addresses_travels_as_kebab_case_and_defaults_off() {
+    let mut on = route_policy_update_request_sample("suggest");
+    on.app_rules_take_all_addresses = true;
+    let json = serde_json::to_value(&on).expect("serialise");
+    assert_eq!(
+        json["app-rules-take-all-addresses"], true,
+        "the QML switch reads `app-rules-take-all-addresses`"
+    );
+
+    // Programs overriding address rules is the user's choice: an omitted
+    // field never reads as on.
+    let mut json = json;
+    let obj = json.as_object_mut().expect("object payload");
+    obj.remove("app-rules-take-all-addresses");
+    let parsed: RoutePolicyUpdateRequest =
+        serde_json::from_value(json).expect("deserialise pre-field payload");
+    assert!(!parsed.app_rules_take_all_addresses);
 }
 
 /// Every push event a client can receive. Kept here rather than built ad

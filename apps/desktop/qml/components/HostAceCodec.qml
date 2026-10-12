@@ -34,6 +34,15 @@ QtObject {
         return ace !== "" ? ace : trimmed
     }
 
+    /// The ACE form of a host the user typed in Unicode, or "" when there is
+    /// nothing to show: an ASCII host, or a conversion that failed. The rule
+    /// form's hint, unlike `encode`, which must always return a value.
+    function hint(host) {
+        var trimmed = String(host || "").trim()
+        var ace = encode(trimmed)
+        return ace !== trimmed ? ace : ""
+    }
+
     /// ACE host -> Unicode, for display. A value with no `xn--` label is
     /// returned untouched.
     function decode(host) {

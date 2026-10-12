@@ -167,9 +167,8 @@ impl IpcHandler for SnapshotInitialHandler {
         };
         let autostart = Some(self.autostart.get());
         let retention_settings = Some(self.retention.get());
-        // App rules whose exe resolved to no path (the
-        // orchestrator publishes the set on every filter compute).
-        let unenforced_app_rules = self.app_enforcement.unresolved();
+        // The caller's own app rules whose exe resolved to no path.
+        let unenforced_app_rules = self.app_enforcement.unresolved(ctx.caller_stored());
         // Smart-kill-switch shared-IP exclusion count for the GUI
         // "strictness reduced for N shared IPs" warning.
         let kill_switch_shared_ip_exemptions = self.shared_ip_exemptions.count();
@@ -319,7 +318,8 @@ mod tests {
             oper_status: "up".into(),
         };
         let app_enforcement = AppEnforcementStatus::new();
-        app_enforcement.set_unresolved(vec!["ab.exe".into(), "disko*.exe".into()]);
+        app_enforcement.set_unresolved("unix:uid:1000", vec!["ab.exe".into(), "disko*.exe".into()]);
+        app_enforcement.set_unresolved("unix:uid:1001", vec!["other.exe".into()]);
         let shared_exemptions = crate::app_enforcement_status::SharedIpExemptionStatus::new();
         shared_exemptions.set(&[
             std::net::Ipv4Addr::new(192, 0, 2, 1),
@@ -347,9 +347,15 @@ mod tests {
             block_all,
         );
 
-        let resp = h.handle(&req(), &ctx()).unwrap();
+        let caller = IpcRequestContext {
+            caller_principal: Some(nrr_domain::user_principal::UserPrincipal::from_linux_uid(
+                1000,
+            )),
+            ..ctx()
+        };
+        let resp = h.handle(&req(), &caller).unwrap();
         let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
-        // Sorted + deduped by the status.
+        // The caller's own, sorted + deduped by the status; another user's stay out.
         assert_eq!(parsed.unenforced_app_rules, vec!["ab.exe", "disko*.exe"]);
         // The smart-kill-switch exclusion count rides the same snapshot.
         assert_eq!(parsed.kill_switch_shared_ip_exemptions, 3);

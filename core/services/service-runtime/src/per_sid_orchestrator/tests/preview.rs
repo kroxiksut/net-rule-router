@@ -42,7 +42,7 @@ fn a_preview_publishes_nothing_about_the_live_policy() {
         "the preview itself must still report what it found"
     );
     assert!(
-        app_status.unresolved().is_empty(),
+        app_status.unresolved("S-1-5-21-A").is_empty(),
         "the GUI's unresolved-app list belongs to the APPLIED policy"
     );
     assert_eq!(

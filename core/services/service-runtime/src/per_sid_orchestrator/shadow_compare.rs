@@ -105,6 +105,7 @@ impl PerSidApplyOrchestrator {
     /// this returns, and the kill-switch classes are compared by their own
     /// oracle tests — widening this to them before they are modelled would
     /// report a difference that means nothing.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn shadow_compare_neutral_plan(
         &self,
         sid: &str,
@@ -112,6 +113,7 @@ impl PerSidApplyOrchestrator {
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
         fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
         secondary_ip_denylist: &std::collections::HashSet<std::net::Ipv4Addr>,
+        app_takeover: bool,
         live: &[nrr_platform_api::types::WfpFilterSpec],
     ) -> bool {
         // Same input, same verdict — and the verdict is already in the log.
@@ -138,6 +140,7 @@ impl PerSidApplyOrchestrator {
             rule_book,
             fqdn_cache,
             secondary_ip_denylist,
+            app_takeover,
             live,
         ) else {
             return false;
@@ -177,6 +180,7 @@ impl PerSidApplyOrchestrator {
     /// nothing can hold to account.
     ///
     /// `None` when the SID is not a principal this build can model.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn neutral_plan_verdict(
         &self,
         sid: &str,
@@ -184,6 +188,7 @@ impl PerSidApplyOrchestrator {
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
         fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
         secondary_ip_denylist: &std::collections::HashSet<std::net::Ipv4Addr>,
+        app_takeover: bool,
         live: &[nrr_platform_api::types::WfpFilterSpec],
     ) -> Option<NeutralPlanVerdict> {
         use nrr_platform_api::enforcement::{EnforcementPlan, UserPrincipal};
@@ -203,6 +208,7 @@ impl PerSidApplyOrchestrator {
             app_resolver: self.app_resolver.as_ref(),
             app_observations: self.app_observations.as_ref(),
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: app_takeover,
             // The set the live pass hid from the tunnel. Comparing against a
             // plan that never saw it was comparing a pipeline WITH the
             // shared-IP policy to one without: every secondary rule then

@@ -131,7 +131,7 @@ WhatsAp*.exe  # Messaging and social apps
 discord.exe  # Messaging and social apps
 signal.exe  # Messaging and social apps
 viber.exe  # Messaging and social apps
-line.exe  # Messaging and social apps
+# line.exe  # LINE: the process name is too generic, check it on your machine
 skype.exe  # Messaging and social apps
 zoom.exe  # Messaging and social apps
 slack.exe  # Messaging and social apps
@@ -140,7 +140,7 @@ wechat.exe  # Messaging and social apps
 
 chatgpt.exe  # AI desktop wrappers and launchers (common names)
 claude.exe  # AI desktop wrappers and launchers (common names)
-poe.exe  # AI desktop wrappers and launchers (common names)
+# poe.exe  # Poe: the process name is too generic, check it on your machine
 codex.exe  # AI desktop wrappers and launchers (common names)
 codex*.exe  # AI desktop wrappers and launchers (common names)
 Cursor.exe  # AI desktop wrappers and launchers (common names)

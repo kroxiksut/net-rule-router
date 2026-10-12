@@ -74,26 +74,30 @@ pub fn collect_exemptions(
     };
 
     let mut local_subnets = primary_local_subnets(routes, primary.index);
-    for subnet in virtual_machine_local_subnets(routes, adapters, Some(secondary.index)) {
+    for subnet in virtual_machine_local_subnets(routes, adapters, secondary.map(|s| s.index)) {
         if !local_subnets.contains(&subnet) {
             local_subnets.push(subnet);
         }
     }
+    // A tunnel that removes its link on disconnect leaves no route on it to set
+    // apart; no interface is numbered 0 on either OS.
+    let tunnel = secondary.map_or(0, |s| s.index);
 
     CatchAllExemptions {
-        server_ips: bootstrap_server_ips(routes, secondary.index, Some(primary_gateway)),
+        server_ips: bootstrap_server_ips(routes, tunnel, Some(primary_gateway)),
         local_subnets,
         server_ips_v6: bootstrap_server_ips_v6(
             routes,
-            secondary.index,
+            tunnel,
             primary_gateway_v6(routes, primary.index),
         ),
         local_subnets_v6: primary_local_subnets_v6(routes, primary.index),
     }
 }
 
-/// Whether [`collect_exemptions`] can read anything for these bindings: both
-/// links present, and the primary with a gateway.
+/// Whether [`collect_exemptions`] can read anything for these bindings: the
+/// primary present with a gateway and a tunnel bound, present or not — the LAN
+/// is read off the primary alone.
 #[must_use]
 pub fn links_resolve(
     adapters: &[AdapterInfo],
@@ -110,9 +114,9 @@ fn resolve_links<'a>(
     adapters: &'a [AdapterInfo],
     primary_name: Option<&str>,
     secondary_name: Option<&str>,
-) -> Option<(&'a AdapterInfo, &'a AdapterInfo, Ipv4Addr)> {
+) -> Option<(&'a AdapterInfo, Option<&'a AdapterInfo>, Ipv4Addr)> {
     let primary = primary_name.and_then(|n| adapter_by_name(adapters, n))?;
-    let secondary = secondary_name.and_then(|n| adapter_by_name(adapters, n))?;
+    let secondary = adapter_by_name(adapters, secondary_name?);
     let gateway = primary.gateways.first().copied()?;
     Some((primary, secondary, gateway))
 }
@@ -211,6 +215,21 @@ mod tests {
         let (routes, adapters) = machine();
         assert!(!collect_exemptions(&routes, &adapters, Some("eth0"), None).can_arm());
         assert!(!collect_exemptions(&routes, &adapters, None, Some("tun0")).can_arm());
+    }
+
+    /// WireGuard and AmneziaWG remove their link on disconnect. The LAN comes
+    /// off the primary, so the guard keeps its holes while the tunnel is gone.
+    #[test]
+    fn a_tunnel_whose_link_is_gone_still_exempts_the_lan_and_the_server() {
+        let (routes, mut adapters) = machine();
+        adapters.retain(|a| a.friendly_name != "tun0");
+
+        let ex = collect_exemptions(&routes, &adapters, Some("eth0"), Some("tun0"));
+
+        assert_eq!(ex.server_ips, vec![Ipv4Addr::new(203, 0, 113, 7)]);
+        assert_eq!(ex.local_subnets, vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]);
+        assert!(links_resolve(&adapters, Some("eth0"), Some("tun0")));
+        assert!(!links_resolve(&adapters, None, Some("tun0")));
     }
 
     /// A primary with no gateway cannot produce a bootstrap route, and calling

@@ -180,6 +180,9 @@ Window {
             // assertion in Qt's window-update path, which took the tray process
             // down — and the main window followed it.
             placeTimer.restart()
+            // A new screen gets the whole allowance, not what the last one left.
+            _retireRestart = true
+            _retireRestart = false
         } else {
             _placeOnScreen()
             show()

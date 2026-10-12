@@ -71,7 +71,7 @@ The helper is held to narrow rules:
 
 ## Installation scope
 
-The service is installed machine-wide only; there is no per-user install. A release build refuses to register the service from a directory an ordinary user can write to, and says why: whoever can replace the service executable gets code execution as the system account. Installing or updating the service requires elevation.
+The service is installed machine-wide only; there is no per-user install. A release build never registers the service from a directory an ordinary user can write to: whoever can replace the service executable gets code execution as the system account. Installing from such a directory — an unpacked portable copy on the desktop or a USB stick — registers a copy instead: the service executable and the files it loads are copied into `NetRuleRouter Service` under Program Files, a folder only administrators can change, checked byte for byte after copying, and registered from there only once that folder is confirmed out of reach of ordinary accounts. A later install from a newer copy updates it; removing the service removes it. The folder you install from is trusted at the moment you install, as with any installer; changes made to it afterwards no longer reach the service. Installing or updating the service requires elevation.
 
 On Windows every executable loads libraries only from the Windows system directory and its own installation folder, never from the current directory or `PATH`. The interface takes its Qt plugins and QML modules from the installation folder only: environment variables and folders outside it cannot redirect them. That makes the installation folder the one place whose integrity matters, so it must stay writable by administrators only.
 

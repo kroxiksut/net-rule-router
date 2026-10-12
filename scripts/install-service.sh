@@ -52,6 +52,8 @@ case "$profile" in
     ;;
 esac
 
+nrr_refuse_if_package_managed "remove the package first (apt remove / dnf remove netrulerouter), then run this again."
+
 target_root="$(nrr_target_root "$repo_root")"
 exe_path="$(nrr_built_service_binary "$target_root" "$profile")"
 

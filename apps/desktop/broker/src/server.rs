@@ -347,6 +347,17 @@ fn run_with_budget(
     Ok((status, reader.join().unwrap_or_default()))
 }
 
+/// The refusal code for a service verb that exited with `exit_code`. A failed
+/// relocation has its own, so the application can say what to check instead of
+/// echoing the verb's English text.
+fn failure_code(exit_code: i32) -> &'static str {
+    if exit_code == i32::from(nrr_platform_api::service_control::RELOCATION_FAILED_EXIT_CODE) {
+        "service-relocation-failed"
+    } else {
+        "service-control-failed"
+    }
+}
+
 /// The child's last non-empty stderr line, for an error message.
 fn last_stderr_line(stderr: &str) -> Option<&str> {
     stderr
@@ -408,7 +419,7 @@ fn run_service_control(hint: Option<&str>, action: &str) -> BrokerResponse {
                 "service-control: {action} FAILED exit={code}{reason}"
             ));
             BrokerResponse::err(
-                "service-control-failed",
+                failure_code(code),
                 format!("'{action}' exited with code {code}{reason}"),
             )
         }
@@ -720,7 +731,7 @@ install failed: no PROGRAMDATA
     }
 
     use super::{
-        check_service_binary, claim_post_elevation_settle, log_dir_candidates,
+        check_service_binary, claim_post_elevation_settle, failure_code, log_dir_candidates,
         resolve_service_binary, rotate_broker_log, AtomicBool,
     };
     use nrr_shared::product_identity::BinaryRole;
@@ -807,6 +818,32 @@ install failed: no PROGRAMDATA
         assert!(resolve_service_binary(Some(&elsewhere), Some(&dir)).is_err());
         let renamed = dir.join("payload.exe");
         assert!(resolve_service_binary(Some(&renamed), Some(&dir)).is_err());
+    }
+
+    /// An install from a portable copy registers a protected copy elsewhere.
+    /// The broker never learns that location and never runs it: every verb,
+    /// uninstall and update included, runs the sibling, which reaches the
+    /// registration by service name.
+    #[test]
+    fn the_registered_protected_copy_is_never_what_the_broker_runs() {
+        let portable = PathBuf::from(r"D:\Portable\NetRuleRouter");
+        let installed_copy =
+            Path::new(r"C:\Program Files\NetRuleRouter Service").join(service_name());
+        assert!(check_service_binary(&installed_copy, Some(&portable)).is_err());
+        assert!(resolve_service_binary(Some(&installed_copy), Some(&portable)).is_err());
+        assert_eq!(
+            resolve_service_binary(None, Some(&portable)),
+            Ok(portable.join(service_name()))
+        );
+    }
+
+    #[test]
+    fn a_failed_relocation_is_named_and_every_other_failure_stays_generic() {
+        let relocation = i32::from(nrr_platform_api::service_control::RELOCATION_FAILED_EXIT_CODE);
+        assert_eq!(failure_code(relocation), "service-relocation-failed");
+        for other in [1, 2, 3, -1] {
+            assert_eq!(failure_code(other), "service-control-failed", "{other}");
+        }
     }
 
     #[test]

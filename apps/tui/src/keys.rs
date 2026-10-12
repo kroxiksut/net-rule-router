@@ -245,6 +245,16 @@ pub const ENF_RESTORED_WHERE: Key = key(
     "The list of what was blocked: {screen}",
 );
 
+pub const APP_UNRESOLVED_TITLE: Key = key(
+    "notifications.app-unresolved.title",
+    "App rules applied, but some apps weren't found",
+);
+pub const APP_UNRESOLVED_BODY: Key = key(
+    "notifications.app-unresolved.body",
+    "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules.",
+);
+pub const APP_UNRESOLVED_MORE: Key = key("status.app-unresolved-more", "+{n} more");
+
 // ── Notices ──────────────────────────────────────────────────────────────────
 
 pub const NOTICES_TITLE: Key = key("notifications.title", "Notifications");
@@ -397,6 +407,9 @@ pub const ALL: &[Key] = &[
     ENF_RESTORED_TITLE,
     ENF_RESTORED_BODY,
     ENF_RESTORED_WHERE,
+    APP_UNRESOLVED_TITLE,
+    APP_UNRESOLVED_BODY,
+    APP_UNRESOLVED_MORE,
     NOTICES_TITLE,
     NOTICES_EMPTY,
     LEVEL_WARNING,

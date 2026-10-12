@@ -166,6 +166,10 @@ pub mod logind;
 #[cfg(target_os = "linux")]
 pub mod own_traffic;
 
+/// `SO_BINDTODEVICE` holding a probe to the link its source address belongs to.
+#[cfg(target_os = "linux")]
+pub mod source_link;
+
 /// Linux host system-information collector for the diagnostic archive — the
 /// analog of `nrr_platform_windows::system_info`. Reads procfs / `os-release`
 /// (`/proc/cpuinfo`, `/proc/meminfo`, `/etc/os-release`) to enrich the

@@ -294,7 +294,11 @@ const OS_ERROR_DATAGRAM_TOO_LARGE: Option<i32> = None;
 fn classify_recv_error(error: &std::io::Error) -> RecvErrorClass {
     use std::io::ErrorKind;
     match error.kind() {
-        ErrorKind::WouldBlock | ErrorKind::TimedOut => RecvErrorClass::Idle,
+        // A signal (resume from sleep among them) interrupts a waiting
+        // receive; nothing arrived and nothing is wrong.
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted => {
+            RecvErrorClass::Idle
+        }
         // Windows surfaces the ICMP port-unreachable for a reply to a client
         // whose port already closed (WSAECONNRESET) on the NEXT receive.
         ErrorKind::ConnectionReset

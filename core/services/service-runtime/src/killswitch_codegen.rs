@@ -86,9 +86,10 @@ use nrr_platform_api::wfp_slotting::{pack_both, FamilyChunk, V4SlotChunk};
 // Weight bands come from `wfp_bands`, which holds the complete order and
 // asserts it. This file emits filters; it does not get to invent a band.
 use crate::wfp_bands::{
-    APP_EXEMPT_BASE, APP_KILLSWITCH_BLOCK_BASE, APP_KILLSWITCH_MAX_APPS, CATCHALL_BLOCK_WEIGHT,
-    CATCHALL_EXEMPT_BASE, DOH_BLOCK_BASE, FAKEIP_POOL_PERMIT_BASE, KILLSWITCH_BLOCK_BASE,
-    KILLSWITCH_MAX_DESTINATIONS, KILLSWITCH_PERMIT_BASE, PACKET_BLOCK_BASE, PACKET_EXEMPT_BASE,
+    APP_EXEMPT_BASE, APP_KILLSWITCH_BLOCK_BASE, APP_KILLSWITCH_MAX_APPS, APP_TAKEOVER_BLOCK_BASE,
+    APP_TAKEOVER_MAX_APPS, CATCHALL_BLOCK_WEIGHT, CATCHALL_EXEMPT_BASE, DOH_BLOCK_BASE,
+    FAKEIP_POOL_PERMIT_BASE, KILLSWITCH_BLOCK_BASE, KILLSWITCH_MAX_DESTINATIONS,
+    KILLSWITCH_PERMIT_BASE, PACKET_BLOCK_BASE, PACKET_EXEMPT_BASE,
 };
 
 use crate::wfp_codegen::filter_id_for;
@@ -524,6 +525,20 @@ pub fn app_kill_switch_filters(
     secondary_luid: u64,
     protocols: KillSwitchProtocols,
 ) -> Vec<WfpFilterSpec> {
+    app_kill_switch_filters_for(sid, app_patterns, secondary_luid, protocols, false)
+}
+
+/// [`app_kill_switch_filters`] under the principal's
+/// `app_rules_take_all_addresses`. With it on, the block outranks the primary
+/// rule permits: the app takes every address it uses, main-named ones
+/// included, so it must reach none of them off the tunnel.
+pub fn app_kill_switch_filters_for(
+    sid: &str,
+    app_patterns: &[String],
+    secondary_luid: u64,
+    protocols: KillSwitchProtocols,
+    app_takeover: bool,
+) -> Vec<WfpFilterSpec> {
     if secondary_luid == 0 || !protocols.wants_ale_block() {
         return Vec::new();
     }
@@ -538,8 +553,9 @@ pub fn app_kill_switch_filters(
         // An address a MAIN-LINK rule names is not this app's to cut: the block
         // sits BELOW the primary rule band, so the primary rules' own permits
         // outrank it for every address they name — uncapped, unlike the old
-        // per-(app, address) rescue permits this ordering replaced.
-        filters.push(block_app_off_secondary(sid, pattern, idx));
+        // per-(app, address) rescue permits this ordering replaced. Unless the
+        // app takes all its addresses: then those are its own.
+        filters.push(block_app_off_secondary(sid, pattern, idx, app_takeover));
     }
     filters
 }
@@ -581,13 +597,20 @@ fn permit_app_via_secondary(
 /// Per-app `Block` half: drop `pattern`'s process whenever its egress-
 /// conditional permit does not match (secondary adapter down / off-tunnel fallback). Above
 /// the per-process Permit's secondary band, below the primary rule band and the
-/// app permit — see [`APP_KILLSWITCH_BLOCK_BASE`].
+/// app permit — see [`APP_KILLSWITCH_BLOCK_BASE`] — or above the primary band
+/// under the takeover setting ([`app_block_band`]).
 ///
 /// The id folds a band tag for the same reason the permit folds its LUID: a
 /// WFP filter is immutable by key and the add-only install swallows a
 /// duplicate id, so a weight change under the OLD id would leave the stale
 /// higher-weight block alive across an upgrade.
-fn block_app_off_secondary(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec {
+fn block_app_off_secondary(
+    sid: &str,
+    pattern: &str,
+    idx: u64,
+    app_takeover: bool,
+) -> WfpFilterSpec {
+    let (weight, band) = app_block_band(idx, app_takeover);
     WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
@@ -595,20 +618,25 @@ fn block_app_off_secondary(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec 
         remote_ip_set: Vec::new(),
         remote_ip_set_v6: Vec::new(),
         remote_port: None,
-        weight: APP_KILLSWITCH_BLOCK_BASE + idx,
-        id: filter_id_for(
-            sid,
-            KILLSWITCH_ROLE,
-            "sub-main-band",
-            "ks-app-block",
-            pattern,
-        ),
+        weight,
+        id: filter_id_for(sid, KILLSWITCH_ROLE, band, "ks-app-block", pattern),
         user_sid: Some(sid.to_string()),
         app_pattern: Some(pattern.to_string()),
         local_interface_luid: None,
         remote_subnet: None,
         remote_subnet_v6: None,
         ip_protocol: None,
+    }
+}
+
+/// Weight and id band tag of the `idx`-th pinned app's block. Under the
+/// takeover setting it sits above the primary rule permits while it fits the
+/// window; past that it keeps the sub-primary weight.
+pub(crate) fn app_block_band(idx: u64, app_takeover: bool) -> (u64, &'static str) {
+    if app_takeover && idx < APP_TAKEOVER_MAX_APPS as u64 {
+        (APP_TAKEOVER_BLOCK_BASE + idx, "over-main-band")
+    } else {
+        (APP_KILLSWITCH_BLOCK_BASE + idx, "sub-main-band")
     }
 }
 

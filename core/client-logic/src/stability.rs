@@ -89,6 +89,14 @@ pub const KEY_CAPABILITY: [(&str, &str); 3] = [
     ("conn-trace-gui", "connTraceLog"),
 ];
 
+/// Keys that drive a feature of their own: even a service that applies the
+/// whole row only stores them where the platform lacks that feature.
+pub const KEY_REQUIRES: [(&str, &str); 3] = [
+    ("fake-ip-enabled", "fakeIp"),
+    ("fake-ip-udp-relay", "fakeIp"),
+    ("fake-ip-instant-rst", "fakeIp"),
+];
+
 const WHOLE_ROW_CAPABILITY: &str = "serviceStabilityConfig";
 
 /// The declared default of a scalar field.
@@ -180,6 +188,12 @@ fn profile_supports(supports: Option<&Map<String, Value>>, feature: &str) -> boo
 
 /// Whether this platform's service applies `key`.
 pub fn key_applies(key: &str, supports: Option<&Map<String, Value>>) -> bool {
+    let feature_missing = KEY_REQUIRES
+        .iter()
+        .any(|(name, capability)| *name == key && !profile_supports(supports, capability));
+    if feature_missing {
+        return false;
+    }
     if profile_supports(supports, WHOLE_ROW_CAPABILITY) {
         return true;
     }

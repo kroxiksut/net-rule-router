@@ -1,7 +1,8 @@
 //! The Status screen: the routing state in words, both connections with
 //! whether their rules are in force, and the notice feed.
 
-use nrr_client_logic::adapters::display_name;
+use nrr_client_logic::adapters::{bound_row_index, display_name};
+use nrr_client_logic::placeholders::list_summary;
 use nrr_client_logic::Route;
 use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
 
@@ -200,7 +201,28 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if app.restore.offer.is_some() {
         lines.push(ViewLine::text(texts.get(restore::OFFER_LINE)));
     }
+    lines.extend(unresolved_app_lines(app, texts));
     lines
+}
+
+/// The caller's app rules that found no program: standing while it lasts, so
+/// it sits with the state rather than in the feed.
+fn unresolved_app_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
+    let apps = match &app.snapshot {
+        Some(snapshot) if app.link.is_connected() => &snapshot.unenforced_app_rules,
+        _ => return Vec::new(),
+    };
+    if apps.is_empty() {
+        return Vec::new();
+    }
+    let summary = list_summary(apps, &texts.get(keys::APP_UNRESOLVED_MORE));
+    vec![
+        ViewLine::new(vec![Segment::state(
+            texts.get(keys::APP_UNRESOLVED_TITLE),
+            StateTone::Caution,
+        )]),
+        ViewLine::text(texts.fill(keys::APP_UNRESOLVED_BODY, &[("apps", summary)])),
+    ]
 }
 
 fn role_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
@@ -260,13 +282,7 @@ pub(crate) fn bound_row<'a>(
     rows: &'a [InterfaceRowDto],
     binding: &RouteBindingDto,
 ) -> Option<&'a InterfaceRowDto> {
-    let names = |id: &str| {
-        std::iter::once(binding.stable_id.as_str())
-            .chain(binding.known_stable_ids.iter().map(String::as_str))
-            .any(|known| !known.is_empty() && known.eq_ignore_ascii_case(id))
-    };
-    rows.iter()
-        .find(|row| names(&row.persistent_id) || names(&row.adapter_name))
+    bound_row_index(rows, binding).and_then(|i| rows.get(i))
 }
 
 fn availability(row: Option<&InterfaceRowDto>, texts: &Texts) -> Segment {
@@ -313,4 +329,42 @@ fn notice_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         lines.push(ViewLine::text(notice.body.clone()));
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{app_at, texts_en, Fixture};
+
+    fn shown(app: &AppState) -> Vec<String> {
+        routing_lines(app, &texts_en())
+            .iter()
+            .map(|line| line.segments.iter().map(|s| s.text.as_str()).collect())
+            .collect()
+    }
+
+    /// App rules with no program behind them stand under the routing state,
+    /// named, the fourth and later counted; nothing while none or offline.
+    #[test]
+    fn app_rules_that_found_no_program_are_named_under_the_state() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        assert!(!shown(&app).iter().any(|l| l.contains("weren't found")));
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.unenforced_app_rules = ["a.exe", "b.exe", "c.exe", "d.exe"]
+                .map(String::from)
+                .to_vec();
+        }
+        let lines = shown(&app);
+        assert!(lines
+            .iter()
+            .any(|l| l == "App rules applied, but some apps weren't found"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(": a.exe, b.exe, c.exe +1 more.")),
+            "{lines:?}"
+        );
+        app.link = Link::Offline;
+        assert!(!shown(&app).iter().any(|l| l.contains("weren't found")));
+    }
 }

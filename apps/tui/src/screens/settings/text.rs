@@ -198,6 +198,14 @@ pub const SUBDOMAINS: Key = key(
     "Also cover subdomains for domain rules",
 );
 pub const SUBDOMAINS_NOTE: Key = key("settings.routing-behavior.include-subdomains.note", "");
+pub const APP_TAKEOVER: Key = key(
+    "settings.routing-behavior.app-rules-take-all.label",
+    "Programs in your rules take all their traffic",
+);
+pub const APP_TAKEOVER_NOTE: Key = key(
+    "settings.routing-behavior.app-rules-take-all.description",
+    "",
+);
 pub const LEAK_TITLE: Key = key("settings.routing.kill-switch.title", "Leak protection");
 pub const LEAK_ENABLE: Key = key(
     "settings.routing.kill-switch.enable-label",
@@ -780,6 +788,8 @@ pub fn all() -> Vec<Key> {
         MODE_STRICT_SECONDARY,
         SUBDOMAINS,
         SUBDOMAINS_NOTE,
+        APP_TAKEOVER,
+        APP_TAKEOVER_NOTE,
         LEAK_TITLE,
         LEAK_ENABLE,
         LEAK_ENABLE_NOTE,

@@ -256,6 +256,7 @@ fn route_policy_record(sid: &str, mode: BehaviorMode) -> RoutePolicyRecord {
         zone_priority_over_ip: false,
         short_name_completion: false,
         short_name_suffix: String::new(),
+        app_rules_take_all_addresses: false,
         binding_source: BindingSource::UserAssigned,
     }
 }

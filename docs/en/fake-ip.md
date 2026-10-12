@@ -40,9 +40,10 @@ adapter:
   adapter. The file is shipped exactly as its author signed it and is used only
   through its published interface. See
   [Third-party components](third-party-components.md).
-- **Linux** provides an equivalent adapter in the operating system itself, so
-  the Linux build ships no extra driver. The same will hold on macOS when a
-  build for it exists.
+- **Linux** is not covered yet: this version does not offer fake-IP there.
+  The operating system has an equivalent adapter built in, so the Linux build
+  will need no extra driver once the feature reaches it. See
+  [On Linux today](#on-linux-today).
 
 The Settings screen shows the driver's status next to the checkbox, so you can
 confirm the genuine driver is present before relying on the feature.
@@ -61,6 +62,15 @@ Fake-IP is deliberately not used for every connection:
 
 In each of these cases the connection simply uses its real address, and the
 rest of NetRuleRouter's protection still applies.
+
+## On Linux today
+
+Until fake-IP reaches Linux, routing and leak protection there decide per
+address. While the additional connection is up this changes nothing you would
+notice. While it is **down** and leak protection holds a routed site back, a
+site you did not route can be held back with it if both happen to be served
+from the same address, which is common behind large content delivery networks.
+It opens again as soon as the additional connection is back.
 
 ## Known limitation: DNS-over-HTTPS
 

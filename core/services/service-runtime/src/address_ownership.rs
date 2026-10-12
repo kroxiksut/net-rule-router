@@ -25,6 +25,13 @@
 //!    program happens to touch. A route cannot be scoped to a process, so
 //!    honouring the app rule would move every other process talking to the same
 //!    address, against a rule the user wrote for that very host.
+//!
+//!    A per-user setting inverts this for programs: an application rule then
+//!    takes every address its program uses, the other link's address rules
+//!    notwithstanding. The price is the one above — the address goes the
+//!    program's route for every program on the machine. A literal-IP Block
+//!    still vetoes, two programs on different links leave a shared address
+//!    with the main link, and rule 2 is untouched.
 //! 2. **A named address is never blocked.** When two of the user's rules point
 //!    one address in opposite directions, blocking is not one of the two
 //!    outcomes — it is a third one nobody asked for, and the worst of the three.
@@ -103,8 +110,13 @@ pub struct AddressOwnership {
     /// no network is claimed.
     main_zone_only: HashSet<IpAddr>,
     additional_zone_only: HashSet<IpAddr>,
-    /// `route_rank`'s addresses in address order, built on the first interior
-    /// query so a compute that never asks pays nothing.
+    /// Addresses application rules took from the address rules, by the link
+    /// whose program uses them. Empty unless `app_takeover` is set.
+    app_taken: HashMap<IpAddr, Link>,
+    /// Rule 1 inverted for programs: see the module doc.
+    app_takeover: bool,
+    /// `route_rank`'s and `app_taken`'s addresses in address order, built on
+    /// the first interior query so a compute that never asks pays nothing.
     explicit_sorted: OnceLock<Vec<IpAddr>>,
     order: ZoneVsIpOrder,
 }
@@ -287,9 +299,66 @@ impl AddressOwnership {
             networks,
             main_zone_only,
             additional_zone_only,
+            app_taken: HashMap::new(),
+            app_takeover: false,
             explicit_sorted: OnceLock::new(),
             order,
         }
+    }
+
+    /// Resolve under a principal's settings. Every mechanism that holds the
+    /// app observations builds its arbiter here, so none of them can apply the
+    /// takeover differently from the others.
+    #[must_use]
+    pub fn resolve_for(
+        rule_book: &CanonicalRuleBook,
+        cache: &dyn FqdnCacheLookup,
+        settings: OwnershipSettings,
+        support: RuleShapeSupport,
+        observations: &dyn AppObservationLookup,
+    ) -> Self {
+        let ownership = Self::resolve_with_support(rule_book, cache, settings.order, support);
+        if settings.app_takeover {
+            ownership.with_app_takeover(rule_book, observations)
+        } else {
+            ownership
+        }
+    }
+
+    /// Hand every address each link's application rules were observed using to
+    /// that link, ahead of any address rule — the setting that inverts rule 1.
+    ///
+    /// The main link is walked first, so an address programs on both links use
+    /// stays with it, the tie-break [`Self::owner_of`] applies everywhere else.
+    /// A literal-IP Block's address is never taken.
+    #[must_use]
+    pub fn with_app_takeover(
+        mut self,
+        rule_book: &CanonicalRuleBook,
+        observations: &dyn AppObservationLookup,
+    ) -> Self {
+        for (set, link) in [
+            (&rule_book.primary, Link::Main),
+            (&rule_book.secondary, Link::Additional),
+        ] {
+            for pattern in crate::app_destination_memory::routed_app_patterns(set) {
+                for ip in observations.ips_for_app(&pattern) {
+                    let ip = IpAddr::V4(ip);
+                    if !self.literal_blocks.contains_key(&ip) {
+                        self.app_taken.entry(ip).or_insert(link);
+                    }
+                }
+            }
+        }
+        self.app_takeover = true;
+        self.explicit_sorted = OnceLock::new();
+        self
+    }
+
+    /// Whether application rules take their addresses from the address rules.
+    #[must_use]
+    pub fn app_takeover(&self) -> bool {
+        self.app_takeover
     }
 
     /// Build from already-resolved sets. For callers that hold one side only
@@ -310,9 +379,19 @@ impl AddressOwnership {
     /// works only while the tunnel is up.
     ///
     /// A network decides only what no closer claim holds: an address held
-    /// through a zone alone goes to the other link's network (rule 5).
+    /// through a zone alone goes to the other link's network (rule 5). An
+    /// address a program took under the takeover setting is its link's before
+    /// any of that.
     #[must_use]
     pub fn owner_of(&self, ip: IpAddr) -> Option<Link> {
+        self.app_taken
+            .get(&ip)
+            .copied()
+            .or_else(|| self.address_owner(ip))
+    }
+
+    /// [`Self::owner_of`] as the address rules alone settle it.
+    fn address_owner(&self, ip: IpAddr) -> Option<Link> {
         let network = || self.networks.winner(ip);
         if self.main.contains(&ip) {
             if self.main_zone_only.contains(&ip) && network() == Some(Link::Additional) {
@@ -336,7 +415,9 @@ impl AddressOwnership {
     /// No when the other link's address rules name it: see rule 1 in the module
     /// doc. The check is symmetric on purpose, because the failure is: a program
     /// on one link touches an address the user routed over the other, and the
-    /// address follows the program instead of the rule written for it.
+    /// address follows the program instead of the rule written for it. Under
+    /// the takeover setting the program's own claim decides, so the answer is
+    /// no only when a program on the main link uses the address too.
     #[must_use]
     pub fn app_rule_may_claim(&self, ip: IpAddr, for_link: Link) -> bool {
         match self.owner_of(ip) {
@@ -371,6 +452,21 @@ impl AddressOwnership {
             Link::Additional => Link::Main,
         };
         self.owner_of(ip) != Some(other)
+    }
+
+    /// Whether an ADDRESS rule's FILTER on `for_link` may act on this address:
+    /// [`Self::address_rule_may_steer`], except that the main link's permit
+    /// stays on an address a program on the additional link took. A filter
+    /// steers nothing, and with the tunnel gone every other program must still
+    /// reach the address directly — rule 2 with the takeover setting on.
+    #[must_use]
+    pub fn address_rule_may_permit(&self, ip: IpAddr, for_link: Link) -> bool {
+        match (for_link, self.app_taken.get(&ip)) {
+            (Link::Main, Some(Link::Additional)) => {
+                self.address_owner(ip) != Some(Link::Additional)
+            }
+            _ => self.address_rule_may_steer(ip, for_link),
+        }
     }
 
     /// Whether enforcement may install a BLOCK for this address. See rule 2.
@@ -469,6 +565,12 @@ impl AddressOwnership {
         &self.additional
     }
 
+    /// Addresses programs took under the takeover setting, with the link that
+    /// took each, in no particular order.
+    pub fn app_taken(&self) -> impl Iterator<Item = (IpAddr, Link)> + '_ {
+        self.app_taken.iter().map(|(ip, link)| (*ip, *link))
+    }
+
     /// The networks `link`'s route rules name, in address order. A network
     /// both links name is listed for both.
     pub fn networks(&self, link: Link) -> impl Iterator<Item = IpBlock> + '_ {
@@ -488,15 +590,21 @@ impl AddressOwnership {
             .map(|(net, _)| net)
     }
 
-    /// The addresses route rules name literally or through a host that lie
-    /// inside `network`, in address order — what an emitter carving `network`
-    /// asks [`Self::owner_of`] or [`Self::block_yields`] about, without walking
-    /// the network itself.
+    /// The addresses route rules name literally or through a host, and those
+    /// programs took, that lie inside `network`, in address order — what an
+    /// emitter carving `network` asks [`Self::owner_of`] or
+    /// [`Self::block_yields`] about, without walking the network itself.
     #[must_use]
     pub fn explicit_inside(&self, network: IpBlock) -> &[IpAddr] {
         let sorted = self.explicit_sorted.get_or_init(|| {
-            let mut ips: Vec<IpAddr> = self.route_rank.keys().copied().collect();
+            let mut ips: Vec<IpAddr> = self
+                .route_rank
+                .keys()
+                .chain(self.app_taken.keys())
+                .copied()
+                .collect();
             ips.sort_unstable();
+            ips.dedup();
             ips
         });
         let start = sorted.partition_point(|ip| *ip < network.network());
@@ -562,6 +670,34 @@ impl ZoneVsIpOrder {
             Self::ZoneFirst
         } else {
             Self::ExactIpFirst
+        }
+    }
+}
+
+/// A principal's stored settings the arbiter reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct OwnershipSettings {
+    pub order: ZoneVsIpOrder,
+    /// `app_rules_take_all_addresses`: rule 1 inverted for programs.
+    pub app_takeover: bool,
+}
+
+impl OwnershipSettings {
+    /// From the stored `zone_priority_over_ip` and `app_rules_take_all_addresses`.
+    #[must_use]
+    pub fn from_policy(zone_priority_over_ip: bool, app_rules_take_all_addresses: bool) -> Self {
+        Self {
+            order: ZoneVsIpOrder::from_zone_priority_over_ip(zone_priority_over_ip),
+            app_takeover: app_rules_take_all_addresses,
+        }
+    }
+}
+
+impl From<ZoneVsIpOrder> for OwnershipSettings {
+    fn from(order: ZoneVsIpOrder) -> Self {
+        Self {
+            order,
+            app_takeover: false,
         }
     }
 }
@@ -1015,7 +1151,9 @@ impl<'a> AppDestinationGate<'a> {
     ///
     /// Order matters: ownership first, because "the user's other rule names
     /// this host" is a statement about the address itself, while the census
-    /// answers a question about who else happens to be on it.
+    /// answers a question about who else happens to be on it. Under the
+    /// takeover setting the census is not asked: other programs following the
+    /// address is the price the user accepted.
     #[must_use]
     pub fn admit(&self, pattern: &str, for_link: Link) -> AppDestinations {
         let mut out = AppDestinations::default();
@@ -1023,9 +1161,10 @@ impl<'a> AppDestinationGate<'a> {
             if !self.ownership.app_rule_may_claim(IpAddr::V4(ip), for_link) {
                 out.refused
                     .push((ip, AppDestinationRefusal::ClaimedByAddressRule));
-            } else if self
-                .observations
-                .destination_used_outside(&self.friendly, ip)
+            } else if !self.ownership.app_takeover
+                && self
+                    .observations
+                    .destination_used_outside(&self.friendly, ip)
             {
                 out.refused
                     .push((ip, AppDestinationRefusal::UsedByOtherProcess));
@@ -1454,6 +1593,176 @@ mod tests {
         // Nothing routes an unnamed address, so nothing overrules its block.
         let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
         assert!(!by_exact.block_yields(other, &zone("example")));
+    }
+
+    /// Programs take every address they use: rule 1 inverted by the setting.
+    mod takeover {
+        use super::*;
+        use crate::app_observation_lookup::MockAppObservationLookup;
+
+        fn program_rule(id: &str, exe: &str) -> CanonicalRule {
+            CanonicalRule {
+                app_match: Some(CanonicalAppMatch {
+                    pattern: CanonicalAppPattern::Exact(exe.into()),
+                    include_child_processes: false,
+                }),
+                ..app_rule(id)
+            }
+        }
+
+        fn observed(exe: &str, ips: Vec<Ipv4Addr>) -> MockAppObservationLookup {
+            let obs = MockAppObservationLookup::new();
+            obs.set_ips(exe, ips);
+            obs
+        }
+
+        /// The main link names blog.example, a program on the additional link
+        /// is seen using its address.
+        fn contested() -> CanonicalRuleBook {
+            book(
+                vec![address_rule(
+                    "p1",
+                    CanonicalAddressMatch::ExactFqdn("blog.example".into()),
+                    RuleAction::Route,
+                )],
+                vec![app_rule("s1")],
+            )
+        }
+
+        fn resolve(
+            book: &CanonicalRuleBook,
+            obs: &dyn AppObservationLookup,
+            on: bool,
+        ) -> AddressOwnership {
+            AddressOwnership::resolve_for(
+                book,
+                &cache(),
+                OwnershipSettings::from_policy(false, on),
+                crate::wfp_codegen::current_rule_shape_support(),
+                obs,
+            )
+        }
+
+        #[test]
+        fn a_program_takes_an_address_the_other_links_rule_names() {
+            let obs = observed("helper.exe", vec![NAMED]);
+            let ownership = resolve(&contested(), &obs, true);
+            let ip = IpAddr::V4(NAMED);
+
+            assert_eq!(ownership.owner_of(ip), Some(Link::Additional));
+            assert!(ownership.app_rule_may_claim(ip, Link::Additional));
+            assert!(ownership
+                .refused_for_app(&[NAMED], Link::Additional)
+                .is_empty());
+            // The main rule does not steer it back...
+            assert!(!ownership.address_rule_may_steer(ip, Link::Main));
+            // ...but keeps its permit and is never blocked: rule 2.
+            assert!(ownership.address_rule_may_permit(ip, Link::Main));
+            assert!(!ownership.may_block(ip));
+            assert!(ownership.main_named().contains(&ip));
+            assert!(ownership.named_by(ip, Link::Main));
+        }
+
+        #[test]
+        fn off_leaves_the_address_rule_in_charge() {
+            let obs = observed("helper.exe", vec![NAMED]);
+            let ownership = resolve(&contested(), &obs, false);
+            let ip = IpAddr::V4(NAMED);
+
+            assert_eq!(ownership.owner_of(ip), Some(Link::Main));
+            assert!(!ownership.app_rule_may_claim(ip, Link::Additional));
+            assert!(ownership.address_rule_may_steer(ip, Link::Main));
+            assert_eq!(ownership.app_taken().count(), 0);
+            assert!(!ownership.app_takeover());
+        }
+
+        #[test]
+        fn a_literal_block_is_never_taken() {
+            let mut book = contested();
+            book.secondary = CanonicalRuleSet::from_rules(vec![
+                app_rule("s1"),
+                address_rule(
+                    "b1",
+                    CanonicalAddressMatch::ExactIp(IpAddr::V4(OTHER)),
+                    RuleAction::Block,
+                ),
+            ]);
+            let obs = observed("helper.exe", vec![OTHER]);
+            let ownership = resolve(&book, &obs, true);
+
+            assert_eq!(ownership.owner_of(IpAddr::V4(OTHER)), None);
+            assert_eq!(ownership.app_taken().count(), 0);
+            assert_eq!(ownership.literal_block_of(IpAddr::V4(OTHER)), Some("b1"));
+        }
+
+        #[test]
+        fn programs_on_both_links_leave_the_address_with_the_main_one() {
+            let book = book(
+                vec![program_rule("p1", "browser.exe")],
+                vec![app_rule("s1")],
+            );
+            let obs = observed("helper.exe", vec![OTHER]);
+            obs.set_ips("browser.exe", vec![OTHER]);
+            let ownership = resolve(&book, &obs, true);
+            let ip = IpAddr::V4(OTHER);
+
+            assert_eq!(ownership.owner_of(ip), Some(Link::Main));
+            assert!(!ownership.app_rule_may_claim(ip, Link::Additional));
+            assert!(ownership.app_rule_may_claim(ip, Link::Main));
+        }
+
+        #[test]
+        fn a_taken_address_is_one_a_network_carving_asks_about() {
+            let obs = observed("helper.exe", vec![NAMED]);
+            let ownership = resolve(&contested(), &obs, true);
+            let net = IpBlock::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)), 24).expect("net");
+
+            assert_eq!(ownership.explicit_inside(net), &[IpAddr::V4(NAMED)]);
+        }
+
+        #[test]
+        fn the_gate_admits_what_the_program_took() {
+            let obs = observed("helper.exe", vec![NAMED]);
+            let book = contested();
+
+            let on = resolve(&book, &obs, true);
+            let admitted = AppDestinationGate::for_rule_set(&on, &obs, &book.secondary)
+                .admit("helper.exe", Link::Additional);
+            assert_eq!(admitted.admitted, vec![NAMED]);
+            assert!(admitted.refused.is_empty());
+
+            let off = resolve(&book, &obs, false);
+            let refused = AppDestinationGate::for_rule_set(&off, &obs, &book.secondary)
+                .admit("helper.exe", Link::Additional);
+            assert!(refused.admitted.is_empty());
+            assert_eq!(
+                refused.refused,
+                vec![(NAMED, AppDestinationRefusal::ClaimedByAddressRule)]
+            );
+        }
+
+        /// Other programs following the address is the price the user
+        /// accepted, so the census does not get a say.
+        #[test]
+        fn the_census_is_skipped_only_under_the_takeover() {
+            let book = book(Vec::new(), vec![app_rule("s1")]);
+            let obs = observed("helper.exe", vec![OTHER]);
+            obs.set_used_outside(OTHER);
+
+            let off = resolve(&book, &obs, false);
+            let gate = AppDestinationGate::for_rule_set(&off, &obs, &book.secondary);
+            assert_eq!(
+                gate.admit("helper.exe", Link::Additional).refused,
+                vec![(OTHER, AppDestinationRefusal::UsedByOtherProcess)]
+            );
+
+            let on = resolve(&book, &obs, true);
+            let gate = AppDestinationGate::for_rule_set(&on, &obs, &book.secondary);
+            assert_eq!(
+                gate.admit("helper.exe", Link::Additional).admitted,
+                vec![OTHER]
+            );
+        }
     }
 
     mod networks {

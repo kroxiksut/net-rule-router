@@ -8,7 +8,9 @@
 //! supported code.
 
 use nrr_shared::launcher_rpc::HostAnswerDeadlines;
-use nrr_shared::{load_locale_catalog, resolve_catalog_text, AppAction, SetupActionAvailability};
+use nrr_shared::{
+    load_locale_catalog, resolve_catalog_text, AppAction, FreeRuleType, SetupActionAvailability,
+};
 use nrr_ui_support::theme::resolve_theme;
 use nrr_ui_support::tray::{TrayActionRuntime, TrayRuntimeSnapshot, TrayStatusKind};
 use nrr_ui_support::ui_preferences::UiPreferences;
@@ -134,6 +136,14 @@ struct TrayContextPayload {
     platform_profile: nrr_shared::platform_profile::PlatformProfile,
     /// How long `RpcTransport.qml` waits for each answer; the launcher owns the budgets.
     rpc_answer_deadlines: HostAnswerDeadlines,
+    /// The rule types the window's add-rule form offers, so the tray's copy of
+    /// that form offers the same ones.
+    supported_rule_types: Vec<RuleTypeContext>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuleTypeContext {
+    id: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +168,7 @@ pub fn write_qt_tray_context_file(
     preferences: &UiPreferences,
     urls: TrayContextUrls,
     rpc_answer_deadlines: HostAnswerDeadlines,
+    supported_rule_types: &[FreeRuleType],
 ) -> Result<PathBuf, String> {
     let locale_catalog = load_locale_catalog();
     let status_slug = runtime.status_kind.slug();
@@ -199,6 +210,12 @@ pub fn write_qt_tray_context_file(
         quick_actions: to_action_context(&runtime.quick_actions, &locale_catalog, language),
         platform_profile: nrr_shared::platform_profile::PlatformProfile::current(),
         rpc_answer_deadlines,
+        supported_rule_types: supported_rule_types
+            .iter()
+            .map(|rule_type| RuleTypeContext {
+                id: rule_type.slug(),
+            })
+            .collect(),
     };
 
     let timestamp = SystemTime::now()
@@ -387,6 +404,7 @@ mod tests {
                 &preferences,
                 super::TrayContextUrls::default(),
                 super::HostAnswerDeadlines::default(),
+                &[],
             )
             .expect("context file is written to the temp dir");
             let raw = std::fs::read_to_string(&path).expect("context file is readable");
@@ -431,6 +449,7 @@ mod tests {
             &preferences,
             super::TrayContextUrls::default(),
             deadlines,
+            &[],
         )
         .expect("context file is written to the temp dir");
         let raw = std::fs::read_to_string(&path).expect("context file is readable");
@@ -439,5 +458,42 @@ mod tests {
         let carried = &parsed[HOST_ANSWER_DEADLINES_CONTEXT_KEY];
         assert_eq!(carried["defaultMs"], 1234);
         assert_eq!(carried["operationsMs"]["mutation.submit"], 5678);
+    }
+
+    /// The tray's add-rule window builds its type list from this field alone;
+    /// without it the form would open with nothing to choose.
+    #[test]
+    fn tray_context_carries_the_offered_rule_types() {
+        use nrr_shared::FreeRuleType;
+        use nrr_ui_support::theme::resolve_theme;
+        use nrr_ui_support::tray::tray_runtime_snapshot;
+        use nrr_ui_support::ui_preferences::UiPreferences;
+
+        let shell = nrr_shared::gui_shell_v1();
+        let preferences = UiPreferences::default();
+        let theme = resolve_theme(preferences.theme_mode);
+        let runtime = tray_runtime_snapshot(
+            &shell,
+            true,
+            None,
+            theme.effective_mode,
+            nrr_ui_support::tray::TrayServiceLink::Unknown,
+        );
+        let path = super::write_qt_tray_context_file(
+            &runtime,
+            &preferences.language,
+            &preferences,
+            super::TrayContextUrls::default(),
+            super::HostAnswerDeadlines::default(),
+            &[FreeRuleType::Domain, FreeRuleType::Subnet],
+        )
+        .expect("context file is written to the temp dir");
+        let raw = std::fs::read_to_string(&path).expect("context file is readable");
+        let _ = std::fs::remove_file(&path);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("context file is JSON");
+        assert_eq!(
+            parsed["supportedRuleTypes"],
+            serde_json::json!([{ "id": "domain" }, { "id": "subnet" }])
+        );
     }
 }

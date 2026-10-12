@@ -77,8 +77,8 @@ Vendored third-party components redistributed with the product, with their licen
 
 ### packaging/
 Per-platform files the build stamps into binaries or the delivery installs:
-- **`packaging/windows`** — `app.rc.in`, the icon and version block every Windows executable carries (Task Manager shows its FileDescription), and `app_resource.rs`, which the crates' `build.rs` include to fill it; the Qt host fills the same template from CMake.
-- **`packaging/linux`** — the two XDG desktop entries (`netrulerouter.desktop`, `netrulerouter-tray.desktop`). Their basenames are the Wayland `app_id` the Qt host declares via `setDesktopFileName`, which is how a compositor finds the window's name and icon.
+- **`packaging/windows`** — `app.rc.in`, the icon and version block every Windows executable carries (Task Manager shows its FileDescription), and `app_resource.rs`, which the crates' `build.rs` include to fill it; the Qt host fills the same template from CMake. Also the installer sources `scripts/package-windows.ps1 -Installers` builds from the package folder: `NetRuleRouter.iss` (Inno Setup EXE), `NetRuleRouter.wxs` (WiX MSI) and `setup-actions.ps1`, the service and data steps both run through the existing console and user scripts.
+- **`packaging/linux`** — the two XDG desktop entries (`netrulerouter.desktop`, `netrulerouter-tray.desktop`). Their basenames are the Wayland `app_id` the Qt host declares via `setDesktopFileName`, which is how a compositor finds the window's name and icon. `maintainer/` holds the service steps the `.deb` scripts and `.rpm` scriptlets share, `tarball/` the archive's `install.sh` / `uninstall.sh`; `scripts/package-linux.sh` assembles all three formats from them.
 
 ### scripts/
 Developer automation, PowerShell and shell side by side: bootstrap, build, run, check, service install/uninstall/status, desktop-entry install/uninstall, full data purge, network reset, smoke and speed probes, packaging, WSL gate. `scripts/lib/` holds path constants and helpers the shell and PowerShell scripts source (never execute); `scripts/dev/` holds one-off maintenance utilities.
@@ -165,6 +165,9 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `package-windows` — Portable Windows package: binaries, the Qt and Visual C++
   runtimes, payload and a `build-info.json` stamp. See
   `docs/en/packaging-windows.md`.
+- `package-linux` — Linux `.deb`, `.rpm` and `.tar.gz`: `netrulerouter` (service,
+  console, terminal interface) and `netrulerouter-gui` (window, tray), plus
+  full and headless archives and `SHA256SUMS`. See `docs/en/packaging-linux.md`.
 
 **Quality policy:**
 - `scripts/check.ps1` and `scripts/check.sh` enforce the local baseline

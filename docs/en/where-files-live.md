@@ -42,6 +42,12 @@ The two `.db` files above are meant to be managed by the application itself, thr
 
 If the service ever finds that the key it uses to check this database is gone while rules are already stored — a restore that left it behind, for example — your rules are kept: Diagnostics shows a security alert, and rule changes wait until you acknowledge it.
 
+## The service from a portable copy: `C:\Program Files\NetRuleRouter Service\`
+
+Only there when the service was installed from a portable folder — one you unpacked to the desktop or a flash drive. The service runs with system rights, so it is never started from a folder ordinary users can change: the install puts a copy of it here, where only administrators can change anything, and runs that copy. You can move or delete the portable folder afterwards; the service keeps working.
+
+Installing again from a newer portable copy updates this folder. Removing the service, from the app or with `nrr-cli uninstall`, removes it. If an installer put the app under `Program Files` already, this folder is never created.
+
 ## Your own settings: `%APPDATA%\NetRuleRouter\`
 
 Per-user, and the place your personal preferences live. On a domain PC with roaming profiles these follow you between machines.
@@ -79,7 +85,7 @@ The layout follows the XDG conventions your other applications use, so nothing l
 | `%LOCALAPPDATA%\NetRuleRouter\` | `~/.cache/netrulerouter/` | Caches that are rebuilt when missing |
 | `%TEMP%\NetRuleRouter\` | `/run/user/<your id>/netrulerouter/` and `~/.local/state/netrulerouter/` | Coordination files for the current session, and the launcher logs |
 
-For a clean start there is the same script with a shell spelling: `./scripts/purge-data.sh`, dry-run until you add `--yes`, and the audit trail stays unless you add `--purge-audit`. It gives the network back first — the packet filters and the DNS redirect the service set up — and deletes nothing if that fails.
+For a clean start there is the same script with a shell spelling: `./scripts/purge-data.sh`, dry-run until you add `--yes`, and the audit trail stays unless you add `--purge-audit`. It gives the network back first — the packet filters and the DNS redirect the service set up — and deletes nothing if that fails. Where NetRuleRouter came from a `.deb` or `.rpm`, remove the package first (see [Packaging for Linux](packaging-linux.md)); until then the script refuses everything but `--user-only`, which clears only your own profile. Other accounts' files are listed, not deleted: each user clears their own with `--user-only`.
 
 ## What survives a reinstall
 

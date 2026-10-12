@@ -82,6 +82,9 @@ pub struct PlannerInput<'a> {
     /// address-ownership arbiter, which is the one place the two can contest
     /// the same address.
     pub zone_priority_over_ip: bool,
+    /// Application rules take every address their program uses, from the
+    /// principal's stored `app_rules_take_all_addresses`. Reaches the arbiter.
+    pub app_rules_take_all_addresses: bool,
     /// Addresses the shared-IP policy declined for the ADDITIONAL route — the
     /// same set the Windows codegen hides behind
     /// [`crate::secondary_ip_policy::DenylistFilteredCache`].
@@ -189,13 +192,17 @@ pub fn plan_route_rules_with_shapes(
     // that very host, and the kill-switch then blocks the address for every
     // process — the incident the arbiter exists for, reproduced on the Linux
     // enforcement path.
-    let order = crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+    let settings = crate::address_ownership::OwnershipSettings::from_policy(
         input.zone_priority_over_ip,
+        input.app_rules_take_all_addresses,
     );
-    let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
+    let order = settings.order;
+    let ownership = crate::address_ownership::AddressOwnership::resolve_for(
         rule_book,
         input.fqdn_cache,
-        order,
+        settings,
+        crate::wfp_codegen::current_rule_shape_support(),
+        input.app_observations,
     );
     let carving = NetworkCarving::index(
         rule_book,

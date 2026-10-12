@@ -51,8 +51,9 @@ fn refusal_is_read_before_emptiness(file: &str, refusal: &str, empty: &str) {
 
 #[test]
 fn every_preview_reader_asks_about_a_refusal_before_calling_the_diff_empty() {
+    // The rules preview of the window and of the tray.
     refusal_is_read_before_emptiness(
-        "apps/desktop/qml/flows/ReviewFlowController.qml",
+        "apps/desktop/qml/flows/RulesSubmitter.qml",
         "Pure.previewRefusal(summary)",
         "Pure.reviewSummaryIsEmpty(summary)",
     );
@@ -90,16 +91,6 @@ struct ConfirmedMutation {
 }
 
 const CONFIRMED_MUTATIONS: &[ConfirmedMutation] = &[
-    ConfirmedMutation {
-        file: "apps/desktop/qml/flows/ReviewFlowController.qml",
-        confirm: "_executeRulesActivation",
-        completion: Some("_completeRulesActivation"),
-        markers: &[
-            "status.rules-activate-completed",
-            "_persistBoundFilesAfterApply()",
-            "_captureRulesDirtyBaseline()",
-        ],
-    },
     ConfirmedMutation {
         file: "apps/desktop/qml/flows/ReviewFlowController.qml",
         confirm: "_executeResetToBaselineActivation",
@@ -187,6 +178,88 @@ fn every_confirmed_mutation_announces_success_only_from_its_outcome() {
     }
 }
 
+/// The rules apply reads its verdict in the submitter the window and the tray
+/// share, whose `ok` only that verdict sets; the window completes an apply only
+/// from that `ok`, on the reviewed path and the direct one alike.
+#[test]
+fn the_rules_apply_announces_success_only_from_its_outcome() {
+    let file = "apps/desktop/qml/flows/RulesSubmitter.qml";
+    let source = repo_file(file);
+    assert!(
+        !source.contains("rpcOperationStatusGet"),
+        "{file}: the operation record is read through the shared helper only"
+    );
+    let (_, commit) = function_body(file, &source, "commit");
+    let outcome = commit
+        .find("rpc.readMutationOutcome(")
+        .unwrap_or_else(|| panic!("{file}: `commit` must read the outcome of its confirm"));
+    let successes: Vec<usize> = commit
+        .match_indices("done(true")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(successes.len(), 1, "{file}: one success in `commit`");
+    assert!(
+        successes[0] > outcome,
+        "{file}: `commit` succeeds from the outcome read"
+    );
+    let (_, apply_now) = function_body(file, &source, "applyNow");
+    let committing = apply_now
+        .find("commit(d.state")
+        .unwrap_or_else(|| panic!("{file}: `applyNow` confirms through `commit`"));
+    let settled = apply_now
+        .find("finish(cok")
+        .unwrap_or_else(|| panic!("{file}: `applyNow` succeeds from `commit`'s answer"));
+    assert!(settled > committing);
+    assert!(
+        !apply_now.contains("finish(true"),
+        "{file}: `applyNow` never succeeds on its own"
+    );
+
+    let file = "apps/desktop/qml/flows/ReviewFlowController.qml";
+    let source = repo_file(file);
+    assert!(!source.contains("rpcOperationStatusGet"));
+    let completion = "_completeRulesActivation";
+    let calls: Vec<usize> = source
+        .match_indices(&format!("{completion}("))
+        .map(|(at, _)| at)
+        .filter(|&at| !source[..at].ends_with("function "))
+        .collect();
+    assert_eq!(
+        calls.len(),
+        2,
+        "{file}: the reviewed and the direct apply are the only ways into `{completion}`"
+    );
+    for (entry, submit) in [
+        ("_executeRulesActivation", "submitter.commit("),
+        ("applyWithoutReview", "submitter.applyNow("),
+    ] {
+        let (at, body) = function_body(file, &source, entry);
+        let sent = body
+            .find(submit)
+            .unwrap_or_else(|| panic!("{file}: `{entry}` goes through `{submit}`"));
+        assert!(
+            calls
+                .iter()
+                .any(|&call| call > at + sent && call < at + body.len()),
+            "{file}: `{entry}` completes from its submitter's answer"
+        );
+    }
+    let (_, home) = function_body(file, &source, completion);
+    for marker in [
+        "status.rules-activate-completed",
+        "_persistBoundFilesAfterApply()",
+        "_captureRulesDirtyBaseline()",
+    ] {
+        let everywhere = source.matches(marker).count();
+        assert!(everywhere > 0, "{file}: `{marker}` is gone");
+        assert_eq!(
+            everywhere,
+            home.matches(marker).count(),
+            "{file}: `{marker}` must run only once the outcome is known"
+        );
+    }
+}
+
 /// One helper reads the verdict; a record this account cannot read is settled
 /// from what the service holds now, never from the confirm.
 #[test]
@@ -215,14 +288,25 @@ fn a_failure_is_worded_with_its_own_values() {
         transport.contains("else done(failure, Pure.operationFailureArgs(status))"),
         "RpcTransport.qml: the outcome read hands the failure's values to `done`"
     );
-    for (file, announce) in [
+    // The rules apply words its failures in the submitter the tray shares.
+    let submitter_file = "apps/desktop/qml/flows/RulesSubmitter.qml";
+    let submitter = repo_file(submitter_file);
+    let (_, describe) = function_body(submitter_file, &submitter, "describeFailure");
+    assert!(
+        describe.contains("(res.failureArgs || null)")
+            && describe.contains("Pure.ipcErrorLabel(String(code || \"unknown\"), args, tr)"),
+        "{submitter_file}: `describeFailure` words the failure with its own values"
+    );
+    for (file, announce, wording) in [
         (
             "apps/desktop/qml/flows/ReviewFlowController.qml",
             "_announceRulesActivationFailed",
+            "failureArgs: args || null }, root.tr)",
         ),
         (
             "apps/desktop/qml/flows/PresetImportController.qml",
             "_announcePresetImportFailed",
+            "ipcErrorLabel(String(code || \"unknown\"), args || null)",
         ),
     ] {
         let source = repo_file(file);
@@ -232,7 +316,7 @@ fn a_failure_is_worded_with_its_own_values() {
         );
         let (_, body) = function_body(file, &source, announce);
         assert!(
-            body.contains("ipcErrorLabel(String(code || \"unknown\"), args || null)"),
+            body.contains(wording),
             "{file}: `{announce}` words the failure with the values it was given"
         );
         assert!(

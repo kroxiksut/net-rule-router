@@ -143,6 +143,7 @@ fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
             app_resolver: &resolver,
             secondary_ip_denylist: &HashSet::new(),
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
             families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
             packet_blocks: true,
         });
@@ -208,6 +209,7 @@ fn every_protected_destination_is_one_the_routes_actually_steer() {
         app_resolver: &resolver,
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -300,6 +302,7 @@ fn an_address_rule_wins_over_an_app_rule_on_either_link() {
         app_resolver: &resolver,
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -340,6 +343,7 @@ fn a_destination_another_process_uses_is_pinned_by_neither_mechanism() {
         app_resolver: &resolver,
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -397,6 +401,7 @@ fn the_neutral_planner_reads_the_same_arbiter() {
             app_resolver: &resolver,
             app_observations: &observations,
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
             secondary_ip_denylist: &std::collections::HashSet::new(),
             packet_blocks: true,
         },
@@ -544,6 +549,7 @@ fn codegen(rule_book: &CanonicalRuleBook, cache: &MockFqdnCacheLookup) -> Vec<Sp
         app_resolver: &MockAppPathResolver::new(),
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     })
@@ -571,6 +577,7 @@ fn blocked_by_planner(
             app_resolver: &MockAppPathResolver::new(),
             app_observations: &MockAppObservationLookup::new(),
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
             secondary_ip_denylist: &HashSet::new(),
             packet_blocks: true,
         },
@@ -730,6 +737,7 @@ fn codegen_output(
         app_resolver: &MockAppPathResolver::new(),
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     })
@@ -966,6 +974,7 @@ fn an_app_scoped_block_is_skipped_by_both_mechanisms_and_reported() {
             app_resolver: &MockAppPathResolver::new(),
             app_observations: &MockAppObservationLookup::new(),
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
             secondary_ip_denylist: &HashSet::new(),
             packet_blocks: true,
         },
@@ -1088,6 +1097,7 @@ fn the_planner_reports_the_conflicts_the_codegen_reports() {
                 app_resolver: &MockAppPathResolver::new(),
                 app_observations: &MockAppObservationLookup::new(),
                 zone_priority_over_ip: false,
+                app_rules_take_all_addresses: false,
                 secondary_ip_denylist: &HashSet::new(),
                 packet_blocks: true,
             },
@@ -1528,6 +1538,7 @@ fn every_mechanism_gives_a_network_rule_the_engines_answer() {
                 app_resolver: &MockAppPathResolver::new(),
                 secondary_ip_denylist: &HashSet::new(),
                 zone_priority_over_ip: false,
+                app_rules_take_all_addresses: false,
                 families: nrr_service_runtime::enforcement_planner::FamilyScope::Both,
                 packet_blocks: true,
             },
@@ -1544,6 +1555,7 @@ fn every_mechanism_gives_a_network_rule_the_engines_answer() {
                 app_resolver: &MockAppPathResolver::new(),
                 app_observations: &MockAppObservationLookup::new(),
                 zone_priority_over_ip: false,
+                app_rules_take_all_addresses: false,
                 secondary_ip_denylist: &HashSet::new(),
                 packet_blocks: true,
             },
@@ -1607,4 +1619,274 @@ fn the_network_sweep_notices_a_network_that_swallows_a_narrower_host() {
         filter_outcome(&[net, host], "10.1.2.3".parse().expect("ip")),
         Outcome::Route(RouteRole::Primary)
     );
+}
+
+// ── Programs take all their addresses ──────────────────────────────────────
+//
+// The per-user setting inverts address-over-application for programs. Every
+// mechanism must invert it the same way: the program's address goes its
+// route, the main rule does not pull it back, the main link keeps its permit
+// (a main-named address is never blocked for everyone), and a literal Block
+// still wins.
+
+const TOP_OF_PRIMARY_BAND: u64 = 0x0030_0000;
+
+fn primary_target() -> SecondaryRouteTarget {
+    SecondaryRouteTarget {
+        gateway: Ipv4Addr::new(192, 0, 2, 1),
+        gateway_v6: None,
+        interface_index: 7,
+    }
+}
+
+fn takeover_filters(
+    rule_book: &CanonicalRuleBook,
+    observations: &MockAppObservationLookup,
+) -> Vec<Spec> {
+    generate_filters(CodegenInput {
+        sid: "S-1-5-21-TEST",
+        rule_book,
+        behavior_mode: RouteBehaviorMode::PreferPrimary,
+        fqdn_cache: &cache(),
+        app_observations: observations,
+        app_resolver: &resolver(),
+        secondary_ip_denylist: &HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: true,
+        families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    })
+    .filters
+}
+
+fn takeover_flows(
+    rule_book: &CanonicalRuleBook,
+    observations: &MockAppObservationLookup,
+) -> Vec<nrr_platform_api::enforcement::FlowRule> {
+    plan_route_rules(
+        rule_book,
+        "S-1-5-21-TEST",
+        RouteBehaviorMode::PreferPrimary,
+        &PlannerInput {
+            ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::Off,
+            fqdn_cache: &cache(),
+            app_resolver: &resolver(),
+            app_observations: observations,
+            zone_priority_over_ip: false,
+            app_rules_take_all_addresses: true,
+            secondary_ip_denylist: &HashSet::new(),
+            packet_blocks: true,
+        },
+    )
+    .0
+}
+
+fn takeover_settings() -> nrr_service_runtime::address_ownership::OwnershipSettings {
+    nrr_service_runtime::address_ownership::OwnershipSettings::from_policy(false, true)
+}
+
+/// `(via the additional link, via the main link)` host routes to `ip`, from
+/// the route codegen under `mode`.
+fn routed(
+    mode: RouteBehaviorMode,
+    rule_book: &CanonicalRuleBook,
+    observations: &MockAppObservationLookup,
+    ip: Ipv4Addr,
+) -> (bool, bool) {
+    let routes = generate_routes(
+        mode,
+        rule_book,
+        Some(&primary_target()),
+        &target(),
+        &cache(),
+        observations,
+        &HashSet::new(),
+        takeover_settings(),
+        &[],
+    );
+    let via = |gateway: Ipv4Addr| {
+        routes.routes.iter().any(|r| {
+            r.destination == IpAddr::V4(ip)
+                && r.prefix_length == 32
+                && r.next_hop == IpAddr::V4(gateway)
+        })
+    };
+    (via(target().gateway), via(primary_target().gateway))
+}
+
+/// The same question of the neutral route plan.
+fn planned(
+    mode: RouteBehaviorMode,
+    rule_book: &CanonicalRuleBook,
+    observations: &MockAppObservationLookup,
+    ip: Ipv4Addr,
+) -> (bool, bool) {
+    use nrr_platform_api::enforcement::{DstMatch, EgressRef};
+    let intents = nrr_service_runtime::enforcement_planner::plan_routes(
+        mode,
+        rule_book,
+        true,
+        &cache(),
+        observations,
+        &HashSet::new(),
+        nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
+        takeover_settings(),
+        &[],
+    );
+    let via = |egress: EgressRef| {
+        intents
+            .iter()
+            .any(|r| r.dst == DstMatch::HostV4(ip) && r.egress == egress)
+    };
+    (via(EgressRef::Secondary), via(EgressRef::Primary))
+}
+
+fn in_band(f: &Spec, low: u64, high: u64) -> bool {
+    f.weight >= low && f.weight < high
+}
+
+#[test]
+fn a_program_takes_an_address_the_main_link_names_in_every_mechanism() {
+    for (how, main_rule) in main_link_claims() {
+        let observations = observations();
+        let rule_book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![main_rule]),
+            secondary: CanonicalRuleSet::from_rules(vec![app_rule("r-app", APP)]),
+        };
+
+        // Filters: the program's permit on the additional link, and the main
+        // link's permit kept beside it.
+        let filters = takeover_filters(&rule_book, &observations);
+        assert!(
+            covering(&filters, WfpAction::Permit, CONTESTED).any(|f| in_band(
+                f,
+                BASE_SECONDARY,
+                BASE_PRIMARY
+            )),
+            "{how}: the filter side did not let the program take the address",
+        );
+        assert!(
+            covering(&filters, WfpAction::Permit, CONTESTED).any(|f| in_band(
+                f,
+                BASE_PRIMARY,
+                TOP_OF_PRIMARY_BAND
+            )),
+            "{how}: the main link lost its permit; with the tunnel gone the address \
+             would be blocked for every program",
+        );
+
+        // The neutral planner says the same.
+        let flows = takeover_flows(&rule_book, &observations);
+        let host_flow = |role: nrr_shared::RouteRole| {
+            flows.iter().any(|f| {
+                f.precedence.class
+                    == nrr_platform_api::enforcement::PrecedenceClass::RouteRule(role)
+                    && f.flow.dst == nrr_platform_api::enforcement::DstMatch::HostV4(CONTESTED)
+            })
+        };
+        assert!(
+            host_flow(nrr_shared::RouteRole::Secondary),
+            "{how}: the planner did not let the program take the address",
+        );
+        assert!(
+            host_flow(nrr_shared::RouteRole::Primary),
+            "{how}: the planner dropped the main link's permit",
+        );
+
+        // Routes: through the tunnel where the main link is the default, and
+        // never pulled back where the tunnel is.
+        for mode in [
+            RouteBehaviorMode::PreferPrimary,
+            RouteBehaviorMode::PreferSecondaryWhenAvailable,
+        ] {
+            let codegen = routed(mode, &rule_book, &observations, CONTESTED);
+            let plan = planned(mode, &rule_book, &observations, CONTESTED);
+            assert!(
+                !codegen.1 && !plan.1,
+                "{how}, {mode:?}: the main rule steered the program's address back",
+            );
+            assert_eq!(
+                codegen, plan,
+                "{how}, {mode:?}: the route codegen and the planner disagree",
+            );
+            if mode == RouteBehaviorMode::PreferPrimary {
+                assert!(
+                    codegen.0,
+                    "{how}: the program's address is not routed through the tunnel",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_literal_block_still_wins_over_a_program_that_takes_all_addresses() {
+    let observations = observations();
+    let rule_book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(Vec::new()),
+        secondary: CanonicalRuleSet::from_rules(vec![
+            app_rule("r-app", APP),
+            block_rule(
+                "r-block",
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(CONTESTED)),
+            ),
+        ]),
+    };
+
+    let filters = takeover_filters(&rule_book, &observations);
+    let blocked = covering(&filters, WfpAction::Block, CONTESTED)
+        .map(|f| f.weight)
+        .max();
+    let permitted = covering(&filters, WfpAction::Permit, CONTESTED)
+        .map(|f| f.weight)
+        .max();
+    assert!(
+        blocked > permitted,
+        "a permit outranks the literal Block: block={blocked:?} permit={permitted:?}",
+    );
+    assert!(
+        takeover_flows(&rule_book, &observations).iter().any(|f| {
+            f.verdict == nrr_platform_api::enforcement::Verdict::Block
+                && f.flow.dst == nrr_platform_api::enforcement::DstMatch::HostV4(CONTESTED)
+        }),
+        "the planner lost the literal Block",
+    );
+    // What nobody blocked is still the program's.
+    let (through_tunnel, _) = routed(
+        RouteBehaviorMode::PreferPrimary,
+        &rule_book,
+        &observations,
+        APP_ONLY,
+    );
+    assert!(through_tunnel);
+}
+
+/// The census does not get a say once the user chose the trade: an address
+/// another process uses goes the program's route in both mechanisms.
+#[test]
+fn the_census_is_not_asked_when_programs_take_all_addresses() {
+    let observations = observations();
+    observations.set_used_outside(APP_ONLY);
+    let rule_book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(Vec::new()),
+        secondary: CanonicalRuleSet::from_rules(vec![app_rule("r-app", APP)]),
+    };
+
+    let filters = takeover_filters(&rule_book, &observations);
+    assert!(covering(&filters, WfpAction::Permit, APP_ONLY)
+        .next()
+        .is_some());
+    let codegen = routed(
+        RouteBehaviorMode::PreferPrimary,
+        &rule_book,
+        &observations,
+        APP_ONLY,
+    );
+    let plan = planned(
+        RouteBehaviorMode::PreferPrimary,
+        &rule_book,
+        &observations,
+        APP_ONLY,
+    );
+    assert!(codegen.0 && plan.0);
 }

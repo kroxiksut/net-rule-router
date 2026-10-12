@@ -3,14 +3,10 @@
 
 use super::*;
 
-/// Resolves the absolute path to `NetRuleRouterTray.exe`. Used for the
-/// autostart helper's `set_enabled` and `get_state` calls. In production
-/// the tray binary lives next to the service binary in
-/// `%ProgramFiles%\NetRuleRouter\`; in dev runs it sits next to the
-/// service in `target/debug/`. We use the `current_exe()` parent directory
-/// joined with `NetRuleRouterTray.exe`. If the file does not exist, autostart
-/// `set_enabled` will reject with `InvalidPath` at call time — better
-/// than silently writing a dangling registry value.
+/// `NetRuleRouterTray.exe` beside the service binary, for the autostart
+/// helper. A service copied out of a portable folder has no tray beside it;
+/// `set_enabled` then refuses with `InvalidPath` rather than write a dangling
+/// registry value. The launcher answers autostart requests itself.
 pub(super) fn resolve_tray_binary_path() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     let parent = exe

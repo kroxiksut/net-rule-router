@@ -70,6 +70,18 @@ mod tests {
         ));
     }
 
+    /// Drift guard: the GUI offers fake-IP exactly when this port can open an
+    /// adapter. Whoever makes it real flips the profile in the same change.
+    #[test]
+    fn the_platform_profile_offers_fake_ip_only_where_the_adapter_opens() {
+        assert_eq!(
+            nrr_shared::platform_profile::PlatformProfile::linux()
+                .supports
+                .fake_ip,
+            LinuxTunAdapter::new().is_available()
+        );
+    }
+
     #[test]
     fn an_invalid_configuration_is_rejected_before_the_stub_error() {
         let adapter = LinuxTunAdapter::new();

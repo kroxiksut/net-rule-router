@@ -112,11 +112,12 @@ fn main() -> std::process::ExitCode {
                 // elevated console.
                 refresh_interactive_grant();
                 println!("Installed service '{}'.", nrr_service_runtime::SERVICE_NAME);
+                print_registered_binary();
                 std::process::ExitCode::SUCCESS
             }
             Err(e) => {
                 eprintln!("install failed: {e}");
-                std::process::ExitCode::from(1)
+                std::process::ExitCode::from(e.exit_code())
             }
         },
         #[cfg(windows)]
@@ -264,6 +265,9 @@ fn main() -> std::process::ExitCode {
         // Backs the `scripts/reset-network.ps1` wrapper.
         #[cfg(windows)]
         "cleanup" => runtime_deps::run_offline_reset(),
+        // SCM runs this once the crash restarts are spent.
+        #[cfg(windows)]
+        "after-crash" => runtime_deps::run_after_crash(),
         // Explicit foreground runtime. ONLY a deliberate `console` verb runs
         // the runtime in the foreground (dev / smoke tests). It must stay
         // an explicit opt-in: a silent fallback here would turn a stale or
@@ -379,26 +383,52 @@ fn reinstall_from_this_binary() -> std::process::ExitCode {
              The service is now NOT registered — run `install` from the folder you want to run.",
             binary_path.display()
         );
-        return std::process::ExitCode::from(1);
+        return std::process::ExitCode::from(e.exit_code());
     }
     // A fresh registration carries SCM's default DACL; the GUI's own start
     // button needs the same grant `install` makes.
     refresh_interactive_grant();
 
+    // What the service manager now starts: a protected copy when this binary
+    // sits where ordinary accounts can change it.
+    let registered = registered_binary().unwrap_or(binary_path);
     if let Err(e) = scm::start_service(30) {
         eprintln!(
             "service '{}' was re-registered at '{}' but did not start: {e}",
             nrr_service_runtime::SERVICE_NAME,
-            binary_path.display()
+            registered.display()
         );
         return std::process::ExitCode::from(1);
     }
     println!(
         "Service '{}' now runs '{}'.",
         nrr_service_runtime::SERVICE_NAME,
-        binary_path.display()
+        registered.display()
     );
     std::process::ExitCode::SUCCESS
+}
+
+/// The binary the service manager has registered, when it says.
+#[cfg(windows)]
+fn registered_binary() -> Option<std::path::PathBuf> {
+    use nrr_platform_api::service_control::ServiceControlPort;
+    nrr_platform_windows::service_control::WindowsServiceControl::new()
+        .query()
+        .ok()
+        .flatten()
+        .and_then(|report| report.binary_path)
+}
+
+/// Names the registered binary when it is not this one: the install placed a
+/// protected copy, and that copy is what runs from now on.
+#[cfg(windows)]
+fn print_registered_binary() {
+    let (Some(registered), Ok(this)) = (registered_binary(), env::current_exe()) else {
+        return;
+    };
+    if registered != this {
+        println!("Registered binary: {}", registered.display());
+    }
 }
 
 /// Apply a service start mode (shared by the `set-start-auto` /

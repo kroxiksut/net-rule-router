@@ -65,6 +65,8 @@ pub enum ScmError {
     Handler(String),
     /// Install / uninstall went wrong.
     Manager(String),
+    /// The protected copy the install registers could not be put in place.
+    Relocation(String),
 }
 
 impl std::fmt::Display for ScmError {
@@ -74,6 +76,7 @@ impl std::fmt::Display for ScmError {
             Self::Dispatch(s) => write!(f, "SCM dispatcher: {s}"),
             Self::Handler(s) => write!(f, "service control handler: {s}"),
             Self::Manager(s) => write!(f, "SCM manager: {s}"),
+            Self::Relocation(s) => write!(f, "{s}"),
         }
     }
 }
@@ -82,7 +85,21 @@ impl std::error::Error for ScmError {}
 
 impl From<ServiceControlError> for ScmError {
     fn from(err: ServiceControlError) -> Self {
-        Self::Manager(err.to_string())
+        match err {
+            ServiceControlError::Relocation { .. } => Self::Relocation(err.to_string()),
+            other => Self::Manager(other.to_string()),
+        }
+    }
+}
+
+impl ScmError {
+    /// The verb's exit code for this failure. A relocation failure has its own,
+    /// so the broker that ran the verb can name it without reading the text.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Relocation(_) => nrr_platform_api::service_control::RELOCATION_FAILED_EXIT_CODE,
+            _ => 1,
+        }
     }
 }
 
@@ -477,6 +494,24 @@ mod tests {
     /// Every control the handler branches on has to be advertised too — an
     /// unadvertised one is never delivered, so the branch is dead code that
     /// looks alive.
+    #[test]
+    fn a_relocation_failure_keeps_its_own_exit_code() {
+        let relocation = ScmError::from(ServiceControlError::Relocation {
+            detail: "disk full".to_string(),
+        });
+        assert_eq!(
+            relocation.exit_code(),
+            nrr_platform_api::service_control::RELOCATION_FAILED_EXIT_CODE
+        );
+        assert!(relocation.to_string().contains("disk full"));
+        let other = ScmError::from(ServiceControlError::AccessDenied);
+        assert_eq!(other.exit_code(), 1);
+        assert_ne!(
+            other.exit_code(),
+            nrr_platform_api::service_control::RELOCATION_FAILED_EXIT_CODE
+        );
+    }
+
     #[test]
     fn running_advertises_every_control_the_handler_acts_on() {
         let accepted = running_controls();

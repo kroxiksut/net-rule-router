@@ -56,9 +56,10 @@ function Resolve-RepoServiceBinary {
     }
 }
 
-# The registered service's own binary, or $null. `ImagePath` carries SCM
-# arguments and may be quoted, so take the executable and drop the rest.
-function Resolve-InstalledServiceBinary {
+# The executable the registration names, whether or not it still exists, or
+# $null. `ImagePath` carries SCM arguments and may be quoted, so take the
+# executable and drop the rest.
+function Get-ServiceImagePath {
     if (-not (Test-Path $NrrServiceKey)) { return $null }
     try { $imagePath = (Get-ItemProperty -Path $NrrServiceKey -Name ImagePath -ErrorAction Stop).ImagePath }
     catch { return $null }
@@ -71,7 +72,13 @@ function Resolve-InstalledServiceBinary {
     elseif ($imagePath -match '^(?<exe>.+?\.exe)(?=\s|$)') {
         $imagePath = $Matches['exe']
     }
-    if (Test-Path -LiteralPath $imagePath) { return $imagePath }
+    return $imagePath
+}
+
+# The registered service's own binary, or $null when it is gone.
+function Resolve-InstalledServiceBinary {
+    $imagePath = Get-ServiceImagePath
+    if ($imagePath -and (Test-Path -LiteralPath $imagePath)) { return $imagePath }
     return $null
 }
 
@@ -117,6 +124,73 @@ function Invoke-NativeCommand {
     catch {
         if (-not $Quiet) { Write-Host "    $($_.Exception.Message)" }
         return -1
+    }
+}
+
+function Test-ReparsePoint {
+    param([System.IO.FileSystemInfo] $Item)
+    return [bool]($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+}
+
+# Delete $Path (a directory tree or a file) without following a link: a junction
+# planted in the tree would otherwise turn an elevated delete into one of
+# whatever it points at. $Root bounds the walk: $Path must lie below it, and a
+# link on any segment between the two stops the delete. A link met inside the
+# tree is removed as a link. Checks and deletes go by path, so a swap between
+# them still races: use it only where the one who could plant a link is the
+# one whose data goes, or an administrator, never in another user's profile.
+# Returns $null on success, otherwise the reason it stopped.
+function Remove-TreeNoFollow {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [string] $Root
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if (-not $full.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        return "$full is not under $rootFull"
+    }
+
+    $segment = $rootFull.TrimEnd('\')
+    foreach ($name in $full.Substring($rootFull.Length).Split('\')) {
+        $segment = Join-Path $segment $name
+        try { $item = Get-Item -LiteralPath $segment -Force -ErrorAction Stop }
+        catch { return $null }
+        if ((Test-ReparsePoint $item) -and $segment -ne $full) {
+            return "$segment is a link; nothing below it was deleted"
+        }
+    }
+
+    $removeEntry = {
+        param([System.IO.FileSystemInfo] $Entry)
+        if (-not $Entry.FullName.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$($Entry.FullName) is not under $rootFull"
+        }
+        if ($Entry -is [System.IO.DirectoryInfo]) {
+            if (-not (Test-ReparsePoint $Entry)) {
+                foreach ($child in @(Get-ChildItem -LiteralPath $Entry.FullName -Force -ErrorAction Stop)) {
+                    & $removeEntry $child
+                }
+                $Entry.Attributes = [System.IO.FileAttributes]::Directory
+            }
+            # Non-recursive: on a link this removes the link alone.
+            [System.IO.Directory]::Delete($Entry.FullName, $false)
+        }
+        else {
+            if (-not (Test-ReparsePoint $Entry)) {
+                $Entry.Attributes = [System.IO.FileAttributes]::Normal
+            }
+            [System.IO.File]::Delete($Entry.FullName)
+        }
+    }
+
+    try {
+        & $removeEntry (Get-Item -LiteralPath $full -Force -ErrorAction Stop)
+        return $null
+    }
+    catch {
+        return $_.Exception.Message
     }
 }
 

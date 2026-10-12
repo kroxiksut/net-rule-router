@@ -73,6 +73,18 @@ function comboItemText(item, textRole, textResolver, index) {
     return String(item)
 }
 
+// A combo popup as wide as its widest entry plus the indicator, never narrower
+// than the closed combo. `measure(text)` and `clamp(width)` come from the
+// window, which knows its font and its room.
+function comboPopupWidthFor(control, model, textRole, textResolver, measure, clamp) {
+    var maxWidth = measure(control.displayText)
+    for (var i = 0; i < modelLength(model); i += 1) {
+        var itemText = comboItemText(modelItem(model, i), textRole, textResolver, i)
+        maxWidth = Math.max(maxWidth, measure(itemText))
+    }
+    return clamp(Math.max(control.width, maxWidth + 72))
+}
+
 // ---- menu / text formatting ----
 
 function menuActionText(label, shortcutHint) {
@@ -510,6 +522,14 @@ var STABILITY_KEY_CAPABILITY = {
     "conn-trace-gui": "connTraceLog"
 }
 
+// Keys that drive a feature of their own: even a service that applies the
+// whole row only stores them where the platform lacks that feature.
+var STABILITY_KEY_REQUIRES = {
+    "fake-ip-enabled": "fakeIp",
+    "fake-ip-udp-relay": "fakeIp",
+    "fake-ip-instant-rst": "fakeIp"
+}
+
 // `supports` is the platform profile's capability map; an absent map or flag
 // reads as supported, as the window's `supports()` does.
 function _profileSupports(supports, feature) {
@@ -517,6 +537,8 @@ function _profileSupports(supports, feature) {
 }
 
 function stabilityKeyApplies(key, supports) {
+    var feature = STABILITY_KEY_REQUIRES[key]
+    if (feature !== undefined && !_profileSupports(supports, feature)) return false
     if (_profileSupports(supports, "serviceStabilityConfig")) return true
     var capability = STABILITY_KEY_CAPABILITY[key]
     return capability !== undefined && _profileSupports(supports, capability)
@@ -836,6 +858,49 @@ function formatLastKnownTimestamp(observedAtMs, nowMs) {
     return dd + "." + mo + " " + timePart
 }
 
+// ---- live adapter list ----
+
+// The enumerations that are this machine's. Any other spelling, an unknown one
+// included, is placeholder rows: a role bound to one names no adapter here.
+var INTERFACES_LIVE_SOURCES = ["windows-live", "linux-live"]
+
+function interfacesSourceIsLive(source) {
+    return typeof source === "string" && INTERFACES_LIVE_SOURCES.indexOf(source) >= 0
+}
+
+function _asciiLower(s) {
+    return s.replace(/[A-Z]/g, function(c) { return c.toLowerCase() })
+}
+
+// Index of the wire row a wire route binding names: its current or an earlier
+// id against the row's id or OS adapter name, ASCII case-insensitive; first
+// match wins, -1 for none. How a client fills the `selected-role` the service
+// leaves empty.
+// Lists from the C++ bridge are Qt sequences, which `Array.isArray` rejects.
+function _isList(value) {
+    return !!value && typeof value === "object" && typeof value.length === "number"
+}
+
+function boundWireRowIndex(rows, binding) {
+    if (!_isList(rows) || !binding || typeof binding !== "object") return -1
+    var ids = []
+    var id = binding["stable-id"]
+    if (typeof id === "string" && id !== "") ids.push(_asciiLower(id))
+    var known = binding["known-stable-ids"]
+    if (_isList(known)) {
+        for (var k = 0; k < known.length; k += 1) {
+            if (typeof known[k] === "string" && known[k] !== "") ids.push(_asciiLower(known[k]))
+        }
+    }
+    for (var i = 0; i < rows.length; i += 1) {
+        var row = rows[i] || {}
+        var rid = _asciiLower(String(row["persistent-id"] || ""))
+        var rname = _asciiLower(String(row["adapter-name"] || ""))
+        if (ids.indexOf(rid) >= 0 || ids.indexOf(rname) >= 0) return i
+    }
+    return -1
+}
+
 // ---- own fake-IP TUN adapter detection ----
 
 // True when a mapped interface row is NetRuleRouter's OWN fake-IP TUN adapter
@@ -1045,6 +1110,51 @@ function fillPlaceholders(text, values) {
         out = out.split("{" + name + "}").join(String(values[name]))
     }
     return out
+}
+
+// A wire error code in the user's words; `tr(key, fallback)` is the caller's
+// locale lookup. `args` (optional) are the refusal's own values: a refusal that
+// names what it refused reads as a sentence about it, else as the code's text.
+// Snake-case slugs are accepted, and an unknown one comes back as itself so the
+// surface still says something.
+function ipcErrorLabel(code, args, tr) {
+    var slug = String(code || "").toLowerCase().replace(/_/g, "-")
+    if (slug === "") return tr("errors.unknown", "Unknown error")
+    var detail = refusalDetail(slug, args)
+    if (detail) {
+        var sentence = tr(detail.key, "")
+        if (sentence && sentence !== detail.key) {
+            return fillPlaceholders(sentence, detail.values)
+        }
+    }
+    var key = "errors." + slug
+    var localised = tr(key, "")
+    if (localised && localised !== key && localised !== "") return localised
+    return slug
+}
+
+// The words for a `previewRefusal`: the refused values when the service names
+// them, else the refusal code's own text.
+function previewRefusalText(refusal, tr) {
+    if (!refusal) return ""
+    if (refusal.values !== "") {
+        return tr("risk.signal.invalid-rule-value",
+            "A rule contains an invalid value: {rules}").replace("{rules}", refusal.values)
+    }
+    return ipcErrorLabel(refusal.code, refusal.args, tr)
+}
+
+// The first three of `list`, comma-separated, then `moreTemplate` with `{n}`
+// filled with how many were left out: a notice naming every one would not fit.
+function listSummary(list, moreTemplate) {
+    var items = _isList(list) ? list : []
+    var shown = []
+    for (var i = 0; i < items.length && i < 3; i += 1) shown.push(String(items[i]))
+    var text = shown.join(", ")
+    if (items.length > 3) {
+        text += " " + String(moreTemplate).split("{n}").join(String(items.length - 3))
+    }
+    return text
 }
 
 // A value placed into StyledText. A name learned from DNS or the service may
@@ -1379,6 +1489,22 @@ function reviewSummaryIsEmpty(summary) {
     return true
 }
 
+// `{ added, removed, changed }` rule counts of a review summary, bucketed the
+// way the review dialog shows them (modified and retargeted are both
+// "changed"). Counted by `.length` for the same QVariantList reason as above.
+function reviewSummaryRuleCounts(summary) {
+    var len = function(key) {
+        var arr = summary ? summary[key] : null
+        return (arr !== undefined && arr !== null && typeof arr.length === "number")
+            ? arr.length : 0
+    }
+    return {
+        added: len("rules-added"),
+        removed: len("rules-removed"),
+        changed: len("rules-modified") + len("rules-retargeted")
+    }
+}
+
 // Parse a parked pending-apply `summary-json` text into
 // { added, removed, modified, total }. Best-effort: a corrupted or missing
 // summary just renders as zeros.
@@ -1447,7 +1573,8 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "local-networks-auto-accept": false,
     "zone-priority-over-ip": false,
     "short-name-completion": false,
-    "short-name-suffix": ""
+    "short-name-suffix": "",
+    "app-rules-take-all-addresses": false
 }
 
 // Keys the policy SNAPSHOT carries but the update REQUEST must not: they are

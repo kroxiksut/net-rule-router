@@ -11,11 +11,17 @@ import "../lib/pure.js" as Pure
 // controllers are reached as `root.presetImportController` (retry dispatch) and
 // `root.driftController` (post-activate baseline recapture). Main.qml
 // instantiates one and exposes it as `root.reviewFlowController`; RulesSection /
-// NavigationSidebar / DriftController drive it through that handle. RPC goes
-// through `root.rpc`; `nrrNativeBridge` is a global context property (bare).
+// NavigationSidebar / DriftController drive it through that handle. The
+// rules-update dry-run and confirm go through `submitter`, other RPC through
+// `root.rpc`; `nrrNativeBridge` is a global context property (bare).
 QtObject {
     id: reviewFlowController
     property var root
+
+    /// The dry-run / confirm half, shared with the tray (`RulesSubmitter`).
+    property var submitter: RulesSubmitter {
+        rpc: reviewFlowController.root ? reviewFlowController.root.rpc : null
+    }
 
     /// `origin` names the CALLER, and it travels all the way to the service as
     /// part of the correlation id. Three paths reach this function — the footer
@@ -44,11 +50,7 @@ QtObject {
             _resolveGuardRulesApply(false)
             return
         }
-        var contentHash =
-            (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
-                && typeof nrrNativeBridge.sha256Hex === "function")
-                ? nrrNativeBridge.sha256Hex(rulesJson)
-                : ("client-stub-" + String(Date.now()))
+        var contentHash = submitter.contentHash(rulesJson)
         var backendKind = String(root.backendStatus ? root.backendStatus.kind || "" : "")
         if (backendKind !== "connected") {
             // Nothing can be activated while the service is down, but the
@@ -92,6 +94,48 @@ QtObject {
         if (typeof cb === "function") cb(!!ok)
     }
 
+    /// Apply the table as it stands with no review dialog — for a rule the
+    /// user already confirmed elsewhere (added from the tray). Same one-cycle
+    /// guard as `_guardApplyRules`, and a success runs the same completion as
+    /// a reviewed apply. A failure leaves the table dirty, so the ordinary
+    /// Apply can retry it. `onDone(ok)`.
+    function applyWithoutReview(origin, onDone) {
+        var resume = (typeof onDone === "function") ? onDone : null
+        if (root._guardRulesInFlight || root.rpc.longCallInFlight) {
+            console.log("review-flow: an apply cycle is already in flight, ignoring start from",
+                        String(origin || "unnamed"))
+            if (resume) resume(false)
+            return
+        }
+        var rulesJson = root._buildRulesJsonFromModel()
+        if (!rulesJson) {
+            if (resume) resume(false)
+            return
+        }
+        root._guardRulesInFlight = true
+        root._guardRulesResume = resume
+        submitter.applyNow(rulesJson, "apply-direct:" + String(origin || "unnamed"), null,
+            function(ok, r) {
+                if (!ok) {
+                    console.log("review-flow: direct apply failed:", r.reason, r.code, r.failure)
+                    root.statusLine = submitter.describeFailure(r, root.tr)
+                    _resolveGuardRulesApply(false)
+                    return
+                }
+                // The completion reads the applied request from here (the
+                // admin-baseline branch); this one never is.
+                root.pendingReviewState = {
+                    rulesJson: r.state.rulesJson,
+                    contentHash: r.state.contentHash,
+                    correlationId: r.state.correlationId,
+                    summary: r.summary,
+                    confirmationToken: "",
+                    adminBaseline: false
+                }
+                _completeRulesActivation(r.payload)
+            })
+    }
+
 
     /// Entry point for sections (RulesSection's Save button). Kicks
     /// off the dry-run pass; the rpcResponse callback opens
@@ -113,36 +157,17 @@ QtObject {
             _resolveGuardRulesApply(false)
             return
         }
+        var startedAtMs = Date.now()
         // The origin travels on the wire (`correlation_id` in the service log),
         // so the next duplicate names its own caller instead of leaving us to
         // guess which of six paths fired it.
-        var corr = Pure.newCorrelationId(String(origin || "review-save"))
-        var payload = {
-            "rules-json": String(rulesJson || ""),
-            "content-hash": String(contentHash || ""),
-            "correlation-id": corr
-        }
-        // An admin "set baseline" edit tags the inner
-        // payload so the client emits the elevated `mutation-request` class
-        // (broker relays the UAC) and the server commits to the shared
-        // baseline instead of the caller's own per-SID partition.
-        if (adminBaseline) payload["admin-baseline"] = true
-        root.pendingReviewState = {
-            rulesJson: payload["rules-json"],
-            contentHash: payload["content-hash"],
-            correlationId: corr,
-            summary: null,
-            confirmationToken: "",
-            adminBaseline: !!adminBaseline
-        }
-        root._activeReviewKind = "rules-update"
-        var startedAtMs = Date.now()
-        var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
-            "rules-update", payload, true /* dryRun */, ""
-        )
-        root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
+        var sent = submitter.dryRun(rulesJson, {
+            origin: origin,
+            adminBaseline: adminBaseline,
+            contentHash: contentHash
+        }, function(ok, r) {
             if (!ok) {
-                console.log("review-flow: dry-run failed:", code, msg)
+                console.log("review-flow: dry-run failed:", r.code, r.message)
                 // Release the guard without navigating.
                 _resolveGuardRulesApply(false)
                 return
@@ -154,21 +179,19 @@ QtObject {
                 _resolveGuardRulesApply(false)
                 return
             }
-            var summary = (p && p["review-summary"]) || p || {}
-            var token = (p && p["confirmation-token"]) || ""
+            var summary = r.summary
+            var token = r.token
             // A refused preview has an empty diff; say why, or it reads as
             // "nothing to apply".
-            var refusal = Pure.previewRefusal(summary)
-            if (refusal) {
-                root.statusLine = root.tr("status.rules-activate-failed",
-                    "Failed to activate rules: ") + root.previewRefusalText(refusal)
+            if (r.refusal) {
+                root.statusLine = submitter.describeFailure(r, root.tr)
                 _resolveGuardRulesApply(false)
                 return
             }
             // Nothing changed vs the active
             // revision: don't open an empty review dialog, tell the user
             // plainly there's nothing to apply and release the guard.
-            if (Pure.reviewSummaryIsEmpty(summary)) {
+            if (r.empty) {
                 root.showNotice(
                     root.tr("dialog.nothing-to-apply.title", "Nothing to apply"),
                     root.tr("dialog.nothing-to-apply.body",
@@ -195,6 +218,22 @@ QtObject {
             root.reviewDiffDialog.readOnly = false
             root.reviewDiffDialog.open()
         })
+        if (sent === null) {
+            console.log("review-flow: dry-run could not be sent, aborting")
+            _resolveGuardRulesApply(false)
+            return
+        }
+        // Set right after sending: the answer is asynchronous, so it always
+        // finds this state in place.
+        root.pendingReviewState = {
+            rulesJson: sent.rulesJson,
+            contentHash: sent.contentHash,
+            correlationId: sent.correlationId,
+            summary: null,
+            confirmationToken: "",
+            adminBaseline: sent.adminBaseline
+        }
+        root._activeReviewKind = "rules-update"
     }
 
 
@@ -265,19 +304,25 @@ QtObject {
     function _executeRulesActivation(token) {
         if (!root.bridgeAvailable) return
         if (!_guardMutationElevation()) return
-        var payload = {
-            "rules-json": root.pendingReviewState.rulesJson,
-            "content-hash": root.pendingReviewState.contentHash,
-            "correlation-id": root.pendingReviewState.correlationId
-        }
-        // Carry the admin-baseline flag on confirm so the
-        // client emits the elevated `mutation-request` class.
-        if (root.pendingReviewState.adminBaseline) payload["admin-baseline"] = true
-        var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
-            "rules-update", payload, false /* dryRun */, token
-        )
-        root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
-            if (!ok && code === "confirmation-expired") {
+        // The confirm carries the admin-baseline flag of the preview, so the
+        // client emits the elevated `mutation-request` class for it too.
+        var sent = submitter.commit(root.pendingReviewState, token, function(ok, r) {
+            if (ok) {
+                _completeRulesActivation(r.payload)
+                return
+            }
+            var failure = r.failure
+            var failureArgs = r.failureArgs
+            if (failure !== "") {
+                console.log("review-flow: activation refused:", failure)
+                // Nothing was activated: the edits stay unsaved and the
+                // bound files keep what is in force.
+                _announceRulesActivationFailed(failure, failureArgs)
+                _resolveGuardRulesApply(false)
+                return
+            }
+            var code = r.code
+            if (code === "confirmation-expired") {
                 // Re-issue the dry-run; the dirty flag must stay
                 // set because the user hasn't successfully confirmed
                 // anything yet.
@@ -287,61 +332,43 @@ QtObject {
                 _resolveGuardRulesApply(false)
                 return
             }
-            if (!ok && code === "uac-declined") {
+            if (code === "uac-declined") {
                 // The user dismissed the
                 // one-time UAC prompt. Nothing was applied; keep the dirty
                 // flag so they can simply click Apply again to retry.
-                root.statusLine = root.tr("status.activate-uac-declined",
-                    "Administrator approval was cancelled — changes were not applied. " +
-                    "Click Apply again to retry.")
+                root.statusLine = submitter.describeFailure(r, root.tr)
                 // Release the unsaved-changes guard (if it drove this
                 // apply) without navigating; no-op for non-guard flows.
                 _resolveGuardRulesApply(false)
                 return
             }
-            if (!ok) {
-                console.log("review-flow: activate failed:", code, msg)
-                // A `forbidden` here is the mutation gate (e.g. an
-                // unacknowledged security alert), not missing rights: rules
-                // commit as a non-elevated `user-scoped-mutation`.
-                _announceRulesActivationFailed(code, null)
-                // Clear the dirty flag even on failure: the user has
-                // completed the Save-and-review gesture and can't
-                // recover from non-retryable errors (forbidden, etc.)
-                // without restarting the app, so prompting them about
-                // "unsaved changes" on every navigation is noise. The
-                // `confirmation-expired` retry path above keeps the
-                // flag set because that one IS retryable in-session.
-                root.setUnsavedChanges("rules", false)
-                // Release the guard without navigating on a
-                // non-retryable failure (the error is shown in statusLine).
-                _resolveGuardRulesApply(false)
-                return
-            }
-            // The confirm only accepts the change; its verdict is on the
-            // operation record.
-            root.rpc.readMutationOutcome(p, root.rpc.settleByPreview("rules-update", payload),
-                function(failure, failureArgs) {
-                    if (failure === "") {
-                        _completeRulesActivation(p)
-                        return
-                    }
-                    console.log("review-flow: activation refused:", failure)
-                    // Nothing was activated: the edits stay unsaved and the
-                    // bound files keep what is in force.
-                    _announceRulesActivationFailed(failure, failureArgs)
-                    _resolveGuardRulesApply(false)
-                })
+            console.log("review-flow: activate failed:", code, r.message)
+            // A `forbidden` here is the mutation gate (e.g. an
+            // unacknowledged security alert), not missing rights: rules
+            // commit as a non-elevated `user-scoped-mutation`.
+            _announceRulesActivationFailed(code, null)
+            // Clear the dirty flag even on failure: the user has
+            // completed the Save-and-review gesture and can't
+            // recover from non-retryable errors (forbidden, etc.)
+            // without restarting the app, so prompting them about
+            // "unsaved changes" on every navigation is noise. The
+            // `confirmation-expired` retry path above keeps the
+            // flag set because that one IS retryable in-session.
+            root.setUnsavedChanges("rules", false)
+            // Release the guard without navigating on a
+            // non-retryable failure (the error is shown in statusLine).
+            _resolveGuardRulesApply(false)
         })
+        if (!sent) {
+            console.log("review-flow: activate could not be sent, aborting")
+            _resolveGuardRulesApply(false)
+        }
     }
 
     // `args` are this refusal's own values; null words it by its code alone.
     function _announceRulesActivationFailed(code, args) {
-        root.statusLine = root.tr("status.rules-activate-failed",
-            "Failed to activate rules: ") +
-            ((typeof root.ipcErrorLabel === "function")
-                ? root.ipcErrorLabel(String(code || "unknown"), args || null)
-                : String(code || "unknown"))
+        root.statusLine = submitter.describeFailure(
+            { failure: String(code || "unknown"), failureArgs: args || null }, root.tr)
     }
 
     function _completeRulesActivation(p) {

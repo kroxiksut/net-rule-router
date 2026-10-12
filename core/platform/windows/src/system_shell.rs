@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_RoamingAppData,
-    SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
+    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+    FOLDERID_RoamingAppData, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
 };
 
 /// Where every supported Windows keeps it; used only if the API itself fails,
@@ -55,6 +55,13 @@ pub fn system_powershell() -> PathBuf {
 #[must_use]
 pub fn program_data_directory() -> Option<PathBuf> {
     known_folder(&FOLDERID_ProgramData)
+}
+
+/// `%ProgramFiles%` as the shell registers it (for this process's bitness), or
+/// `None` when it cannot say.
+#[must_use]
+pub fn program_files_directory() -> Option<PathBuf> {
+    known_folder(&FOLDERID_ProgramFiles)
 }
 
 /// `%LOCALAPPDATA%` as the shell registers it, or `None` when it cannot say.

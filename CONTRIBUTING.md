@@ -26,7 +26,8 @@ is the page to open first.
 ## Reporting a security issue
 
 Do not open a public issue. Use GitHub's **Report a vulnerability** button on
-the repository's Security tab, which opens a private advisory. Include the
+the repository's Security tab, which opens a private advisory, or e-mail
+<fmalkov91@gmail.com> if you cannot use GitHub. Include the
 version, the platform, and what an attacker would gain — that last part decides
 how fast it moves. The trust boundaries the product is built around are written
 down in [`SECURITY.md`](SECURITY.md); a report that names the boundary it

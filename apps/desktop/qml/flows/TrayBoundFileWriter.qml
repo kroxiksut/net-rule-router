@@ -29,6 +29,9 @@ QtObject {
     /// the bridge, so the conversion crosses as a callback.
     property var aceCodec: HostAceCodec {}
 
+    /// The same writer the main window uses.
+    property var fileWriter: RulesFileWriter { rpc: writer.rpc }
+
     /// One write at a time: the trigger is a push, and a burst of them would
     /// otherwise interleave two full read-build-write chains over one file.
     property bool _inFlight: false
@@ -75,41 +78,19 @@ QtObject {
             }
             var pending = 2
             var settle = function() { if (--pending === 0) writer._inFlight = false }
-            writer._writeRoute("primary", paths.primary, rows, settle)
-            writer._writeRoute("secondary", paths.secondary, rows, settle)
+            var includeComments = snap.includeComments !== false
+            writer._writeRoute("primary", paths.primary, rows, includeComments, settle)
+            writer._writeRoute("secondary", paths.secondary, rows, includeComments, settle)
         })
     }
 
-    function _writeRoute(route, path, rows, done) {
+    function _writeRoute(route, path, rows, includeComments, done) {
         if (path === "") { done(); return }
-        var corr = nrrNativeBridge.rpcSidecarPassthroughRead(route)
-        var build = function(sections) {
-            var model = { count: rows.length, get: function(i) { return rows[i] } }
-            var text = Rules.buildCanonicalRulesText(model, route, sections, true, os)
-            // Compare the routing body, not the bytes: the header carries a
-            // generation timestamp, so a byte compare rewrites every file on
-            // every pass and the drift watch then sees its own mtime churn.
-            var b64 = String(nrrNativeBridge.readFileBytes(path) || "")
-            if (b64 !== "") {
-                var current = ""
-                try { current = Qt.atob(b64) } catch (e) { current = "" }
-                if (current !== ""
-                        && Rules.canonicalRulesBody(current)
-                            === Rules.canonicalRulesBody(text)) {
-                    done()
-                    return
-                }
-            }
-            if (!nrrNativeBridge.writeTextFile(path, text)) {
-                console.log("tray bound-file: write failed:", route, path)
-            } else {
-                console.log("tray bound-file: mirrored service rules into", path)
-            }
+        var model = { count: rows.length, get: function(i) { return rows[i] } }
+        fileWriter.writeRoute(route, path, model, includeComments, os, function(ok, changed) {
+            if (!ok) console.log("tray bound-file: write failed:", route, path)
+            else if (changed) console.log("tray bound-file: mirrored service rules into", path)
             done()
-        }
-        if (!corr || String(corr) === "") { build({}); return }
-        rpc.registerRpcCallback(corr, function(ok, payload) {
-            build((ok && payload && payload.sections) || {})
         })
     }
 }

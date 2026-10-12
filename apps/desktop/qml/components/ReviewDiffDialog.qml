@@ -261,10 +261,8 @@ Dialog {
                         + "approval ends when you close NetRuleRouter.")
                     : root.tr(
                         "dialog.review-diff.no-elevation-warning",
-                        "NetRuleRouter is not running as Administrator. When you "
-                        + "apply, Windows will ask for administrator approval once "
-                        + "— after you approve it, this and later changes apply "
-                        + "without prompting again until you close the app.")
+                        "NetRuleRouter is not running as administrator. When you "
+                        + "apply, the system will ask for administrator approval.")
                 wrapMode: Text.Wrap
                 color: "#664d03"
                 font.pixelSize: 12

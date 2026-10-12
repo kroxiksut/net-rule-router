@@ -123,6 +123,10 @@ pub mod routing;
 // Windows-only: the module talks to the Service Control Manager.
 #[cfg(windows)]
 pub mod service_control;
+// The administrators-only copy of the service binary an install from a
+// user-writable folder registers instead.
+#[cfg(windows)]
+pub mod service_placement;
 // Named-kernel-mutex mechanism behind
 // `nrr_platform_api::single_instance::SingleInstancePort`.
 #[cfg(windows)]

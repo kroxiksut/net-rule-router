@@ -109,6 +109,9 @@ pub fn run() -> ExitCode {
     nrr_platform_api::own_traffic::install_own_traffic_marker(Box::new(
         nrr_platform_linux::own_traffic::SoMarkOwnTraffic,
     ));
+    nrr_platform_api::source_link::install_source_link_pinner(Box::new(
+        nrr_platform_linux::source_link::BindToSourceDevice,
+    ));
 
     tracing::info!(
         target: "nrr::lifecycle",
@@ -255,12 +258,22 @@ fn spawn_watchdog(interval: Duration, stop: StopToken, beats: Heartbeats) {
     let spawned = std::thread::Builder::new()
         .name("nrr-sd-watchdog".to_owned())
         .spawn(move || {
+            let mut last_look = epoch_secs();
             while !stop.is_stop_requested() {
                 // An idle acceptor sits in `accept`; the poke makes a live one
                 // turn once, and refresh its beat, before the next look.
                 let _ = std::os::unix::net::UnixStream::connect(SOCKET_PATH);
                 std::thread::sleep(interval);
-                let stale = stale_heartbeats(epoch_secs(), window, &beats.readings());
+                let now = epoch_secs();
+                let jumped = clock_jumped(last_look, now, interval);
+                last_look = now;
+                // After a sleep every beat reads as old as the nap: the
+                // components get one round to beat again before being judged.
+                if jumped {
+                    let _ = notify(&[NotifyState::Watchdog]);
+                    continue;
+                }
+                let stale = stale_heartbeats(now, window, &beats.readings());
                 if !stale.is_empty() {
                     tracing::error!(
                         target: "nrr::lifecycle",
@@ -292,6 +305,14 @@ const RUNTIME_LIVENESS_WINDOW_SECS: u64 = 60;
 /// per interval, so its beat is up to one interval old by design.
 fn liveness_window(interval: Duration) -> u64 {
     RUNTIME_LIVENESS_WINDOW_SECS.max(interval.as_secs().saturating_mul(2))
+}
+
+/// Whether the wall clock moved far more than one watchdog sleep between two
+/// looks: the machine slept or the clock was set forward. The watchdog's own
+/// thread does not wedge with the runtime, so only that stretches its sleep.
+fn clock_jumped(previous: u64, now: u64, interval: Duration) -> bool {
+    let sleep = interval.as_secs();
+    now.saturating_sub(previous) > sleep.saturating_mul(2).saturating_add(10)
 }
 
 /// Names of the heartbeats older than `window` seconds at `now`.
@@ -546,6 +567,17 @@ mod tests {
 
     /// A wedged enforcement pass or accept loop used to go unnoticed while
     /// the adapter monitor kept ticking.
+    /// A resume from a 40-minute sleep is a clock jump, not a wedge; an
+    /// ordinary round, a slow one and a clock set back are not jumps.
+    #[test]
+    fn a_sleep_reads_as_a_clock_jump_not_a_stale_heartbeat() {
+        let interval = Duration::from_secs(15);
+        assert!(clock_jumped(1_000, 1_000 + 2_393, interval));
+        assert!(!clock_jumped(1_000, 1_015, interval));
+        assert!(!clock_jumped(1_000, 1_035, interval));
+        assert!(!clock_jumped(1_000, 900, interval));
+    }
+
     #[test]
     fn any_stale_heartbeat_withholds_the_ping() {
         let fresh = NOW - 1;

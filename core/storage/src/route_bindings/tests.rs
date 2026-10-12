@@ -121,6 +121,23 @@ fn link_provider_apps_roundtrip_replace_clear_and_dedupe() {
         .is_err());
 }
 
+#[test]
+fn any_leak_guard_armed_sees_one_user_among_many() {
+    let (_dir, conn) = fresh_db();
+    let repo = RouteBindingsRepository::new(&conn);
+    assert!(!repo.any_leak_guard_armed().expect("empty"));
+
+    let mut off = sample_record(BindingSource::UserAssigned);
+    off.kill_switch_enabled = false;
+    repo.update_for_sid("S-1-5-21-A", &off, 1).expect("off");
+    assert!(!repo.any_leak_guard_armed().expect("one off"));
+
+    let mut on = off.clone();
+    on.kill_switch_enabled = true;
+    repo.update_for_sid("S-1-5-21-B", &on, 1).expect("on");
+    assert!(repo.any_leak_guard_armed().expect("one on"));
+}
+
 fn sample_record(source: BindingSource) -> RoutePolicyRecord {
     RoutePolicyRecord {
         primary: Some(RouteBindingRecord {
@@ -188,6 +205,8 @@ fn sample_record(source: BindingSource) -> RoutePolicyRecord {
         zone_priority_over_ip: false,
         short_name_completion: true,
         short_name_suffix: "corp.example".to_string(),
+        // Non-default (default is `false`) — proves the v70 column round-trips.
+        app_rules_take_all_addresses: true,
         binding_source: source,
     }
 }
@@ -690,6 +709,10 @@ fn row_defaults_as_wire() -> Vec<(&'static str, serde_json::Value)> {
         ("zone-priority-over-ip", json!(row.zone_priority_over_ip)),
         ("short-name-completion", json!(row.short_name_completion)),
         ("short-name-suffix", json!(row.short_name_suffix)),
+        (
+            "app-rules-take-all-addresses",
+            json!(row.app_rules_take_all_addresses),
+        ),
     ]
 }
 

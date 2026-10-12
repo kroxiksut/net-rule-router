@@ -83,6 +83,7 @@ fn generate_in(
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
             families,
             packet_blocks: true,
         },
@@ -175,6 +176,7 @@ fn the_shape_gate_lets_networks_into_the_service() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -497,6 +499,7 @@ fn only_the_baseline_block_reaches_the_packet_layer() {
                 app_resolver: &NoopAppPathResolver,
                 secondary_ip_denylist: &std::collections::HashSet::new(),
                 zone_priority_over_ip: false,
+                app_rules_take_all_addresses: false,
                 families: FamilyScope::V4Only,
                 packet_blocks,
             },

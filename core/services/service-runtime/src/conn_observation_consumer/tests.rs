@@ -443,6 +443,7 @@ impl crate::per_sid_orchestrator::RoutePolicySource for OneSecondaryPolicy {
             primary_probe_repeat_secs: 300,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
         })
     }
 }

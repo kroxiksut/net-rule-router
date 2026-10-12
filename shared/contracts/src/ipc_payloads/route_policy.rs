@@ -194,6 +194,11 @@ pub struct RoutePolicyDto {
     /// The network domain the user named; empty when unset.
     #[serde(default)]
     pub short_name_suffix: String,
+    /// An application rule takes every address its program uses, even one an
+    /// address rule of the other link names. Off by default; an older peer
+    /// that omits it reads as off.
+    #[serde(default)]
+    pub app_rules_take_all_addresses: bool,
 }
 
 /// Additive default for [`RoutePolicyDto::auto_rules_mode`] /
@@ -474,6 +479,9 @@ pub struct RoutePolicyUpdateRequest {
     /// The network domain the user named; empty when unset.
     #[serde(default)]
     pub short_name_suffix: String,
+    /// Application rules take all their addresses (see [`RoutePolicyDto`]).
+    #[serde(default)]
+    pub app_rules_take_all_addresses: bool,
     /// When not empty, only these fields (wire names) are taken from this
     /// request; the rest stay as stored. Two clients each writing the row they
     /// read lose each other's change; naming what changed keeps both.
@@ -532,6 +540,7 @@ impl RoutePolicyUpdateRequest {
             zone_priority_over_ip,
             short_name_completion,
             short_name_suffix,
+            app_rules_take_all_addresses,
             binding_source: _,
             apply_only: _,
         } = self;
@@ -564,6 +573,7 @@ impl RoutePolicyUpdateRequest {
             zone_priority_over_ip: stored_zone_priority,
             short_name_completion: stored_short_name_completion,
             short_name_suffix: stored_short_name_suffix,
+            app_rules_take_all_addresses: stored_app_takeover,
             binding_source: _,
         } = current;
 
@@ -597,6 +607,7 @@ impl RoutePolicyUpdateRequest {
             // Decides which resolvers learn the machine's short names.
             || short_name_completion != stored_short_name_completion
             || short_name_suffix != stored_short_name_suffix
+            || app_rules_take_all_addresses != stored_app_takeover
     }
 }
 

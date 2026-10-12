@@ -77,7 +77,7 @@ Window {
             wrapMode: Text.WordWrap
             color: root.ownerRoot ? root.ownerRoot.textColor : "white"
             text: root.tr("dialog.first-launch-install.body-1",
-                "NetRuleRouter applies routing rules from a Windows background service so they persist across reboots and user sessions.")
+                "NetRuleRouter applies routing rules from a background system service so they persist across reboots and user sessions.")
         }
         Label {
             Layout.fillWidth: true

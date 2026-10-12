@@ -44,7 +44,7 @@ pub const TRACE_SUBTITLE: Key = key(
 );
 pub const TRACE_VERDICT_NOTE: Key = key(
     "diag.conn-trace.verdict-note",
-    "\"Blocked\" means the connection was dropped by a Windows filter — this can be Windows Firewall or your antivirus, not necessarily NetRuleRouter.",
+    "\"Blocked\" means the connection was dropped by a filter in the system — this can be the system firewall or your antivirus, not necessarily NetRuleRouter.",
 );
 pub const TRACE_LOADING: Key = key("diag.conn-trace.entries-loading", "Loading connections...");
 pub const TRACE_EMPTY: Key = key(

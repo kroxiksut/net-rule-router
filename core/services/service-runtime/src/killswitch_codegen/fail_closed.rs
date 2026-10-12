@@ -146,6 +146,17 @@ pub fn fail_closed_block_apps(
     app_patterns: &[String],
     protocols: KillSwitchProtocols,
 ) -> Vec<WfpFilterSpec> {
+    fail_closed_block_apps_for(sid, app_patterns, protocols, false)
+}
+
+/// [`fail_closed_block_apps`] under the principal's
+/// `app_rules_take_all_addresses`; see [`app_kill_switch_filters_for`].
+pub fn fail_closed_block_apps_for(
+    sid: &str,
+    app_patterns: &[String],
+    protocols: KillSwitchProtocols,
+    app_takeover: bool,
+) -> Vec<WfpFilterSpec> {
     if !protocols.wants_ale_block() {
         return Vec::new();
     }
@@ -153,16 +164,18 @@ pub fn fail_closed_block_apps(
         .iter()
         .take(APP_KILLSWITCH_MAX_APPS)
         .enumerate()
-        .map(|(idx, pattern)| ale_block_app(sid, pattern, APP_KILLSWITCH_BLOCK_BASE + idx as u64))
+        .map(|(idx, pattern)| ale_block_app(sid, pattern, idx as u64, app_takeover))
         .collect()
 }
 
 /// ALE-layer block keyed on an app id (mirrors [`ale_block`] for the per-app
 /// fail-closed path). Protocol-agnostic (covers TCP+UDP). Sits below the
 /// primary rule band ([`APP_KILLSWITCH_BLOCK_BASE`]) so main-named addresses
-/// keep working for the app even with the tunnel unresolved; the id folds the
-/// band tag for the same upgrade reason as [`block_app_off_secondary`].
-fn ale_block_app(sid: &str, pattern: &str, weight: u64) -> WfpFilterSpec {
+/// keep working for the app even with the tunnel unresolved, unless the app
+/// takes all its addresses ([`app_block_band`]); the id folds the band tag for
+/// the same upgrade reason as [`block_app_off_secondary`].
+fn ale_block_app(sid: &str, pattern: &str, idx: u64, app_takeover: bool) -> WfpFilterSpec {
+    let (weight, band) = app_block_band(idx, app_takeover);
     WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
@@ -171,13 +184,7 @@ fn ale_block_app(sid: &str, pattern: &str, weight: u64) -> WfpFilterSpec {
         remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
-        id: filter_id_for(
-            sid,
-            KILLSWITCH_ROLE,
-            "sub-main-band",
-            "ks-app-fc-block",
-            pattern,
-        ),
+        id: filter_id_for(sid, KILLSWITCH_ROLE, band, "ks-app-fc-block", pattern),
         user_sid: Some(sid.to_string()),
         app_pattern: Some(pattern.to_string()),
         local_interface_luid: None,

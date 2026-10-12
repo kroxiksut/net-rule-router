@@ -20,6 +20,23 @@ where
         })
 }
 
+/// The first three of `items`, comma-separated, then `more` with `{n}` filled
+/// with how many were left out (`listSummary`): a notice naming every one would
+/// not fit.
+pub fn list_summary(items: &[String], more: &str) -> String {
+    const SHOWN: usize = 3;
+    let head = items
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match items.len().checked_sub(SHOWN) {
+        Some(rest) if rest > 0 => format!("{head} {}", more.replace("{n}", &rest.to_string())),
+        _ => head,
+    }
+}
+
 /// A translated log line with `{name}` taken from `args` and `{0}`, `{1}`…
 /// from `positional`, in one pass (`formatLogLine`): a value is never
 /// re-scanned, so a `{host}` inside it stays literal.

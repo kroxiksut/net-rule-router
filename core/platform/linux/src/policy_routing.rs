@@ -35,7 +35,7 @@ use nrr_platform_api::route_table::{
     PrincipalRoutingPort, SelectorDelta, SelectorPlan, TableSelector,
 };
 
-use crate::route_table::FibRule;
+use crate::route_table::{FibRule, RawFibRule};
 
 /// A user's table is this plus their uid.
 pub const PRINCIPAL_TABLE_BASE: u32 = 0x8000_0000;
@@ -60,6 +60,94 @@ const UID_RANGE_SINCE: (u32, u32) = (4, 10);
 #[must_use]
 pub fn table_for_uid(uid: u32) -> Option<u32> {
     (uid <= LAST_MAPPED_UID).then(|| PRINCIPAL_TABLE_BASE + uid)
+}
+
+/// The `main` rule's priority: a rule added without one lands just in front of
+/// the first rule after `local`, which is `main` until ours are installed.
+const MAIN_RULE_PRIORITY: u32 = 32_766;
+
+/// Somebody else's rules in an unbroken run right in front of ours, each with
+/// the priority it would have had without us. A VPN that comes up after the
+/// service (`wg-quick` numbers nothing) lands there and takes every user's
+/// traffic before their own table is looked up. The kernel numbers such a rule
+/// down from the first rule after `local`; without ours that is the first
+/// foreign rule behind our band, so a second tunnel lands in front of the
+/// first, as it would have. A `goto`, or a rule some `goto` jumps to, stops
+/// the run: moving either would break the jump.
+pub(crate) fn displaced_rules(rules: &[RawFibRule]) -> Vec<(usize, u32)> {
+    let mut out = Vec::new();
+    for ipv6 in [false, true] {
+        let family = || rules.iter().filter(move |r| r.ipv6 == ipv6);
+        let Some(start) = family().filter(|r| r.ours).map(|r| r.priority).min() else {
+            continue;
+        };
+        let base = family()
+            .filter(|r| !r.ours && r.priority > *PRIORITY_BAND.end())
+            .map(|r| r.priority)
+            .min()
+            .unwrap_or(MAIN_RULE_PRIORITY);
+        let jumped_to: Vec<u32> = family().filter_map(|r| r.goto_target).collect();
+        let mut priority = start;
+        while priority > 1 {
+            priority -= 1;
+            let Some(target) = base.checked_sub(start - priority) else {
+                break;
+            };
+            let here: Vec<usize> = (0..rules.len())
+                .filter(|&i| {
+                    rules[i].ipv6 == ipv6 && !rules[i].ours && rules[i].priority == priority
+                })
+                .collect();
+            if here.is_empty()
+                || here.iter().any(|&i| rules[i].goto_target.is_some())
+                || jumped_to.contains(&priority)
+                || target <= *PRIORITY_BAND.end()
+            {
+                break;
+            }
+            out.extend(here.into_iter().map(|i| (i, target)));
+        }
+    }
+    out
+}
+
+/// Every rule [`displaced_rules`] would move, whole: empty once ours are in
+/// front. A pass input, so a VPN coming up wakes a pass that would otherwise
+/// see nothing it reads move; the body, so one rule replacing another at the
+/// same priority is a change too.
+#[cfg(target_os = "linux")]
+pub fn rules_in_front_of_ours() -> Result<Vec<(bool, u32, Vec<u8>)>, PlatformError> {
+    let rules = crate::route_table::get_raw_fib_rules()?;
+    Ok(displaced_rules(&rules)
+        .into_iter()
+        .map(|(i, _)| (rules[i].ipv6, rules[i].priority, rules[i].body.clone()))
+        .collect())
+}
+
+/// Move what [`displaced_rules`] finds. One refused move does not hold back
+/// the others; the first refusal is returned after all were tried.
+#[cfg(target_os = "linux")]
+fn keep_ours_in_front() -> Result<usize, PlatformError> {
+    let rules = crate::route_table::get_raw_fib_rules()?;
+    let mut moved = 0;
+    let mut first_error = None;
+    for (i, to) in displaced_rules(&rules) {
+        let rule = &rules[i];
+        if let Err(e) = crate::route_table::move_raw_fib_rule(rule, to) {
+            first_error.get_or_insert(e);
+            continue;
+        }
+        moved += 1;
+        tracing::info!(
+            target: "nrr::routes",
+            msg_key = "linux-foreign-rule-moved",
+            from = rule.priority,
+            to,
+            ipv6 = rule.ipv6,
+            "a routing rule added after ours stood in front of them; moved to where it would have been without us",
+        );
+    }
+    first_error.map_or(Ok(moved), Err)
 }
 
 /// Whether table `n` is one of ours.
@@ -282,6 +370,15 @@ impl PrincipalRoutingPort for LinuxPrincipalRouting {
         if delta.added > 0 && uid_range_ignored(&crate::route_table::get_fib_rules()?) {
             self.clear_selectors()?;
             return Err(PlatformError::NotSupported { reason: OLD_KERNEL });
+        }
+        // Ours already stand; a move refused now is retried by the next pass.
+        if let Err(e) = keep_ours_in_front() {
+            tracing::warn!(
+                target: "nrr::routes",
+                msg_key = "linux-foreign-rule-move-failed",
+                error = %e,
+                "a routing rule in front of ours could not be moved: until it is, it takes the traffic first",
+            );
         }
         Ok(delta)
     }
@@ -534,6 +631,106 @@ mod tests {
         assert!(!uid_range_ignored(&[rule]));
         rule.uid_range = None;
         assert!(uid_range_ignored(&[rule]));
+    }
+
+    fn raw(ipv6: bool, priority: u32, ours: bool) -> RawFibRule {
+        RawFibRule {
+            ipv6,
+            priority,
+            goto_target: None,
+            ours,
+            body: Vec::new(),
+        }
+    }
+
+    /// `wg-quick` brought up after the service: its pair landed at 30098/30099
+    /// in front of ours and goes back to 32764/32765, order kept.
+    #[test]
+    fn a_vpn_pair_in_front_of_ours_goes_where_it_would_have_been() {
+        let rules = [
+            raw(false, 0, false),
+            raw(false, 30_098, false),
+            raw(false, 30_099, false),
+            raw(false, USER_PRIORITY, true),
+            raw(false, SYSTEM_PRIORITY, true),
+            raw(false, 32_766, false),
+        ];
+        let mut moves = displaced_rules(&rules);
+        moves.sort_unstable();
+        assert_eq!(moves, vec![(1, 32_764), (2, 32_765)]);
+    }
+
+    /// The families are numbered apart; each run is measured from its own.
+    #[test]
+    fn each_family_is_measured_from_its_own_rules() {
+        let rules = [
+            raw(false, 30_099, false),
+            raw(false, USER_PRIORITY, true),
+            raw(true, 30_099, false),
+            raw(true, SYSTEM_PRIORITY, true),
+        ];
+        let mut moves = displaced_rules(&rules);
+        moves.sort_unstable();
+        assert_eq!(moves, vec![(0, 32_765)]);
+    }
+
+    /// Rules numbered on purpose elsewhere (Tailscale's 52xx), a gap, a `goto`,
+    /// and rules behind ours all stay.
+    #[test]
+    fn only_an_unbroken_run_right_in_front_moves() {
+        let mut jump = raw(false, 30_098, false);
+        jump.goto_target = Some(32_000);
+        let rules = [
+            raw(false, 5_270, false),
+            jump,
+            raw(false, 30_099, false),
+            raw(false, USER_PRIORITY, true),
+            raw(false, 32_765, false),
+        ];
+        assert_eq!(
+            displaced_rules(&rules),
+            vec![(2, 32_764)],
+            "in front of the rule behind ours"
+        );
+        let gapped = [raw(false, 30_097, false), raw(false, USER_PRIORITY, true)];
+        assert!(displaced_rules(&gapped).is_empty());
+    }
+
+    /// A second tunnel up after the first was moved lands in front of the
+    /// first, as it would have without us, never on the first one's slots.
+    #[test]
+    fn a_second_tunnel_goes_in_front_of_the_first() {
+        let rules = [
+            raw(false, 30_098, false),
+            raw(false, 30_099, false),
+            raw(false, USER_PRIORITY, true),
+            raw(false, 32_764, false),
+            raw(false, 32_765, false),
+            raw(false, 32_766, false),
+        ];
+        let mut moves = displaced_rules(&rules);
+        moves.sort_unstable();
+        assert_eq!(moves, vec![(0, 32_762), (1, 32_763)]);
+    }
+
+    /// A rule some `goto` jumps to keeps its priority, or the jump would land
+    /// nowhere.
+    #[test]
+    fn a_jump_target_stays() {
+        let mut jump = raw(false, 5_000, false);
+        jump.goto_target = Some(30_099);
+        let rules = [
+            jump,
+            raw(false, 30_099, false),
+            raw(false, USER_PRIORITY, true),
+        ];
+        assert!(displaced_rules(&rules).is_empty());
+    }
+
+    /// With none of ours installed nobody is in front of anything.
+    #[test]
+    fn nothing_moves_without_rules_of_ours() {
+        assert!(displaced_rules(&[raw(false, 30_099, false)]).is_empty());
     }
 
     #[test]

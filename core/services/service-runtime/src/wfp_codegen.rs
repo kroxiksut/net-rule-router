@@ -222,6 +222,9 @@ pub struct CodegenInput<'a> {
     /// address-ownership arbiter, which is the one place the two can contest
     /// the same address.
     pub zone_priority_over_ip: bool,
+    /// Application rules take every address their program uses, from the
+    /// principal's stored `app_rules_take_all_addresses`. Reaches the arbiter.
+    pub app_rules_take_all_addresses: bool,
     /// Which address families this pass may emit filters for — the Windows
     /// twin of `PlannerInput::ipv6`. `V4Only` reproduces the shape from before
     /// IPv6 existed, filter for filter and weight for weight.
@@ -618,13 +621,17 @@ pub fn generate_filters_with_shapes(
     // Resolved from the UNFILTERED cache: the denylist view exists to trim what
     // goes to the tunnel, and reading it here would understate what the main
     // link claims.
-    let order = crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+    let settings = crate::address_ownership::OwnershipSettings::from_policy(
         input.zone_priority_over_ip,
+        input.app_rules_take_all_addresses,
     );
-    let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
+    let order = settings.order;
+    let ownership = crate::address_ownership::AddressOwnership::resolve_for(
         input.rule_book,
         input.fqdn_cache,
-        order,
+        settings,
+        current_rule_shape_support(),
+        input.app_observations,
     );
     let carving = crate::enforcement_planner::NetworkCarving::index(
         input.rule_book,

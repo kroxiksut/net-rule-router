@@ -138,7 +138,7 @@ use std::collections::HashSet;
 /// It replaced a pinned COUNT, which could not see an operation removed and
 /// another added in the same change — and a prose comment that tried to
 /// enumerate the catalog and had drifted to naming 33 of 70.
-const PINNED_OPERATION_SLUGS: [&str; 73] = [
+const PINNED_OPERATION_SLUGS: [&str; 74] = [
     "audit.list",
     "autorules.candidates.accept",
     "autorules.candidates.dismiss",
@@ -212,6 +212,7 @@ const PINNED_OPERATION_SLUGS: [&str; 73] = [
     "traffic-stats.get",
     "traffic-stats.history-merge.set",
     "traffic-stats.set",
+    "vpn.gateway-candidates.list",
 ];
 
 /// The catalog must list every variant in `IpcOperationName::ALL` exactly

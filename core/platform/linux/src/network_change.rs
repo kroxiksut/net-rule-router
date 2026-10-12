@@ -63,6 +63,8 @@ const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
+const RTM_NEWRULE: u16 = 32;
+const RTM_DELRULE: u16 = 33;
 
 /// Does this message type mean the topology changed?
 ///
@@ -72,7 +74,14 @@ const RTM_DELROUTE: u16 = 25;
 fn is_topology_change(message_type: u16) -> bool {
     matches!(
         message_type,
-        RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE
+        RTM_NEWLINK
+            | RTM_DELLINK
+            | RTM_NEWADDR
+            | RTM_DELADDR
+            | RTM_NEWROUTE
+            | RTM_DELROUTE
+            | RTM_NEWRULE
+            | RTM_DELRULE
     )
 }
 
@@ -173,13 +182,20 @@ impl Drop for NetlinkWatcher {
 
 /// The multicast groups the watcher joins. Both families: a tunnel can gain or
 /// lose only its v6 address or default route, and our own v6 routes need the
-/// same prompt restore after someone else deletes them.
+/// same prompt restore after someone else deletes them. Rules too: a VPN's
+/// rule landing in front of ours takes every user's traffic.
 #[cfg(target_os = "linux")]
 const SUBSCRIBED_GROUPS: u32 = (libc::RTMGRP_LINK
     | libc::RTMGRP_IPV4_IFADDR
     | libc::RTMGRP_IPV4_ROUTE
+    | libc::RTMGRP_IPV4_RULE
     | libc::RTMGRP_IPV6_IFADDR
-    | libc::RTMGRP_IPV6_ROUTE) as u32;
+    | libc::RTMGRP_IPV6_ROUTE) as u32
+    | RTMGRP_IPV6_RULE;
+
+/// `1 << (RTNLGRP_IPV6_RULE - 1)`; the legacy group mask has no named constant.
+#[cfg(target_os = "linux")]
+const RTMGRP_IPV6_RULE: u32 = 1 << (19 - 1);
 
 /// `AF_NETLINK` socket bound to [`SUBSCRIBED_GROUPS`].
 #[cfg(target_os = "linux")]
@@ -448,9 +464,19 @@ mod tests {
             libc::RTMGRP_IPV4_ROUTE,
             libc::RTMGRP_IPV6_IFADDR,
             libc::RTMGRP_IPV6_ROUTE,
+            libc::RTMGRP_IPV4_RULE,
         ] {
             assert_ne!(SUBSCRIBED_GROUPS & group as u32, 0, "group {group:#x}");
         }
+        assert_eq!(RTMGRP_IPV6_RULE, 1 << (libc::RTNLGRP_IPV6_RULE - 1));
+        assert_ne!(SUBSCRIBED_GROUPS & RTMGRP_IPV6_RULE, 0);
+    }
+
+    /// A VPN's rule landing in front of ours must wake a pass.
+    #[test]
+    fn a_rule_change_is_a_topology_change() {
+        assert!(carries_topology_change(&message(RTM_NEWRULE, b"x")));
+        assert!(carries_topology_change(&message(RTM_DELRULE, b"x")));
     }
 
     /// The live half: subscribing must succeed on any Linux host (the groups

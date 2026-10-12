@@ -40,10 +40,9 @@ pub fn plan_routes(
     app_observations: &dyn AppObservationLookup,
     denied: &HashSet<Ipv4Addr>,
     families: FamilyScope,
-    // Where an exact-address rule sits against a zone rule, from the
-    // principal's `zone_priority_over_ip`. The two can only contest the same
-    // address in the ownership arbiter, so this is the whole of its reach here.
-    order: crate::address_ownership::ZoneVsIpOrder,
+    // The principal's `zone_priority_over_ip` and `app_rules_take_all_addresses`.
+    // Both reach the ownership arbiter only, so this is the whole of their reach.
+    order: impl Into<crate::address_ownership::OwnershipSettings>,
     // The tunnel's own catch-all prefixes; empty when they are not known.
     tunnel_catch_alls: &[(Ipv4Addr, u8)],
 ) -> Vec<RouteIntent> {
@@ -75,7 +74,7 @@ pub fn plan_routes_with(
     app_observations: &dyn AppObservationLookup,
     denied: &HashSet<Ipv4Addr>,
     families: FamilyScope,
-    order: crate::address_ownership::ZoneVsIpOrder,
+    order: impl Into<crate::address_ownership::OwnershipSettings>,
     tunnel_catch_alls: &[(Ipv4Addr, u8)],
     networks: &NetworkRouteFacts,
     support: nrr_domain::rule_shape::RuleShapeSupport,
@@ -84,8 +83,12 @@ pub fn plan_routes_with(
     // Ownership from the UNFILTERED cache: the denylist view exists to trim
     // what goes to the tunnel, and reading it here would understate what the
     // main link claims.
-    let ownership = crate::address_ownership::AddressOwnership::resolve_with_support(
-        rule_book, cache, order, support,
+    let ownership = crate::address_ownership::AddressOwnership::resolve_for(
+        rule_book,
+        cache,
+        order.into(),
+        support,
+        app_observations,
     );
     match mode {
         RouteBehaviorMode::PreferPrimary => {

@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NetRuleRouter MSI (WiX Toolset 5). Built by scripts\package-windows.ps1 from the
+  package folder it has just produced; see docs/en/packaging-windows.md.
+
+  Bind path "pkg": the package folder. Preprocessor variables (wix build -d):
+  Version (numeric a.b.c), DisplayVersion, LicenseRtf, optional Variant
+  (full | headless). The processor comes from wix build -arch: x64 or arm64.
+
+  Removal keeps all data, including from Apps & Features. Complete removal:
+    msiexec /x <package.msi or product code> REMOVEALLDATA=1 [REMOVEAUDIT=1]
+  REMOVEAUDIT=1 erases the audit trail and only counts together with REMOVEALLDATA=1.
+  Complete removal erases the service's data and that of the user running msiexec;
+  other Windows accounts' data is listed in the log, never deleted.
+
+  Service and data steps run through scripts\setup-actions.ps1, which reuses the
+  console and the user scripts; the package registers no service itself.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <?ifndef Variant ?>
+    <?define Variant = "full" ?>
+  <?endif?>
+  <?if $(sys.BUILDARCH) = "x86" ?>
+    <?define SysDir = "[SystemFolder]" ?>
+  <?else?>
+    <?define SysDir = "[System64Folder]" ?>
+  <?endif?>
+
+  <!-- UpgradeCode never changes: an upgrade finds the previous installation by it. -->
+  <Package Name="NetRuleRouter" Manufacturer="NetRuleRouter" Version="$(var.Version)"
+           UpgradeCode="32814437-D697-4AC1-B07C-BD46DE72F89C" Scope="perMachine"
+           Language="1033">
+    <!-- Pre-release builds share one numeric version; each must still replace the last. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of NetRuleRouter is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="AppIcon" SourceFile="!(bindpath.pkg)\assets\icons\app\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPCOMMENTS" Value="Version $(var.DisplayVersion)" />
+    <Property Id="ARPCONTACT" Value="fmalkov91@gmail.com" />
+
+    <Property Id="REMOVEALLDATA" Secure="yes" />
+    <Property Id="REMOVEAUDIT" Secure="yes" />
+
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+    <!-- The service runs as LocalSystem from here and refuses a folder an
+         ordinary user can write to, so no folder choice is offered. -->
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="NetRuleRouter" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="NetRuleRouter">
+      <ComponentGroupRef Id="PackageFiles" />
+    </Feature>
+
+    <!-- Register: from the installed console, after the files are in place. -->
+    <SetProperty Id="NrrRegister" Sequence="execute" Before="NrrRegister"
+                 Condition="NOT (REMOVE~=&quot;ALL&quot;)"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action Register" />
+    <SetProperty Id="NrrRegisterRollback" Action="SetNrrRegisterRollbackFresh"
+                 Sequence="execute" Before="NrrRegisterRollback"
+                 Condition="NOT (REMOVE~=&quot;ALL&quot;) AND NOT WIX_UPGRADE_DETECTED"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action Rollback" />
+    <SetProperty Id="NrrRegisterRollback" Action="SetNrrRegisterRollbackUpgrade"
+                 Sequence="execute" Before="NrrRegisterRollback"
+                 Condition="NOT (REMOVE~=&quot;ALL&quot;) AND WIX_UPGRADE_DETECTED"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action Rollback -Upgrade" />
+
+    <!-- Unregister: the service is already stopped (ServiceControl below); the
+         files are still there. An upgrade keeps the registration. -->
+    <SetProperty Id="NrrUnregister" Action="SetNrrUnregisterKeep"
+                 Sequence="execute" Before="NrrUnregister"
+                 Condition="NOT (REMOVEALLDATA=&quot;1&quot;)"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action Unregister" />
+    <SetProperty Id="NrrUnregister" Action="SetNrrUnregisterData"
+                 Sequence="execute" Before="NrrUnregister"
+                 Condition="REMOVEALLDATA=&quot;1&quot; AND NOT (REMOVEAUDIT=&quot;1&quot;)"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action Unregister -RemoveData" />
+    <SetProperty Id="NrrUnregister" Action="SetNrrUnregisterDataAudit"
+                 Sequence="execute" Before="NrrUnregister"
+                 Condition="REMOVEALLDATA=&quot;1&quot; AND REMOVEAUDIT=&quot;1&quot;"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action Unregister -RemoveData -RemoveAudit" />
+
+    <!-- The installing user's own data, as that user: the elevated half runs as
+         SYSTEM, whose profile never held any. -->
+    <SetProperty Id="NrrRemoveUserData" Sequence="execute" Before="NrrRemoveUserData"
+                 Condition="REMOVEALLDATA=&quot;1&quot;"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action RemoveUserData" />
+
+    <CustomAction Id="NrrRegister" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="NrrRegisterRollback" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="rollback" Impersonate="no" Return="ignore" />
+    <!-- A failed step must never trap the program on the machine. -->
+    <CustomAction Id="NrrUnregister" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <CustomAction Id="NrrRemoveUserData" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="yes" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="NrrRegisterRollback" Before="NrrRegister"
+              Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
+      <Custom Action="NrrRegister" After="InstallFiles"
+              Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
+      <Custom Action="NrrRemoveUserData" After="StopServices"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND REMOVEALLDATA=&quot;1&quot;" />
+      <Custom Action="NrrUnregister" After="NrrRemoveUserData"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="PackageFiles" Directory="INSTALLFOLDER">
+      <Files Include="!(bindpath.pkg)\**">
+        <Exclude Files="!(bindpath.pkg)\.nrr-package" />
+        <Exclude Files="!(bindpath.pkg)\nrr-service.exe" />
+        <?if $(var.Variant) = "full" ?>
+          <Exclude Files="!(bindpath.pkg)\NetRuleRouter.exe" />
+        <?endif?>
+      </Files>
+
+      <Component>
+        <File Source="!(bindpath.pkg)\nrr-service.exe" KeyPath="yes" />
+        <!-- Stops the service before its binary is replaced or removed. -->
+        <ServiceControl Id="StopNrrService" Name="NetRuleRouter" Stop="both" Wait="yes" />
+      </Component>
+
+      <?if $(var.Variant) = "full" ?>
+        <Component>
+          <File Source="!(bindpath.pkg)\NetRuleRouter.exe" KeyPath="yes">
+            <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="NetRuleRouter"
+                      WorkingDirectory="INSTALLFOLDER" Advertise="no" />
+          </File>
+        </Component>
+      <?endif?>
+
+      <Component Subdirectory="scripts">
+        <File Source="$(sys.SOURCEFILEDIR)setup-actions.ps1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

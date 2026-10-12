@@ -29,8 +29,9 @@ use nrr_platform_api::service_control::{
 };
 
 use crate::systemd::{
-    log_dir, plan_install, plan_uninstall, state_dir, SystemdInstallPlan, SystemdServiceConfig,
-    SystemdUninstallPlan, UnitActivation, SYSTEMD_UNIT_NAME,
+    installed_daemon_path, log_dir, package_unit_paths, plan_install, plan_uninstall, state_dir,
+    SystemdInstallPlan, SystemdServiceConfig, SystemdUninstallPlan, UnitActivation,
+    PACKAGE_UNIT_DIRS, SYSTEMD_UNIT_NAME,
 };
 
 /// The privileged watchdog contract: the daemon must ping `WATCHDOG=1` at least
@@ -78,6 +79,8 @@ pub trait SystemdOps {
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()>;
     /// Run `argv` (no shell) and capture what it said.
     fn run(&self, argv: &[String]) -> io::Result<CommandOutcome>;
+    /// Whether anything, a dangling link included, is at `path`.
+    fn exists(&self, path: &Path) -> bool;
 }
 
 /// The real implementation: filesystem writes and `systemctl` spawns.
@@ -123,6 +126,10 @@ impl SystemdOps for FsOps {
             std::fs::create_dir_all(parent)?;
         }
         std::os::unix::fs::symlink(target, link)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok()
     }
 
     fn run(&self, argv: &[String]) -> io::Result<CommandOutcome> {
@@ -412,6 +419,23 @@ impl LinuxServiceControl {
         Ok(())
     }
 
+    /// A unit a distribution package installed is the package manager's to
+    /// add and remove; writing ours beside it would shadow it from `/etc`.
+    fn refuse_if_package_managed(&self) -> Result<(), ServiceControlError> {
+        match package_unit_paths().find(|unit| self.ops.exists(unit)) {
+            None => Ok(()),
+            Some(unit) => Err(ServiceControlError::Mechanism {
+                detail: format!(
+                    "{product} is installed from a system package ({unit}). Install, \
+                     upgrade and remove it with the package manager; start and stop it \
+                     with `systemctl`.",
+                    product = nrr_shared::product_identity::PRODUCT_NAME,
+                    unit = unit.display()
+                ),
+            }),
+        }
+    }
+
     /// Is the unit active right now? `is-active` answers with its exit code, so
     /// a non-zero one is the answer "no", not a failure.
     fn is_active(&self) -> Result<bool, ServiceControlError> {
@@ -466,8 +490,8 @@ fn unit_config(spec: &ServiceInstallSpec) -> SystemdServiceConfig {
     // systemd expresses the restart delay in whole seconds; a sub-second policy
     // rounds up rather than down to zero, which would be a restart storm.
     cfg.restart_sec = spec.recovery.first_restart_delay_ms.div_ceil(1_000).max(1);
-    cfg.start_limit_burst = spec.recovery.max_auto_restarts;
-    cfg.start_limit_interval_sec = spec.recovery.reset_period_secs;
+    // The policy's failure budget does not carry over: systemd counts every
+    // start, so the unit keeps the bound `for_binary` sets.
     cfg
 }
 
@@ -493,6 +517,7 @@ impl ServiceControlPort for LinuxServiceControl {
                 operation: "installing the service under a specific account",
             });
         }
+        self.refuse_if_package_managed()?;
         // Refused before anything is written: the unit hides the home trees
         // from the service, so registering a binary that lives in one produces
         // an install that reports success and a service that can never start.
@@ -538,6 +563,7 @@ impl ServiceControlPort for LinuxServiceControl {
         &self,
         spec: &ServiceUninstallSpec,
     ) -> Result<ServiceUninstallReport, ServiceControlError> {
+        self.refuse_if_package_managed()?;
         // The registered ExecStart is the only reliable source of the daemon
         // path, and the alias symlink can only be swept up if it is known.
         let Some(registration) = self.query()? else {
@@ -607,6 +633,43 @@ impl ServiceControlPort for LinuxServiceControl {
         }
         Ok(parse_show_output(&outcome.stdout))
     }
+}
+
+/// The footprint a distribution package ships: what `install` would write for
+/// the daemon at its installed path, with the unit in the package directory.
+/// No commands: enabling the unit is the package scripts' job.
+pub fn package_install_plan() -> SystemdInstallPlan {
+    let spec = ServiceInstallSpec::production_defaults(installed_daemon_path());
+    let mut plan = plan_install(&unit_config(&spec), UnitActivation::LeaveDisabled);
+    plan.unit_path = Path::new(PACKAGE_UNIT_DIRS[0]).join(SYSTEMD_UNIT_NAME);
+    plan.post_write_commands.clear();
+    plan
+}
+
+/// Write [`package_install_plan`] under `root` instead of `/`, returning the
+/// paths written. Links keep their absolute targets, which resolve once the
+/// package is unpacked.
+pub fn stage_package_files(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let plan = package_install_plan();
+    let reroot = |path: &Path| root.join(path.strip_prefix("/").unwrap_or(path));
+    let ops = FsOps;
+    let mut written = Vec::new();
+    let files = std::iter::once((&plan.unit_path, &plan.unit_contents, 0o644)).chain(
+        plan.additional_files
+            .iter()
+            .map(|file| (&file.path, &file.contents, file.mode)),
+    );
+    for (path, contents, mode) in files {
+        let staged = reroot(path.as_path());
+        ops.write_file(&staged, contents, mode)?;
+        written.push(staged);
+    }
+    for link in &plan.symlinks {
+        let staged = reroot(link.link_path.as_path());
+        ops.symlink(&link.target, &staged)?;
+        written.push(staged);
+    }
+    Ok(written)
 }
 
 /// Delete the daemon's own nftables table, and nothing else.
@@ -716,6 +779,8 @@ mod tests {
         /// match wins, so a specific entry can precede a general one.
         answers: Vec<(&'static str, CommandOutcome)>,
         default_answer: CommandOutcome,
+        /// Paths [`SystemdOps::exists`] reports present.
+        present: Vec<PathBuf>,
     }
 
     fn ok(stdout: &str) -> CommandOutcome {
@@ -754,6 +819,7 @@ mod tests {
             ops: journal.clone(),
             answers,
             default_answer: ok(""),
+            present: Vec::new(),
         };
         (LinuxServiceControl::with_ops(Box::new(fake)), journal)
     }
@@ -797,6 +863,9 @@ mod tests {
                 }
             }
             Ok(self.default_answer.clone())
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.present.iter().any(|p| p == path)
         }
     }
 
@@ -988,12 +1057,91 @@ mod tests {
     }
 
     #[test]
+    fn a_package_installed_unit_is_left_to_the_package_manager() {
+        for unit in package_unit_paths() {
+            let journal: Journal = std::rc::Rc::new(RefCell::new(Vec::new()));
+            let port = LinuxServiceControl::with_ops(Box::new(Fake {
+                ops: journal.clone(),
+                answers: vec![("show", ok(&show_running()))],
+                default_answer: ok(""),
+                present: vec![unit.clone()],
+            }));
+            let install = port.install(&install_spec(ServiceStartMode::WithWindows));
+            assert!(
+                matches!(&install, Err(ServiceControlError::Mechanism { detail }) if detail.contains("package")),
+                "{install:?}"
+            );
+            assert!(port.uninstall(&ServiceUninstallSpec::keep_data()).is_err());
+            assert!(recorded(&journal).is_empty(), "{:?}", recorded(&journal));
+        }
+    }
+
+    #[test]
+    fn the_package_ships_the_install_footprint_without_running_anything() {
+        let plan = package_install_plan();
+        assert_eq!(
+            plan.unit_path,
+            PathBuf::from("/usr/lib/systemd/system/netrulerouter.service")
+        );
+        assert!(plan.post_write_commands.is_empty());
+        assert!(
+            plan.unit_contents
+                .contains(r#"ExecStart="/usr/libexec/netrulerouter/nrr-serviced" run"#),
+            "{}",
+            plan.unit_contents
+        );
+        assert_eq!(
+            plan.additional_files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/etc/logrotate.d/netrulerouter"),
+                PathBuf::from("/usr/share/polkit-1/actions/netrulerouter.policy"),
+            ]
+        );
+        assert_eq!(
+            plan.symlinks
+                .iter()
+                .map(|l| l.link_path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("/usr/libexec/netrulerouter/nrr-service")]
+        );
+    }
+
+    #[test]
+    fn the_package_files_are_staged_under_the_given_root() {
+        let root = std::env::temp_dir().join(format!("nrr-pkg-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let written = stage_package_files(&root).expect("stage");
+        assert!(written.iter().all(|p| p.starts_with(&root)), "{written:?}");
+        let unit = root.join("usr/lib/systemd/system/netrulerouter.service");
+        assert!(unit.is_file());
+        assert_eq!(
+            std::fs::read_link(root.join("usr/libexec/netrulerouter/nrr-service"))
+                .expect("alias link"),
+            PathBuf::from(DAEMON)
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn the_recovery_policy_reaches_the_unit_file() {
         let cfg = unit_config(&install_spec(ServiceStartMode::WithWindows));
         let policy = RecoveryPolicy::production();
-        assert_eq!(cfg.start_limit_burst, policy.max_auto_restarts);
-        assert_eq!(cfg.start_limit_interval_sec, policy.reset_period_secs);
         assert_eq!(cfg.restart_sec, policy.first_restart_delay_ms / 1_000);
+    }
+
+    /// An install plus one restart must not use up the budget a crash restart
+    /// needs: systemd counts manual starts too.
+    #[test]
+    fn manual_starts_leave_room_for_a_crash_restart() {
+        let unit = crate::systemd::render_service_unit(&unit_config(&install_spec(
+            ServiceStartMode::WithWindows,
+        )));
+        assert!(unit.contains("StartLimitIntervalSec=600"), "{unit}");
+        assert!(unit.contains("StartLimitBurst=5"), "{unit}");
+        assert!(unit.contains("Restart=on-failure"), "{unit}");
     }
 
     #[test]

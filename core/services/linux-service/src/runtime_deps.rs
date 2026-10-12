@@ -1188,6 +1188,13 @@ pub(crate) fn build_policy_stack(
                 "routes",
                 hashed(|| nrr_platform_linux::LinuxApi.get_ip_forward_table()),
             )
+            // A VPN's rule landing in front of ours moves nothing else a pass
+            // reads. Not an own-writes source: a rule landing mid-pass would be
+            // absorbed at settle and wait for the next full pass.
+            .with_source(
+                "rules-in-front",
+                hashed(nrr_platform_linux::policy_routing::rules_in_front_of_ours),
+            )
     };
 
     // Writing the trace to the log is a window that closes by itself, the

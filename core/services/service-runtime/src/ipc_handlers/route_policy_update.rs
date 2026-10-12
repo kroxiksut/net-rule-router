@@ -261,6 +261,7 @@ mod tests {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             binding_source: BindingSourceDto::UserAssigned,
         }
     }
@@ -300,6 +301,7 @@ mod tests {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })
@@ -432,6 +434,7 @@ mod tests {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })
@@ -476,6 +479,7 @@ mod tests {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })
@@ -519,6 +523,7 @@ mod tests {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })
@@ -565,6 +570,7 @@ mod tests {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             binding_source: dto.binding_source,
             apply_only: Vec::new(),
         })
@@ -631,6 +637,7 @@ mod tests {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             binding_source: dto.binding_source,
             apply_only: Vec::new(),
         })
@@ -684,6 +691,7 @@ mod tests {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             binding_source: BindingSourceDto::UserAssigned,
             apply_only: Vec::new(),
         })

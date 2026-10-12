@@ -53,7 +53,7 @@ const CLIENTS_POLICY_SURFACES: [IpcClientProfile; 3] = [
     IpcClientProfile::Tui,
 ];
 
-const IPC_OPERATION_CATALOG: [IpcOperationSpec; 73] = [
+const IPC_OPERATION_CATALOG: [IpcOperationSpec; 74] = [
     IpcOperationSpec {
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
@@ -667,6 +667,16 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 73] = [
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_POLICY_SURFACES,
+        requires_service_mutation_privilege: false,
+    },
+    // ── A VPN's gateway ─────────────────────────────────────────
+    IpcOperationSpec {
+        name: IpcOperationName::VpnGatewayCandidatesList,
+        // In-memory read of the connection trace, scoped to the caller. Not
+        // the tray: the rule is added in the window or the terminal.
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TUI,
         requires_service_mutation_privilege: false,
     },
 ];

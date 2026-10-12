@@ -31,46 +31,51 @@ use nrr_shared::ipc_payloads::{EnforcementStatusDto, RoutesHeldDto, RuleConflict
 /// cannot grow the snapshot past a frame.
 const MAX_RULE_CONFLICTS: usize = 128;
 
-/// Latest set of application rules whose exe could not be resolved to a path
-/// (so their per-process `ALE_APP_ID` filter was not built), plus each
-/// principal's rule conflicts. Written by the orchestrator on every applying
-/// compute, read by the `SnapshotInitial` handler. App entries are the rule's
-/// pattern (e.g. `"ab.exe"`, `"disko*.exe"`), stored sorted + deduped.
+/// Per principal: application rules whose exe could not be resolved to a path
+/// (so nothing enforces them), and rule conflicts. Written by each applying
+/// compute, read by the `SnapshotInitial` handler for the caller only: with
+/// two users signed in, one's list must not replace or clear the other's.
+/// App entries are the rule's pattern (e.g. `"ab.exe"`), sorted + deduped.
 #[derive(Clone, Default)]
 pub struct AppEnforcementStatus(Arc<Mutex<EnforcementState>>);
 
 #[derive(Default)]
 struct EnforcementState {
-    unresolved: Vec<String>,
+    unresolved: HashMap<String, Vec<String>>,
     /// Per principal: a conflict names that user's own rules and addresses.
     conflicts: HashMap<String, Vec<RuleConflictDto>>,
 }
 
 impl AppEnforcementStatus {
-    /// Construct an empty status (no unresolved app rules).
+    /// Construct an empty status (nobody has unresolved app rules).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replace the stored set with `apps`, sorted + deduplicated. A poisoned
-    /// lock is skipped (best-effort diagnostics must never panic the apply
-    /// path); the previous value is left intact in that case.
-    pub fn set_unresolved(&self, mut apps: Vec<String>) {
+    /// Replace `principal`'s set with `apps`, sorted + deduplicated; an empty
+    /// list forgets it. A poisoned lock is skipped: diagnostics must never
+    /// panic the apply path.
+    pub fn set_unresolved(&self, principal: &str, mut apps: Vec<String>) {
         apps.sort();
         apps.dedup();
         if let Ok(mut guard) = self.0.lock() {
-            guard.unresolved = apps;
+            if apps.is_empty() {
+                guard.unresolved.remove(principal);
+            } else {
+                guard.unresolved.insert(principal.to_string(), apps);
+            }
         }
     }
 
-    /// Snapshot the current set (already sorted + deduped). A poisoned lock
-    /// recovers the inner value rather than panicking.
-    pub fn unresolved(&self) -> Vec<String> {
+    /// `principal`'s set from its last applying compute.
+    pub fn unresolved(&self, principal: &str) -> Vec<String> {
         self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .unresolved
-            .clone()
+            .get(principal)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Replace `principal`'s rule conflicts; an empty list forgets them.
@@ -636,42 +641,62 @@ mod tests {
     #[test]
     fn empty_by_default() {
         let status = AppEnforcementStatus::new();
-        assert!(status.unresolved().is_empty());
+        assert!(status.unresolved(SID).is_empty());
+    }
+
+    const SID: &str = "S-1-5-21-1-1-1-1001";
+
+    /// Two users signed in: each sees only their own, and clearing one leaves
+    /// the other.
+    #[test]
+    fn each_principal_keeps_its_own_set() {
+        let status = AppEnforcementStatus::new();
+        let other = "S-1-5-21-1-1-1-1002";
+        status.set_unresolved(SID, vec!["ab.exe".to_string()]);
+        status.set_unresolved(other, vec!["cd.exe".to_string()]);
+        assert_eq!(status.unresolved(SID), vec!["ab.exe"]);
+        assert_eq!(status.unresolved(other), vec!["cd.exe"]);
+        status.set_unresolved(other, Vec::new());
+        assert_eq!(status.unresolved(SID), vec!["ab.exe"]);
+        assert!(status.unresolved(other).is_empty());
     }
 
     #[test]
     fn set_then_get_round_trips() {
         let status = AppEnforcementStatus::new();
-        status.set_unresolved(vec!["ab.exe".to_string(), "disko*.exe".to_string()]);
-        assert_eq!(status.unresolved(), vec!["ab.exe", "disko*.exe"]);
+        status.set_unresolved(SID, vec!["ab.exe".to_string(), "disko*.exe".to_string()]);
+        assert_eq!(status.unresolved(SID), vec!["ab.exe", "disko*.exe"]);
     }
 
     #[test]
     fn stores_sorted_and_deduped() {
         let status = AppEnforcementStatus::new();
-        status.set_unresolved(vec![
-            "b.exe".to_string(),
-            "a.exe".to_string(),
-            "b.exe".to_string(),
-            "a.exe".to_string(),
-        ]);
-        assert_eq!(status.unresolved(), vec!["a.exe", "b.exe"]);
+        status.set_unresolved(
+            SID,
+            vec![
+                "b.exe".to_string(),
+                "a.exe".to_string(),
+                "b.exe".to_string(),
+                "a.exe".to_string(),
+            ],
+        );
+        assert_eq!(status.unresolved(SID), vec!["a.exe", "b.exe"]);
     }
 
     #[test]
     fn clone_shares_inner_state() {
         let writer = AppEnforcementStatus::new();
         let reader = writer.clone();
-        writer.set_unresolved(vec!["chrome.exe".to_string()]);
-        assert_eq!(reader.unresolved(), vec!["chrome.exe"]);
+        writer.set_unresolved(SID, vec!["chrome.exe".to_string()]);
+        assert_eq!(reader.unresolved(SID), vec!["chrome.exe"]);
     }
 
     #[test]
     fn set_overwrites_previous() {
         let status = AppEnforcementStatus::new();
-        status.set_unresolved(vec!["old.exe".to_string()]);
-        status.set_unresolved(vec!["new.exe".to_string()]);
-        assert_eq!(status.unresolved(), vec!["new.exe"]);
+        status.set_unresolved(SID, vec!["old.exe".to_string()]);
+        status.set_unresolved(SID, vec!["new.exe".to_string()]);
+        assert_eq!(status.unresolved(SID), vec!["new.exe"]);
     }
 
     #[test]

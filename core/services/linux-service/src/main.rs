@@ -7,6 +7,7 @@
 //!   enable/disable the service via `systemctl`. Require root.
 //! - `status` — print a one-shot banner and exit.
 //! - `cleanup` — undo what a dead daemon left on the machine (see [`cleanup`]).
+//! - `package-files <DIR>` — the unit and its companions a package ships.
 //! - `help` / no args — usage.
 //!
 //! Argv parsing lives in [`cli`] as a pure, unit-tested function; the OS verbs
@@ -70,12 +71,15 @@ fn main() -> ExitCode {
         Command::RestoreDns => restore_dns(),
         #[cfg(target_os = "linux")]
         Command::Cleanup => run_cleanup(),
+        #[cfg(target_os = "linux")]
+        Command::PackageFiles => install::write_package_files(args.get(1).map(String::as_str)),
         #[cfg(not(target_os = "linux"))]
         Command::Run
         | Command::Install
         | Command::Uninstall
         | Command::RestoreDns
-        | Command::Cleanup => {
+        | Command::Cleanup
+        | Command::PackageFiles => {
             eprintln!(
                 "the `run`, `install`, `uninstall` and `cleanup` verbs run only on Linux \
                  (this is the systemd daemon entrypoint)"
@@ -85,7 +89,7 @@ fn main() -> ExitCode {
         Command::Unknown(verb) => {
             eprintln!(
                 "unknown subcommand `{verb}`; expected one of: \
-                 run, install, uninstall, status, cleanup, help"
+                 run, install, uninstall, status, cleanup, package-files, help"
             );
             ExitCode::from(2)
         }
@@ -132,6 +136,8 @@ fn print_usage() {
          \x20   uninstall    Disable and remove the systemd service (requires root)\n\
          \x20   status       Print a status banner and exit\n\
          \x20   cleanup      Undo the network state a stopped service left behind (requires root)\n\
+         \x20   package-files DIR\n\
+         \x20                Write the unit and the files beside it a package ships, under DIR\n\
          \x20   help         Show this help"
     );
 }

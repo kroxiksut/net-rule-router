@@ -681,6 +681,7 @@ impl nrr_service_runtime::RoutePolicyWriter for EmptyRoutePolicyWriter {
                 zone_priority_over_ip: false,
                 short_name_completion: false,
                 short_name_suffix: String::new(),
+                app_rules_take_all_addresses: false,
                 binding_source: request.binding_source,
             },
         )

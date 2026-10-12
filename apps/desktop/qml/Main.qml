@@ -26,7 +26,7 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, fakeIp: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
     // Unknown feature or missing profile → true (show it), which is why the
@@ -120,9 +120,7 @@ ApplicationWindow {
     /// source says otherwise, rows must not be presented as this machine's
     /// adapters, so the check is a known-live list rather than "not the mock".
     property string interfacesDataSource: "fallback-mock"
-    readonly property var interfacesLiveSources: ["windows-live", "linux-live"]
-    readonly property bool interfacesAreLive:
-        interfacesLiveSources.indexOf(interfacesDataSource) >= 0
+    readonly property bool interfacesAreLive: Pure.interfacesSourceIsLive(interfacesDataSource)
     // Sidecar-backed cache of the last external IP the service resolved per
     // adapter (key -> {ip, observedAtMs}). Populated once at cold start via
     // `interfacesRolesController.loadExternalIpCache()` and kept current by
@@ -896,43 +894,20 @@ ApplicationWindow {
     function availabilityLabel(id) { return tr("interfaces.availability." + id, id) }
     function routeStateLabel(id) { return tr("interfaces.state." + id, id) }
     function defaultRouteLabel(role) {
-        if (role === "primary") return tr("label.primary", "Primary")
-        if (role === "block") return tr("label.block", "Block")
-        return tr("label.secondary", "Additional")
+        return Rules.routeDisplayLabel(role, "", "", tr)
     }
     function routeLabel(role) {
-        if (role === "primary") return prefs.routePrimaryLabel || defaultRouteLabel("primary")
-        // "block" is a fixed semantic, NOT a renamable adapter label — it
-        // must never fall through to prefs.routeSecondaryLabel.
-        if (role === "block") return defaultRouteLabel(role)
-        return prefs.routeSecondaryLabel || defaultRouteLabel("secondary")
+        return Rules.routeDisplayLabel(role, prefs.routePrimaryLabel, prefs.routeSecondaryLabel, tr)
     }
     function routeRoleOptions(includeBlock) {
-        var opts = [
-            { id: "primary", label: routeLabel("primary") },
-            { id: "secondary", label: routeLabel("secondary") }
-        ]
-        if (includeBlock) opts.push({ id: "block", label: routeLabel("block") })
-        return opts
+        return Rules.routeRoleOptions(includeBlock, routeLabel)
     }
     function localeTextForLanguage(languageId, key, fallbackText) {
         return resolveCatalogText(languageId, key, fallbackText)
     }
-    // Memoized: `ruleTypeLabel` is called once per row on every
-    // `RulesSection.rebuildDisplay()` sort pass (up to a few hundred rows),
-    // and `tr()` does two map lookups plus a locale-fallback walk per call.
-    // Keyed by the raw slug; invalidated wholesale on a real language switch
-    // via `onCurrentLanguageChanged` below (a same-language `currentLanguage`
-    // reassignment is a QML value-equality no-op and never fires it).
-    property var _ruleTypeLabelCache: ({})
-    onCurrentLanguageChanged: _ruleTypeLabelCache = ({})
+    // Memoized in the support object, keyed by slug, dropped on a language switch.
     function ruleTypeLabel(id) {
-        var slug = String(id)
-        var cached = _ruleTypeLabelCache[slug]
-        if (cached !== undefined) return cached
-        var label = tr("rules.type." + slug, slug)
-        _ruleTypeLabelCache[slug] = label
-        return label
+        return ruleEditSupport.ruleTypeLabel(id)
     }
     function themeLabel(id) { return tr("theme." + id, id) }
     function fallbackLanguage() {
@@ -973,12 +948,9 @@ ApplicationWindow {
         return Math.ceil(fontMetricsProbe.advanceWidth(String(text || "")))
     }
     function comboPopupWidth(control, model, textRole, textResolver) {
-        var maxWidth = measuredTextWidth(control.displayText, control.font)
-        for (var i = 0; i < Pure.modelLength(model); i += 1) {
-            var itemText = Pure.comboItemText(Pure.modelItem(model, i), textRole, textResolver, i)
-            maxWidth = Math.max(maxWidth, measuredTextWidth(itemText, control.font))
-        }
-        return clampPopupWidth(control, Math.max(control.width, maxWidth + 72))
+        return Pure.comboPopupWidthFor(control, model, textRole, textResolver,
+            function(text) { return measuredTextWidth(text, control.font) },
+            function(width) { return clampPopupWidth(control, width) })
     }
     function menuPopupWidth(labels) {
         var maxWidth = 0
@@ -1103,26 +1075,9 @@ ApplicationWindow {
     /// rules on screen: the edited row replaced (`index` >= 0) or the new one
     /// appended. `done(pairs, candidate)` gets nothing when the bridge is out.
     function candidateRouteOverlaps(index, row, done) {
-        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
-                || typeof nrrNativeBridge.rpcRulesOverlaps !== "function") {
-            return
-        }
-        var rulesJson = _buildRulesJsonFromModel({ index: index, row: row })
-        if (!rulesJson) return
-        var candidate = { id: String(row.id), route: String(row.targetRoute) }
-        var corr = nrrNativeBridge.rpcRulesOverlaps(rulesJson, prefs.routeIncludeSubdomains !== false)
-        rpc.registerRpcCallback(corr, function(ok, payload) {
-            var all = (ok && payload && payload["route-overlaps"]) || []
-            var mine = []
-            for (var i = 0; i < all.length; i += 1) {
-                var o = all[i]
-                if (String(o.winner["rule-id"]) === candidate.id
-                        || String(o.loser["rule-id"]) === candidate.id) {
-                    mine.push(o)
-                }
-            }
-            done(mine, candidate)
-        })
+        if (!bridgeAvailable) return
+        ruleEditSupport.candidateRouteOverlaps(rulesModel, index, row,
+            prefs.routeIncludeSubdomains !== false, done)
     }
 
     /// Delete the covered (exact) rule of each named pair. Ordinary local
@@ -1392,24 +1347,10 @@ ApplicationWindow {
 
     // `args` (optional) are the refusal's own values: a refusal that names
     // what it refused reads as a sentence about it, else as the code's text.
+    // `tr` crosses as a value: it reads no `this`, and a `.pragma library`
+    // cannot see it.
     function ipcErrorLabel(code, args) {
-        var slug = String(code || "").toLowerCase().replace(/_/g, "-")
-        if (slug === "") return tr("errors.unknown", "Unknown error")
-        var detail = Pure.refusalDetail(slug, args)
-        if (detail) {
-            var sentence = tr(detail.key, "")
-            if (sentence && sentence !== detail.key) {
-                return Pure.fillPlaceholders(sentence, detail.values)
-            }
-        }
-        var key = "errors." + slug
-        var fallback = tr("errors.unknown", "Unknown error")
-        var localised = tr(key, "")
-        if (localised && localised !== key && localised !== "") return localised
-        // No matching entry — return the raw slug so the surface is
-        // still self-describing (e.g. a brand-new server error code
-        // we haven't added a key for yet).
-        return slug
+        return Pure.ipcErrorLabel(code, args, tr)
     }
 
     /// A failed service-control action: the refusal's own wording when its code
@@ -1426,12 +1367,7 @@ ApplicationWindow {
     /// The words for a `Pure.previewRefusal`: the refused values when the
     /// service names them, else the refusal code's own text.
     function previewRefusalText(refusal) {
-        if (!refusal) return ""
-        if (refusal.values !== "") {
-            return tr("risk.signal.invalid-rule-value",
-                "A rule contains an invalid value: {rules}").replace("{rules}", refusal.values)
-        }
-        return ipcErrorLabel(refusal.code, refusal.args)
+        return Pure.previewRefusalText(refusal, tr)
     }
 
     // Guarded section navigation. Every site that
@@ -2488,14 +2424,8 @@ ApplicationWindow {
     /// Human-readable summary of the unresolved app rules for the banner:
     /// the first few names, then "+N more" so a long list never blows the row.
     function _unenforcedAppRulesSummary() {
-        var list = unenforcedAppRules || []
-        if (list.length === 0) return ""
-        var head = list.slice(0, 3).join(", ")
-        if (list.length > 3) {
-            return head + " " + tr("status.app-unresolved-more", "+{n} more")
-                .replace("{n}", String(list.length - 3))
-        }
-        return head
+        return Pure.listSummary(unenforcedAppRules,
+            tr("status.app-unresolved-more", "+{n} more"))
     }
     // Correlation-id RPC transport over the C++ bridge: the pending-callback
     // table, GC timer, and bridge forwarders live in flows/RpcTransport, not
@@ -2541,9 +2471,13 @@ ApplicationWindow {
                 // (the stopped-service diff, a confirmation) takes focus away
                 // from `window` itself, and the user is still looking at us.
                 active: window.active || Qt.application.state === Qt.ApplicationActive,
+                visible: window.visible,
                 rulesPathPrimary: window._comparableRulesPathFor("primary"),
                 rulesPathSecondary: window._comparableRulesPathFor("secondary"),
-                rulesFolder: window.userPresetsDir
+                rulesFolder: window.userPresetsDir,
+                // So the tray writes the linked files the way this window does.
+                includeComments: (typeof boundFilesController !== "undefined" && boundFilesController)
+                    ? boundFilesController._emitComments() : true
             }
         }
     }
@@ -2568,6 +2502,10 @@ ApplicationWindow {
     // moment it happens instead of waiting for the heartbeat. (A rebound rules
     // file is published from `onPrefsChanged`, which already exists.)
     onActiveChanged: {
+        if (typeof guiPresence !== "undefined" && guiPresence) guiPresence.publish()
+    }
+    // Closed to the tray: the tray's "Add rule…" stops handing over to a hidden window.
+    onVisibleChanged: {
         if (typeof guiPresence !== "undefined" && guiPresence) guiPresence.publish()
     }
     // Focus can move to a child window without `window.active` changing at all,
@@ -3549,6 +3487,11 @@ ApplicationWindow {
                         && mpCorr.indexOf("auto-rules-") === 0) {
                     boundFilesController.handleAutoRulesAuthored(mpCorr)
                 }
+                // The tray's own form applies only while this window is hidden.
+                if (mpPhase === "completed"
+                        && mpCorr.indexOf("rules-update-tray-add-rule-") === 0) {
+                    boundFilesController.handleRulesAddedFromTray()
+                }
                 break
             case "auto-rule-candidates-changed":
                 // The tray asks the question while this window is closed, and
@@ -4431,15 +4374,9 @@ ApplicationWindow {
         var modes = ((context.interfaces || {}).supportedBehaviorModes) || []
         for (var m = 0; m < modes.length; m += 1) behaviorModeModel.append(modes[m])
         Pure.clearModel(ruleTypesModel)
-        var types = ((context.rules || {}).supportedRuleTypes) || []
-        for (var t = 0; t < types.length; t += 1) {
-            // The backend lists what the RULE MODEL knows; the profile says what
-            // this OS can enforce. Offering an application rule where per-process
-            // routing has no backend would take the user's input and silently
-            // drop it.
-            if (String(types[t].id) === "application" && !supports("appRouting")) continue
-            ruleTypesModel.append(types[t])
-        }
+        var types = Rules.offeredRuleTypes(((context.rules || {}).supportedRuleTypes) || [],
+            supports("appRouting"))
+        for (var t = 0; t < types.length; t += 1) ruleTypesModel.append(types[t])
         Pure.clearModel(rulesModel)
         // When the launcher intended the real service
         // (BackendChoice::Ipc) but the service was stopped/unreachable, it
@@ -5306,12 +5243,8 @@ ApplicationWindow {
                     .replace("{ours}", String(mismatch.ourVersion || "?")
                         + " (" + String(mismatch.ourFingerprint || "?") + ")"))
         }
-        // Secondary launchers can carry an `action`
-        // slug beyond a plain section switch. Known slugs:
-        // `safe-disable` (tray menu, after "Safe disable (temporary)…")
-        // and `rules-drift-apply` ("Apply" on the tray's file-vs-service
-        // notice). Older launchers
-        // omit `action`, which is fine — the dispatch is a no-op.
+        // A tray hand-off can carry an `action` slug beyond the section
+        // switch; an older launcher omits it and the dispatch is a no-op.
         var actionSlug = String(request.action || "")
         if (actionSlug === "safe-disable") {
             var prefilledReason = String(request.reason || "")
@@ -5357,10 +5290,63 @@ ApplicationWindow {
             // from the service; measuring the app leg mid-hydrate would report a
             // difference that stops existing a moment later.
             _driftCompareHandoffTimer.restart()
+        } else if (actionSlug === "add-rule") {
+            // "Add rule…" in the tray menu: the form the Add button opens. A
+            // form already open is the user's work in progress and stays.
+            requestSectionChange("rules")
+            if (allowUserRuleEdits === false) {
+                statusLine = tr("errors.rules-locked",
+                    "Your administrator manages the routing rules on this computer, so they cannot be changed here.")
+                return
+            }
+            if (ruleDialog.visible) return
+            editingRule = -1
+            ruleDialog.resetForEdit()
+            ruleDialog.open()
+            // Taken before the rule lands: edits already in the table decide
+            // whether saving it may apply straight away.
+            _trayAddRule = { hadEdits: rulesGuardDirty() }
         } else if (actionSlug !== "") {
             console.log("applyGuiActivationRequest: unknown action slug",
                         actionSlug)
         }
+    }
+
+    /// Set while the rule form was opened by the tray's "Add rule…" and not yet
+    /// saved or abandoned: `{ hadEdits }`.
+    property var _trayAddRule: null
+    // Closed without a save (a click outside, say): the next form the user
+    // opens is their own. Deferred past the accept that may still be saving,
+    // and kept while the form is back up or the duplicate question is.
+    function _dropTrayAddRuleIfAbandoned() {
+        Qt.callLater(function() {
+            if (!ruleDialog.visible && !ruleDuplicateDialog.visible) window._trayAddRule = null
+        })
+    }
+    Connections {
+        target: ruleDialog
+        function onRejected() { window._trayAddRule = null }
+        function onClosed() { window._dropTrayAddRuleIfAbandoned() }
+    }
+    Connections {
+        target: ruleDuplicateDialog
+        function onClosed() { window._dropTrayAddRuleIfAbandoned() }
+    }
+    /// The tray-opened form was saved into the table: apply it at once, or,
+    /// when the table already held edits, leave it to be applied with them.
+    function _finishTrayAddRule() {
+        var request = _trayAddRule
+        _trayAddRule = null
+        if (!request || editingRule >= 0) return
+        if (request.hadEdits) {
+            statusLine = tr("status.tray-add-rule-apply-with-edits",
+                "The rule is in the list. Apply it together with your other unsaved rule changes.")
+            return
+        }
+        if (typeof reviewFlowController.applyWithoutReview !== "function") return
+        reviewFlowController.applyWithoutReview("tray-add-rule", function(ok) {
+            if (!ok) console.log("tray add-rule: apply without review did not complete")
+        })
     }
 
     // Real two-phase safe-disable. Phase 1
@@ -5468,21 +5454,7 @@ ApplicationWindow {
     }
 
     function nextFreeRuleId() {
-        // Max of existing numeric suffixes + 1, falling back to 1 when the
-        // model is empty. Avoids the previous `100 + count + 1` quirk that
-        // produced ids like R-107 for the first user-added rule.
-        var maxN = 0
-        for (var i = 0; i < rulesModel.count; i += 1) {
-            var raw = String(rulesModel.get(i).id || "")
-            var m = raw.match(/^R-(\d+)$/)
-            if (m) {
-                var n = parseInt(m[1], 10)
-                if (!isNaN(n) && n > maxN) maxN = n
-            }
-        }
-        var next = Math.min(maxN + 1, freeRulesMaxCount)
-        var padded = ("0000" + String(next)).slice(-4)
-        return "R-" + padded
+        return Rules.nextFreeRuleId(rulesModel, freeRulesMaxCount)
     }
     // A single-rule Edit writes via rulesModel.set(),
     // which does NOT change rulesModel.count, so RulesSection's onCountChanged
@@ -5499,41 +5471,10 @@ ApplicationWindow {
                 .replace("{max}", String(freeRulesMaxCount))
             return
         }
-        // Auto-derive a Punycode hint into the Comment field when the
-        // user typed an IDN host and left the comment blank. Storage
-        // stays Unicode (human-readable in the rules file); the comment
-        // surfaces the ACE form so the user can cross-reference it.
-        var finalComment = ruleDialog.localComment
-        if (finalComment === ""
-                && (ruleDialog.localRuleType === "zone"
-                    || ruleDialog.localRuleType === "domain"
-                    || ruleDialog.localRuleType === "suffix-domain"
-                    || ruleDialog.localRuleType === "exact-fqdn")) {
-            var ace = _punycodeFor(ruleDialog.localValue)
-            if (ace !== "") finalComment = "Punycode: " + ace
-        }
-        var item = {
-            id: editingRule >= 0 ? rulesModel.get(editingRule).id : nextFreeRuleId(),
-            enabled: ruleDialog.localEnabled,
-            ruleType: ruleDialog.localRuleType,
-            ruleTypeTitle: ruleTypeLabel(ruleDialog.localRuleType),
-            matchValue: ruleDialog.localValue,
-            aceMatchValue: _aceLowerForSearch(ruleDialog.localValue),
-            targetRoute: ruleDialog.localRoute,
-            verify: Rules.rowIsVerify({ ruleType: ruleDialog.localRuleType,
-                targetRoute: ruleDialog.localRoute, verify: ruleDialog.localVerify }),
-            comment: finalComment,
-            // Editing an app-authored rule makes it the user's own: the badge
-            // said "we added this for you", and once they have gone in and
-            // changed it that is no longer what happened. Cleared explicitly
-            // because `ListModel.set` MERGES roles — omitting them would leave
-            // the provenance in place, which is how the badge survived edits.
-            // Also stops the rule counting against the app-authored budget that
-            // evicts the oldest of its own additions.
-            originReason: "",
-            originAnchor: "",
-            originAdded: ""
-        }
+        // Editing an app-authored rule makes it the user's own, which also
+        // takes it out of the app-authored budget that evicts the oldest.
+        var item = ruleEditSupport.ruleRowFromDialog(ruleDialog,
+            editingRule >= 0 ? rulesModel.get(editingRule).id : nextFreeRuleId())
         // Duplicate detection by (ruleType,
         // matchValue, targetRoute). When found, surface a modal asking
         // the user whether to abandon the current edit and jump to the
@@ -5584,39 +5525,70 @@ ApplicationWindow {
         // Recompute against the baseline so an edit that nets back
         // to the saved content does NOT leave a false "unsaved" state.
         _recomputeRulesDirty()
+        if (_trayAddRule) _finishTrayAddRule()
     }
 
     /// Add the accepted lines of a pasted address list, each with the type
     /// Rust sorted it into; route, comment and the enable toggle come from the
-    /// dialog. A line already in the list is skipped, not reported as an error.
+    /// dialog.
     function saveRuleList(entries) {
+        var drafts = []
+        for (var i = 0; i < entries.length; i += 1) {
+            var ruleType = String(entries[i]["rule-type"] || "")
+            drafts.push({
+                "rule-type": ruleType,
+                value: entries[i].value,
+                route: ruleDialog.localRoute,
+                comment: ruleDialog.localComment,
+                enabled: ruleDialog.localEnabled,
+                verify: Rules.rowIsVerify({ ruleType: ruleType,
+                    targetRoute: ruleDialog.localRoute, verify: ruleDialog.localVerify })
+            })
+        }
+        var added = addRuleDrafts(drafts)
+        if (!_trayAddRule) return
+        if (added > 0) _finishTrayAddRule()
+        else _trayAddRule = null
+    }
+
+    /// Add rules drafted outside the rule dialog, each `{ "rule-type", value,
+    /// route, comment, enabled?, verify? }`, into the list on screen; they
+    /// reach the service through the usual review and apply. A rule already
+    /// in the list is skipped, not reported as an error. Returns how many were
+    /// added.
+    function addRuleDrafts(drafts) {
+        var list = drafts || []
         var added = 0
         var already = 0
         var capped = false
         var keys = {}
         for (var k = 0; k < rulesModel.count; k += 1) keys[Rules.mergeKey(rulesModel.get(k))] = true
-        for (var i = 0; i < entries.length; i += 1) {
-            if (userRuleCount() >= freeRulesMaxCount) { capped = true; break }
-            var ruleType = String(entries[i]["rule-type"] || "")
-            var value = String(entries[i].value || "")
+        var userCount = userRuleCount()
+        for (var i = 0; i < list.length; i += 1) {
+            var d = list[i] || {}
+            var ruleType = String(d["rule-type"] || "")
+            var value = String(d.value || "")
+            var route = String(d.route || "")
+            if (ruleType === "" || value === "" || (route !== "primary" && route !== "secondary")) continue
             var item = {
                 id: nextFreeRuleId(),
-                enabled: ruleDialog.localEnabled,
+                enabled: d.enabled !== false,
                 ruleType: ruleType,
                 ruleTypeTitle: ruleTypeLabel(ruleType),
                 matchValue: value,
                 aceMatchValue: _aceLowerForSearch(value),
-                targetRoute: ruleDialog.localRoute,
-                verify: Rules.rowIsVerify({ ruleType: ruleType,
-                    targetRoute: ruleDialog.localRoute, verify: ruleDialog.localVerify }),
-                comment: ruleDialog.localComment,
+                targetRoute: route,
+                verify: d.verify === true,
+                comment: String(d.comment || ""),
                 originReason: "",
                 originAnchor: "",
                 originAdded: ""
             }
             var key = Rules.mergeKey(item)
             if (keys[key]) { already += 1; continue }
+            if (userCount >= freeRulesMaxCount) { capped = true; break }
             keys[key] = true
+            userCount += 1
             rulesModel.append(item)
             // A new rule has no stored comment to clear.
             if (item.comment !== "") _sidecarWriteCommentForRow(item)
@@ -5636,6 +5608,7 @@ ApplicationWindow {
         }
         statusLine = status
         _recomputeRulesDirty()
+        return added
     }
 
     function resetDefaults() {
@@ -6109,80 +6082,10 @@ ApplicationWindow {
             "File binding cleared. Rules will not be auto-loaded on next launch.")
     }
 
-    // Single source of truth for "what the
-    // service is actually applying". Maps one wire `RuleRowEntry`
-    // (kebab-case, from `rules.list`) into the camelCase shape the
-    // rulesModel / RulesSection delegates expect (matches the cold-start
-    // context rows emitted by `ui_surface.rs`).
+    // The service's `rules.list` row as a table row. One mapping for every
+    // surface (the tray re-sends whole rule books built from it).
     function _serviceRuleRowToModelRow(w) {
-        var slug = String(w["rule-type"] || "")
-        var route = String(w["target-route"] || "primary")
-        var row = {
-            id: Rules.canonicalRuleId(String(w.id || "")),
-            enabled: !!w.enabled,
-            ruleType: slug,
-            ruleTypeTitle: (typeof ruleTypeLabel === "function")
-                ? ruleTypeLabel(slug) : slug,
-            matchValue: String(w["match-value"] || ""),
-            targetRoute: route,
-            verify: w.verify === true,
-            comment: (w.comment !== undefined && w.comment !== null)
-                ? String(w.comment) : "",
-            validationStatus: String(w["validation-status"] || "valid"),
-            validationMessageKey: String(w["validation-message-key"] || ""),
-            // ВАЖНО: пустой объект, а не `null`. С `null` QML ListModel не
-            // может вывести тип роли и пишет предупреждение «validationMessageArgs
-            // is null …» на КАЖДУЮ из ~300 строк при импорте пресета. Этот поток
-            // записей в stdout-пайп лаунчера и был основной причиной тормозов
-            // populate (~3.3 c). Делегат читает поле через `if (args) for(k in args)`
-            // — пустой объект совместим и итераций не даёт.
-            validationMessageArgs: ({}),
-            // Read-only OS hosts-file override annotation
-            // for this rule's hostname (service-filled via `rules.list`;
-            // empty when the hostname is not pinned by the OS hosts file).
-            // Flattened to two scalar roles so QML's ListModel keeps stable
-            // role types across rebuild (nested-object roles are unreliable).
-            // Presence marker = hostsOverrideIp !== "".
-            hostsOverrideIp: (w["hosts-override"] && w["hosts-override"].ip !== undefined)
-                ? String(w["hosts-override"].ip) : "",
-            hostsOverrideBlocking: !!(w["hosts-override"] && w["hosts-override"].blocking),
-            // What the last "check the main route" pass found for this rule's
-            // address: "answered", "silent", or "" when it was never checked.
-            // A fact about reachability, not a recommendation — the row words
-            // it so.
-            mainRoute: String(w["main-route"] || ""),
-            // Provenance of an app-authored rule. Flattened to three scalar
-            // roles for the same reason as the hosts-override pair above:
-            // a nested-object role has an unreliable type across a model
-            // rebuild. Presence marker = originReason !== "" (a rule the user
-            // typed carries no origin at all).
-            originReason: (w.origin && w.origin.reason !== undefined)
-                ? String(w.origin.reason) : "",
-            originAnchor: (w.origin && w.origin.anchor !== undefined)
-                ? String(w.origin.anchor) : "",
-            originAdded: (w.origin && w.origin.added !== undefined)
-                ? String(w.origin.added) : "",
-            // What an application rule is currently holding on the additional
-            // link. Flattened to a count plus a joined sample for the same
-            // reason as the hosts-override pair above. It is shown at all
-            // because the holding is machine-wide: a route cannot be scoped to
-            // a process, so these addresses travel the additional link for
-            // every program, not just the one the rule names.
-            // The count is the service's own total, not the length of what
-            // arrived: the wire list is capped, and a truncated length would
-            // understate what the rule is actually holding.
-            pinnedCount: Number(w["pinned-destinations-total"]
-                || (w["pinned-destinations"] || []).length),
-            pinnedSample: (w["pinned-destinations"] || [])
-                .slice(0, 20).join(", ")
-        }
-        // Boundary conversion (inbound): snapshot rows carry ACE on
-        // host-like rule types; decode for display (mirrors cold-start).
-        if (Rules.isHostlikeRuleType(slug)) {
-            row.matchValue = _unicodeDecodeHost(row.matchValue)
-        }
-        row.aceMatchValue = _aceLowerForSearch(row.matchValue)
-        return row
+        return ruleEditSupport.serviceRowToModelRow(w)
     }
 
     // Re-pull the active revision's rules
@@ -6486,6 +6389,21 @@ ApplicationWindow {
     }
 
     Timer { interval: autoCloseMs; running: autoCloseMs > 0; repeat: false; onTriggered: window.close() }
+    // Closed to the tray, the hidden window keeps the whole interface in memory
+    // for a reopen that takes about half a second cold. After a while hidden,
+    // with nothing of the user's unsaved or mid-apply, the process ends and the
+    // tray carries on alone.
+    Timer {
+        interval: 5 * 60 * 1000
+        running: !window.visible && !window.quittingToTray
+        repeat: true
+        onTriggered: {
+            if (window.hasAnyUnsavedChanges() || window._guardRulesInFlight
+                    || rpcTransport.longCallInFlight) return
+            console.log("Main: hidden in the tray for a while, ending the window process")
+            window.windDownApplication()
+        }
+    }
     Timer {
         interval: 350
         running: typeof nrrNativeBridge !== "undefined" && !!nrrNativeBridge && !!nrrNativeBridge.takePendingGuiRequest
@@ -7135,6 +7053,16 @@ ApplicationWindow {
     }
 
     RuleEditDialog { id: ruleDialog; root: window }
+    // The half of the rule form the tray's add-rule window shares with this one.
+    RuleEditSupport {
+        id: ruleEditSupport
+        host: window
+        language: window.currentLanguage
+        rpc: rpcTransport
+        aceCodec: window.hostAceCodec
+        onSerializeFailed: window.statusLine = window.tr("status.rules-serialize-failed",
+            "Internal error while preparing rules — see logs")
+    }
 
     // Duplicate-rule modal. Two-button
     // pattern: "Open existing" jumps to the offending row in Edit mode;
@@ -7387,37 +7315,14 @@ ApplicationWindow {
     function _unicodeDecodeHost(host) {
         return hostAceCodec.decode(host)
     }
-    // Returns the ASCII (Punycode) representation of `host` when it
-    // contains non-ASCII characters, or "" otherwise. Used by the
-    // Add/Edit rule dialog as an inline hint AND by `saveRule()` to
-    // auto-fill the comment when the user left it blank. Distinct from
-    // `_aceEncodeHost`, which passes ASCII through unchanged for the
-    // wire boundary.
+    // The ACE form of an IDN host for the rule form's hint and the comment
+    // `saveRule` fills in; "" for an ASCII host.
     function _punycodeFor(host) {
-        var trimmed = String(host || "").trim()
-        if (trimmed === "") return ""
-        var allAscii = true
-        for (var i = 0; i < trimmed.length; i += 1) {
-            if (trimmed.charCodeAt(i) > 127) { allAscii = false; break }
-        }
-        if (allAscii) return ""
-        if (typeof nrrNativeBridge === "undefined"
-                || !nrrNativeBridge
-                || typeof nrrNativeBridge.punycodeEncodeHost !== "function") {
-            return ""
-        }
-        return String(nrrNativeBridge.punycodeEncodeHost(trimmed) || "")
+        return hostAceCodec.hint(host)
     }
 
-    // Precomputed lowercase ACE form stored alongside
-    // `matchValue` so the rules-table search can match either the
-    // Unicode value the user typed in the dialog or its Punycode
-    // equivalent. Computed once per insert/edit; avoids N×M bridge
-    // calls on every keystroke. ASCII inputs short-circuit through
-    // `_aceEncodeHost` so for non-hostlike rules this collapses to a
-    // plain `.toLowerCase()`.
     function _aceLowerForSearch(host) {
-        return _aceEncodeHost(host).toLowerCase()
+        return ruleEditSupport.aceLowerForSearch(host)
     }
 
     // Base64 → UTF-8 via native bridge (Qt's QByteArray::fromBase64 +
@@ -7466,7 +7371,7 @@ ApplicationWindow {
     function _renumberRuleIdsSequential() {
         if (!rulesModel) return
         for (var j = 0; j < rulesModel.count; j += 1) {
-            var want = "R-" + ("0000" + String(j + 1)).slice(-4)
+            var want = Rules.sequentialRuleId(j)
             // Skip a redundant write when the id is already correct so we
             // don't churn bindings on rows that didn't move.
             if (String(rulesModel.get(j).id || "") !== want) {
@@ -7586,26 +7491,10 @@ ApplicationWindow {
         })
     }
 
-    /// Best-effort persistence of one row's comment
-    /// into the sidecar. Empty string deletes (Rust write_comment
-    /// special-cases). Rust runs `sanitize_comment` on the way in,
-    /// so we don't pre-sanitise here. Failure logs but never blocks
-    /// the UI — comments are decoration, not core data.
+    /// Best-effort sidecar write of one row's comment; empty deletes it.
     function _sidecarWriteCommentForRow(row) {
-        if (!bridgeAvailable
-                || typeof nrrNativeBridge === "undefined"
-                || nrrNativeBridge === null
-                || typeof nrrNativeBridge.rpcSidecarCommentWrite !== "function") {
-            return
-        }
-        var p = Rules.sidecarRuleSignatureParts(row)
-        if (p.type === "" || p.value === "" || p.route === "") return
-        var comment = String((row && row.comment) || "")
-        var corr = nrrNativeBridge.rpcSidecarCommentWrite(
-            p.type, p.value, p.route, comment)
-        rpcTransport.registerRpcCallback(corr, function(ok, payload, code, msg) {
-            if (!ok) console.log("sidecar.comment.write failed:", code, msg)
-        })
+        if (!bridgeAvailable) return
+        ruleEditSupport.writeComment(row)
     }
 
     /// Single-route canonical V1 envelope from `rows` filtered by `route` --
@@ -7732,24 +7621,12 @@ ApplicationWindow {
     /// place of row `index`, or after the last one when `index` is negative.
     function _buildRulesJsonFromModel(candidate) {
         try {
-            var primary = []
-            var secondary = []
-            var put = function(entry) {
-                // A block lives in the secondary bucket; its `action`
-                // field (set by the serializer) overrides routing.
-                var bucket = (Rules.routeBucket(entry.targetRoute) === "secondary")
-                    ? secondary : primary
-                bucket.push(Rules.ruleRowToWireDto(entry, _aceEncodeHost))
-            }
+            var rows = []
             for (var i = 0; i < rulesModel.count; i += 1) {
-                put(candidate && candidate.index === i ? candidate.row : rulesModel.get(i))
+                rows.push(candidate && candidate.index === i ? candidate.row : rulesModel.get(i))
             }
-            if (candidate && candidate.index < 0) put(candidate.row)
-            return JSON.stringify({
-                "schema-version": 1,
-                "primary": primary,
-                "secondary": secondary
-            })
+            if (candidate && candidate.index < 0) rows.push(candidate.row)
+            return Rules.buildRulesJson(rows, _aceEncodeHost)
         } catch (err) {
             // A throw here would otherwise silently kill every save/review/
             // park flow that depends on the rules payload. Surface it and

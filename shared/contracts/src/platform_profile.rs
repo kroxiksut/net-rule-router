@@ -86,6 +86,10 @@ pub struct PlatformSupports {
     pub dns_observe: bool,
     /// Local DNS resolver (Mode B — enforce-before-connect).
     pub dns_resolver: bool,
+    /// Per-site virtual addresses (fake-IP) on top of the local resolver.
+    /// Mirrors whether this OS's TUN port can open an adapter; a drift guard in
+    /// the per-OS platform crate holds the two together.
+    pub fake_ip: bool,
     /// Bypass the hosts file when resolving rule hosts to routable IPs.
     pub hosts_pin: bool,
     /// A privileged background service that keeps enforcing while the GUI is
@@ -176,6 +180,7 @@ impl PlatformProfile {
                 app_routing: true,
                 dns_observe: true,
                 dns_resolver: true,
+                fake_ip: true,
                 hosts_pin: true,
                 background_service: true,
                 autostart: true,
@@ -211,6 +216,8 @@ impl PlatformProfile {
                 app_routing: false,
                 dns_observe: false,
                 dns_resolver: true,
+                // The TUN port is a stub that never opens an adapter.
+                fake_ip: false,
                 hosts_pin: true,
                 background_service: true,
                 autostart: true,
@@ -258,6 +265,7 @@ impl PlatformProfile {
                 app_routing: false,
                 dns_observe: false,
                 dns_resolver: true,
+                fake_ip: false,
                 hosts_pin: true,
                 background_service: true,
                 autostart: true,
@@ -300,6 +308,7 @@ mod tests {
     fn windows_is_fully_featured() {
         let s = PlatformProfile::windows().supports;
         assert!(s.kill_switch && s.app_routing && s.dns_observe && s.dns_resolver);
+        assert!(s.fake_ip);
         assert!(s.hosts_pin && s.background_service && s.autostart);
         assert!(s.service_stability_config && s.local_network_exceptions && s.block_notices);
         assert!(s.audit_chain_restart && s.conn_trace_log && s.verbose_logging);
@@ -325,6 +334,15 @@ mod tests {
                 .supports
                 .service_start_on_app_launch
         );
+    }
+
+    /// Only Windows opens a TUN adapter; a checkbox elsewhere would switch on
+    /// a stack that never starts.
+    #[test]
+    fn fake_ip_is_offered_on_windows_only() {
+        assert!(PlatformProfile::windows().supports.fake_ip);
+        assert!(!PlatformProfile::linux().supports.fake_ip);
+        assert!(!PlatformProfile::macos().supports.fake_ip);
     }
 
     /// The daemon applies a verbose window without the rest of the stability
@@ -386,6 +404,7 @@ mod tests {
         assert_eq!(v["supports"]["killSwitch"], true);
         assert_eq!(v["supports"]["appRouting"], true);
         assert_eq!(v["supports"]["dnsResolver"], true);
+        assert_eq!(v["supports"]["fakeIp"], true);
         assert_eq!(v["supports"]["serviceStabilityConfig"], true);
         assert_eq!(v["supports"]["localNetworkExceptions"], true);
         assert_eq!(v["supports"]["blockNotices"], true);

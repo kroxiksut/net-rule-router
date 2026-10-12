@@ -47,6 +47,7 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-env-changed=CMAKE_PREFIX_PATH");
+    println!("cargo:rerun-if-env-changed=QT_HOST_PATH");
     println!("cargo:rerun-if-env-changed=NRR_QT_HOST_GENERATOR");
     println!("cargo:rerun-if-env-changed=NRR_QT_HOST_BUILD_TYPE");
     println!("cargo:rerun-if-env-changed=NRR_SKIP_QT_HOST");
@@ -76,6 +77,9 @@ fn main() {
         return;
     }
 
+    // The host links the launcher's target, not the build machine: an ARM64
+    // build on x64 needs the ARM64 kit and the ARM64 compiler.
+    let msvc = MsvcTarget::from_cargo();
     // Windows has no system Qt, so a prefix must be found or the configure step
     // fails with an unhelpful message. On Linux the distribution's Qt6 is where
     // CMake already looks, so an unset prefix is the normal case and passing an
@@ -83,20 +87,28 @@ fn main() {
     let qt_prefix = env::var("CMAKE_PREFIX_PATH")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| cfg!(windows).then(default_qt_prefix))
+        .or_else(|| cfg!(windows).then(|| default_qt_prefix(msvc)))
         .unwrap_or_default();
+    // A cross-compiled kit runs moc and rcc from a kit for the build machine.
+    let qt_host_path = env::var("QT_HOST_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
 
     // CMake caches the found Qt (`Qt6_DIR` etc.) inside the build dir, and a
     // later `-DCMAKE_PREFIX_PATH=<new>` does NOT invalidate that cache — a Qt
     // upgrade would silently keep linking the old version. Stamp the prefix
     // and wipe the build dir when it changes.
     let stamp = out_dir.join("qt-prefix.stamp");
+    let stamp_value = match &qt_host_path {
+        Some(host) => format!("{qt_prefix}\n{host}"),
+        None => qt_prefix.clone(),
+    };
     let previous = fs::read_to_string(&stamp).unwrap_or_default();
-    if previous != qt_prefix {
+    if previous != stamp_value {
         if build_dir.exists() {
             fs::remove_dir_all(&build_dir).expect("remove stale CMake build dir");
         }
-        fs::write(&stamp, &qt_prefix).expect("write qt prefix stamp");
+        fs::write(&stamp, &stamp_value).expect("write qt prefix stamp");
     }
 
     let mut configure = Command::new("cmake");
@@ -118,12 +130,15 @@ fn main() {
                 .arg("-G")
                 .arg("Visual Studio 17 2022")
                 .arg("-A")
-                .arg("x64");
+                .arg(msvc.platform);
         }
         Err(_) => {}
     }
     if !qt_prefix.is_empty() {
         configure.arg(format!("-DCMAKE_PREFIX_PATH={qt_prefix}"));
+    }
+    if let Some(host) = &qt_host_path {
+        configure.arg(format!("-DQT_HOST_PATH={host}"));
     }
     // Single-config generators take the build type at configure time; the
     // multi-config ones ignore it and take `--build --config` instead.
@@ -205,10 +220,32 @@ fn run(command: &mut Command, step: &str) {
     }
 }
 
-/// Pick the newest Qt under `C:\Qt\<X.Y.Z>\msvc2022_64` when
-/// `CMAKE_PREFIX_PATH` is not set. Version directories sort numerically
-/// (so 6.11.1 beats 6.9.2 despite the string order).
-fn default_qt_prefix() -> String {
+/// The Visual Studio platform and the Qt kit directory of the cargo target.
+#[derive(Clone, Copy)]
+struct MsvcTarget {
+    platform: &'static str,
+    qt_kit: &'static str,
+}
+
+impl MsvcTarget {
+    fn from_cargo() -> Self {
+        match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+            Ok("aarch64") => Self {
+                platform: "ARM64",
+                qt_kit: "msvc2022_arm64",
+            },
+            _ => Self {
+                platform: "x64",
+                qt_kit: "msvc2022_64",
+            },
+        }
+    }
+}
+
+/// Pick the newest Qt under `C:\Qt\<X.Y.Z>\<kit>` when `CMAKE_PREFIX_PATH`
+/// is not set. Version directories sort numerically (so 6.11.1 beats 6.9.2
+/// despite the string order).
+fn default_qt_prefix(msvc: MsvcTarget) -> String {
     let root = Path::new("C:/Qt");
     let mut best: Option<(Vec<u64>, PathBuf)> = None;
     for entry in root.read_dir().into_iter().flatten().flatten() {
@@ -218,7 +255,7 @@ fn default_qt_prefix() -> String {
         if version.len() != 3 {
             continue; // Tools/Docs/dist and other non-version entries
         }
-        let cmake = entry.path().join("msvc2022_64/lib/cmake");
+        let cmake = entry.path().join(format!("{}/lib/cmake", msvc.qt_kit));
         if cmake.exists() && best.as_ref().is_none_or(|(v, _)| version > *v) {
             best = Some((version, cmake));
         }
@@ -226,7 +263,8 @@ fn default_qt_prefix() -> String {
     match best {
         Some((_, cmake)) => cmake.display().to_string(),
         None => panic!(
-            "CMAKE_PREFIX_PATH is not set and no Qt with an msvc2022_64 kit was found under C:\\Qt"
+            "CMAKE_PREFIX_PATH is not set and no Qt with an {} kit was found under C:\\Qt",
+            msvc.qt_kit
         ),
     }
 }

@@ -75,12 +75,15 @@ yourself — it doesn't create or hide them.
 > list travels with your rule set.
 
 The full walkthrough, including what to do if you lose network access, is in
-[`docs/en/quickstart.md`](docs/en/quickstart.md).
+[`docs/en/quickstart.md`](docs/en/quickstart.md). Which Windows and Linux
+versions it runs on, and which have been checked, is in
+[`docs/en/supported-systems.md`](docs/en/supported-systems.md).
 
 ## Highlights
 
 - **Two-route model** — a `primary` and an additional route, one active config at a time.
-- **Four ways to match traffic** — by domain (label + all subdomains), by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), by exact IPv4, or by application (the process name).
+- **Six ways to match traffic** — by exact domain, by domain with all its subdomains, by exact IPv4 or IPv6 address, by subnet or address range, by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), or by application (the process name).
+- **Traffic statistics** — how much went through each connection today, during the current session of the additional connection and over every day kept (you choose how many), with a CSV export for any period.
 - **Per-name routing** — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
 - **Leak protection** — if the additional route goes down, matching traffic is held rather than silently leaking to `primary`.
 - **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
@@ -104,17 +107,22 @@ and stops at the first match:
 |---|-----------|---------|
 | 1 | Exact domain (FQDN) | `api.bank.com` |
 | 2 | Subdomain / suffix | `*.bank.com` |
-| 3 | Zone (TLD / internal suffix, domain zones) | `.ru`, `.com`, `.intra` |
+| 3 | Exact IP address (IPv4 or IPv6) | `203.0.113.7`, `2001:db8::7` |
 | 4 | Subnet (CIDR) or IP range | `10.0.0.0/8`, `192.0.2.10-192.0.2.40` |
-| 5 | Exact IP address (IPv4 or IPv6) | `203.0.113.7`, `2001:db8::7` |
+| 5 | Zone (TLD / internal suffix, domain zones) | `.ru`, `.com`, `.intra` |
 | 6 | Application (process name) | `chrome.exe` |
 | 7 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed |
 
 Notes:
 
-- An **exact IP** always wins over any network containing it, and a network
-  wins over the zone it sits in: the narrower rule wins. Between two networks
-  the more specific one wins.
+- The narrower rule wins: a site's own name beats its address, an **exact IP**
+  beats any network containing it, a network beats the zone it sits in.
+  Between two names the longer one wins, between two networks the more
+  specific one.
+- A **block** of an exact IP address stops that address whatever other rule
+  names it. Any other block takes its place in the order above.
+- When two rules of the same kind are equally specific, a block wins over a
+  route, and the main route over the additional one.
 - A rule names a destination **or** an application. A rule that limits an
   address to one application cannot be carried out yet, so the service refuses
   it rather than applying it to every application.
@@ -123,7 +131,10 @@ Notes:
   Ports and protocols are not supported.
 - IPv6 addresses work in rules. They travel the additional connection when it
   carries IPv6; when it does not, they are held back rather than slipping out
-  over the main one.
+  over the main one. IPv6 has not been tested on a real IPv6 network yet. After
+  a rule change, connections already open over IPv6 keep their old route until
+  the program reconnects (over IPv4 the app refreshes them), and a `?` on an
+  IPv6 address never moves the rule.
 - The decision engine is pure and deterministic: identical inputs always produce identical, fully-traceable outputs.
 
 > A destination that matches no rule takes the default route — so a site
@@ -260,9 +271,9 @@ See [`SECURITY.md`](SECURITY.md) for the full trust model.
 ## Roadmap
 
 **Current:** two-route model, one active config per Windows user over a shared
-administrator baseline, domain / zone / exact-IP / app rules, per-name routing,
-presets, explain mode, leak protection, suggested addresses, diagnostics archive,
-administrative console, RU/EN.
+administrator baseline, domain / zone / IP / network / app rules, per-name
+routing, presets, explain mode, leak protection, suggested addresses, traffic
+statistics with CSV export, diagnostics archive, administrative console, RU/EN.
 
 **In progress:** Linux support (the platform-specific pieces sit behind one
 interface per capability, so the shared decision logic is already OS-neutral),
@@ -272,7 +283,8 @@ then macOS.
 resolve to them, and route and protect them as they do IPv4; what remains is
 verifying it on real IPv6 networks before calling it finished.
 
-**Right after that:** traffic history per connection, with a warning when the
+**Right after that:** a check that tells whether a server that does not answer
+is down or held back by one of your connections, and a warning when the
 additional connection nears your data plan's limit.
 
 The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
@@ -284,6 +296,7 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 | [`SECURITY.md`](SECURITY.md) | Security model & trust boundaries |
 | [`STRUCTURE.md`](STRUCTURE.md) | Repository layout |
 | [`docs/en/quickstart.md`](docs/en/quickstart.md) | Quick start: from install to the first applied rule |
+| [`docs/en/supported-systems.md`](docs/en/supported-systems.md) | Supported Windows and Linux versions, what each gets, and what has been checked |
 | [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md) | Preset & rule file format |
 | [`docs/en/routing-modes.md`](docs/en/routing-modes.md) | The routing switches: what each one buys you, and how they combine |
 | [`docs/en/what-routing-changes.md`](docs/en/what-routing-changes.md) | Who sees what once a site is routed — and what routing deliberately leaves alone |
@@ -296,7 +309,7 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 | [`docs/en/cli.md`](docs/en/cli.md) | The `nrr-cli` console: verbs, exit codes, and what it deliberately does not do |
 | [`docs/en/tui.md`](docs/en/tui.md) | The `nrr-tui` terminal interface: starting it, screens, keys, accessibility, rights |
 | [`docs/en/building-windows.md`](docs/en/building-windows.md) | Building from source on Windows: toolchain, Qt, common failures |
-| [`docs/en/packaging-windows.md`](docs/en/packaging-windows.md) | Producing a portable package for distribution |
+| [`docs/en/packaging-windows.md`](docs/en/packaging-windows.md) | Producing the portable package and the installers for distribution |
 
 ## License
 

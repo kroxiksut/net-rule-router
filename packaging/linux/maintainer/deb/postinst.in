@@ -1,0 +1,12 @@
+case "$1" in
+  configure)
+    if [ -e "$NRR_PKG_FIRST_INSTALL_FLAG" ]; then
+      rm -f -- "$NRR_PKG_FIRST_INSTALL_FLAG"
+      nrr_pkg_enable_and_start
+    else
+      nrr_pkg_restart_if_running
+    fi
+    ;;
+esac
+
+exit 0

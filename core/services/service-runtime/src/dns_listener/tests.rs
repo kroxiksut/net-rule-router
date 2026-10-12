@@ -1409,7 +1409,11 @@ fn a_rule_host_slot_is_returned_after_the_query() {
 #[test]
 fn per_datagram_receive_errors_never_count_toward_the_fatal_streak() {
     use std::io::{Error, ErrorKind};
-    for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+    for kind in [
+        ErrorKind::WouldBlock,
+        ErrorKind::TimedOut,
+        ErrorKind::Interrupted,
+    ] {
         assert_eq!(
             classify_recv_error(&Error::from(kind)),
             RecvErrorClass::Idle

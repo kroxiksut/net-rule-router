@@ -25,12 +25,15 @@ fn compute_records_unresolved_app_rules_into_status() {
     .with_app_enforcement_status(status.clone());
 
     // Empty before any compute.
-    assert!(status.unresolved().is_empty());
+    assert!(status.unresolved("S-1-5-21-APP").is_empty());
 
     orch.compute_filters_for_sid("S-1-5-21-APP", true, None, ComputeIntent::Apply)
         .unwrap();
 
-    assert_eq!(status.unresolved(), vec!["ab.exe".to_string()]);
+    assert_eq!(
+        status.unresolved("S-1-5-21-APP"),
+        vec!["ab.exe".to_string()]
+    );
 }
 
 #[test]
@@ -181,6 +184,7 @@ fn the_neutral_plan_agrees_with_the_filters_the_orchestrator_computes() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             &live,
         )
         .expect("a well-formed SID yields a verdict");
@@ -230,6 +234,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             &live,
         ),
         "computing the filters already compared this input — the periodic pass must not pay for it twice"
@@ -243,6 +248,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             &live
         ),
         "the first sighting of an input has to be compared"
@@ -254,6 +260,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             &live
         ),
         "the same input yields the same verdict — recomputing it buys nothing"
@@ -268,6 +275,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             narrower
         ),
         "a change inside the window is sampled later, not compared on the spot"
@@ -292,6 +300,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             narrower
         ),
         "a different filter set after the window must be compared again"
@@ -327,6 +336,7 @@ fn the_shadow_compare_is_remembered_per_user() {
         &book.rule_book,
         orch.fqdn_cache.as_ref(),
         &std::collections::HashSet::new(),
+        false,
         &live
     ));
     assert!(!orch.shadow_compare_neutral_plan(
@@ -335,6 +345,7 @@ fn the_shadow_compare_is_remembered_per_user() {
         &book.rule_book,
         orch.fqdn_cache.as_ref(),
         &std::collections::HashSet::new(),
+        false,
         &live
     ));
 
@@ -346,6 +357,7 @@ fn the_shadow_compare_is_remembered_per_user() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             &live
         ),
         "another user has not been evidenced yet, whatever the first one's input was"

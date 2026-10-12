@@ -186,6 +186,10 @@ pub struct RoutePolicyRecord {
     pub short_name_completion: bool,
     /// The network domain the user named; stored normalised, empty when unset.
     pub short_name_suffix: String,
+    /// An application rule takes every address its program uses, even one the
+    /// other link's address rules name. Off by default: routes are per
+    /// address, so a taken address goes that way for every program.
+    pub app_rules_take_all_addresses: bool,
     /// "Treat a domain as `domain` + `*.domain`". When `true`, the
     /// enforcement layer expands every bare-domain (`ExactFqdn`) rule with a
     /// `SuffixDomain` sibling so it also covers subdomains (apex kept).
@@ -281,6 +285,7 @@ impl RoutePolicyRecord {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             // Default ON: adding `site.example` and silently losing
             // `cdn.site.example` to the other route was the surprising outcome.
             // Widening only adds coverage towards the route the rule names, so
@@ -401,6 +406,7 @@ struct BlockPolicyRow {
     zone_priority_over_ip: bool,
     short_name_completion: bool,
     short_name_suffix: String,
+    app_rules_take_all_addresses: bool,
 }
 
 impl Default for BlockPolicyRow {
@@ -430,6 +436,7 @@ impl Default for BlockPolicyRow {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
         }
     }
 }
@@ -539,9 +546,10 @@ impl<'c> RouteBindingsRepository<'c> {
                  auto_rules_eager_delivery_names, primary_probe_auto, \
                  primary_probe_timeout_ms, primary_probe_max_targets, \
                  primary_probe_repeat_secs, local_networks_auto_accept, \
-                 zone_priority_over_ip, short_name_completion, short_name_suffix, updated_at)
+                 zone_priority_over_ip, short_name_completion, short_name_suffix, \
+                 app_rules_take_all_addresses, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
              ON CONFLICT(sid) DO UPDATE SET
                 block_secondary_when_unavailable = excluded.block_secondary_when_unavailable,
                 kill_switch_fail_closed = excluded.kill_switch_fail_closed,
@@ -567,6 +575,7 @@ impl<'c> RouteBindingsRepository<'c> {
                 zone_priority_over_ip = excluded.zone_priority_over_ip,
                 short_name_completion = excluded.short_name_completion,
                 short_name_suffix = excluded.short_name_suffix,
+                app_rules_take_all_addresses = excluded.app_rules_take_all_addresses,
                 updated_at = excluded.updated_at",
             params![
                 sid,
@@ -594,6 +603,7 @@ impl<'c> RouteBindingsRepository<'c> {
                 record.zone_priority_over_ip as i64,
                 record.short_name_completion as i64,
                 record.short_name_suffix,
+                record.app_rules_take_all_addresses as i64,
                 now_epoch_secs
             ],
         )
@@ -719,6 +729,18 @@ impl<'c> RouteBindingsRepository<'c> {
             .map_err(|e| StorageError::Internal(format!("has policy: {e}")))
     }
 
+    /// Whether any user has leak protection on — what a crashed service's
+    /// cleanup asks before it lifts the blocks that protection holds.
+    pub fn any_leak_guard_armed(&self) -> StorageResult<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM secondary_block_policy WHERE kill_switch_enabled = 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| StorageError::Internal(format!("any leak guard: {e}")))
+    }
+
     /// Read the current policy snapshot for `sid`. Returns
     /// `RoutePolicyRecord::empty(...)` if the SID has no rows in any of
     /// the three tables (i.e. the user has never sent a `RoutePolicyUpdate`).
@@ -756,6 +778,7 @@ impl<'c> RouteBindingsRepository<'c> {
             zone_priority_over_ip: policy.zone_priority_over_ip,
             short_name_completion: policy.short_name_completion,
             short_name_suffix: policy.short_name_suffix,
+            app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
             binding_source,
         })
     }
@@ -857,7 +880,7 @@ impl<'c> RouteBindingsRepository<'c> {
                  primary_probe_timeout_ms, primary_probe_max_targets, \
                  primary_probe_repeat_secs, \
                  local_networks_auto_accept, zone_priority_over_ip, \
-                 short_name_completion, short_name_suffix
+                 short_name_completion, short_name_suffix, app_rules_take_all_addresses
                  FROM secondary_block_policy WHERE sid = ?1",
                 params![sid],
                 |row| {
@@ -907,6 +930,7 @@ impl<'c> RouteBindingsRepository<'c> {
                         zone_priority_over_ip: row.get::<_, i64>(21)? != 0,
                         short_name_completion: row.get::<_, i64>(22)? != 0,
                         short_name_suffix: row.get(23)?,
+                        app_rules_take_all_addresses: row.get::<_, i64>(24)? != 0,
                     })
                 },
             )

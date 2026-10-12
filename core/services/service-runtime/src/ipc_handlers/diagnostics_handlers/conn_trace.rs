@@ -100,7 +100,7 @@ impl ConnTraceEntriesListHandler {
 /// True when the trace row belongs to our own service process. The fake-IP
 /// relay dials the real destination from here, so such a row is traffic carried
 /// for an application, not the service's own errand.
-fn is_own_service(process: &str) -> bool {
+pub(super) fn is_own_service(process: &str) -> bool {
     let service = nrr_shared::product_identity::BinaryRole::Service;
     [service.windows_file_name(), service.unix_file_name()]
         .iter()
@@ -108,7 +108,7 @@ fn is_own_service(process: &str) -> bool {
 }
 
 /// Executable name from a device/NT path (`\device\…\chrome.exe` → `chrome.exe`).
-fn exe_name(path: Option<&str>) -> String {
+pub(super) fn exe_name(path: Option<&str>) -> String {
     match path {
         Some(p) => p
             .rsplit(['\\', '/'])
@@ -124,9 +124,10 @@ fn shown_ip(ip: std::net::IpAddr) -> String {
     redact_ipv4_str(&ip.to_string(), VIEWER_REDACTION).display_or_marker()
 }
 
-/// Whether `audience` may see a row owned by `owner`. Rows with no owner and
-/// the service's own connections belong to the machine, not to a person; the
-/// relay rows among the latter carry the caller's own traffic.
+/// Whether `audience` may see a row owned by `owner`. Rows with no owner
+/// belong to the machine. The service's own rows do not: the relay among them
+/// carries every user's traffic, and a row cannot say whose, so only an
+/// administrator sees them. A user still sees their program's leg to the relay.
 fn row_visible_to(
     audience: &DiagnosticsAudience,
     rec: &crate::conn_observation_consumer::ConnectionTraceRecord,
@@ -137,7 +138,6 @@ fn row_visible_to(
     rec.user_sid
         .as_deref()
         .is_none_or(|owner| owner.is_empty() || owner.eq_ignore_ascii_case(caller))
-        || is_own_service(&exe_name(rec.process_path.as_deref()))
 }
 
 impl IpcHandler for ConnTraceEntriesListHandler {

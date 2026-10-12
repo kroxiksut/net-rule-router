@@ -240,6 +240,27 @@ QtObject {
                 "Could not update the subdomain setting: ")
         })
     }
+    /// Let an application rule take every address its program uses, even one
+    /// another rule sends the other way. Those addresses then go that route for
+    /// every program, which is why it is off by default.
+    function applyAppRulesTakeAllAddresses(enabled, onFailed) {
+        var want = enabled === true
+        _applyRoutePolicyKey("app-rules-take-all-addresses", want, {
+            onApplied: function(v) {
+                root.updateRoutingState({ appRulesTakeAllAddresses: v })
+            },
+            onFailed: onFailed,
+            ok: want
+                ? root.tr("status.app-rules-take-all-on",
+                    "Programs in your rules now take all their traffic.")
+                : root.tr("status.app-rules-take-all-off",
+                    "Rules for sites and addresses take priority over programs again."),
+            uac: root.tr("status.route-policy-uac-declined",
+                "Administrator approval was declined; the setting was not changed."),
+            failPrefix: root.tr("status.app-rules-take-all-failed",
+                "Could not change how programs in rules are routed: ")
+        })
+    }
     /// Shared-IP policy slug (`majority-of-ip` | `majority-of-rules` |
     /// `any-rule-domain`).
     function applySharedIpPolicy(slug) {

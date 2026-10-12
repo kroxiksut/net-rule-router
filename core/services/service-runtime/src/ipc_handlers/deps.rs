@@ -179,6 +179,10 @@ pub struct IpcHandlerDeps {
     /// both conn-trace reads registered as `UnimplementedHandler`. Wired via
     /// `with_conn_trace_ring(...)`.
     pub conn_trace_ring: Option<Arc<crate::conn_observation_consumer::ConnectionTraceRing>>,
+    /// The highest system uid on a Unix host, so `vpn.gateway-candidates.list`
+    /// can tell a service account's connections from a person's. `None` keeps
+    /// the shadow-utils default. Wired via `with_unix_sys_uid_max(...)`.
+    pub unix_sys_uid_max: Option<u32>,
     /// Inspector for the shipped third-party binaries.
     /// `None` degrades to the no-op inspector, so `third-party.components.list`
     /// still answers — with the attribution-only assets and no binaries, which
@@ -310,6 +314,7 @@ impl IpcHandlerDeps {
             block_notice_journal: None,
             block_notice_author: None,
             conn_trace_ring: None,
+            unix_sys_uid_max: None,
             third_party_integrity: None,
             conn_trace_expectation: None,
             // No fake-IP view by default (field stays empty). Production
@@ -627,6 +632,13 @@ impl IpcHandlerDeps {
         ring: Arc<crate::conn_observation_consumer::ConnectionTraceRing>,
     ) -> Self {
         self.conn_trace_ring = Some(ring);
+        self
+    }
+
+    /// The machine's `SYS_UID_MAX`, read by the Unix composition root.
+    #[must_use]
+    pub fn with_unix_sys_uid_max(mut self, sys_uid_max: u32) -> Self {
+        self.unix_sys_uid_max = Some(sys_uid_max);
         self
     }
 

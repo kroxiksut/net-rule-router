@@ -974,7 +974,7 @@ ScrollView {
                         }
                         ToolTip.visible: connHdrVerdictHover.hovered
                         ToolTip.text: root.tr("diag.conn-trace.col-verdict-tip",
-                            "Whether the connection was allowed or dropped. A \"Blocked\" row may be a Windows Firewall or antivirus drop — not necessarily NetRuleRouter.")
+                            "Whether the connection was allowed or dropped. A \"Blocked\" row may be a drop by the system firewall or an antivirus — not necessarily NetRuleRouter.")
                     }
                 }
 
@@ -984,7 +984,7 @@ ScrollView {
                     Layout.fillWidth: true
                     visible: section._connTraceShown && section._connTraceEntries.length > 0
                     text: root.tr("diag.conn-trace.verdict-note",
-                        "\"Blocked\" means the connection was dropped by a Windows filter — this can be Windows Firewall or your antivirus, not necessarily NetRuleRouter. NetRuleRouter never blocks traffic on your primary route.")
+                        "\"Blocked\" means the connection was dropped by a filter in the system — this can be the system firewall or your antivirus, not necessarily NetRuleRouter. NetRuleRouter never blocks traffic on your primary route.")
                     color: root.mutedTextColor
                     font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                     wrapMode: Text.WordWrap

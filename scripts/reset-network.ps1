@@ -47,11 +47,13 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\service-paths.ps1')
 
 $root = Split-Path -Parent $PSScriptRoot
-# Must match `dns_redirect.rs::NRPT_MARKER` and
+# Must match `dns_redirect.rs::NRPT_MARKER`, `NRPT_RULE_KEY` and
 # `route_codegen.rs::SECONDARY_ROUTE_METRIC` — emergency mode reproduces the
 # binary's own sweeps, and a drifted constant here would either miss our state
 # or delete somebody else's.
 $nrptMarker = 'NetRuleRouter-ModeB-DnsRedirect'
+$nrptRuleKey = '{5E0C2A17-8B3D-4F61-9C4A-2D7E6F1B0A93}'
+$nrptTable = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig'
 $routeMetric = 5
 
 $targetRoot = Resolve-TargetRoot $root
@@ -120,6 +122,32 @@ if (-not $cleanupOk) {
     }
     catch {
         Write-Warning "NRPT sweep failed: $($_.Exception.Message)"
+    }
+
+    # The cmdlet reads the whole table, so one half-written key (the service
+    # died between creating it and writing its values) fails it for every
+    # rule. The registry sweep is the binary's: our fixed key, any copy with
+    # our marker, and any key without `Version`, which no DNS client can use.
+    Write-Host "--> sweeping the NRPT table in the registry" -ForegroundColor Cyan
+    try {
+        $swept = 0
+        if (Test-Path -LiteralPath $nrptTable) {
+            foreach ($key in @(Get-ChildItem -LiteralPath $nrptTable -ErrorAction Stop)) {
+                $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+                $ours = $key.PSChildName -eq $nrptRuleKey -or
+                    ($values -and $values.Comment -eq $nrptMarker)
+                $halfWritten = -not ($values -and $null -ne $values.Version)
+                if ($ours -or $halfWritten) {
+                    Remove-Item -LiteralPath $key.PSPath -Recurse -Force -ErrorAction Stop
+                    $swept += 1
+                }
+            }
+        }
+        Write-Host "    NRPT keys removed: $swept"
+        Clear-DnsClientCache -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Warning "NRPT registry sweep failed: $($_.Exception.Message)"
     }
 
     # Same signature the binary's offline reset adopts: our metric at /32 (the

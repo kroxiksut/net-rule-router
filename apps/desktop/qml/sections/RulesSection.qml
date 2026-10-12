@@ -1722,27 +1722,13 @@ ColumnLayout {
     // production-correct canonicalization waits for a bridge
     // method (separate B.x slice).
     function _buildRulesJson() {
-        var primary = []
-        var secondary = []
+        var rows = []
+        if (root.rulesModel) {
+            for (var i = 0; i < root.rulesModel.count; i += 1) rows.push(root.rulesModel.get(i))
+        }
         // The window owns the ACE encoder (it needs the C++ bridge); the
         // shared serializer takes it as an argument.
-        var ace = root._aceEncodeHost
-        if (root.rulesModel) {
-            for (var i = 0; i < root.rulesModel.count; i += 1) {
-                var entry = root.rulesModel.get(i)
-                // A block lives in the secondary bucket; its `action`
-                // field (set by the serializer) overrides routing.
-                var bucket = (Rules.routeBucket(entry.targetRoute) === "secondary")
-                    ? secondary : primary
-                bucket.push(Rules.ruleRowToWireDto(entry, ace))
-            }
-        }
-        var dto = {
-            "schema-version": 1,
-            "primary": primary,
-            "secondary": secondary
-        }
-        return JSON.stringify(dto)
+        return Rules.buildRulesJson(rows, root._aceEncodeHost)
     }
 
     // Toggle one rule's enabled flag. Called from the

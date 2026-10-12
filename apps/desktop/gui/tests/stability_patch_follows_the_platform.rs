@@ -119,6 +119,17 @@ fn the_capability_table_names_real_flags_and_real_keys() {
         );
         assert!(dto.get(key).is_some(), "{key} is not a stability wire key");
     }
+    let requires = run_pure("STABILITY_KEY_REQUIRES").expect("node ran a moment ago");
+    let requires = requires.as_object().expect("the table is an object");
+    assert!(!requires.is_empty());
+    for (key, capability) in requires {
+        let capability = capability.as_str().expect("a capability name");
+        assert!(
+            supports.get(capability).is_some(),
+            "{key}: `{capability}` is not a platform profile flag"
+        );
+        assert!(dto.get(key).is_some(), "{key} is not a stability wire key");
+    }
 }
 
 #[test]

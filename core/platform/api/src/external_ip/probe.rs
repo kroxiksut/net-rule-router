@@ -1,15 +1,12 @@
 //! Thin UDP transport for the external-address probe.
 //!
-//! Portable by construction: `std::net` only. There is no per-OS mechanism to
-//! hide behind a port trait here — the same twenty bytes go out of the same
-//! socket API on Windows, Linux and macOS — so this module is the whole
-//! implementation rather than a seam.
+//! `std::net` plus one port: [`crate::source_link`], because binding to an
+//! adapter's address picks its way out on Windows but not on Linux.
 //!
-//! The decisive property is `UdpSocket::bind((local_ipv4, 0))`: binding the
-//! probe socket to ONE adapter's own source address makes the reflexive
-//! address that comes back describe THAT adapter. Showing an external address
-//! *per adapter* is the entire point of the feature, and an HTTP "what is my
-//! IP" call cannot be source-bound without dragging in an HTTP client.
+//! The decisive property is that the probe leaves by ONE adapter, so the
+//! reflexive address that comes back describes THAT adapter. Showing an
+//! external address *per adapter* is the point of the feature, and an HTTP
+//! "what is my IP" call cannot be held to an adapter without an HTTP client.
 //!
 //! Timing is bounded from two sides: each attempt has its own read timeout,
 //! and the batch has a wall-clock budget it never exceeds — the caller is a
@@ -240,6 +237,7 @@ fn attempt(
 ) -> io::Result<Option<Ipv4Addr>> {
     let socket = UdpSocket::bind(SocketAddrV4::new(source, 0))?;
     crate::own_traffic::mark_own_socket(&socket);
+    crate::source_link::pin_to_source_link(&socket, source);
     // Pinning the peer makes the kernel drop datagrams from anywhere else and
     // surfaces an ICMP port-unreachable as an error instead of a silent wait.
     socket.connect(SocketAddr::V4(server))?;

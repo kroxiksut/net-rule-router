@@ -1,7 +1,7 @@
 //! Windows implementation of the service-control port: the Service Control
 //! Manager.
 //!
-//! This is mechanism only — every decision about *whether* an operation may run
+//! This is mechanism only вЂ” every decision about *whether* an operation may run
 //! and *what the user is told* lives in the caller. The module was extracted
 //! from the service binary so the administrative console can drive the same
 //! code path the service's own verbs and the elevation broker drive; a binary
@@ -22,6 +22,9 @@ use nrr_platform_api::service_control::{
     ServiceInstallSpec, ServiceRunState, ServiceStartMode, ServiceStatusReport,
     ServiceUninstallReport, ServiceUninstallSpec,
 };
+use nrr_platform_api::service_placement::{
+    plan_copy, registers_protected_copy, CopyPlan, RegisteredFrom,
+};
 use nrr_shared::product_identity::{
     WINDOWS_SERVICE_DESCRIPTION, WINDOWS_SERVICE_DISPLAY_NAME, WINDOWS_SERVICE_NAME,
 };
@@ -40,12 +43,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_WAIT_HINT: Duration = Duration::from_secs(120);
 
 /// Best-effort drain budget applied when uninstall has to stop a running
-/// service first. Uninstall proceeds even if the service is slow to go down —
+/// service first. Uninstall proceeds even if the service is slow to go down вЂ”
 /// SCM marks a still-running service for deletion on exit.
 const UNINSTALL_STOP_BUDGET: Duration = Duration::from_secs(10);
 
 /// Subdirectories of the service-owned data root that install creates.
 const DATA_SUBDIRS: &[&str] = &["", "logs", "audit", "backup"];
+
+/// How long an install that updates the protected copy waits for the service
+/// to stop (past it, nothing is replaced), and then for it to start again.
+const COPY_UPDATE_STOP_BUDGET: Duration = Duration::from_secs(30);
+const COPY_UPDATE_START_BUDGET: Duration = Duration::from_secs(30);
 
 /// Windows service control over SCM.
 #[derive(Debug, Clone, Copy, Default)]
@@ -62,7 +70,7 @@ impl WindowsServiceControl {
 pub const BASE_FILTERING_ENGINE_SERVICE: &str = "BFE";
 
 /// Is the filtering engine running? `None` when the question cannot be answered
-/// (no rights to ask, SCM unreachable) — absence of an answer is not an answer.
+/// (no rights to ask, SCM unreachable) вЂ” absence of an answer is not an answer.
 ///
 /// Windows-only by nature: there is no equivalent to interrogate elsewhere, so
 /// this stays out of the neutral port.
@@ -82,7 +90,7 @@ impl ServiceControlPort for WindowsServiceControl {
         &self,
         spec: &ServiceInstallSpec,
     ) -> Result<ServiceInstallReport, ServiceControlError> {
-        // Step 1 — the privileged handle, before anything is written.
+        // Step 1 вЂ” the privileged handle, before anything is written.
         //
         // Registration is what this install cannot do without, and it is the
         // step that refuses an unelevated caller. Taken first, an access-denied
@@ -94,10 +102,14 @@ impl ServiceControlPort for WindowsServiceControl {
             open_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
 
         // SCM will start this file as LocalSystem on every boot, and a DLL
-        // beside it loads before the system copy.
-        check_binary_location(&spec.binary_path)?;
+        // beside it loads before the system copy: a binary ordinary accounts
+        // can change is registered as a protected copy instead.
+        let binary_path = match self.place_binary(&manager, &spec.binary_path)? {
+            Placement::Register(path) => path,
+            Placement::AlreadyRegistered => return Ok(refresh_registration(&manager, spec)),
+        };
 
-        // Step 2 — data directories, locked down before anything is registered.
+        // Step 2 вЂ” data directories, locked down before anything is registered.
         // A tree that already exists is locked down too: `%ProgramData%` lets
         // any user create it first and stay its owner.
         let mut dirs_created = Vec::new();
@@ -129,11 +141,11 @@ impl ServiceControlPort for WindowsServiceControl {
                 ServiceStartMode::OnAppLaunch => ServiceStartType::OnDemand,
             },
             error_control: ServiceErrorControl::Normal,
-            executable_path: spec.binary_path.clone(),
+            executable_path: binary_path.clone(),
             launch_arguments: vec![],
             // Every filter this product installs goes through the Base Filtering
             // Engine, and its API calls block rather than fail while BFE is still
-            // coming up — an auto-start service that races it at OS boot can sit
+            // coming up вЂ” an auto-start service that races it at OS boot can sit
             // in START_PENDING until the SCM gives up. Declaring the dependency
             // hands the ordering to the SCM.
             dependencies: vec![ServiceDependency::Service(OsString::from("BFE"))],
@@ -144,17 +156,18 @@ impl ServiceControlPort for WindowsServiceControl {
             .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
             .map_err(map_service_error)?;
 
-        // Step 3 — description.
+        // Step 3 вЂ” description.
         service
             .set_description(WINDOWS_SERVICE_DESCRIPTION)
             .map_err(map_service_error)?;
 
-        // Step 4 — crash recovery actions. Best-effort: a service that is
+        // Step 4 вЂ” crash recovery actions. Best-effort: a service that is
         // registered but lacks failure actions is still a working install, and
         // the report says which of the two happened.
-        let recovery_configured = configure_recovery(&service, &spec.recovery).is_ok();
+        let recovery_configured =
+            configure_recovery(&service, &spec.recovery, &binary_path).is_ok();
 
-        // Step 5 — event-source registration, so lifecycle records show up under
+        // Step 5 вЂ” event-source registration, so lifecycle records show up under
         // our name instead of as "description cannot be found". Best-effort for
         // the same reason as recovery actions: a service that logs plainly is
         // still an installed service.
@@ -176,9 +189,19 @@ impl ServiceControlPort for WindowsServiceControl {
         let service = manager
             .open_service(
                 WINDOWS_SERVICE_NAME,
-                ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+                ServiceAccess::QUERY_STATUS
+                    | ServiceAccess::QUERY_CONFIG
+                    | ServiceAccess::STOP
+                    | ServiceAccess::DELETE,
             )
             .map_err(map_service_error)?;
+        // Read while the registration exists: it says whether the protected
+        // copy is what this service ran.
+        let registered_binary = service.query_config().ok().map(|config| {
+            nrr_platform_api::autostart::executable_of_command_line(
+                &config.executable_path.to_string_lossy(),
+            )
+        });
 
         let status = service.query_status().map_err(map_service_error)?;
         let mut stopped = status.current_state == ServiceState::Stopped;
@@ -210,7 +233,7 @@ impl ServiceControlPort for WindowsServiceControl {
         // ONLY when the service really did stop. Sweeping under a live service
         // is worse than not sweeping at all: its next pass puts everything back,
         // the delete then succeeds, and the machine keeps orphaned filters and
-        // an NRPT rule pointing at a resolver that no longer exists — with
+        // an NRPT rule pointing at a resolver that no longer exists вЂ” with
         // nothing installed that would sweep them at boot. The report says which
         // of the two happened rather than claiming the machine is clean.
         let machine_state_cleared = if stopped {
@@ -224,6 +247,11 @@ impl ServiceControlPort for WindowsServiceControl {
         // Leaving the source registered would keep an orphan key pointing at a
         // service that no longer exists.
         let _ = crate::event_log::deregister_event_source();
+
+        // A process that did not stop still runs from the copy.
+        if stopped {
+            remove_protected_copy(registered_binary.as_deref());
+        }
 
         let data_removed = if spec.remove_service_owned_data {
             let root = service_data_root()?;
@@ -255,7 +283,7 @@ impl ServiceControlPort for WindowsServiceControl {
             .map_err(map_service_error)?;
 
         // Already running: nothing to do. A start already in flight is NOT
-        // "done" — the poll below waits for it, so a caller that asked for a
+        // "done" вЂ” the poll below waits for it, so a caller that asked for a
         // running service gets one or an error, never a maybe.
         let status = service.query_status().map_err(map_service_error)?;
         if status.current_state == ServiceState::Running {
@@ -276,7 +304,7 @@ impl ServiceControlPort for WindowsServiceControl {
         // of a race.
         //
         // Only RUNNING ends the wait: accepting START_PENDING made a wedged
-        // service read as started. STOPPED is terminal too — the service ran
+        // service read as started. STOPPED is terminal too вЂ” the service ran
         // and gave up.
         //
         // A pending service names how long its next step may take (wait hint)
@@ -429,7 +457,7 @@ fn filetime_to_system_time(ft: windows::Win32::Foundation::FILETIME) -> std::tim
         + std::time::Duration::new(seconds.saturating_sub(EPOCH_DIFFERENCE_SECONDS), nanos)
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// в”Ђв”Ђ Helpers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 fn open_manager(access: ServiceManagerAccess) -> Result<ServiceManager, ServiceControlError> {
     ServiceManager::local_computer(None::<&str>, access).map_err(map_service_error)
@@ -474,34 +502,205 @@ fn is_within(path: &Path, base: &Path) -> bool {
     lower(path).starts_with(lower(base))
 }
 
-/// Refuse a service binary that accounts other than SYSTEM, Administrators and
-/// TrustedInstaller can change. A development build only warns: its binary
-/// lives in the build directory by design.
-fn check_binary_location(binary: &Path) -> Result<(), ServiceControlError> {
-    let problem = match crate::trusted_location::untrusted_writer(binary) {
-        Ok(None) => return Ok(()),
-        Ok(Some(writer)) => writer,
-        Err(e) => format!("cannot tell who can change {}: {e}", binary.display()),
-    };
-    if cfg!(debug_assertions) {
-        tracing::warn!(
-            target: "nrr::service-control",
-            msg_key = "win-svcctl-untrusted-binary-location",
-            problem = %problem,
-            "registering a service binary that non-administrators can change — development build only",
-        );
-        return Ok(());
+/// Who besides SYSTEM, Administrators and TrustedInstaller could change
+/// `binary` or plant a file beside it, or `None` when nobody can. Permissions
+/// that cannot be read count as a problem, never as protected.
+fn location_problem(binary: &Path) -> Option<String> {
+    match crate::trusted_location::untrusted_writer(binary) {
+        Ok(None) => None,
+        Ok(Some(writer)) => Some(writer),
+        Err(e) => Some(format!(
+            "cannot tell who can change {}: {e}",
+            binary.display()
+        )),
     }
-    Err(ServiceControlError::InvalidState {
-        detail: format!(
-            "{problem}. The service runs as LocalSystem from this file: move the program to a \
-             folder only administrators can change, such as Program Files, and install again"
-        ),
+}
+
+/// What the install registers.
+enum Placement {
+    /// Register this binary.
+    Register(PathBuf),
+    /// The existing registration already names the protected copy, which is
+    /// current now; there is nothing to register.
+    AlreadyRegistered,
+}
+
+impl WindowsServiceControl {
+    /// The binary to register for `source`: itself when only administrators
+    /// can change it (or in a development build, whose binary lives in the
+    /// build directory by design), else the protected copy, written or updated
+    /// first. The copy is registered only once its own location checks out.
+    fn place_binary(
+        &self,
+        manager: &ServiceManager,
+        source: &Path,
+    ) -> Result<Placement, ServiceControlError> {
+        let problem = location_problem(source);
+        if !registers_protected_copy(problem.is_none(), cfg!(debug_assertions)) {
+            if let Some(problem) = problem {
+                tracing::warn!(
+                    target: "nrr::service-control",
+                    msg_key = "win-svcctl-untrusted-binary-location",
+                    problem = %problem,
+                    "registering a service binary that non-administrators can change вЂ” development build only",
+                );
+            }
+            return Ok(Placement::Register(source.to_path_buf()));
+        }
+        let relocation = |detail: String| ServiceControlError::Relocation { detail };
+        let dir = crate::service_placement::installed_copy_dir().map_err(relocation)?;
+        let target = crate::service_placement::installed_copy_binary(&dir);
+        let payload = crate::service_placement::Payload::read(source).map_err(relocation)?;
+        let copy = payload.state_in(&dir).map_err(relocation)?;
+        let placement = match plan_copy(copy, registered_from(manager, &target)?) {
+            CopyPlan::RefuseRegisteredElsewhere => {
+                return Err(ServiceControlError::InvalidState {
+                    detail: "the service is already registered from another folder; \
+                             reinstall replaces that registration"
+                        .to_string(),
+                })
+            }
+            CopyPlan::Nothing => Placement::AlreadyRegistered,
+            CopyPlan::Register => {
+                crate::service_placement::prepare_copy_dir(&dir).map_err(relocation)?;
+                Placement::Register(target.clone())
+            }
+            CopyPlan::WriteAndRegister => {
+                write_protected_copy(&dir, &payload)?;
+                Placement::Register(target.clone())
+            }
+            CopyPlan::Update { restart } => {
+                self.stop(COPY_UPDATE_STOP_BUDGET).map_err(|e| {
+                    ServiceControlError::InvalidState {
+                        detail: format!(
+                            "the service did not stop, so its files were not replaced: {e}"
+                        ),
+                    }
+                })?;
+                write_protected_copy(&dir, &payload)?;
+                if restart {
+                    self.start(COPY_UPDATE_START_BUDGET)?;
+                }
+                Placement::AlreadyRegistered
+            }
+        };
+        if let Some(problem) = location_problem(&target) {
+            return Err(relocation(format!(
+                "{problem}; the copy is not out of reach of ordinary accounts"
+            )));
+        }
+        Ok(placement)
+    }
+}
+
+fn write_protected_copy(
+    dir: &Path,
+    payload: &crate::service_placement::Payload,
+) -> Result<(), ServiceControlError> {
+    let relocation = |detail: String| ServiceControlError::Relocation { detail };
+    crate::service_placement::prepare_copy_dir(dir).map_err(relocation)?;
+    payload.write_to(dir).map_err(relocation)
+}
+
+/// What the service manager has registered, measured against the protected
+/// copy's path вЂ” a location this process computed, never one it was handed.
+fn registered_from(
+    manager: &ServiceManager,
+    copy: &Path,
+) -> Result<RegisteredFrom, ServiceControlError> {
+    let service = match manager.open_service(
+        WINDOWS_SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    ) {
+        Ok(service) => service,
+        Err(e) => {
+            return match map_service_error(e) {
+                ServiceControlError::NotInstalled => Ok(RegisteredFrom::Nothing),
+                other => Err(other),
+            }
+        }
+    };
+    let config = service.query_config().map_err(map_service_error)?;
+    let registered = nrr_platform_api::autostart::executable_of_command_line(
+        &config.executable_path.to_string_lossy(),
+    );
+    if !same_file_path(&registered, copy) {
+        return Ok(RegisteredFrom::Elsewhere);
+    }
+    let status = service.query_status().map_err(map_service_error)?;
+    Ok(RegisteredFrom::TheCopy {
+        running: status.current_state != ServiceState::Stopped,
     })
 }
 
+/// An install over a registration that already names the current protected
+/// copy: re-apply what install configures, register nothing.
+fn refresh_registration(
+    manager: &ServiceManager,
+    spec: &ServiceInstallSpec,
+) -> ServiceInstallReport {
+    let recovery_configured = manager
+        .open_service(
+            WINDOWS_SERVICE_NAME,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+        )
+        .is_ok_and(|service| {
+            let _ = service.set_description(WINDOWS_SERVICE_DESCRIPTION);
+            service.query_config().is_ok_and(|config| {
+                configure_recovery(&service, &spec.recovery, &config.executable_path).is_ok()
+            })
+        });
+    ServiceInstallReport {
+        data_dirs_created: Vec::new(),
+        recovery_configured,
+        acl_applied: None,
+        event_source_registered: Some(crate::event_log::register_event_source().is_ok()),
+    }
+}
+
+/// After the registration is gone, remove the protected copy if it was what
+/// the service ran. The folder is computed here; the registered path only says
+/// whether it is ours to remove. A failure leaves an inert administrators-only
+/// folder the next install reuses.
+fn remove_protected_copy(registered: Option<&Path>) {
+    let (Some(registered), Ok(dir)) = (registered, crate::service_placement::installed_copy_dir())
+    else {
+        return;
+    };
+    if !same_file_path(
+        registered,
+        &crate::service_placement::installed_copy_binary(&dir),
+    ) {
+        return;
+    }
+    // A removal run from the copy itself (the registered binary's own
+    // `uninstall`) cannot delete its running image: that part waits for the
+    // next restart.
+    if let Err(e) = crate::service_placement::remove_copy_dir(&dir) {
+        tracing::warn!(
+            target: "nrr::service-control",
+            msg_key = "win-svcctl-protected-copy-not-removed",
+            error = %e,
+            "the service's protected copy could not be removed; the next install reuses it",
+        );
+    }
+}
+
+/// Path equality as the file system sees it: case, separators, a trailing
+/// separator and the verbatim prefix do not make two paths different.
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    fn comparable(path: &Path) -> String {
+        let text = path.to_string_lossy().replace('/', "\\");
+        text.strip_prefix(r"\\?\")
+            .unwrap_or(&text)
+            .trim_end_matches('\\')
+            .to_lowercase()
+    }
+    comparable(left) == comparable(right)
+}
+
 /// Translate an SCM failure into the neutral taxonomy. Only two OS codes carry
-/// meaning a caller can act on — everything else is reported verbatim.
+/// meaning a caller can act on вЂ” everything else is reported verbatim.
 fn map_service_error(err: windows_service::Error) -> ServiceControlError {
     // ERROR_ACCESS_DENIED = 5, ERROR_SERVICE_DOES_NOT_EXIST = 1060.
     if let windows_service::Error::Winapi(io_err) = &err {
@@ -520,27 +719,35 @@ fn map_service_error(err: windows_service::Error) -> ServiceControlError {
 fn configure_recovery(
     service: &Service,
     policy: &RecoveryPolicy,
+    binary: &Path,
 ) -> Result<(), ServiceControlError> {
     use windows_service::service::{ServiceFailureActions, ServiceFailureResetPeriod};
 
-    let mut actions: Vec<ServiceAction> = Vec::new();
-    for i in 0..policy.max_auto_restarts {
-        let delay_ms = if i == 0 {
-            policy.first_restart_delay_ms
-        } else {
-            policy.second_restart_delay_ms
-        };
-        actions.push(ServiceAction {
+    let mut actions: Vec<ServiceAction> = (0..policy.max_auto_restarts)
+        .map(|i| ServiceAction {
             action_type: ServiceActionType::Restart,
-            delay: Duration::from_millis(delay_ms as u64),
+            delay: Duration::from_millis(u64::from(match i {
+                0 => policy.first_restart_delay_ms,
+                1 => policy.second_restart_delay_ms,
+                _ => policy.later_restart_delay_ms,
+            })),
+        })
+        .collect();
+    // The SCM repeats the last action for every failure after it, so a run
+    // command here fires on each crash past the restarts, never a restart.
+    let command = policy.release_network_when_exhausted.then(|| {
+        actions.push(ServiceAction {
+            action_type: ServiceActionType::RunCommand,
+            delay: Duration::from_secs(1),
+        });
+        OsString::from(format!("\"{}\" after-crash", binary.display()))
+    });
+    if command.is_none() {
+        actions.push(ServiceAction {
+            action_type: ServiceActionType::None,
+            delay: Duration::ZERO,
         });
     }
-    // Trailing "no action" entry: further failures leave the service stopped
-    // for an operator instead of looping.
-    actions.push(ServiceAction {
-        action_type: ServiceActionType::None,
-        delay: Duration::ZERO,
-    });
 
     service
         .update_failure_actions(ServiceFailureActions {
@@ -548,7 +755,7 @@ fn configure_recovery(
                 policy.reset_period_secs as u64,
             )),
             reboot_msg: None,
-            command: None,
+            command,
             actions: Some(actions),
         })
         .map_err(|e| ServiceControlError::Mechanism {
@@ -558,12 +765,12 @@ fn configure_recovery(
 
 /// Restrict the service-owned data directory to the security baseline.
 ///
-/// SYSTEM and Administrators only — no `Users` entry anywhere under the tree.
+/// SYSTEM and Administrators only вЂ” no `Users` entry anywhere under the tree.
 /// The state DB carries every SID's rule set, route bindings and session list;
 /// the audit directory is the tamper-evident record of who changed what; the
 /// operational log names the hosts each user's traffic touched. Reads of those
 /// go through the service, scoped to the caller, and a diagnostics archive is
-/// handed over by `file_handoff` — nothing needs the folder itself.
+/// handed over by `file_handoff` вЂ” nothing needs the folder itself.
 ///
 /// The owner becomes Administrators and explicit entries below the root are
 /// dropped: under `%ProgramData%` any account may create the tree first, and
@@ -675,7 +882,7 @@ const SWEEP_BUDGET: Duration = Duration::from_secs(30);
 /// Run `work` on a worker thread and give up on it after `budget`.
 ///
 /// `None` means it did not answer in time. The thread is abandoned rather than
-/// cancelled — a blocked RPC into the filtering engine cannot be interrupted,
+/// cancelled вЂ” a blocked RPC into the filtering engine cannot be interrupted,
 /// and this runs in a short-lived process that is about to exit anyway.
 fn within<T, F>(budget: Duration, work: F) -> Option<T>
 where
@@ -705,14 +912,14 @@ where
 /// the next reboot, and adopting them needs the reconciler from the service
 /// layer, which this crate must not depend on.
 ///
-/// Returns `false` if either sweep could not run — the caller reports it rather
+/// Returns `false` if either sweep could not run вЂ” the caller reports it rather
 /// than failing the removal, because a registered service is the worse outcome.
 fn sweep_enforcement_state() -> bool {
     let api: std::sync::Arc<dyn nrr_platform_api::windows_api::WindowsApiPort> =
         std::sync::Arc::new(crate::windows_api::ProductionWindowsApi);
     // Budgeted: opening the engine and sweeping it are both RPC into the Base
     // Filtering Engine, and a wedged engine answers neither. Removal must not
-    // be the command that hangs — a service left registered is the worse
+    // be the command that hangs вЂ” a service left registered is the worse
     // outcome, and our filters are not persistent, so a reboot clears whatever
     // this could not.
     let filters_swept = within(SWEEP_BUDGET, move || {
@@ -722,7 +929,7 @@ fn sweep_enforcement_state() -> bool {
     })
     .unwrap_or(false);
     // Only once the filters are gone: the sub-layer cannot be deleted while
-    // anything still references it. Its own handle rather than the session's —
+    // anything still references it. Its own handle rather than the session's вЂ”
     // that one belongs to the neutral layer and does not hand out its token.
     if filters_swept {
         if let Ok(token) = crate::win32_ffi::wfp_engine::engine_open() {
@@ -738,13 +945,13 @@ fn sweep_enforcement_state() -> bool {
         }
     }
     // Machine-wide engine options, including ones an instance that was killed
-    // rather than stopped left changed — it wrote down what they held.
+    // rather than stopped left changed вЂ” it wrote down what they held.
     crate::conn_observe::wfp_events::restore_engine_options();
     // The autostart entry, for whoever is running the removal.
     //
     // Per-user by nature (`HKCU`), so this reaches exactly one hive: the
     // caller's. Another account that also enabled autostart keeps its entry,
-    // and reaching it would mean walking other users' registry — invasive, and
+    // and reaching it would mean walking other users' registry вЂ” invasive, and
     // still blind to anyone not logged in. The residue is inert (it names an
     // executable that no longer exists), so the honest split is: clear what we
     // can reach here, and leave the rest to a per-user uninstall action.
@@ -845,6 +1052,25 @@ mod tests {
             Err(ServiceControlError::InvalidState { .. })
         ));
         assert!(adoption_verdict(root, &created, &before, Some(&before)).is_ok());
+    }
+
+    #[test]
+    fn a_registered_path_matches_the_copy_whatever_its_spelling() {
+        let copy = Path::new(r"C:\Program Files\NetRuleRouter Service\nrr-service.exe");
+        for same in [
+            r"c:\program files\netrulerouter service\NRR-SERVICE.EXE",
+            r"\\?\C:\Program Files\NetRuleRouter Service\nrr-service.exe",
+            "C:/Program Files/NetRuleRouter Service/nrr-service.exe",
+        ] {
+            assert!(same_file_path(Path::new(same), copy), "{same}");
+        }
+        for other in [
+            r"C:\Program Files\NetRuleRouter\nrr-service.exe",
+            r"C:\Users\Public\NetRuleRouter Service\nrr-service.exe",
+            r"C:\Program Files\NetRuleRouter Service\other.exe",
+        ] {
+            assert!(!same_file_path(Path::new(other), copy), "{other}");
+        }
     }
 
     #[test]

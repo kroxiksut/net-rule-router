@@ -124,13 +124,17 @@ Contract tests live in `shared/contracts/tests/` split by domain.
 
 **Product invariant: the NARROWER rule beats the wider one.** A zone is the widest thing a user can name, so anything more specific inside it wins. There is no user-facing switch that inverts this — `zone_priority_over_ip` survives as a parameter with the invariant as its default, and nothing in the GUI sets it.
 
+Evaluation order, first match wins (a literal-IP Block vetoes every route on its address before any of these):
+
 1. Exact FQDN
-2. Subdomain / suffix
-3. Zone — TLD or internal domain suffix (e.g. `.ru`, `.com`, `.intra`); hostname must end with `.{zone_name}`
-4. Subnet / IP range — beats the zone it sits inside; between networks the longer prefix wins; an identical network on both routes is an error
-5. Exact IP — beats any network (and zone) containing it
+2. Subdomain / suffix — longest base domain first
+3. Exact IP — beats any network containing it
+4. Subnet / IP range — between networks the longer prefix wins; an identical network on both routes is an error
+5. Zone — TLD or internal domain suffix (e.g. `.ru`, `.com`, `.intra`); hostname must end with `.{zone_name}`; anything named inside it wins
 6. Application
 7. Default route
+
+`core/domain/tests/priority_order_in_docs.rs` derives this order from the engine and holds README, quickstart and `rules-file-format` (EN/RU) to it.
 
 The same invariant settles application rules against address rules, and it is the address-ownership arbiter that enforces it: an address a rule names belongs to that rule, and an application keeps only the addresses nobody named.
 

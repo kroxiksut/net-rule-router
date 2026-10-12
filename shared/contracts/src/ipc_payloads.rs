@@ -1160,6 +1160,8 @@ mod traffic;
 pub use traffic::*;
 mod suggestions;
 pub use suggestions::*;
+mod vpn_gateways;
+pub use vpn_gateways::*;
 // ── Serde defaults shared by more than one payload group ─────────────────
 //
 // A default named by two groups belongs to neither: a child module cannot

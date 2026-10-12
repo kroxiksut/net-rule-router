@@ -144,6 +144,14 @@ fn stability_tables_match_js() {
         js.eval_json("STABILITY_KEY_CAPABILITY"),
         Value::Object(capabilities)
     );
+    let requires: Map<String, Value> = stability::KEY_REQUIRES
+        .iter()
+        .map(|(key, capability)| ((*key).to_owned(), Value::from(*capability)))
+        .collect();
+    assert_eq!(
+        js.eval_json("STABILITY_KEY_REQUIRES"),
+        Value::Object(requires)
+    );
 }
 
 #[test]

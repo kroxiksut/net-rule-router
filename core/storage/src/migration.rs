@@ -44,7 +44,8 @@ use crate::schema::{
     STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V59_DDL, STATE_DB_V5_DDL, STATE_DB_V60_DDL,
     STATE_DB_V61_DDL, STATE_DB_V62_DDL, STATE_DB_V63_DDL, STATE_DB_V64_DDL, STATE_DB_V65_DDL,
     STATE_DB_V66_DDL, STATE_DB_V67_DDL, STATE_DB_V68_DDL, STATE_DB_V69_DDL, STATE_DB_V6_DDL,
-    STATE_DB_V7_DDL, STATE_DB_V8_DDL, STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL, TRAFFIC_DB_V2_DDL,
+    STATE_DB_V70_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL, STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL,
+    TRAFFIC_DB_V2_DDL,
 };
 
 /// One versioned step; the catalogues below append, never edit.
@@ -623,6 +624,11 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         version: 69,
         name: "block_notice_mute_notice_scope",
         stmts: STATE_DB_V69_DDL,
+    },
+    MigrationDef {
+        version: 70,
+        name: "add_app_rules_take_all_addresses",
+        stmts: STATE_DB_V70_DDL,
     },
 ];
 

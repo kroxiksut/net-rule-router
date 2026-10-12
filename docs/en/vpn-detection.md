@@ -25,6 +25,55 @@ A connection your provider delivers the internet itself over — PPPoE, or a
 mobile-broadband modem — is not someone else's VPN: it is treated as an
 ordinary main connection, and leak protection covers it like any other.
 
+## A VPN that must connect through the other channel (VPN over VPN)
+
+Some VPNs accept a connection only from certain places. A typical case: a
+corporate VPN that works only from abroad, while your main connection is a
+domestic one. That VPN then has to reach its gateway through your additional
+route — your own VPN abroad — and NetRuleRouter can make sure it always does.
+
+**With the helper.** Open **Settings → Routing behavior → Your VPN client** and
+find **Other VPNs (corporate)**:
+
+1. Name the VPN program: type its file name, or press **Scan for VPN apps**
+   and pick it from the programs found.
+2. Choose the route it has to connect through — usually the additional one.
+3. Start the VPN and let it try to connect, then press **Find gateway
+   addresses**. The addresses that program connected to recently are listed,
+   the most likely gateway first and already ticked. Where a host name is
+   shown you can tick it instead of the address, and you can type the
+   gateway's address or name yourself.
+4. Press **Add rules**. The rules join your rules list like any other; apply
+   the changes as usual.
+
+In the terminal interface the same helper is the `v` key on the Rules screen.
+
+**By hand.** It is one ordinary rule: the gateway's address, or its host name,
+in the rules of the route the VPN has to connect through. The gateway is named
+in the VPN client's connection settings or profile. In the additional route's
+rules file it looks like this:
+
+```
+--- IP
+203.0.113.10    # VPN gateway: corporate VPN
+```
+
+**Do not add that program under "Your VPN client" for this.** That list is for
+the program that brings your additional route up, and its traffic is
+deliberately let out over the main connection so it can always reconnect.
+Putting the corporate VPN there would send it over the domestic main
+connection, which is exactly what it must not use.
+
+**When the route is down.** If the route the gateway is bound to is not
+available, the corporate VPN does not connect — it is not moved to the other
+route. Bring that route back (reconnect your own VPN) and the corporate VPN can
+connect again.
+
+**If large transfers stall.** A tunnel inside a tunnel leaves less room for
+each packet. If the corporate VPN connects but big downloads, file copies or
+remote-desktop sessions hang, lower the MTU in the corporate VPN client's
+settings (for example to 1300) and reconnect.
+
 ## How detection works
 
 The app scans your **running programs** and **installed programs** and flags any

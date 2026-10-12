@@ -967,3 +967,165 @@ mod rules_folder {
         );
     }
 }
+
+/// `v`: a rule for a VPN's gateway, the window's "Other VPNs (corporate)".
+mod gateway {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn with_candidates(rows: Vec<Value>, candidates: Value) -> FakeService {
+        let fake = service(rows);
+        fake.answer(IpcOperationName::VpnGatewayCandidatesList, candidates);
+        fake
+    }
+
+    fn two_candidates() -> Value {
+        json!({
+            "program": "corpvpn.exe",
+            "candidates": [
+                {
+                    "address": "203.0.113.5",
+                    "hostname": "gw.corp.example",
+                    "ports": [500, 4500],
+                    "protocols": ["udp"],
+                    "connections": 3,
+                    "last-seen-ms": 1_757_000_000_000_i64
+                },
+                {
+                    "address": "198.51.100.7",
+                    "ports": [443],
+                    "protocols": ["tcp"],
+                    "connections": 1,
+                    "last-seen-ms": 0
+                }
+            ],
+            "omitted": 2,
+            "observer-active": true
+        })
+    }
+
+    fn note(app: &AppState) -> String {
+        app.rules
+            .note
+            .as_ref()
+            .map(|note| note.text(&texts_en()))
+            .unwrap_or_default()
+    }
+
+    fn press(app: &mut AppState, code: KeyCode) {
+        screen(ScreenId::Rules).on_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn a_number_adds_the_listed_address_over_the_chosen_channel() {
+        let fake = with_candidates(Vec::new(), two_candidates());
+        let mut app = on_rules(&fake);
+        // A path is reduced to the program's file name; Enter alone keeps the
+        // additional channel.
+        answer(&mut app, &["v", "C:\\Apps\\Corp\\corpvpn.exe", ""]);
+        drain(&mut app, &fake);
+
+        assert_eq!(
+            fake.sent(IpcOperationName::VpnGatewayCandidatesList),
+            vec![json!({ "program": "corpvpn.exe" })]
+        );
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(
+            shown.contains(
+                "1. 203.0.113.5 · ports 500, 4500 · last seen 2025-09-04 15:33 · By name: gw.corp.example"
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("2. 198.51.100.7 · ports 443 · last seen —"),
+            "{shown}"
+        );
+        assert!(shown.contains("Addresses not shown: 2."), "{shown}");
+
+        answer(&mut app, &["1"]);
+        assert!(matches!(app.rules.mode, Mode::List));
+        let row = app.rules.table.rows.last().expect("a rule was added");
+        assert_eq!(row.rule.rule_type, RuleType::ExactIp);
+        assert_eq!(row.rule.match_value, "203.0.113.5");
+        assert_eq!(row.rule.target_route, TargetRoute::Secondary);
+        assert_eq!(row.rule.comment, "VPN gateway: corpvpn.exe");
+        assert!(app.rules.table.is_dirty(), "s applies it like any edit");
+        assert!(note(&app).contains("Rule added"), "{}", note(&app));
+    }
+
+    #[test]
+    fn a_typed_name_becomes_a_host_rule_on_the_main_channel() {
+        let fake = with_candidates(Vec::new(), two_candidates());
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["v", "corpvpn.exe", "1"]);
+        drain(&mut app, &fake);
+        answer(&mut app, &["https://GW.corp.example/login"]);
+
+        let row = app.rules.table.rows.last().expect("a rule was added");
+        assert_eq!(row.rule.rule_type, RuleType::Domain);
+        assert_eq!(row.rule.match_value, "gw.corp.example");
+        assert_eq!(row.rule.target_route, TargetRoute::Primary);
+    }
+
+    #[test]
+    fn a_value_that_is_no_address_keeps_the_question_and_bang_cancels() {
+        let fake = with_candidates(
+            Vec::new(),
+            json!({ "program": "corpvpn.exe", "candidates": [], "observer-active": false }),
+        );
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["v", "corpvpn.exe", ""]);
+        drain(&mut app, &fake);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(
+            shown.contains("cannot see where a program connects"),
+            "an unwatched machine says so: {shown}"
+        );
+
+        answer(&mut app, &["not a host"]);
+        assert!(matches!(app.rules.mode, Mode::Gateway(_)));
+        assert!(screen_text(&app, ScreenId::Rules)
+            .contains("This is neither an address nor a host name."),);
+        answer(&mut app, &["!"]);
+        assert!(matches!(app.rules.mode, Mode::List));
+        assert!(app.rules.table.rows.is_empty());
+    }
+
+    #[test]
+    fn an_address_already_in_the_list_is_not_added_twice() {
+        let fake = with_candidates(
+            vec![rule("1", "exact-ip", "203.0.113.5", "secondary")],
+            two_candidates(),
+        );
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["v", "corpvpn.exe", "2"]);
+        drain(&mut app, &fake);
+        answer(&mut app, &[""]);
+
+        assert_eq!(app.rules.table.rows.len(), 1);
+        assert!(
+            note(&app).contains("Already in the list: 1."),
+            "{}",
+            note(&app)
+        );
+    }
+
+    #[test]
+    fn the_keys_walk_the_same_questions() {
+        let fake = with_candidates(Vec::new(), two_candidates());
+        let mut app = on_rules(&fake);
+        press(&mut app, KeyCode::Char('v'));
+        for c in "corpvpn.exe".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        drain(&mut app, &fake);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+
+        let row = app.rules.table.rows.last().expect("a rule was added");
+        assert_eq!(row.rule.match_value, "198.51.100.7");
+        assert_eq!(row.rule.target_route, TargetRoute::Secondary);
+    }
+}

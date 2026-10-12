@@ -15,8 +15,8 @@ pub const REVIEW_PAGE: usize = 12;
 /// Overlaps the form spells out before it counts the rest.
 const FORM_OVERLAPS: usize = 3;
 use super::{
-    main_route, text, verdicts, Busy, Choice, ChoicePurpose, Input, InputPurpose, Mode, Phase,
-    SetList,
+    gateway, main_route, text, verdicts, Busy, Choice, ChoicePurpose, Input, InputPurpose, Mode,
+    Phase, SetList,
 };
 use crate::i18n::Texts;
 use crate::keys;
@@ -59,6 +59,11 @@ pub fn view(app: &AppState, texts: &Texts) -> ScreenView {
         Mode::Review(review) => Panel {
             title: texts.get(text::REVIEW_TITLE),
             lines: review_lines(review, texts),
+            feed: false,
+        },
+        Mode::Gateway(stage) => Panel {
+            title: texts.get(text::GATEWAY_TITLE),
+            lines: gateway::lines(stage, texts),
             feed: false,
         },
     };

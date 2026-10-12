@@ -777,6 +777,10 @@ public:
     // additional route, folded per program and address.
     Q_INVOKABLE QString rpcConnTraceOutageBlocksList();
 
+    // The remote addresses one program connected to recently, most likely
+    // VPN gateway first. `program` is its file name; a path is reduced to it.
+    Q_INVOKABLE QString rpcVpnGatewayCandidatesList(const QString &program);
+
     // The live diagnostics status; the launch context holds only the copy
     // taken at start-up.
     Q_INVOKABLE QString rpcSnapshotDiagnosticsGet();

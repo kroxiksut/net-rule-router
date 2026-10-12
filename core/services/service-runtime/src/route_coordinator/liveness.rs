@@ -132,12 +132,15 @@ impl SecondaryRouteCoordinator {
             .as_ref()
             .map(|p| p.shared_ip_policy)
             .unwrap_or_default();
-        // Zone-vs-exact-address order comes from the same stored policy: the
-        // routes and the filters must arbitrate one address identically.
-        let zone_order = crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+        // The arbiter's settings come from the same stored policy: the routes
+        // and the filters must arbitrate one address identically.
+        let ownership_settings = crate::address_ownership::OwnershipSettings::from_policy(
             stored_policy
                 .as_ref()
                 .is_some_and(|p| p.zone_priority_over_ip),
+            stored_policy
+                .as_ref()
+                .is_some_and(|p| p.app_rules_take_all_addresses),
         );
         let denied = crate::secondary_ip_policy::secondary_ip_denylist(
             &rule_book.secondary,
@@ -152,7 +155,7 @@ impl SecondaryRouteCoordinator {
             self.fqdn_cache.as_ref(),
             self.app_observations.as_ref(),
             &denied,
-            zone_order,
+            ownership_settings,
             tunnel_catch_alls,
             networks,
             self.network_support,

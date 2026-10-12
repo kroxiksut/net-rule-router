@@ -56,13 +56,13 @@ WhatsAp*.exe
 discord.exe
 signal.exe
 viber.exe
-line.exe
+# line.exe  # LINE: the process name is too generic, check it on your machine
 skype.exe
 zoom.exe
 slack.exe
 chatgpt.exe
 claude.exe
-poe.exe
+# poe.exe  # Poe: the process name is too generic, check it on your machine
 codex.exe
 codex*.exe
 Cursor.exe

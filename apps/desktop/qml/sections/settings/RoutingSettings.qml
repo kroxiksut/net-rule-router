@@ -19,6 +19,8 @@ ColumnLayout {
     // local-networks ops reads one of them instead of asking the profile itself.
     readonly property bool stabilitySupported: root.serviceStabilitySupported
     readonly property bool localNetworksSupported: root.localNetworksSupported
+    // Fake-IP rides the stability row and needs a TUN adapter of its own.
+    readonly property bool fakeIpOffered: stabilitySupported && root.supports("fakeIp")
 
     // Kill-switch failure posture. `true` = fail-closed
     // (block when the additional adapter can't be resolved); `false` =
@@ -80,6 +82,9 @@ ColumnLayout {
     // the domain the user named. Per-SID service setting.
     property bool shortNameCompletion: false
     property string shortNameSuffix: ""
+    // Application rules take every address their program uses. Per-SID
+    // service setting; the snapshot is the SSOT.
+    property bool appRulesTakeAllAddresses: false
     function _shortNamesApplied(enabled, domain) {
         panel.shortNameCompletion = enabled
         panel.shortNameSuffix = domain
@@ -388,7 +393,8 @@ ColumnLayout {
         "primary-probe-auto", "primary-probe-timeout-ms", "primary-probe-max-targets",
         "primary-probe-repeat-secs",
         "local-networks-auto-accept",
-        "short-name-completion", "short-name-suffix"
+        "short-name-completion", "short-name-suffix",
+        "app-rules-take-all-addresses"
     ]
 
     /// Copy the subset of `cur` this panel mirrors into the display mirror.
@@ -541,6 +547,9 @@ ColumnLayout {
             "short-name-completion", root.routePolicyDefault("short-name-completion"))
         panel.shortNameSuffix = _offlineRoutePolicyPick(parked, mirror,
             "short-name-suffix", root.routePolicyDefault("short-name-suffix"))
+        panel.appRulesTakeAllAddresses = _offlineRoutePolicyPick(parked, mirror,
+            "app-rules-take-all-addresses",
+            root.routePolicyDefault("app-rules-take-all-addresses"))
     }
 
     function _loadKillSwitchPosture() {
@@ -594,6 +603,8 @@ ColumnLayout {
                 root._routePolicyEffective(cur, "local-networks-auto-accept")
             panel.shortNameCompletion = root._routePolicyEffective(cur, "short-name-completion")
             panel.shortNameSuffix = root._routePolicyEffective(cur, "short-name-suffix")
+            panel.appRulesTakeAllAddresses =
+                root._routePolicyEffective(cur, "app-rules-take-all-addresses")
             // A live read always wins — and refreshes the display mirror the
             // service-stopped seed reads back.
             panel._rememberRoutePolicy(cur)
@@ -1802,6 +1813,57 @@ ColumnLayout {
                 text: root.tr("settings.routing-behavior.include-subdomains.note",
                     "On by default: a rule for a site also covers that site's subdomains, so images and scripts from “cdn.example.com” take the same route as “example.com”. Applies to all your domain rules at once. It only catches subdomains of the SAME site — an IP-check served from a different provider (a third-party domain) still won't be covered — and it sends more traffic through the additional adapter. Turn it off to match the exact domain only.")
             }
+
+            // Programs over sites: an application rule takes every address its
+            // program uses. The price is always shown, never folded away.
+            Item {
+                Layout.fillWidth: true
+                Layout.preferredHeight: root.uiTheme.spacingSm
+            }
+            CheckBox {
+                id: appRulesTakeAllCheck
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                checked: panel.appRulesTakeAllAddresses
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing-behavior.app-rules-take-all.label",
+                        "Programs in your rules take all their traffic")
+                    : ""
+                Accessible.description: appRulesTakeAllNote.text
+                contentItem: Label {
+                    text: appRulesTakeAllCheck.text
+                    leftPadding: appRulesTakeAllCheck.indicator.width + appRulesTakeAllCheck.spacing
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: {
+                    var wanted = checked
+                    panel.appRulesTakeAllAddresses = wanted
+                    if (typeof root.routePolicyController.applyAppRulesTakeAllAddresses
+                            === "function") {
+                        // A refused write leaves the service as it was.
+                        root.routePolicyController.applyAppRulesTakeAllAddresses(wanted,
+                            function() {
+                                panel.appRulesTakeAllAddresses = !wanted
+                                appRulesTakeAllCheck.checked = !wanted
+                            })
+                    }
+                }
+            }
+            Label {
+                id: appRulesTakeAllNote
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingSm
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing-behavior.app-rules-take-all.description",
+                        "A program you named in a rule sends everything it connects to over that rule's route, even to sites another rule sends the other way. Routing works per address, so those sites then go that route for every program on this computer.")
+                    : ""
+            }
         }
     }
 
@@ -1866,6 +1928,13 @@ ColumnLayout {
                     onClicked: if (typeof root.openVpnOnboarding === "function")
                         root.openVpnOnboarding()
                 }
+            }
+            // A VPN that has to connect through one channel: a rule on its
+            // gateway, not an entry above (that one keeps its program on the
+            // main link).
+            VpnGatewayHelper {
+                root: panel.root
+                Layout.fillWidth: true
             }
         }
     }
@@ -2239,9 +2308,33 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.uiTheme.spacingSm
             }
+            // Where the rest of the row applies but no TUN adapter opens, the
+            // setting is named and explained instead of offered.
+            ColumnLayout {
+                Layout.fillWidth: true
+                visible: panel.stabilitySupported && !panel.fakeIpOffered
+                    && panel.killSwitchEnabled && panel.enforcementMode === "resolver"
+                spacing: root.uiTheme.spacingXs
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    text: root.tr("settings.routing.fake-ip.label",
+                        "Route sites over virtual addresses (fake-IP)")
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                    text: root.platformUnsupportedText
+                }
+            }
             RowLayout {
                 Layout.fillWidth: true
-                visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.enforcementMode === "resolver"
+                visible: panel.fakeIpOffered && panel.killSwitchEnabled && panel.enforcementMode === "resolver"
                 CheckBox {
                     id: fakeIpCheck
                     Layout.fillWidth: true
@@ -2276,7 +2369,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.fakeIpOffered && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && root.routingFakeIpDetailsExpanded
                 color: root.mutedTextColor
@@ -2291,7 +2384,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.fakeIpOffered && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.fakeIpDriverVerdict !== ""
                     && panel.fakeIpDriverVerdict !== "none"
@@ -2313,7 +2406,7 @@ ColumnLayout {
                 id: fakeIpUdpRelayCheck
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.fakeIpOffered && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
                     && panel.fakeIpEnabled
@@ -2339,7 +2432,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.fakeIpOffered && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
                     && panel.fakeIpEnabled
@@ -2357,7 +2450,7 @@ ColumnLayout {
                 id: fakeIpInstantRstCheck
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.fakeIpOffered && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
                     && panel.fakeIpEnabled
@@ -2383,7 +2476,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.stabilitySupported && panel.killSwitchEnabled
+                visible: panel.fakeIpOffered && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
                     && panel.fakeIpEnabled

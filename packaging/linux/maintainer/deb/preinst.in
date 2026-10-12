@@ -1,0 +1,10 @@
+case "$1" in
+  install)
+    nrr_pkg_take_over_hand_install
+    # Tells postinst this is a first install (or one after a removal), which
+    # enables the unit; an upgrade only restarts what is running.
+    : >"$NRR_PKG_FIRST_INSTALL_FLAG"
+    ;;
+esac
+
+exit 0

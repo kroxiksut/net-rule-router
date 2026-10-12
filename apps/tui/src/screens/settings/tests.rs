@@ -126,6 +126,31 @@ fn a_routing_switch_names_only_its_own_key_and_is_recorded() {
 }
 
 #[test]
+fn programs_taking_all_their_traffic_is_a_routing_switch_off_by_default() {
+    let fake = service();
+    let mut app = on_settings();
+    answer(&mut app, "c2");
+    drain(&mut app, &fake);
+    let id = ItemId::Policy("app-rules-take-all-addresses");
+    let row = row_of(&app, Category::Routing, id);
+    let item = items::items(&app, Category::Routing)
+        .into_iter()
+        .find(|item| item.id == id)
+        .expect("the switch is listed");
+    assert_eq!(item.kind, items::Kind::Toggle(false));
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+
+    let sent = fake.sent(IpcOperationName::RoutePolicyUpdate);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0]["apply-only"],
+        json!(["app-rules-take-all-addresses"])
+    );
+    assert_eq!(sent[0]["app-rules-take-all-addresses"], json!(true));
+}
+
+#[test]
 fn hiding_a_notice_kind_for_a_week_sends_its_deadline() {
     let fake = service();
     fake.answer(
@@ -228,4 +253,52 @@ fn line_mode_walks_the_sections_by_code() {
     assert!(text.contains("c9. Terminal"), "{text}");
     assert!(!text.contains('\u{1b}'), "{text}");
     assert_snapshot("settings-plain", &text);
+}
+
+/// Where no TUN adapter opens, fake-IP is named and explained, never offered,
+/// even on a service that applies the rest of the stability row.
+#[test]
+fn fake_ip_is_not_offered_where_the_platform_lacks_it() {
+    let mut app = on_settings();
+    app.settings.data.policy = Loadable::Ready(
+        json!({ "kill-switch-enabled": true })
+            .as_object()
+            .cloned()
+            .expect("an object"),
+    );
+    app.settings.data.stability = Loadable::Ready(
+        json!({ "enforcement-mode": "resolver", "fake-ip-enabled": true })
+            .as_object()
+            .cloned()
+            .expect("an object"),
+    );
+    const KEYS: [&str; 3] = [
+        "fake-ip-enabled",
+        "fake-ip-udp-relay",
+        "fake-ip-instant-rst",
+    ];
+    let fake_ip_rows = |app: &AppState| {
+        items::items(app, Category::Routing)
+            .into_iter()
+            .filter(|item| KEYS.iter().any(|&key| item.id == ItemId::Stability(key)))
+            .count()
+    };
+
+    let mut with_it = PlatformProfile::windows().supports;
+    with_it.fake_ip = true;
+    app.settings.supports = with_it;
+    assert_eq!(fake_ip_rows(&app), 3);
+
+    let mut without = with_it;
+    without.fake_ip = false;
+    app.settings.supports = without;
+    assert_eq!(fake_ip_rows(&app), 0);
+    let texts = texts_en();
+    let unsupported = texts.get(text::UNSUPPORTED);
+    assert!(
+        items::items(&app, Category::Routing)
+            .iter()
+            .any(|item| item.label.resolve(&texts).contains(&unsupported)),
+        "the setting is not explained"
+    );
 }

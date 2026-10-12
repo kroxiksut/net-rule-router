@@ -397,7 +397,7 @@ fn handle_service_info(client: &dyn IpcClient) -> LocalHandlerResult {
     // "Another copy is registered" and "the registered copy is older" are two
     // different faults with one fix, so answer both and let QML offer it once.
     let elsewhere = match (registered.as_ref(), expected.as_ref()) {
-        (Some(registered), Some(expected)) => !same_path(registered, expected),
+        (Some(registered), Some(expected)) => registered_elsewhere(registered, expected),
         _ => false,
     };
     let older = version_is_older(&service_version, GUI_SEMVER);
@@ -464,6 +464,16 @@ fn binary_is_newer_than_process(
     // different sources, and a start that races its own binary's write would
     // otherwise report itself stale.
     Some(modified > started + std::time::Duration::from_secs(1))
+}
+
+/// Whether the service manager starts another binary than the one shipped with
+/// this application. A byte-identical copy is this binary: an install from a
+/// folder ordinary accounts can change registers exactly such a copy, kept
+/// where only administrators can change it, and offering to "update" it would
+/// only write the same copy again.
+fn registered_elsewhere(registered: &std::path::Path, expected: &std::path::Path) -> bool {
+    !same_path(registered, expected)
+        && !nrr_platform_api::service_placement::same_contents(registered, expected)
 }
 
 /// Case- and spelling-insensitive path comparison. Canonicalisation resolves
@@ -979,6 +989,25 @@ mod tests {
         assert!(!version_is_older("nightly", "0.2.0"));
         // Pre-release/build metadata is ignored, not guessed at.
         assert!(!version_is_older("0.2.0-prealpha", "0.2.0"));
+    }
+
+    #[test]
+    fn a_protected_copy_of_our_own_service_is_not_registered_elsewhere() {
+        let shipped_dir = tempfile::tempdir().expect("shipped dir");
+        let copy_dir = tempfile::tempdir().expect("copy dir");
+        let shipped = shipped_dir.path().join("service.bin");
+        let copy = copy_dir.path().join("service.bin");
+        std::fs::write(&shipped, b"this build").expect("shipped");
+        std::fs::write(&copy, b"this build").expect("copy");
+        assert!(!registered_elsewhere(&copy, &shipped));
+        assert!(!registered_elsewhere(&shipped, &shipped));
+
+        std::fs::write(&copy, b"an older build").expect("older copy");
+        assert!(registered_elsewhere(&copy, &shipped));
+        assert!(
+            registered_elsewhere(&copy_dir.path().join("gone.bin"), &shipped),
+            "a registered binary that cannot be read is not taken for ours"
+        );
     }
 
     #[test]

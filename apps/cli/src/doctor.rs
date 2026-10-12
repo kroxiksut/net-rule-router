@@ -168,7 +168,9 @@ pub struct Facts {
     /// attempted at all (no service manager on this platform).
     pub service_answer: Option<ServiceAnswer>,
     /// The registered binary is a byte-for-byte copy of the one shipped here:
-    /// an install that stages a copy into a system directory runs this build.
+    /// an install that stages a copy into a system directory (Linux), or into
+    /// an administrators-only folder from a portable copy (Windows), runs this
+    /// build.
     pub registered_is_shipped_copy: bool,
 }
 
@@ -540,7 +542,7 @@ pub fn collect(port: Option<&dyn ServiceControlPort>) -> Facts {
                 ..
             },
             Some(shipped),
-        ) => same_contents(registered, &shipped),
+        ) => nrr_platform_api::service_placement::same_contents(registered, &shipped),
         _ => false,
     };
     Facts {
@@ -582,47 +584,6 @@ fn probe_service(registration: &Registration) -> Option<ServiceAnswer> {
 
 /// What stands for a version the handshake did not carry.
 const UNREPORTED: &str = "unreported";
-
-/// Whether two files hold the same bytes. Unreadable is "not the same": the
-/// finding then says what it would have said without the comparison.
-fn same_contents(a: &Path, b: &Path) -> bool {
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {}
-        _ => return false,
-    }
-    let (Ok(fa), Ok(fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
-        return false;
-    };
-    same_stream(fa, fb).unwrap_or(false)
-}
-
-/// Chunk by chunk, stopping at the first difference: the binaries run to tens
-/// of megabytes, and `doctor` is what a struggling machine runs.
-fn same_stream(mut a: impl std::io::Read, mut b: impl std::io::Read) -> std::io::Result<bool> {
-    use std::io::Read;
-    const CHUNK: usize = 64 * 1024;
-    let (mut x, mut y) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);
-    loop {
-        let n = read_full(&mut a, &mut x)?;
-        if n != read_full(&mut b, &mut y)? || x[..n] != y[..n] {
-            return Ok(false);
-        }
-        if n == 0 {
-            return Ok(true);
-        }
-    }
-
-    fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            match r.read(&mut buf[filled..])? {
-                0 => break,
-                n => filled += n,
-            }
-        }
-        Ok(filled)
-    }
-}
 
 /// Turn the link outcome into the fact [`assess`] judges. The version is asked
 /// for only once connected.
@@ -700,18 +661,6 @@ mod tests {
     use super::*;
 
     use nrr_shared::product_identity::PRODUCT_NAME_UNIX;
-
-    #[test]
-    fn streams_compare_chunk_by_chunk_to_the_last_byte() {
-        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        let same = |a: &[u8], b: &[u8]| same_stream(a, b).expect("in memory");
-        assert!(same(&big, &big));
-        let mut last_differs = big.clone();
-        *last_differs.last_mut().expect("bytes") ^= 1;
-        assert!(!same(&big, &last_differs));
-        assert!(!same(&big, &big[..big.len() - 1]));
-        assert!(same(&[], &[]));
-    }
 
     /// A plausible install directory, never THE install directory: `collect`
     /// reads `current_exe()` and looks beside it, so the product runs wherever

@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use nrr_application::mock_backend::rules::RulesScreenRequest;
 use nrr_desktop_gui::app_shell::LaunchRequest;
 use nrr_desktop_gui::ui_surface::write_qt_context_file_at;
 use nrr_desktop_tray::{write_qt_tray_context_file, TrayContextUrls};
@@ -115,12 +116,18 @@ fn emit_tray_context(
         logs_folder_url: nrr_desktop_gui::ui_surface::logs_folder_url(),
     };
 
+    // The window's add-rule form takes its types from this snapshot; the tray's
+    // copy of the form must offer the same ones.
+    let rules = backend_bundle
+        .facade
+        .rules_snapshot(RulesScreenRequest::default());
     write_qt_tray_context_file(
         &runtime,
         &preferences.language,
         preferences,
         urls,
         crate::rpc_dispatcher::host_answer_deadlines(),
+        rules.supported_rule_types,
     )
 }
 

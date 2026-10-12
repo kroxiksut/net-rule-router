@@ -534,6 +534,7 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             primary_probe_repeat_secs: record.primary_probe_repeat_secs,
             local_networks_auto_accept: record.local_networks_auto_accept,
             zone_priority_over_ip: record.zone_priority_over_ip,
+            app_rules_take_all_addresses: record.app_rules_take_all_addresses,
         })
     }
 }
@@ -745,6 +746,7 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             zone_priority_over_ip: request.zone_priority_over_ip,
             short_name_completion: request.short_name_completion,
             short_name_suffix,
+            app_rules_take_all_addresses: request.app_rules_take_all_addresses,
             binding_source: dto_source_to_storage(request.binding_source),
         };
         let conn = self
@@ -921,6 +923,7 @@ fn record_to_dto(
         zone_priority_over_ip: rec.zone_priority_over_ip,
         short_name_completion: rec.short_name_completion,
         short_name_suffix: rec.short_name_suffix,
+        app_rules_take_all_addresses: rec.app_rules_take_all_addresses,
         binding_source: storage_source_to_dto(rec.binding_source),
     }
 }

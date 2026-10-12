@@ -134,15 +134,17 @@ fn a_rule_row_caps_its_address_list_but_keeps_the_true_count() {
     assert!(json.get("pinned-destinations-total").is_none());
 }
 
-/// The window reads the total, not the length of the list it received.
+/// The window reads the total, not the length of the list it received. The
+/// service-row mapping both the window and the tray use lives in `rules.js`.
 #[test]
 fn the_window_reads_the_total_rather_than_the_delivered_length() {
     let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/desktop/qml/Main.qml"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/desktop/qml/lib/rules.js"),
     )
-    .expect("read Main.qml");
+    .expect("read rules.js");
     assert!(
         source.contains(r#"pinnedCount: Number(w["pinned-destinations-total"]"#),
-        "Main.qml no longer takes the pinned count from the service's total"
+        "the service-row mapping no longer takes the pinned count from the service's total"
     );
 }

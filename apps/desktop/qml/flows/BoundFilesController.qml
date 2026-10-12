@@ -34,40 +34,9 @@ QtObject {
         return !root.prefs || root.prefs.exportIncludeComments !== false
     }
 
-    /// The foreign-OS / unsupported sections captured at the last import for `route`,
-    /// handed to `onSections`. The sidecar is owned by the launcher, not the
-    /// service, so this resolves with the service stopped; any failure
-    /// degrades to "no passthrough" rather than blocking the save.
-    function _readPassthroughSections(route, onSections) {
-        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
-                || typeof nrrNativeBridge.rpcSidecarPassthroughRead !== "function"
-                || !root.rpc || typeof root.rpc.registerRpcCallback !== "function") {
-            onSections({})
-            return
-        }
-        var corr = nrrNativeBridge.rpcSidecarPassthroughRead(route)
-        if (!corr || String(corr) === "") { onSections({}); return }
-        root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
-            if (!ok) console.log("sidecar.passthrough.read failed:", code, msg)
-            onSections((ok && payload && payload.sections) || {})
-        })
-    }
-
-    /// Does `path` already hold these rules? Compares the routing BODY, not
-    /// the bytes: the metadata header carries the generation timestamp, so a
-    /// byte compare would call every file stale the moment it is regenerated.
-    function _fileHoldsText(path, text) {
-        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
-                || typeof nrrNativeBridge.readFileBytes !== "function") return false
-        if (typeof nrrNativeBridge.decodeBase64Utf8 !== "function") return false
-        var b64 = String(nrrNativeBridge.readFileBytes(path) || "")
-        if (b64 === "") return false
-        // NOT `Qt.atob`: it decodes as latin-1, so every byte of a UTF-8
-        // Cyrillic comment comes back as two characters and the comparison
-        // never matches. The file was then rewritten on every save and the
-        // drift detector woke up for nothing.
-        var current = String(nrrNativeBridge.decodeBase64Utf8(b64) || "")
-        return Rules.canonicalRulesBody(current) === Rules.canonicalRulesBody(text)
+    /// The window-independent writer (also used by the tray).
+    property var writer: RulesFileWriter {
+        rpc: boundFilesController.root ? boundFilesController.root.rpc : null
     }
 
     /// Generate `route`'s rules from the local table and write them to `path`.
@@ -78,27 +47,21 @@ QtObject {
         var done = function(ok, changed) {
             if (typeof onDone === "function") onDone(!!ok, !!changed)
         }
-        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
-                || typeof nrrNativeBridge.writeTextFile !== "function") {
+        if (!writer.canWrite) {
             root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
             done(false, false)
             return
         }
-        _readPassthroughSections(route, function(sections) {
-            var text = Rules.buildCanonicalRulesText(
-                root.rulesModel, route, sections,
-                (includeComments === undefined) ? _emitComments() : !!includeComments,
-                root.platformProfile.os)
-            if (_fileHoldsText(path, text)) { done(true, false); return }
-            if (!nrrNativeBridge.writeTextFile(path, text)) {
-                console.log("[bound-file] writeTextFile failed:", route, path)
-                root.statusLine = root.tr("status.export-write-failed",
-                    "Cannot write preset file to the chosen path.") + " " + path
-                done(false, false)
-                return
-            }
-            done(true, true)
-        })
+        writer.writeRoute(route, path, root.rulesModel,
+            (includeComments === undefined) ? _emitComments() : !!includeComments,
+            root.platformProfile.os,
+            function(ok, changed) {
+                if (!ok) {
+                    root.statusLine = root.tr("status.export-write-failed",
+                        "Cannot write preset file to the chosen path.") + " " + path
+                }
+                done(ok, changed)
+            })
     }
 
     // ── the "this is one of the app's own rule sets" gate ────────────────
@@ -507,14 +470,35 @@ QtObject {
             })
     }
 
-    /// Auto-rules landed in the user's own rule set on the service's
-    /// initiative (a suggestion accepted from the tray, or "apply
+    /// Rules landed in the user's own rule set from outside this window — the
+    /// tray's "Add rule…" while the window was hidden, or the service's
+    /// auto-rules (a suggestion accepted from the tray, or "apply
     /// automatically"). Pull them into the table, then write them to the linked
-    /// rules files — an address the user just accepted must not turn into a
-    /// divergence they are asked about a second later.
+    /// rules files — a rule the user just added must not turn into a divergence
+    /// they are asked about a second later.
     ///
     /// Local edits win: re-pulling would discard whatever the user is in the
     /// middle of typing, so a dirty rules editor is told rather than clobbered.
+    function handleRulesAddedFromTray() {
+        if (root.unsavedChangesRegistry && root.unsavedChangesRegistry["rules"]) {
+            root.setStatus(
+                root.tr("status.tray-rule-added-unsaved-short",
+                    "Rule added from the tray — reload to see it"),
+                root.tr("status.tray-rule-added-unsaved",
+                    "The rule you added from the tray is in your rules. Save or discard your edits, then reload the rules to see it."))
+            return
+        }
+        // The window owns the linked files while it runs, hidden or not.
+        root._refreshRulesFromService({
+            silent: true,
+            onComplete: function(ok) {
+                if (!ok) return
+                _reconcileBoundFileDirty()
+                _persistBoundFilesAfterApply()
+            }
+        })
+    }
+
     function handleAutoRulesAuthored(correlationId) {
         // The service also removes rule twins it once stored by mistake; that
         // is not "addresses added".
@@ -716,10 +700,10 @@ QtObject {
     /// "differs" — surfacing a save the user does not need beats hiding one
     /// they do.
     function writeRouteDiffers(route, path, onResult) {
-        _readPassthroughSections(route, function(sections) {
+        writer.readPassthroughSections(route, function(sections) {
             var text = Rules.buildCanonicalRulesText(
                 root.rulesModel, route, sections, _emitComments(), root.platformProfile.os)
-            onResult(!_fileHoldsText(path, text))
+            onResult(!writer.fileHoldsText(path, text))
         })
     }
 

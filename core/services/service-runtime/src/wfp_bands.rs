@@ -69,6 +69,14 @@ pub(crate) const KILLSWITCH_NETWORK_BLOCK_BASE: u64 = KILLSWITCH_BLOCK_BASE + NE
 /// only has to beat the holds (disjoint) and the pins' blocks.
 pub(crate) const KILLSWITCH_NETWORK_PERMIT_BASE: u64 = KILLSWITCH_NETWORK_BLOCK_BASE + 0x0001_0000;
 
+/// Per-app kill-switch / fail-closed Block filters while application rules take
+/// all their addresses: above the primary rule band, so a pinned app reaches a
+/// main-named address only through the tunnel, and below the app's own
+/// egress-conditional permit, so it still does while the tunnel is up. The last
+/// window below [`KILLSWITCH_PERMIT_BASE`].
+pub(crate) const APP_TAKEOVER_BLOCK_BASE: u64 =
+    KILLSWITCH_NETWORK_PERMIT_BASE + NETWORK_HOLD_MAX as u64;
+
 /// The kill switch's per-destination egress-conditional permit. Above
 /// [`BASE_PRIMARY`] so it outranks the plain rule permit for the same address.
 pub(crate) const KILLSWITCH_PERMIT_BASE: u64 = 0x0040_0000;
@@ -113,6 +121,7 @@ const ALE_BANDS: &[(&str, u64)] = &[
         "KILLSWITCH_NETWORK_PERMIT_BASE",
         KILLSWITCH_NETWORK_PERMIT_BASE,
     ),
+    ("APP_TAKEOVER_BLOCK_BASE", APP_TAKEOVER_BLOCK_BASE),
     ("KILLSWITCH_PERMIT_BASE", KILLSWITCH_PERMIT_BASE),
     ("FAKEIP_POOL_PERMIT_BASE", FAKEIP_POOL_PERMIT_BASE),
     ("CATCHALL_EXEMPT_BASE", CATCHALL_EXEMPT_BASE),
@@ -174,6 +183,12 @@ pub const KILLSWITCH_MAX_DESTINATIONS: usize = 0x000D_FFFF;
 /// Per-app kill-switch / fail-closed entries, so `+ idx` cannot climb out of the
 /// app-block window into the primary rule band.
 pub(crate) const APP_KILLSWITCH_MAX_APPS: usize = 0x0003_FFFF;
+
+/// Apps whose block fits the [`APP_TAKEOVER_BLOCK_BASE`] window. One past it
+/// keeps the sub-primary weight: a leak to main-named addresses, never a
+/// collision with the app permits above.
+pub(crate) const APP_TAKEOVER_MAX_APPS: usize =
+    (KILLSWITCH_PERMIT_BASE - APP_TAKEOVER_BLOCK_BASE) as usize;
 
 /// Slots one packet-layer per-destination filter takes (`idx * 16 + k`).
 pub(crate) const PACKET_SLOTS_PER_DESTINATION: u64 = 16;
@@ -307,7 +322,9 @@ const _: () = {
     let hold_slots = holds * PACKET_SLOTS_PER_DESTINATION;
     assert!((KILLSWITCH_MAX_DESTINATIONS as u64) < NETWORK_INDEX_BASE);
     assert!(KILLSWITCH_NETWORK_BLOCK_BASE + holds <= KILLSWITCH_NETWORK_PERMIT_BASE);
-    assert!(KILLSWITCH_NETWORK_PERMIT_BASE + holds <= KILLSWITCH_PERMIT_BASE);
+    assert!(KILLSWITCH_NETWORK_PERMIT_BASE + holds <= APP_TAKEOVER_BLOCK_BASE);
+    assert!(APP_TAKEOVER_BLOCK_BASE + (APP_TAKEOVER_MAX_APPS as u64) <= KILLSWITCH_PERMIT_BASE);
+    assert!(APP_TAKEOVER_BLOCK_BASE >= BASE_PRIMARY + BAND_WIDTH);
     assert!(NETWORK_CUT_OUT_BASE + (NETWORK_CUT_OUT_MAX as u64) <= APP_EXEMPT_BASE);
     assert!(PACKET_BLOCK_BASE + window <= PACKET_NETWORK_BLOCK_BASE);
     assert!(PACKET_NETWORK_BLOCK_BASE + hold_slots <= PACKET_NETWORK_PERMIT_BASE);
@@ -341,7 +358,7 @@ mod tests {
     /// without a table entry changes this number.
     #[test]
     fn every_band_is_in_a_table() {
-        assert_eq!(ALE_BANDS.len(), 15);
+        assert_eq!(ALE_BANDS.len(), 16);
         assert_eq!(PACKET_BANDS.len(), 6);
     }
 

@@ -60,30 +60,34 @@ pub struct SystemdServiceConfig {
     pub watchdog_sec: Option<u32>,
     /// Seconds systemd waits before restarting a crashed daemon (`RestartSec=`).
     pub restart_sec: u32,
-    /// How many restarts within [`Self::start_limit_interval_sec`] systemd
-    /// attempts before giving up and leaving the unit failed
-    /// (`StartLimitBurst=`). The point is the same as the Windows failure
-    /// actions': recover from a crash, but never spin forever on a daemon that
-    /// cannot start.
+    /// How many starts within [`Self::start_limit_interval_sec`] systemd
+    /// allows before leaving the unit failed (`StartLimitBurst=`): recover
+    /// from a crash, but never spin forever on a daemon that cannot start.
     pub start_limit_burst: u8,
     /// The window the restart counter is measured over
     /// (`StartLimitIntervalSec=`).
     pub start_limit_interval_sec: u32,
 }
 
+/// The crash-loop bound. Unlike the Windows failure count, systemd counts every
+/// start, manual ones included, so a day-long window refused a crash restart
+/// after an install and one restart; ten minutes still stops a loop.
+pub const START_LIMIT_INTERVAL_SEC: u32 = 600;
+/// Starts allowed within [`START_LIMIT_INTERVAL_SEC`].
+pub const START_LIMIT_BURST: u8 = 5;
+
 impl SystemdServiceConfig {
     /// Configuration for a daemon at `binary_path`, with the product's own
-    /// name as the description and recovery values matching the Windows
-    /// production policy. Callers adjust individual fields afterwards rather
-    /// than spelling every one of them.
+    /// name as the description and the crash-loop bound above. Callers adjust
+    /// individual fields afterwards rather than spelling every one of them.
     pub fn for_binary(binary_path: PathBuf) -> Self {
         Self {
             description: nrr_shared::product_identity::SERVICE_DISPLAY_NAME.to_string(),
             binary_path,
             watchdog_sec: None,
             restart_sec: 5,
-            start_limit_burst: 2,
-            start_limit_interval_sec: 86_400,
+            start_limit_burst: START_LIMIT_BURST,
+            start_limit_interval_sec: START_LIMIT_INTERVAL_SEC,
         }
     }
 }
@@ -306,6 +310,18 @@ pub const SYSTEMD_UNIT_NAME: &str = nrr_shared::product_identity::SYSTEMD_UNIT_N
 /// mirroring the Windows `install` verb's admin requirement.
 pub const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
 
+/// Where a distribution package puts the unit, the first being where ours goes.
+/// A unit in either belongs to the package manager, so `install` and
+/// `uninstall` leave the service alone while one is there.
+pub const PACKAGE_UNIT_DIRS: [&str; 2] = ["/usr/lib/systemd/system", "/lib/systemd/system"];
+
+/// The unit paths [`PACKAGE_UNIT_DIRS`] name, in order.
+pub fn package_unit_paths() -> impl Iterator<Item = PathBuf> {
+    PACKAGE_UNIT_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(SYSTEMD_UNIT_NAME))
+}
+
 /// A computed, side-effect-free plan for `linux-service install` — the Linux
 /// analog of the Windows `scm.rs::install_service` sequence (register unit →
 /// enable → start). Separating the plan (what to write / run) from its execution
@@ -434,9 +450,9 @@ pub fn plan_install(cfg: &SystemdServiceConfig, activation: UnitActivation) -> S
 }
 
 /// `systemctl reset-failed` for the unit. `StartLimitBurst=` counts EVERY start,
-/// not only crash restarts, so a third reinstall or restart in a day would be
-/// refused as a crash loop. An operator's start is not one: clear the counter
-/// first, and leave the limit to bound `Restart=` alone.
+/// so a burst of reinstalls or restarts could be refused as a crash loop. An
+/// operator's start is not one: clear the counter first, and leave the limit to
+/// bound `Restart=` alone.
 pub fn reset_start_limit() -> Vec<String> {
     vec![
         "systemctl".to_string(),

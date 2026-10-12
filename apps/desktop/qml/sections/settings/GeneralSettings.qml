@@ -66,7 +66,7 @@ GroupBox {
         }
 
         // Autostart toggle. The state comes from the launcher's probe of the
-        // user's own registry, carried in the initial snapshot.
+        // user's own sign-in entry, carried in the initial snapshot.
         CheckBox {
             id: autostartCheckbox
             Layout.fillWidth: true
@@ -83,7 +83,7 @@ GroupBox {
             wrapMode: Text.WordWrap
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
             text: root.tr("settings.general.autostart.description",
-                "Adds an entry under HKEY_CURRENT_USER\\…\\Run that launches the tray icon.")
+                "Adds the tray icon to the programs your system starts when you sign in.")
         }
         Label {
             Layout.fillWidth: true
@@ -105,7 +105,7 @@ GroupBox {
                     return root.tr("settings.general.autostart.state.disabled", "Disabled")
                 if (slug === "overridden-externally")
                     return root.tr("settings.general.autostart.state.overridden",
-                        "Registry value points to another binary — toggle to repair.")
+                        "The sign-in entry starts another program file — toggle to repair.")
                 return root.tr("settings.general.autostart.state.absent", "No autostart entry.")
             }
         }

@@ -17,7 +17,7 @@
       }, "modeFallback": "prefer-primary" } },
     { "name": "loose values normalised", "input": { "snapshot": {
         "kill-switch-protocols": 200, "allow-dns-over-primary": "false", "primary-probe-timeout-ms": "900",
-        "short-name-suffix": 7, "kill-switch-fail-closed": 0
+        "short-name-suffix": 7, "kill-switch-fail-closed": 0, "app-rules-take-all-addresses": "true"
       } } },
     { "name": "full snapshot", "input": { "snapshot": {
         "mode": "prefer-secondary", "block-secondary-when-unavailable": true, "kill-switch-fail-closed": false,
@@ -28,7 +28,8 @@
         "auto-rules-mode": "off", "auto-rules-eager-delivery-names": true, "primary-probe-auto": true,
         "primary-probe-timeout-ms": 2000, "primary-probe-max-targets": 4, "primary-probe-repeat-secs": 60,
         "local-networks-auto-accept": true, "zone-priority-over-ip": true, "short-name-completion": true,
-        "short-name-suffix": "corp.example", "binding-source": "user-assigned"
+        "short-name-suffix": "corp.example", "app-rules-take-all-addresses": true,
+        "binding-source": "user-assigned"
       }, "modeFallback": "prefer-primary" } }
   ]
 }

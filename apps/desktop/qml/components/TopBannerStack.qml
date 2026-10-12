@@ -125,10 +125,10 @@ Item {
                 Accessible.description: root._bannerServiceAction() === "install"
                     ? root.tr(
                         "dialog.service-not-running.install-service-description",
-                        "Install the Windows service (requires administrator privileges) and start it.")
+                        "Install the background service (requires administrator privileges) and start it.")
                     : root.tr(
                         "dialog.service-not-running.start-service-description",
-                        "Start the Windows service (requires administrator privileges).")
+                        "Start the background service (requires administrator privileges).")
                 onClicked: root._startServiceFromBanner()
             }
         }

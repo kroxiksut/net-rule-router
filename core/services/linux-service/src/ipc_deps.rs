@@ -465,6 +465,8 @@ pub(crate) fn build_ipc_surface(
         .with_system_info(nrr_platform_linux::system_info::collect())
         .with_file_handoff(Arc::new(nrr_platform_linux::file_handoff::ChownFileHandoff))
         .with_conn_trace_ring(conn_trace_ring)
+        // Tells a daemon's connections from a person's for the VPN-gateway read.
+        .with_unix_sys_uid_max(nrr_platform_linux::service_account_uids::read_sys_uid_max())
         // The same status the planner publishes rule conflicts into.
         .with_app_enforcement_status(app_enforcement)
         // The cycle pushes channel status on change only; a client that

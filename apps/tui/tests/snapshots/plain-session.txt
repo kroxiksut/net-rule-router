@@ -53,6 +53,7 @@ Commands on this screen:
   r: show the rules the service applies
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+  v: add a rule for a VPN's gateway
 Type a screen number, h for help or q to quit, then press Enter.
 Help — Rules:
   A number: open that screen
@@ -73,6 +74,7 @@ Commands on this screen:
   r: show the rules the service applies
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+  v: add a rule for a VPN's gateway
 Screens:
   1. Status
   2. First run
@@ -108,4 +110,5 @@ Commands on this screen:
   r: show the rules the service applies
   m: move the rules that work only on the other route. n: not now
   c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+  v: add a rule for a VPN's gateway
 Type a screen number, h for help or q to quit, then press Enter.

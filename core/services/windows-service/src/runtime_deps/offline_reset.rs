@@ -160,6 +160,50 @@ pub(crate) fn run_offline_reset() -> std::process::ExitCode {
     }
 }
 
+/// SCM's last failure action, run once the restarts are spent. Nothing answers
+/// on the loopback resolver any more, so the DNS redirect goes whatever the
+/// settings; filters and routes go too unless someone's leak protection asked
+/// for blocking over leaking.
+pub(crate) fn run_after_crash() -> std::process::ExitCode {
+    if !leak_guard_armed_anywhere() {
+        return run_offline_reset();
+    }
+    let dns_sweep = nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
+        &nrr_platform_windows::dns_redirect::TransactedNrptStore,
+        &nrr_platform_windows::dns_redirect::WindowsSearchList,
+    );
+    println!("NetRuleRouter: the service stopped for good; name resolution handed back.");
+    println!("  Leak protection is on, so its blocks stay until the service runs again.");
+    if dns_sweep.is_clean() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "after-crash: the DNS redirect could not be removed; run \
+             `nrr-cli reset-network --confirm`."
+        );
+        std::process::ExitCode::from(1)
+    }
+}
+
+/// Unknown counts as armed: lifting a block the user asked for is the one
+/// mistake this question exists to avoid.
+fn leak_guard_armed_anywhere() -> bool {
+    let Ok(topology) =
+        nrr_storage::resolve_storage_topology(&nrr_storage::StorageProfile::ProductionService)
+    else {
+        return true;
+    };
+    if !topology.state_db_path.exists() {
+        return false;
+    }
+    let Ok(conn) = nrr_storage::migration::open_connection(&topology.state_db_path) else {
+        return true;
+    };
+    nrr_storage::route_bindings::RouteBindingsRepository::new(&conn)
+        .any_leak_guard_armed()
+        .unwrap_or(true)
+}
+
 /// Why an offline sweep stopped.
 pub(crate) enum SweepOutcome {
     /// Everything reachable was cleared.
@@ -262,7 +306,8 @@ pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
     }
     if let Err(e) = &dns_sweep.search_list {
         eprintln!(
-            "cleanup: DNS suffix search list sweep failed ({e}); check the list with              `Get-DnsClientGlobalSetting` and remove suffixes NetRuleRouter added."
+            "cleanup: DNS suffix search list sweep failed ({e}); check the list with \
+             `Get-DnsClientGlobalSetting` and remove suffixes NetRuleRouter added."
         );
     }
 

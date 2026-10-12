@@ -123,6 +123,7 @@ fn a_shared_address_gets_no_secondary_filter() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -168,6 +169,7 @@ fn exact_ip_rule_emits_single_filter_with_remote_ip() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -204,6 +206,7 @@ fn exact_fqdn_rule_fans_out_over_cached_ips() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -258,6 +261,7 @@ fn codegen_output_is_deterministic_and_behaviorally_self_equivalent() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &denylist,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     };
@@ -290,6 +294,7 @@ fn codegen_output_is_deterministic_and_behaviorally_self_equivalent() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -312,6 +317,7 @@ fn exact_fqdn_rule_with_cold_cache_emits_diagnostic_no_filter() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -348,6 +354,7 @@ fn suffix_domain_fans_out_over_cached_subdomains_and_their_ips() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -378,6 +385,7 @@ fn suffix_domain_fan_out_includes_the_apex() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -406,6 +414,7 @@ fn zone_fan_out_still_excludes_the_bare_zone_label() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -427,6 +436,7 @@ fn suffix_domain_with_only_a_cached_apex_still_emits_a_filter() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -447,6 +457,7 @@ fn suffix_domain_with_no_cached_subdomains_emits_diagnostic() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -483,6 +494,7 @@ fn suffix_domain_over_many_hosts_keeps_every_address_inside_one_band() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -545,6 +557,7 @@ fn a_wide_rule_costs_filters_by_slot_not_by_address() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -570,6 +583,7 @@ fn a_wide_rule_costs_filters_by_slot_not_by_address() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -605,6 +619,7 @@ fn suffix_domain_at_backstop_emits_truncated_diagnostic() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -637,6 +652,7 @@ fn zone_fans_out_over_cached_hosts_under_tld() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -656,6 +672,7 @@ fn zone_with_no_cached_hosts_emits_zone_empty_diagnostic() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -686,6 +703,7 @@ fn application_rule_emits_filter_with_app_pattern_and_no_remote_ip() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -719,6 +737,7 @@ fn app_observed_ips_are_marked_only_for_a_resolved_secondary_route_rule() {
             app_resolver: resolver,
             secondary_ip_denylist: &denylist,
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
             families: crate::enforcement_planner::FamilyScope::V4Only,
             packet_blocks: true,
         })
@@ -764,6 +783,7 @@ fn builtin_vpn_globs_resolve_to_concrete_paths_never_leaving_a_glob() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -797,6 +817,7 @@ fn builtin_vpn_globs_unresolved_yield_empty_exempt_set() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -832,6 +853,7 @@ fn builtin_vpn_exempt_paths_are_deduped_and_sorted() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -860,6 +882,7 @@ fn app_rule_with_unresolved_exe_emits_diagnostic_and_no_app_id_filter() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -908,6 +931,7 @@ fn glob_app_rule_fans_out_one_app_id_filter_per_resolved_path() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -946,6 +970,7 @@ fn resolved_app_id_weight_sits_below_shifted_observation_mirrors() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -981,6 +1006,7 @@ fn strict_secondary_fail_closed_emits_block_catch_all() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1008,6 +1034,7 @@ fn prefer_primary_does_not_emit_default_block() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1027,6 +1054,7 @@ fn prefer_secondary_when_available_does_not_emit_default_block() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1051,6 +1079,7 @@ fn disabled_rule_is_skipped_with_diagnostic() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1086,6 +1115,7 @@ fn repeated_generation_produces_identical_filter_ids() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1098,6 +1128,7 @@ fn repeated_generation_produces_identical_filter_ids() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1140,6 +1171,7 @@ fn primary_filters_outrank_secondary_filters_by_weight() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1177,6 +1209,7 @@ fn per_sid_user_sid_stamped_on_every_filter() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1201,6 +1234,7 @@ fn different_sids_produce_different_filter_ids() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1213,6 +1247,7 @@ fn different_sids_produce_different_filter_ids() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1237,6 +1272,7 @@ fn primary_and_secondary_rule_with_same_id_produce_different_filter_ids() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1266,6 +1302,7 @@ fn fanout_idx_keeps_filter_ids_unique_for_multi_ip_hostname() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1286,6 +1323,7 @@ fn no_rule_no_strict_mode_yields_empty_output() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1311,6 +1349,7 @@ fn secondary_dest_ips_collects_only_secondary_rule_ips() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1343,6 +1382,7 @@ fn secondary_dest_ips_dedupes_across_rules_and_fanout() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1382,6 +1422,7 @@ fn an_app_rule_does_not_take_over_an_address_a_main_route_rule_names() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1434,6 +1475,7 @@ fn an_app_whose_every_address_was_claimed_is_not_reported_as_unobserved() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1472,6 +1514,7 @@ fn an_app_rule_still_claims_addresses_nobody_else_named() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1494,6 +1537,7 @@ fn secondary_dest_ips_skips_app_match_rules() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1529,6 +1573,7 @@ fn app_rule_routes_observed_ips_as_secondary_dest() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1568,6 +1613,7 @@ fn secondary_app_patterns_collects_secondary_route_apps() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1611,6 +1657,7 @@ fn secondary_app_patterns_excludes_primary_and_block_apps() {
         app_resolver: &resolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1646,6 +1693,7 @@ fn block_rule_emits_ale_and_packet_block_at_block_band() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1698,6 +1746,7 @@ fn block_rule_ip_is_excluded_from_secondary_dest_ips() {
         app_resolver: &NoopAppPathResolver,
         secondary_ip_denylist: &std::collections::HashSet::new(),
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
@@ -1724,6 +1773,7 @@ fn block_filter_ids_are_deterministic_across_reapply() {
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
             families: crate::enforcement_planner::FamilyScope::V4Only,
             packet_blocks: true,
         })
@@ -1810,6 +1860,7 @@ fn an_app_and_address_rule_is_skipped_whole_for_either_action() {
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
             families: crate::enforcement_planner::FamilyScope::V4Only,
             packet_blocks: true,
         });

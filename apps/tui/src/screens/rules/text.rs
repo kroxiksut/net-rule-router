@@ -538,6 +538,86 @@ pub const UNRECOGNIZED: Key = key(
     "Rules this version cannot read: {n}. They are kept in your rules and are not applied; a newer version of the app applies them.",
 );
 
+// ── A VPN's gateway ──────────────────────────────────────────────────────────
+
+pub const GATEWAY_TITLE: Key = key(
+    "settings.routing.vpn-gateway.title",
+    "Other VPNs (corporate)",
+);
+pub const GATEWAY_NOTE: Key = key(
+    "settings.routing.vpn-gateway.note",
+    "For a VPN that connects only from one network, such as a work VPN allowed only from abroad: its gateway gets a rule for the channel you choose, so it always connects through that channel. If that channel is down, the VPN does not connect over the other one.",
+);
+pub const GATEWAY_FINDING: Key = key(
+    "settings.routing.vpn-gateway.finding",
+    "Looking at recent connections...",
+);
+pub const GATEWAY_FAILED: Key = key(
+    "settings.routing.vpn-gateway.failed",
+    "Could not read the connections: ",
+);
+pub const GATEWAY_OBSERVER_OFF: Key = key(
+    "settings.routing.vpn-gateway.observer-off",
+    "On this system NetRuleRouter cannot see where a program connects. Type the gateway address below.",
+);
+pub const GATEWAY_EMPTY: Key = key(
+    "settings.routing.vpn-gateway.empty",
+    "{program} has not connected anywhere on the internet recently. Start the VPN and let it try to connect, then search again.",
+);
+pub const GATEWAY_CANDIDATE: Key = key(
+    "settings.routing.vpn-gateway.candidate",
+    "{address} · ports {ports} · last seen {time}",
+);
+pub const GATEWAY_BY_NAME: Key = key("settings.routing.vpn-gateway.by-name", "By name: {host}");
+pub const GATEWAY_OMITTED: Key = key(
+    "settings.routing.vpn-gateway.omitted",
+    "Addresses not shown: {count}.",
+);
+pub const GATEWAY_INVALID: Key = key(
+    "settings.routing.vpn-gateway.manual-invalid",
+    "This is neither an address nor a host name.",
+);
+pub const GATEWAY_COMMENT: Key = key(
+    "settings.routing.vpn-gateway.rule-comment",
+    "VPN gateway: {program}",
+);
+pub const GATEWAY_APPLY_HINT: Key = key(
+    "settings.routing.vpn-gateway.apply-hint",
+    "The rules are in your list now. Apply the changes to put them into effect.",
+);
+pub const GATEWAY_ALREADY: Key = key(
+    "status.rules-list-already-present",
+    "Already in the list: {count}.",
+);
+pub const GATEWAY_PROGRAM_QUESTION: Key = key(
+    "tui.rules.gateway.program-question",
+    "Which VPN program? Type its file name, for example corpvpn.exe.",
+);
+pub const GATEWAY_CHANNEL_QUESTION: Key = key(
+    "tui.rules.gateway.channel-question",
+    "Through which channel should it connect?",
+);
+pub const GATEWAY_PICK: Key = key(
+    "tui.rules.gateway.pick",
+    "Type a number to add that address, or type the gateway address or name.",
+);
+pub const GATEWAY_PICK_KEYS: Key = key(
+    "tui.rules.gateway.pick-keys",
+    "Up and Down choose, Enter adds the chosen address; typing an address or name adds that instead. Esc cancels.",
+);
+pub const GATEWAY_NONE_FOUND: Key = key(
+    "tui.rules.gateway.none-found",
+    "No addresses found. Type the gateway address or name.",
+);
+pub const HELP_GATEWAY: Key = key(
+    "tui.rules.help.gateway",
+    "v: add a rule for a VPN's gateway, so that VPN connects through the channel you choose",
+);
+pub const PLAIN_GATEWAY: Key = key(
+    "tui.rules.plain.gateway",
+    "v: add a rule for a VPN's gateway",
+);
+
 /// Every key above, for the test that holds both locale files to them.
 #[cfg(test)]
 pub const ALL: &[Key] = &[
@@ -729,4 +809,24 @@ pub const ALL: &[Key] = &[
     SORT_MAIN_ROUTE,
     HELP_MAIN_ROUTE,
     PLAIN_MAIN_ROUTE,
+    GATEWAY_TITLE,
+    GATEWAY_NOTE,
+    GATEWAY_FINDING,
+    GATEWAY_FAILED,
+    GATEWAY_OBSERVER_OFF,
+    GATEWAY_EMPTY,
+    GATEWAY_CANDIDATE,
+    GATEWAY_BY_NAME,
+    GATEWAY_OMITTED,
+    GATEWAY_INVALID,
+    GATEWAY_COMMENT,
+    GATEWAY_APPLY_HINT,
+    GATEWAY_ALREADY,
+    GATEWAY_PROGRAM_QUESTION,
+    GATEWAY_CHANNEL_QUESTION,
+    GATEWAY_PICK,
+    GATEWAY_PICK_KEYS,
+    GATEWAY_NONE_FOUND,
+    HELP_GATEWAY,
+    PLAIN_GATEWAY,
 ];

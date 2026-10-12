@@ -8,6 +8,7 @@ mod apply;
 mod files;
 mod folder;
 mod form;
+mod gateway;
 mod main_route;
 mod own_settings;
 mod render;
@@ -42,6 +43,8 @@ pub enum Mode {
     Form(Box<Form>),
     Choice(Choice),
     Review(Box<Review>),
+    /// `v`: a rule for a VPN's gateway.
+    Gateway(Box<gateway::Stage>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +202,8 @@ pub struct RulesState {
     pub unrecognized: u32,
     /// The main-route check and whether its column is shown.
     pub main_route: main_route::MainRoute,
+    /// The comment a VPN-gateway rule gets, in the reader's language.
+    pub gateway_comment: String,
 }
 
 impl RulesState {
@@ -214,6 +219,7 @@ impl RulesState {
 /// The texts were loaded or changed language.
 pub fn on_texts(app: &mut AppState, texts: &Texts) {
     app.rules.my_rules = texts.get(text::MY_RULES);
+    app.rules.gateway_comment = texts.get(text::GATEWAY_COMMENT);
 }
 
 pub struct RulesScreen;
@@ -236,6 +242,7 @@ impl Screen for RulesScreen {
             text::HELP_RELOAD,
             text::HELP_VERDICTS,
             text::HELP_MAIN_ROUTE,
+            text::HELP_GATEWAY,
             text::HELP_FORM,
         ]
     }
@@ -255,6 +262,7 @@ impl Screen for RulesScreen {
             text::PLAIN_RELOAD,
             text::PLAIN_VERDICTS,
             text::PLAIN_MAIN_ROUTE,
+            text::PLAIN_GATEWAY,
         ]
     }
 
@@ -278,6 +286,7 @@ impl Screen for RulesScreen {
             Mode::Form(form) => form_key(app, form, key),
             Mode::Choice(choice) => choice_key(app, choice, key),
             Mode::Review(review) => review_key(app, review, key),
+            Mode::Gateway(stage) => gateway::on_key(app, *stage, key),
         }
     }
 
@@ -345,6 +354,10 @@ impl Screen for RulesScreen {
                 }
                 true
             }
+            Mode::Gateway(stage) => {
+                gateway::on_line(app, *stage, line);
+                true
+            }
         }
     }
 
@@ -357,6 +370,7 @@ impl Screen for RulesScreen {
                 Some(text::PLAIN_REVIEW_CRITICAL_PROMPT)
             }
             Mode::Review(_) => Some(text::PLAIN_REVIEW_PROMPT),
+            Mode::Gateway(stage) => gateway::plain_prompt(stage),
         }
     }
 }
@@ -975,6 +989,7 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'm' => return verdicts::move_all(app),
             'n' => return verdicts::not_now(app),
             'c' => return main_route::start(app),
+            'v' => return gateway::start(app),
             'O' => change_order(app),
             _ => return false,
         },
@@ -1165,6 +1180,7 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         "m" => return verdicts::move_all(app),
         "n" => return verdicts::not_now(app),
         "c" => return main_route::start(app),
+        "v" => return gateway::start(app),
         "O" => change_order(app),
         _ => return false,
     }

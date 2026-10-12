@@ -1,0 +1,8 @@
+case "$1" in
+  # An upgrade keeps the daemon running; postinst restarts it on the new files.
+  remove)
+    nrr_pkg_stop_and_reset_network
+    ;;
+esac
+
+exit 0

@@ -524,6 +524,84 @@ fn parse_rule_message(body: &[u8]) -> Option<FibRule> {
     Some(rule)
 }
 
+/// `FR_ACT_GOTO` — jump to the rule at another priority (`FRA_GOTO`).
+const FR_ACT_GOTO: u8 = 2;
+const FRA_GOTO: u16 = 17;
+
+/// A rule exactly as dumped, so somebody else's can be put back whole at
+/// another priority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawFibRule {
+    pub ipv6: bool,
+    pub priority: u32,
+    /// The priority a `goto` rule jumps to.
+    pub goto_target: Option<u32>,
+    /// Ours by [`crate::policy_routing::is_our_rule`].
+    pub ours: bool,
+    pub body: Vec<u8>,
+}
+
+fn parse_raw_rule(body: &[u8]) -> Option<RawFibRule> {
+    if body.len() < FIB_RULE_HDR_LEN {
+        return None;
+    }
+    let ipv6 = match body[0] {
+        AF_INET_U8 => false,
+        AF_INET6_U8 => true,
+        _ => return None,
+    };
+    let mut priority = 0;
+    let mut jump = 0;
+    let mut offset = FIB_RULE_HDR_LEN;
+    while offset + RTATTR_HEADER_LEN <= body.len() {
+        let len = u16::from_ne_bytes([body[offset], body[offset + 1]]) as usize;
+        let attr_type = u16::from_ne_bytes([body[offset + 2], body[offset + 3]]);
+        if len < RTATTR_HEADER_LEN || offset + len > body.len() {
+            break;
+        }
+        let word = <[u8; 4]>::try_from(&body[offset + RTATTR_HEADER_LEN..offset + len])
+            .ok()
+            .map(u32::from_ne_bytes);
+        match (attr_type, word) {
+            (FRA_PRIORITY, Some(value)) => priority = value,
+            (FRA_GOTO, Some(value)) => jump = value,
+            _ => {}
+        }
+        offset += align(len);
+    }
+    let ours = parse_rule_message(body).is_some_and(|r| crate::policy_routing::is_our_rule(&r));
+    Some(RawFibRule {
+        ipv6,
+        priority,
+        goto_target: (body[7] == FR_ACT_GOTO).then_some(jump),
+        ours,
+        body: body.to_vec(),
+    })
+}
+
+/// `body` with its priority set to `priority`, every other attribute kept.
+fn with_priority(body: &[u8], priority: u32) -> Vec<u8> {
+    let mut out = body[..FIB_RULE_HDR_LEN.min(body.len())].to_vec();
+    let mut offset = FIB_RULE_HDR_LEN;
+    while offset + RTATTR_HEADER_LEN <= body.len() {
+        let len = u16::from_ne_bytes([body[offset], body[offset + 1]]) as usize;
+        let attr_type = u16::from_ne_bytes([body[offset + 2], body[offset + 3]]);
+        if len < RTATTR_HEADER_LEN || offset + len > body.len() {
+            break;
+        }
+        if attr_type != FRA_PRIORITY {
+            push_attr(
+                &mut out,
+                attr_type,
+                &body[offset + RTATTR_HEADER_LEN..offset + len],
+            );
+        }
+        offset += align(len);
+    }
+    push_attr(&mut out, FRA_PRIORITY, &priority.to_ne_bytes());
+    out
+}
+
 // ── Socket round-trip (Linux only) ───────────────────────────────────────────
 
 /// Read the IPv4 route table.
@@ -609,6 +687,57 @@ pub(crate) fn delete_fib_rule(rule: &FibRule) -> Result<(), PlatformError> {
     let socket = NetlinkRequestSocket::open()?;
     socket.send(&encode_rule_mutation(RTM_DELRULE, rule, socket.sequence))?;
     socket.expect_ack("delete a policy routing rule")
+}
+
+/// Every policy-routing rule exactly as dumped, both families.
+#[cfg(target_os = "linux")]
+pub(crate) fn get_raw_fib_rules() -> Result<Vec<RawFibRule>, PlatformError> {
+    let socket = NetlinkRequestSocket::open()?;
+    socket.send(&encode_rule_dump(socket.sequence))?;
+    let mut rules = Vec::new();
+    loop {
+        let datagram = socket.receive()?;
+        let (done, error) = walk_datagram(&datagram, |message_type, body| {
+            if message_type == RTM_NEWRULE {
+                rules.extend(parse_raw_rule(body));
+            }
+        });
+        if let Some(code) = error {
+            return Err(errno_error("dump the policy routing rules", code));
+        }
+        if done {
+            return Ok(rules);
+        }
+    }
+}
+
+/// Put somebody else's rule at `priority`: the copy first, then the original,
+/// so the traffic it steers is never left without it. A copy already standing
+/// there (an earlier move whose delete failed) counts as made.
+#[cfg(target_os = "linux")]
+pub(crate) fn move_raw_fib_rule(rule: &RawFibRule, priority: u32) -> Result<(), PlatformError> {
+    let socket = NetlinkRequestSocket::open()?;
+    socket.send(&frame(
+        RTM_NEWRULE,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        socket.sequence,
+        &with_priority(&rule.body, priority),
+    ))?;
+    match socket.expect_ack("move a policy routing rule") {
+        Err(e) if e.classify() != nrr_platform_api::error::ErrorClass::Conflict => return Err(e),
+        _ => {}
+    }
+    let socket = NetlinkRequestSocket::open()?;
+    socket.send(&frame(
+        RTM_DELRULE,
+        NLM_F_REQUEST | NLM_F_ACK,
+        socket.sequence,
+        &rule.body,
+    ))?;
+    match socket.expect_ack("remove a moved policy routing rule") {
+        Err(e) if e.classify() != nrr_platform_api::error::ErrorClass::Idempotent => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Wrap a kernel errno in the neutral error the port declares.
@@ -973,6 +1102,54 @@ mod tests {
 
     fn rule_body(rule: &FibRule) -> Vec<u8> {
         encode_rule_mutation(RTM_NEWRULE, rule, 1)[NLMSG_HEADER_LEN..].to_vec()
+    }
+
+    /// `not fwmark 0xca6c lookup 51820` as a VPN installs it.
+    fn vpn_rule_body(priority: u32) -> Vec<u8> {
+        let mut body = vec![AF_INET_U8, 0, 0, 0, 0, 0, 0, FR_ACT_TO_TBL];
+        body.extend_from_slice(&FIB_RULE_INVERT.to_ne_bytes());
+        push_attr(&mut body, FRA_PRIORITY, &priority.to_ne_bytes());
+        push_attr(&mut body, 10, &0xca6cu32.to_ne_bytes()); // FRA_FWMARK
+        push_attr(&mut body, FRA_TABLE, &51_820u32.to_ne_bytes());
+        body
+    }
+
+    /// A moved rule keeps everything it matches on; only the priority changes.
+    #[test]
+    fn a_rule_moved_keeps_all_but_its_priority() {
+        let body = vpn_rule_body(30_099);
+        let moved = with_priority(&body, 32_765);
+        let before = parse_raw_rule(&body).expect("parse");
+        let after = parse_raw_rule(&moved).expect("parse");
+        assert_eq!((before.priority, after.priority), (30_099, 32_765));
+        assert_eq!(moved[..FIB_RULE_HDR_LEN], body[..FIB_RULE_HDR_LEN]);
+        assert_eq!(with_priority(&moved, 30_099).len(), body.len());
+        let parsed = parse_rule_message(&moved).expect("parse");
+        assert_eq!(parsed.table, 51_820);
+        assert!(parsed.narrowed, "the mark and the inversion survive");
+    }
+
+    #[test]
+    fn a_raw_rule_knows_whether_it_is_ours() {
+        assert!(!parse_raw_rule(&vpn_rule_body(30_099)).expect("parse").ours);
+        assert!(
+            parse_raw_rule(&rule_body(&uid_rule(None)))
+                .expect("parse")
+                .ours
+        );
+        let mut jump = vpn_rule_body(30_098);
+        jump[7] = FR_ACT_GOTO;
+        push_attr(&mut jump, FRA_GOTO, &32_000u32.to_ne_bytes());
+        assert_eq!(
+            parse_raw_rule(&jump).expect("parse").goto_target,
+            Some(32_000)
+        );
+        assert_eq!(
+            parse_raw_rule(&vpn_rule_body(30_098))
+                .expect("parse")
+                .goto_target,
+            None
+        );
     }
 
     fn uid_rule(suppress: Option<u8>) -> FibRule {

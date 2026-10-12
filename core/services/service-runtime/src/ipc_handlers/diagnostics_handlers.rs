@@ -124,11 +124,15 @@ mod archive;
 mod cache;
 mod conn_trace;
 mod explain;
+mod vpn_gateways;
 
 pub use archive::*;
 pub use cache::*;
 pub use conn_trace::*;
 pub use explain::*;
+pub use vpn_gateways::{
+    VpnGatewayCandidatesListHandler, DEFAULT_UNIX_SYS_UID_MAX, MAX_GATEWAY_CANDIDATES,
+};
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 

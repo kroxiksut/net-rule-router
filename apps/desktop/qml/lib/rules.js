@@ -435,6 +435,25 @@ function ruleRowToWireDto(row, aceEncodeHost, opts) {
     return dto
 }
 
+// The `rules-update` payload for a whole rules table, in table order. Shared by
+// the window and the tray so both submit byte-identical JSON for one set of
+// rows. Throws on a row the serializer cannot carry; the caller reports it.
+function buildRulesJson(rows, aceEncodeHost) {
+    var primary = []
+    var secondary = []
+    for (var i = 0; i < rows.length; i += 1) {
+        // A block lives in the secondary bucket; its `action` field (set by
+        // the serializer) overrides routing.
+        var bucket = (routeBucket(rows[i].targetRoute) === "secondary") ? secondary : primary
+        bucket.push(ruleRowToWireDto(rows[i], aceEncodeHost))
+    }
+    return JSON.stringify({
+        "schema-version": 1,
+        "primary": primary,
+        "secondary": secondary
+    })
+}
+
 // ---- drift canonicalisation ----
 
 // One-route canonical V1 envelope built from `rows`, in the exact shape the
@@ -637,4 +656,303 @@ function mainRouteCheckHosts(rows) {
         hosts.push(host)
     }
     return hosts
+}
+
+// The file name of a program typed or picked with its path.
+function vpnProgramFileName(raw) {
+    var parts = String(raw || "").trim().split(/[\\\/]/)
+    return parts[parts.length - 1].trim()
+}
+
+function _vpnIsIpv4(s) {
+    var parts = s.split(".")
+    if (parts.length !== 4) return false
+    for (var i = 0; i < parts.length; i += 1) {
+        if (!/^[0-9]{1,3}$/.test(parts[i]) || parseInt(parts[i], 10) > 255) return false
+    }
+    return true
+}
+
+// Groups of one side of an IPv6 text, the last possibly a dotted IPv4 (worth
+// two); -1 when a group is malformed or empty.
+function _vpnIpv6Groups(side, mayEndInIpv4) {
+    if (side === "") return 0
+    var groups = side.split(":")
+    var count = 0
+    for (var i = 0; i < groups.length; i += 1) {
+        var g = groups[i]
+        if (i === groups.length - 1 && mayEndInIpv4 && g.indexOf(".") >= 0) {
+            if (!_vpnIsIpv4(g)) return -1
+            count += 2
+        } else if (/^[0-9A-Fa-f]{1,4}$/.test(g)) {
+            count += 1
+        } else {
+            return -1
+        }
+    }
+    return count
+}
+
+function _vpnIsIpv6(s) {
+    if (s.indexOf(":") < 0) return false
+    var at = s.indexOf("::")
+    if (at < 0) return _vpnIpv6Groups(s, true) === 8
+    var right = s.substring(at + 2)
+    if (right.indexOf("::") >= 0) return false
+    var l = _vpnIpv6Groups(s.substring(0, at), false)
+    var r = _vpnIpv6Groups(right, true)
+    return l >= 0 && r >= 0 && l + r <= 7
+}
+
+// An address literal, brackets allowed, lower-cased; null otherwise.
+function _vpnIpLiteral(s) {
+    var bare = (s.length >= 2 && s.charAt(0) === "[" && s.charAt(s.length - 1) === "]")
+        ? s.substring(1, s.length - 1) : s
+    return (_vpnIsIpv4(bare) || _vpnIsIpv6(bare)) ? bare.toLowerCase() : null
+}
+
+// A name of two labels or more: ASCII letters, digits, `-` and `_`, or any
+// non-ASCII character but a space; no label empty or edged with `-`, and the
+// last not all digits, which is a mistyped address. The rules validator
+// judges the rest.
+function _vpnIsHostName(s) {
+    var labels = s.split(".")
+    if (labels.length < 2 || /^[0-9]*$/.test(labels[labels.length - 1])) return false
+    for (var i = 0; i < labels.length; i += 1) {
+        var label = labels[i]
+        if (label === "" || label.charAt(0) === "-" || label.charAt(label.length - 1) === "-") {
+            return false
+        }
+        for (var k = 0; k < label.length; k += 1) {
+            var c = label.charAt(k)
+            var ok = label.charCodeAt(k) < 128 ? /[A-Za-z0-9_-]/.test(c) : !/\s/.test(c)
+            if (!ok) return false
+        }
+    }
+    return true
+}
+
+// The rule that lets a VPN reach its gateway over `route`: an exact address,
+// or one host (`domain` without `*.`) when a name is chosen or typed, its
+// comment `commentTemplate` with `{program}` filled. null when the input is
+// neither, no program is named, or the route is not an adapter route. Twin of
+// `nrr_client_logic::vpn_gateway::gateway_rule_draft`.
+function vpnGatewayRuleDraft(input, program, route, commentTemplate) {
+    var name = vpnProgramFileName(program)
+    var text = String(input || "").trim()
+    if (name === "" || text === "" || (route !== "primary" && route !== "secondary")) return null
+    var comment = String(commentTemplate || "").split("{program}").join(name)
+    var make = function (type, value) {
+        return { "rule-type": type, value: value, route: route, comment: comment }
+    }
+    var ip = _vpnIpLiteral(text)
+    if (ip !== null) return make("exact-ip", ip)
+    var host = String(normalizeHostInput("exact-fqdn", text)).trim()
+    ip = _vpnIpLiteral(host)
+    if (ip !== null) return make("exact-ip", ip)
+    if (host.charAt(host.length - 1) === ".") host = host.substring(0, host.length - 1)
+    host = host.toLowerCase()
+    return _vpnIsHostName(host) ? make("domain", host) : null
+}
+
+// ---- the add/edit rule form ----
+//
+// The main window and the tray's add-rule window host the same dialog; what
+// it shows and what a saved form becomes live here so the two cannot differ.
+// `rows` is a ListModel or a plain array of table rows.
+
+function _rowCount(rows) {
+    if (!rows) return 0
+    return rows.length !== undefined ? rows.length : rows.count
+}
+
+function _rowAt(rows, i) {
+    return rows.length !== undefined ? rows[i] : rows.get(i)
+}
+
+// The form's type list: the backend's types less application where this OS
+// cannot route per process, which would take the input and drop it.
+function offeredRuleTypes(types, appRoutingSupported) {
+    var out = []
+    for (var i = 0; i < (types || []).length; i += 1) {
+        if (String(types[i].id) === "application" && !appRoutingSupported) continue
+        out.push(types[i])
+    }
+    return out
+}
+
+// What the user calls a route: their own name for an adapter route, else the
+// stock one. A block is a fixed meaning, never renamed.
+function routeDisplayLabel(role, primaryLabel, secondaryLabel, tr) {
+    if (role === "primary") return String(primaryLabel || "") || tr("label.primary", "Primary")
+    if (role === "block") return tr("label.block", "Block")
+    return String(secondaryLabel || "") || tr("label.secondary", "Additional")
+}
+
+// The form's route choices; a block only for a rule that already is one.
+function routeRoleOptions(includeBlock, routeLabel) {
+    var opts = [
+        { id: "primary", label: routeLabel("primary") },
+        { id: "secondary", label: routeLabel("secondary") }
+    ]
+    if (includeBlock) opts.push({ id: "block", label: routeLabel("block") })
+    return opts
+}
+
+// Highest `R-NNNN` id in `rows` plus one, capped at `maxCount` when given.
+function nextFreeRuleId(rows, maxCount) {
+    var maxN = 0
+    for (var i = 0; i < _rowCount(rows); i += 1) {
+        var m = String(_rowAt(rows, i).id || "").match(/^R-(\d+)$/)
+        if (m) {
+            var n = parseInt(m[1], 10)
+            if (!isNaN(n) && n > maxN) maxN = n
+        }
+    }
+    var next = maxCount > 0 ? Math.min(maxN + 1, maxCount) : maxN + 1
+    return "R-" + ("0000" + String(next)).slice(-4)
+}
+
+// The id of the row at `index` once a table is numbered from R-0001: the
+// service numbers each route from R-0000, so a merged table would repeat ids.
+function sequentialRuleId(index) {
+    return "R-" + ("0000" + String(index + 1)).slice(-4)
+}
+
+// `rows` as an array with `row` in place of row `index`, or after the last one
+// when `index` is negative.
+function rowsWithCandidate(rows, index, row) {
+    var out = []
+    for (var i = 0; i < _rowCount(rows); i += 1) out.push(i === index ? row : _rowAt(rows, i))
+    if (index < 0) out.push(row)
+    return out
+}
+
+// The `local.rules-overlaps` route overlaps rule `candidateId` takes part in.
+function overlapsOfRule(overlaps, candidateId) {
+    var mine = []
+    for (var i = 0; i < (overlaps || []).length; i += 1) {
+        var o = overlaps[i]
+        if (String(o.winner["rule-id"]) === String(candidateId)
+                || String(o.loser["rule-id"]) === String(candidateId)) {
+            mine.push(o)
+        }
+    }
+    return mine
+}
+
+// One table row from the saved form `f` ({ ruleType, value, route, verify,
+// comment, enabled }). A blank comment on an IDN host gets the Punycode form,
+// so the user can match the rule to what the service shows. `h` supplies
+// `ruleTypeLabel`, `punycodeHint` and `aceLowerForSearch`.
+function ruleRowFromForm(f, id, h) {
+    var comment = String(f.comment || "")
+    if (comment === "" && isHostlikeRuleType(f.ruleType)) {
+        var ace = h.punycodeHint(f.value)
+        if (ace !== "") comment = "Punycode: " + ace
+    }
+    return {
+        id: id,
+        enabled: f.enabled,
+        ruleType: f.ruleType,
+        ruleTypeTitle: h.ruleTypeLabel(f.ruleType),
+        matchValue: f.value,
+        aceMatchValue: h.aceLowerForSearch(f.value),
+        targetRoute: f.route,
+        verify: rowIsVerify({ ruleType: f.ruleType, targetRoute: f.route, verify: f.verify }),
+        comment: comment,
+        // A rule the user saved is theirs: provenance is cleared explicitly,
+        // because `ListModel.set` merges roles and would keep the old badge.
+        originReason: "",
+        originAnchor: "",
+        originAdded: ""
+    }
+}
+
+// Table row from one wire `RuleRowEntry` (`rules.list`). The one mapping every
+// surface uses: the tray re-sends the whole rule book built from these rows,
+// so a field lost here would silently change rules the user never touched.
+// Host values arrive ACE and are decoded for display.
+function serviceRuleRowToModelRow(w, ruleTypeLabel, aceDecode, aceLowerForSearch) {
+    var slug = String(w["rule-type"] || "")
+    var origin = w.origin || null
+    var hosts = w["hosts-override"] || null
+    var row = {
+        id: canonicalRuleId(String(w.id || "")),
+        enabled: !!w.enabled,
+        ruleType: slug,
+        ruleTypeTitle: typeof ruleTypeLabel === "function" ? ruleTypeLabel(slug) : slug,
+        matchValue: String(w["match-value"] || ""),
+        targetRoute: String(w["target-route"] || "primary"),
+        verify: w.verify === true,
+        comment: (w.comment !== undefined && w.comment !== null) ? String(w.comment) : "",
+        validationStatus: String(w["validation-status"] || "valid"),
+        validationMessageKey: String(w["validation-message-key"] || ""),
+        // An empty object, not null: with null the ListModel cannot type the
+        // role and logs a warning per row, which once dominated populate time.
+        validationMessageArgs: ({}),
+        // Nested objects are flattened to scalar roles: a nested role has an
+        // unreliable type across a ListModel rebuild.
+        hostsOverrideIp: (hosts && hosts.ip !== undefined) ? String(hosts.ip) : "",
+        hostsOverrideBlocking: !!(hosts && hosts.blocking),
+        // "answered", "silent", or "" when never checked.
+        mainRoute: String(w["main-route"] || ""),
+        originReason: (origin && origin.reason !== undefined) ? String(origin.reason) : "",
+        originAnchor: (origin && origin.anchor !== undefined) ? String(origin.anchor) : "",
+        originAdded: (origin && origin.added !== undefined) ? String(origin.added) : "",
+        // What an application rule holds on the additional link, machine-wide.
+        // The count is the service's total: the wire list is capped.
+        pinnedCount: Number(w["pinned-destinations-total"]
+            || (w["pinned-destinations"] || []).length),
+        pinnedSample: (w["pinned-destinations"] || []).slice(0, 20).join(", ")
+    }
+    if (isHostlikeRuleType(slug)) row.matchValue = aceDecode(row.matchValue)
+    row.aceMatchValue = aceLowerForSearch(row.matchValue)
+    return row
+}
+
+// What adding `items` to `rows` amounts to. An exact duplicate is left out; a
+// rule whose type and value already sit on another route is reported in
+// `elsewhere`, and with `moveElsewhere` that row is moved instead of a second
+// copy being added. `rows` itself is not changed.
+// Returns { rows, added, changed, addedRows, movedRows, duplicates,
+// elsewhere: [{ item, row }] }.
+function planRuleAddition(rows, items, moveElsewhere) {
+    var out = []
+    for (var i = 0; i < _rowCount(rows); i += 1) out.push(_rowAt(rows, i))
+    var plan = { rows: out, added: 0, changed: 0, addedRows: [], movedRows: [],
+        duplicates: [], elsewhere: [] }
+    for (var k = 0; k < items.length; k += 1) {
+        var item = items[k]
+        var key = mergeKey(item)
+        var sameValue = canonicalRuleTypeSlug(item.ruleType) + "|"
+            + String(item.matchValue || "").toLowerCase()
+        var duplicate = false
+        var other = -1
+        for (var r = 0; r < out.length; r += 1) {
+            if (mergeKey(out[r]) === key) { duplicate = true; break }
+            if (other < 0 && canonicalRuleTypeSlug(out[r].ruleType) + "|"
+                    + String(out[r].matchValue || "").toLowerCase() === sameValue) {
+                other = r
+            }
+        }
+        if (duplicate) {
+            plan.duplicates.push(item)
+        } else if (other >= 0) {
+            plan.elsewhere.push({ item: item, row: out[other] })
+            if (moveElsewhere) {
+                var moved = {}
+                for (var f in out[other]) moved[f] = out[other][f]
+                moved.targetRoute = item.targetRoute
+                out[other] = moved
+                plan.movedRows.push(moved)
+                plan.changed += 1
+            }
+        } else {
+            out.push(item)
+            plan.addedRows.push(item)
+            plan.added += 1
+        }
+    }
+    return plan
 }

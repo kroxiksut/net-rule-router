@@ -130,9 +130,9 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
         IpcOperationName::RulesMergePreview => Duration::from_secs(5),
         // One bounded in-memory ring snapshot (page-sized). As cheap as the
         // cache read; 5 s mirrors the other paginated reads.
-        IpcOperationName::ConnTraceEntriesList | IpcOperationName::ConnTraceOutageBlocksList => {
-            Duration::from_secs(5)
-        }
+        IpcOperationName::ConnTraceEntriesList
+        | IpcOperationName::ConnTraceOutageBlocksList
+        | IpcOperationName::VpnGatewayCandidatesList => Duration::from_secs(5),
         // Hashes a ~400 KiB DLL and verifies its signature; the signature
         // check can touch the certificate store, so give it more room than a
         // pure in-memory read.

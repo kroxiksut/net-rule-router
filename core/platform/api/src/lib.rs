@@ -90,6 +90,8 @@ pub mod logon_session;
 pub mod network_change;
 // The service's own sockets, tagged so machine-scope filters let them through.
 pub mod own_traffic;
+// A probe held to the adapter its source address belongs to.
+pub mod source_link;
 // Make a directory reachable by name from the user's shell (the administrative
 // console's directory on PATH). The decision — is it already there, what does
 // the list become — is pure and lives here; the mechanism is per-OS (per-user
@@ -120,6 +122,9 @@ pub mod routing;
 // backends implement it over SCM (Windows) and systemd (Linux); the console and
 // the service binary's own verbs code against the trait.
 pub mod service_control;
+// Whether an install registers its binary in place or a copy kept where only
+// administrators can change it, and what to do about a copy already there.
+pub mod service_placement;
 // Session-scoped single-instance claim for the desktop surfaces. A kernel
 // object on Windows, a socket in the private runtime directory on Linux —
 // anything deleting a file does not end and the OS releases when the owner dies.

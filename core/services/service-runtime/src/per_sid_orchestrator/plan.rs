@@ -211,6 +211,7 @@ impl PerSidApplyOrchestrator {
             app_resolver: self.app_resolver.as_ref(),
             secondary_ip_denylist: &secondary_ip_denylist,
             zone_priority_over_ip: false,
+            app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
             families: ipv6.families(),
             packet_blocks: self.rules_provider.rules_are_baseline_for(sid),
         });
@@ -232,6 +233,7 @@ impl PerSidApplyOrchestrator {
             &rules.rule_book,
             fqdn_cache,
             &secondary_ip_denylist,
+            policy.app_rules_take_all_addresses,
             &codegen_out.filters,
         );
         if let Some(aug) = fake_ip_augmentation {
@@ -406,7 +408,7 @@ impl PerSidApplyOrchestrator {
             .as_ref()
             .filter(|_| intent.publishes())
         {
-            status.set_unresolved(unresolved_apps.clone());
+            status.set_unresolved(sid, unresolved_apps.clone());
             status.set_rule_conflicts(
                 sid,
                 crate::app_enforcement_status::rule_conflicts_from(
@@ -577,12 +579,15 @@ impl PerSidApplyOrchestrator {
             // the shared-IP trade-off below — it is a direct contradiction
             // between two of the user's rules, and a block is neither of the two
             // things they asked for.
-            let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
+            let ownership = crate::address_ownership::AddressOwnership::resolve_for(
                 &rules.rule_book,
                 fqdn_cache,
-                crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+                crate::address_ownership::OwnershipSettings::from_policy(
                     policy.zone_priority_over_ip,
+                    policy.app_rules_take_all_addresses,
                 ),
+                crate::wfp_codegen::current_rule_shape_support(),
+                self.app_observations.as_ref(),
             );
             // The machine's OWN local networks are never pinned to the tunnel.
             // An application rule learns its destinations by watching, and a
@@ -865,12 +870,14 @@ impl PerSidApplyOrchestrator {
                             // secondary adapter egress (ALE layer only — no per-app ICMP).
                             // Main-named addresses need no rescue permits: the
                             // app block sits below the primary rule band, so the
-                            // primary rules' own permits carry them.
-                            let app_pair = crate::killswitch_codegen::app_kill_switch_filters(
+                            // primary rules' own permits carry them — unless the
+                            // app takes all its addresses, when it outranks them.
+                            let app_pair = crate::killswitch_codegen::app_kill_switch_filters_for(
                                 sid,
                                 &codegen_out.secondary_app_patterns,
                                 resolution.secondary_luid,
                                 protocols,
+                                policy.app_rules_take_all_addresses,
                             );
                             app_block_emitted |= !app_pair.is_empty();
                             ks.extend(app_pair);
@@ -989,10 +996,11 @@ impl PerSidApplyOrchestrator {
                             // so a secondary-routed app is cut here by its own
                             // unconditional block instead — same coverage the
                             // egress pair would give with a usable tunnel.
-                            let app_blocks = crate::killswitch_codegen::fail_closed_block_apps(
+                            let app_blocks = crate::killswitch_codegen::fail_closed_block_apps_for(
                                 sid,
                                 &codegen_out.secondary_app_patterns,
                                 protocols,
+                                policy.app_rules_take_all_addresses,
                             );
                             app_block_emitted |= !app_blocks.is_empty();
                             fc.extend(app_blocks);
@@ -1176,10 +1184,11 @@ impl PerSidApplyOrchestrator {
                         // observed destinations, and its UN-observed ones never
                         // had a block in this branch at all — first contact used
                         // to egress the primary until the observer caught up.
-                        let app_blocks = crate::killswitch_codegen::fail_closed_block_apps(
+                        let app_blocks = crate::killswitch_codegen::fail_closed_block_apps_for(
                             sid,
                             &codegen_out.secondary_app_patterns,
                             protocols,
+                            policy.app_rules_take_all_addresses,
                         );
                         app_block_emitted |= !app_blocks.is_empty();
                         fc.extend(app_blocks);

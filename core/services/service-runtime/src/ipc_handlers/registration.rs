@@ -637,6 +637,21 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, UnimplementedHandler::new(op));
                 }
             },
+            // Rides the trace ring but not its viewer switch: the switch hides
+            // the trace panel, not a helper the user asked to run.
+            IpcOperationName::VpnGatewayCandidatesList => match deps.conn_trace_ring.clone() {
+                Some(ring) => {
+                    let handler = diagnostics_handlers::VpnGatewayCandidatesListHandler::new(ring);
+                    let handler = match deps.unix_sys_uid_max {
+                        Some(max) => handler.with_unix_sys_uid_max(max),
+                        None => handler,
+                    };
+                    registry.register(op, handler);
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
             IpcOperationName::AutoRuleDismissedRestore => match deps.auto_rules.clone() {
                 Some(engine) => {
                     registry.register(op, AutoRuleDismissedRestoreHandler::new(engine));

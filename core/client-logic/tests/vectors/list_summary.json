@@ -1,0 +1,14 @@
+{
+  "description": "pure.js listSummary: the first three items, comma-separated, then the 'more' template with {n} filled with how many were left out",
+  "cases": [
+    { "name": "nothing", "input": { "items": [], "more": "+{n} more" }, "expected": "" },
+    { "name": "one", "input": { "items": ["ab.exe"], "more": "+{n} more" }, "expected": "ab.exe" },
+    { "name": "two", "input": { "items": ["a", "b"], "more": "+{n} more" }, "expected": "a, b" },
+    { "name": "the count twice in the template", "input": { "items": ["a", "b", "c", "d", "e"], "more": "+{n} ({n})" }, "expected": "a, b, c +2 (2)" },
+    { "name": "a name with a comma stays whole", "input": { "items": ["Foo, Inc. app"], "more": "+{n} more" }, "expected": "Foo, Inc. app" },
+    { "name": "exactly three", "input": { "items": ["a", "b", "c"], "more": "+{n} more" }, "expected": "a, b, c" },
+    { "name": "four", "input": { "items": ["a", "b", "c", "d"], "more": "+{n} more" }, "expected": "a, b, c +1 more" },
+    { "name": "many, another language", "input": { "items": ["a", "b", "c", "d", "e", "f"], "more": "и ещё {n}" }, "expected": "a, b, c и ещё 3" },
+    { "name": "a template without the number", "input": { "items": ["a", "b", "c", "d"], "more": "and more" }, "expected": "a, b, c and more" }
+  ]
+}

@@ -441,12 +441,12 @@ impl PerSidApplyOrchestrator {
         }
     }
 
-    /// Reset the shared unresolved-app set and `sid`'s rule conflicts so the
+    /// Reset `sid`'s unresolved-app set and rule conflicts so the
     /// GUI does not keep listing them for a SID that no longer has any
     /// (enforceable) rules. No-op when the status is unwired.
     pub(super) fn clear_app_enforcement_status(&self, sid: &str) {
         if let Some(status) = self.app_enforcement_status.as_ref() {
-            status.set_unresolved(Vec::new());
+            status.set_unresolved(sid, Vec::new());
             status.set_rule_conflicts(sid, Vec::new());
         }
     }

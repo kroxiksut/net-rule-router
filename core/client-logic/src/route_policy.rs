@@ -34,7 +34,7 @@ impl FieldDefault {
 
 /// Every route-policy field this build writes, with its default.
 /// `binding-source` is absent on purpose: the writer always stamps it.
-pub const FIELD_DEFAULTS: [(&str, FieldDefault); 25] = [
+pub const FIELD_DEFAULTS: [(&str, FieldDefault); 26] = [
     ("mode", FieldDefault::Text("prefer-primary")),
     (
         "block-secondary-when-unavailable",
@@ -66,6 +66,7 @@ pub const FIELD_DEFAULTS: [(&str, FieldDefault); 25] = [
     ("zone-priority-over-ip", FieldDefault::Bool(false)),
     ("short-name-completion", FieldDefault::Bool(false)),
     ("short-name-suffix", FieldDefault::Text("")),
+    ("app-rules-take-all-addresses", FieldDefault::Bool(false)),
 ];
 
 /// Keys the snapshot carries but the request has no field for: each is

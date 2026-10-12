@@ -14,7 +14,7 @@ use js_harness::{
 };
 use nrr_client_logic::adapters::{self, RoleHint, UnroutableReason};
 use nrr_client_logic::placeholders::{
-    fill_placeholders, format_log_line, plural_category, PluralRule,
+    fill_placeholders, format_log_line, list_summary, plural_category, PluralRule,
 };
 use nrr_client_logic::review::{self, Outcome};
 use nrr_client_logic::route_policy;
@@ -26,7 +26,7 @@ use nrr_client_logic::rules_table::{
 };
 use nrr_client_logic::Route;
 use nrr_shared::ipc_payloads::{
-    InterfaceRowDto, OperationStatusResponse, ReviewSummaryResponse, RuleRowEntry,
+    InterfaceRowDto, OperationStatusResponse, ReviewSummaryResponse, RouteBindingDto, RuleRowEntry,
 };
 use nrr_shared::preset_parser::ParsedRule;
 use serde_json::{json, Map, Value};
@@ -108,6 +108,22 @@ fn format_log_line_matches_js() {
                 &strings(&input["positional"]),
             ))
         },
+    );
+}
+
+#[test]
+fn list_summary_matches_js() {
+    check(
+        "list_summary",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "listSummary({}, {})",
+                arg(input, "items"),
+                arg(input, "more")
+            )
+        },
+        |input| Value::from(list_summary(&strings(&input["items"]), text(input, "more"))),
     );
 }
 
@@ -319,6 +335,49 @@ fn adapter_eligibility_matches_js() {
                 "offeredSecondary": adapters::offered_for_role(&row, Route::Secondary),
             })
         },
+    );
+}
+
+#[test]
+fn bound_wire_row_index_matches_js() {
+    let (base_document, _) = load_vectors("adapters");
+    let base = &base_document["base-row"];
+    check(
+        "bound_wire_row_index",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "boundWireRowIndex({}, {})",
+                arg(input, "rows"),
+                arg(input, "binding")
+            )
+        },
+        |input| {
+            let rows: Vec<InterfaceRowDto> = input["rows"]
+                .as_array()
+                .expect("rows is an array")
+                .iter()
+                .map(|patch| {
+                    serde_json::from_value(merged(base, patch)).expect("row is an InterfaceRowDto")
+                })
+                .collect();
+            let binding: Option<RouteBindingDto> =
+                serde_json::from_value(input["binding"].clone()).expect("binding or null");
+            let index = binding
+                .and_then(|binding| adapters::bound_row_index(&rows, &binding))
+                .map_or(-1, |i| i64::try_from(i).expect("index fits"));
+            Value::from(index)
+        },
+    );
+}
+
+#[test]
+fn interfaces_source_is_live_matches_js() {
+    check(
+        "interfaces_source_is_live",
+        &mut JsLib::pure(),
+        |input| format!("interfacesSourceIsLive({})", arg(input, "source")),
+        |input| Value::from(adapters::rows_are_live(text(input, "source"))),
     );
 }
 

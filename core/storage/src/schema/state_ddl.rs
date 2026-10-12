@@ -1475,3 +1475,9 @@ pub const STATE_DB_V69_DDL: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_block_notice_mutes_sid
      ON block_notice_mutes(sid, updated_at DESC)",
 ];
+
+/// Application rules take every address their program uses, even one the other
+/// link's address rules name. Per-SID, off by default. DEV schema; wiped freely.
+pub const STATE_DB_V70_DDL: &[&str] = &[
+    "ALTER TABLE secondary_block_policy ADD COLUMN app_rules_take_all_addresses      INTEGER NOT NULL DEFAULT 0 CHECK(app_rules_take_all_addresses IN (0, 1))",
+];

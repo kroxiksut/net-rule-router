@@ -48,6 +48,8 @@ case "$profile" in
     ;;
 esac
 
+nrr_refuse_if_package_managed "apt remove / dnf remove netrulerouter."
+
 # The staged copy is the registered daemon, so it answers `uninstall` even when
 # the build tree has been cleaned; the build output is the fallback.
 exe_path="$NRR_STAGED_SERVICE_BINARY"

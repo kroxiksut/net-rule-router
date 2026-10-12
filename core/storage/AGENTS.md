@@ -1,11 +1,14 @@
 # nrr-storage
 
-Synchronous SQLite persistence for two databases:
+Synchronous SQLite persistence for three databases:
 
 | File | Kind | On corruption |
 |------|------|---------------|
 | `nrr_fqdn_ip_cache.db` | Rebuildable | Delete + rebuild |
 | `nrr_service_state.db` | Service-critical | Reported at boot, then rolled back to a trusted earlier revision |
+| `nrr_traffic_stats.db` | Rebuildable (traffic ledger; its settings live in the state DB so a rebuild keeps them) | Delete + rebuild |
+
+A schema NEWER than this build supports (`SchemaTooNew`, a downgrade) is not corruption: the data is whole, only we do not understand it. Never delete, rebuild or overwrite it; report and stay off that store.
 
 Design invariants:
 - **Sync-only** blocking `rusqlite`. No async primitives in the crate. Async callers wrap with `spawn_blocking`.

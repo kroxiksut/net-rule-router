@@ -172,6 +172,7 @@ SystemTrayIcon {
         _autoRuleActiveIds = []
         _enforcementNoticeKind = ""
         _noticeMuteKind = ""
+        _silenceChoiceReplacedOffer = false
         _verifyVerdictOnScreen = false
         // A block notice nobody answered is not quieted: unseen is not seen.
         _blockNoticeShown = []
@@ -331,6 +332,48 @@ SystemTrayIcon {
         rpc: tray.rpc
         presence: tray.guiPresence
         os: tray.platformProfile.os || ""
+    }
+
+    // ── "Add rule…" ──────────────────────────────────────────────────────────
+    //
+    // With the main window up, its own form takes the rule, into the table the
+    // user is looking at. Without it, the same form opens in a small window of
+    // the tray's own and the rule goes straight to the service.
+
+    property var rulesSubmitter: RulesSubmitter { rpc: tray.rpc }
+    property Component _addRuleWindowComponent: Component { TrayRuleWindow {} }
+    /// Made on demand and dropped once closed with no rule on its way.
+    property var _addRuleWindow: null
+
+    function openAddRule() {
+        // A window closed to the tray is still running, hidden; raising it for
+        // a quick add is what the tray's own form is for.
+        if (guiPresence.read().windowVisible) {
+            triggerAction("add-rule")
+            return
+        }
+        if (!_addRuleWindow) {
+            var w = _addRuleWindowComponent.createObject(tray, { trayHost: tray })
+            if (!w) return
+            w.released.connect(function() {
+                if (tray._addRuleWindow === w) tray._addRuleWindow = null
+                Qt.callLater(function() { w.destroy() })
+            })
+            _addRuleWindow = w
+        }
+        _addRuleWindow.present()
+    }
+
+    /// What became of a rule added from the tray's own form.
+    function noteAddRuleOutcome(bodyText) {
+        _presentOrQueue("tray-add-rule", function() {
+            promptWindow.present({
+                titleText: tr("tray.add-rule.title", "Add rule"),
+                bodyText: bodyText,
+                dismissActionId: "tray-add-rule-dismiss",
+                autoRetireMs: _infoNoticeMs
+            })
+        })
     }
 
     // Service status snapshot for icon + menu state.
@@ -2715,6 +2758,10 @@ SystemTrayIcon {
             _scheduleDrain()
             return
         }
+        if (action.indexOf("suggestions-silence-") === 0) {
+            _onSuggestionsSilenceChoice(action)
+            return
+        }
         // Block-notice actions swap the SAME window through a chain of
         // sub-screens (route confirm, snooze choice, mute choice) rather than
         // reusing the auto-rule id machinery below, which answers a different
@@ -2773,7 +2820,7 @@ SystemTrayIcon {
             _scheduleDrain()
             return
         }
-        if (action === "auto-rules-reload-dismiss") {
+        if (action === "auto-rules-reload-dismiss" || action === "tray-add-rule-dismiss") {
             _scheduleDrain()
             return
         }
@@ -3299,19 +3346,33 @@ SystemTrayIcon {
         })
     }
 
+    /// The service leaves `selected-role` empty, so which row is which route
+    /// comes from the user's bindings, read fresh beside the rows.
     function _applyExternalAddressRows(payload) {
         var rows = (payload && payload.rows) || []
-        var primary = ""
-        var secondary = ""
-        for (var i = 0; i < rows.length; i += 1) {
-            var row = rows[i] || {}
-            var role = String(row["selected-role"] || "")
-            var facts = row["observed-facts"] || {}
-            var ip = String(facts["external-ip"] || "")
-            if (ip === "") continue
-            if (role === "primary") primary = ip
-            else if (role === "secondary") secondary = ip
+        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined"
+                || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") {
+            _takeRouteExternalAddresses(rows, null)
+            return
         }
+        var corr = nrrNativeBridge.rpcSnapshotInitialGet()
+        rpc.registerRpcCallback(corr, function(ok, snapshot) {
+            var policy = ok && snapshot
+                ? (snapshot["route-policy"] || snapshot.routePolicy || null) : null
+            tray._takeRouteExternalAddresses(rows, policy)
+        })
+    }
+
+    function _takeRouteExternalAddresses(rows, policy) {
+        var addressOf = function(role) {
+            var i = Pure.boundWireRowIndex(rows, policy ? policy[role] : null)
+            if (i < 0) return ""
+            var facts = (rows[i] || {})["observed-facts"] || {}
+            return String(facts["external-ip"] || "")
+        }
+        var primary = addressOf("primary")
+        var secondary = addressOf("secondary")
         if (primary !== "") {
             _externalPrimary = primary
             _externalPrimaryCachedAtMs = 0
@@ -3329,25 +3390,103 @@ SystemTrayIcon {
 
     // ── Quiet period for suggestions ─────────────────────────────────────────
 
-    /// Silence suggestions for `hours` (0 = until the tray restarts). Distinct
-    /// from refusing them: nothing is decided, the service keeps collecting,
-    /// and the addresses are still there when the quiet period ends.
     /// Whether the quiet period is currently in force. A stored flag, not a
     /// `Date.now()` comparison inside a binding: bindings do not re-evaluate
     /// when time passes, so the menu would keep claiming silence long after it
     /// had expired. Refreshed whenever the menu opens.
     property bool _suggestionsSilenced: false
 
+    /// The chooser took the place of an offer on screen; cancelling it brings
+    /// the offer back rather than losing it until the next announcement.
+    property bool _silenceChoiceReplacedOffer: false
+
+    /// Silence suggestions for `hours` (0 = until the tray restarts). Distinct
+    /// from refusing them: nothing is decided, the service keeps collecting,
+    /// and the addresses are still there when the quiet period ends.
     function _silenceSuggestions(hours) {
         _autoRuleSilencedUntilMs = hours > 0
             ? Date.now() + hours * 3600000
             : Number.MAX_VALUE
         _suggestionsSilenced = true
+        // An offer queued behind the chooser would otherwise show the moment
+        // the quiet period was asked for.
+        _noticeQueue = _noticeQueue.filter(function(n) { return n.kind !== "auto-rules" })
         if (promptWindow && promptWindow.visible
                 && _autoRuleActiveIds.length > 0) {
             promptWindow.retire()
             _autoRuleActiveIds = []
         }
+    }
+
+    function _resumeSuggestions() {
+        _autoRuleSilencedUntilMs = 0
+        _autoRuleSnoozedIds = ({})
+        _suggestionsSilenced = false
+    }
+
+    /// An offer on screen is what the user wants quiet, so the chooser replaces
+    /// it in place; anything else on screen keeps its turn.
+    function _showSuggestionsSilenceChoice() {
+        var show = function() {
+            promptWindow.present({
+                titleText: tr("tray.suggestions.silence", "Do not suggest addresses"),
+                bodyText: tr("tray.suggestions.silence-body",
+                    "New addresses will not be offered for as long as you choose. "
+                    + "They keep collecting under Suggested addresses."),
+                primaryAction: {
+                    label: tr("tray.suggestions.for-30-minutes", "For 30 minutes"),
+                    actionId: "suggestions-silence-30m",
+                    accent: false
+                },
+                secondaryAction: {
+                    label: tr("tray.suggestions.for-2-hours", "For 2 hours"),
+                    actionId: "suggestions-silence-2h"
+                },
+                tertiaryAction: {
+                    label: tr("tray.suggestions.for-4-hours", "For 4 hours"),
+                    actionId: "suggestions-silence-4h"
+                },
+                extraActions: [{
+                    label: tr("tray.suggestions.for-8-hours", "For 8 hours"),
+                    actionId: "suggestions-silence-8h"
+                }, {
+                    label: tr("tray.suggestions.until-restart", "Until restart"),
+                    actionId: "suggestions-silence-restart"
+                }],
+                // Closing the chooser is not an answer — it must not pick a length.
+                dismissActionId: "suggestions-silence-cancel",
+                autoRetireMs: _promptAutoRetireMs
+            })
+        }
+        if (promptWindow && promptWindow.visible && _autoRuleActiveIds.length > 0) {
+            _autoRuleActiveIds = []
+            _silenceChoiceReplacedOffer = true
+            show()
+            return
+        }
+        _silenceChoiceReplacedOffer = false
+        _presentOrQueue("suggestions-silence", show)
+    }
+
+    function _onSuggestionsSilenceChoice(action) {
+        var hours = {
+            "suggestions-silence-30m": 0.5,
+            "suggestions-silence-2h": 2,
+            "suggestions-silence-4h": 4,
+            "suggestions-silence-8h": 8,
+            "suggestions-silence-restart": 0
+        }[action]
+        var replacedOffer = _silenceChoiceReplacedOffer
+        _silenceChoiceReplacedOffer = false
+        if (hours !== undefined) {
+            _silenceSuggestions(hours)
+        } else if (replacedOffer) {
+            // Through the queue: re-showing inside the closing pass kills the tray.
+            _noticeQueue = [{ kind: "auto-rules",
+                              show: function() { tray._fetchAutoRuleCandidates() } }]
+                .concat(_noticeQueue.filter(function(n) { return n.kind !== "auto-rules" }))
+        }
+        _scheduleDrain()
     }
 
     function tr(key, fallbackText) {
@@ -3829,6 +3968,10 @@ SystemTrayIcon {
             enabled: actionEnabled("open-main-window", true)
             onTriggered: triggerAction("open-main-window")
         }
+        MenuItem {
+            text: tr("tray.menu.add-rule", "Add rule…")
+            onTriggered: tray.openAddRule()
+        }
         // The offer notice retires itself, so without a way back the addresses
         // are gone until the service happens to re-announce them.
         MenuItem {
@@ -3877,40 +4020,18 @@ SystemTrayIcon {
         }
         // Only offered while suggestions are a thing that happens: in `auto`
         // mode nothing is ever proposed, so a "stop proposing" entry would be
-        // a control over nothing.
-        Menu {
-            title: tray._suggestionsSilenced
-                ? tr("tray.suggestions.silenced", "Address suggestions: silenced")
-                : tr("tray.suggestions.silence", "Do not suggest addresses")
+        // a control over nothing. The length is chosen in the prompt window,
+        // not a submenu: Qt 6.10's D-Bus menu crashes the tray walking one.
+        MenuItem {
+            text: tray._suggestionsSilenced
+                ? tr("tray.suggestions.resume", "Suggest addresses again")
+                : tr("tray.suggestions.silence-menu", "Do not suggest addresses…")
             visible: tray._autoRulesMode === "suggest"
-            MenuItem {
-                text: tr("tray.suggestions.for-30-minutes", "For 30 minutes")
-                onTriggered: tray._silenceSuggestions(0.5)
-            }
-            MenuItem {
-                text: tr("tray.suggestions.for-2-hours", "For 2 hours")
-                onTriggered: tray._silenceSuggestions(2)
-            }
-            MenuItem {
-                text: tr("tray.suggestions.for-4-hours", "For 4 hours")
-                onTriggered: tray._silenceSuggestions(4)
-            }
-            MenuItem {
-                text: tr("tray.suggestions.for-8-hours", "For 8 hours")
-                onTriggered: tray._silenceSuggestions(8)
-            }
-            MenuItem {
-                text: tr("tray.suggestions.until-restart", "Until restart")
-                onTriggered: tray._silenceSuggestions(0)
-            }
-            MenuSeparator {}
-            MenuItem {
-                text: tr("tray.suggestions.resume", "Suggest again")
-                enabled: tray._suggestionsSilenced
-                onTriggered: {
-                    tray._autoRuleSilencedUntilMs = 0
-                    tray._autoRuleSnoozedIds = ({})
-                    tray._suggestionsSilenced = false
+            onTriggered: {
+                if (tray._suggestionsSilenced) {
+                    tray._resumeSuggestions()
+                } else {
+                    tray._showSuggestionsSilenceChoice()
                 }
             }
         }

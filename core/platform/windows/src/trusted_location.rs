@@ -71,6 +71,11 @@ const TRUSTED_SIDS: &[&str] = &[
 /// SYSTEM and Administrators own the tree and alone may touch it.
 const SERVICE_TREE_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
+/// As above, plus read and execute for Users (`0x1200a9`: FILE_GENERIC_READ |
+/// FILE_GENERIC_EXECUTE): the application and the console compare their own
+/// copy of the service binary with the one registered.
+const PROGRAM_TREE_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
+
 /// Who besides the trusted accounts could change `binary`, if anyone: an
 /// account named in a description, or `None` when only trusted accounts can.
 pub fn untrusted_writer(binary: &Path) -> Result<Option<String>, String> {
@@ -121,11 +126,20 @@ impl std::fmt::Display for LockdownError {
 /// anywhere in the tree refuses the whole operation — the reset would follow
 /// it out of the tree.
 pub fn lock_down_service_tree(root: &Path) -> Result<(), LockdownError> {
+    lock_down_tree(root, SERVICE_TREE_SDDL)
+}
+
+/// [`lock_down_service_tree`] for a folder of programs the service runs: the
+/// same owner and protection, but Users may read and execute what is inside.
+pub fn lock_down_program_tree(root: &Path) -> Result<(), LockdownError> {
+    lock_down_tree(root, PROGRAM_TREE_SDDL)
+}
+
+fn lock_down_tree(root: &Path, sddl: &str) -> Result<(), LockdownError> {
     if let Some(link) = first_reparse_point(root).map_err(LockdownError::Failed)? {
         return Err(LockdownError::Link(link));
     }
-    let descriptor =
-        SecurityDescriptor::from_sddl(SERVICE_TREE_SDDL).map_err(LockdownError::Failed)?;
+    let descriptor = SecurityDescriptor::from_sddl(sddl).map_err(LockdownError::Failed)?;
     let (owner, dacl) = descriptor.owner_and_dacl().map_err(LockdownError::Failed)?;
     let wide = wide(root.as_os_str());
     // SAFETY: `wide` is a NUL-terminated path borrowed for the call; `owner`
@@ -439,6 +453,19 @@ mod tests {
         assert_eq!(census.entries.len(), 3);
         assert_eq!(census.foreign, census.entries);
         assert!(census.entries.contains(&file));
+    }
+
+    #[test]
+    fn a_program_tree_lets_users_read_but_change_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("service.exe");
+        std::fs::write(&file, b"image").expect("write");
+        if lock_down_program_tree(dir.path()).is_err() {
+            return; // handing ownership to Administrators needs an elevated run
+        }
+        assert_eq!(untrusted_rights(dir.path(), PLANTS_BESIDE), Ok(None));
+        assert_eq!(untrusted_rights(&file, REPLACES_FILE), Ok(None));
+        assert_eq!(std::fs::read(&file).expect("readable"), b"image");
     }
 
     #[test]

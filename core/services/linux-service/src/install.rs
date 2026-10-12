@@ -10,6 +10,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use nrr_platform_api::service_control::{
@@ -60,6 +61,36 @@ pub fn uninstall_service() -> ExitCode {
         }
         Err(e) => {
             eprintln!("uninstall failed: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `package-files <DIR>`: write the unit, its companion files and the alias
+/// link a distribution package ships, rooted at DIR. Run by the packaging
+/// script, so the package carries exactly what `install` would write.
+pub fn write_package_files(root: Option<&str>) -> ExitCode {
+    let Some(root) = root
+        .map(Path::new)
+        .filter(|root| !root.as_os_str().is_empty())
+    else {
+        eprintln!("package-files: name the directory to write into");
+        return ExitCode::from(2);
+    };
+    // Into `/` this would be a hand install that looks like a package one.
+    if root.parent().is_none() {
+        eprintln!("package-files: refusing to write into {}", root.display());
+        return ExitCode::from(2);
+    }
+    match nrr_platform_linux::service_control::stage_package_files(root) {
+        Ok(written) => {
+            for path in written {
+                println!("{}", path.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("package-files failed: {e}");
             ExitCode::from(1)
         }
     }

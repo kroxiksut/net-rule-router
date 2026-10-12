@@ -37,6 +37,9 @@ NRR_STAGED_LOCALES_DIR="$NRR_SERVICE_INSTALL_DIR/locales"
 # platform/linux (systemd unit, logrotate drop-in, polkit actions), the systemd
 # State/Logs/Runtime directories, and the enforcement table in lower_linux.rs.
 NRR_UNIT_FILE="/etc/systemd/system/$NRR_UNIT_NAME"
+# Where a distribution package puts the unit (systemd.rs PACKAGE_UNIT_DIRS).
+# One there means the package manager owns the install; these scripts stand down.
+NRR_PACKAGE_UNIT_FILES=("/usr/lib/systemd/system/$NRR_UNIT_NAME" "/lib/systemd/system/$NRR_UNIT_NAME")
 NRR_LOGROTATE_CONFIG="/etc/logrotate.d/$NRR_PRODUCT_NAME_UNIX"
 NRR_POLKIT_POLICY="/usr/share/polkit-1/actions/$NRR_PRODUCT_NAME_UNIX.policy"
 NRR_STATE_DIR="/var/lib/$NRR_PRODUCT_NAME_UNIX"
@@ -87,6 +90,19 @@ nrr_refuse_sudo() {
     echo "paths would resolve for root. $1" >&2
     exit 2
   fi
+}
+
+# Stop before touching an install the package manager owns: staging over its
+# files or removing its unit would leave the package database lying.
+nrr_refuse_if_package_managed() {
+  local unit
+  for unit in "${NRR_PACKAGE_UNIT_FILES[@]}"; do
+    if [ -e "$unit" ]; then
+      echo "$NRR_PRODUCT_NAME is installed from a system package ($unit)." >&2
+      echo "Use the package manager instead: $1" >&2
+      exit 1
+    fi
+  done
 }
 
 nrr_cyan() { printf '\033[36m%s\033[0m\n' "$1"; }

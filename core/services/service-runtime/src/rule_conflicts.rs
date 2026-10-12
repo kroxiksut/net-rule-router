@@ -88,7 +88,8 @@ impl<'a> AddressRuleWalk<'a> {
     /// (`None` for a literal address).
     ///
     /// A Block steers nothing but still loses an address a narrower rule names;
-    /// a route may not take an address the main link's own rules name.
+    /// a route may not take an address the main link's own rules name, and the
+    /// main link keeps its permit on one a program took (rule 2).
     pub fn keeps(&mut self, host: Option<&str>, ip: IpAddr) -> bool {
         let ownership = self.ownership;
         match self.action {
@@ -103,7 +104,7 @@ impl<'a> AddressRuleWalk<'a> {
                 !ownership.block_yields(ip, self.addr_match)
             }
             RuleAction::Route | RuleAction::Verify => {
-                let steers = ownership.address_rule_may_steer(ip, self.link);
+                let steers = ownership.address_rule_may_permit(ip, self.link);
                 if steers {
                     if let Some(block) = ownership.literal_block_of(ip) {
                         if self.vetoed_ips.insert(ip) && self.vetoed.is_none() {

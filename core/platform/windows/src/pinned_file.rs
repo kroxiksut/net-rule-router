@@ -175,7 +175,8 @@ fn long_form(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn final_path(file: &File) -> io::Result<PathBuf> {
+/// The path Windows resolves an open handle to, every link followed.
+pub(crate) fn final_path(file: &File) -> io::Result<PathBuf> {
     let handle = HANDLE(file.as_raw_handle().cast());
     let mut buf = vec![0u16; 512];
     loop {

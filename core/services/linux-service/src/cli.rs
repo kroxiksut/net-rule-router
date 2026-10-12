@@ -19,6 +19,9 @@ pub enum Command {
     RestoreDns,
     /// Undo everything a dead daemon left on the machine: DNS, nft, routes.
     Cleanup,
+    /// `package-files <DIR>` — write the install footprint a distribution
+    /// package ships under DIR, for the packaging script.
+    PackageFiles,
     /// `help` / `--help` / no arguments — print usage.
     Help,
     /// Any unrecognised verb — a hard error, never a daemon start.
@@ -42,6 +45,7 @@ pub fn parse_command(args: &[String]) -> Command {
         "status" => Command::Status,
         "restore-dns" => Command::RestoreDns,
         "cleanup" => Command::Cleanup,
+        "package-files" => Command::PackageFiles,
         "help" | "h" | "" => Command::Help,
         other => Command::Unknown(other.to_string()),
     }
@@ -88,6 +92,10 @@ mod tests {
         assert_eq!(parse(&["install"]), Command::Install);
         assert_eq!(parse(&["uninstall"]), Command::Uninstall);
         assert_eq!(parse(&["status"]), Command::Status);
+        assert_eq!(
+            parse(&["package-files", "/tmp/root"]),
+            Command::PackageFiles
+        );
         assert_eq!(parse(&["help"]), Command::Help);
     }
 

@@ -136,6 +136,7 @@ fn snap_full(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
         primary_probe_repeat_secs: 300,
         local_networks_auto_accept: false,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
     }
 }
 
@@ -170,6 +171,7 @@ fn snap_primary_only(primary: &str) -> PerSidPolicySnapshot {
         primary_probe_repeat_secs: 300,
         local_networks_auto_accept: false,
         zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
     }
 }
 

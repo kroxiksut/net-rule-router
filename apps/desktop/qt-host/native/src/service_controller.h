@@ -32,6 +32,10 @@
 // How long a direct elevated run may take once its prompt is answered.
 inline constexpr int kElevatedRunTimeoutMs = 30000;
 
+// `RELOCATION_FAILED_EXIT_CODE` in nrr-platform-api: the copy into the
+// administrators-only folder failed. The broker turns it into the same slug.
+inline constexpr unsigned long kRelocationFailedExitCode = 9;
+
 // How long the GUI waits for the launcher to answer a broker-routed action.
 // Must exceed the broker's own bound for it (`client_answer_timeout` for
 // `broker.service-control`: settle 1.5 s + child budget 90 s + margin 5 s),
@@ -64,7 +68,8 @@ public slots:
         (void) command;
         emit result(operation, false,
                     QStringLiteral("Service control needs the app's launcher; "
-                                   "start the app normally, or use the command line."));
+                                   "start the app normally, or use the command line."),
+                    QString());
 #else
         SHELLEXECUTEINFOW sei{};
         sei.cbSize = sizeof(sei);
@@ -87,30 +92,33 @@ public slots:
                 return;
             }
             emit result(operation, false,
-                        QStringLiteral("ShellExecuteExW failed: %1").arg(lastError));
+                        QStringLiteral("ShellExecuteExW failed: %1").arg(lastError), QString());
             return;
         }
 
         const DWORD wait = WaitForSingleObject(sei.hProcess, kElevatedRunTimeoutMs);
         if (wait != WAIT_OBJECT_0) {
             CloseHandle(sei.hProcess);
-            emit result(operation, false, nrrServiceOperationTimedOut());
+            emit result(operation, false, nrrServiceOperationTimedOut(), QString());
             return;
         }
         DWORD exitCode = 1;
         GetExitCodeProcess(sei.hProcess, &exitCode);
         CloseHandle(sei.hProcess);
         if (exitCode == 0) {
-            emit result(operation, true, QString());
+            emit result(operation, true, QString(), QString());
         } else {
             emit result(operation, false,
-                        QStringLiteral("Service binary exited with code %1").arg(exitCode));
+                        QStringLiteral("Service binary exited with code %1").arg(exitCode),
+                        exitCode == kRelocationFailedExitCode
+                            ? QStringLiteral("service-relocation-failed")
+                            : QString());
         }
 #endif
     }
 
 signals:
-    void result(QString operation, bool success, QString errorMessage);
+    void result(QString operation, bool success, QString errorMessage, QString errorCode);
     void uacDeclined(QString operation);
 };
 
@@ -344,8 +352,9 @@ signals:
     void brokerSessionEstablished();
 
 private slots:
-    void onWorkerResult(QString operation, bool success, QString errorMessage) {
-        emit operationCompleted(operation, success, errorMessage, QString());
+    void onWorkerResult(QString operation, bool success, QString errorMessage,
+                        QString errorCode) {
+        emit operationCompleted(operation, success, errorMessage, errorCode);
         // Auto-start on successful install: registering the service with
         // SCM does not run it, but the user clicked "Install" expecting
         // a working service. Mirror the PowerShell scripts' install →

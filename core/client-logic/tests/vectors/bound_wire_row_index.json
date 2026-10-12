@@ -1,0 +1,111 @@
+{
+  "description": "pure.js boundWireRowIndex: which interfaces.snapshot row a route binding names, by its current or an earlier id against the row's id or OS adapter name; -1 for none. Rows carry only the two ids; the test lays them over the adapters base row.",
+  "cases": [
+    {
+      "name": "current id names the row id",
+      "input": {
+        "rows": [
+          { "persistent-id": "{00000000-0000-0000-0000-000000000001}", "adapter-name": "{00000000-0000-0000-0000-000000000001}" },
+          { "persistent-id": "{00000000-0000-0000-0000-000000000002}", "adapter-name": "{00000000-0000-0000-0000-000000000002}" }
+        ],
+        "binding": { "stable-id": "{00000000-0000-0000-0000-000000000002}", "display-name": "VPN", "user-confirmed": true }
+      },
+      "expected": 1
+    },
+    {
+      "name": "linux interface name names the adapter name",
+      "input": {
+        "rows": [
+          { "persistent-id": "linux:2", "adapter-name": "wlan0" },
+          { "persistent-id": "linux:7", "adapter-name": "wg0" }
+        ],
+        "binding": { "stable-id": "wg0", "display-name": "wg0", "user-confirmed": true }
+      },
+      "expected": 1
+    },
+    {
+      "name": "an earlier id still names the reinstalled adapter",
+      "input": {
+        "rows": [
+          { "persistent-id": "{00000000-0000-0000-0000-00000000000b}", "adapter-name": "{00000000-0000-0000-0000-00000000000b}" }
+        ],
+        "binding": {
+          "stable-id": "{00000000-0000-0000-0000-00000000000c}",
+          "display-name": "VPN",
+          "user-confirmed": true,
+          "known-stable-ids": ["{00000000-0000-0000-0000-00000000000b}"]
+        }
+      },
+      "expected": 0
+    },
+    {
+      "name": "case does not matter",
+      "input": {
+        "rows": [
+          { "persistent-id": "{0000000A-0000-0000-0000-000000000001}", "adapter-name": "x" }
+        ],
+        "binding": { "stable-id": "{0000000a-0000-0000-0000-000000000001}", "display-name": "", "user-confirmed": false }
+      },
+      "expected": 0
+    },
+    {
+      "name": "first of two matching rows",
+      "input": {
+        "rows": [
+          { "persistent-id": "a", "adapter-name": "eth0" },
+          { "persistent-id": "eth0", "adapter-name": "b" }
+        ],
+        "binding": { "stable-id": "eth0", "display-name": "eth0", "user-confirmed": true }
+      },
+      "expected": 0
+    },
+    {
+      "name": "the display name is not an id",
+      "input": {
+        "rows": [
+          { "persistent-id": "linux:2", "adapter-name": "wlan0" }
+        ],
+        "binding": { "stable-id": "", "display-name": "wlan0", "user-confirmed": true }
+      },
+      "expected": -1
+    },
+    {
+      "name": "an empty id never names an empty row",
+      "input": {
+        "rows": [
+          { "persistent-id": "", "adapter-name": "" }
+        ],
+        "binding": { "stable-id": "", "display-name": "", "user-confirmed": false, "known-stable-ids": [""] }
+      },
+      "expected": -1
+    },
+    {
+      "name": "no row matches",
+      "input": {
+        "rows": [
+          { "persistent-id": "linux:2", "adapter-name": "wlan0" }
+        ],
+        "binding": { "stable-id": "wg0", "display-name": "wg0", "user-confirmed": true }
+      },
+      "expected": -1
+    },
+    {
+      "name": "no rows",
+      "input": {
+        "rows": [],
+        "binding": { "stable-id": "wg0", "display-name": "wg0", "user-confirmed": true }
+      },
+      "expected": -1
+    },
+    {
+      "name": "nothing bound",
+      "input": {
+        "rows": [
+          { "persistent-id": "linux:2", "adapter-name": "wlan0" }
+        ],
+        "binding": null
+      },
+      "expected": -1
+    }
+  ]
+}

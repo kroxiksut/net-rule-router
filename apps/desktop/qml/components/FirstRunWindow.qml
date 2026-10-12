@@ -75,6 +75,9 @@ Window {
     // minus "off" (the checkbox is the on/off control).
     property string diagnosticLogsDuration: "four-hours"
     property bool wantBlockNoticesMuted: false
+    // Without it a restart leaves no icon and no notices: the routing runs,
+    // and nothing on screen says so.
+    property bool wantTrayAutostart: true
 
     // Which adapter currently holds the primary role, read back from the same
     // model the Interfaces screen edits — so assigning it here and assigning it
@@ -117,6 +120,9 @@ Window {
         }
         if (wantBlockNoticesMuted) {
             root.commitPrefs({ notifyBlockNotices: false })
+        }
+        if (wantTrayAutostart && root.supports("autostart")) {
+            root.setAutostartEnabled(true)
         }
         var patch = { "fake-ip-enabled": wantFakeIp }
         if (wantDiagnosticLogs) {
@@ -746,7 +752,7 @@ Window {
                 CheckBox {
                     id: firstRunFakeIpCheck
                     Layout.fillWidth: true
-                    visible: root.serviceStabilitySupported
+                    visible: root.serviceStabilitySupported && root.supports("fakeIp")
                     checked: firstRunWindow.wantFakeIp
                     text: root.tr("dialog.first-run-wizard.protection-fake-ip",
                         "Route sites by name, so an address shared with another site is not dragged along")
@@ -818,6 +824,22 @@ Window {
                         verticalAlignment: Text.AlignVCenter
                     }
                     onToggled: firstRunWindow.wantBlockNoticesMuted = checked
+                }
+                CheckBox {
+                    id: firstRunTrayAutostartCheck
+                    Layout.fillWidth: true
+                    visible: root.supports("autostart")
+                    checked: firstRunWindow.wantTrayAutostart
+                    text: root.tr("settings.general.autostart.label",
+                        "Start NetRuleRouter tray automatically at sign-in")
+                    contentItem: Label {
+                        text: firstRunTrayAutostartCheck.text
+                        leftPadding: firstRunTrayAutostartCheck.indicator.width + firstRunTrayAutostartCheck.spacing
+                        color: root.textColor
+                        wrapMode: Text.WordWrap
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    onToggled: firstRunWindow.wantTrayAutostart = checked
                 }
             }
 

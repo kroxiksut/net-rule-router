@@ -532,6 +532,7 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         // No conn-trace ring in test deps; both conn-trace reads resolve
         // to the Unimplemented stub here.
         conn_trace_ring: None,
+        unix_sys_uid_max: None,
         third_party_integrity: None,
         // No expected-route inputs in test deps; trace rows would
         // carry an empty `expected_route`.
@@ -608,6 +609,7 @@ impl RoutePolicyWriter for FakeRoutePolicyWriter {
             zone_priority_over_ip: false,
             short_name_completion: false,
             short_name_suffix: String::new(),
+            app_rules_take_all_addresses: false,
             binding_source: request.binding_source,
         };
         *self.stored.lock().unwrap() = Some(dto.clone());

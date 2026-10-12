@@ -317,10 +317,19 @@ pub enum IpcOperationName {
     /// [`crate::ipc_payloads::VerifyVerdictsDismissRequest`] →
     /// [`crate::ipc_payloads::VerifyVerdictsDismissResponse`].
     VerifyVerdictsDismiss,
+    /// The remote addresses one program connected to recently, most likely
+    /// VPN gateway first, so a VPN that must connect over the other link can
+    /// get an ordinary rule for its gateway. Read from the in-memory
+    /// connection trace; the caller sees their own connections and those of
+    /// the machine's service accounts, never another person's. Query op (no
+    /// mutation queue, no elevation).
+    /// [`crate::ipc_payloads::VpnGatewayCandidatesRequest`] →
+    /// [`crate::ipc_payloads::VpnGatewayCandidatesResponse`].
+    VpnGatewayCandidatesList,
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 73] = [
+    pub const ALL: [Self; 74] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -394,6 +403,7 @@ impl IpcOperationName {
         Self::VerifyVerdictsList,
         Self::VerifyVerdictsAccept,
         Self::VerifyVerdictsDismiss,
+        Self::VpnGatewayCandidatesList,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -471,6 +481,7 @@ impl IpcOperationName {
             Self::VerifyVerdictsList => "rules.verify.verdicts.list",
             Self::VerifyVerdictsAccept => "rules.verify.verdicts.accept",
             Self::VerifyVerdictsDismiss => "rules.verify.verdicts.dismiss",
+            Self::VpnGatewayCandidatesList => "vpn.gateway-candidates.list",
         }
     }
 

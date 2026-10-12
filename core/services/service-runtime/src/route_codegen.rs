@@ -626,10 +626,9 @@ pub fn generate_routes(
     // the mode-A secondary `/32` fan-out ONLY; the same set the WFP codegen uses,
     // so a declined shared IP is dropped from BOTH the route and the kill-switch.
     denied: &HashSet<Ipv4Addr>,
-    // Where an exact-address rule sits against a zone rule, from the
-    // principal's `zone_priority_over_ip`. The two can only contest the same
-    // address in the ownership arbiter, so this is the whole of its reach here.
-    order: crate::address_ownership::ZoneVsIpOrder,
+    // The principal's `zone_priority_over_ip` and `app_rules_take_all_addresses`.
+    // Both reach the ownership arbiter only, so this is the whole of their reach.
+    order: impl Into<crate::address_ownership::OwnershipSettings>,
     // The tunnel's own catch-all prefixes (see [`tunnel_catch_all_prefixes`]);
     // mode A's counter-overlay is shaped to out-specific exactly these.
     tunnel_catch_alls: &[(Ipv4Addr, u8)],
@@ -660,7 +659,7 @@ pub fn generate_routes_with(
     cache: &dyn FqdnCacheLookup,
     app_observations: &dyn AppObservationLookup,
     denied: &HashSet<Ipv4Addr>,
-    order: crate::address_ownership::ZoneVsIpOrder,
+    order: impl Into<crate::address_ownership::OwnershipSettings>,
     tunnel_catch_alls: &[(Ipv4Addr, u8)],
     networks: &network_routes::NetworkRouteFacts,
     support: nrr_domain::rule_shape::RuleShapeSupport,
@@ -668,8 +667,12 @@ pub fn generate_routes_with(
     // Read from the UNFILTERED cache: the denylist view exists to trim what
     // goes to the tunnel, and using it here would understate what the main
     // link claims.
-    let ownership = crate::address_ownership::AddressOwnership::resolve_with_support(
-        rule_book, cache, order, support,
+    let ownership = crate::address_ownership::AddressOwnership::resolve_for(
+        rule_book,
+        cache,
+        order.into(),
+        support,
+        app_observations,
     );
     let mut out = match mode {
         RouteBehaviorMode::PreferPrimary => {

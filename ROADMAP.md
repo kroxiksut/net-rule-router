@@ -21,8 +21,12 @@ on real IPv6 networks before calling it finished.
 
 ## Right after the first alpha
 
-**Traffic history per connection.** See how much went through the additional
-connection and how much went directly, over a period you choose.
+**"Is it the server or is it us?"** When a program cannot connect somewhere, a
+list shows which servers did not answer recently and whether NetRuleRouter had
+anything to do with it. One button checks each of them over the main
+connection and, if you have one, over the additional connection too, and tells
+you plainly: the server does not answer at all, only one of your connections
+lets it through, or it works now.
 
 **Data plan warning.** VPN subscriptions and mobile plans come with a limit,
 and NetRuleRouter is the one place that knows how much of it the additional

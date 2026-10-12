@@ -97,9 +97,9 @@ Dialog {
     function _primaryDescription() {
         return _isNotInstalled()
             ? tr("dialog.service-not-running.install-service-description",
-                "Install the Windows service (requires administrator privileges) and start it.")
+                "Install the background service (requires administrator privileges) and start it.")
             : tr("dialog.service-not-running.start-service-description",
-                "Start the Windows service (requires administrator privileges).")
+                "Start the background service (requires administrator privileges).")
     }
 
     onRejected: cancelled()

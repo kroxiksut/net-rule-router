@@ -167,32 +167,64 @@ const SESSION_PROPERTIES: [&str; 6] = [
     "--property=TimestampMonotonic",
 ];
 
-/// Seat and sign-in facts for `uids`: two `loginctl` calls, made only when
-/// there is somebody to choose between. Unreadable means no facts, which
-/// leaves logind's own order to decide.
-fn sign_in_facts(uids: &[u32]) -> HashMap<u32, SignInFacts> {
+/// Seat and sign-in facts for `uids` from their `user*` sessions: two
+/// `loginctl` calls. `None` when unreadable, which leaves logind's own order to
+/// decide and nobody filtered out.
+fn sign_in_facts(uids: &[u32]) -> Option<HashMap<u32, SignInFacts>> {
     let uids: Vec<String> = uids.iter().map(u32::to_string).collect();
     let mut args = vec!["show-user"];
     args.extend(uids.iter().map(String::as_str));
     args.push("--property=Sessions");
-    let Ok(out) = crate::command::output_with_timeout(
+    let out = crate::command::output_with_timeout(
         "loginctl",
         &args,
         crate::command::DEFAULT_COMMAND_TIMEOUT,
-    ) else {
-        return HashMap::new();
-    };
+    )
+    .ok()?;
     let sessions = parse_session_ids(&String::from_utf8_lossy(&out.stdout));
     // `show-session` with no id describes the caller's own session.
     if sessions.is_empty() {
-        return HashMap::new();
+        return Some(HashMap::new());
     }
     let mut args = vec!["show-session"];
     args.extend(sessions.iter().map(String::as_str));
     args.extend(SESSION_PROPERTIES);
     crate::command::output_with_timeout("loginctl", &args, crate::command::DEFAULT_COMMAND_TIMEOUT)
+        .ok()
         .map(|out| parse_session_facts(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_default()
+}
+
+/// The people among `users`. A display manager's greeter is an online user in
+/// logind (`fly-dm`, `gdm`, `lightdm` on the seat), and counted as present it
+/// gets a table and can be picked as the owner of the system one over the
+/// administrator signed in over SSH. A person has a `user*` session or linger;
+/// facts are asked for only when there is somebody to choose between or a
+/// system account to tell apart, so the usual tick costs nothing more.
+fn people(
+    users: Vec<LiveUser>,
+    sys_uid_max: u32,
+    facts_of: impl FnOnce(&[u32]) -> Option<HashMap<u32, SignInFacts>>,
+) -> (Vec<LiveUser>, HashMap<u32, SignInFacts>) {
+    let system_account = |u: &LiveUser| u.uid != 0 && u.uid <= sys_uid_max && !u.lingering;
+    if users.len() < 2 && !users.iter().any(system_account) {
+        return (users, HashMap::new());
+    }
+    let Some(facts) = facts_of(&users.iter().map(|u| u.uid).collect::<Vec<_>>()) else {
+        return (users, HashMap::new());
+    };
+    let people = users
+        .into_iter()
+        .filter(|u| u.lingering || facts.contains_key(&u.uid))
+        .collect();
+    (people, facts)
+}
+
+fn live_people() -> Result<(Vec<LiveUser>, HashMap<u32, SignInFacts>), LogindError> {
+    Ok(people(
+        live_users()?,
+        crate::service_account_uids::read_sys_uid_max(),
+        sign_in_facts,
+    ))
 }
 
 /// `Sessions=2 5 c1` lines, one per user, as `show-user` prints them.
@@ -348,7 +380,7 @@ impl nrr_platform_api::active_principals::ActivePrincipalSource for LogindActive
         Vec<nrr_platform_api::enforcement::UserPrincipal>,
         nrr_platform_api::active_principals::ActivePrincipalError,
     > {
-        let users = live_users().map_err(|e| {
+        let (users, _) = live_people().map_err(|e| {
             nrr_platform_api::active_principals::ActivePrincipalError::new(e.to_string())
         })?;
         Ok(users
@@ -363,15 +395,9 @@ impl nrr_platform_api::active_principals::ActivePrincipalSource for LogindActive
         Vec<nrr_platform_api::active_principals::PresentPrincipal>,
         nrr_platform_api::active_principals::ActivePrincipalError,
     > {
-        let users = live_users().map_err(|e| {
+        let (users, facts) = live_people().map_err(|e| {
             nrr_platform_api::active_principals::ActivePrincipalError::new(e.to_string())
         })?;
-        // One user has nobody to be chosen over: the common tick asks nothing more.
-        let facts = if users.len() > 1 {
-            sign_in_facts(&users.iter().map(|u| u.uid).collect::<Vec<_>>())
-        } else {
-            HashMap::new()
-        };
         Ok(users
             .into_iter()
             .map(|u| {
@@ -393,6 +419,52 @@ impl nrr_platform_api::active_principals::ActivePrincipalSource for LogindActive
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live(uid: u32, lingering: bool) -> LiveUser {
+        LiveUser {
+            uid,
+            name: format!("u{uid}"),
+            lingering,
+        }
+    }
+
+    fn uids(users: &[LiveUser]) -> Vec<u32> {
+        users.iter().map(|u| u.uid).collect()
+    }
+
+    /// The greeter on the seat is online in logind but signs nobody in; the
+    /// administrator over SSH is the person.
+    #[test]
+    fn a_greeter_is_not_a_person() {
+        let users = vec![live(102, false), live(1000, false)];
+        let (found, _) = people(users, 999, |asked| {
+            assert_eq!(asked, [102, 1000]);
+            Some(HashMap::from([(1000, SignInFacts::default())]))
+        });
+        assert_eq!(uids(&found), [1000]);
+        let (alone, _) = people(vec![live(102, false)], 999, |_| Some(HashMap::new()));
+        assert!(alone.is_empty(), "a login screen alone is nobody signed in");
+    }
+
+    /// One ordinary user asks nothing more; root and a lingering account are
+    /// people without a seat session; unreadable facts filter nobody.
+    #[test]
+    fn the_usual_tick_asks_nothing_and_doubt_keeps_everyone() {
+        let ask_nothing = |_: &[u32]| -> Option<HashMap<u32, SignInFacts>> {
+            unreachable!("one ordinary user needs no facts")
+        };
+        assert_eq!(
+            uids(&people(vec![live(1000, false)], 999, ask_nothing).0),
+            [1000]
+        );
+        assert_eq!(uids(&people(vec![live(0, false)], 999, ask_nothing).0), [0]);
+        assert_eq!(
+            uids(&people(vec![live(500, true)], 999, ask_nothing).0),
+            [500]
+        );
+        let (kept, _) = people(vec![live(102, false), live(1000, false)], 999, |_| None);
+        assert_eq!(uids(&kept), [102, 1000]);
+    }
 
     /// A current systemd: every row carries its state, nothing is looked up.
     fn listed(stdout: &str) -> Result<Vec<LiveUser>, LogindError> {

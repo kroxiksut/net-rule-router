@@ -315,7 +315,7 @@ GroupBox {
                 color: root.textColor
                 text: root.serviceRegisteredElsewhere
                     ? root.tr("settings.service.update.elsewhere",
-                        "Windows starts the background service from another folder, not the one this application runs from.")
+                        "The system starts the background service from another folder, not the one this application runs from.")
                     : root.tr("settings.service.update.older",
                         "The running background service is an older build than this application.")
             }

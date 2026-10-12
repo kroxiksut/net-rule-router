@@ -1,0 +1,14 @@
+{
+  "description": "pure.js interfacesSourceIsLive: only an OS's own live spelling names this machine's adapters; anything else is placeholder rows a role must not be bound to",
+  "cases": [
+    { "name": "windows enumeration", "input": { "source": "windows-live" }, "expected": true },
+    { "name": "linux enumeration", "input": { "source": "linux-live" }, "expected": true },
+    { "name": "placeholder rows", "input": { "source": "fallback-mock" }, "expected": false },
+    { "name": "empty", "input": { "source": "" }, "expected": false },
+    { "name": "absent", "input": {}, "expected": false },
+    { "name": "an OS not declared yet", "input": { "source": "macos-live" }, "expected": false },
+    { "name": "other case", "input": { "source": "Windows-Live" }, "expected": false },
+    { "name": "padded", "input": { "source": " linux-live" }, "expected": false },
+    { "name": "bare suffix", "input": { "source": "live" }, "expected": false }
+  ]
+}

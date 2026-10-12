@@ -1109,6 +1109,7 @@ fn health_json_carries_enrichment_from_providers() {
         zone_priority_over_ip: false,
         short_name_completion: false,
         short_name_suffix: String::new(),
+        app_rules_take_all_addresses: false,
         binding_source: BindingSourceDto::UserAssigned,
     });
 
@@ -1260,8 +1261,9 @@ fn call_as<H: IpcHandler>(
 }
 
 /// Another user's rows name their programs and destinations; an ordinary
-/// caller gets their own plus the machine's (no owner, or the service's own
-/// relay connections), an elevated one everything.
+/// caller gets their own plus the unowned ones, an elevated one everything.
+/// The service's relay rows carry every user's traffic and stay with the
+/// administrator.
 #[test]
 fn conn_trace_shows_an_ordinary_caller_only_their_own_and_the_machines_rows() {
     use nrr_domain::user_principal::UserPrincipal;
@@ -1297,7 +1299,7 @@ fn conn_trace_shows_an_ordinary_caller_only_their_own_and_the_machines_rows() {
 
     assert_eq!(
         processes(ctx_for(Some(me.clone()), false)),
-        vec![service, "nobody.exe", "mine.exe"]
+        vec!["nobody.exe", "mine.exe"]
     );
     assert_eq!(
         processes(ctx_for(Some(me), true)),
@@ -1306,7 +1308,7 @@ fn conn_trace_shows_an_ordinary_caller_only_their_own_and_the_machines_rows() {
     );
     assert_eq!(
         processes(ctx_for(None, false)),
-        vec![service, "nobody.exe"],
+        vec!["nobody.exe"],
         "an unattributed caller owns nothing"
     );
 }

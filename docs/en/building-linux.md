@@ -8,7 +8,9 @@ the plan.
 
 Linux support is younger than the Windows one. The workspace builds, the test
 suite runs, and the service applies policy on real hardware — but there is no
-packaged release yet, so everything below starts from a checkout.
+packaged release yet, so everything below starts from a checkout. To turn your
+build into `.deb`, `.rpm` and `.tar.gz` packages, see
+[Packaging for Linux](packaging-linux.md).
 
 ## What to install
 
@@ -117,6 +119,19 @@ session data and installs separately:
 Run the per-user form as yourself, not through `sudo`: the paths it writes to
 are resolved from your own session, and under `sudo` they would resolve for
 root.
+
+On a machine where NetRuleRouter was installed from a package, these scripts
+refuse to install or remove the service: the package manager owns it there.
+
+## Packages
+
+```bash
+./scripts/package-linux.sh --build              # full: needs Qt 6.6 or newer
+./scripts/package-linux.sh --headless --build   # without the GUI: no Qt needed
+```
+
+What the packages contain, which machine to build them on, and how they
+install and uninstall: [Packaging for Linux](packaging-linux.md).
 
 ## Quality gate
 

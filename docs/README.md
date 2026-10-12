@@ -8,8 +8,9 @@
 |----------|---------------|
 | [Quick start](en/quickstart.md) | Download, install, set up your first rules |
 | [Building from source — Windows](en/building-windows.md) | What to install (Rust, Qt, CMake…) and how to build |
-| [Packaging a portable build — Windows](en/packaging-windows.md) | Making a folder that runs on a clean machine, and what the build stamp records |
+| [Packaging — Windows](en/packaging-windows.md) | Making a folder that runs on a clean machine, the EXE and MSI installers, and what each way of uninstalling keeps |
 | [Building from source — Linux](en/building-linux.md) | Prerequisites, the build and install scripts, and the quality gate |
+| [Packaging — Linux](en/packaging-linux.md) | Building `.deb`, `.rpm` and `.tar.gz` packages, with and without the GUI, and what installing and removing them does |
 | [Rules format](en/rules-file-format.md) | Rule syntax for humans, with examples |
 | [Answering the setup questions ahead of time](en/first-run-answers.md) | Supplying the first-run answers in a file so the setup window never appears |
 | [Where NetRuleRouter keeps its files](en/where-files-live.md) | What lives in `ProgramData`, `AppData` and `%TEMP%`, what survives a reinstall, and what is safe to delete |

@@ -135,7 +135,7 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                         "  start mode:        {}",
                         parse::start_mode_word(start_mode)
                     );
-                    println!("  binary:            {}", spec.binary_path.display());
+                    print_registered_binary(port.as_ref(), &spec.binary_path);
                     println!(
                         "  crash recovery:    {}",
                         yes_no(report.recovery_configured)
@@ -262,7 +262,7 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                 return report_failure("reinstall", &err, ctx, "reinstall");
             }
             println!("Re-registered the {PRODUCT_NAME} service.");
-            println!("  binary:            {}", spec.binary_path.display());
+            print_registered_binary(port.as_ref(), &spec.binary_path);
             println!(
                 "  start mode:        {}",
                 parse::start_mode_word(spec.start_mode)
@@ -282,6 +282,41 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                 Err(err) => report_failure("reinstall", &err, ctx, "start"),
             }
         }),
+    }
+}
+
+/// Name the binary the service manager now starts. An install may register a
+/// copy rather than the file it was given — a system location on Linux, an
+/// administrators-only folder for a portable copy on Windows — and the operator
+/// who later deletes the folder they installed from needs to know which.
+fn print_registered_binary(port: &dyn ServiceControlPort, given: &Path) {
+    let registered = port
+        .query()
+        .ok()
+        .flatten()
+        .and_then(|report| report.binary_path);
+    for line in registered_binary_lines(registered.as_deref(), given) {
+        println!("{line}");
+    }
+}
+
+fn registered_binary_lines(registered: Option<&Path>, given: &Path) -> Vec<String> {
+    match registered {
+        Some(registered) if !same_file(registered, given) => vec![
+            format!("  binary:            {}", registered.display()),
+            format!("  copied from:       {}", given.display()),
+        ],
+        _ => vec![format!("  binary:            {}", given.display())],
+    }
+}
+
+/// Path equality under the host file system's case rules.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (a, b) = (a.to_string_lossy(), b.to_string_lossy());
+    if cfg!(any(windows, target_os = "macos")) {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
     }
 }
 
@@ -722,6 +757,22 @@ mod tests {
     fn install_failure_hint_only_blames_a_removal_that_happened() {
         assert!(install_failure_hint(true).contains("removed"));
         assert!(!install_failure_hint(false).contains("removed"));
+    }
+
+    #[test]
+    fn a_registered_copy_is_named_with_where_it_came_from() {
+        let given = Path::new("portable").join(BinaryRole::Service.host_file_name());
+        let copy = Path::new("protected").join(BinaryRole::Service.host_file_name());
+        let lines = registered_binary_lines(Some(&copy), &given);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains(&copy.display().to_string()), "{lines:?}");
+        assert!(lines[1].contains("copied from"), "{lines:?}");
+
+        let same = registered_binary_lines(Some(&given), &given);
+        assert_eq!(same.len(), 1, "{same:?}");
+        let unknown = registered_binary_lines(None, &given);
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert!(unknown[0].contains(&given.display().to_string()));
     }
 
     #[test]

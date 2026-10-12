@@ -216,6 +216,12 @@ QtObject {
             ? bridge.rpcVpnDiscover()
             : ""
     }
+    // Where one program connected lately, for the VPN-gateway helper.
+    function rpcVpnGatewayCandidatesList(program) {
+        return (bridgeAvailable && typeof bridge.rpcVpnGatewayCandidatesList === "function")
+            ? bridge.rpcVpnGatewayCandidatesList(String(program || ""))
+            : ""
+    }
     // Traffic counter. The polling + model logic lives in
     // TrafficStatsController; these are thin bridge forwarders.
     function rpcTrafficStatsGet(payload) {
